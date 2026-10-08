@@ -385,14 +385,55 @@ def _settle_operand_shapes(function: Any, values: Any) -> None:
             value.shape = settled
 
 
+def _post_call_edge_fact(
+    module: IRModule, page: Any, row: tuple, fact: Any, cells: Any,
+) -> None:
+    """Post ``fact`` on declared ``page`` REVISE, DERIVED from ``cells``;
+    ``Unsourced`` (listed by the audit) when no cell exists or the fact
+    changed over the same unchanged cells.  A fact the row already holds is
+    not restated."""
+
+    from .concordance_declarations import (
+        SSA_CALL_EDGE_CAUSE_NOT_ON_BOOK, SSA_CALL_EDGE_CELL_NOT_ON_BOOK,
+        TENSOR_SSA_LOWERING,
+    )
+    from .identity_concordance import (
+        ConcordanceRefusal, Derived, Mode, Unsourced,
+    )
+
+    book = identity_book(module)
+    stored = book.pages.get(page.name)
+    if stored is not None and stored.latest(row) == fact:
+        return
+    sources = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+    if sources:
+        try:
+            book.post(
+                page, row, fact, stage=TENSOR_SSA_LOWERING,
+                provenance=Derived(sources), mode=Mode.REVISE,
+            )
+            return
+        except ConcordanceRefusal:
+            reason = SSA_CALL_EDGE_CAUSE_NOT_ON_BOOK
+    else:
+        reason = SSA_CALL_EDGE_CELL_NOT_ON_BOOK
+    book.post(
+        page, row, fact, stage=TENSOR_SSA_LOWERING,
+        provenance=Unsourced(reason), mode=Mode.REVISE,
+    )
+
+
 def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
     tuple[str, int], list[tuple[tuple[int, ...], str]]
 ]:
     """Publish current exact actual/formal contracts after metadata settles."""
 
+    from .concordance_declarations import (
+        SSA_CALL_SHAPE, SSA_CALL_SHAPE_EVIDENCE,
+    )
     from .identity_concordance import record_proven_shape, shape_scope_of
+    from .ssa_record_return_state import ssa_value_identity_cell
 
-    page = identity_book(module).page("ssa_call_shape")
     contracts: dict[
         tuple[str, int], list[tuple[tuple[int, ...], str]]
     ] = {}
@@ -454,8 +495,15 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                         callee_name, int(formal.id),
                         str(caller_name), int(actual.id),
                     )
-                    if page.latest(row) != fact:
-                        page.set(row, len(page.history(row)), fact)
+                    edge_cells = (
+                        ssa_value_identity_cell(
+                            caller, int(actual.id), book=identity_book(module),
+                        ),
+                        ssa_value_identity_cell(
+                            callee, int(formal.id), book=identity_book(module),
+                        ),
+                    )
+                    _post_call_edge_fact(module, SSA_CALL_SHAPE, row, fact, edge_cells)
                     evidence_page = identity_book(module).page(
                         "ssa_call_shape_evidence"
                     )
@@ -470,10 +518,10 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                         and tuple(descriptor.shape or ())
                         else "ssa_occurrence"
                     )
-                    if evidence_page.latest(row) != evidence:
-                        evidence_page.set(
-                            row, len(evidence_page.history(row)), evidence
-                        )
+                    _post_call_edge_fact(
+                        module, SSA_CALL_SHAPE_EVIDENCE, row, evidence,
+                        edge_cells,
+                    )
                     record_proven_shape(
                         shape_scope_of(callee), int(formal.id), extents,
                         actual.dtype,
@@ -1497,10 +1545,21 @@ def propagate_repository_ssa_call_metadata(
             key = (scopes[id(owner_function)], int(value.id))
             scoped_values.setdefault(key, {})[id(value)] = value
             reference_counts.setdefault(key, set()).add(owner_name)
-    reference_count_page = identity_book(module).page("cross_function_references")
+    from .concordance_declarations import CROSS_FUNCTION_REFERENCES
+    from .ssa_record_return_state import ssa_value_identity_cell
+
     for key, owners in reference_counts.items():
         if len(owners) > 1:
-            reference_count_page.set(key, 0, tuple(sorted(owners)))
+            _post_call_edge_fact(
+                module, CROSS_FUNCTION_REFERENCES, key, tuple(sorted(owners)),
+                tuple(
+                    ssa_value_identity_cell(
+                        module.functions[owner], int(key[1]),
+                        book=identity_book(module),
+                    )
+                    for owner in sorted(owners)
+                ),
+            )
 
     def occurrences_of(value_id: int, function: Any) -> tuple[SSAValue, ...]:
         """Occurrences in this source owner's canonical value space."""

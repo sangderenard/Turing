@@ -2858,3 +2858,30 @@ FIXED_POINT_ROUND = declare_page("bounded_fixed_point_round", (
 __all__ += [
     "FIXED_POINT_ROUND_STAGE", "FIXED_POINT_ROOT", "FIXED_POINT_ROUND",
 ]
+
+# -- repository-SSA call-edge shape publication (``tensor_ssa_lowering``) ----
+#: ``_publish_exact_ssa_call_shapes``: one row per exact call edge position
+#: ``(callee, formal id, caller, actual id)`` -> ``(extents, dtype)``, REVISE
+#: (a later round may state a different contract), DERIVED(the actual's and
+#: the formal's ``ssa_value`` cells).  ``ssa_call_shape_evidence`` names, on
+#: the same row, which source the extents were read from (``str``), DERIVED
+#: from the same cells.
+SSA_CALL_SHAPE = declare_page("ssa_call_shape", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("caller", K.NAME), RowField("actual", K.VALUE_ID),
+), tuple)
+SSA_CALL_SHAPE_EVIDENCE = declare_page("ssa_call_shape_evidence", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("caller", K.NAME), RowField("actual", K.VALUE_ID),
+), str)
+#: ``propagate_repository_ssa_call_metadata``: the functions of a module that
+#: mention one value id of one source owner's id space, ``(owner scope, id)``
+#: -> sorted function names, DERIVED(the value's ``ssa_value`` cell in each).
+CROSS_FUNCTION_REFERENCES = declare_page("cross_function_references", (
+    RowField("owner", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
+#: ``Unsourced`` reasons for the three pages above: the value has no
+#: ``ssa_value`` cell in the function that holds it, or the contract changed
+#: over the same cells.
+SSA_CALL_EDGE_CELL_NOT_ON_BOOK = declare_reason("ssa_call_edge_cell_not_on_book")
+SSA_CALL_EDGE_CAUSE_NOT_ON_BOOK = declare_reason("ssa_call_edge_cause_not_on_book")
