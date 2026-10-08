@@ -42,6 +42,7 @@ from src.compiler.precompile_to_ssa import (
     resolve_sequence_schemas,
 )
 from src.compiler.identity_concordance import (
+    Ref,
     begin_identity_book,
     commit_sequence_row_layout,
     end_identity_book,
@@ -140,6 +141,67 @@ def test_field_write_versions_result_colliding_with_receiver_storage():
         if instruction.res is address
     )
     assert gep.args[0].id == 18
+
+
+def test_arm_owned_field_write_colliding_with_receiver_storage_stays_in_its_arm():
+    """The result that collides with the receiver column is versioned, and
+    the write authored inside the ``if`` is stored in that arm -- not after
+    the producer, which dominates every path."""
+
+    _book, token = begin_identity_book()
+    try:
+        from src.compiler.concordance_declarations import SSA_FIELD_VERSION
+
+        cell = Ref(SSA_FIELD_VERSION, ("probe",), 0)
+        written = SSAValue(18, dtype="float64")
+        compute = Instr("Compute", [], written)
+        predicate = SSAValue(40, dtype="bool")
+        authored = Instr(
+            "Store", [written, SSAValue(20, dtype="float64")], None,
+            attributes={
+                "binding": "scalar_record_field_assignment",
+                "field_state_cell": cell,
+            },
+        )
+        control = Function(
+            "Controller__update_dt_max",
+            [predicate],
+            {
+                "entry": BasicBlock("entry", [
+                    compute, Instr("CondBr", [predicate], None),
+                ]),
+                "if_true": BasicBlock("if_true", [
+                    authored, Instr("Br", [], None),
+                ]),
+                "if_merge": BasicBlock("if_merge", [Instr("Return", [], None)]),
+            },
+        )
+
+        lowered, _locations = _inject_field_slot_access(
+            control,
+            self_value_id=18,
+            non_self_param_ids=(40,),
+            field_ops=(("write", 18, 0), ("read", 20, 0)),
+            field_count=1,
+            output_value_ids=(),
+            field_dtypes={0: "float64"},
+            field_write_state_cells=(cell,),
+        )
+    finally:
+        end_identity_book(token)
+
+    assert compute.res.id != 18
+    entry_stores = [
+        instruction for instruction in lowered.blocks["entry"].instrs
+        if instruction.op == "Store"
+    ]
+    arm_stores = [
+        instruction for instruction in lowered.blocks["if_true"].instrs
+        if instruction.op == "Store"
+    ]
+    assert entry_stores == []
+    assert len(arm_stores) == 1
+    assert arm_stores[0].args[0] is compute.res
 
 
 def test_region_output_versions_declared_inout_formal():
