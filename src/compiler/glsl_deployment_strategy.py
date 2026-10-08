@@ -15949,15 +15949,33 @@ def _propagate_callsite_tensor_specializations(
             # shape and comes back to it -- a round trip, which a settling
             # fixed point never makes -- instead of the whole compile merely
             # looking slow from outside.
-            _page = _book.page("callsite_return_specialization")
+            from .concordance_declarations import (
+                CALLSITE_RETURN_SPECIALIZATION_PAGE,
+                PLANNER_TENSOR_SPECIALIZATION,
+                SPECIALIZATION_ROUND_CAUSE_NOT_ON_BOOK,
+            )
+            from .identity_concordance import _post_or_unsourced
+
             _row = (
                 shape_scope_of(caller), shape_scope_of(callee), int(node_id),
             )
-            _page.set(_row, len(_page.history(_row)), tuple(
+            _fact = tuple(
                 None if item is None or not isinstance(item, Mapping)
                 else (tuple(item.get("shape") or ()), str(item.get("dtype") or ""))
                 for item in output_descriptors
-            ))
+            )
+            _stored = _book.pages.get(CALLSITE_RETURN_SPECIALIZATION_PAGE.name)
+            # The round's published return shape is read off the callee's
+            # return cells: DERIVED from them.
+            if _stored is None or _stored.latest(_row) != _fact:
+                _post_or_unsourced(
+                    _book, CALLSITE_RETURN_SPECIALIZATION_PAGE, _row, _fact,
+                    PLANNER_TENSOR_SPECIALIZATION,
+                    tuple(dict.fromkeys(
+                        cell for cells in output_cells for cell in cells
+                    )),
+                    SPECIALIZATION_ROUND_CAUSE_NOT_ON_BOOK,
+                )
             return_cells_by_call[(id(caller.G), int(node_id))] = tuple(
                 output_cells
             )
@@ -16514,19 +16532,52 @@ def _propagate_callsite_tensor_specializations(
                                 role="return",
                             )
 
-                            mutation_page = current_identity_book().page(
-                                "callsite_tensor_result_specialization"
+                            from ..common.tensors.topological_reducer import (
+                                node_identity_cell as _result_node_cell,
                             )
+                            from .concordance_declarations import (
+                                CALLSITE_TENSOR_RESULT_SPECIALIZATION,
+                                PLANNER_TENSOR_SPECIALIZATION,
+                                SPECIALIZATION_ROUND_CAUSE_NOT_ON_BOOK,
+                            )
+                            from .identity_concordance import (
+                                _post_or_unsourced,
+                            )
+
                             mutation_row = (
                                 shape_scope_of(caller), int(_node_id),
                             )
-                            mutation_page.set(
+                            # The replaced descriptor is the callee's exact
+                            # return: DERIVED from the callee's return cells
+                            # and the call node's own cell.
+                            result_cells = [
+                                cell for cells in return_cells_by_call.get(
+                                    (id(caller.G), int(_node_id)), (),
+                                ) for cell in (
+                                    cells if isinstance(cells, tuple)
+                                    else (cells,)
+                                )
+                            ]
+                            try:
+                                result_cells.append(
+                                    _result_node_cell(caller, int(_node_id))
+                                )
+                            except ValueError:
+                                pass
+                            _post_or_unsourced(
+                                current_identity_book(),
+                                CALLSITE_TENSOR_RESULT_SPECIALIZATION,
                                 mutation_row,
-                                len(mutation_page.history(mutation_row)),
                                 (
                                     _callsite_descriptor_receipt(previous),
                                     _callsite_descriptor_receipt(replacement),
                                 ),
+                                PLANNER_TENSOR_SPECIALIZATION,
+                                tuple(dict.fromkeys(
+                                    cell for cell in result_cells
+                                    if cell is not None
+                                )),
+                                SPECIALIZATION_ROUND_CAUSE_NOT_ON_BOOK,
                             )
                             # Invalidation above withdrew every descriptor
                             # derived from the old call result.  Re-evaluate
@@ -16717,8 +16768,35 @@ def _propagate_callsite_tensor_specializations(
                     )
                     incumbent = settlement_page.latest(settlement_row)
                     if incumbent is None:
-                        settlement_page.concord(
-                            settlement_row, settlement_fact,
+                        # DERIVED from the settled value's identity cell.
+                        from ..common.tensors.topological_reducer import (
+                            node_identity_cell as _settled_node_cell,
+                        )
+                        from .concordance_declarations import (
+                            PLANNER_TENSOR_SPECIALIZATION as _SETTLE_STAGE,
+                            SYNTHESIZED_NO_SOURCE as _SETTLE_NO_SOURCE,
+                            TENSOR_SHAPE_SETTLEMENT,
+                        )
+                        from .identity_concordance import (
+                            Derived as _SettleDerived, Mode as _SettleMode,
+                            Unsourced as _SettleUnsourced,
+                        )
+
+                        try:
+                            settled_cell = _settled_node_cell(
+                                caller, int(value_id),
+                            )
+                        except ValueError:
+                            settled_cell = None
+                        current_identity_book().post(
+                            TENSOR_SHAPE_SETTLEMENT, settlement_row,
+                            settlement_fact, stage=_SETTLE_STAGE,
+                            provenance=(
+                                _SettleDerived((settled_cell,))
+                                if settled_cell is not None
+                                else _SettleUnsourced(_SETTLE_NO_SOURCE)
+                            ),
+                            mode=_SettleMode.CONCORD,
                         )
                         changed = True
                         mutation_counts["settled_graph_shapes"] += 1

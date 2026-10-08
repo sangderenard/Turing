@@ -2973,3 +2973,33 @@ AGGREGATE_LEDGER = declare_page("aggregate_ledger", (
 AGGREGATE_LEDGER_CAUSE_NOT_ON_BOOK = declare_reason(
     "aggregate_ledger_cause_not_on_book"
 )
+
+#: ``_callsite_specialized_shell_type.record_and_return``: the return shape a
+#: callsite specialization published in one round, ``(caller, callee, call)``
+#: -> ``(shape, dtype)`` per output, REVISE (one column per round, so
+#: ``oscillating_rows`` names a shape that is left and returned to), DERIVED(the
+#: callee's return cells).
+CALLSITE_RETURN_SPECIALIZATION_PAGE = declare_page("callsite_return_specialization", (
+    RowField("caller", K.SCOPE), RowField("callee", K.NAME),
+    RowField("call", K.VALUE_ID),
+), tuple)
+#: A specialization round whose published shape changed over the same return
+#: cells (the cause is the settled argument descriptors, which are not cells).
+SPECIALIZATION_ROUND_CAUSE_NOT_ON_BOOK = declare_reason(
+    "specialization_round_cause_not_on_book"
+)
+
+#: ``_propagate_callsite_tensor_specializations``: a call result descriptor
+#: replaced by the callee's exact specialized return, ``(caller, call)`` ->
+#: ``(previous receipt, replacement receipt)``, REVISE, DERIVED(the callee's
+#: return cells, the call node's identity cell).
+CALLSITE_TENSOR_RESULT_SPECIALIZATION = declare_page(
+    "callsite_tensor_result_specialization", (
+        RowField("caller", K.SCOPE), RowField("call", K.VALUE_ID),
+    ), tuple,
+)
+#: The settlement pass's first receipt for a re-proved value, ``(function,
+#: value)`` -> ``(extents, dtype)``, CONCORD, DERIVED(the value's identity cell).
+TENSOR_SHAPE_SETTLEMENT = declare_page("tensor_shape_settlement_concordance", (
+    RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
