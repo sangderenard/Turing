@@ -294,7 +294,27 @@ def plan_region_to_ssa_instrs(
         claim = (str(item.opcode).casefold(), "bool")
         incumbent = predicate_type_page.latest(row)
         if incumbent is None:
-            predicate_type_page.set(row, 0, claim)
+            from .concordance_declarations import (
+                CANONICAL_VALUE, OPERATOR_RESULT_TYPE, PLANNER_HIERARCHY,
+                SYNTHESIZED_NO_SOURCE,
+            )
+            from .identity_concordance import Derived, Mode, Unsourced
+
+            output_cell = (
+                None if lexical_read_scope is None else
+                current_identity_book().latest_ref(
+                    CANONICAL_VALUE,
+                    (tuple(lexical_read_scope), int(item.outputs[0])),
+                )
+            )
+            current_identity_book().post(
+                OPERATOR_RESULT_TYPE, row, claim, stage=PLANNER_HIERARCHY,
+                provenance=(
+                    Derived((output_cell,)) if output_cell is not None
+                    else Unsourced(SYNTHESIZED_NO_SOURCE)
+                ),
+                mode=Mode.CONCORD,
+            )
         elif incumbent != claim:
             raise ValueError(
                 "operator result-type concordance disagreement: "

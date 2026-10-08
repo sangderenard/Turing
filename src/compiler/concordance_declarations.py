@@ -2935,3 +2935,19 @@ SOURCE_NUMERIC_SPECIALIZATION = declare_transform(
 SOURCE_PYTHON_IDENTITY = declare_page("source_python_identity_concordance", (
     RowField("numeric_scope", K.SCOPE), RowField("node", K.VALUE_ID),
 ), tuple)
+
+# -- operation-owned result domains and scalar kernel operands ---------------
+#: ``plan_region_to_ssa_instrs``: the truth type a predicate operation owns,
+#: ``(function scope, closure, region name, output value)`` -> ``(opcode,
+#: "bool")``, CONCORD, DERIVED(the output's ``canonical_value`` cell).
+OPERATOR_RESULT_TYPE = declare_page("operator_result_type_concordance", (
+    RowField("function_scope", K.SCOPE), RowField("closure", K.INDEX),
+    RowField("region", K.NAME), RowField("output", K.VALUE_ID),
+), tuple)
+#: ``lower_tensor_calls_to_repository_ssa``: an exact scalar operand that
+#: crosses by value into a scalar kernel, ``(function, result id)`` ->
+#: ``("scalar_operand", position)``, CONCORD, DERIVED(the result's and the
+#: scalar operand's ``ssa_value`` cells).
+SCALAR_KERNEL_OPERAND = declare_page("scalar_kernel_operand_concordance", (
+    RowField("function", K.SCOPE), RowField("result", K.VALUE_ID),
+), tuple)

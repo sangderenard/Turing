@@ -385,6 +385,38 @@ def _settle_operand_shapes(function: Any, values: Any) -> None:
             value.shape = settled
 
 
+def _post_scalar_kernel_operand(
+    module: IRModule, function: Any, row: tuple, fact: tuple, values: Any,
+) -> None:
+    """``scalar_kernel_operand_concordance`` CONCORD, DERIVED(the
+    ``ssa_value`` cells of the result and the scalar operand);
+    ``Unsourced`` when neither has a cell."""
+
+    from .concordance_declarations import (
+        SCALAR_KERNEL_OPERAND, SSA_CALL_EDGE_CELL_NOT_ON_BOOK,
+        TENSOR_SSA_LOWERING,
+    )
+    from .identity_concordance import Derived, Mode, Unsourced
+    from .ssa_record_return_state import ssa_value_identity_cell
+
+    book = identity_book(module)
+    cells = tuple(dict.fromkeys(
+        cell for cell in (
+            ssa_value_identity_cell(function, int(value.id), book=book)
+            for value in values
+        )
+        if cell is not None
+    ))
+    book.post(
+        SCALAR_KERNEL_OPERAND, row, fact, stage=TENSOR_SSA_LOWERING,
+        provenance=(
+            Derived(cells) if cells
+            else Unsourced(SSA_CALL_EDGE_CELL_NOT_ON_BOOK)
+        ),
+        mode=Mode.CONCORD,
+    )
+
+
 def _post_call_edge_fact(
     module: IRModule, page: Any, row: tuple, fact: Any, cells: Any,
 ) -> None:
@@ -5646,13 +5678,13 @@ def lower_tensor_calls_to_repository_ssa(
                                         if not tuple(operand.shape or ())
                                         and not shape_unknown(operand)
                                     )
-                                    identity_book(module).page(
-                                        "scalar_kernel_operand_concordance"
-                                    ).concord(
+                                    scalar = data_args[scalar_position]
+                                    _post_scalar_kernel_operand(
+                                        module, function,
                                         (str(function_name), int(result.id)),
                                         ("scalar_operand", int(scalar_position)),
+                                        (result, scalar),
                                     )
-                                    scalar = data_args[scalar_position]
                                     array = data_args[1 - scalar_position]
                                     if str(scalar.dtype or "").casefold() not in {
                                         "double", "float64",
