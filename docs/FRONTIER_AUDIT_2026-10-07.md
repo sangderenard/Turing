@@ -282,8 +282,8 @@ uncommitted work in the deleted worktrees is lost; committed lane branches survi
   spilled. `compile: end` and the finished native build spill what is left, so
   `module.metadata["identity_book"]` is kept with its cold pages out. Python returns freed
   objects to its allocator, not the OS: on a synthetic 450k-cell book, spilling 2/3 of the
-  cells dropped the working set 17%, but the next 450k cells then cost 305 MiB instead of
-  813 MiB (holes reused). **Risk list for the first compile:** a function the static
+  cells dropped the working set 17% (812 -> 671 MiB), but a second 450k cells then ended at
+  1116 MiB instead of 1625 MiB (31% lower; the holes are reused). **Risk list for the first compile:** a function the static
   classification put in the wrong stage (costs reloads, not answers); a table reference
   held across a boundary that `getrefcount` cannot see (a C-level iterator); the compile-tail
   unsourced detector and the log read every edge partition back (the peak at the tail equals
