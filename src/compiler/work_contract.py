@@ -199,8 +199,24 @@ class WorkContract:
     # (callee, signature) per round (``signature``) or once per callsite
     # (``callsite``).  See ``_HONORED_CALLSITE_DESCRIPTOR_REUSE``.
     callsite_descriptor_reuse: str = "signature"
+    # Resident-set budget for one compile, in bytes; ``None`` = unregulated.
+    # At every stage boundary ``memory_regulation`` reads the process resident
+    # set and, above the budget, releases RECOMPUTABLE items in declared order
+    # (each a ``memory_release_receipt`` row on the book) until it is under
+    # it.  Nothing is killed or refused, and the compile's output does not
+    # depend on it: a release only drops what a later read recomputes.
+    memory_budget_bytes: int | None = None
 
     def __post_init__(self) -> None:
+        if self.memory_budget_bytes is not None and not (
+            isinstance(self.memory_budget_bytes, int)
+            and not isinstance(self.memory_budget_bytes, bool)
+            and self.memory_budget_bytes > 0
+        ):
+            raise ValueError(
+                "memory_budget_bytes must be a positive int or None, got "
+                f"{self.memory_budget_bytes!r}"
+            )
         if self.callsite_descriptor_reuse not in _HONORED_CALLSITE_DESCRIPTOR_REUSE:
             raise ValueError(
                 f"callsite_descriptor_reuse={self.callsite_descriptor_reuse!r} "
@@ -327,6 +343,14 @@ def active_contract() -> WorkContract:
     if contract is None:
         named = os.environ.get("TURING_WORK_CONTRACT")
         contract = _named(named) if named else PRESETS["develop"]
+
+    # The budget is a regulation of THIS process, not a fidelity choice: it
+    # does not rename the contract (the name keys caches of its products).
+    budget = os.environ.get("TURING_MEMORY_BUDGET_BYTES")
+    if budget:
+        contract = dataclasses.replace(
+            contract, memory_budget_bytes=int(budget),
+        )
 
     inexact = _flag("TURING_POW_INEXACT")
     fma = _flag("TURING_FMA_CONTRACT")

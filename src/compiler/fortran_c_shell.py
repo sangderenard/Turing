@@ -40982,6 +40982,9 @@ def _lower_resolved_process_graph_deployment(
     deployment.prepare_complete_catalogue = whole_source
     report("ssa-source: validating resolved ProcessGraph call topology")
     deployment.compile_process_graph(prepare_ephemerals=False)
+    from .memory_regulation import stage_boundary
+
+    stage_boundary("ssa-source: call topology validated")
     if subdivision_request is not None:
         from .glsl_deployment_strategy import (
             _structural_region_program_from_subgraph,
@@ -41114,6 +41117,7 @@ def _lower_resolved_process_graph_deployment(
         progress=report,
         structural_ssa_only=True,
     )
+    stage_boundary("ssa-source: control/operator graph planned")
     compilation = SimpleNamespace(
         deployment=deployment,
         class_navigation=build_class_navigation_table(graph),
@@ -41128,6 +41132,7 @@ def _lower_resolved_process_graph_deployment(
         tensor_ssa_reference=tensor_ssa_reference,
         progress=progress,
     )
+    stage_boundary("ssa-source: repository SSA lowered")
     if linked_source_region_ssa:
         from .precompile_to_ssa import link_verified_source_region_integrals
 
@@ -43092,6 +43097,9 @@ def _lower_ast_source_to_ssa_impl(
             })
             if selected_values:
                 function_graph.graph["parameter_value_abi"] = selected_values
+    from .memory_regulation import stage_boundary, stage_end
+
+    stage_boundary("ssa-source: topology reduced, program ABI reattached")
     if linked_process_graphs:
         # Reduction may rewrite call nodes and dependency graphs. Reapply the
         # idempotent function-table link before planning so the direct SSA path
@@ -43147,6 +43155,11 @@ def _lower_ast_source_to_ssa_impl(
         assignment_normalization=assignment_receipts,
         progress=progress,
     )
+    # The deployment (every planned shell, its callsite copies and dispatch
+    # subgraphs) was local to that call and is unreachable now; its shell
+    # classes and closures are reference cycles, so say so to the collector
+    # here rather than leaving them to the repository-SSA tail below.
+    stage_end("ssa-source: deployment released")
     if numeric_specialization_receipts:
         module.metadata["numeric_source_specializations"] = tuple(
             dict(receipt) for receipt in numeric_specialization_receipts
@@ -43956,7 +43969,12 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             f"[compiler] {message}", file=sys.stderr, flush=True,
         )
 
-    _, _token = begin_identity_book(resumed_book)
+    _book, _token = begin_identity_book(resumed_book)
+    from .memory_regulation import begin_regulation, end_regulation
+
+    _regulator, _regulation_token, _releases_book_state = begin_regulation(
+        _book, owned_book=resumed_book is None,
+    )
     ok = False
     try:
         result = _lower_ast_source_to_ssa_impl(*args, **kwargs)
@@ -44032,6 +44050,10 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
         _dump_identity_book_log(
             book, name=kwargs.get("name"), entrypoint=entrypoint, ok=ok,
             level=identity_log_level, extra_lines=_log_summary,
+        )
+        end_regulation(
+            _regulator, _regulation_token,
+            releases_book_state=_releases_book_state,
         )
 
 

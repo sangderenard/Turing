@@ -587,6 +587,30 @@ POLICY_DECLARATION = declare_transform("policy_declaration", 0)
 COMPILE_POLICY = declare_page("compile_policy", (
     RowField("policy", K.NAME),
 ), str)
+#: ``memory_regulation.MemoryRegulator``: a stage boundary found the
+#: process resident set above the work contract's ``memory_budget_bytes`` and
+#: released one recomputable item to bring it down.  One row per release,
+#: keyed (the stage boundary's label, the compile's release ordinal); the
+#: fact states the item, the resident set before and after, the budget and
+#: how many entries the item let go.  DERIVED from the ``compile_policy``
+#: ``memory_budget_bytes`` cell, which is declared when the first release
+#: reads it -- so a compile that never exceeds its budget posts nothing and
+#: its book is the unregulated compile's book.
+MEMORY_REGULATION = declare_stage("memory_regulation")
+
+
+@dataclass(frozen=True)
+class MemoryRelease:
+    item: str
+    rss_before_bytes: int
+    rss_after_bytes: int
+    budget_bytes: int
+    released: int
+
+
+MEMORY_RELEASE_RECEIPT = declare_page("memory_release_receipt", (
+    RowField("compile_stage", K.NAME), RowField("ordinal", K.INDEX),
+), MemoryRelease)
 #: ``_propagate_callsite_tensor_specializations``: per callsite per
 #: fixed-point round, whether the callee return descriptors were derived on
 #: this callsite's own callee copy -- ``("computed", signature digest)``,
