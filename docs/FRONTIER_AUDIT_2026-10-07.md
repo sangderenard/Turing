@@ -65,10 +65,29 @@ Run today on `main` e5a52f50 (459 functions): **10 violations, NOT clean.**
   `if_merge.2` (1), `exchange_time_bound` `if_merge` (1). Each names an initial the
   function does not define — a use waiting for a repair that cannot be made.
 
-So loose end 3 is open: these 10 must be fixed at their writers (which pass leaves the
-stale initial / places the Load's definition on one arm) and the probe must report 0
-before N=4. The 69-column parity stands, but it is parity on a module with 10 latent
-undefined reads.
+**CLOSED 2026-10-08** (commits 36849e6a, aa78fa7a on `main`): the probe now reports
+458 functions, 0 violations; `native_round.py 2` still `PARITY 69 column(s) bit-exact`;
+clang 20.1.7 `-Wuninitialized -Wsometimes-uninitialized` on the emitted C: 0 warnings
+(sanity-checked against a deliberately uninitialized file).
+- Fix A (the LNot): `recover_structural_source_outputs` rebuilds each anonymous
+  control-predicate formal as a chain before `Ret`; the arm's own `control_expression`
+  already computes it, so the chain is dead, but the dead-pure sweep's vocabulary
+  (`ir_identities._PURE_REGION_OPS`) lacked `LNot`/`Select`/`isfinite`, so the tail
+  survived in `function_exit` reading an arm-local Load. Vocabulary widened; each
+  retirement is now a `dead_structural_retirement` row derived from the value's
+  `ssa_value` cell. Repro `probe_dead_structural_dominance.py`.
+- Fix B (the 9 Phis): `initial_value_id` was the PLANNER's spelling of the pre-merge
+  version, not the SSA id the lowering holds (they differ for planning aliases, minted
+  literals and builder stand-ins); only record-field Phis carried the SSA id. Every
+  carried-Phi emission now routes through `_phi_initial_binding`, which posts a
+  `phi_initial_binding` row (spelled id, resident id) derived from both `ssa_value`
+  cells and reads `initial_value_id` back from it; alias settlement rebinds the initial
+  through the same `alias_application_concordance` row. Repro `probe_phi_initial_resident.py`
+  (hand-built IR, the audit's oscillator/mapping lowerings, and a specialized re-lowering).
+- Found in passing, untouched: the audit's `toplevel`/`controller`/`controller_untyped`
+  lowerings still report `undefined_operand` in `Phi`/`restore_type` functions; a retry
+  loop with a `break` hits a `break-edge-value ... does not dominate the exit edge`
+  emission error.
 
 ## 3. Lanes: landed / in progress / never started
 
