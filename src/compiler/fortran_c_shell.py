@@ -15783,7 +15783,7 @@ def _class_surface_ssa_program(
             ("<sequence-schema-survey>", item)
             for item in sequence_schema_shortfalls
         )
-    for shell in planned_shells:
+    for shell_index, shell in enumerate(planned_shells, 1):
         graph = getattr(shell, "process_graph", None)
         graph_obj = graph.G if graph is not None else None
         function_name = (
