@@ -2850,6 +2850,30 @@ class ConcordanceRefusal(ValueError):
     """
 
 
+class ProjectedScopeRead(LookupError):
+    """A row of a node the reading scope's declared projection does not hold.
+
+    ``fork_read_scope`` of a proper induced subgraph carries the rows of the
+    copy's own nodes (``ScopeProjection``).  A read, under that forked scope,
+    of a node-keyed row of a node the SOURCE graph has and the copy does not
+    would otherwise miss like any absent row; it is refused instead, naming
+    the scope, page and row, after an ``Unresolved(ROW_PROJECTED_OUT_OF_SCOPE)``
+    row is posted at the key (derived from the scope's ``scope_origin`` cell,
+    which carries the projection)."""
+
+
+@dataclass(frozen=True)
+class LiveScopeProjection:
+    """The read-time form of a forked scope's declared ``ScopeProjection``:
+    which pages are node-keyed and which source-graph nodes the scope does not
+    hold.  Registered on the book (``IdentityBook.scope_projections``) by the
+    writer that posts the projection, so the book can refuse a read of a node
+    the relation says the scope does not hold."""
+
+    pages: frozenset
+    excluded: frozenset
+
+
 class Mode(Enum):
     CONCORD = "concord"
     REVISE = "revise"
@@ -3326,6 +3350,28 @@ class IdentityPage:
         self.set(row, entries[-1][0] + 1 if entries else 0, fact)
         return fact
 
+    def _missed(self, row: Any) -> None:
+        """A read found no cell for ``row``.  Under a scope whose declared
+        projection excludes the row's node, that is not an absent row but a
+        read of a row the scope does not hold: post the ``Unresolved`` receipt
+        and refuse (``ProjectedScopeRead``).  Every other miss is a plain
+        miss."""
+
+        book = self.book
+        if book is None:
+            return
+        projections = book.__dict__.get("scope_projections")
+        if not projections or type(row) is not tuple or len(row) < 2:
+            return
+        projection = projections.get(row[0])
+        if (
+            projection is None
+            or self.name not in projection.pages
+            or row[1] not in projection.excluded
+        ):
+            return
+        book._refuse_projected_read(self, row)
+
     def latest(self, row: Any, default: Any = None) -> Any:
         """Return the most recently recorded fact for ``row``.
 
@@ -3339,6 +3385,7 @@ class IdentityPage:
             self._reindex()
         columns = self.row_columns.get(row)
         if not columns:
+            self._missed(row)
             return default
         return self.cells[(row, columns[-1])]
 
@@ -3348,7 +3395,10 @@ class IdentityPage:
         if len(self.column_positions) != len(self.columns):
             self._reindex()
         columns = self.row_columns.get(row)
-        return columns[-1] if columns else None
+        if not columns:
+            self._missed(row)
+            return None
+        return columns[-1]
 
     def concord(self, row: Any, fact: Any) -> Any:
         """Commit ``fact`` for ``row`` and return the committed fact.
@@ -3559,6 +3609,12 @@ class IdentityBook:
         #: When a pass sets this, raw writes made while it is set are tagged
         #: with that stage instead of ``RAW_STAGE``.
         self.active_stage: Stage | None = None
+        #: Forked read scopes that hold a projection of their source's rows
+        #: (``fork_read_scope`` of a proper induced subgraph), scope ->
+        #: ``LiveScopeProjection``.  Consulted only when a read MISSES, so a
+        #: scope without one costs nothing.
+        self.scope_projections: dict[Any, LiveScopeProjection] = {}
+        self._reporting_projected_read = False
 
     def page(self, name: Any) -> IdentityPage:
         """The page named ``name`` (a str or a declared ``Page``), created
@@ -3792,6 +3848,51 @@ class IdentityBook:
     def _ref_from_key(self, key: tuple) -> Ref:
         page_name, row, column = key
         return Ref(self.registry.page(page_name), row, column)
+
+    def register_scope_projection(
+        self, scope: Any, pages: Iterable[str], excluded: Iterable[Any],
+    ) -> None:
+        """Hold the read-time form of ``scope``'s declared projection: reads
+        of ``pages`` rows keyed by a node in ``excluded`` are refused."""
+
+        self.scope_projections[scope] = LiveScopeProjection(
+            frozenset(pages), frozenset(excluded),
+        )
+
+    def _refuse_projected_read(self, page: IdentityPage, row: tuple) -> None:
+        """Post ``Unresolved(ROW_PROJECTED_OUT_OF_SCOPE)`` at ``row`` (DERIVED
+        from the scope's ``scope_origin`` cell, which carries the projection)
+        and raise ``ProjectedScopeRead``."""
+
+        from .concordance_declarations import (
+            READ_SCOPE_FORK, ROW_PROJECTED_OUT_OF_SCOPE, SCOPE_ORIGIN,
+        )
+
+        if getattr(self, "_reporting_projected_read", False):
+            return
+        self._reporting_projected_read = True
+        receipt = "an Unresolved row is posted there"
+        try:
+            declared = self.registry.pages.get(page.name)
+            origin = self.latest_ref(SCOPE_ORIGIN, (row[0],))
+            if declared is not None and origin is not None:
+                self.post(
+                    declared, row, Unresolved(ROW_PROJECTED_OUT_OF_SCOPE),
+                    stage=READ_SCOPE_FORK, provenance=Derived((origin,)),
+                    mode=Mode.CONCORD,
+                )
+            else:
+                receipt = "no Unresolved row could be posted (undeclared page or no scope_origin)"
+        except ConcordanceRefusal as refusal:
+            receipt = f"the Unresolved row was refused: {refusal}"
+        finally:
+            self._reporting_projected_read = False
+        raise ProjectedScopeRead(
+            f"{page.name} row {row!r}: node {row[1]!r} is not held by read "
+            f"scope {row[0]!r} (its scope_origin row declares a projection "
+            f"onto the copy's own nodes); {receipt} "
+            f"({ROW_PROJECTED_OUT_OF_SCOPE.name})"
+        )
 
     def latest_ref(self, page: Page, row: tuple) -> Ref | None:
         """The Ref of ``row``'s most recent cell on ``page``, or None."""

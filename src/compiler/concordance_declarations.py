@@ -646,7 +646,26 @@ CONTROL_FUNCTION_ROOT = declare_transform("control_function_root", 0)
 #: ``fork_read_scope``: the forked scope's ``SCOPE_ORIGIN`` row.
 FORK_READ_SCOPE = declare_transform("fork_read_scope", 1)
 
+#: Pages of a read scope whose rows are keyed by a node at ``row[1]`` (the
+#: consumer of an operand position, or the node's own value id).  A forked
+#: scope of a proper induced subgraph carries these pages' rows for its own
+#: nodes only (``ScopeProjection``).  Every page not named here is not keyed
+#: by node (``name_binding`` by name, ``return_site_*`` by return-site cell,
+#: ``reducer_field_state`` by receiver, ...) and is carried whole.
+READ_SCOPE_NODE_KEYED_PAGES = (
+    "identity_transition",
+    "lexical_read_binding",
+    "consumer_operand",
+    "loop_continuation_rewire_concordance",
+    "canonical_value",
+    "ingestion_value",
+)
+
 # -- reasons -----------------------------------------------------------------
+#: A read, under a forked read scope, of a row keyed by a node the scope's
+#: declared projection does not hold (``ScopeProjection``): the
+#: ``Unresolved`` row posted where the read was made.
+ROW_PROJECTED_OUT_OF_SCOPE = declare_reason("row_projected_out_of_scope")
 NO_PRODUCER_AT_USE = declare_reason("no_producer_at_use")
 NAME_ARM_VERSION_MISSING = declare_reason("name_arm_version_missing")
 WHILE_TEST_NO_READ_EXPRESSION = declare_reason("while_test_no_read_expression")
@@ -762,9 +781,39 @@ class OperandAppend(OperandTransition):
 
 
 @dataclass(frozen=True)
+class ScopeProjection:
+    """What a forked read scope holds of its source's rows, as a relation.
+
+    ``fork_read_scope`` of a proper induced subgraph (a planned dispatch
+    region) carries, on the pages in ``pages`` (keyed by node: ``row[1]`` is
+    the consumer / value id), only the rows of the copy's own nodes; every
+    other page is carried whole.  The scope therefore holds "the rows of
+    these nodes of the source scope", and the nodes are named by
+    ``node_count`` and ``node_digest`` (sha1 of the sorted ids).
+
+    The rows not carried are counted, by why they were not: ``rows_excluded``
+    are rows of nodes the SOURCE graph has and the copy does not (a read of
+    one under the forked scope is refused loudly: see
+    ``IdentityBook.scope_projections``); ``rows_stale`` are rows of ids that
+    were nodes of neither graph (retired before the copy was cut).
+    """
+
+    pages: tuple
+    node_count: int
+    node_digest: str
+    source_node_count: int
+    rows_carried: int
+    rows_excluded: int
+    rows_stale: int
+
+
+@dataclass(frozen=True)
 class ScopeFork:
     source_scope: Any
     cause: Any
+    #: The declared projection of the source's rows this scope holds, or
+    #: ``None`` for a fork that carried every row (a whole-graph copy).
+    projection: Any = None
 
 
 # -- pages: new (plan 80, B1.1) ------------------------------------------------

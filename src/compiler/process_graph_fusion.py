@@ -250,7 +250,12 @@ def extract_clean_process_subgraph(
     extracted.G.graph.update(shared_metadata)
     # The copy owns its read facts from here on; its operand rewrites are
     # recorded in its own scope, never in its source's.
-    fork_read_scope(extracted, "extract_clean_process_subgraph")
+    fork_read_scope(
+        extracted, "extract_clean_process_subgraph",
+        source_graph=(
+            graph if included and len(included) < len(graph.G) else None
+        ),
+    )
     for node_id in extracted.G:
         data = extracted.G.nodes[node_id]
         for key, value in tuple(data.items()):
