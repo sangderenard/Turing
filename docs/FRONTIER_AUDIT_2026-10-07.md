@@ -255,6 +255,17 @@ uncommitted work in the deleted worktrees is lost; committed lane branches survi
   (function-subgraph forks) is still eager and forces materialisation — the next memory
   target; closed-latch raw copies refuse at first write, not fork time; `scope_rows(fork)`
   walks the origin on every call (CPU).
+  **Function-subgraph forks copy-on-read too** (8156b6e5; 13 more unit tests, 35 total):
+  `fork_operand_position_scope` shares `_post_copy_on_read_fork` with `fork_read_scope`,
+  posts only its `scope_origin` with a projection onto the included nodes, copies no rows;
+  only boundary nodes' rows materialise (the filter's retire touches exactly three rows per
+  dropped position); the relabel tail still cites every member `identity_transition` row,
+  so that page gets no saving. Risk additions: materialised rows are stage-labelled
+  `read_scope_fork` not `function_subgraph`; read-through covers every page, wider than the
+  three the eager copy carried (`ingestion_value` for synthesised members now resolves to a
+  correctly sourced fork-virtual cell instead of an unsourced row — compile output could
+  shift); a read of a non-included source node under a `...|operands` scope now raises
+  `ProjectedScopeRead` where it returned None.
   First compile after this: `profile_memory_n2.py 2 --trace`, then with a small
   `--budget-bytes` comparing the emitted-C sha256, then the N=2 parity and solve gates —
   on the user's say-so. Watch for `ConcordanceRefusal` "source cell does not exist",
