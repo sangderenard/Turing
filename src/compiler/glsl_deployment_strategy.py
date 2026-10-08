@@ -17531,6 +17531,44 @@ def _stable_signature_value(value: Any) -> object:
 _POLYMORPHIC_FORMAL_SCANS: dict[int, tuple[Any, dict[str, tuple[int, bool]]]] = {}
 
 
+def release_polymorphic_formal_scans() -> int:
+    """Drop every memoized polymorphic-formal scan; return how many pages'
+    memos there were.  Each answer is a function of the page's content
+    (``_owner_has_polymorphic_formal`` rescans on a miss), so this releases
+    recomputable memory."""
+
+    released = sum(len(entry[1]) for entry in _POLYMORPHIC_FORMAL_SCANS.values())
+    _POLYMORPHIC_FORMAL_SCANS.clear()
+    return released
+
+
+def release_compile_planning_state(book: Any) -> dict[str, int]:
+    """End of a compile that OWNS ``book``: let go of the planning state
+    keyed to it, which no later read can reach.
+
+    ``_CALLSITE_SHELL_TYPE_CACHE`` keys every planned shell by the identity
+    of the compile's book (a later compile has another book and must plan
+    again: plan 80, R3), and ``_child_signature_results`` holds the book
+    itself and the answers computed on it.  Both are process-global, so
+    without this each finished compile left its callsite copies, their
+    dispatch subgraphs and the planning book's answers reachable for the
+    rest of the process.  Returns what was released, by item."""
+
+    book_id = id(book)
+    shells = [key for key in _CALLSITE_SHELL_TYPE_CACHE if key[1] == book_id]
+    for key in shells:
+        del _CALLSITE_SHELL_TYPE_CACHE[key]
+    children = 0
+    held = _CHILD_SIGNATURE_RESULTS.get(book_id)
+    if held is not None and held[0] is book:
+        children = len(held[1])
+        del _CHILD_SIGNATURE_RESULTS[book_id]
+    return {
+        "callsite_shell_types": len(shells),
+        "child_signature_results": children,
+    }
+
+
 def _owner_has_polymorphic_formal(formal_page: Any, authored_owner: str) -> bool:
     """Whether any ``formal_shape`` row of ``authored_owner`` is
     ``Unresolved(FORMAL_SHAPE_CONFLICT)`` -- two call edges disagreed on a
@@ -17555,7 +17593,12 @@ def _owner_has_polymorphic_formal(formal_page: Any, authored_owner: str) -> bool
     key = id(formal_page)
     entry = _POLYMORPHIC_FORMAL_SCANS.get(key)
     if entry is None or entry[0]() is not formal_page:
-        entry = (weakref.ref(formal_page), {})
+        def forget(reference: Any, key: int = key) -> None:
+            held = _POLYMORPHIC_FORMAL_SCANS.get(key)
+            if held is not None and held[0] is reference:
+                del _POLYMORPHIC_FORMAL_SCANS[key]
+
+        entry = (weakref.ref(formal_page, forget), {})
         _POLYMORPHIC_FORMAL_SCANS[key] = entry
     version = len(formal_page.cells)
     held = entry[1].get(authored_owner)

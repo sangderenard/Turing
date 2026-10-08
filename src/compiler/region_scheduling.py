@@ -217,7 +217,21 @@ def _control_dependency_value_ids(control: Any) -> frozenset[int]:
 #: and freed every specialization round, so a freed graph's id is recycled by
 #: a new graph with (by chance) the same node count and the stale levels were
 #: returned for it.  The weak reference is checked on every hit.
+#: The entry is dropped when that graph dies (the weak reference's callback),
+#: so the cache holds levels for LIVE graphs only: it used to keep one dict
+#: per callsite copy ever made, for the life of the process.
 _DEPENDENCY_LEVEL_CACHE: dict[int, tuple[int, dict[int, int], Any]] = {}
+
+
+def release_dependency_levels() -> int:
+    """Drop every cached level table; return how many there were.
+
+    The levels are a pure function of the graph (``_dependency_levels``
+    recomputes the same table), so this releases recomputable memory."""
+
+    released = len(_DEPENDENCY_LEVEL_CACHE)
+    _DEPENDENCY_LEVEL_CACHE.clear()
+    return released
 
 
 def _dependency_levels(graph: Any) -> dict[int, int]:
@@ -257,7 +271,12 @@ def _dependency_levels(graph: Any) -> dict[int, int]:
                 levels[int(member)] = depth
     except Exception:
         levels = {}
+    def forget(reference: Any, key: int = key) -> None:
+        held = _DEPENDENCY_LEVEL_CACHE.get(key)
+        if held is not None and held[2] is reference:
+            del _DEPENDENCY_LEVEL_CACHE[key]
+
     _DEPENDENCY_LEVEL_CACHE[key] = (
-        graph.G.number_of_nodes(), levels, weakref.ref(graph.G),
+        graph.G.number_of_nodes(), levels, weakref.ref(graph.G, forget),
     )
     return levels
