@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
 import audit_identity_concordance as audit  # noqa: E402
-from src.compiler import glsl_deployment_strategy as strategy  # noqa: E402
+from src.compiler import tensor_descriptor_query as descriptor_query  # noqa: E402
 from src.compiler.identity_concordance import (  # noqa: E402
     authored_function_name, current_identity_book,
 )
@@ -29,13 +29,13 @@ from src.compiler.identity_concordance import (  # noqa: E402
 
 @pytest.mark.parametrize("case", list(audit.CASES))
 def test_query_scoped_answers_equal_fresh_recompute(case, monkeypatch):
-    rule = strategy._tensor_descriptor_rule
+    rule = descriptor_query._tensor_descriptor_rule
     compared = {"roots": 0, "scoped_rows": 0}
     mismatches: list[tuple] = []
 
     def checked(graph, node_id, _seen=None):
         answer = rule(graph, node_id, _seen)
-        if isinstance(_seen, strategy._DescriptorQuery) and not _seen:
+        if isinstance(_seen, descriptor_query._DescriptorQuery) and not _seen:
             compared["roots"] += 1
             fresh = rule(graph, node_id, set())
             if answer != fresh:
@@ -56,7 +56,7 @@ def test_query_scoped_answers_equal_fresh_recompute(case, monkeypatch):
             compared["scoped_rows"] += len(scanned)
         return answer
 
-    monkeypatch.setattr(strategy, "_tensor_descriptor_rule", checked)
+    monkeypatch.setattr(descriptor_query, "_tensor_descriptor_rule", checked)
     audit.CASES[case]()
     assert not mismatches, mismatches[:3]
     print(f"{case}: roots compared={compared['roots']} "
