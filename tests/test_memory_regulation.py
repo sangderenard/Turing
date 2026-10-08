@@ -242,3 +242,40 @@ def test_a_compile_resuming_a_callers_book_keeps_that_books_planning_state():
     )
     assert releases is False
     regulation.end_regulation(regulator, token, releases_book_state=releases)
+
+
+def test_released_dispatch_region_copies_are_gone_and_reads_fail_loudly():
+    from src.compiler.glsl_deployment_strategy import (
+        ReleasedDispatchRegions, release_dispatch_region_copies,
+    )
+
+    class Shell:
+        dispatch_subgraphs = ("r0", "r1", "r2")
+        deep_compilers = ("c0",)
+        ephemeral_callables = ()
+        process_graph = "kept"
+
+    class Other(Shell):
+        pass
+
+    first, second, third = Shell(), Shell(), Other()
+    first.deep_compilers = ("instance override", "x")   # an instance override
+    released = release_dispatch_region_copies([first, second, third])
+    # Counted once per owner: the Shell class and the Other subclass (which
+    # inherits, so owns nothing) are not double counted; the instance
+    # override is its own owner.
+    assert released == {
+        "dispatch_subgraphs": 3, "deep_compilers": 1 + 2,
+        "ephemeral_callables": 0,
+    }
+    for shell in (first, second, third):
+        assert isinstance(shell.dispatch_subgraphs, ReleasedDispatchRegions)
+        for read in (len, iter, bool, lambda held: held[0]):
+            with pytest.raises(RuntimeError, match="released"):
+                read(shell.dispatch_subgraphs)
+        assert shell.process_graph == "kept"
+    # Releasing again lets go of nothing.
+    assert release_dispatch_region_copies([first, second, third]) == {
+        "dispatch_subgraphs": 0, "deep_compilers": 0,
+        "ephemeral_callables": 0,
+    }

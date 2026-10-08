@@ -17532,6 +17532,60 @@ def _stable_signature_value(value: Any) -> object:
 _POLYMORPHIC_FORMAL_SCANS: dict[int, tuple[Any, dict[str, tuple[int, bool]]]] = {}
 
 
+class ReleasedDispatchRegions(tuple):
+    """What a shell's ``dispatch_subgraphs`` / ``deep_compilers`` /
+    ``ephemeral_callables`` become once ``release_dispatch_region_copies``
+    has let the region copies go: an empty tuple whose every read raises, so
+    a reader the static argument missed fails loudly instead of seeing no
+    regions."""
+
+    def _refuse(self, *_args, **_kwargs):
+        raise RuntimeError(
+            "the dispatch region copies of this shell were released after "
+            "the whole-source lowering finished its per-function loop; "
+            "nothing may read them after that stage"
+        )
+
+    __iter__ = __len__ = __getitem__ = __bool__ = __contains__ = _refuse
+    __reversed__ = __eq__ = __hash__ = _refuse
+
+
+_REGION_COPY_ATTRIBUTES = (
+    "dispatch_subgraphs", "deep_compilers", "ephemeral_callables",
+)
+
+
+def release_dispatch_region_copies(shells: Any) -> dict[str, int]:
+    """Let go of every planned shell's dispatch region copies (the induced
+    subgraphs the planner cut, and the deep compilers / ephemeral callables
+    built over them).
+
+    The whole-source lowering reads them only inside its per-function loop
+    (``fortran_c_shell._class_surface_ssa_program``): the repository SSA of
+    each function is built from them there, and the stages after it
+    (call-frame fixed point, record/keyed-sequence ABI, module assembly)
+    read each shell's ``process_graph`` (the function's own graph),
+    ``loop_plans`` and ``callsite_function_shells``, never a region.  They
+    are class attributes of the planned shell types, so they are replaced on
+    the type (and on an instance that overrides one).  Returns what was let
+    go, by attribute."""
+
+    owners: dict[int, Any] = {}
+    for shell in shells:
+        owners[id(shell)] = shell
+        owners[id(type(shell))] = type(shell)
+    released = {name: 0 for name in _REGION_COPY_ATTRIBUTES}
+    sentinel = ReleasedDispatchRegions()
+    for owner in owners.values():
+        for name in _REGION_COPY_ATTRIBUTES:
+            held = owner.__dict__.get(name)
+            if held is None or isinstance(held, ReleasedDispatchRegions):
+                continue
+            released[name] += len(held)
+            setattr(owner, name, sentinel)
+    return released
+
+
 def release_polymorphic_formal_scans() -> int:
     """Drop every memoized polymorphic-formal scan; return how many pages'
     memos there were.  Each answer is a function of the page's content

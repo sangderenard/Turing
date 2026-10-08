@@ -14529,8 +14529,14 @@ def _class_surface_ssa_program(
     *,
     tensor_ssa_reference: Any = None,
     progress: Callable[[str], None] | None = None,
+    release_dispatch_regions: bool = False,
 ):
     """Lower every planned method of a whole object to one reusable SSA unit.
+
+    ``release_dispatch_regions`` (the caller owns ``compilation`` and reads
+    nothing of its deployment after this returns) lets go of every shell's
+    dispatch region copies as soon as the per-function loop that reads them
+    ends: see ``glsl_deployment_strategy.release_dispatch_region_copies``.
 
     This is the whole-object emission path and it performs NO numeric
     projection.  Each method lowers its own control program plus the operator
@@ -18570,6 +18576,12 @@ def _class_surface_ssa_program(
                 for symbol, item in lowering_failures
             )
         )
+    if release_dispatch_regions:
+        from .glsl_deployment_strategy import release_dispatch_region_copies
+        from .memory_regulation import stage_end
+
+        release_dispatch_region_copies(discovered_planned_shells)
+        stage_end("ssa-program: dispatch region copies released")
     if not export_symbols:
         return None, {}, ()
     report(
@@ -41165,6 +41177,9 @@ def _lower_resolved_process_graph_deployment(
         artifact_name,
         tensor_ssa_reference=tensor_ssa_reference,
         progress=progress,
+        # This function owns ``deployment`` and reads nothing of it after the
+        # lowering returns.
+        release_dispatch_regions=True,
     )
     stage_boundary("ssa-source: repository SSA lowered")
     if linked_source_region_ssa:
