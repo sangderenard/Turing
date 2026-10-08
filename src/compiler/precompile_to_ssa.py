@@ -4886,6 +4886,19 @@ class _ControlSSABuilder:
             mode=Mode.CONCORD,
         )
 
+    def _loop_scope_value_cells(self, *value_ids: Any) -> tuple:
+        """The ``ssa_value`` cells of the SSA values a loop-scope generation
+        names, in this lowering's scope."""
+
+        book = self._book()
+        return tuple(
+            cell for cell in (
+                book.latest_ref(SSA_VALUE, (self._scope(), int(value_id)))
+                for value_id in value_ids
+            )
+            if cell is not None
+        )
+
     def _loop_scope_rebinds(self, loop: Any, carried: Any) -> tuple:
         """Describe every carried entry without collapsing shared seeds.
 
@@ -5726,6 +5739,9 @@ class _ControlSSABuilder:
                     int(reserved.id),
                     int(completed.id),
                     "complete_loop_latch_carried",
+                    cells=self._loop_scope_value_cells(
+                        int(reserved.id), int(completed.id),
+                    ),
                 )
                 completed.accounting = {
                     **dict(completed.accounting or {}),
@@ -9870,6 +9886,8 @@ class _ControlSSABuilder:
                 self.function_name, loop.source_loop_node_id,
                 header.name, latch.name, exit_block.name,
                 self._loop_scope_rebinds(loop, carried),
+                boundary_cells=(loop_cell,),
+                rebind_cells=self._loop_scope_value_cells,
             )
         except Exception:
             pass
@@ -10768,6 +10786,8 @@ class _ControlSSABuilder:
                 self.function_name, loop.source_loop_node_id,
                 header.name, latch.name, exit_block.name,
                 self._loop_scope_rebinds(loop, carried),
+                boundary_cells=(loop_cell,),
+                rebind_cells=self._loop_scope_value_cells,
             )
         except Exception:
             pass
