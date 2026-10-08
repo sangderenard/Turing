@@ -136,10 +136,18 @@ def _record_aggregate_ledger_lookup(
         # count does not match the leaf count, which leaves the dangling
         # ledger in place and nobody the wiser.
         resident = sum(1 for leaf in leaves if int(leaf) in graph.G)
-        current_identity_book().page("aggregate_ledger").set(
-            (str(owner), int(value_id), "ledger_lookup"),
-            0,
-            (
+        from ..common.tensors.topological_reducer import node_identity_cell
+        from .concordance_declarations import (
+            AGGREGATE_LEDGER, AGGREGATE_LEDGER_CAUSE_NOT_ON_BOOK,
+            PLANNER_HIERARCHY,
+        )
+        from .identity_concordance import (
+            ConcordanceRefusal, Derived, Mode, Unsourced,
+        )
+
+        ledger_book = current_identity_book()
+        ledger_row = (str(owner), int(value_id), "ledger_lookup")
+        ledger_fact = (
                 "emptied" if emptied
                 else "absent" if not leaves
                 else "resident" if resident == len(leaves)
@@ -153,7 +161,34 @@ def _record_aggregate_ledger_lookup(
                     tuple(sorted(map(str, attributes))),
                     len(tuple(attributes.get("tensor_output_descriptors") or ())),
                 ) if emptied else ()),
-            ),
+        )
+        stored_ledger = ledger_book.pages.get(AGGREGATE_LEDGER.name)
+        if stored_ledger is not None and stored_ledger.latest(ledger_row) == ledger_fact:
+            return
+        ledger_cells = []
+        for ledger_node in (int(value_id), *(
+            int(leaf) for leaf in leaves if int(leaf) in graph.G
+        )):
+            try:
+                ledger_cells.append(node_identity_cell(graph, ledger_node))
+            except ValueError:
+                pass
+        ledger_cells = tuple(dict.fromkeys(ledger_cells))
+        if ledger_cells:
+            try:
+                ledger_book.post(
+                    AGGREGATE_LEDGER, ledger_row, ledger_fact,
+                    stage=PLANNER_HIERARCHY, provenance=Derived(ledger_cells),
+                    mode=Mode.REVISE,
+                )
+                return
+            except ConcordanceRefusal:
+                pass
+        ledger_book.post(
+            AGGREGATE_LEDGER, ledger_row, ledger_fact,
+            stage=PLANNER_HIERARCHY,
+            provenance=Unsourced(AGGREGATE_LEDGER_CAUSE_NOT_ON_BOOK),
+            mode=Mode.REVISE,
         )
     except Exception:  # noqa: BLE001 -- diagnostics never fail a build
         pass

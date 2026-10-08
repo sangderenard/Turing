@@ -2960,3 +2960,16 @@ CALL_ARGUMENT_OPERAND = declare_page("call_argument_operand", (
     RowField("read_scope", K.SCOPE), RowField("callsite", K.VALUE_ID),
     RowField("position", K.INDEX),
 ), tuple)
+
+#: ``_record_aggregate_ledger_lookup``: every aggregate-ledger lookup, found or
+#: not, ``(owner, value, "ledger_lookup")`` -> ``(state, leaf count, resident
+#: count, node type, expression type, ledger keys, ...)``.  REVISE (each lookup
+#: restates it), DERIVED(the aggregate node's identity cell and the cells of the
+#: leaves still resident in the graph).
+AGGREGATE_LEDGER = declare_page("aggregate_ledger", (
+    RowField("owner", K.SCOPE), RowField("value", K.VALUE_ID),
+    RowField("key", K.LABEL),
+), tuple)
+AGGREGATE_LEDGER_CAUSE_NOT_ON_BOOK = declare_reason(
+    "aggregate_ledger_cause_not_on_book"
+)
