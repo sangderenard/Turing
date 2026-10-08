@@ -15,6 +15,7 @@ from __future__ import annotations
 
 COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/glsl_deployment_strategy.py",
+    "src/compiler/captured_region_programs.py",
     "src/compiler/callsite_literal_specialization.py",
     "src/compiler/tensor_descriptor_query.py",
     "src/compiler/source_control_retention.py",
