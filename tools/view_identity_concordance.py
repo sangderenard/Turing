@@ -578,7 +578,9 @@ def core_identity_rows(pg, book, row_node) -> np.ndarray:
     def has_row(page_name, row):
         page = book.pages.get(page_name)
         try:
-            return page is not None and bool(page.history(row))
+            # A row a copy-on-read fork has not written is not a row of the
+            # book (it has no cell and no node in the view): ``holds``.
+            return page is not None and page.holds(row)
         except (KeyError, TypeError):
             return False
 

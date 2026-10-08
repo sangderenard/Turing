@@ -404,7 +404,7 @@ class EmissionRecorder:
         latest = book.latest_ref(page, row)
         mode = Mode.CONCORD
         if latest is not None:
-            incumbent = book.pages[page.name].cells.get((row, latest.column))
+            incumbent = book.pages[page.name].cell(row, latest.column)
             if incumbent != fact:
                 # Re-emission of the same function changed its text (another
                 # root, another entry): a revision caused by the new
@@ -430,7 +430,7 @@ class EmissionRecorder:
         latest = book.latest_ref(EMISSION_FUNCTION, row)
         incumbent = (
             None if latest is None
-            else book.pages[EMISSION_FUNCTION.name].cells.get((row, latest.column))
+            else book.pages[EMISSION_FUNCTION.name].cell(row, latest.column)
         )
         if incumbent == pending:
             # Posted pending already with no finish in between (an emission

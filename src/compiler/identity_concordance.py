@@ -3528,6 +3528,14 @@ class IdentityPage:
             return self._fork_of_scope(row[0])[1]
         raise KeyError(key)
 
+    def holds(self, row: Any) -> bool:
+        """Whether the book holds a cell of its own for ``row`` -- unlike
+        ``latest`` / ``history``, which also answer for a row a copy-on-read
+        scope has not written yet."""
+        if len(self.column_positions) != len(self.columns):
+            self._reindex()
+        return bool(self.row_columns.get(row))
+
     def materialised_scope_rows(self, scope: Any) -> tuple[Any, ...]:
         """The rows of ``scope`` the book holds cells for, in recorded
         order.  For a scope that is not a copy-on-read fork this is
@@ -4247,7 +4255,6 @@ class IdentityBook:
         declared = self.registry.pages.get(page.name)
         previous = self.__dict__.get("_materialising")
         previous_stamp = self.__dict__.get("_stamp_override")
-        previous_stage = self.active_stage
         self._materialising = key
         self._stamp_override = stamp
         try:
@@ -4255,7 +4262,8 @@ class IdentityBook:
                 isinstance(fact, Unresolved)
                 or isinstance(fact, declared.fact_type)
             ):
-                self.active_stage = READ_SCOPE_FORK
+                # (Tagged under the latch with the stage active now, as the
+                # eager copy's raw write was.)
                 page.set(row, 0, fact)
             else:
                 self.post(
@@ -4266,7 +4274,6 @@ class IdentityBook:
         finally:
             self._materialising = previous
             self._stamp_override = previous_stamp
-            self.active_stage = previous_stage
 
     def _preserve_fork_snapshots(
         self, page: IdentityPage, row: Any, key: tuple, fact: Any,

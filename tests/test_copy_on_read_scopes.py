@@ -389,20 +389,17 @@ def test_edges_of_rows_written_in_the_fork_are_the_edges_the_copy_posted():
     assert len(lazy_book.page(OPS).materialised_scope_rows(lazy)) == 0
     assert len(eager_book.page(OPS).materialised_scope_rows(eager)) == 1
     # The raw page's copy is tagged exactly as the eager raw copy was.
-    tagged = {
-        (name, row): (reason, stage.name)
-        for name, row, reason, stage in lazy_book.unsourced_rows()
-        if row[0] == lazy and name == "raw_rows"
-    }
-    eager_tagged = {
-        (name, row): (reason, stage.name)
-        for name, row, reason, stage in eager_book.unsourced_rows()
-        if row[0] == eager and name == "raw_rows"
-    }
-    # (The revision of the row, raw too, is tagged in both.)
-    assert set(tagged) == {("raw_rows", (lazy, "k"))}
-    assert tagged == eager_tagged
-    assert tagged[("raw_rows", (lazy, "k"))][0] is RAW_PRIMITIVE
+    def tags(book, scope):
+        return sorted(
+            (name, row, reason.name, stage.name)
+            for name, row, reason, stage in book.unsourced_rows()
+            if row[0] == scope and name == "raw_rows"
+        )
+
+    # (The row's copy and its revision are both raw writes: tagged alike.)
+    assert tags(lazy_book, lazy) == tags(eager_book, eager) == [(
+        "raw_rows", (lazy, "k"), RAW_PRIMITIVE.name, "raw_primitive",
+    )]
 
 
 def test_unmaterialised_cells_report_the_edge_they_will_have(book):
@@ -633,6 +630,10 @@ def test_the_origin_relation_and_materialised_rows_are_all_the_viewer_sees(book)
     )]
     assert (forked, 2, "arg0", 0) not in page.rows()
     assert (forked, 1, "arg0", 0) in page.rows()
+    # ``holds`` is the book's cell; ``history`` is the resolved view.
+    assert not page.holds((forked, 2, "arg0", 0))
+    assert page.holds((forked, 1, "arg0", 0))
+    assert page.history((forked, 2, "arg0", 0)) == ((0, "b"),)
 
 
 def test_an_old_pickle_of_a_book_has_no_forks_and_still_works(book):
@@ -655,3 +656,63 @@ def test_an_old_pickle_of_a_book_has_no_forks_and_still_works(book):
     legacy = object.__new__(type(book))
     legacy.__setstate__(state)
     assert legacy.read_through == {} and legacy._stamp_override is None
+
+
+# ------------------------------------------------------------- siblings
+def test_sibling_forks_of_one_origin_are_independent_and_counts_hold(book):
+    source = book.mint_scope("fn", READ_SCOPE_FORK)
+    _source_rows(book, source)
+    page = book.page(LRB)
+    first = _fork(book, source)
+    second = _fork(book, source)
+    assert first != second
+    assert page.scope_row_count(first) == page.scope_row_count(second) == 4
+
+    page.revise((first, 1, "arg0", 0), "first")
+    page.revise((second, 1, "arg0", 0), None)
+    page.revise((second, 5, "arg0", 0), "second-only")
+
+    assert page.latest((first, 1, "arg0", 0)) == "first"
+    assert page.latest((second, 1, "arg0", 0)) is None
+    assert page.latest((source, 1, "arg0", 0)) == "a"
+    assert page.latest((first, 5, "arg0", 0)) is None
+    # A count is the same number a listing has, before and after writes.
+    for scope in (first, second):
+        assert page.scope_row_count(scope) == len(page.scope_rows(scope))
+    assert page.scope_row_count(first) == 4
+    assert page.scope_row_count(second) == 4 + 1          # row 1 withdrawn but own
+    assert len(set(page.scope_rows(second))) == page.scope_row_count(second)
+
+
+def test_an_unresolved_fact_and_a_raw_fact_on_a_declared_page_are_copied_as_they_are(
+    book,
+):
+    source = book.mint_scope("fn", READ_SCOPE_FORK)
+    receipt = Unresolved(ROW_PROJECTED_OUT_OF_SCOPE)
+    book.post(
+        LRB, (source, 1, "arg0", 0), receipt, stage=READ_SCOPE_FORK,
+        provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+    )
+    # A declared page whose writer still writes a fact of another shape.
+    book.page(LRB).set((source, 2, "arg0", 0), 0, ("not", "a", "str"))
+    forked = _fork(book, source)
+    page = book.page(LRB)
+    assert page.latest((forked, 1, "arg0", 0)) == receipt
+    assert page.latest((forked, 2, "arg0", 0)) == ("not", "a", "str")
+
+    page.revise((forked, 1, "arg0", 0), "resolved")
+    page.revise((forked, 2, "arg0", 0), "now-a-str")
+
+    # The Unresolved copy is a sourced cell; the odd-shaped one a tagged raw.
+    assert _edges(book, LRB, (forked, 1, "arg0", 0), 0) == {
+        (("lexical_read_binding", (source, 1, "arg0", 0), 0),
+         READ_SCOPE_FORK.name),
+    }
+    assert _edges(book, LRB, (forked, 2, "arg0", 0), 0) == set()
+    assert any(
+        row == (forked, 2, "arg0", 0) and name.name == "lexical_read_binding"
+        for name, row, _reason, _stage in book.unsourced_rows()
+    )
+    assert page.history((forked, 2, "arg0", 0)) == (
+        (0, ("not", "a", "str")), (1, "now-a-str"),
+    )

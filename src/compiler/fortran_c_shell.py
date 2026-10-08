@@ -14859,8 +14859,8 @@ def _class_surface_ssa_program(
         )
 
     def _cell_fact(ref: Any) -> Any:
-        return shape_identity_book.pages[ref.page.name].cells.get(
-            (ref.row, ref.column)
+        return shape_identity_book.pages[ref.page.name].cell(
+            ref.row, ref.column,
         )
 
     def post_shape_statement(
