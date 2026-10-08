@@ -35,4 +35,5 @@ COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/sequence_storage_binding.py",
     "src/compiler/lexical_control_placement.py",
     "src/compiler/late_source_recovery.py",
+    "src/compiler/shortfall_settlement.py",
 )
