@@ -3301,8 +3301,9 @@ class IdentityPage:
     A WRITE under the fork (``set``, ``revise``, ``IdentityBook.post``, or a
     ``Ref`` to the unwritten row named as a source) first MATERIALISES the
     row: a cell at column 0 holding that fact, DERIVED from the origin's cell
-    at stage ``read_scope_fork`` (same fact, same edge, same stamp as the
-    eager copy had), then the write lands as the next column.  Nothing is
+    at stage ``read_scope_fork`` (same fact and edge as the eager copy had,
+    stamped one reading before the fork's ``scope_origin`` cell as the copy
+    was, ticking nothing), then the write lands as the next column.  Nothing is
     ever deleted; a fork's rows are never rewritten by the origin's later
     writes (the snapshot), and an in-place overwrite of an origin cell
     materialises its forks' rows first (``_stamp``).
@@ -3519,13 +3520,15 @@ class IdentityPage:
         )
 
     def stamp_at(self, row: Any, column: int) -> int:
-        """The clock reading of cell ``(row, column)``; a virtual cell was
-        made by its fork, whose stamp it carries (``KeyError`` if none)."""
+        """The clock reading of cell ``(row, column)``; a virtual cell reads
+        as its fork made it: one reading before the fork's ``scope_origin``
+        cell, which is what its materialisation is stamped with
+        (``KeyError`` if there is no such cell)."""
         key = (row, column)
         if key in self.cells:
             return self.stamps[key]
         if self.is_virtual(row, column):
-            return self._fork_of_scope(row[0])[1]
+            return self._fork_of_scope(row[0])[1] - 1
         raise KeyError(key)
 
     def holds(self, row: Any) -> bool:
@@ -4256,7 +4259,10 @@ class IdentityBook:
         previous = self.__dict__.get("_materialising")
         previous_stamp = self.__dict__.get("_stamp_override")
         self._materialising = key
-        self._stamp_override = stamp
+        # The eager copy was posted BEFORE the fork's ``scope_origin`` cell
+        # (stamp ``stamp``): one reading earlier, so a source posted at the
+        # fork is newer than the copy, as it was.
+        self._stamp_override = stamp - 1
         try:
             if declared is None or not (
                 isinstance(fact, Unresolved)

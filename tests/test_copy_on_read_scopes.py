@@ -419,7 +419,7 @@ def test_unmaterialised_cells_report_the_edge_they_will_have(book):
     }
     assert book.stamp_of(cell) == page.stamp_at(row, 0)
     origin_cell = book.latest_ref(SCOPE_ORIGIN, (forked,))
-    assert book.stamp_of(cell) == book.stamp_of(origin_cell)
+    assert book.stamp_of(cell) == book.stamp_of(origin_cell) - 1
     assert _cell_count(book, "lexical_read_binding") == before
     # ... naming it as a source writes it (it must exist to be derived from),
     # with the edge the copy had.
@@ -452,7 +452,7 @@ def test_materialising_a_row_ticks_nothing_and_keeps_the_forks_stamp(book):
 
     page.revise(row, "B")
 
-    assert page.stamps[(row, 0)] == fork_stamp          # the copy, at the fork
+    assert page.stamps[(row, 0)] == fork_stamp - 1      # the copy, as at the fork
     assert page.stamps[(row, 1)] > page.stamps[(row, 0)]
     assert page.stamps[(row, 1)] == clock               # the write, now
     assert book.clock[0] == clock + 1                   # the write's one tick
@@ -716,3 +716,18 @@ def test_an_unresolved_fact_and_a_raw_fact_on_a_declared_page_are_copied_as_they
     assert page.history((forked, 2, "arg0", 0)) == (
         (0, ("not", "a", "str")), (1, "now-a-str"),
     )
+
+
+def test_a_revise_derived_from_the_fork_cell_itself_is_a_changed_source(book):
+    source = book.mint_scope("fn", READ_SCOPE_FORK)
+    _source_rows(book, source)
+    forked = _fork(book, source)
+    row = (forked, 1, "arg0", 0)
+    # The scope_origin cell is newer than every copy the fork made, so a
+    # revision derived from it has a cause (as with the eager copy).
+    origin_cell = book.latest_ref(SCOPE_ORIGIN, (forked,))
+    book.post(
+        LRB, row, "a2", stage=OPERAND_POSITION,
+        provenance=Derived((origin_cell,)), mode=Mode.REVISE,
+    )
+    assert book.page(LRB).history(row) == ((0, "a"), (1, "a2"))
