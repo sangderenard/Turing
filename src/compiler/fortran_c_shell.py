@@ -21684,6 +21684,18 @@ def _class_surface_ssa_program(
         ) -> None:
             getters: list[tuple[int, bool]] = []
             write_sources: list[int] = []
+
+            def slot_version(value_id: int) -> bool:
+                """A scalar field read the control injection materialised as
+                a slot Load is a VERSION of the field -- read at its own place
+                (before or after a write, in one arm or at the join) -- not
+                the field's address.  The slot address is already the one
+                storage; aliasing one version onto another returns the
+                pre-write value for a read authored after the write, or a
+                Load that does not dominate the use."""
+
+                return storage == "scalar" and int(value_id) in slot_loaded
+
             for node_id, data in graph.nodes(data=True):
                 operation = str(
                     data.get("type") or data.get("op") or ""
@@ -21730,6 +21742,7 @@ def _class_surface_ssa_program(
                 # against its callee's single member.
                 read_ids = list(dict.fromkeys(
                     value_id for value_id, _after_write in getters
+                    if not slot_version(value_id)
                 ))
                 if len(read_ids) < 2:
                     return
@@ -21815,7 +21828,7 @@ def _class_surface_ssa_program(
                 ) else RESIDENT_CHOSEN_BY_ORDER
             )
             for value_id, _after_write in getters:
-                if int(value_id) != resident_id:
+                if int(value_id) != resident_id and not slot_version(value_id):
                     post_storage_alias(
                         int(value_id), resident_id,
                         (_frame_graph_cell(graph, resident_id),),
@@ -21829,6 +21842,12 @@ def _class_surface_ssa_program(
                         reason=alias_reason,
                     )
 
+        slot_loaded = {
+            int(value_id)
+            for value_id in function.metadata.get(
+                "receiver_field_read_value_ids", ()
+            )
+        }
         for parameter_name, record in declared_records.items():
             parameter_ids = set(map(
                 int, identities.get(str(parameter_name), ())

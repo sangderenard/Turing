@@ -12973,6 +12973,9 @@ def _inject_field_slot_access(
             CONTROL_BLOCK_PLACEMENT, (scope, block),
         )
 
+    # The reads this injection materialised as slot Loads: each is a VERSION
+    # of its field, read at its own place and time, not an address of it.
+    slot_loaded_read_ids: set[int] = set()
     for schedule_index, (kind, value_id, slot) in enumerate(field_ops):
         if schedule_index in arm_owned:
             position, write_cell = arm_owned[schedule_index]
@@ -13024,6 +13027,7 @@ def _inject_field_slot_access(
                 position = return_position  # returned but otherwise unconsumed
             if position is None:
                 continue  # a read nothing consumes has no place and no effect
+            slot_loaded_read_ids.add(int(value_id))
         else:
             group = []
             reference = reference_sources.get(int(value_id))
@@ -13169,6 +13173,9 @@ def _inject_field_slot_access(
             "receiver_field_locations": tuple(sorted(
                 (int(slot), *location)
                 for slot, location in field_locations.items()
+            )),
+            "receiver_field_read_value_ids": tuple(sorted(
+                slot_loaded_read_ids
             )),
         },
     ), field_locations
