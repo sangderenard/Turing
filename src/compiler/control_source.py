@@ -265,12 +265,15 @@ class LoopControlBlock:
     # reducer could not resolve at that return.
     return_value_ids: tuple[int | None, ...] = ()
     # ``break``/``continue``: the graph node of the source statement, and
-    # the bindings live at that site as (pre-loop identity, value-at-site)
-    # pairs -- the values the exit edge carries for every name the arm
-    # rebound (reducer ``loop_break_sites``).  A missing pair means the
+    # the bindings live at that site as ((pre-loop identity, loop-carried
+    # update), value-at-site) pairs -- the values the exit edge carries for
+    # every name the arm rebound (reducer ``loop_break_sites``).  The
+    # binding is the carried pair, not the pre-loop identity alone: two
+    # names seeded from one value are distinct bindings.  A name that is
+    # not carried is keyed (initial, initial).  A missing pair means the
     # site did not rebind that name.
     site_node_id: int | None = None
-    site_values: tuple[tuple[int, int], ...] = ()
+    site_values: tuple[tuple[tuple[int, int], int], ...] = ()
     # ``return``: the return SITE's identity cell -- the cell the reducer
     # keys the ``return_site_slot`` / ``return_site_field_state`` rows by
     # (the return construct, never the value it returns).  Lowering stamps
@@ -760,7 +763,7 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             # (``if dt > 0.2: dt = dt * 0.5; continue`` -- once no
             # conditional merge consumed ``dt * 0.5``, its region was
             # dropped and the continue edge carried the header value.)
-            values.update(int(value) for _initial, value in block.site_values)
+            values.update(int(value) for _binding, value in block.site_values)
         elif isinstance(block, StateMachineTick):
             if block.state_value_id is not None:
                 values.add(int(block.state_value_id))

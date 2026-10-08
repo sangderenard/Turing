@@ -8386,7 +8386,9 @@ def _normalize_lexical_values(
                 # rebinds it) yet still needs a post-loop identity: its
                 # continuation is the last break site's value, which the loop
                 # port materialization rewires onto a LoopResult port.
-                loop_break_sites: dict[tuple[int, int, int, int], dict[int, int]] = {}
+                loop_break_sites: dict[
+                    tuple[int, int, int, int], dict[tuple[int, int], int]
+                ] = {}
                 loop_break_bindings: dict[str, tuple[int, int]] = {}
                 for site_span, site in (
                     graph.G.graph.get("loop_control_site_bindings") or {}
@@ -8405,7 +8407,7 @@ def _normalize_lexical_values(
                     # the continue value had no consumer but a conditional
                     # merge synthesized from ``dt``'s identity history.)
                     is_break = site["action"] == "break"
-                    site_values: dict[int, int] = {}
+                    site_values: dict[tuple[int, int], int] = {}
                     for name, value in site["bindings"].items():
                         if name in loop_target_bindings:
                             continue
@@ -8423,7 +8425,16 @@ def _normalize_lexical_values(
                             or int(value) not in graph.G
                         ):
                             continue
-                        site_values[int(initial)] = int(value)
+                        # The binding's key is its carried pair: two names
+                        # seeded from one pre-loop value (``tried = dt``)
+                        # share ``initial`` yet are distinct bindings with
+                        # distinct updates and distinct values at a site.
+                        carried_pair = loop_carried_bindings.get(name)
+                        site_values[
+                            (int(carried_pair[0]), int(carried_pair[1]))
+                            if carried_pair is not None
+                            else (int(initial), int(initial))
+                        ] = int(value)
                         if is_break and name not in loop_carried_bindings:
                             loop_break_bindings[name] = (int(initial), int(value))
                     loop_break_sites[site_span] = site_values
@@ -8441,7 +8452,9 @@ def _normalize_lexical_values(
                             (
                                 *(
                                     (int(initial), "site_initial")
-                                    for initial in site_values
+                                    for initial in dict.fromkeys(
+                                        key[0] for key in site_values
+                                    )
                                 ),
                                 *(
                                     (int(value), "site_value")
@@ -9282,9 +9295,10 @@ def _normalize_lexical_values(
         if "loop_break_sites" in attributes:
             attributes["loop_break_sites"] = {
                 span: {
-                    mapping[initial]: mapping[value]
-                    for initial, value in site_values.items()
-                    if initial in mapping and value in mapping
+                    (mapping[initial], mapping[updated]): mapping[value]
+                    for (initial, updated), value in site_values.items()
+                    if initial in mapping and updated in mapping
+                    and value in mapping
                 }
                 for span, site_values in attributes["loop_break_sites"].items()
             }
