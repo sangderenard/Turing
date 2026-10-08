@@ -38,4 +38,5 @@ COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/shortfall_settlement.py",
     "src/compiler/dead_storage_pruning.py",
     "src/compiler/function_alias_concordance.py",
+    "src/compiler/authored_record_abi.py",
 )
