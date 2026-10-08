@@ -384,6 +384,89 @@ def test_compartment_carries_its_own_nodes_tokens_and_shares_read_only_tables():
     assert whole.G.graph["ingestion_identity_table"]["x"][0] is not names["x"][0]
 
 
+def test_region_fork_of_read_scope_holds_its_own_nodes_rows_as_a_declared_projection():
+    import pytest
+
+    from src.compiler.concordance_declarations import (
+        INGESTION_VALUE, LEXICAL_READ_BINDING, NodeFact, READ_SCOPE_FORK,
+        ROW_PROJECTED_OUT_OF_SCOPE, SYNTHESIZED_NO_SOURCE,
+    )
+    from src.compiler.identity_concordance import (
+        Mode, ProjectedScopeRead, Unresolved, Unsourced, begin_identity_book,
+        end_identity_book,
+    )
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        _add(graph, 1, "input")
+        _add(graph, 2, "add", (1,))
+        _add(graph, 3, "sin", (2,))
+        _add(graph, 4, "mul", (3,))
+        scope = book.mint_scope("projection_test", READ_SCOPE_FORK)
+        ingestion = book.mint_scope("projection_test|ingestion", READ_SCOPE_FORK)
+        for node_id in (1, 2, 3, 4):
+            book.post(
+                INGESTION_VALUE, (ingestion, node_id), NodeFact("t", "t", "t"),
+                stage=READ_SCOPE_FORK,
+                provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+            )
+        graph.G.graph["ingestion_value_scope"] = ingestion
+        for consumer in (1, 2, 3, 4, "return"):
+            book.post(
+                LEXICAL_READ_BINDING, (scope, consumer, "arg0", 0), "x",
+                stage=READ_SCOPE_FORK,
+                provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+            )
+        graph.G.graph["lexical_read_scope"] = scope
+        page = book.page(LEXICAL_READ_BINDING)
+
+        region = extract_clean_process_subgraph(graph, (2, 3))
+        forked = tuple(region.G.graph["lexical_read_scope"])
+        assert forked != scope
+        # The region holds the rows of its own nodes (and the non-node
+        # ``return`` consumer), not the source's other nodes'.
+        assert {row[1] for row in page.scope_rows(forked)} == {2, 3, "return"}
+        # The relation is on the book: the scope_origin fact carries it.
+        origin = book.page("scope_origin").latest((forked,))
+        assert origin.source_scope == scope
+        projection = origin.projection
+        assert projection.node_count == 2
+        assert projection.source_node_count == 4
+        assert projection.rows_carried == 2
+        assert projection.rows_excluded == 2
+        assert projection.rows_stale == 0
+        assert "lexical_read_binding" in projection.pages
+        # A read of a source node the region does not hold is refused, and
+        # leaves an Unresolved row with the declared reason, derived from
+        # the scope_origin cell.
+        with pytest.raises(ProjectedScopeRead):
+            page.latest((forked, 4, "arg0", 0))
+        receipt = page.latest((forked, 4, "arg0", 0))
+        assert isinstance(receipt, Unresolved)
+        assert receipt.reason is ROW_PROJECTED_OUT_OF_SCOPE
+        # A node that is in neither graph (a node the region adds) is a miss.
+        assert page.latest((forked, 99, "arg0", 0)) is None
+
+        # A whole-graph copy forks every row and declares no projection ...
+        whole = extract_clean_process_subgraph(graph, graph.G)
+        whole_scope = tuple(whole.G.graph["lexical_read_scope"])
+        assert len(page.scope_rows(whole_scope)) == 5
+        assert book.page("scope_origin").latest((whole_scope,)).projection is None
+        # ... and a whole copy of the region still does not hold node 1.
+        again = extract_clean_process_subgraph(region, region.G)
+        again_scope = tuple(again.G.graph["lexical_read_scope"])
+        # (Node 2's operand position was retired when its parent, node 1,
+        # left the region: that row has no fact to carry.)
+        assert {row[1] for row in page.scope_rows(again_scope)} == {
+            3, "return",
+        }
+        with pytest.raises(ProjectedScopeRead):
+            page.latest((again_scope, 1, "arg0", 0))
+    finally:
+        end_identity_book(token)
+
+
 def test_shader_reducer_consumes_existing_process_graph_schedule():
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")
