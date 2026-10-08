@@ -502,6 +502,15 @@ role_schemas.update({
     'alias':       {'up': {}, 'down': {}},
     'withitem':    {'up': {'context_expr': 1, 'optional_vars': 1}, 'down': {}},
 
+    # Structural pattern matching: the subject, then each case (its pattern,
+    # optional guard and body).  ``MatchValue`` holds the literal expression a
+    # case compares the subject with; ``MatchSingleton`` holds a bare
+    # ``True``/``False``/``None`` (no child node).
+    'Match':       {'up': {'subject': 1, 'cases': 'many'}, 'down': {}},
+    'match_case':  {'up': {'pattern': 1, 'guard': 1, 'body': 'many'}, 'down': {}},
+    'MatchValue':  {'up': {'value': 1}, 'down': {}},
+    'MatchSingleton': {'up': {}, 'down': {}},
+
     # Optionally: cover all ast.AST leaf nodes as {}
 })
 

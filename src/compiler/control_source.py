@@ -291,11 +291,37 @@ class LoopControlBlock:
 
 @dataclass(frozen=True)
 class StateMachineTick:
-    """One compiled state transition, not a host polling loop."""
+    """One compiled state transition, not a host polling loop.
+
+    ``state`` is the spelling the renderers print (a loop induction name, a
+    uniform).  ``state_value_id`` is the state itself: the graph value the
+    selector reads, resolved through the book like a conditional's
+    predicate.  ``source_node_id`` is the dispatch construct's graph node
+    (the ``match`` statement), the tick's owner cell the way a
+    conditional's ``source_node_id`` is its.  A tick carrying neither is a
+    hand-built one (a coordinator's method switch): it has no owner to name
+    and posts ``Unsourced(CONTROL_OWNER_UNKNOWN)`` like any ownerless block.
+    """
 
     state: str
     cases: tuple[tuple[str, "ControlBlock"], ...]
     default: "ControlBlock | None" = None
+    state_value_id: int | None = None
+    source_node_id: int | None = None
+    # Aligned with ``cases``: the graph node of each case literal (the
+    # ``MatchValue`` constant), whose identity cell the case's blocks and the
+    # equality predicate derive from.  None where a case has no node.
+    case_value_ids: tuple[int | None, ...] = ()
+    # One entry per scalar the arms rebind: ``(per-case arm value ids, the
+    # default arm's value id, initial value id, merged value id)``.  An arm
+    # that does not rebind the name repeats the initial id (the entered
+    # version), exactly as ``ConditionalBlock.carried_aliases`` encodes a
+    # missing arm; with no ``default`` the default slot is the initial id --
+    # the version a state matching no case leaves in place.  Lowering joins
+    # every arm that reaches the merge in one Phi.
+    carried_aliases: tuple[
+        tuple[tuple[int, ...], int, int, int], ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -736,6 +762,19 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             # dropped and the continue edge carried the header value.)
             values.update(int(value) for _initial, value in block.site_values)
         elif isinstance(block, StateMachineTick):
+            if block.state_value_id is not None:
+                values.add(int(block.state_value_id))
+            values.update(
+                int(value_id) for value_id in block.case_value_ids
+                if value_id is not None
+            )
+            for arm_ids, default_id, initial_id, merged_id in (
+                block.carried_aliases
+            ):
+                values.update(int(value_id) for value_id in arm_ids)
+                values.update((
+                    int(default_id), int(initial_id), int(merged_id),
+                ))
             for _case, body in block.cases:
                 visit(body)
             if block.default is not None:
@@ -889,6 +928,28 @@ def _callsite_marker(block: Any) -> int | None:
         return None
 
 
+def control_callsite_markers(control: "ControlProgram | None") -> frozenset:
+    """The planned callsites a ControlProgram already places: every
+    ``__plan_callsite_N__`` marker in any block, arms of every construct
+    (a state-machine tick's cases included) -- a marker present is placed,
+    and the lexical scheduler must not place it a second time."""
+
+    found: set = set()
+
+    def walk(block: Any) -> None:
+        for child in _flatten_control_sequence(block):
+            marker = _callsite_marker(child)
+            if marker is not None:
+                found.add(int(marker))
+            for _arm, _index, children in _control_block_arms(child):
+                for grandchild in children:
+                    walk(grandchild)
+
+    if control is not None:
+        walk(control.root)
+    return frozenset(found)
+
+
 def _describe_control_block(
     block: Any, *, cell: Any, region_cell: Any, callsite_cell: Any,
 ) -> Any:
@@ -918,6 +979,7 @@ def _describe_control_block(
     sites: tuple = ()
     regions: tuple = ()
     extra: tuple = ()
+    cases: tuple = ()
     if isinstance(block, StatementBlock):
         region = _region_marker(block)
         callsite_ordinal = _callsite_marker(block)
@@ -1007,14 +1069,25 @@ def _describe_control_block(
         owner = cell(block.value_id)
         extra = (bool(block.final),)
     elif isinstance(block, StateMachineTick):
+        # Like a conditional: the owner is the dispatch construct's node
+        # cell, the predicate is the state selector's value cell.
+        owner = cell(block.source_node_id)
+        predicate = cell(block.state_value_id)
+        cases = cells(
+            value_id for value_id in block.case_value_ids
+            if value_id is not None
+        )
+        carried = cells(alias[3] for alias in block.carried_aliases)
         extra = (str(block.state),)
     elif isinstance(block, ParallelDeployment):
         extra = (str(block.schedule_preference),)
     if owner is None and reason is None and not isinstance(
-        block, (StateMachineTick, ParallelDeployment),
+        block, ParallelDeployment,
     ):
         reason = CONTROL_OWNER_UNKNOWN
-    return kind, owner, reason, (predicate, carried, sites, regions, callsite, extra)
+    return kind, owner, reason, (
+        predicate, carried, sites, regions, callsite, extra, cases,
+    )
 
 
 def control_block_cell(book: Any, scope: Any, block: Any) -> Any:
@@ -1172,9 +1245,11 @@ def post_control_program(
         )
 
     def fact_cells(fields: tuple) -> tuple:
-        predicate, carried, sites, regions, callsite, _extra = fields
+        predicate, carried, sites, regions, callsite, _extra, cases = fields
         return tuple(
-            item for item in (predicate, *carried, *sites, *regions, callsite)
+            item for item in (
+                predicate, *carried, *sites, *regions, callsite, *cases,
+            )
             if isinstance(item, Ref)
         )
 
@@ -2402,6 +2477,15 @@ def enrich_represented_conditionals(
         elif isinstance(block, ResourceScopeBlock):
             yield from conditional_aliases(block.body)
         elif isinstance(block, StateMachineTick):
+            # Loop-carry enrichment reads only (initial, merged); a tick's
+            # N-way alias is reported in the conditional's 4-tuple shape.
+            for arm_ids, default_id, initial_id, merged_id in (
+                block.carried_aliases
+            ):
+                yield (
+                    int(arm_ids[0]) if arm_ids else int(default_id),
+                    int(default_id), int(initial_id), int(merged_id),
+                )
             for _value, body in block.cases:
                 yield from conditional_aliases(body)
             if block.default is not None:
@@ -2816,10 +2900,15 @@ def compose_region_code(
         if isinstance(block, SequenceQueryBlock):
             return block
         if isinstance(block, StateMachineTick):
-            return StateMachineTick(
-                block.state,
-                tuple((value, substitute(body)) for value, body in block.cases),
-                None if block.default is None else substitute(block.default),
+            return replace(
+                block,
+                cases=tuple(
+                    (value, substitute(body)) for value, body in block.cases
+                ),
+                default=(
+                    None if block.default is None
+                    else substitute(block.default)
+                ),
             )
         if isinstance(block, ParallelDeployment):
             return ParallelDeployment(
@@ -3128,16 +3217,26 @@ def project_control_regions(
                 return None
             return block
         if isinstance(block, StateMachineTick):
-            cases = tuple(
-                (value, projected)
-                for value, body in block.cases
-                if (projected := project(body)) is not None
+            literal_ids = tuple(block.case_value_ids) + (None,) * (
+                len(block.cases) - len(block.case_value_ids)
             )
+            kept = [
+                (value, projected, literal_id)
+                for (value, body), literal_id in zip(block.cases, literal_ids)
+                if (projected := project(body)) is not None
+            ]
+            cases = tuple((value, projected) for value, projected, _ in kept)
             default = (
                 None if block.default is None else project(block.default)
             )
             return (
-                StateMachineTick(block.state, cases, default)
+                replace(
+                    block, cases=cases, default=default,
+                    case_value_ids=(
+                        tuple(literal_id for _, _, literal_id in kept)
+                        if block.case_value_ids else ()
+                    ),
+                )
                 if cases or default is not None else None
             )
         if isinstance(block, ParallelDeployment):
@@ -3626,7 +3725,7 @@ def overlay_scheduled_control(
                     default = nested_root if consumed else SequenceBlock(())
                 consumed_any |= consumed
             return (
-                StateMachineTick(block.state, tuple(cases), default),
+                replace(block, cases=tuple(cases), default=default),
                 consumed_any,
             )
         if isinstance(block, ParallelDeployment):
@@ -4174,6 +4273,7 @@ def compile_cffi_shell(
 
 __all__ = [
     "ControlBlock",
+    "control_callsite_markers",
     "ControlDeploymentLane",
     "ControlDeploymentRegion",
     "ControlExpression",

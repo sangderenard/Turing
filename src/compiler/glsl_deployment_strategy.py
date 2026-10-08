@@ -6043,14 +6043,16 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     for child in block.blocks
                 ))
             if isinstance(block, StateMachineTick):
-                return StateMachineTick(
-                    block.state,
-                    tuple(
+                return replace(
+                    block,
+                    cases=tuple(
                         (case, fix_aggregate_loop_bounds(body))
                         for case, body in block.cases
                     ),
-                    None if block.default is None
-                    else fix_aggregate_loop_bounds(block.default),
+                    default=(
+                        None if block.default is None
+                        else fix_aggregate_loop_bounds(block.default)
+                    ),
                 )
             if isinstance(block, ParallelDeployment):
                 return ParallelDeployment(
@@ -7476,6 +7478,7 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
             ast.With,
             ast.withitem,
             ast.If,
+            ast.Match,
             ast.Raise,
             ast.Assert,
             ast.Pass,

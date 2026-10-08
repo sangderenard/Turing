@@ -13,7 +13,7 @@ accelerated backends can share the same structural contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import re
 from typing import Iterable, Mapping, Sequence
@@ -150,9 +150,15 @@ def _render_c_or_glsl(
                 block.schedule_preference,
             )
         if isinstance(block, StateMachineTick):
-            return StateMachineTick(
-                block.state,
-                tuple((value, substitute(body)) for value, body in block.cases),
+            return replace(
+                block,
+                cases=tuple(
+                    (value, substitute(body)) for value, body in block.cases
+                ),
+                default=(
+                    None if block.default is None
+                    else substitute(block.default)
+                ),
             )
         if isinstance(block, ParallelDeployment):
             return ParallelDeployment(
