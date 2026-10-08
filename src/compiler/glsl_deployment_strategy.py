@@ -19923,6 +19923,43 @@ def _shape_only_view_operations() -> frozenset[str]:
 _SHAPE_ONLY_VIEW_OPERATIONS = _shape_only_view_operations()
 
 
+def _promoting_sides(
+    graph: Any, operands: tuple[int, ...], sides: list[Any],
+) -> list[Any]:
+    """The operand descriptors that decide an elementwise result dtype.
+
+    An authored Python ``int``/``float`` literal is a weak scalar: against a
+    floating tensor it does not promote (``1 - float32_tensor`` stays
+    float32, as the eager reference does).  Giving it its own dtype made
+    every ``1 - mask`` over a float32 value float64 at the graph stage, so a
+    float32 program carried a float64 intermediate into a float32 formal."""
+
+    def weak_scalar(operand: int, side: Any) -> bool:
+        if tuple(side.get("shape") or ()):
+            return False
+        node = graph.G.nodes[operand]
+        if str(node.get("type")) not in {"Constant", "Const", "const"}:
+            return False
+        literal = node.get("constant")
+        if literal is None:
+            literal = (node.get("attributes") or {}).get("value")
+        return isinstance(literal, (bool, int, float)) and not isinstance(
+            literal, np.generic
+        )
+
+    strong = [
+        side for operand, side in zip(operands, sides)
+        if not weak_scalar(operand, side)
+    ]
+    if strong and len(strong) < len(sides) and any(
+        np.dtype(str(side.get("dtype"))).kind in "fc"
+        for side in strong
+        if str(side.get("dtype") or "unknown") != "unknown"
+    ):
+        return strong
+    return list(sides)
+
+
 def _tensor_descriptor_rule(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -20728,7 +20765,9 @@ def _tensor_descriptor_rule(
                             }
                             else str(np.result_type(*(
                                 np.dtype(str(side.get("dtype")))
-                                for side in sides
+                                for side in _promoting_sides(
+                                    graph, operands, sides,
+                                )
                                 if str(side.get("dtype") or "unknown")
                                 != "unknown"
                             )))
