@@ -870,6 +870,12 @@ CALLSITE_ARGUMENT = declare_page("callsite_argument", (
 LOOP_RESULT_RECONCILIATION = declare_page("loop_result_reconciliation", (
     RowField("function", K.SCOPE), RowField("argument", K.VALUE_ID),
 ), tuple)                              # mode REVISE
+#: ``Unsourced`` reasons of ``_post_loop_result_reconciliation``: a pass that
+#: states something different about the same unchanged cells (the IR was
+#: rewritten between two runs by a pass whose cell is not in hand), and a
+#: value that has no ``ssa_value`` cell in the function's scope.
+REVISION_CAUSE_NOT_ON_BOOK = declare_reason("revision_cause_not_on_book")
+SSA_VALUE_NOT_ON_BOOK = declare_reason("ssa_value_not_on_book")
 #: ``_canonicalize_non_dominating_loop_result_uses``: one row per substituted
 #: OCCURRENCE ``(function scope, block, use index, argument position)`` ->
 #: ``(original id, replacement id, dominance evidence)``.  REVISE (the
@@ -939,6 +945,9 @@ LOOP_SCOPE_INNER_TRANSITION = declare_page("loop_scope_inner_transition", (
 
 # -- pages: physical call-input adaptation and precision passes (census 75,
 # section 6; ``ssa_call_input_adapters.py`` and ``ir_identities.py``) --------
+#: ``ssa_call_input_adapters``: the pass that restores exact region-feed views
+#: and adapts logical values to compiled physical buffer contracts.
+PHYSICAL_CALL_INPUT_ADAPTATION = declare_stage("physical_call_input_adaptation")
 EXACT_REGION_FEED_DTYPE = declare_page("exact_region_feed_dtype", (
     RowField("control_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), tuple)                              # mode CONCORD
@@ -2849,3 +2858,148 @@ FIXED_POINT_ROUND = declare_page("bounded_fixed_point_round", (
 __all__ += [
     "FIXED_POINT_ROUND_STAGE", "FIXED_POINT_ROOT", "FIXED_POINT_ROUND",
 ]
+
+# -- repository-SSA call-edge shape publication (``tensor_ssa_lowering``) ----
+#: ``_publish_exact_ssa_call_shapes``: one row per exact call edge position
+#: ``(callee, formal id, caller, actual id)`` -> ``(extents, dtype)``, REVISE
+#: (a later round may state a different contract), DERIVED(the actual's and
+#: the formal's ``ssa_value`` cells).  ``ssa_call_shape_evidence`` names, on
+#: the same row, which source the extents were read from (``str``), DERIVED
+#: from the same cells.
+SSA_CALL_SHAPE = declare_page("ssa_call_shape", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("caller", K.NAME), RowField("actual", K.VALUE_ID),
+), tuple)
+SSA_CALL_SHAPE_EVIDENCE = declare_page("ssa_call_shape_evidence", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("caller", K.NAME), RowField("actual", K.VALUE_ID),
+), str)
+#: ``propagate_repository_ssa_call_metadata``: the functions of a module that
+#: mention one value id of one source owner's id space, ``(owner scope, id)``
+#: -> sorted function names, DERIVED(the value's ``ssa_value`` cell in each).
+CROSS_FUNCTION_REFERENCES = declare_page("cross_function_references", (
+    RowField("owner", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
+#: ``Unsourced`` reasons for the three pages above: the value has no
+#: ``ssa_value`` cell in the function that holds it, or the contract changed
+#: over the same cells.
+SSA_CALL_EDGE_CELL_NOT_ON_BOOK = declare_reason("ssa_call_edge_cell_not_on_book")
+SSA_CALL_EDGE_CAUSE_NOT_ON_BOOK = declare_reason("ssa_call_edge_cause_not_on_book")
+
+# -- linked-value ABI phase stores (``_class_surface_ssa_program``) ----------
+#: One page per shape store, so a value whose stores disagree is a row rather
+#: than a hunt (``shape_store_report``).  ``(authored function, value id)`` ->
+#: extents.  ``shape.node``: what the planned graph's node says; ``shape.linked``:
+#: what the linked-value ABI contract declares.  REVISE, DERIVED(the node's
+#: ``canonical_value`` cell, and for ``.node`` its shape-transformation state).
+SHAPE_NODE_STORE = declare_page("shape.node", (
+    RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
+SHAPE_LINKED_STORE = declare_page("shape.linked", (
+    RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
+#: Every exact call edge the linked-value phase settles over:
+#: ``(callee, formal id, caller, actual id)`` -> ``"argument"``, DERIVED(the
+#: actual's and the formal's ``canonical_value`` cells).
+CALL_EDGE = declare_page("call_edge", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("caller", K.NAME), RowField("actual", K.VALUE_ID),
+), str)
+
+# -- source numeric scopes (``topological_reducer`` source pursuit) ----------
+#: ``propagate_call_formal_numeric_types``: a call whose callee the source
+#: pursuit reached.  ``(caller numeric scope, call node, callee numeric scope)``
+#: -> True, CONCORD, DERIVED(the call node's identity cell, the callee's
+#: ``function_address`` cell).
+SOURCE_FUNCTION_REACHABILITY = declare_page(
+    "source_function_reachability_concordance", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("callee_scope", K.NAME),
+    ), bool,
+)
+#: ``specialize_python_precision_widths``: the numeric scope a callsite
+#: specialization owns, ``(authored function, receipt digest)`` ->
+#: ``(scope, receipt)``, CONCORD, NOVEL(SOURCE_NUMERIC_SPECIALIZATION) from the
+#: authored function's ``function_address`` cell.
+SOURCE_NUMERIC_SPECIALIZATION_PAGE = declare_page(
+    "source_numeric_specialization_concordance", (
+        RowField("authored_scope", K.SCOPE), RowField("digest", K.NAME),
+    ), tuple,
+)
+SOURCE_NUMERIC_SPECIALIZATION = declare_transform(
+    "source_numeric_specialization", 1,
+)
+#: ``resolve_expression``: the Python identity program a call node resolved
+#: to, ``(numeric scope, node)`` -> descriptor, CONCORD, DERIVED(the node's
+#: identity cell).
+SOURCE_PYTHON_IDENTITY = declare_page("source_python_identity_concordance", (
+    RowField("numeric_scope", K.SCOPE), RowField("node", K.VALUE_ID),
+), tuple)
+
+# -- operation-owned result domains and scalar kernel operands ---------------
+#: ``plan_region_to_ssa_instrs``: the truth type a predicate operation owns,
+#: ``(function scope, closure, region name, output value)`` -> ``(opcode,
+#: "bool")``, CONCORD, DERIVED(the output's ``canonical_value`` cell).
+OPERATOR_RESULT_TYPE = declare_page("operator_result_type_concordance", (
+    RowField("function_scope", K.SCOPE), RowField("closure", K.INDEX),
+    RowField("region", K.NAME), RowField("output", K.VALUE_ID),
+), tuple)
+#: ``lower_tensor_calls_to_repository_ssa``: an exact scalar operand that
+#: crosses by value into a scalar kernel, ``(function, result id)`` ->
+#: ``("scalar_operand", position)``, CONCORD, DERIVED(the result's and the
+#: scalar operand's ``ssa_value`` cells).
+SCALAR_KERNEL_OPERAND = declare_page("scalar_kernel_operand_concordance", (
+    RowField("function", K.SCOPE), RowField("result", K.VALUE_ID),
+), tuple)
+
+#: ``_concord_call_argument_operands``: which operand of the call node produced
+#: each argument binding, ``(read scope, callsite, argument position)`` ->
+#: ``(role, ordinal)``, CONCORD, DERIVED(the operand position's transition /
+#: lexical read binding cell, else the call node's identity cell).
+CALL_ARGUMENT_OPERAND = declare_page("call_argument_operand", (
+    RowField("read_scope", K.SCOPE), RowField("callsite", K.VALUE_ID),
+    RowField("position", K.INDEX),
+), tuple)
+
+#: ``_record_aggregate_ledger_lookup``: every aggregate-ledger lookup, found or
+#: not, ``(owner, value, "ledger_lookup")`` -> ``(state, leaf count, resident
+#: count, node type, expression type, ledger keys, ...)``.  REVISE (each lookup
+#: restates it), DERIVED(the aggregate node's identity cell and the cells of the
+#: leaves still resident in the graph).
+AGGREGATE_LEDGER = declare_page("aggregate_ledger", (
+    RowField("owner", K.SCOPE), RowField("value", K.VALUE_ID),
+    RowField("key", K.LABEL),
+), tuple)
+AGGREGATE_LEDGER_CAUSE_NOT_ON_BOOK = declare_reason(
+    "aggregate_ledger_cause_not_on_book"
+)
+
+#: ``_callsite_specialized_shell_type.record_and_return``: the return shape a
+#: callsite specialization published in one round, ``(caller, callee, call)``
+#: -> ``(shape, dtype)`` per output, REVISE (one column per round, so
+#: ``oscillating_rows`` names a shape that is left and returned to), DERIVED(the
+#: callee's return cells).
+CALLSITE_RETURN_SPECIALIZATION_PAGE = declare_page("callsite_return_specialization", (
+    RowField("caller", K.SCOPE), RowField("callee", K.SCOPE),
+    RowField("call", K.VALUE_ID),
+), tuple)
+#: A specialization round whose published shape changed over the same return
+#: cells (the cause is the settled argument descriptors, which are not cells).
+SPECIALIZATION_ROUND_CAUSE_NOT_ON_BOOK = declare_reason(
+    "specialization_round_cause_not_on_book"
+)
+
+#: ``_propagate_callsite_tensor_specializations``: a call result descriptor
+#: replaced by the callee's exact specialized return, ``(caller, call)`` ->
+#: ``(previous receipt, replacement receipt)``, REVISE, DERIVED(the callee's
+#: return cells, the call node's identity cell).
+CALLSITE_TENSOR_RESULT_SPECIALIZATION = declare_page(
+    "callsite_tensor_result_specialization", (
+        RowField("caller", K.SCOPE), RowField("call", K.VALUE_ID),
+    ), tuple,
+)
+#: The settlement pass's first receipt for a re-proved value, ``(function,
+#: value)`` -> ``(extents, dtype)``, CONCORD, DERIVED(the value's identity cell).
+TENSOR_SHAPE_SETTLEMENT = declare_page("tensor_shape_settlement_concordance", (
+    RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)

@@ -81,6 +81,25 @@ def _frame_table_cell(table: Any, value_id: Any, page: Any) -> Any:
     return current_identity_book().latest_ref(page, (owner, int(value_id)))
 
 
+def _frame_call_cells(graph: Any, callsite_id: Any) -> tuple[Any, ...]:
+    """The cells a call record of ``callsite_id`` in ``graph`` is built from:
+    the call's ``call_binding`` cell (caller read scope, call node), else its
+    node identity ``canonical_value`` cell."""
+
+    from .concordance_declarations import CALL_BINDING
+    from .identity_concordance import current_identity_book
+
+    if graph is None or callsite_id is None:
+        return ()
+    scope = (getattr(graph, "graph", None) or {}).get("lexical_read_scope")
+    if scope is None:
+        return ()
+    bound = current_identity_book().latest_ref(
+        CALL_BINDING, (tuple(scope), int(callsite_id)),
+    )
+    return _frame_cells(bound, _frame_graph_cell(graph, callsite_id))
+
+
 def _frame_post(
     page: Any, row: tuple, fact: Any, *, stage: Any, cells: Any = (),
     mode: Any = None, reason: Any = None,

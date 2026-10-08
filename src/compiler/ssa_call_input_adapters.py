@@ -27,7 +27,14 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
     adapter below, which inserts a Cast. Both sides consume one concordance
     page so another call cannot silently reinterpret the identity.
     """
-    page = current_identity_book().page('exact_region_feed_dtype')
+    from .concordance_declarations import (
+        EXACT_REGION_FEED_DTYPE, PHYSICAL_CALL_INPUT_ADAPTATION,
+    )
+    from .identity_concordance import Derived, Mode
+    from .ssa_record_return_state import ssa_value_identity_cell
+
+    book = current_identity_book()
+    page = book.page('exact_region_feed_dtype')
     changed = 0
     for caller in functions.values():
         for block in caller.blocks.values():
@@ -57,17 +64,21 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                 )):
                     if exact_dtype not in _NUMERIC_DTYPES:
                         continue
+                    # Page ``exact_region_feed_dtype`` row ``(function, value
+                    # id)``: the exact dtype the value is fed (or received) as.
+                    # DERIVED from the value's ``ssa_value`` cell in its own
+                    # function -- the caller's feed value, the callee's formal.
                     facts = (
                         (
-                            ('feed', str(caller.name), int(feed_id)),
-                            (exact_dtype,),
+                            (str(caller.name), int(feed_id)),
+                            (exact_dtype,), caller, int(feed_id),
                         ),
                         (
-                            ('formal', str(callee.name), int(formal.id)),
-                            (exact_dtype,),
+                            (str(callee.name), int(formal.id)),
+                            (exact_dtype,), callee, int(formal.id),
                         ),
                     )
-                    for row, proposed in facts:
+                    for row, proposed, owner, owner_value_id in facts:
                         incumbent = page.latest(row)
                         if incumbent is not None and tuple(incumbent) != proposed:
                             raise ValueError(
@@ -76,7 +87,18 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                                 f'recorded={incumbent!r}, proposed={proposed!r}'
                             )
                         if incumbent is None:
-                            page.set(row, 0, proposed)
+                            value_cell = ssa_value_identity_cell(
+                                owner, owner_value_id, book=book,
+                            )
+                            if value_cell is None:
+                                page.set(row, 0, proposed)
+                            else:
+                                book.post(
+                                    EXACT_REGION_FEED_DTYPE, row, proposed,
+                                    stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                                    provenance=Derived((value_cell,)),
+                                    mode=Mode.CONCORD,
+                                )
 
                     actual_accounting = dict(actual.accounting or {})
                     formal_accounting = dict(formal.accounting or {})

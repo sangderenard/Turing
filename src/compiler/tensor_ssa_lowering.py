@@ -385,14 +385,87 @@ def _settle_operand_shapes(function: Any, values: Any) -> None:
             value.shape = settled
 
 
+def _post_scalar_kernel_operand(
+    module: IRModule, function: Any, row: tuple, fact: tuple, values: Any,
+) -> None:
+    """``scalar_kernel_operand_concordance`` CONCORD, DERIVED(the
+    ``ssa_value`` cells of the result and the scalar operand);
+    ``Unsourced`` when neither has a cell."""
+
+    from .concordance_declarations import (
+        SCALAR_KERNEL_OPERAND, SSA_CALL_EDGE_CELL_NOT_ON_BOOK,
+        TENSOR_SSA_LOWERING,
+    )
+    from .identity_concordance import Derived, Mode, Unsourced
+    from .ssa_record_return_state import ssa_value_identity_cell
+
+    book = identity_book(module)
+    cells = tuple(dict.fromkeys(
+        cell for cell in (
+            ssa_value_identity_cell(function, int(value.id), book=book)
+            for value in values
+        )
+        if cell is not None
+    ))
+    book.post(
+        SCALAR_KERNEL_OPERAND, row, fact, stage=TENSOR_SSA_LOWERING,
+        provenance=(
+            Derived(cells) if cells
+            else Unsourced(SSA_CALL_EDGE_CELL_NOT_ON_BOOK)
+        ),
+        mode=Mode.CONCORD,
+    )
+
+
+def _post_call_edge_fact(
+    module: IRModule, page: Any, row: tuple, fact: Any, cells: Any,
+) -> None:
+    """Post ``fact`` on declared ``page`` REVISE, DERIVED from ``cells``;
+    ``Unsourced`` (listed by the audit) when no cell exists or the fact
+    changed over the same unchanged cells.  A fact the row already holds is
+    not restated."""
+
+    from .concordance_declarations import (
+        SSA_CALL_EDGE_CAUSE_NOT_ON_BOOK, SSA_CALL_EDGE_CELL_NOT_ON_BOOK,
+        TENSOR_SSA_LOWERING,
+    )
+    from .identity_concordance import (
+        ConcordanceRefusal, Derived, Mode, Unsourced,
+    )
+
+    book = identity_book(module)
+    stored = book.pages.get(page.name)
+    if stored is not None and stored.latest(row) == fact:
+        return
+    sources = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+    if sources:
+        try:
+            book.post(
+                page, row, fact, stage=TENSOR_SSA_LOWERING,
+                provenance=Derived(sources), mode=Mode.REVISE,
+            )
+            return
+        except ConcordanceRefusal:
+            reason = SSA_CALL_EDGE_CAUSE_NOT_ON_BOOK
+    else:
+        reason = SSA_CALL_EDGE_CELL_NOT_ON_BOOK
+    book.post(
+        page, row, fact, stage=TENSOR_SSA_LOWERING,
+        provenance=Unsourced(reason), mode=Mode.REVISE,
+    )
+
+
 def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
     tuple[str, int], list[tuple[tuple[int, ...], str]]
 ]:
     """Publish current exact actual/formal contracts after metadata settles."""
 
+    from .concordance_declarations import (
+        SSA_CALL_SHAPE, SSA_CALL_SHAPE_EVIDENCE,
+    )
     from .identity_concordance import record_proven_shape, shape_scope_of
+    from .ssa_record_return_state import ssa_value_identity_cell
 
-    page = identity_book(module).page("ssa_call_shape")
     contracts: dict[
         tuple[str, int], list[tuple[tuple[int, ...], str]]
     ] = {}
@@ -454,8 +527,15 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                         callee_name, int(formal.id),
                         str(caller_name), int(actual.id),
                     )
-                    if page.latest(row) != fact:
-                        page.set(row, len(page.history(row)), fact)
+                    edge_cells = (
+                        ssa_value_identity_cell(
+                            caller, int(actual.id), book=identity_book(module),
+                        ),
+                        ssa_value_identity_cell(
+                            callee, int(formal.id), book=identity_book(module),
+                        ),
+                    )
+                    _post_call_edge_fact(module, SSA_CALL_SHAPE, row, fact, edge_cells)
                     evidence_page = identity_book(module).page(
                         "ssa_call_shape_evidence"
                     )
@@ -470,10 +550,10 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                         and tuple(descriptor.shape or ())
                         else "ssa_occurrence"
                     )
-                    if evidence_page.latest(row) != evidence:
-                        evidence_page.set(
-                            row, len(evidence_page.history(row)), evidence
-                        )
+                    _post_call_edge_fact(
+                        module, SSA_CALL_SHAPE_EVIDENCE, row, evidence,
+                        edge_cells,
+                    )
                     record_proven_shape(
                         shape_scope_of(callee), int(formal.id), extents,
                         actual.dtype,
@@ -1123,6 +1203,7 @@ def propagate_repository_ssa_call_metadata(
     def enrich(
         function, value_id: int, source: SSAValue, *, authoritative: bool = False,
         source_function: Any = None,
+        source_owner: Any = None,
         stage: str = "repository_ssa_enrichment",
     ) -> bool:
         changed = False
@@ -1240,9 +1321,11 @@ def propagate_repository_ssa_call_metadata(
                 }
                 changed = True
             from .identity_concordance import (
+                SHAPE_STATE_PAGE,
                 record_shape_transformation,
                 shape_scope_of,
             )
+            from .ssa_record_return_state import ssa_value_identity_cell
 
             source_rank = int(source_accounting.get(
                 "program_abi_rank", len(source_shape),
@@ -1294,6 +1377,29 @@ def propagate_repository_ssa_call_metadata(
                     ),
                 },
                 role="ssa_value",
+                # The shape was read off the source value: the edge derives
+                # from that value's ``ssa_value`` cell in its own function.
+                source_cells=tuple(
+                    cell for cell in (
+                        ssa_value_identity_cell(
+                            function if source_owner is None else source_owner,
+                            int(source.id),
+                            book=identity_book(module),
+                        ),
+                        # The state the source was last resolved to: when
+                        # that changed, this edge's revision has its cause.
+                        identity_book(module).latest_ref(
+                            SHAPE_STATE_PAGE, (
+                                shape_scope_of(
+                                    function if source_owner is None
+                                    else source_owner
+                                ),
+                                int(source.id),
+                            ),
+                        ),
+                    )
+                    if cell is not None
+                ),
             )
         return changed
 
@@ -1471,10 +1577,21 @@ def propagate_repository_ssa_call_metadata(
             key = (scopes[id(owner_function)], int(value.id))
             scoped_values.setdefault(key, {})[id(value)] = value
             reference_counts.setdefault(key, set()).add(owner_name)
-    reference_count_page = identity_book(module).page("cross_function_references")
+    from .concordance_declarations import CROSS_FUNCTION_REFERENCES
+    from .ssa_record_return_state import ssa_value_identity_cell
+
     for key, owners in reference_counts.items():
         if len(owners) > 1:
-            reference_count_page.set(key, 0, tuple(sorted(owners)))
+            _post_call_edge_fact(
+                module, CROSS_FUNCTION_REFERENCES, key, tuple(sorted(owners)),
+                tuple(
+                    ssa_value_identity_cell(
+                        module.functions[owner], int(key[1]),
+                        book=identity_book(module),
+                    )
+                    for owner in sorted(owners)
+                ),
+            )
 
     def occurrences_of(value_id: int, function: Any) -> tuple[SSAValue, ...]:
         """Occurrences in this source owner's canonical value space."""
@@ -1630,6 +1747,7 @@ def propagate_repository_ssa_call_metadata(
                             authoritative=(
                                 specialized_call and settle_exact_formals
                             ),
+                            source_owner=function,
                         )
                         if specialized_call:
                             changed |= settle_specialized_formal_descriptor(
@@ -1654,6 +1772,7 @@ def propagate_repository_ssa_call_metadata(
                         ):
                             changed |= enrich(
                                 function, int(actual.id), formal,
+                                source_owner=callee,
                             )
 
                     callee_returns = returned(callee)
@@ -1776,20 +1895,24 @@ def propagate_repository_ssa_call_metadata(
                                     or view_descriptor is not None
                                     or material_descriptor is not None
                                 ),
+                                source_owner=callee,
                             )
                             if not authoritative_returns:
                                 changed |= enrich(
-                                    callee, int(callee_value.id), caller_value
+                                    callee, int(callee_value.id), caller_value,
+                                    source_owner=function,
                                 )
                     elif len(callee_returns) == 1 and instruction.res is not None:
                         changed |= enrich(
                             function, int(instruction.res.id), callee_returns[0],
                             authoritative=settle_exact_returns,
+                            source_owner=callee,
                         )
                         if not authoritative_returns:
                             changed |= enrich(
                                 callee, int(callee_returns[0].id),
                                 instruction.res,
+                                source_owner=function,
                             )
                     elif len(callee_returns) > 1 and instruction.res is not None:
                         # An aggregate may be forwarded into a small adapter
@@ -1814,6 +1937,7 @@ def propagate_repository_ssa_call_metadata(
                                             changed |= enrich(
                                                 adapter, int(projected.id), source,
                                                 authoritative=settle_exact_returns,
+                                                source_owner=callee,
                                             )
         settle_exact_formals = False
         settle_exact_returns = False
@@ -5554,13 +5678,13 @@ def lower_tensor_calls_to_repository_ssa(
                                         if not tuple(operand.shape or ())
                                         and not shape_unknown(operand)
                                     )
-                                    identity_book(module).page(
-                                        "scalar_kernel_operand_concordance"
-                                    ).concord(
+                                    scalar = data_args[scalar_position]
+                                    _post_scalar_kernel_operand(
+                                        module, function,
                                         (str(function_name), int(result.id)),
                                         ("scalar_operand", int(scalar_position)),
+                                        (result, scalar),
                                     )
-                                    scalar = data_args[scalar_position]
                                     array = data_args[1 - scalar_position]
                                     if str(scalar.dtype or "").casefold() not in {
                                         "double", "float64",

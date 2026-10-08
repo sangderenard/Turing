@@ -3997,6 +3997,16 @@ SHAPE_SOURCE_NOT_ON_BOOK = declare_reason("shape_source_not_on_book")
 #: A shape state re-resolved over an edge that did not change since the
 #: row's previous revision (the row was withdrawn or re-pointed in between).
 SHAPE_STATE_REDERIVED = declare_reason("shape_state_rederived_over_unchanged_edge")
+#: A binding-kind resolution re-posted over the same ``argument_binding`` cell
+#: with a different requesting kind.
+ARGUMENT_BINDING_RESOLUTION_CAUSE_NOT_ON_BOOK = declare_reason(
+    "argument_binding_resolution_cause_not_on_book"
+)
+#: A loop scope's inner-generation transition re-posted over the same value
+#: cells (the transformation that caused it left no cell).
+LOOP_SCOPE_TRANSITION_CAUSE_NOT_ON_BOOK = declare_reason(
+    "loop_scope_transition_cause_not_on_book"
+)
 
 
 def record_shape_transformation(
@@ -4044,7 +4054,9 @@ def record_shape_transformation(
         source_ref = book.latest_ref(SHAPE_STATE_PAGE, (source_scope, source_id))
         edge_ref = _post_or_unsourced(
             book, SHAPE_EDGE_PAGE, edge_row, edge_fact, stage_object,
-            source_cells or (() if source_ref is None else (source_ref,)),
+            tuple(dict.fromkeys((
+                *source_cells, *(() if source_ref is None else (source_ref,)),
+            ))),
             SHAPE_SOURCE_NOT_ON_BOOK,
         )
     # The same edge, read from its source end: which targets were derived
@@ -4200,6 +4212,7 @@ def withdraw_superseded_shape_derivations(
             else:
                 invalidate_shape_transformation(
                     target_scope, target_id, source_id, reason,
+                    source_scope=source_scope,
                 )
             pending.append((target_scope, target_id, None))
 
@@ -4220,14 +4233,33 @@ def concordant_shape_transformation_state(
 
 def invalidate_shape_transformation(
     scope: Any, value_id: Any, source_id: Any, reason: Any,
+    *, source_scope: Any = None,
 ) -> None:
-    """Record that a target's prior path was superseded upstream."""
+    """Record that a target's prior path was superseded upstream.
 
-    page = current_identity_book().page("shape_transformation_state")
+    The withdrawal derives from the cell of the identity that changed: the
+    source's shape state cell (``source_scope`` defaults to the target's
+    scope -- a dependency inside one function).  A source with no state cell
+    on the book, or one that has not changed since the target's previous
+    revision, leaves the withdrawal without a cause on the book: it is
+    posted ``Unsourced(SHAPE_SOURCE_NOT_ON_BOOK)`` and listed by the audit.
+    """
+
+    book = current_identity_book()
+    page = book.page(SHAPE_STATE_PAGE)
     row = (_shape_key(scope), value_id)
     fact = ("invalidated", source_id, str(reason))
     if page.latest(row) != fact:
-        page.revise(row, fact)
+        source_ref = book.latest_ref(SHAPE_STATE_PAGE, (
+            _shape_key(scope if source_scope is None else source_scope),
+            source_id,
+        ))
+        _post_or_unsourced(
+            book, SHAPE_STATE_PAGE, row, fact,
+            book.registry.declare_stage(str(reason)),
+            () if source_ref is None else (source_ref,),
+            SHAPE_SOURCE_NOT_ON_BOOK,
+        )
 
 
 def committed_sequence_row_layout(
@@ -4889,9 +4921,34 @@ OUTER, CARRIED, INNER = 0, 1, 2
 _GENERATION_NAMES = {OUTER: "outer", CARRIED: "carried", INNER: "inner"}
 
 
+def _post_loop_scope_cell(
+    book: "IdentityBook", row: tuple, column: int, fact: Any, cells: Any,
+) -> None:
+    """One generation cell of a ``loop_scope`` row: the page's COLUMN is the
+    generation, so a cell is posted (REVISE, DERIVED from ``cells``) only
+    when it is the row's next column; a cell already there with the same fact
+    says nothing new; anything else is written as before, raw."""
+
+    page = book.page("loop_scope")
+    if (row, column) in page.cells:
+        if page.cells[(row, column)] != fact:
+            page.set(row, column, fact)
+        return
+    sources = tuple(cell for cell in dict.fromkeys(cells or ()) if cell is not None)
+    if sources and column == len(page.history(row)):
+        book.post(
+            book.registry.page("loop_scope"), row, fact,
+            stage=book.registry.declare_stage("loop_scope_declaration"),
+            provenance=Derived(sources), mode=Mode.REVISE,
+        )
+    else:
+        page.set(row, column, fact)
+
+
 def declare_loop_scope(
     function: Any, loop_node_id: Any, header: str, latch: str,
-    exit_block: str, rebinds: Any,
+    exit_block: str, rebinds: Any, *, boundary_cells: Any = (),
+    rebind_cells: Any = None,
 ) -> None:
     """Declare one loop as a scope whose bindings evolve per iteration.
 
@@ -4902,13 +4959,18 @@ def declare_loop_scope(
     moves code across it must be able to ask where it is, instead of
     recovering it from block names or branch topology that the
     transformation itself may have rewritten.
+
+    ``boundary_cells``: the loop construct's cell(s), which the boundary
+    derives from.  ``rebind_cells(outer, carried, inner)``: the cells of the
+    three generations' values, which each generation derives from.
     """
 
-    page = current_identity_book().page("loop_scope")
+    book = current_identity_book()
+    page = book.page("loop_scope")
     scope = (authored_function_name(function), int(loop_node_id))
-    page.set(
-        (*scope, "boundary"), 0,
-        (str(header), str(latch), str(exit_block)),
+    _post_loop_scope_cell(
+        book, (*scope, "boundary"), 0,
+        (str(header), str(latch), str(exit_block)), boundary_cells,
     )
     rebinds = tuple(rebinds)
     outer_counts = Counter(int(rebind[0]) for rebind in rebinds)
@@ -4931,12 +4993,23 @@ def declare_loop_scope(
             )
         )
         row = (*scope, row_key)
-        page.set(row, OUTER, int(outer_id))
-        page.set(row, CARRIED, int(carried_id))
-        page.set(row, INNER, int(inner_id))
-        page.set(row, INNER + 1, ("graph", int(graph_outer), int(graph_inner)))
+        cells = (
+            () if rebind_cells is None
+            else tuple(rebind_cells(
+                int(outer_id), int(carried_id), int(inner_id),
+            ))
+        )
+        _post_loop_scope_cell(book, row, OUTER, int(outer_id), cells)
+        _post_loop_scope_cell(book, row, CARRIED, int(carried_id), cells)
+        _post_loop_scope_cell(book, row, INNER, int(inner_id), cells)
+        _post_loop_scope_cell(
+            book, row, INNER + 1,
+            ("graph", int(graph_outer), int(graph_inner)), cells,
+        )
         if source_bindings:
-            page.set(row, INNER + 2, ("bindings", source_bindings))
+            _post_loop_scope_cell(
+                book, row, INNER + 2, ("bindings", source_bindings), cells,
+            )
 
 
 def rebind_loop_scope_inner(
@@ -4945,6 +5018,8 @@ def rebind_loop_scope_inner(
     declared_inner: int,
     resident_inner: int,
     reason: Any,
+    *,
+    cells: Any = (),
 ) -> None:
     """Register a transformation of the value crossing a loop backedge.
 
@@ -4953,16 +5028,29 @@ def rebind_loop_scope_inner(
     resident SSA value for that same inner generation.  Record that transition
     separately so the original declaration remains historical evidence while
     every later consumer sees the resident identity.
+
+    ``cells``: the cells of the declared and resident values, which the
+    transition derives from.
     """
 
-    page = current_identity_book().page("loop_scope_inner_transition")
+    book = current_identity_book()
+    page = book.page("loop_scope_inner_transition")
     row = (
         authored_function_name(function), int(loop_node_id),
         int(declared_inner),
     )
+    fact = (int(resident_inner), str(reason))
+    sources = tuple(cell for cell in dict.fromkeys(cells or ()) if cell is not None)
+    if sources:
+        _post_or_unsourced(
+            book, book.registry.page("loop_scope_inner_transition"), row,
+            fact, book.registry.declare_stage("loop_scope_declaration"),
+            sources, LOOP_SCOPE_TRANSITION_CAUSE_NOT_ON_BOOK,
+        )
+        return
     history = page.history(row)
     column = history[-1][0] + 1 if history else 0
-    page.set(row, column, (int(resident_inner), str(reason)))
+    page.set(row, column, fact)
 
 
 def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
@@ -5054,12 +5142,18 @@ def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
                 ), None)
                 if resident is None or resident == int(rebind["inner"]):
                     continue
+                from .ssa_record_return_state import ssa_value_identity_cell
+
                 rebind_loop_scope_inner(
                     function_name,
                     loop_node_id,
                     declared_inner,
                     resident,
                     "completed_module_latch_projection",
+                    cells=tuple(
+                        ssa_value_identity_cell(function, value_id, book=book)
+                        for value_id in (declared_inner, resident)
+                    ),
                 )
                 receipt = {
                     "function": str(function_name),
@@ -5410,29 +5504,41 @@ def materializing_binding_kind(
     what it is, and every callsite naming it gets the kind that works.
     """
 
+    from .concordance_declarations import ARGUMENT_BINDING
+    from .concordance_declarations import ARGUMENT_BINDING_RESOLUTION
+
     page = book.page("argument_binding")
-    for _callsite, fact in argument_binding_history(
-        page, str(callee_symbol), int(formal_id),
-    ):
-        if not (isinstance(fact, tuple) and len(fact) == 2):
+    callee_symbol = str(callee_symbol)
+    for row in page.scope_rows(callee_symbol):
+        if not (len(row) == 3 and row[1] == int(formal_id)):
             continue
-        recorded_kind, recorded_source = fact
-        if not isinstance(recorded_source, int):
-            continue
-        if int(recorded_source) != int(source_id):
-            continue
-        if str(recorded_kind) == "caller_storage":
-            resolution_page = book.page("argument_binding_resolution")
-            resolution_row = (
-                str(callee_symbol), int(formal_id), int(source_id),
-            )
-            history = resolution_page.history(resolution_row)
-            column = history[-1][0] + 1 if history else 0
-            resolution_page.set(resolution_row, column, (
-                "caller_storage", str(kind),
-                "materializing_binding_kind",
-            ))
-            return "caller_storage"
+        for column, fact in page.history(row):
+            if not (isinstance(fact, tuple) and len(fact) == 2):
+                continue
+            recorded_kind, recorded_source = fact
+            if not isinstance(recorded_source, int):
+                continue
+            if int(recorded_source) != int(source_id):
+                continue
+            if str(recorded_kind) == "caller_storage":
+                resolution_row = (
+                    callee_symbol, int(formal_id), int(source_id),
+                )
+                resolution = (
+                    "caller_storage", str(kind), "materializing_binding_kind",
+                )
+                stored = book.pages.get(ARGUMENT_BINDING_RESOLUTION.name)
+                if stored is None or stored.latest(resolution_row) != resolution:
+                    # DERIVED from the ``argument_binding`` cell that proved
+                    # the slot is caller storage.
+                    _post_or_unsourced(
+                        book, ARGUMENT_BINDING_RESOLUTION, resolution_row,
+                        resolution,
+                        book.registry.declare_stage("materializing_binding_kind"),
+                        (Ref(ARGUMENT_BINDING, row, column),),
+                        ARGUMENT_BINDING_RESOLUTION_CAUSE_NOT_ON_BOOK,
+                    )
+                return "caller_storage"
     return str(kind)
 
 

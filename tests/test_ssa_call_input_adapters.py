@@ -189,10 +189,10 @@ def test_exact_region_feed_restores_physical_call_view_after_projection():
         assert produced.dtype == 'bool'
         assert adapt_physical_call_inputs(functions) == 0
         assert book.page('exact_region_feed_dtype').latest(
-            ('feed', 'caller', 37)
+            ('caller', 37)
         ) == ('float64',)
         assert book.page('exact_region_feed_dtype').latest(
-            ('formal', 'region', 40)
+            ('region', 40)
         ) == ('float64',)
     finally:
         end_identity_book(token)

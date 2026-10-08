@@ -968,6 +968,10 @@ def evaporate_unrolled_loops(
         attributes["unrolled_from"] = int(source_id)
         cloned["attributes"] = attributes
         graph.G.add_node(clone_id, **cloned)
+        # The clone's ``canonical_value`` row is NOVEL from the cell of the
+        # body node it copies, so its operand edges (below) find a sourced
+        # row instead of an Unsourced one synthesized by the reducer.
+        _post_planner_node_row(graph, clone_id, "loop_body_clone", int(source_id))
         from ..common.tensors.topological_reducer import _set_operands
 
         _set_operands(graph, clone_id, list(parents), cause=_LOOP_BODY_CLONE)

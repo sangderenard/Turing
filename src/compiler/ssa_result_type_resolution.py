@@ -28,6 +28,19 @@ def equivalent_physical_layout(left, right):
     return all(dimension >= 0 for shape in shapes for dimension in shape) and prod(shapes[0]) == prod(shapes[1])
 
 
+def _value_cells(*pairs):
+    """The ``ssa_value`` cells of ``(function, value)`` pairs that the book
+    holds (the proof of a proposal was read from these values)."""
+    from .ssa_record_return_state import ssa_value_identity_cell
+
+    cells = []
+    for function, value in pairs:
+        cell = ssa_value_identity_cell(function, int(value.id))
+        if cell is not None and cell not in cells:
+            cells.append(cell)
+    return tuple(cells)
+
+
 def settle_call_result_types(functions, emit_outputs, function_values):
     ledger = TransformationLedger((
         TransformationRule('provisional', 1),
@@ -41,7 +54,8 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             physical = (accounting.get('physical_dtype') or accounting.get('program_abi_storage')) and value.dtype not in {None, '', 'unknown'}
             ledger.propose((function.name, int(value.id)),
                 'physical_storage' if physical else 'provisional',
-                ('initial', _type(value)), after=_type(value))
+                ('initial', _type(value)), after=_type(value),
+                sources=_value_cells((function, value)))
 
     def bindings():
         for caller in functions.values():
@@ -143,7 +157,12 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             rule = 'physical_storage' if source_priority == 3 else 'callee_output'
             previous_priority = ledger.incumbent_priority(identity)
             accepted = ledger.propose(identity, rule,
-                (callee.name, int(source.id), _type(source)), before=_type(target), after=_type(source))
+                (callee.name, int(source.id), _type(source)), before=_type(target), after=_type(source),
+                sources=_value_cells((callee, source), (caller, target)) + tuple(
+                    cell for cell in (
+                        ledger.decision_cell((callee.name, int(source.id))),
+                    ) if cell is not None
+                ))
             winner = ledger.incumbent_target(identity)
             if winner != _type(target):
                 target.dtype, target.shape, target.device = winner

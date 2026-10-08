@@ -87,6 +87,7 @@ from .frame_identity_book import (
     _argument_binding_fact as _argument_binding_fact,
     _frame_binding_value_ids as _frame_binding_value_ids,
     _frame_book_scope as _frame_book_scope,
+    _frame_call_cells as _frame_call_cells,
     _frame_cells as _frame_cells,
     _frame_graph_cell as _frame_graph_cell,
     _frame_mint as _frame_mint,
@@ -3662,14 +3663,21 @@ def _prune_unused_callee_formals_once(
         )
         from .identity_concordance import current_identity_book
 
-        pruned_page = current_identity_book().page(
-            "pruned_callee_formal_concordance"
+        from .concordance_declarations import (
+            FRAME_BINDING as _PRUNE_FRAME_BINDING,
+            PRUNED_CALLEE_FORMAL as _PRUNED_CALLEE_FORMAL,
         )
+
+        # A formal no instruction references (or a superseded placeholder):
+        # DERIVED from its own ``ssa_value`` cell in the callee.
         removed_ids = {
             int(callee.args[index].id) for index in removable_indices
-            if pruned_page.concord(
+            if _frame_post(
+                _PRUNED_CALLEE_FORMAL,
                 (str(callee_name), int(callee.args[index].id)), "unused",
-            ) == "unused"
+                stage=_PRUNE_FRAME_BINDING,
+                cells=(_frame_value_cell(callee, callee.args[index].id),),
+            ) is not None
         }
         for call in callers:
             old_output_position = call.attributes.get(
@@ -15115,7 +15123,10 @@ def _class_surface_ssa_program(
     # missing edge is visible as an absence rather than inferred from a fact
     # that never arrives.  A scalar argument with no edge here can never
     # receive its caller's literal, however well the propagation works.
-    edge_page = _shape_book().page("call_edge")
+    from .concordance_declarations import (
+        CALL_EDGE as _CALL_EDGE,
+        LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
+    )
     linked_value_edges = []
     from .hierarchical_plan import PlanCall as _ABIPlanCall
     for planned_shell in planned_shells:
@@ -15145,7 +15156,14 @@ def _class_surface_ssa_program(
                     str(caller_graph.graph.get("function_name")),
                     int(caller_id),
                 )
-                edge_page.set(edge_row, 0, "argument")
+                _frame_post(
+                    _CALL_EDGE, edge_row, "argument",
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(
+                        _frame_graph_cell(caller_graph, int(caller_id)),
+                        _frame_graph_cell(callee_graph, int(callee_id)),
+                    ),
+                )
             # Results carry the same exact value contract in the opposite
             # direction.  Keeping them in this fixed point lets a shaped
             # callee return feed the next call before either caller partitions
@@ -15453,8 +15471,14 @@ def _class_surface_ssa_program(
         abi_guard.round(changed)
     # One page per store, so a value whose stores disagree is a row rather
     # than a hunt.
-    _node_page = _shape_book().page("shape.node")
-    _linked_page = _shape_book().page("shape.linked")
+    from .concordance_declarations import (
+        LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
+        SHAPE_LINKED_STORE as _SHAPE_LINKED_STORE,
+        SHAPE_NODE_STORE as _SHAPE_NODE_STORE,
+    )
+    from .identity_concordance import (
+        Mode as _ShapeMode, SHAPE_STATE_PAGE as _SHAPE_STATE_PAGE,
+    )
     for _graph in planned_graphs_by_shell.values():
         _name = _abi_shape_scope_of(_graph)
         _contracts = linked_value_abi_by_graph.get(id(_graph), {})
@@ -15463,17 +15487,38 @@ def _class_surface_ssa_program(
             _row = (_name, _value_id)
             _tensor = _data.get("tensor") or {}
             _extents = tuple(_tensor.get("shape") or ())
+            _node_cell = _frame_graph_cell(_graph, _value_id)
             if _extents:
-                _node_page.set(_row, 0, _extents)
+                _frame_post(
+                    _SHAPE_NODE_STORE, _row, _extents,
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(
+                        _node_cell,
+                        _shape_book().latest_ref(
+                            _SHAPE_STATE_PAGE, (_name, _value_id),
+                        ),
+                    ),
+                    mode=_ShapeMode.REVISE,
+                )
             _contract = _contracts.get(_value_id) or {}
             _declared = tuple(_contract.get("shape") or ())
             if _declared:
-                _linked_page.set(_row, 0, tuple(map(int, _declared)))
+                _frame_post(
+                    _SHAPE_LINKED_STORE, _row, tuple(map(int, _declared)),
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(_node_cell,), mode=_ShapeMode.REVISE,
+                )
 
     # One page per store, so a value whose stores disagree is a row rather
     # than a hunt.
-    _node_page = _shape_book().page("shape.node")
-    _linked_page = _shape_book().page("shape.linked")
+    from .concordance_declarations import (
+        LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
+        SHAPE_LINKED_STORE as _SHAPE_LINKED_STORE,
+        SHAPE_NODE_STORE as _SHAPE_NODE_STORE,
+    )
+    from .identity_concordance import (
+        Mode as _ShapeMode, SHAPE_STATE_PAGE as _SHAPE_STATE_PAGE,
+    )
     for _graph in planned_graphs_by_shell.values():
         _name = _abi_shape_scope_of(_graph)
         _contracts = linked_value_abi_by_graph.get(id(_graph), {})
@@ -15482,12 +15527,27 @@ def _class_surface_ssa_program(
             _row = (_name, _value_id)
             _tensor = _data.get("tensor") or {}
             _extents = tuple(_tensor.get("shape") or ())
+            _node_cell = _frame_graph_cell(_graph, _value_id)
             if _extents:
-                _node_page.set(_row, 0, _extents)
+                _frame_post(
+                    _SHAPE_NODE_STORE, _row, _extents,
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(
+                        _node_cell,
+                        _shape_book().latest_ref(
+                            _SHAPE_STATE_PAGE, (_name, _value_id),
+                        ),
+                    ),
+                    mode=_ShapeMode.REVISE,
+                )
             _contract = _contracts.get(_value_id) or {}
             _declared = tuple(_contract.get("shape") or ())
             if _declared:
-                _linked_page.set(_row, 0, tuple(map(int, _declared)))
+                _frame_post(
+                    _SHAPE_LINKED_STORE, _row, tuple(map(int, _declared)),
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(_node_cell,), mode=_ShapeMode.REVISE,
+                )
 
     for planned_graph in planned_graphs_by_shell.values():
         contracts = linked_value_abi_by_graph.get(id(planned_graph), {})
@@ -29062,7 +29122,8 @@ def _class_surface_ssa_program(
                     "ssa_sequence_operation"
                 ))
             ),
-        ))
+        ), sources=_frame_call_cells(caller_graph, planned_call.callsite_id),
+            stage=FRAME_BINDING)
         call_expression = call_data.get("expr_obj")
         call_position = (
             int(getattr(call_expression, "end_lineno", 0) or 0),
@@ -32832,9 +32893,27 @@ def _class_surface_ssa_program(
                     for (_caller_id, callee_id), argument in zip(
                         record.argument_bindings, marker.args
                     ):
-                        scheduled_call_sources[
-                            (*scheduled_key, int(callee_id))
-                        ] = argument
+                        from .concordance_declarations import (
+                            FRAME_BINDING as _SCHEDULED_FRAME_BINDING,
+                            SCHEDULED_CALL_ARGUMENT as _SCHEDULED_CALL_ARGUMENT,
+                        )
+                        from .identity_concordance import Mode as _ScheduledMode
+
+                        # The marker's operand, DERIVED from its own
+                        # ``ssa_value`` cell and the formal it feeds.
+                        _frame_post(
+                            _SCHEDULED_CALL_ARGUMENT,
+                            (
+                                scheduled_call_sources.scope,
+                                (*scheduled_key, int(callee_id)),
+                            ),
+                            argument, stage=_SCHEDULED_FRAME_BINDING,
+                            cells=(
+                                _frame_value_cell(caller, argument.id),
+                                _frame_value_cell(callee, callee_id),
+                            ),
+                            mode=_ScheduledMode.REVISE,
+                        )
                 if eligible:
                     call_arguments = []
                     constants = []
@@ -36422,14 +36501,24 @@ def _class_surface_ssa_program(
                         # hands it a one-element array must not turn it into a
                         # span, which the pass would then push onto every other
                         # caller's scalar.
+                        from .concordance_declarations import (
+                            FRAME_BINDING as _KERNEL_FRAME_BINDING,
+                            KERNEL_BY_VALUE_FORMAL as _KERNEL_BY_VALUE_FORMAL,
+                        )
                         by_value_kernel_formal = bool(
                             callee.metadata.get("llvm_argument_names")
                         ) and str(formal.dtype or "") != "ptr" and (
-                            current_identity_book().page(
-                                "kernel_by_value_formal_concordance"
-                            ).concord(
+                            # The formal crosses by value: DERIVED from the
+                            # formal's and the actual's ``ssa_value`` cells.
+                            _frame_post(
+                                _KERNEL_BY_VALUE_FORMAL,
                                 (str(callee.name), int(formal.id)), "by_value",
-                            ) == "by_value"
+                                stage=_KERNEL_FRAME_BINDING,
+                                cells=(
+                                    _frame_value_cell(callee, formal.id),
+                                    _frame_value_cell(caller, actual.id),
+                                ),
+                            ) is not None
                         )
                         actual_rank = max(
                             len(tuple(actual.shape or ())),
