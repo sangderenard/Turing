@@ -75,6 +75,7 @@ from .concordance_declarations import (
     FUNCTION_OUTPUT,
     FUNCTION_PARAMETER,
     GRAPH_ID_WITHOUT_CANONICAL_CELL,
+    INGESTION_VALUE,
     LEXICAL_READ_BINDING,
     LOAD,
     LOOP_CARRIED_BINDING,
@@ -4178,8 +4179,9 @@ class _ControlSSABuilder:
 
         if self.lexical_read_scope is None or graph_id is None:
             return None
-        return self._book().latest_ref(
-            CANONICAL_VALUE, (self.lexical_read_scope, int(graph_id)),
+        row = (self.lexical_read_scope, int(graph_id))
+        return self._book().latest_ref(CANONICAL_VALUE, row) or (
+            self._book().latest_ref(INGESTION_VALUE, row)
         )
 
     def _declared_cell(self, page_name: str, row: tuple) -> Ref | None:
@@ -15507,8 +15509,11 @@ def lower_control_sections_to_ssa(
 
         if lexical_read_scope is None or value_id is None:
             return None
-        return _book().latest_ref(
-            CANONICAL_VALUE, (tuple(lexical_read_scope), int(value_id)),
+        row = (tuple(lexical_read_scope), int(value_id))
+        # A node a specialized copy added after the canonical relabel has its
+        # ``ingestion_value`` row in the copy's scope and no canonical row.
+        return _book().latest_ref(CANONICAL_VALUE, row) or _book().latest_ref(
+            INGESTION_VALUE, row,
         )
 
     for uniform in getattr(control, "uniforms", ()) or ():
