@@ -21,6 +21,14 @@ contract = ExtractionContract(
 
 original = shell._concordant_function_aliases
 
+def _rebind_everywhere(name, old, new):
+    """Rebind ``name`` in every compiler module that imported it (the shell re-exports it)."""
+
+    for module_name, module in tuple(sys.modules.items()):
+        if module_name.startswith("src.compiler.") and getattr(module, name, None) is old:
+            setattr(module, name, new)
+
+
 def traced(function, *, include_output_identities=False):
     try:
         return original(
@@ -43,7 +51,7 @@ def traced(function, *, include_output_identities=False):
             )
         raise
 
-shell._concordant_function_aliases = traced
+_rebind_everywhere("_concordant_function_aliases", original, traced)
 try:
     shell.lower_ast_source_to_ssa(
         source_path.read_text(encoding="utf-8"),
@@ -54,4 +62,4 @@ try:
         progress=lambda message: print(f"[lower] {message}", flush=True),
     )
 finally:
-    shell._concordant_function_aliases = original
+    _rebind_everywhere("_concordant_function_aliases", traced, original)

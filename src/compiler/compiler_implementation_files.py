@@ -37,4 +37,5 @@ COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/late_source_recovery.py",
     "src/compiler/shortfall_settlement.py",
     "src/compiler/dead_storage_pruning.py",
+    "src/compiler/function_alias_concordance.py",
 )
