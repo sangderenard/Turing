@@ -1095,19 +1095,21 @@ class CorrelationTable:
         book = identity_book(module)
         registered = book.registry.pages
         private = set(book.registry.private_pages) | set(_PRIVATE_PAGE_NAMES)
-        sourced: set[Any] = set()
+        # (All three private pages first: reading one back from the spill file
+        # posts a receipt, which must be on the book before it is measured.)
         edge_page = book.pages.get(EDGE_PAGE.name)
+        mint_page = book.pages.get(MINT_PAGE.name)
+        unsourced_page = book.pages.get(UNSOURCED_PAGE.name)
+        sourced: set[Any] = set()
         if edge_page is not None:
             sourced.update(row[0] for row in edge_page.rows())
         minted_with_edge: set[int] = set()
-        mint_page = book.pages.get(MINT_PAGE.name)
         if mint_page is not None:
             for row in mint_page.rows():
                 sourced.add(row[0])
                 if row[1] is not None:
                     minted_with_edge.add(int(row[1]))
         tags: dict[tuple[str, Any], str] = {}
-        unsourced_page = book.pages.get(UNSOURCED_PAGE.name)
         if unsourced_page is not None:
             for row in unsourced_page.rows():
                 tags[(row[0], row[1])] = row[2]
@@ -6660,16 +6662,22 @@ def _prepare_log(book: IdentityBook, level: IdentityLogLevel) -> None:
     """Before a log that prints a private edge page's rows, read back the rows
     spilled pages own: the page is then whole for the whole log, and the
     receipts of the reads are posted before the first line, not under it."""
-    if book.__dict__.get("_spill") is None or level < IdentityLogLevel.FACTS:
+    if book.__dict__.get("_spill") is None:
         return
     from .identity_spill import PARTITIONED, make_whole
 
     for part in PARTITIONED:
         page = dict.get(book.pages, part)
-        if (
-            page is not None and page.__dict__.get("_detached")
+        if page is None or not page.__dict__.get("_detached"):
+            continue
+        prints = (
+            level >= IdentityLogLevel.FACTS
             and level >= _page_rows_level(book, part)
-        ):
+        )
+        # (Below FULL the log ends with the unsourced tally, which reads the
+        # unsourced rows of every page.)
+        tally = part == UNSOURCED_PAGE.name and level is not IdentityLogLevel.FULL
+        if prints or tally:
             make_whole(book, part, "log")
 
 

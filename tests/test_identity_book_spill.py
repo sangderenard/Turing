@@ -966,3 +966,30 @@ def test_a_book_spilled_and_reloaded_at_random_is_the_book_never_spilled(seed):
                 assert kept(mine["rows"]) == kept(section["rows"]), name
             elif name != "<unsourced tally>":
                 assert mine["rows"] == section["rows"], name
+
+
+def test_the_unsourced_detector_scans_a_spilled_book_without_reading_it_back():
+    from types import SimpleNamespace
+
+    from src.compiler.identity_concordance import CorrelationTable
+
+    rows = populated()
+    book = rows.book
+    module = SimpleNamespace(metadata={"identity_book": book}, functions={})
+    before = CorrelationTable()._unsourced_worklist(module)
+    assert before[0], "the raw revisions are unsourced cells"
+    book.spill_pages([COLD, COLD2], trigger="explicit")
+    posted = set(book.pages[PAGE_SPILL_RECEIPT.name].rows())
+    after = CorrelationTable()._unsourced_worklist(module)
+    # the receipts the spill (and the scan's own reads of the edge rows)
+    # posted are sourced cells: no new finding
+    assert after == before
+    # the scan borrowed the pages: they are still out; the only reads it made
+    # were of the private edge rows, which it needs in whole, and each of
+    # those is a receipt on the book before the scan measured anything
+    assert set(book.spilled_pages()) == {COLD, COLD2}
+    receipts = book.pages[PAGE_SPILL_RECEIPT.name]
+    for row in set(receipts.rows()) - posted:
+        fact = receipts.latest(row)
+        assert fact.action == "reload" and PAGE not in fact.parts, fact
+        assert set(fact.parts) <= set(PARTITIONED)

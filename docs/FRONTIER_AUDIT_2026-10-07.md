@@ -270,6 +270,26 @@ uncommitted work in the deleted worktrees is lost; committed lane branches survi
   `--budget-bytes` comparing the emitted-C sha256, then the N=2 parity and solve gates —
   on the user's say-so. Watch for `ConcordanceRefusal` "source cell does not exist",
   `ProjectedScopeRead` on a node a region should hold, and the materialised-row count.
+  **Cold-page spill landed** (`identity_spill.py`, `page_lifecycle.py`; 35 unit tests on
+  hand-posted rows, no compile): a page no later stage touches (`PAGE_LIFECYCLE`, read
+  statically per function, conservative) and the edge rows it owns are written to the
+  book's lzma segment file at the stage boundary after its `cold_after` stage and dropped
+  from RAM, when the work contract says `spill_cold_pages` (env `TURING_SPILL_COLD_PAGES`)
+  or a boundary is over `memory_budget_bytes` (a release item after the memos). Any read
+  (`__getattr__` on the deleted tables) or write/source (`post`) reads it back; each spill,
+  reload and refusal is a `page_spill_receipt` row derived from the policy cell. Pages whose
+  tables a reader holds (`sys.getrefcount`) or whose facts do not pickle are refused, not
+  spilled. `compile: end` and the finished native build spill what is left, so
+  `module.metadata["identity_book"]` is kept with its cold pages out. Python returns freed
+  objects to its allocator, not the OS: on a synthetic 450k-cell book, spilling 2/3 of the
+  cells dropped the working set 17%, but the next 450k cells then cost 305 MiB instead of
+  813 MiB (holes reused). **Risk list for the first compile:** a function the static
+  classification put in the wrong stage (costs reloads, not answers); a table reference
+  held across a boundary that `getrefcount` cannot see (a C-level iterator); the compile-tail
+  unsourced detector and the log read every edge partition back (the peak at the tail equals
+  the unspilled book's, then `compile: end` spills again); a spill file that grows by one
+  segment per re-spill. First run: `TURING_SPILL_COLD_PAGES=1 profile_memory_n2.py 2`,
+  compare emitted-C sha256 and the `page_spill_receipt` count per page — on the user's say-so.
 
 ## 4. Next walls (measured)
 
