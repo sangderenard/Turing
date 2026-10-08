@@ -146,13 +146,34 @@ Not merged: `fix/raw-primitive-posts` (19 commits; being rebased by its author o
 488bc9a0, then merge item 13); the two uncommitted in-progress moves in the split
 worktrees (`lexical_control_placement.py`, `source_control_retention.py`).
 
-**First N=4 attempt:** the scratch driver stopped before any lowering — its
-column-coverage guard found 139 of 303 state columns absent from `craft_machine_columns`
-(the 19 thrusters' throttle/limits/max_thrust/propellant/rk-stage delivered values, the
-stage gimbal, tank supply, inertia, mass and centre-of-mass columns). Decision given:
-the driver takes every column from the authored source the game uses
-(`OrbitalJumper._initial_columns` / the MachineCraft state construction), never invented
-values, then the N=4 lowering + parity runs.
+**N=4 native: DONE (2026-10-08).** `PARITY 305 column(s) bit-exact, 0 mismatched`
+(303 state columns + `dt` + `telemetry`; Python and native telemetry identical). The
+driver takes every column from `MachineCraft._initial_columns`, the same method
+`OrbitalJumper.__init__` uses, with the arguments `OrbitalGame` passes (`orbital_game.py:761`:
+`GravityCenter` at the origin with `MU_EARTH`, `_circular_state(MU_EARTH, CRAFT_RADIUS_M, 0.0)`,
+identity attitude, zero angular velocity, `green_coast=True`) — 1,332 columns from the 35
+pieces' outputs, none unprovided. End to end 1,360 s (22.7 min), ~21 GB.
+
+| Stage | Time |
+|---|---|
+| piece load + authored columns | 87 s |
+| source closure | 7 s |
+| topology reduction | 10 s |
+| deployment select | 139.5 s (`extract-dispatch-subgraphs`: restore 68 s, copy_shallow 26 s; callsite tensor specialization on the 18,738-node catalogue 18.6 s) |
+| deployment instantiate | 141 s |
+| call-topology planning (40 shells) | 16.5 s |
+| SSA lowering (1,066 functions, 35 exports) | **850 s — of which ABI settlement round 1 = 681 s** |
+| pre-native dominance repair | 18 s |
+| C emission + compile/link | 30 s + 10 s |
+| Python lane + native prepare (346 buffers) + run | 7.5 s (native window 2.4 s) |
+
+**The N=4 wall:** ABI settlement round 1 sits in `_fold_callsite_structural_values`
+(glsl_deployment_strategy.py ~21921): the dead-metadata loop removes ONE node per
+whole-graph scan and restarts (`while dead_metadata: for node in tuple(G.nodes): ... break`),
+quadratic in nodes × removals; rounds 2+ take 13-27 s. Invisible at N=2 (whole settlement
+~55 s). Lane `fix/dead-metadata-worklist` dispatched. Note: the cached pieces are now
+STALE against the merged compiler (the driver loaded them without rebuilding; the game's
+own path would rebuild all 35, ~26 min).
 
 ### 3c. Lanes running after the merge (dispatched 2026-10-08, all Sonnet, off `main` 887a858b)
 
