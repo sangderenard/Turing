@@ -240,9 +240,25 @@ uncommitted work in the deleted worktrees is lost; committed lane branches survi
   written to the lzma log and dropped from RAM, re-readable on demand), edges kept;
   (3) the cap's release set is small until (1)/(2) exist (the callsite shell-type cache
   and child-signature results cannot be dropped mid-compile without re-planning).
+  **Copy-on-read landed** (005ac869, 86f70540, 2319cf49; 22 unit tests on a real book,
+  no compile): `fork_read_scope` posts only the `scope_origin` row
+  (`ScopeFork(..., copy_on_read=True)`); a row under a fork with no cell of its own reads
+  as the origin's row AS OF THE FORK (snapshot by clock stamp, recursing fork-of-fork), so
+  later origin revisions never leak in; the first write/revise/post or use as a source
+  materialises column 0 with the origin's fact DERIVED from the origin's cell (stage
+  `read_scope_fork`, CONCORD) — edges identical to the eager copy for every row that is
+  ever touched; projection composes; in-place overwrite of an origin cell materialises the
+  forks' rows first. ~70 enumeration sites classified (table in the lane report);
+  `rows()`/`cells`/`stamps` stay materialised-only by design. **Risk list for the first
+  compile:** an unscoped scan that silently relied on duplicate fork rows;
+  `edges_out_of(origin)` not listing unwritten fork cells; `fork_operand_position_scope`
+  (function-subgraph forks) is still eager and forces materialisation — the next memory
+  target; closed-latch raw copies refuse at first write, not fork time; `scope_rows(fork)`
+  walks the origin on every call (CPU).
   First compile after this: `profile_memory_n2.py 2 --trace`, then with a small
   `--budget-bytes` comparing the emitted-C sha256, then the N=2 parity and solve gates —
-  on the user's say-so.
+  on the user's say-so. Watch for `ConcordanceRefusal` "source cell does not exist",
+  `ProjectedScopeRead` on a node a region should hold, and the materialised-row count.
 
 ## 4. Next walls (measured)
 
