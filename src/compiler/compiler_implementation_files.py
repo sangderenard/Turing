@@ -44,4 +44,5 @@ COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/record_field_lowering.py",
     "src/compiler/field_slot_recovery.py",
     "src/compiler/sequence_expression_ops.py",
+    "src/compiler/sequence_row_projection.py",
 )
