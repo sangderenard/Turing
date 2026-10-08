@@ -51,9 +51,10 @@ def main() -> int:
     # itself -- exactly what step_with_dt_control_used does, minus its
     # separate while-loop retry logic.
     root_source = (
-        "def root(metrics, targets, dx, distribution):\n"
+        "def root(metrics, targets, dx, distribution, dt_current):\n"
         "    coerced = coerce_metrics(metrics)\n"
-        "    dt_pen = _propose_dt_pen(coerced, targets, dx, distribution)\n"
+        "    dt_pen = _propose_dt_pen(\n"
+        "        coerced, targets, dx, distribution, dt_current)\n"
         "    return coerced.hard_failure + dt_pen\n"
     )
     source = real_source + "\n\n" + root_source
@@ -70,6 +71,8 @@ def main() -> int:
         ],
         "values": [
             {"function": "root", "parameter": "dx", "storage": "scalar",
+             "dtype": "float64", "rank": 0, "python_type": "builtins.float"},
+            {"function": "root", "parameter": "dt_current", "storage": "scalar",
              "dtype": "float64", "rank": 0, "python_type": "builtins.float"},
             {"function": "root", "parameter": "distribution", "storage": "scalar",
              "dtype": "int64", "rank": 0, "python_type": "builtins.NoneType"},
@@ -103,9 +106,11 @@ def main() -> int:
     metrics = Metrics(max_vel=2.0, max_flux=2.0, div_inf=0.1, mass_err=0.05)
     targets_obj = Targets(cfl=0.3, div_max=1.0, mass_max=1.0)
     dx = 0.02
+    dt_current = 0.01
     arguments = _managed_native_feeds_by_id(
         SimpleNamespace(module=module, root_name=entry),
-        {"metrics": metrics, "targets": targets_obj, "dx": dx, "distribution": None},
+        {"metrics": metrics, "targets": targets_obj, "dx": dx, "dt_current": dt_current,
+         "distribution": None},
     )
     from src.compiler.identity_concordance import concordance_report
     print(concordance_report(module))
@@ -127,7 +132,7 @@ def main() -> int:
     got = result.returned[0] if result.returned else None
     coerced = coerce_metrics(metrics)
     expected = float(coerced.hard_failure) + _propose_dt_pen(
-        coerced, targets_obj, dx, None,
+        coerced, targets_obj, dx, None, dt_current,
     )
     ok = got is not None and abs(float(got) - float(expected)) < 1e-9
     print(f"got={got} expected={expected} {'OK' if ok else 'MISMATCH'}", flush=True)

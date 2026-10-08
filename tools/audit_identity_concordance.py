@@ -123,6 +123,10 @@ def tick(state, dt):
 
 
 def _lower_toplevel(*, process_graph_sink=None):
+    from src.common.tensors import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
     from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.vehicle_python_compilation import (
@@ -147,8 +151,16 @@ def _lower_toplevel(*, process_graph_sink=None):
         inspect.getsource(_scalar),
         inspect.getsource(_energy_time_limit),
         inspect.getsource(_propose_dt_pen),
-        "def root(metrics, targets, dx, distribution):\n"
-        "    return _propose_dt_pen(metrics, targets, dx, distribution)\n",
+        # The authored shape: ``step_with_dt_control_used`` takes
+        # ``distribution=None`` as a signature default and its caller omits
+        # it, so the default reaches ``_propose_dt_pen`` as the callsite's
+        # own argument (not as an undeclared runtime formal).
+        "def step(metrics, targets, dx, dt_current, distribution=None):\n"
+        "    return _propose_dt_pen(\n"
+        "        metrics, targets, dx, distribution, dt_current)\n"
+        "\n"
+        "def root(metrics, targets, dx, dt_current):\n"
+        "    return step(metrics, targets, dx, dt_current)\n",
     ))
     policy = ExtractionContract(
         CONTRACTS / "program_extraction.yaml"
@@ -161,10 +173,19 @@ def _lower_toplevel(*, process_graph_sink=None):
             {"function": "*", "parameter": "metrics", "record": "Metrics"},
             {"function": "*", "parameter": "targets", "record": "Targets"},
         ],
-        "values": [],
+        # Declared the way ``dt_system_contract`` declares its scalar entry
+        # parameters; ``distribution`` is not declared there either.
+        "values": [
+            {"function": "root", "parameter": name, "storage": "scalar",
+             "dtype": "float64", "rank": 0, "python_type": "builtins.float"}
+            for name in ("dx", "dt_current")
+        ],
     })
     module, _outputs, _exports = lower_ast_source_to_ssa(
-        source, "root", name="concordance_toplevel", extraction_contract=policy,
+        source, "root", name="concordance_toplevel",
+        python_bindings={"AbstractTensor": AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        extraction_contract=policy,
         resolved_process_graph_sink=process_graph_sink,
     )
     return module

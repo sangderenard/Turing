@@ -53,8 +53,8 @@ def main() -> int:
     bindings = {"_apply_energy_sidechain": _apply_energy_sidechain}
     if args.entry == "proposal":
         root_source = (
-            "def root(metrics, targets, dx):\n"
-            "    return _propose_dt_pen(metrics, targets, dx, None)\n"
+            "def root(metrics, targets, dx, dt_current):\n"
+            "    return _propose_dt_pen(metrics, targets, dx, None, dt_current)\n"
         )
         bindings = {"_propose_dt_pen": _propose_dt_pen}
     source = root_source

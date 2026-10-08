@@ -54,12 +54,13 @@ def main() -> int:
     # entire body is `while True:` and the first isolated (loop-free) repro
     # of this same rebind lowered cleanly, ruling that shape out.
     root_source = (
-        "def root(metrics, targets, dx, distribution, attempts):\n"
+        "def root(metrics, targets, dx, distribution, dt_current, attempts):\n"
         "    dt_pen = 0.0\n"
         "    count = 0\n"
         "    while count < attempts:\n"
         "        metrics = coerce_metrics(metrics)\n"
-        "        dt_pen = _propose_dt_pen(metrics, targets, dx, distribution)\n"
+        "        dt_pen = _propose_dt_pen(\n"
+        "            metrics, targets, dx, distribution, dt_current)\n"
         "        count = count + 1\n"
         "    return dt_pen\n"
     )

@@ -49,8 +49,9 @@ def main() -> int:
         inspect.getsource(_scalar),
         inspect.getsource(_energy_time_limit),
         inspect.getsource(_propose_dt_pen),
-        "def root(metrics, targets, dx, distribution):\n"
-        "    return _propose_dt_pen(metrics, targets, dx, distribution)\n",
+        "def root(metrics, targets, dx, distribution, dt_current):\n"
+        "    return _propose_dt_pen(\n"
+        "        metrics, targets, dx, distribution, dt_current)\n",
     ))
     base = _base_records()
     policy = ExtractionContract(
