@@ -1123,6 +1123,7 @@ def propagate_repository_ssa_call_metadata(
     def enrich(
         function, value_id: int, source: SSAValue, *, authoritative: bool = False,
         source_function: Any = None,
+        source_owner: Any = None,
         stage: str = "repository_ssa_enrichment",
     ) -> bool:
         changed = False
@@ -1240,9 +1241,11 @@ def propagate_repository_ssa_call_metadata(
                 }
                 changed = True
             from .identity_concordance import (
+                SHAPE_STATE_PAGE,
                 record_shape_transformation,
                 shape_scope_of,
             )
+            from .ssa_record_return_state import ssa_value_identity_cell
 
             source_rank = int(source_accounting.get(
                 "program_abi_rank", len(source_shape),
@@ -1294,6 +1297,29 @@ def propagate_repository_ssa_call_metadata(
                     ),
                 },
                 role="ssa_value",
+                # The shape was read off the source value: the edge derives
+                # from that value's ``ssa_value`` cell in its own function.
+                source_cells=tuple(
+                    cell for cell in (
+                        ssa_value_identity_cell(
+                            function if source_owner is None else source_owner,
+                            int(source.id),
+                            book=identity_book(module),
+                        ),
+                        # The state the source was last resolved to: when
+                        # that changed, this edge's revision has its cause.
+                        identity_book(module).latest_ref(
+                            SHAPE_STATE_PAGE, (
+                                shape_scope_of(
+                                    function if source_owner is None
+                                    else source_owner
+                                ),
+                                int(source.id),
+                            ),
+                        ),
+                    )
+                    if cell is not None
+                ),
             )
         return changed
 
@@ -1630,6 +1656,7 @@ def propagate_repository_ssa_call_metadata(
                             authoritative=(
                                 specialized_call and settle_exact_formals
                             ),
+                            source_owner=function,
                         )
                         if specialized_call:
                             changed |= settle_specialized_formal_descriptor(
@@ -1654,6 +1681,7 @@ def propagate_repository_ssa_call_metadata(
                         ):
                             changed |= enrich(
                                 function, int(actual.id), formal,
+                                source_owner=callee,
                             )
 
                     callee_returns = returned(callee)
@@ -1776,20 +1804,24 @@ def propagate_repository_ssa_call_metadata(
                                     or view_descriptor is not None
                                     or material_descriptor is not None
                                 ),
+                                source_owner=callee,
                             )
                             if not authoritative_returns:
                                 changed |= enrich(
-                                    callee, int(callee_value.id), caller_value
+                                    callee, int(callee_value.id), caller_value,
+                                    source_owner=function,
                                 )
                     elif len(callee_returns) == 1 and instruction.res is not None:
                         changed |= enrich(
                             function, int(instruction.res.id), callee_returns[0],
                             authoritative=settle_exact_returns,
+                            source_owner=callee,
                         )
                         if not authoritative_returns:
                             changed |= enrich(
                                 callee, int(callee_returns[0].id),
                                 instruction.res,
+                                source_owner=function,
                             )
                     elif len(callee_returns) > 1 and instruction.res is not None:
                         # An aggregate may be forwarded into a small adapter
@@ -1814,6 +1846,7 @@ def propagate_repository_ssa_call_metadata(
                                             changed |= enrich(
                                                 adapter, int(projected.id), source,
                                                 authoritative=settle_exact_returns,
+                                                source_owner=callee,
                                             )
         settle_exact_formals = False
         settle_exact_returns = False

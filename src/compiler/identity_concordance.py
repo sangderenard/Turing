@@ -4044,7 +4044,9 @@ def record_shape_transformation(
         source_ref = book.latest_ref(SHAPE_STATE_PAGE, (source_scope, source_id))
         edge_ref = _post_or_unsourced(
             book, SHAPE_EDGE_PAGE, edge_row, edge_fact, stage_object,
-            source_cells or (() if source_ref is None else (source_ref,)),
+            tuple(dict.fromkeys((
+                *source_cells, *(() if source_ref is None else (source_ref,)),
+            ))),
             SHAPE_SOURCE_NOT_ON_BOOK,
         )
     # The same edge, read from its source end: which targets were derived
