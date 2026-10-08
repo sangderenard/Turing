@@ -6882,6 +6882,33 @@ class NativeObjectSection:
         object.__setattr__(self, "symbols", tuple(map(str, self.symbols)))
 
 
+def _spill_book_after_build(module: Any) -> None:
+    """The emission and the native build are done: under the work contract's
+    ``spill_cold_pages`` policy, the identity book's pages that no stage reads
+    after the build leave RAM for the book's spill file (``page_lifecycle``;
+    the native system keeps the book for its whole life).  Whatever reads
+    one later brings it back.  Never fails a finished build."""
+
+    try:
+        from .work_contract import active_contract
+
+        if not active_contract().spill_cold_pages:
+            return
+        book = (getattr(module, "metadata", None) or {}).get("identity_book")
+        if book is None:
+            return
+        from .page_lifecycle import spill_cold_pages
+
+        spill_cold_pages(
+            book, "build", trigger="policy",
+            boundary="build: native executable built",
+        )
+    except Exception as error:  # a memory courtesy must not lose a build
+        import warnings
+
+        warnings.warn(f"identity book spill after the build failed: {error!r}")
+
+
 def compile_fortran_module_c_shell(
     module: Any,
     inputs: Mapping[str, Any],
@@ -7241,6 +7268,7 @@ def compile_fortran_module_c_shell(
                 "native Fortran/C-shell compilation failed:\n"
                 + (completed.stderr or completed.stdout)
             )
+    _spill_book_after_build(module)
     return FortranCShellExecutable(
         directory=output,
         executable_path=executable,

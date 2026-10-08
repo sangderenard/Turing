@@ -15,6 +15,17 @@ that is *regulated* rather than hoped for:
   its budget posts nothing and leaves the book the unregulated compile
   leaves).  Nothing is killed or refused.
 
+* ``spill_cold_pages`` (the work contract's policy, declared beside the
+  budget) and a budget breach both move the identity book's COLD pages -- the
+  pages no later stage touches (``page_lifecycle``) -- out of RAM into the
+  book's spill file (``identity_spill``).  Under the policy a boundary
+  spills whatever its completed stages made cold, whatever the resident
+  set; over budget, spilling is one of the releases, after the memos and
+  before the collection.  A spilled page is read back, transparently, by
+  whatever touches it, so the compile's output does not depend on either;
+  each spill and reload is a ``page_spill_receipt`` row derived from the
+  policy cell.
+
 * ``end_regulation`` runs at the end of the compile.  What it lets go of is
   not a decision but a retention bug fixed at its source -- state keyed to a
   book that no later read can reach (``release_compile_planning_state``) and
@@ -57,12 +68,18 @@ def _collect_cyclic_garbage() -> int:
     return gc.collect()
 
 
+def _spill_cold_pages() -> int:
+    regulator = _ACTIVE.get()
+    return 0 if regulator is None else regulator.spill_cold("budget")
+
+
 #: The recomputable items a budget breach releases, in this order (cheapest
 #: to recompute first; the collection last, so it also frees what the memo
 #: releases above it dropped).
 RELEASE_ORDER: tuple[tuple[str, Callable[[], int]], ...] = (
     ("dependency_level_memo", _release_dependency_levels),
     ("polymorphic_formal_scan_memo", _release_polymorphic_formal_scans),
+    ("cold_pages", _spill_cold_pages),
     ("cyclic_garbage", _collect_cyclic_garbage),
 )
 
@@ -73,9 +90,20 @@ class MemoryRegulator:
 
     book: Any
     budget_bytes: int | None = None
+    #: The work contract's ``spill_cold_pages``: spill the book's cold pages
+    #: at every boundary, over budget or not.
+    spill_policy: bool = False
     #: ``(stage label, resident set)`` at every boundary, in order.
     history: list[tuple[str, int]] = field(default_factory=list)
     releases: int = 0
+    #: The last stage known to have completed (a ``page_lifecycle`` stage
+    #: key), and the label of the boundary that said so.
+    completed: str | None = None
+    label: str = ""
+    #: Whether this regulator may spill its book: it opened the book itself.
+    #: A compile resuming its caller's book does not know which stages the
+    #: caller has finished with.
+    owns_book: bool = True
     _report: bool = field(
         default_factory=lambda: bool(os.environ.get("TURING_COMPILE_RSS")),
     )
@@ -86,6 +114,13 @@ class MemoryRegulator:
 
         resident = process_rss_bytes()
         self.history.append((str(label), resident))
+        self.label = str(label)
+        from .page_lifecycle import BOUNDARY_COMPLETES
+
+        self.completed = BOUNDARY_COMPLETES.get(self.label, self.completed)
+        if self.spill_policy:
+            self.spill_cold("policy")
+            resident = process_rss_bytes()
         if self._report:
             print(
                 f"[compiler-rss] {label}: {resident / 2**20:.0f} MiB",
@@ -103,6 +138,20 @@ class MemoryRegulator:
                 break
         return resident
 
+    def spill_cold(self, trigger: str) -> int:
+        """Spill the book's pages that the completed stages made cold; the
+        number of cells dropped.  ``trigger``: ``"policy"`` or ``"budget"``."""
+
+        if not self.owns_book or self.completed is None:
+            return 0
+        from .page_lifecycle import spill_cold_pages
+
+        result = spill_cold_pages(
+            self.book, self.completed, trigger=trigger,
+            budget_bytes=self.budget_bytes, boundary=self.label,
+        )
+        return int(result.cells_dropped)
+
     def _post(
         self, label: str, item: str, before: int, after: int, budget: int,
         released: int,
@@ -113,7 +162,10 @@ class MemoryRegulator:
         )
         from .identity_concordance import Derived, Mode, Novel
 
+        from .identity_spill import ensure_declared
+
         book = self.book
+        ensure_declared(book)       # (a book with a registry of its own)
         book.post(
             COMPILE_POLICY, ("memory_budget_bytes",), str(budget),
             stage=MEMORY_REGULATION,
@@ -147,7 +199,11 @@ def begin_regulation(
 
     from .work_contract import active_contract
 
-    regulator = MemoryRegulator(book, active_contract().memory_budget_bytes)
+    contract = active_contract()
+    regulator = MemoryRegulator(
+        book, contract.memory_budget_bytes,
+        spill_policy=bool(contract.spill_cold_pages), owns_book=owned_book,
+    )
     outermost = _ACTIVE.get() is None
     token = _ACTIVE.set(regulator)
     regulator.boundary("compile: begin")

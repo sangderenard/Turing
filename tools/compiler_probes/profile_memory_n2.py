@@ -59,11 +59,16 @@ def book_report() -> list[str]:
     from src.compiler.identity_concordance import current_identity_book
 
     book = current_identity_book()
+    # (cell_count reads a spilled page's size from its segment; the plain
+    # ``len(page.cells)`` would read the page back and measure nothing.)
     pages = sorted(
-        ((len(page.cells), name) for name, page in book.pages.items()),
+        ((page.cell_count(), name)
+         for name, page in dict.items(book.pages)),
         reverse=True,
     )
-    lines = [f"  identity book: {sum(n for n, _ in pages):,} cells, "
+    lines = [f"  identity book: {sum(n for n, _ in pages):,} cells "
+             f"({book.resident_cell_count():,} in RAM, "
+             f"{len(book.spilled_pages())} pages spilled), "
              f"{len(book.scope_projections):,} projected scopes, "
              f"{len(book.__dict__.get('_node_universes', {})):,} interned node sets"]
     lines += [f"    {count:>10,}  {name}" for count, name in pages[:10]]
