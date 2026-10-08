@@ -1112,15 +1112,18 @@ class CorrelationTable:
             for row in unsourced_page.rows():
                 tags[(row[0], row[1])] = row[2]
         groups: Counter = Counter()
-        for name, page in book.pages.items():
+        # (Each page is borrowed for its scan and let go: the detector walks
+        # every cell of the book and must not hold the book to do it.)
+        for name in tuple(dict.keys(book.pages)):
             if name not in registered or name in private:
                 continue
-            for (row, column), fact in page.cells.items():
-                if fact is None or isinstance(fact, Unresolved):
-                    continue
-                if (name, row, column) in sourced:
-                    continue
-                groups[(name, tags.get((name, row), "unknown"), "cell")] += 1
+            with book.borrowed(name) as page:
+                for (row, column), fact in page.cells.items():
+                    if fact is None or isinstance(fact, Unresolved):
+                        continue
+                    if (name, row, column) in sourced:
+                        continue
+                    groups[(name, tags.get((name, row), "unknown"), "cell")] += 1
         for (page_name, _row), stage_name in tags.items():
             if page_name in registered:
                 continue
@@ -3282,6 +3285,12 @@ def _validate_fact(page: Page, fact: Any) -> None:
         )
 
 
+#: The tables a spilled page does not hold (``identity_spill.SPILLABLE_ATTRS``).
+_SPILLABLE_TABLES = frozenset((
+    "cells", "stamps", "columns", "scopes", "row_columns", "column_positions",
+))
+
+
 @dataclass
 class IdentityPage:
     """One pipeline stage's row (identity) x column (round) table of facts.
@@ -3359,6 +3368,72 @@ class IdentityPage:
         if "row_columns" not in state or "column_positions" not in state:
             self._reindex()
 
+    # ------------------------------------------------------------ cold spill
+    # A page the book has spilled (``identity_spill``) has NO table
+    # attributes: ``cells``, ``stamps``, ``columns``, ``scopes``,
+    # ``row_columns`` and ``column_positions`` are deleted from the instance
+    # and ``spill`` holds its ``Segment``.  Python calls ``__getattr__`` only
+    # for a name the instance does not have, so a page in RAM pays nothing,
+    # and the first read of a table of a spilled page -- through any api, or
+    # directly -- brings the page back.
+
+    def __getattr__(self, name: str) -> Any:
+        if name in _SPILLABLE_TABLES:
+            state = self.__dict__
+            if state.get("spill") is not None:
+                book = state.get("book")
+                if book is not None:
+                    from .identity_spill import PAGE
+
+                    book._reload(self.name, (PAGE,), "access")
+                    return state[name]
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
+
+    @property
+    def spilled(self) -> bool:
+        """Whether this page's own tables are out of RAM (in the spill file)."""
+        return self.__dict__.get("spill") is not None
+
+    def cell_count(self) -> int:
+        """The number of cells the page holds, spilled or not (a spilled page
+        is counted from its segment, without reading it back; a private edge
+        page counts the rows of owners that are away too)."""
+        segment = self.__dict__.get("spill")
+        count = (
+            segment.cells if segment is not None else len(self.__dict__["cells"])
+        )
+        away = self.__dict__.get("_detached")
+        if away:
+            count += sum(item.cells for item in away.values())
+        return count
+
+    def row_count(self) -> int:
+        """``len(self.rows())``, without reading back what is spilled."""
+        segment = self.__dict__.get("spill")
+        count = (
+            segment.rows if segment is not None
+            else len(self.__dict__["row_columns"])
+        )
+        away = self.__dict__.get("_detached")
+        if away:
+            count += sum(item.rows for item in away.values())
+        return count
+
+    def __getstate__(self) -> dict:
+        # A copy or a pickle of a page is of the whole page.
+        state = self.__dict__
+        book = state.get("book")
+        if book is not None and (
+            state.get("spill") is not None or state.get("_detached")
+        ):
+            book._reload_everything_of(self.name, "pickle")
+        return {
+            key: value for key, value in self.__dict__.items()
+            if key not in ("spill", "_detached", "_borrow")
+        }
+
     def _reindex(self) -> None:
         self.column_positions = {
             column: position for position, column in enumerate(self.columns)
@@ -3416,6 +3491,8 @@ class IdentityPage:
         """
         book = self.book
         if book is not None:
+            if book._spill is not None:
+                book._ensure_owner_whole(self.name)
             if book.__dict__.get("read_through"):
                 book._materialise_row(self, row)
             book._admit_raw_write(self, row)
@@ -3845,6 +3922,49 @@ class PageMapping(MutableMapping):
         return (dict, (dict(self),))
 
 
+class _PageTable(dict):
+    """``IdentityBook.pages``: name -> ``IdentityPage``.  A plain dict (it
+    keeps the dict's own C methods) until a private edge page is partial."""
+
+    def __init__(self, book: Any, items: Iterable = ()) -> None:
+        super().__init__(items)
+        self.book = book
+
+
+class _PartialPageTable(_PageTable):
+    """``pages`` while a private edge page (``identity_spill.PARTITIONED``)
+    has rows spilled pages own away from RAM: it holds every other owner's
+    rows, and handing it to a caller that can walk all of its cells would
+    hand over a page with rows missing.  So ``[]``, ``get``, ``values`` and
+    ``items`` read the missing rows back first.  The book's own code
+    (``post``, ``edges_into``, ...) reaches the live pages through
+    ``dict.get(self.pages, ...)`` and asks for exactly the rows it needs.
+    ``IdentityBook._refresh_page_table`` swaps the class in and out."""
+
+    def _whole(self, page: Any) -> Any:
+        if page is not None and page.__dict__.get("_detached"):
+            from .identity_spill import make_whole
+
+            make_whole(self.book, page.name, "access")
+        return page
+
+    def __getitem__(self, name: Any) -> Any:
+        return self._whole(dict.__getitem__(self, name))
+
+    def get(self, name: Any, default: Any = None) -> Any:
+        page = dict.get(self, name)
+        return default if page is None else self._whole(page)
+
+    def values(self):
+        # (``_whole`` may swap this table back to a plain one: bind it first.)
+        whole = self._whole
+        return [whole(page) for page in tuple(dict.values(self))]
+
+    def items(self):
+        whole = self._whole
+        return [(name, whole(page)) for name, page in tuple(dict.items(self))]
+
+
 def mint_scope(label: Any, stage: Any = None) -> tuple[str, int]:
     """A fresh scope on the active compile's book (see ``IdentityBook``)."""
     return current_identity_book().mint_scope(label, stage)
@@ -3857,9 +3977,12 @@ class IdentityBook:
     def __init__(
         self, *, detached: bool = False, registry: Registry | None = None,
     ) -> None:
-        self.pages: dict[str, IdentityPage] = {}
+        self.pages: dict[str, IdentityPage] = _PageTable(self)
         #: Shared by every page: the book's construction clock.
         self.clock: list[int] = [0]
+        #: The book's spill file and its bookkeeping (``identity_spill``);
+        #: None until a page is spilled.
+        self._spill: Any = None
         #: Created by ``current_identity_book`` because nothing had begun a
         #: compile.  A standalone transaction owns its own book instead of
         #: joining one of these, whose facts belong to no single program.
@@ -3897,6 +4020,15 @@ class IdentityBook:
         self._stamp_override: int | None = None
         self._materialising: tuple | None = None
 
+    def __getstate__(self) -> dict:
+        # A copy or a pickle of a book is of the whole book: what is spilled
+        # is read back first, and the copy owns no spill file.
+        if self.__dict__.get("_spill") is not None:
+            self.reload_all("pickle")
+        state = dict(self.__dict__)
+        state["_spill"] = None
+        return state
+
     def __setstate__(self, state: dict) -> None:
         # A book pickled before copy-on-read scopes existed has no forks.
         self.__dict__.update(state)
@@ -3904,13 +4036,152 @@ class IdentityBook:
         self.__dict__.setdefault("read_through_origins", {})
         self.__dict__.setdefault("_stamp_override", None)
         self.__dict__.setdefault("_materialising", None)
+        self.__dict__.setdefault("_spill", None)
+        if not isinstance(self.pages, _PageTable):
+            self.pages = _PageTable(self, self.pages)
+        else:
+            self.pages.book = self
+        self._refresh_page_table()
+
+    # ------------------------------------------------------------ cold spill
+    def spill_pages(self, names: Iterable[str], **kwargs: Any) -> Any:
+        """Write the named pages (and the edge rows they own) out of RAM; see
+        ``identity_spill.spill_pages``."""
+        from .identity_spill import spill_pages
+
+        return spill_pages(self, names, **kwargs)
+
+    def reload_all(self, reason: str = "explicit") -> int:
+        """Read every spilled page and edge partition back into RAM."""
+        from .identity_spill import PARTITIONED, make_whole, restore_all
+
+        restored = restore_all(self, reason)
+        for part in PARTITIONED:
+            restored += make_whole(self, part, reason)
+        return restored
+
+    def _reload(self, owner: str, parts: Any, reason: str) -> int:
+        from .identity_spill import restore
+
+        return restore(self, {owner: parts}, reason)
+
+    def _reload_everything_of(self, name: str, reason: str) -> None:
+        from .identity_spill import PARTITIONED, make_whole, restore
+
+        restore(self, {name: None}, reason)
+        if name in PARTITIONED:
+            make_whole(self, name, reason)
+
+    def _refresh_page_table(self) -> None:
+        """``pages`` is the guarding table exactly while a private edge page
+        is partial (see ``_PartialPageTable``)."""
+        from .identity_spill import PARTITIONED
+
+        partial = False
+        for name in PARTITIONED:
+            page = dict.get(self.pages, name)
+            if page is not None and page.__dict__.get("_detached"):
+                partial = True
+                break
+        self.pages.__class__ = _PartialPageTable if partial else _PageTable
+
+    def _ensure_owner_whole(self, name: str) -> None:
+        """A page is about to be written, or named as a source: whatever of
+        it (its tables, the edge rows it owns) is spilled comes back first,
+        so no row is ever appended beside a spilled twin of itself."""
+        spill = self._spill
+        if spill is not None and name in spill.detached:
+            from .identity_spill import restore
+
+            restore(self, {name: None}, "post")
+
+    def _ensure_parts(self, owner: str, parts: Iterable[str], reason: str) -> None:
+        """A read of ``owner``'s edge rows on private page(s) ``parts``."""
+        spill = self._spill
+        if spill is not None:
+            away = spill.detached.get(owner)
+            if away:
+                wanted = away.intersection(parts)
+                if wanted:
+                    from .identity_spill import restore
+
+                    restore(self, {owner: wanted}, reason)
+
+    def resident_cell_count(self) -> int:
+        """How many cells are in RAM right now (a spilled page holds none):
+        the proxy for what the book costs, which ``cell_count`` is not."""
+        return sum(
+            len(page.__dict__["cells"])
+            for page in dict.values(self.pages) if "cells" in page.__dict__
+        )
+
+    def spilled_pages(self) -> tuple[str, ...]:
+        """Pages whose own tables are in the spill file, in page order."""
+        return tuple(
+            name for name, page in dict.items(self.pages)
+            if page.__dict__.get("spill") is not None
+        )
+
+    def borrowed(self, name: str):
+        """Read one page of the book without changing the book.
+
+        For the scanners that walk every page (the unsourced detector, the
+        log): a spilled page is read into RAM for the ``with`` block and
+        dropped again after it -- the segment on disk is still the page
+        (nothing wrote to it: the clock and the cell count are checked) -- so
+        a scan of the whole book never holds the whole book.  Posts no
+        receipt: a post would change the book under the scan."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def borrow():
+            page = dict.get(self.pages, name)
+            segment = None if page is None else page.__dict__.get("spill")
+            if segment is None:
+                yield page
+                return
+            from .identity_spill import PAGE, _load_page
+
+            spill = self._spill
+            spill.borrows += 1
+            _load_page(self, name)
+            spill.detached[name].discard(PAGE)
+            clock = self.clock[0]
+            cells = len(page.__dict__["cells"])
+            try:
+                yield page
+            finally:
+                state = page.__dict__
+                if (
+                    self.clock[0] == clock and "cells" in state
+                    and len(state["cells"]) == cells
+                ):
+                    for attribute in _SPILLABLE_TABLES:
+                        del state[attribute]
+                    state["spill"] = segment
+                    spill.detached[name].add(PAGE)
+                elif not spill.detached.get(name):
+                    # Something wrote while it was on loan: it stays.
+                    spill.detached.pop(name, None)
+
+        return borrow()
 
     def page(self, name: Any) -> IdentityPage:
         """The page named ``name`` (a str or a declared ``Page``), created
-        on first mention with this book's clock."""
+        on first mention with this book's clock.  A private edge page with
+        rows spilled is made whole first (``_page`` is the live page)."""
+        page = self._page(name)
+        if page.__dict__.get("_detached"):
+            from .identity_spill import make_whole
+
+            make_whole(self, page.name, "access")
+        return page
+
+    def _page(self, name: Any) -> IdentityPage:
+        """The live page named ``name`` (see ``page``), as it is in RAM now."""
         if isinstance(name, Page):
             name = name.name
-        page = self.pages.get(name)
+        page = dict.get(self.pages, name)
         if page is None:
             page = self.pages[name] = IdentityPage(
                 name, clock=self.clock, book=self,
@@ -4014,7 +4285,9 @@ class IdentityBook:
                 f"Unsourced, got {provenance!r}"
             )
 
-        target_page = self.page(page)
+        if self._spill is not None:
+            self._ensure_owner_whole(page.name)
+        target_page = self._page(page.name)
         minted: int | None = None
         if novel and new_positions:
             # Direct ``GLOBAL_MONOTONIC_IDS.mint()`` calls still exist
@@ -4056,7 +4329,7 @@ class IdentityBook:
                     # runs; this was a third of the orbital specialization
                     # stage.
                     target_key = Ref(page, row, column).key
-                    edge_cells = self.page(EDGE_PAGE).cells
+                    edge_cells = self._page(EDGE_PAGE.name).cells
                     if all(
                         ((target_key, source_ref.key, stage.name), 0)
                         in edge_cells
@@ -4099,8 +4372,8 @@ class IdentityBook:
         target = Ref(page, row, column)
         target_key = target.key
         if sources:
-            edge_page = self.page(EDGE_PAGE)
-            dependents = self.page(DEPENDENTS_PAGE)
+            edge_page = self._page(EDGE_PAGE.name)
+            dependents = self._page(DEPENDENTS_PAGE.name)
             for source_ref, _ in sources:
                 # One key tuple for the edge row and the dependents row
                 # (``Ref.key`` builds a new tuple per call).
@@ -4109,12 +4382,12 @@ class IdentityBook:
                 edge_page._stamp(edge_row, 0, True)
                 dependents._stamp((source_key, edge_row), 0, True)
         elif novel:
-            self.page(MINT_PAGE)._stamp(
+            self._page(MINT_PAGE.name)._stamp(
                 (target_key, minted), 0,
                 (provenance.transform, tuple(provenance.operands)),
             )
         else:
-            self.page(UNSOURCED_PAGE)._stamp(
+            self._page(UNSOURCED_PAGE.name)._stamp(
                 (page.name, row, stage.name), 0, provenance.reason,
             )
         if self.__dict__.get("_stamp_override") is None:
@@ -4130,7 +4403,9 @@ class IdentityBook:
             raise ConcordanceRefusal(f"source must be a Ref, got {ref!r}")
         if self.registry.pages.get(ref.page.name) != ref.page:
             raise ConcordanceRefusal(f"source names undeclared page {ref.page!r}")
-        page = self.pages.get(ref.page.name)
+        if self._spill is not None:
+            self._ensure_owner_whole(ref.page.name)
+        page = dict.get(self.pages, ref.page.name)
         if (
             page is not None and self.__dict__.get("read_through")
             and (ref.row, ref.column) not in page.cells
@@ -4152,7 +4427,7 @@ class IdentityBook:
                 f"row {row!r}; write it through IdentityBook.post"
             )
         stage = self.active_stage if self.active_stage is not None else RAW_STAGE
-        self.page(UNSOURCED_PAGE)._stamp(
+        self._page(UNSOURCED_PAGE.name)._stamp(
             (page.name, row, stage.name), 0, RAW_PRIMITIVE,
         )
 
@@ -4337,7 +4612,7 @@ class IdentityBook:
 
     def latest_ref(self, page: Page, row: tuple) -> Ref | None:
         """The Ref of ``row``'s most recent cell on ``page``, or None."""
-        stored = self.pages.get(page.name)
+        stored = dict.get(self.pages, page.name)
         if stored is None:
             return None
         column = stored.latest_column(row)
@@ -4346,7 +4621,7 @@ class IdentityBook:
         return Ref(page, row, column)
 
     def stamp_of(self, ref: Ref) -> int:
-        page = self.pages.get(ref.page.name)
+        page = dict.get(self.pages, ref.page.name)
         if (
             page is not None and self.__dict__.get("read_through")
             and page.is_virtual(ref.row, ref.column)
@@ -4356,10 +4631,11 @@ class IdentityBook:
 
     def edges_into(self, ref: Ref) -> tuple[tuple[Ref, Stage], ...]:
         """Every (source cell, stage) ``ref``'s cell was derived from."""
-        edge_page = self.pages.get(EDGE_PAGE.name)
+        edge_page = dict.get(self.pages, EDGE_PAGE.name)
         if edge_page is None:
             return ()
-        page = self.pages.get(ref.page.name)
+        self._ensure_parts(ref.page.name, (EDGE_PAGE.name,), "edges_into")
+        page = dict.get(self.pages, ref.page.name)
         if (
             page is not None and self.__dict__.get("read_through")
             and page.is_virtual(ref.row, ref.column)
@@ -4374,9 +4650,10 @@ class IdentityBook:
 
     def edges_out_of(self, ref: Ref) -> tuple[tuple[Ref, Stage], ...]:
         """Every (target cell, stage) derived from ``ref``'s cell."""
-        dependents = self.pages.get(DEPENDENTS_PAGE.name)
+        dependents = dict.get(self.pages, DEPENDENTS_PAGE.name)
         if dependents is None:
             return ()
+        self._ensure_parts(ref.page.name, (DEPENDENTS_PAGE.name,), "edges_out_of")
         return tuple(
             (self._ref_from_key(row[1][0]), self.registry.stages[row[1][2]])
             for row in dependents.scope_rows(ref.key)
@@ -4385,9 +4662,10 @@ class IdentityBook:
     def mint_of(self, ref: Ref) -> tuple[Transform, tuple[Ref, ...]] | None:
         """The (transform, operands) a Novel post minted ``ref``'s row
         with, or None when the cell was not posted Novel."""
-        mint_page = self.pages.get(MINT_PAGE.name)
+        mint_page = dict.get(self.pages, MINT_PAGE.name)
         if mint_page is None:
             return None
+        self._ensure_parts(ref.page.name, (MINT_PAGE.name,), "mint_of")
         for row in mint_page.scope_rows(ref.key):
             fact = mint_page.latest(row)
             if fact is not None:
@@ -6350,48 +6628,23 @@ def iter_identity_book_lines(
     yield f"identity book: {len(book.pages)} page(s)"
     if not full:
         yield f"log level: {level.name.lower()}"
+    _prepare_log(book, level)
     for page_name in sorted(book.pages):
-        page = book.pages[page_name]
-        rows = page.rows()
+        page = dict.get(book.pages, page_name)
         rows_level = _page_rows_level(book, page_name)
         withheld = level < rows_level
-        header = f"[{page_name}] {len(rows)} row(s), {len(page.cells)} cell(s)"
+        # (A spilled page is counted from its segment: a summary log reads
+        # nothing back.)
+        header = f"[{page_name}] {page.row_count()} row(s), {page.cell_count()} cell(s)"
         if not full and withheld and level >= IdentityLogLevel.FACTS:
             header += f" (rows withheld below {rows_level.name.lower()})"
         yield header
         if level < IdentityLogLevel.FACTS or withheld:
             continue
-        # Rows gathered under the id group they belong to, so one page's
-        # entries read as the few spaces they actually span rather than as
-        # one undifferentiated list.  A row whose key names no id keeps its
-        # place under "unkeyed" instead of being dropped or invented into
-        # a group.
-        by_group: dict[str, list[Any]] = {}
-        for row in rows:
-            value_id = row_value_id(row)
-            group = (
-                "unkeyed" if value_id is None
-                else (group_by_prefix([value_id])[0].label)
-            )
-            by_group.setdefault(group, []).append(row)
-        for group in sorted(by_group):
-            group_rows = by_group[group]
-            if len(by_group) > 1:
-                yield f"  ({group}) {len(group_rows)} row(s)"
-            for row in group_rows:
-                spans = page.spans(row)
-                if full:
-                    trail = " -> ".join(
-                        f"{start}..{end}={fact}" for start, end, fact in spans
-                    )
-                    yield f"  {render_row(row)}: {trail}"
-                    continue
-                start, end, fact = spans[-1]
-                more = f" [{len(spans)} spans]" if len(spans) > 1 else ""
-                yield (
-                    f"  {render_row(row)}: {start}..{end}="
-                    f"{_truncate_fact(str(fact))}{more}"
-                )
+        # (A spilled page is borrowed for its rows and let go after: the log
+        # of a book never holds the whole book.)
+        with book.borrowed(page_name) as page:
+            yield from _page_lines(page, page_name, full)
     if full:
         return
     yield f"unsourced: latch {book.latch.name}"
@@ -6401,6 +6654,59 @@ def iter_identity_book_lines(
     for (page_name, stage_name, reason_name), count in sorted(tally.items()):
         yield f"  {page_name} stage={stage_name} reason={reason_name}: {count}"
     yield from extra_lines
+
+
+def _prepare_log(book: IdentityBook, level: IdentityLogLevel) -> None:
+    """Before a log that prints a private edge page's rows, read back the rows
+    spilled pages own: the page is then whole for the whole log, and the
+    receipts of the reads are posted before the first line, not under it."""
+    if book.__dict__.get("_spill") is None or level < IdentityLogLevel.FACTS:
+        return
+    from .identity_spill import PARTITIONED, make_whole
+
+    for part in PARTITIONED:
+        page = dict.get(book.pages, part)
+        if (
+            page is not None and page.__dict__.get("_detached")
+            and level >= _page_rows_level(book, part)
+        ):
+            make_whole(book, part, "log")
+
+
+def _page_lines(page: IdentityPage, page_name: str, full: bool):
+    """One page's row lines (the body of ``iter_identity_book_lines``)."""
+    # Rows gathered under the id group they belong to, so one page's
+    # entries read as the few spaces they actually span rather than as
+    # one undifferentiated list.  A row whose key names no id keeps its
+    # place under "unkeyed" instead of being dropped or invented into
+    # a group.
+    rows = page.rows()
+    by_group: dict[str, list[Any]] = {}
+    for row in rows:
+        value_id = row_value_id(row)
+        group = (
+            "unkeyed" if value_id is None
+            else (group_by_prefix([value_id])[0].label)
+        )
+        by_group.setdefault(group, []).append(row)
+    for group in sorted(by_group):
+        group_rows = by_group[group]
+        if len(by_group) > 1:
+            yield f"  ({group}) {len(group_rows)} row(s)"
+        for row in group_rows:
+            spans = page.spans(row)
+            if full:
+                trail = " -> ".join(
+                    f"{start}..{end}={fact}" for start, end, fact in spans
+                )
+                yield f"  {render_row(row)}: {trail}"
+                continue
+            start, end, fact = spans[-1]
+            more = f" [{len(spans)} spans]" if len(spans) > 1 else ""
+            yield (
+                f"  {render_row(row)}: {start}..{end}="
+                f"{_truncate_fact(str(fact))}{more}"
+            )
 
 
 def render_identity_book(book: IdentityBook) -> str:
