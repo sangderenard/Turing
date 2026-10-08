@@ -247,6 +247,36 @@ def _propagate_scalar_dtypes(functions) -> None:
                     instruction.args[0].id
                 )
 
+        # A Python scalar literal is a weak operand: it names a value, not an
+        # element width, so beside a typed float operand it does not widen the
+        # result (``float32 * 2.0`` is float32, as in the eager lane).
+        weak_literal_ids = {
+            int(instruction.res.id)
+            for instruction in instructions
+            if instruction.op == "Const"
+            and instruction.res is not None
+            and isinstance(
+                instruction.attributes.get("value"), (bool, int, float)
+            )
+        }
+
+        def declared_float(instruction) -> str | None:
+            """The widest float width the non-literal operands declare.
+
+            The declared promotion rule is the precision layer's: the wider
+            element type wins (``topological_reducer._widest_element``).
+            Python's ``float`` is binary64 here, not that table's alias.
+            """
+
+            from ..common.tensors.topological_reducer import _widest_element
+
+            return _widest_element(*(
+                {"float": "float64"}.get(spelling, spelling)
+                for value in instruction.args
+                if int(value.id) not in weak_literal_ids
+                for spelling in (dtype_of.get(int(value.id)),)
+            ))
+
         for _ in range(max(1, len(instructions))):
             changed = False
             for instruction in instructions:
@@ -310,13 +340,13 @@ def _propagate_scalar_dtypes(functions) -> None:
                     candidate is not None for candidate in operand_dtypes
                 ):
                     if any(candidate in floats for candidate in operand_dtypes):
-                        inferred = "float64"
+                        inferred = declared_float(instruction) or "float64"
                     elif all(
                         candidate in integers for candidate in operand_dtypes
                     ):
                         inferred = "int64"
                 elif instruction.op in {"Div", "Sqrt", "Exp", "Log"}:
-                    inferred = "float64"
+                    inferred = declared_float(instruction) or "float64"
                 # A Const's DECLARED integer width is its identity (rule
                 # above) and survives; only an inferred integer widens to
                 # int64.  tensor_ssa_lowering mints kernel shape vectors as

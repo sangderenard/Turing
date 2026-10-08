@@ -315,6 +315,36 @@ def plan_region_to_ssa_instrs(
             }
         )
 
+    # An authored Python scalar literal is a weak operand: it names a value,
+    # not an element width, so beside a typed float operand it does not widen
+    # the result (``float32 * 2.0`` is float32, as in the eager lane).
+    weak_literal_ids = {
+        int(item.outputs[0])
+        for item in region.items
+        if isinstance(item, PlanLine)
+        and item.outputs
+        and str(item.opcode).casefold() in {"const", "constant"}
+        and isinstance(
+            dict(item.attributes).get("value"), (bool, int, float)
+        )
+    }
+    def promoted_float_dtype(value_ids: tuple[int, ...]) -> str | None:
+        """The widest float width the non-literal operands declare, if any.
+
+        The declared promotion rule is the precision layer's: the wider
+        element type wins (``topological_reducer._widest_element``).  Python's
+        ``float`` is binary64 here, not that table's ``float32`` alias.
+        """
+
+        from ..common.tensors.topological_reducer import _widest_element
+
+        return _widest_element(*(
+            {"float": "float64"}.get(spelling, spelling)
+            for value_id in value_ids
+            if int(value_id) not in weak_literal_ids
+            for spelling in (str(dtype_of.get(int(value_id)) or ""),)
+        ))
+
     def promoted_numeric_dtype(value_ids: tuple[int, ...]) -> str | None:
         candidates = {
             str(dtype_of.get(int(value_id)) or "")
@@ -324,7 +354,7 @@ def plan_region_to_ssa_instrs(
             "float", "float16", "float32", "float64", "double",
             "f16", "f32", "f64",
         }):
-            return "float64"
+            return promoted_float_dtype(value_ids) or "float64"
         if candidates.intersection({"int64", "i64"}):
             return "int64"
         if candidates.intersection({"int", "int32", "i32"}):
@@ -389,7 +419,12 @@ def plan_region_to_ssa_instrs(
             elif opcode in scalar_cast_dtypes:
                 inferred = scalar_cast_dtypes[opcode]
             elif opcode in {"truediv", "div"}:
-                inferred = "float64"
+                # True division is floating: the operands' widest declared
+                # float width, float64 when none is declared.
+                inferred = (
+                    promoted_float_dtype(semantic_input_ids(item))
+                    or "float64"
+                )
             elif opcode in dtype_preserving_ops:
                 inferred = promoted_numeric_dtype(semantic_input_ids(item))
             elif opcode in projection_ops:

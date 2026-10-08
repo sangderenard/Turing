@@ -825,6 +825,7 @@ from typing import (
 )
 
 from ..transmogrifier.dtype_layout import (
+    llvm_abi_numpy_table as _llvm_abi_numpy_table,
     llvm_type_bytes_table as _llvm_type_bytes_table,
     llvm_type_for_dtype as _llvm_type_for_dtype,
 )
@@ -1016,9 +1017,15 @@ def _value_llvm_type(value: _Any) -> str:
         )
     ):
         return "ptr"
-    return _llvm_type_for_dtype(
+    llvm_type = _llvm_type_for_dtype(
         accounting.get("physical_dtype") or getattr(value, "dtype", None)
     )
+    # A float32 SPAN is stored as ``float`` (its public buffer is float32).  A
+    # float32 scalar keeps the lane's double register width: scalar arithmetic
+    # is double throughout, and a one-element slot gains nothing from ``float``.
+    if llvm_type == "float" and _declared_span_rank(value) == 0:
+        return "double"
+    return llvm_type
 
 
 def _declared_span_rank(value: _Any) -> int:
@@ -1987,6 +1994,19 @@ def _emit_repository_call_module(
             if source_type == wanted:
                 return loaded
             converted = f"%convert.{tag}"
+            # ``float`` (a float32 span element) meets every other type through
+            # double: widen exactly, or round once on the way in.
+            if source_type == "float":
+                body.append(
+                    f"  {converted}.wide = fpext float {loaded} to double"
+                )
+                return convert_loaded(
+                    f"{converted}.wide", "double", wanted, f"{tag}.wide",
+                )
+            if wanted == "float":
+                narrow = convert_loaded(loaded, source_type, "double", f"{tag}.n")
+                body.append(f"  {converted} = fptrunc double {narrow} to float")
+                return converted
             if wanted == "double" and source_type in {"i1", "i32", "i64"}:
                 opcode = "uitofp" if source_type == "i1" else "sitofp"
                 body.append(
@@ -4668,11 +4688,8 @@ def prepare_artifact_execution(
     if len(llvm_dtypes) != len(artifact.buffer_order):
         raise ValueError("artifact buffer dtype metadata does not match its ABI")
     numpy_dtypes = {
-        "double": np.float64,
-        "i32": np.int32,
-        "i64": np.int64,
-        "i1": np.bool_,
-        "ptr": np.uintp,
+        llvm_type: np.dtype(numpy_name)
+        for llvm_type, numpy_name in _llvm_abi_numpy_table().items()
     }
     buffers: dict[int, _Any] = {}
     for value_id, authored_shape, llvm_dtype in zip(

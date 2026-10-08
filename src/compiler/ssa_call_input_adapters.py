@@ -564,9 +564,16 @@ def _adapt_physical_call_inputs_round(
                                 diagnostics=diagnostics,
                             )
                         )
+                        # A float32 SPAN is stored as float32 (its own storage
+                        # class), so an actual of that kind has physical storage
+                        # a double-backed formal cannot read in place.
+                        float32_span = bool(
+                            tuple(actual.shape or ())
+                            and str(source_dtype).casefold() == 'float32'
+                        )
                         physical_conversion = not (
                             not (accounting.get('program_abi_storage') or accounting.get('physical_dtype')
-                                 or int(actual.id) in caller_formals)
+                                 or int(actual.id) in caller_formals or float32_span)
                             or source_dtype == target_dtype
                             or (not scalar_region and formal.dtype != 'ptr' and actual.dtype != formal.dtype)
                             or (scalar_region and actual.shape)
