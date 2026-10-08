@@ -2951,3 +2951,12 @@ OPERATOR_RESULT_TYPE = declare_page("operator_result_type_concordance", (
 SCALAR_KERNEL_OPERAND = declare_page("scalar_kernel_operand_concordance", (
     RowField("function", K.SCOPE), RowField("result", K.VALUE_ID),
 ), tuple)
+
+#: ``_concord_call_argument_operands``: which operand of the call node produced
+#: each argument binding, ``(read scope, callsite, argument position)`` ->
+#: ``(role, ordinal)``, CONCORD, DERIVED(the operand position's transition /
+#: lexical read binding cell, else the call node's identity cell).
+CALL_ARGUMENT_OPERAND = declare_page("call_argument_operand", (
+    RowField("read_scope", K.SCOPE), RowField("callsite", K.VALUE_ID),
+    RowField("position", K.INDEX),
+), tuple)

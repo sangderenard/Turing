@@ -1139,8 +1139,18 @@ def _concord_consumer_operands(
     fact ``lexical_read_binding``, at ``(read scope, node, role, ordinal)``.
     """
 
-    from ..common.tensors.topological_reducer import _operand_positions
-    from .identity_concordance import current_identity_book
+    from ..common.tensors.topological_reducer import (
+        _operand_positions, node_identity_cell,
+    )
+    from .concordance_declarations import (
+        CONSUMER_OPERAND as _CONSUMER_OPERAND,
+        IDENTITY_TRANSITION as _IDENTITY_TRANSITION,
+        LEXICAL_READ_BINDING as _LEXICAL_READ_BINDING,
+        OPERAND_POSITION as _OPERAND_POSITION,
+    )
+    from .identity_concordance import (
+        Derived as _Derived, Mode as _Mode, current_identity_book,
+    )
 
     scope = graph.G.graph.get("lexical_read_scope")
     if scope is None:
@@ -1179,9 +1189,36 @@ def _concord_consumer_operands(
                     read_page.latest((tuple(scope), int(node_id), *position)),
                 )
         for parent, operand_positions in positions.items():
-            page.concord(
-                (tuple(scope), int(node_id), parent), tuple(operand_positions),
-            )
+            # DERIVED from the cells of the operand positions it names (the
+            # position's latest transition, else its lexical read binding),
+            # else the consumer's identity cell.
+            operand_cells = []
+            for role, ordinal in operand_positions:
+                position_row = (tuple(scope), int(node_id), role, ordinal)
+                for position_page in (
+                    _IDENTITY_TRANSITION, _LEXICAL_READ_BINDING,
+                ):
+                    position_cell = book.latest_ref(position_page, position_row)
+                    if position_cell is not None:
+                        operand_cells.append(position_cell)
+                        break
+            if not operand_cells:
+                try:
+                    operand_cells.append(
+                        node_identity_cell(graph, int(node_id))
+                    )
+                except ValueError:
+                    pass
+            operand_row = (tuple(scope), int(node_id), parent)
+            if operand_cells:
+                book.post(
+                    _CONSUMER_OPERAND, operand_row, tuple(operand_positions),
+                    stage=_OPERAND_POSITION,
+                    provenance=_Derived(tuple(dict.fromkeys(operand_cells))),
+                    mode=_Mode.CONCORD,
+                )
+            else:
+                page.concord(operand_row, tuple(operand_positions))
 
 
 def _concord_item_operands(graph: Any, captures: Any) -> None:
@@ -1241,8 +1278,18 @@ def _concord_call_argument_operands(
     binding each read is the base fact ``lexical_read_binding``.
     """
 
-    from ..common.tensors.topological_reducer import _operand_positions
-    from .identity_concordance import current_identity_book
+    from ..common.tensors.topological_reducer import (
+        _operand_positions, node_identity_cell,
+    )
+    from .concordance_declarations import (
+        CALL_ARGUMENT_OPERAND as _CALL_ARGUMENT_OPERAND,
+        IDENTITY_TRANSITION as _IDENTITY_TRANSITION,
+        LEXICAL_READ_BINDING as _LEXICAL_READ_BINDING,
+        OPERAND_POSITION as _OPERAND_POSITION,
+    )
+    from .identity_concordance import (
+        Derived as _Derived, Mode as _Mode, current_identity_book,
+    )
 
     scope = graph.G.graph.get("lexical_read_scope")
     if scope is None or int(callsite_id) not in graph.G:
@@ -1250,16 +1297,40 @@ def _concord_call_argument_operands(
     positions = list(_operand_positions(
         graph.G.nodes[int(callsite_id)].get("parents") or ()
     ))
-    page = current_identity_book().page("call_argument_operand")
+    book = current_identity_book()
+    page = book.page("call_argument_operand")
     for index, (parent, role) in operand_edges.items():
         ordinal = next((
             edge_ordinal for edge_role, edge_ordinal, edge_parent in positions
             if str(edge_role) == str(role) and int(edge_parent) == int(parent)
         ), None)
         if ordinal is not None:
-            page.concord(
-                (tuple(scope), int(callsite_id), int(index)), (role, ordinal),
-            )
+            # DERIVED from the cell of the call's operand position (its
+            # latest transition, else its lexical read binding), else the
+            # call node's identity cell.
+            argument_cell = None
+            for position_page in (_IDENTITY_TRANSITION, _LEXICAL_READ_BINDING):
+                argument_cell = book.latest_ref(
+                    position_page,
+                    (tuple(scope), int(callsite_id), role, ordinal),
+                )
+                if argument_cell is not None:
+                    break
+            if argument_cell is None:
+                try:
+                    argument_cell = node_identity_cell(graph, int(callsite_id))
+                except ValueError:
+                    argument_cell = None
+            argument_row = (tuple(scope), int(callsite_id), int(index))
+            if argument_cell is not None:
+                book.post(
+                    _CALL_ARGUMENT_OPERAND, argument_row, (role, ordinal),
+                    stage=_OPERAND_POSITION,
+                    provenance=_Derived((argument_cell,)),
+                    mode=_Mode.CONCORD,
+                )
+            else:
+                page.concord(argument_row, (role, ordinal))
 
 
 def _build_shell_hierarchy_plan(
