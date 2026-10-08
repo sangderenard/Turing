@@ -428,6 +428,56 @@ def summarize_process_graph(graph: Any, *, limit: int = 400) -> dict[str, Any]:
     }
 
 
+def process_rss_bytes() -> int:
+    """This process's resident set (working set on Windows), in bytes.
+
+    The one RSS reading the compiler uses (stage-boundary progress lines and
+    the ``memory_budget_bytes`` regulation read it; nothing else should
+    re-derive it).  Returns 0 when the platform offers no reading.
+    """
+
+    import sys
+
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class _Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = _Counters()
+        counters.cb = ctypes.sizeof(_Counters)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        # K32GetProcessMemoryInfo lives in kernel32 on Windows 7 and later.
+        query = kernel32.K32GetProcessMemoryInfo
+        query.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Counters),
+                          wintypes.DWORD]
+        query.restype = wintypes.BOOL
+        if not query(kernel32.GetCurrentProcess(), ctypes.byref(counters),
+                     counters.cb):
+            return 0
+        return int(counters.WorkingSetSize)
+    try:
+        with open("/proc/self/statm", "rb") as stream:
+            import os
+
+            return int(stream.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
 __all__ = [
     "ERROR",
     "KINDS",
@@ -439,6 +489,7 @@ __all__ = [
     "TelemetryChannel",
     "attach_error_buffer",
     "attach_profiler",
+    "process_rss_bytes",
     "record_launch_profile",
     "record_shortfalls",
     "summarize_process_graph",
