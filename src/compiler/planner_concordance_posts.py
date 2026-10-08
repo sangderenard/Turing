@@ -289,6 +289,54 @@ def _materialize_tensor_valued_parameters(graph: Any) -> bool:
     return True
 
 
+def _declared_parameter_python_type(graph: Any, node_id: int) -> str | None:
+    """The Python type the ProgramABI declares for the parameter ``node_id``
+    reads, posted as a ``parameter_python_type`` row; None for a node that is
+    not a declared scalar parameter Input.  The declaration is the posted fact: a
+    descriptor carries it so no consumer re-derives a type from the dtype."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        PARAMETER_PYTHON_TYPE, PLANNER_TENSOR_SPECIALIZATION,
+    )
+
+    node_id = int(node_id)
+    if node_id not in graph.G:
+        return None
+    data = graph.G.nodes[node_id]
+    attributes = data.get("attributes") or {}
+    if (
+        data.get("type") != "Input"
+        or attributes.get("binding_kind") != "parameter"
+    ):
+        return None
+    name = str(attributes.get("binding_name") or "")
+    declared = (graph.G.graph.get("parameter_value_abi") or {}).get(name)
+    # Scalar bindings only: a scalar's Python type is what ``is None`` /
+    # ``isinstance`` ask about, and what its dtype cannot say.  A declared
+    # span keeps the dtype-derived fact it has always had.
+    python_type = (
+        declared.get("python_type")
+        if isinstance(declared, Mapping)
+        and str(declared.get("storage") or "") == "scalar"
+        else None
+    )
+    if not python_type:
+        return None
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is not None:
+        try:
+            cells = (node_identity_cell(graph, node_id),)
+        except ValueError:
+            cells = ()
+        if cells:
+            _post_if_changed(
+                PARAMETER_PYTHON_TYPE, (tuple(scope), name), str(python_type),
+                stage=PLANNER_TENSOR_SPECIALIZATION, cells=cells,
+            )
+    return str(python_type)
+
+
 def _post_call_binding(
     graph: Any, node_id: int, reference: int, resolution: str,
 ) -> Any:

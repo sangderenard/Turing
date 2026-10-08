@@ -496,6 +496,14 @@ PLANNER_TENSOR_DESCRIPTOR = declare_page("planner_tensor_descriptor", (
 FORMAL_TENSOR_CLASS = declare_page("formal_tensor_class", (
     RowField("callee_scope", K.SCOPE), RowField("parameter", K.NAME),
 ), bool)                               # mode REVISE
+#: The Python type a ProgramABI value binding DECLARES for a parameter (the
+#: extraction contract's ``python_type``), restated on the book where the
+#: planner reads it: it outranks any type re-derived from the parameter's dtype
+#: (a declared ``builtins.NoneType`` scalar is int64 storage, not an int).
+#: Keyed by the graph copy's read scope; DERIVED from the Input's identity cell.
+PARAMETER_PYTHON_TYPE = declare_page("parameter_python_type", (
+    RowField("graph_scope", K.SCOPE), RowField("parameter", K.NAME),
+), str)                                # mode REVISE
 EXECUTABLE_NODE = declare_page("executable_node", (
     RowField("planning_scope", K.SCOPE), RowField("node", K.VALUE_ID),
 ), NodeExecution)                      # mode CONCORD

@@ -122,7 +122,11 @@ def tick(state, dt):
     return module
 
 
-def _lower_toplevel(*, process_graph_sink=None):
+def _lower_toplevel(*, process_graph_sink=None, distribution_declared=False):
+    """``distribution_declared`` lowers the same function with ``distribution``
+    a root formal the contract declares ``builtins.NoneType`` (int64 storage),
+    the form ``tools/repro_targets_expansion.py`` uses: the declared type, not
+    the one its dtype implies, decides ``distribution is not None``."""
     from src.common.tensors import AbstractTensor
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         c_backend_repository_ssa_reference,
@@ -155,12 +159,18 @@ def _lower_toplevel(*, process_graph_sink=None):
         # ``distribution=None`` as a signature default and its caller omits
         # it, so the default reaches ``_propose_dt_pen`` as the callsite's
         # own argument (not as an undeclared runtime formal).
-        "def step(metrics, targets, dx, dt_current, distribution=None):\n"
-        "    return _propose_dt_pen(\n"
-        "        metrics, targets, dx, distribution, dt_current)\n"
-        "\n"
-        "def root(metrics, targets, dx, dt_current):\n"
-        "    return step(metrics, targets, dx, dt_current)\n",
+        (
+            "def root(metrics, targets, dx, dt_current, distribution):\n"
+            "    return _propose_dt_pen(\n"
+            "        metrics, targets, dx, distribution, dt_current)\n"
+            if distribution_declared else
+            "def step(metrics, targets, dx, dt_current, distribution=None):\n"
+            "    return _propose_dt_pen(\n"
+            "        metrics, targets, dx, distribution, dt_current)\n"
+            "\n"
+            "def root(metrics, targets, dx, dt_current):\n"
+            "    return step(metrics, targets, dx, dt_current)\n"
+        ),
     ))
     policy = ExtractionContract(
         CONTRACTS / "program_extraction.yaml"
@@ -179,7 +189,11 @@ def _lower_toplevel(*, process_graph_sink=None):
             {"function": "root", "parameter": name, "storage": "scalar",
              "dtype": "float64", "rank": 0, "python_type": "builtins.float"}
             for name in ("dx", "dt_current")
-        ],
+        ] + ([
+            {"function": "root", "parameter": "distribution",
+             "storage": "scalar", "dtype": "int64", "rank": 0,
+             "python_type": "builtins.NoneType"},
+        ] if distribution_declared else []),
     })
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_toplevel",

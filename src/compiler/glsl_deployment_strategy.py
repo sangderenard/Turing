@@ -219,6 +219,7 @@ from .planner_concordance_posts import (
     _formal_identity_cells as _formal_identity_cells,
     _post_planner_specialization as _post_planner_specialization,
     _post_formal_tensor_class as _post_formal_tensor_class,
+    _declared_parameter_python_type as _declared_parameter_python_type,
     _post_copy_formal_tensor_classes as _post_copy_formal_tensor_classes,
     _post_call_binding as _post_call_binding,
     _post_callsite_activation as _post_callsite_activation,
@@ -17299,6 +17300,34 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
 })
 
 
+#: The Python type an inferred (undeclared) scalar of each dtype is taken to be.
+_PYTHON_TYPE_OF_DTYPE = {
+    "bool": "builtins.bool",
+    "int": "builtins.int",
+    "int32": "builtins.int",
+    "int64": "builtins.int",
+    "float": "builtins.float",
+    "float32": "builtins.float",
+    "float64": "builtins.float",
+}
+
+
+def _declared_type_beyond_dtype(
+    graph: Any, node_id: int, dtype: Any,
+) -> str | None:
+    """The ProgramABI-declared Python type of the parameter ``node_id`` reads
+    when it is NOT the type its dtype implies (a ``builtins.NoneType`` scalar
+    is int64 storage; ``builtins.float`` on float64 is the inferred answer and
+    needs no carrying).  Posted on ``parameter_python_type``; the declaration
+    wins over the dtype-derived type wherever a descriptor crosses a call."""
+
+    declared = _declared_parameter_python_type(graph, int(node_id))
+    if declared is None:
+        return None
+    inferred = _PYTHON_TYPE_OF_DTYPE.get(str(dtype), str(dtype))
+    return None if declared == inferred else declared
+
+
 #: Results of an AbstractTensor operation that are not themselves tensors.
 _TENSOR_SCALARIZING_OPERATIONS = frozenset({"item", "tolist", "numpy"})
 
@@ -17652,7 +17681,15 @@ def _tensor_descriptor(
             # including dynamic collection rank and row geometry.  Reading
             # it is the stage's decision; graph-local annotations are only
             # inputs to transformations that append a newer projection.
-            return concorded_descriptor
+            # A declared parameter's Python type rides along (the settled
+            # projection is shape and dtype only).
+            declared_type = _declared_type_beyond_dtype(
+                graph, int(node_id), concorded_descriptor.get("dtype"),
+            )
+            return (
+                concorded_descriptor if declared_type is None
+                else {**concorded_descriptor, "python_type": declared_type}
+            )
         if (
             settled
             and not formal_conflict
@@ -17661,12 +17698,20 @@ def _tensor_descriptor(
             and not polymorphic_specialization
             and not collection_result
         ):
+            settled_dtype = str(
+                (_deepest_fact(page, row) or ("", (), "float64"))[2]
+            )
+            declared_type = _declared_type_beyond_dtype(
+                graph, int(node_id), settled_dtype,
+            )
             return {
                 "shape": settled,
-                "dtype": str(
-                    (_deepest_fact(page, row) or ("", (), "float64"))[2]
-                ),
+                "dtype": settled_dtype,
                 "rank": len(settled),
+                **(
+                    {} if declared_type is None
+                    else {"python_type": declared_type}
+                ),
             }
     except Exception as error:
         if os.environ.get("TURING_DEBUG_SEQUENCE_ROW_LAYOUT"):
@@ -19190,6 +19235,16 @@ def _tensor_descriptor_rule(
             }
         else:
             return None
+    # A declared parameter's Python type is the ProgramABI's, never one
+    # re-derived from the dtype: the Input already carries a ``tensor`` dict
+    # (shape and dtype) from its storage, which skipped the branch above that
+    # attaches the declaration, so a declared ``builtins.NoneType`` scalar
+    # (int64 storage) reached its callee as an int.
+    declared_python_type = _declared_type_beyond_dtype(
+        graph, int(node_id), tensor.get("dtype"),
+    )
+    if declared_python_type is not None:
+        tensor = {**tensor, "python_type": declared_python_type}
     static_shape = tuple(tensor.get("shape") or ())
     return {
         "shape": static_shape,
@@ -19756,15 +19811,9 @@ def _fold_callsite_structural_values(
                 # caller's declared scalar forwarded across the call) is
                 # the fact; the dtype map is only the fallback for
                 # inferred tensor values.
-                python_type = str(descriptor.get("python_type") or "") or {
-                    "bool": "builtins.bool",
-                    "int": "builtins.int",
-                    "int32": "builtins.int",
-                    "int64": "builtins.int",
-                    "float": "builtins.float",
-                    "float32": "builtins.float",
-                    "float64": "builtins.float",
-                }.get(dtype, dtype)
+                python_type = str(descriptor.get("python_type") or "") or (
+                    _PYTHON_TYPE_OF_DTYPE.get(dtype, dtype)
+                )
                 return _ProgramABIValueFact(
                     python_type,
                     "span" if tuple(descriptor.get("shape") or ()) else "scalar",
