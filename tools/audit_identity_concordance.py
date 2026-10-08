@@ -355,6 +355,29 @@ CASES = {
 }
 
 
+#: Findings a case is DECLARED to report, with the reason.  The gate compares
+#: each case's gated finding count with this declaration (zero when absent),
+#: so an expected finding is a stated fact about the case, not a bare number
+#: someone remembers.  A case that reports fewer than declared fails too: the
+#: declaration is then stale.
+EXPECTED_FINDINGS = {
+    "controller_untyped": (
+        4,
+        "undeclared root formal python type: the generic _restore_type "
+        "tests isinstance(ref, AbstractTensor / np.ndarray / list / tuple) "
+        "where ref is the root's dx or dt_prev, declared by no value binding "
+        "(Unresolved(PARAMETER_ABI_UNDECLARED)); the typed 'controller' case "
+        "declares them and reports 0",
+    ),
+}
+
+
+def _gated_findings(report: str) -> int:
+    """The count on the report's first line (the gate line)."""
+    first = report.splitlines()[0]
+    return int(first.rsplit(",", 1)[1].split()[0])
+
+
 def main() -> int:
     arguments = sys.argv[1:]
     if arguments[:1] == ["--pickle"]:
@@ -376,7 +399,14 @@ def main() -> int:
         report = concordance_report(module)
         print(f"  lowered in {time.perf_counter()-started:.1f}s", flush=True)
         print("  " + report.replace("\n", "\n  "), flush=True)
-        if "finding(s)" in report.splitlines()[0] and not report.splitlines()[0].endswith(" 0 finding(s)"):
+        found = _gated_findings(report)
+        expected, reason = EXPECTED_FINDINGS.get(case, (0, ""))
+        if expected:
+            print(f"  declared expectation: {expected} finding(s) -- {reason}",
+                  flush=True)
+        if found != expected:
+            print(f"  GATE: {case} reports {found} finding(s), "
+                  f"declared {expected}", flush=True)
             failures += 1
     return 1 if failures else 0
 
