@@ -178,6 +178,13 @@ c0781c7a) were removed today. Disk: 57 GB free.
   (`test_perforated_network_llvm`, `test_process_graph_autograd`,
   `test_ssa_c_aggregate_constants`, `test_ssa_glsl_compute_backend`). None from this
   week's work; all unowned.
+- Host-facing layout facts: now book rows (`program_abi_field_slot`, the entry's
+  API_CONTRACT, `<entry>_layout.h` printed from it; probe
+  `tools/compiler_probes/probe_host_layout_rows.py`). Still open: the compiler-side scalar
+  copy of the written-slot-wins rule (`_preferred_linked_field_candidates`) is a second
+  copy of `post_program_abi_field_slots`'s rule; the contract has no declared column roles
+  (scene adapter); a formal's program_abi accounting is not a book cell;
+  `NativeSystem.layout()` is still Python-only.
 - Shape proofs keyed by authored function name, shared across specialized copies
   (blocks mixed-shape solve in one function).
 - ~~Cross-book `_turing_source_cells` stamps on cached AST objects.~~ Already fixed on

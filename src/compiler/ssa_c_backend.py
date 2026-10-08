@@ -956,6 +956,37 @@ class CModuleArtifact:
     def complete(self) -> bool:
         return not self.shortfalls
 
+    def write_layout_header(
+        self, directory: str | Path,
+    ) -> tuple[tuple, ...]:
+        """Write ``<entry>_layout.h`` beside ``<entry>.c`` and return the
+        ``emission.build`` ``extra_sources`` row that posts it.
+
+        The header is printed from this entry's API_CONTRACT row on the
+        book (``c_host_layout``); without a book there is no contract and
+        no header (empty tuple)."""
+
+        from .c_host_layout import layout_header_source
+        from .concordance_declarations import ArtifactPart, EMISSION_ARTIFACT
+        from .emission_concordance import api_contract
+
+        emission = self.emission
+        if emission is None or emission.api_contract is None:
+            return ()
+        entry, batch, buffers = api_contract(
+            emission.book, self.name, emission.backend,
+        )
+        fingerprint = emission.book.pages[EMISSION_ARTIFACT.name].latest(
+            (self.name, emission.backend, ArtifactPart.API_CONTRACT),
+        ).sha256
+        text = layout_header_source(
+            entry, batch, buffers, fingerprint=fingerprint,
+        )
+        path = Path(directory) / f"{self.name}_layout.h"
+        # Bytes, not text mode: the row's hash and length are the file's.
+        path.write_bytes(text.encode("utf-8"))
+        return (("layout_header", text, path, (emission.api_contract,)),)
+
     def _dynamic_link_inputs(self) -> tuple[list[str], list[Path]]:
         """What the linker is handed under ``link="dynamic"``: the import
         library beside each piece's DLL when it exists (``.lib``), else the
@@ -1013,6 +1044,7 @@ class CModuleArtifact:
         source_path = destination / f"{self.name}.c"
         library_path = destination / f"{self.name}.dll"
         source_path.write_text(self.source, encoding="utf-8")
+        layout_sources = self.write_layout_header(destination)
         pool_sources: list[str] = []
         if self.pool_required:
             pool_home = (
@@ -1063,6 +1095,7 @@ class CModuleArtifact:
                         self.name, source_text=self.source,
                         source_path=source_path, command=command,
                         library_path=library_path, pieces=pieces,
+                        extra_sources=layout_sources,
                     )
                 return self
             if "sub-compilation" not in (completed.stderr or ""):
@@ -1206,6 +1239,7 @@ class CModuleArtifact:
         initial_state_path = destination / "initial-state.bin"
         final_outputs_path = destination / "final-outputs.bin"
         module_source_path.write_text(self.source, encoding="utf-8")
+        layout_sources = self.write_layout_header(destination)
 
         shapes = self.buffer_shapes or tuple(
             () for _ in self.buffer_order
@@ -1428,7 +1462,7 @@ class CModuleArtifact:
                 extra_sources=((
                     "host", host_source, host_source_path,
                     (self.emission.buffer_order,),
-                ),),
+                ), *layout_sources),
             )
         return CStandaloneExecutable(
             directory=destination,
@@ -1519,8 +1553,13 @@ def emit_ssa_module_to_c(
     watch: Sequence[int] = (),
     trace: bool = False,
     trace_full_values: bool = False,
+    batch: int | None = None,
 ) -> CModuleArtifact:
     """Emit ``function_name`` and its call closure as one C module.
+
+    ``batch``: the cells per column the host declares for this entry; payload
+    of the entry's API_CONTRACT row (the contract has no declared column
+    roles to derive it from), None when the host declares none.
 
     Control flow becomes labels and gotos -- C's goto is exactly the
     unstructured branch the SSA already speaks, so no loop reconstruction is
@@ -1540,7 +1579,8 @@ def emit_ssa_module_to_c(
     )
     from .emission_concordance import (
         ArtifactEmission, emission_book, emission_recorder,
-        imported_kernel_scope, kernel_callers, post_artifact_part, value_cell,
+        imported_kernel_scope, kernel_callers, post_artifact_part,
+        post_api_contract, post_program_abi_field_slots, value_cell,
     )
 
     emission = emission_book(module, "emit_ssa_module_to_c")
@@ -5404,6 +5444,7 @@ def emit_ssa_module_to_c(
     from .ssa_storage_requirements import (
         function_storage_requirements,
         is_compiler_owned_storage,
+        is_structural_abi_value as _is_structural_abi_value,
     )
 
     storage_requirements = function_storage_requirements(module, function_name)
@@ -5418,6 +5459,8 @@ def emit_ssa_module_to_c(
         symbol=_c_symbol(function_name),
     )
     entry_span = wrapper.span(entry_lines)
+    #: The wrapper's FORMAL units, one per public buffer slot.
+    formal_units: list[Any] = []
 
     def activation_array(element_type: str, count: int) -> str:
         """Allocate wrapper-owned storage with LLVM alloca lifetime."""
@@ -5440,12 +5483,7 @@ def emit_ssa_module_to_c(
     def is_structural_abi_value(value) -> bool:
         """Whether *value* is a descriptor rather than physical storage."""
 
-        accounting = dict(value.accounting or {})
-        return (
-            int(value.id) in record_parameter_ids
-            or str(value.dtype or "").casefold() == "ssa.aggregate"
-            or accounting.get("program_abi_storage") == "keyed"
-        )
+        return _is_structural_abi_value(root, value)
 
     def is_private_root_storage(value) -> bool:
         accounting = dict(value.accounting or {})
@@ -5547,9 +5585,9 @@ def emit_ssa_module_to_c(
             f"    {held} *b{index} = "
             f"({held} *)buffers[{index}];"
         )
-        entry_span.take(
+        formal_units.append(entry_span.take(
             UnitKind.FORMAL, args=(value_id,), spelling=f"b{index}",
-        )
+        ))
         rendered_actuals.append(f"b{index}")
     root_formal_ids = {int(formal.id) for formal in root.args}
     watched_private_copies = []
@@ -5588,9 +5626,9 @@ def emit_ssa_module_to_c(
             f"    {element_type} *b{index} = "
             f"({element_type} *)buffers[{index}];"
         )
-        entry_span.take(
+        formal_units.append(entry_span.take(
             UnitKind.FORMAL, args=(output_id,), spelling=f"b{index}",
-        )
+        ))
         if output_id in root_formal_ids:
             # A private frame formal is already passed to the function. Watch
             # copies its final contents out without changing its initialization
@@ -5718,7 +5756,9 @@ def emit_ssa_module_to_c(
     wrapper_header = f"TURING_EXPORT void {name}(void **buffers, long long *extents) {{"
     wrapper_tail = 1 + len(root_allocations)
     wrapper_prefix = len(entry_lines) - wrapper_body_count - wrapper_tail
-    wrapper.unit(UnitKind.FUNCTION_HEADER, wrapper_header, spelling=name)
+    wrapper_header_unit = wrapper.unit(
+        UnitKind.FUNCTION_HEADER, wrapper_header, spelling=name,
+    )
     for line in entry_lines[:wrapper_prefix]:
         wrapper.unit(UnitKind.DECLARATION, line)
     wrapper.unit(
@@ -5793,6 +5833,22 @@ def emit_ssa_module_to_c(
         ),
         reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_C,
     )
+    # The host-facing layout is a book fact first: one row per ProgramABI
+    # slot, DERIVED from the slot values' cells and BUFFER_ORDER.
+    post_program_abi_field_slots(
+        emission, root, name, Backend.C_MODULE, buffer_order=buffer_order,
+        buffer_dtypes=buffer_dtypes, buffer_shapes=buffer_shapes,
+        buffer_order_cell=buffer_order_cell, stage=EMISSION_C,
+    )
+    # The entry's API as a host sees it: DERIVED from the wrapper's header
+    # and formal units, the root's function_output cells, BUFFER_ORDER and
+    # the slot rows above.
+    api_contract_cell = post_api_contract(
+        emission, root, name, Backend.C_MODULE, batch=batch,
+        buffer_order=buffer_order, buffer_dtypes=buffer_dtypes,
+        buffer_shapes=buffer_shapes, buffer_order_cell=buffer_order_cell,
+        unit_cells=(wrapper_header_unit, *formal_units), stage=EMISSION_C,
+    )
     return CModuleArtifact(
         external_slots=external_slot_rows(module, slot_functions),
         linked_llvm=tuple(linked_llvm),
@@ -5811,6 +5867,7 @@ def emit_ssa_module_to_c(
             None if emission is None
             else ArtifactEmission(
                 emission, Backend.C_MODULE, module_text, buffer_order_cell,
+                api_contract=api_contract_cell,
             )
         ),
     )

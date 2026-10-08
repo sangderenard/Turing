@@ -1539,7 +1539,7 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
         progress("emitting linked repository SSA to C")
         artifact = emit_ssa_module_to_c(
             module, exports[0], trace=trace,
-            trace_full_values=trace_full_values,
+            trace_full_values=trace_full_values, batch=batch,
         )
         if not artifact.complete:
             raise RuntimeError("C emission shortfalls: " + "; ".join(
@@ -1599,33 +1599,30 @@ class NativeSystem:
         return self.module.functions[self.entry]
 
     # ------------------------------------------------------------------ ABI
+    def slots(self):
+        """``(parameter, field, role) -> ProgramAbiSlot``: this entry's
+        ProgramABI slots, read from the ``program_abi_field_slot`` rows the
+        emission posted on the module's book.  Which formal is a slot's
+        resident is decided once, where the rows are posted."""
+        from src.compiler.emission_concordance import program_abi_field_slots
+
+        return program_abi_field_slots(
+            self.module, self.artifact.name, self.artifact.emission.backend)
+
     def state_field_ids(self):
         """``state`` field name -> root formal value id.
 
         This is the mapping that says which physical buffer carries ``T``, or
-        ``telemetry``, or any other declared field.  A lowered root can carry
-        more than one formal for the same field: the direct ProgramABI slot
-        and callsite-forwarded aliases used while assembling nested regions.
-        The compiler's ABI rule is that the written slot is authoritative,
-        followed by a direct root slot.  Do not let incidental argument order
-        decide which buffer a ctypes host reads back.
+        ``telemetry``, or any other declared field: the resident of each
+        ``state`` payload slot, as the book's rows name it.
         """
-        candidates = {}
-        for argument in self.root.args:
-            accounting = dict(argument.accounting or {})
-            field = accounting.get("program_abi_field")
-            if (accounting.get("program_abi_parameter") != "state"
-                    or field is None):
-                continue
-            priority = (
-                int(bool(accounting.get("program_abi_field_written"))),
-                int(accounting.get("callsite_id") is None),
-            )
-            candidates.setdefault(str(field), []).append(
-                (priority, int(argument.id)))
+        from src.compiler.concordance_declarations import ProgramAbiSlotRole
+
         return {
-            field: max(choices, key=lambda choice: choice[0])[1]
-            for field, choices in candidates.items()
+            field: slot.value_id
+            for (parameter, field, role), slot in self.slots().items()
+            if parameter == "state" and field is not None
+            and role is ProgramAbiSlotRole.PAYLOAD
         }
 
     def scalar_ids(self):
@@ -1634,20 +1631,12 @@ class NativeSystem:
         A host that wants to hand the next round the dt this one proposed has to
         write into the right buffer, and nothing else records which that is.
         """
-        names = {
-            int(value_id): str(name)
-            for name, value_id in self.root.metadata.get("parameter_names", ())
-        }
         wanted = {"round_dt", "dt_initial", "dx"}
-        found = {}
-        for argument in self.root.args:
-            accounting = dict(argument.accounting or {})
-            if accounting.get("program_abi_field") is not None:
-                continue
-            name = accounting.get("program_abi_parameter") or names.get(int(argument.id))
-            if name in wanted:
-                found[str(name)] = int(argument.id)
-        return found
+        return {
+            parameter: slot.value_id
+            for (parameter, field, role), slot in self.slots().items()
+            if field is None and parameter in wanted
+        }
 
     def buffer_index_of(self, value_id):
         """Where a value id sits in the artifact's ``void **buffers`` table."""
