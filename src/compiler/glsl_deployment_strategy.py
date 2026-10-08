@@ -16447,6 +16447,16 @@ def _propagate_callsite_tensor_specializations(
                                 source_state=exact_result,
                                 target_state=exact_result,
                                 role="return",
+                                # Read off the callee's return cells.
+                                source_cells=tuple(dict.fromkeys(
+                                    cell for cells in return_cells_by_call.get(
+                                        (id(caller.G), int(_node_id)), (),
+                                    ) for cell in (
+                                        cells if isinstance(cells, tuple)
+                                        else (cells,)
+                                    )
+                                    if cell is not None
+                                )),
                             )
                     return_kinds = set((callee.G.graph.get("return_container_kinds") or {}).values())
                     if (
@@ -16530,6 +16540,16 @@ def _propagate_callsite_tensor_specializations(
                                 source_state=replacement,
                                 target_state=replacement,
                                 role="return",
+                                # Read off the callee's return cells.
+                                source_cells=tuple(dict.fromkeys(
+                                    cell for cells in return_cells_by_call.get(
+                                        (id(caller.G), int(_node_id)), (),
+                                    ) for cell in (
+                                        cells if isinstance(cells, tuple)
+                                        else (cells,)
+                                    )
+                                    if cell is not None
+                                )),
                             )
 
                             from ..common.tensors.topological_reducer import (
@@ -17786,6 +17806,18 @@ def _tensor_descriptor(
                         "root",
                     ),)
                 for _source_node, source_value, source_role in semantic_sources:
+                    # The descriptor was read off the source node: the edge
+                    # derives from that node's identity cell.
+                    from ..common.tensors.topological_reducer import (
+                        node_identity_cell as _descriptor_source_cell,
+                    )
+
+                    try:
+                        edge_source_cells = source_cells or (
+                            _descriptor_source_cell(graph, int(_source_node)),
+                        )
+                    except ValueError:
+                        edge_source_cells = source_cells
                     record_shape_transformation(
                         row[0], source_value, row[0], row[1],
                         stage="graph_tensor_descriptor",
@@ -17793,7 +17825,7 @@ def _tensor_descriptor(
                         source_state=concordant_shape_transformation_state(
                             row[0], source_value,
                         ),
-                        source_cells=source_cells,
+                        source_cells=edge_source_cells,
                         target_state=answer,
                         role=source_role,
                     )
