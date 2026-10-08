@@ -882,26 +882,23 @@ def specialize_python_precision_widths(graph: Any) -> bool:
         # field is not an adequate hand-off.  Read the same authored value
         # row used by ``publish_call_result_shape`` before concluding that a
         # Precision promotion is scalar.
-        from ...compiler.identity_concordance import proven_shape_of
+        from ...compiler.identity_concordance import (
+            proven_shape_of,
+            shape_scope_of,
+        )
 
         data = target.nodes[int(value_id)]
         source_value_id = int(data.get("value_id", value_id))
-        for function in (
-            metadata.get("source_numeric_scope"),
-            metadata.get("function_name"),
-        ):
-            if function is None:
-                continue
-            extents = proven_shape_of(str(function), source_value_id)
-            if extents:
-                materialized = (
-                    copy.deepcopy(dict(descriptor))
-                    if isinstance(descriptor, Mapping) else {}
-                )
-                materialized["shape"] = tuple(extents)
-                materialized["rank"] = len(extents)
-                materialized.setdefault("dtype", "float64")
-                return materialized
+        extents = proven_shape_of(shape_scope_of(metadata), source_value_id)
+        if extents:
+            materialized = (
+                copy.deepcopy(dict(descriptor))
+                if isinstance(descriptor, Mapping) else {}
+            )
+            materialized["shape"] = tuple(extents)
+            materialized["rank"] = len(extents)
+            materialized.setdefault("dtype", "float64")
+            return materialized
         return (
             copy.deepcopy(dict(descriptor))
             if isinstance(descriptor, Mapping) else None
@@ -917,10 +914,13 @@ def specialize_python_precision_widths(graph: Any) -> bool:
         materialized["shape"] = extents
         materialized.setdefault("rank", len(extents))
         target.nodes[int(value_id)]["tensor"] = materialized
-        from ...compiler.identity_concordance import record_proven_shape
+        from ...compiler.identity_concordance import (
+            record_proven_shape,
+            shape_scope_of,
+        )
 
         record_proven_shape(
-            scope, int(value_id), extents,
+            shape_scope_of(metadata), int(value_id), extents,
             materialized.get("dtype"), level=None,
         )
 

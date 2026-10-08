@@ -303,7 +303,7 @@ def publish_program_abi_graph_identities(
                         record_shape_transformation(
                             f"ProgramABI:{owner_identity}",
                             (str(owner_identity), field_name),
-                            graph_obj.graph.get("function_name"),
+                            shape_scope_of(graph_obj),
                             int(data.get("value_id", node_id)),
                             stage="program_abi_graph_publication",
                             operation="getattr",
@@ -602,8 +602,8 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                     "dtype": str(result_dtype or "unknown"),
                 }
                 record_shape_transformation(
-                    callee_name, ("return", str(callee_name)),
-                    function.name, result_id,
+                    shape_scope_of(callee), ("return", str(callee_name)),
+                    shape_scope_of(function), result_id,
                     stage="projected_iterable_layout",
                     operation="call_result", source_state=state,
                     target_state=state, role="return",
@@ -788,12 +788,12 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                         "dtype": str(column_dtype or "unknown"),
                     }
                     record_shape_transformation(
-                        callee_name,
+                        shape_scope_of(callee),
                         (
                             "sequence_column",
                             int(descriptor.sequence_id), int(column),
                         ),
-                        function.name, target_id,
+                        shape_scope_of(function), target_id,
                         stage="projected_iterable_layout",
                         operation="sequence_row_column",
                         source_state=state, target_state=state,
@@ -3976,7 +3976,7 @@ def descriptor_from_shape_transformation_state(
 SHAPE_EDGE_PAGE = declare_page(
     "shape_transformation_concordance",
     (RowField("target_scope", _SCOPE), RowField("target_id", _LABEL),
-     RowField("source_scope", _NAME), RowField("source_id", _LABEL),
+     RowField("source_scope", _SCOPE), RowField("source_id", _LABEL),
      RowField("stage", _NAME), RowField("operation", _NAME),
      RowField("role", _NAME)),
     tuple,
@@ -4020,8 +4020,8 @@ def record_shape_transformation(
     caller-local shape cache participates in the decision.
     """
 
-    source_scope = authored_function_name(source_scope)
-    target_scope = authored_function_name(target_scope)
+    source_scope = _shape_key(source_scope)
+    target_scope = _shape_key(target_scope)
     source = shape_transformation_state(source_state)
     target = shape_transformation_state(target_state)
     book = current_identity_book()
@@ -4160,7 +4160,7 @@ def withdraw_superseded_shape_derivations(
     dependents = book.page("shape_transformation_dependents")
     edge_page = book.page("shape_transformation_concordance")
     state_page = book.page("shape_transformation_state")
-    pending = [(authored_function_name(scope), value_id,
+    pending = [(_shape_key(scope), value_id,
                 shape_transformation_state(state))]
     visited: set[tuple[Any, Any]] = set()
     while pending:
@@ -4209,7 +4209,7 @@ def concordant_shape_transformation_state(
 ) -> tuple[Any, ...] | None:
     """Read the latest causally recorded shape at one graph identity."""
 
-    row = (authored_function_name(scope), value_id)
+    row = (_shape_key(scope), value_id)
     fact = current_identity_book().page(
         "shape_transformation_state"
     ).latest(row)
@@ -4224,7 +4224,7 @@ def invalidate_shape_transformation(
     """Record that a target's prior path was superseded upstream."""
 
     page = current_identity_book().page("shape_transformation_state")
-    row = (authored_function_name(scope), value_id)
+    row = (_shape_key(scope), value_id)
     fact = ("invalidated", source_id, str(reason))
     if page.latest(row) != fact:
         page.revise(row, fact)
@@ -4238,7 +4238,7 @@ def committed_sequence_row_layout(
 ) -> SequenceRowLayout | None:
     """Read the element layout already proven for this exact sequence."""
 
-    scope = authored_function_name(scope)
+    scope = _shape_key(scope)
     if page is None:
         page = current_identity_book().page(
             "sequence_row_layout_concordance"
@@ -4267,7 +4267,7 @@ def invalidate_sequence_row_layout(
     """
 
     page = current_identity_book().page("sequence_row_layout_concordance")
-    row = (authored_function_name(scope), int(sequence_id))
+    row = (_shape_key(scope), int(sequence_id))
     incumbent = page.latest(row)
     if incumbent is None:
         return
@@ -4293,7 +4293,7 @@ def commit_sequence_row_layout(
     scalar element here; absence of the row is the only unknown shape.
     """
 
-    scope = authored_function_name(scope)
+    scope = _shape_key(scope)
     if page is None:
         page = current_identity_book().page(
             "sequence_row_layout_concordance"
@@ -4740,6 +4740,148 @@ def authored_function_name(name: Any) -> str:
     # an authored name that itself begins with an underscore makes the last
     # separator fall inside ``___``, which would eat that underscore.
     return text.split("__", 1)[-1] if "__" in text else text
+
+
+def _shape_owner_metadata(owner: Any) -> dict:
+    """The metadata dict that names the shape scope of ``owner``: a
+    ProcessGraph (``G.graph``), a networkx graph (``graph``), an IR function
+    (``metadata``) or the metadata dict itself."""
+
+    graph = getattr(owner, "G", None)
+    if graph is not None and isinstance(getattr(graph, "graph", None), dict):
+        return graph.graph
+    if isinstance(getattr(owner, "graph", None), dict):
+        return owner.graph
+    if isinstance(getattr(owner, "metadata", None), dict):
+        return owner.metadata
+    if isinstance(owner, dict):
+        return owner
+    raise TypeError(f"no shape scope metadata on {type(owner).__name__}")
+
+
+def shape_scope_of(owner: Any) -> Any:
+    """The shape-proof scope of the COPY ``owner`` states shapes for.
+
+    ``proven_shape``, ``shape_transformation_state`` and the other shape
+    pages are keyed by this scope -- the book-minted scope of one graph copy
+    -- and never by the authored function name: the 2x2 and the 3x3
+    specialization of one function are two copies and never share a row.
+    The scope is minted the first time a graph is asked and rides in the
+    graph's metadata, so a copy that is only an extraction of its source
+    (a function shell, a dispatch region, an SSA function lowered from it)
+    states shapes in the SAME scope; a callsite specialization is a variant
+    and forks its own (``fork_shape_scope``).
+
+    An IR function that carries no scope (one no graph lowered to) is its own
+    copy: its scope is its exact symbol, never parsed.
+    """
+
+    metadata = _shape_owner_metadata(owner)
+    scope = metadata.get("shape_scope")
+    if scope is not None:
+        return tuple(scope)
+    if hasattr(owner, "blocks") and hasattr(owner, "name"):
+        # An IR function that no graph copy stamped.
+        return ("ir_function", str(owner.name))
+    from .concordance_declarations import (
+        SCOPE_REGISTRY, SHAPE_SCOPE, SHAPE_SCOPE_FUNCTION,
+    )
+
+    authored = str(
+        metadata.get("function_name")
+        or metadata.get("qualified_name")
+        or "<module>"
+    )
+    book = current_identity_book()
+    scope = book.mint_scope(f"{authored}|shape", SHAPE_SCOPE)
+    book.post(
+        SHAPE_SCOPE_FUNCTION, (scope,), authored, stage=SHAPE_SCOPE,
+        provenance=Derived((book.latest_ref(SCOPE_REGISTRY, scope),)),
+        mode=Mode.CONCORD,
+    )
+    metadata["shape_scope"] = scope
+    return scope
+
+
+def fork_shape_scope(owner: Any, cause: str) -> Any:
+    """Give a graph copy that is a VARIANT of its source its own shape scope.
+
+    A callsite specialization states shapes the source copy does not: it is
+    minted a fresh scope, whose origin (``scope_origin``) names the source
+    scope it was specialized from, DERIVED from the source scope's registry
+    cell.  The source's rows are never written by the variant."""
+
+    from .concordance_declarations import (
+        SCOPE_ORIGIN, SCOPE_REGISTRY, SHAPE_SCOPE, SHAPE_SCOPE_FUNCTION,
+        ScopeFork,
+    )
+
+    source = shape_scope_of(owner)
+    book = current_identity_book()
+    authored = shape_scope_function(source)
+    forked = book.mint_scope(f"{authored}|shape", SHAPE_SCOPE)
+    forked_cell = book.latest_ref(SCOPE_REGISTRY, forked)
+    book.post(
+        SHAPE_SCOPE_FUNCTION, (forked,), authored, stage=SHAPE_SCOPE,
+        provenance=Derived((forked_cell,)), mode=Mode.CONCORD,
+    )
+    source_cell = book.latest_ref(SCOPE_REGISTRY, source)
+    book.post(
+        SCOPE_ORIGIN, (forked,), ScopeFork(source, str(cause)),
+        stage=SHAPE_SCOPE,
+        provenance=Derived(tuple(
+            cell for cell in (source_cell, forked_cell) if cell is not None
+        )),
+        mode=Mode.CONCORD,
+    )
+    _shape_owner_metadata(owner)["shape_scope"] = forked
+    return forked
+
+
+def shape_scope_is_variant(owner: Any) -> bool:
+    """Whether ``owner``'s shape scope was forked from another copy's
+    (``fork_shape_scope``): the book holds a ``scope_origin`` row for it."""
+
+    from .concordance_declarations import SCOPE_ORIGIN
+
+    page = current_identity_book().pages.get(SCOPE_ORIGIN.name)
+    if page is None:
+        return False
+    return page.latest((shape_scope_of(owner),)) is not None
+
+
+def shape_scope_is_variant(owner: Any) -> bool:
+    """Whether ``owner``'s shape scope was forked from another copy's
+    (``fork_shape_scope``): the book holds a ``scope_origin`` row for it."""
+
+    from .concordance_declarations import SCOPE_ORIGIN
+
+    page = current_identity_book().pages.get(SCOPE_ORIGIN.name)
+    if page is None:
+        return False
+    return page.latest((shape_scope_of(owner),)) is not None
+
+
+def shape_scope_function(scope: Any) -> str | None:
+    """The authored function a shape scope states shapes for, as the book
+    recorded it when the scope was minted (``None`` for a scope that is not
+    a shape scope)."""
+
+    from .concordance_declarations import SHAPE_SCOPE_FUNCTION
+
+    page = current_identity_book().pages.get(SHAPE_SCOPE_FUNCTION.name)
+    if page is None:
+        return None
+    return page.latest((tuple(scope) if isinstance(scope, list) else scope,))
+
+
+def _shape_key(scope: Any) -> Any:
+    """The row key of a shape page: the copy's scope, exactly as given.
+
+    A scope is an identity and is used as one -- no name is parsed.  (A bare
+    string is an opaque scope of its own: a caller with no copy to name.)"""
+
+    return tuple(scope) if isinstance(scope, list) else scope
 
 
 OUTER, CARRIED, INNER = 0, 1, 2
@@ -5312,7 +5454,7 @@ def record_proven_shape(
     if not extents:
         return
     page = current_identity_book().page("proven_shape")
-    row = (authored_function_name(function), int(value_id))
+    row = (_shape_key(function), int(value_id))
     recorded = page.history(row)
     fact = ("proven", extents, str(dtype or "float64"))
     target_level = (
@@ -5349,7 +5491,7 @@ def invalidate_proven_shape(
     """Withdraw a derived shape after one of its exact dependencies changes."""
 
     page = current_identity_book().page("proven_shape")
-    row = (authored_function_name(function), int(value_id))
+    row = (_shape_key(function), int(value_id))
     recorded = page.history(row)
     column = max(
         (int(existing) for existing, _fact in recorded), default=-1,
@@ -5378,7 +5520,7 @@ def proven_shape_contract_of(
     """
 
     page = current_identity_book().page("proven_shape")
-    row = (authored_function_name(function), int(value_id))
+    row = (_shape_key(function), int(value_id))
     recorded = page.history(row)
     if not recorded:
         return None

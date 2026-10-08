@@ -19,6 +19,7 @@ from src.compiler.identity_concordance import (
     end_identity_book,
     proven_shape_of,
     record_proven_shape,
+    shape_scope_of,
 )
 from src.transmogrifier.ssa import SSAValue
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
@@ -39,7 +40,7 @@ def test_constant_array_descriptor_enters_the_value_concordance():
         assert _tensor_descriptor(graph, 3) == {
             "shape": (96,), "dtype": "float64", "rank": 1,
         }
-        assert proven_shape_of("pointer_lane", 3) == (96,)
+        assert proven_shape_of(shape_scope_of(graph), 3) == (96,)
     finally:
         end_identity_book(token)
 
@@ -92,7 +93,7 @@ def test_numeric_literal_views_carry_shape_into_matmul_concordance():
         assert _tensor_descriptor(graph, 10) == {
             "shape": (1, 8, 8), "dtype": "float64", "rank": 3,
         }
-        assert proven_shape_of("literal_projection", 10) == (1, 8, 8)
+        assert proven_shape_of(shape_scope_of(graph), 10) == (1, 8, 8)
     finally:
         end_identity_book(token)
 
@@ -158,9 +159,10 @@ def test_polymorphic_helper_keeps_exact_specialization_operand_shape():
         )
         local = SSAValue(6, dtype="float64", shape=(2, 1))
 
-        _settle_operand_shapes(
-            "artifact___row__specialized_column", (local,),
+        column = SimpleNamespace(
+            name="artifact___row__specialized_column", blocks={}, metadata={},
         )
+        _settle_operand_shapes(column, (local,))
 
         assert local.shape == (2, 1)
     finally:
@@ -252,7 +254,7 @@ def test_polymorphic_specialization_rederives_intermediate_shape_locally():
 
     _book, token = begin_identity_book()
     try:
-        record_proven_shape("_row", 2, (2, 2), "float64", 2)
+        record_proven_shape(shape_scope_of(graph), 2, (2, 2), "float64", 2)
         _publish_formal_shape(
             "_row", "matrix",
             {"shape": (2, 2), "dtype": "float64"}, "matrix_lane",
@@ -266,7 +268,7 @@ def test_polymorphic_specialization_rederives_intermediate_shape_locally():
             "shape": (1,), "dtype": "float64", "rank": 1,
         }
         history = current_identity_book().page("proven_shape").history(
-            ("_row", 2)
+            (shape_scope_of(graph), 2)
         )
         assert history[-1][1][0] == "conflicting"
     finally:
@@ -337,7 +339,7 @@ def test_leading_axis_reduction_uses_dynamic_sequence_row_shape():
         assert _tensor_descriptor(graph, 1) == {
             "shape": (3,), "dtype": "float64", "rank": 1,
         }
-        assert proven_shape_of("reduce_dynamic_rows", 1) == (3,)
+        assert proven_shape_of(shape_scope_of(graph), 1) == (3,)
     finally:
         end_identity_book(token)
 
@@ -356,20 +358,20 @@ def test_dependency_change_invalidates_and_then_reproves_concordance_shape():
 
     _book, token = begin_identity_book()
     try:
-        record_proven_shape("helper", 2, (2,), "float64", 4)
+        record_proven_shape(shape_scope_of(graph), 2, (2,), "float64", 4)
         _invalidate_tensor_descriptor_dependents(
             graph, (1,), "call-result-specialization-changed",
         )
 
         assert "tensor" not in graph.G.nodes[2]
-        assert proven_shape_of("helper", 2) is None
+        assert proven_shape_of(shape_scope_of(graph), 2) is None
         assert current_identity_book().page("proven_shape").latest(
-            ("helper", 2)
+            (shape_scope_of(graph), 2)
         ) == (
             "invalidated", 1, "call-result-specialization-changed",
         )
 
-        record_proven_shape("helper", 2, (1,), "float64", 2)
-        assert proven_shape_of("helper", 2) == (1,)
+        record_proven_shape(shape_scope_of(graph), 2, (1,), "float64", 2)
+        assert proven_shape_of(shape_scope_of(graph), 2) == (1,)
     finally:
         end_identity_book(token)

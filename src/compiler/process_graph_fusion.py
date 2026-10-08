@@ -175,6 +175,12 @@ def extract_clean_process_subgraph(
     from ..common.tensors.topological_reducer import (
         _set_operands, fork_read_scope,
     )
+    from .identity_concordance import shape_scope_of
+
+    # An extraction states shapes in its source's shape scope (it is the same
+    # copy, only smaller); the scope must exist before the metadata is copied
+    # so source and extraction cannot each mint their own.
+    shape_scope_of(graph)
 
     extracted.G = graph.G.subgraph(included).copy()
     extracted.G.graph = isolate_metadata(dict(graph.G.graph))

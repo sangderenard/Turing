@@ -1366,6 +1366,7 @@ class _ControlSSABuilder:
         region_value_ranks: Mapping[int, int] | None = None,
         tensor_shape_concordance_scope: str | None = None,
         lexical_read_scope: Any = None,
+        shape_scope: Any = None,
         plan_callsite_bindings: Mapping[
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None = None,
@@ -1451,6 +1452,13 @@ class _ControlSSABuilder:
         # are read from its pages, never passed in as tables.
         self.lexical_read_scope = (
             None if lexical_read_scope is None else tuple(lexical_read_scope)
+        )
+        #: The shape scope of the graph COPY this function is lowered from
+        #: (``identity_concordance.shape_scope_of``): the key every proven
+        #: shape this lowering reads is held under.
+        self.shape_scope = (
+            ("ir_function", str(function_name)) if shape_scope is None
+            else tuple(shape_scope)
         )
         #: The loops enclosing the current emission point, as keys of their
         #: ``loop_entry_state`` rows (None for a loop the book cannot key).
@@ -2020,7 +2028,7 @@ class _ControlSSABuilder:
                 () for _column in range(int(column_count))
             ]
             row_layout = committed_sequence_row_layout(
-                function_name, int(sequence_id),
+                self.shape_scope, int(sequence_id),
             )
             if row_layout is not None:
                 if len(row_layout.column_shapes) != int(column_count):
@@ -2055,7 +2063,7 @@ class _ControlSSABuilder:
                     mutation.argument_value_ids
                 ):
                     row_contract = proven_shape_contract_of(
-                        function_name, int(argument_id),
+                        self.shape_scope, int(argument_id),
                     )
                     if row_contract is None:
                         continue
@@ -11867,6 +11875,7 @@ def lower_control_program_to_ssa(
     region_value_ranks: Mapping[int, int] | None = None,
     tensor_shape_concordance_scope: str | None = None,
     lexical_read_scope: Any = None,
+    shape_scope: Any = None,
     plan_callsite_bindings: Mapping[
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
@@ -11922,6 +11931,7 @@ def lower_control_program_to_ssa(
         region_value_ranks=region_value_ranks,
         tensor_shape_concordance_scope=tensor_shape_concordance_scope,
         lexical_read_scope=lexical_read_scope,
+        shape_scope=shape_scope,
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=value_aliases,
         inout_value_ids=inout_value_ids,
@@ -14156,6 +14166,7 @@ def lower_control_sections_to_ssa(
     function_outputs: tuple[str, ...] = (),
     function_parameters: tuple[str, ...] = (),
     lexical_read_scope: Any = None,
+    shape_scope: Any = None,
     value_dtypes: Mapping[int, str] | None = None,
     value_shapes: Mapping[int, tuple[int, ...]] | None = None,
     constant_values: Mapping[int, Any] | None = None,
@@ -16705,6 +16716,7 @@ def lower_control_sections_to_ssa(
         region_value_ranks=region_value_ranks,
         tensor_shape_concordance_scope=tensor_shape_concordance_scope,
         lexical_read_scope=lexical_read_scope,
+        shape_scope=shape_scope,
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=final_value_aliases,
         inout_value_ids=tuple(map(int, record_field_write_value_ids)),
@@ -17270,6 +17282,12 @@ def lower_control_sections_to_ssa(
                                     *("int64" for _value in appended),
                                 )
                             call_instruction.attributes = attributes
+    # Every function this lowering produced -- the control function and its
+    # planned regions -- states shapes for the graph COPY it was lowered
+    # from (``identity_concordance.shape_scope_of``).
+    if shape_scope is not None:
+        for _stamped in functions.values():
+            _stamped.metadata.setdefault("shape_scope", tuple(shape_scope))
     module = IRModule(
         link_required_ssa_features(functions),
         recursion_table={

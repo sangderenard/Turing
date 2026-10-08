@@ -468,12 +468,12 @@ def _publish_concordant_function_aliases(
     """
 
     from .identity_concordance import (
-        authored_function_name,
         concordant_shape_transformation_state,
         current_identity_book,
         descriptor_from_shape_transformation_state,
         record_shape_transformation,
         resolved_concordant_alias_bindings,
+        shape_scope_of,
     )
 
     from .concordance_declarations import (
@@ -538,7 +538,7 @@ def _publish_concordant_function_aliases(
                 stage=PLANNING_RESIDENCY, mode=Mode.REVISE,
                 cells=alias_cells(alias_id, resident_id),
             )
-        authored_scope = authored_function_name(function.name)
+        authored_scope = shape_scope_of(function)
         source_state = concordant_shape_transformation_state(
             authored_scope, alias_id,
         )
@@ -14919,10 +14919,13 @@ def _sequence_column_dtype_contracts(
             and len(dtypes) == declared[int(sequence_id)]
         ):
             contracts[int(sequence_id)] = dtypes
-            from .identity_concordance import commit_sequence_row_layout
+            from .identity_concordance import (
+                commit_sequence_row_layout,
+                shape_scope_of,
+            )
 
             commit_sequence_row_layout(
-                str(graph_obj.graph.get("function_name") or "<anonymous>"),
+                shape_scope_of(graph_obj),
                 int(sequence_id),
                 tuple(shape for _name, _dtype, shape in row_columns),
                 dtypes,
@@ -16874,6 +16877,7 @@ def _class_surface_ssa_program(
         invalidate_proven_shape as _invalidate_abi_shape,
         record_proven_shape as _record_abi_shape,
         record_shape_transformation as _record_abi_shape_transformation,
+        shape_scope_of as _abi_shape_scope_of,
     )
     shape_identity_book.registry.declare_page(
         _VALUE_SHAPE.name, _VALUE_SHAPE.row_fields, _VALUE_SHAPE.fact_type,
@@ -16960,7 +16964,7 @@ def _class_surface_ssa_program(
             # is read from the book, never posted here.
             state = shape_identity_book.latest_ref(
                 _SHAPE_STATE_PAGE,
-                (str(source_owner.graph.get("function_name")), int(source_id)),
+                (_abi_shape_scope_of(source_owner), int(source_id)),
             )
             if state is not None:
                 cells.append(state)
@@ -17070,7 +17074,7 @@ def _class_surface_ssa_program(
                 "declared_abi_shape_revision",
             )
             _invalidate_abi_shape(
-                row[0], int(value_id), int(value_id),
+                _abi_shape_scope_of(owner), int(value_id), int(value_id),
                 "declared_abi_shape_revision",
             )
         # A second lowering of one law may declare a different batch ABI on
@@ -17089,12 +17093,16 @@ def _class_surface_ssa_program(
             # With only dependent withdrawal, those queries still read the
             # old input projection and re-derived the old batch's outputs.
             _record_abi_shape_transformation(
-                row[0], int(value_id), row[0], int(value_id),
+                _abi_shape_scope_of(owner), int(value_id),
+                _abi_shape_scope_of(owner), int(value_id),
                 stage=_LINKED_VALUE_ABI_SETTLEMENT.name,
                 operation="program_abi_contract", source_state=descriptor,
                 target_state=descriptor, source_cells=(shape_cell,),
             )
-            _record_abi_shape(row[0], int(value_id), stated, fact[2], None)
+            _record_abi_shape(
+                _abi_shape_scope_of(owner), int(value_id), stated, fact[2],
+                None,
+            )
     planned_graphs_by_shell: dict[int, Any] = {}
     for planned_shell in planned_shells:
         planned_graph = getattr(
@@ -17542,7 +17550,7 @@ def _class_surface_ssa_program(
     _node_page = _shape_book().page("shape.node")
     _linked_page = _shape_book().page("shape.linked")
     for _graph in planned_graphs_by_shell.values():
-        _name = str(_graph.graph.get("function_name"))
+        _name = _abi_shape_scope_of(_graph)
         _contracts = linked_value_abi_by_graph.get(id(_graph), {})
         for _node_id, _data in _graph.nodes(data=True):
             _value_id = int(_data.get("value_id", _node_id))
@@ -17561,7 +17569,7 @@ def _class_surface_ssa_program(
     _node_page = _shape_book().page("shape.node")
     _linked_page = _shape_book().page("shape.linked")
     for _graph in planned_graphs_by_shell.values():
-        _name = str(_graph.graph.get("function_name"))
+        _name = _abi_shape_scope_of(_graph)
         _contracts = linked_value_abi_by_graph.get(id(_graph), {})
         for _node_id, _data in _graph.nodes(data=True):
             _value_id = int(_data.get("value_id", _node_id))
@@ -19882,6 +19890,8 @@ def _class_surface_ssa_program(
             ),)
             if source_id is not None and int(source_id) in graph_obj
         )
+        from .identity_concordance import shape_scope_of
+
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -19896,6 +19906,7 @@ def _class_surface_ssa_program(
                     graph_obj.graph.get("function_parameters") or ()
                 ),
                 lexical_read_scope=graph_obj.graph.get("lexical_read_scope"),
+                shape_scope=shape_scope_of(graph_obj),
                 value_dtypes=parameter_value_dtypes,
                 value_shapes=parameter_value_shapes,
                 constant_values=constant_values,
@@ -21961,6 +21972,7 @@ def _class_surface_ssa_program(
             from .identity_concordance import (
                 proven_shape_of,
                 record_proven_shape,
+                shape_scope_of as _structural_shape_scope_of,
             )
 
             operand_shapes = [
@@ -21988,10 +22000,13 @@ def _class_surface_ssa_program(
                     computed_shape = shape if shape else computed_shape
                     continue
                 computed_shape = tuple(merged)
-            shared_shape = proven_shape_of(symbol, value_id)
+            shared_shape = proven_shape_of(
+                _structural_shape_scope_of(graph), value_id,
+            )
             if computed_shape:
                 record_proven_shape(
-                    symbol, value_id, computed_shape, dtype, None,
+                    _structural_shape_scope_of(graph), value_id,
+                    computed_shape, dtype, None,
                 )
             result_shape = computed_shape or shared_shape or ()
             result = SSAValue(value_id, dtype=dtype, shape=result_shape)

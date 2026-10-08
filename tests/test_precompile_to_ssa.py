@@ -4001,11 +4001,12 @@ def test_sequence_row_contract_follows_proven_append_value_identity():
     _book, token = begin_identity_book()
     try:
         record_proven_shape(
-            "row_sequence", 12, (3,), "float64", level=2,
+            ("row_sequence|shape", 0), 12, (3,), "float64", level=2,
         )
         function, shortfalls = lower_control_program_to_ssa(
             control,
             function_name="row_sequence",
+            shape_scope=("row_sequence|shape", 0),
             # This stale stage summary deliberately says scalar/unknown.  The
             # exact graph proof above is the only row-layout authority.
             region_value_meta={12: Meta((), "unknown")},
@@ -4025,12 +4026,13 @@ def test_declared_sequence_reads_row_layout_from_identity_book():
     _book, token = begin_identity_book()
     try:
         commit_sequence_row_layout(
-            "row_sequence", 30, ((3,),), ("float64",),
+            ("row_sequence|shape", 0), 30, ((3,),), ("float64",),
             source="collection value edge",
         )
         function, shortfalls = lower_control_program_to_ssa(
             ControlProgram(SequenceBlock(())),
             function_name="module__row_sequence__specialized_deadbeef",
+            shape_scope=("row_sequence|shape", 0),
             sequence_initializations=((30, "duplicates", 1),),
             sequence_declarations=((30, "duplicates", 1, True),),
         )
