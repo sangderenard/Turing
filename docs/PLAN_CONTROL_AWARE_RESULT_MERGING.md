@@ -174,6 +174,22 @@ shortfalls) verify it.
   blocks (the continuation after an arm-owned break) in the dominator
   fixpoint -- both had made the exit edge carry the stale header value.
 
+Break-edge follow-up (2026-10-08, `tools/compiler_probes/probe_break_edge_value.py`):
+
+- A `break` ending one arm of an `if` whose OTHER arm runs retained regions is
+  arm-owned too (`arm_owned_site` in loop_composer, `arm_loop_control` in the
+  conditional builder): the reducer lets the surviving arm's bindings stand
+  after the `if` without a merge, so only a break that leaves from its own arm
+  keeps them dominating the exit edge (`if ok: dt = dt * 0.5 / else: break`
+  raised `break-edge-value`).
+- `loop_break_sites` / `LoopControlBlock.site_values` key each binding by its
+  carried pair `(pre-loop identity, carried update)`, not the pre-loop identity
+  alone: `tried = dt` before the loop seeds two names from one value, and the
+  later name overwrote the first at every site (silently wrong exit value).
+- Open: a `break` under an `if` nested in an arm whose predicate is computed in
+  that arm (`if c: dt = ...; if dt < x: break`) is still placed lexically, so
+  its guard reads the arm-local predicate at the merge.
+
 ## Related defects found in the existing `break` path (audit_break_in_if_trace.py) -- historical
 
 Same program, `run_superstep` lines 620-626 (`for boundary in

@@ -6657,8 +6657,8 @@ class _ControlSSABuilder:
                 # "updated-if-it-dominates-else-current" rule remains only
                 # for names the site table does not mention.
                 site_values = {
-                    int(initial_id): int(value_id)
-                    for initial_id, value_id in block.site_values
+                    (int(initial_id), int(updated_id)): int(value_id)
+                    for (initial_id, updated_id), value_id in block.site_values
                 }
 
                 def site_value(
@@ -6667,7 +6667,7 @@ class _ControlSSABuilder:
                     incumbent: SSAValue,
                     initial_value: SSAValue,
                 ) -> SSAValue | None:
-                    value_id = site_values.get(int(initial_id))
+                    value_id = site_values.get((int(initial_id), int(updated_id)))
                     if value_id is None:
                         return None
                     value = self.external_values.get(int(value_id))

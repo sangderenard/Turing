@@ -203,7 +203,8 @@ class LoopDescriptor:
     ] = ()
     # Every source break/continue in this loop's body:
     # (statement node id, action, guard chain outermost-first,
-    #  ((pre-loop identity, value at the site), ...), arm_owned).
+    #  (((pre-loop identity, carried update), value at the site), ...),
+    #  arm_owned).
     # The last element is the enclosing ``if`` arm's (first, last) source
     # line when the statement ends that arm.  Such a site is ARM-OWNED when
     # a value it carries is produced by a body region INSIDE the arm (the
@@ -643,15 +644,19 @@ def _retarget_cached_value_ids(
             }
         break_sites = attributes.get("loop_break_sites")
         if isinstance(break_sites, dict) and any(
-            int(initial) == old_value_id or int(value) == old_value_id
+            old_value_id in (int(initial), int(updated), int(value))
             for site_values in break_sites.values()
-            for initial, value in site_values.items()
+            for (initial, updated), value in site_values.items()
         ):
             attributes["loop_break_sites"] = {
                 span: {
-                    (single if int(initial) == old_value_id else int(initial)):
-                    (single if int(value) == old_value_id else int(value))
-                    for initial, value in site_values.items()
+                    (
+                        single if int(initial) == old_value_id
+                        else int(initial),
+                        single if int(updated) == old_value_id
+                        else int(updated),
+                    ): (single if int(value) == old_value_id else int(value))
+                    for (initial, updated), value in site_values.items()
                 }
                 for span, site_values in break_sites.items()
             }
@@ -782,7 +787,8 @@ def _retarget_plan_value_ids(
                 for predicate_id, expect_true in chain
             ),
             tuple(
-                (rename(initial), rename(value)) for initial, value in site_values
+                ((rename(initial), rename(updated)), rename(value))
+                for (initial, updated), value in site_values
             ),
             arm_span,
         )
@@ -2739,7 +2745,7 @@ class LoopComposer:
         loop_controls: list[tuple[str, int, int | None, bool]] = []
         control_sites: list[tuple[
             int, str, tuple[tuple[int, bool], ...],
-            tuple[tuple[int, int], ...], bool,
+            tuple[tuple[tuple[int, int], int], ...], bool,
         ]] = []
         loop_break_sites = dict(
             (graph.G.nodes[int(node_id)].get("attributes") or {})
@@ -2841,8 +2847,9 @@ class LoopComposer:
                             # nothing reads, so its pair is dropped here
                             # (the builder applies the same filter).
                             tuple(sorted(
-                                (int(initial), int(value))
-                                for initial, value in site_values.items()
+                                ((int(initial), int(updated)), int(value))
+                                for (initial, updated), value
+                                in site_values.items()
                                 if live_site_pair(initial, value)
                             )),
                             # The enclosing ``if`` arm's source line span when
@@ -5451,9 +5458,35 @@ def analyze_shader_loop_reductions(
                 line = getattr(data.get("expr_obj"), "lineno", None)
             return None if line is None else int(line)
 
+        def sibling_arm_span(
+            arm_span: tuple[int, int],
+        ) -> tuple[int, int] | None:
+            """Line span of the other arm of the ``if`` that holds ``arm_span``."""
+
+            def span_of(statements: list[ast.stmt]) -> tuple[int, int]:
+                return (
+                    min(int(getattr(item, "lineno", -1)) for item in statements),
+                    max(int(getattr(
+                        item, "end_lineno", getattr(item, "lineno", -1),
+                    )) for item in statements),
+                )
+
+            loop_syntax = graph.G.nodes[int(loop.node_id)].get("expr_obj")
+            for candidate in ast.walk(loop_syntax) if loop_syntax else ():
+                if not isinstance(candidate, ast.If):
+                    continue
+                for arm, other in (
+                    (candidate.body, candidate.orelse),
+                    (candidate.orelse, candidate.body),
+                ):
+                    if arm and other and span_of(arm) == tuple(arm_span):
+                        return span_of(other)
+            return None
+
         def arm_owned_site(
             arm_span: tuple[int, int] | None,
-            site_values: tuple[tuple[int, int], ...],
+            site_values: tuple[tuple[tuple[int, int], int], ...],
+            action: str = "",
         ) -> bool:
             if arm_span is None:
                 return False
@@ -5466,6 +5499,21 @@ def analyze_shader_loop_reductions(
                 if line is not None and first <= line <= last:
                     owned = True
                     break
+            if not owned and action == "break":
+                # A ``break`` ending one arm of a conditional whose OTHER arm
+                # runs body regions: the surviving arm's bindings stand after
+                # the ``if`` unmerged (the reducer's terminal-arm rule), so
+                # the break leaves from its own arm or nothing downstream
+                # dominates it.  Same rule as the conditional builder's
+                # ``arm_loop_control``.
+                sibling = sibling_arm_span(arm_span)
+                if sibling is not None:
+                    owned = any(
+                        int(member) in body_region_nodes
+                        and (line := node_line(member)) is not None
+                        and sibling[0] <= line <= sibling[1]
+                        for member in body_region_nodes
+                    )
             if os.environ.get("TURING_DEBUG_BREAK_EDGE"):
                 print(
                     "DEBUG-ARM-OWNED composer "
@@ -5492,7 +5540,7 @@ def analyze_shader_loop_reductions(
             for site_id, action, chain, site_values, arm_span
             in loop.control_sites
             if site_id in lexical_position
-            and not arm_owned_site(arm_span, site_values)
+            and not arm_owned_site(arm_span, site_values, action)
         )
 
 

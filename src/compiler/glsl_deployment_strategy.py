@@ -7563,8 +7563,8 @@ def _ordinary_conditional_control_programs(
                 for value_id in history
             }
             site_values = {
-                int(initial): int(value)
-                for initial, value in (
+                (int(initial), int(updated)): int(value)
+                for (initial, updated), value in (
                     (owner[1].get(span) or {}) if owner else {}
                 ).items()
                 if int(value) in graph.G
@@ -7581,6 +7581,23 @@ def _ordinary_conditional_control_programs(
                 )
                 for value in site_values.values()
             )
+            # A ``break`` ending one arm of a conditional whose OTHER arm
+            # runs retained regions: the reducer lets the surviving arm's
+            # bindings stand after the ``if`` without a merge (its terminal-
+            # arm rule), so every later value defined in that arm reaches the
+            # loop's controls only if the break leaves the loop FROM its arm.
+            # Placed after the merge instead, the surviving arm's values do
+            # not dominate it (``break-edge-value``).  Same rule as the loop
+            # schedule's ``arm_owned_site``.
+            if not owned and action == "break":
+                sibling_arm = "orelse" if arm_name == "body" else "body"
+                owned = any(
+                    (int(control_id), sibling_arm) in memberships.get(
+                        node_by_value[int(node)], ()
+                    )
+                    for node in retained_region_nodes
+                    if int(node) in node_by_value
+                )
             if os.environ.get("TURING_DEBUG_BREAK_EDGE"):
                 print(
                     "DEBUG-ARM-OWNED builder "
@@ -7597,8 +7614,8 @@ def _ordinary_conditional_control_programs(
                 source_action=action,
                 site_node_id=control_node_by_statement.get(id(terminal)),
                 site_values=tuple(sorted(
-                    (int(initial), int(value))
-                    for initial, value in site_values.items()
+                    ((int(initial), int(updated)), int(value))
+                    for (initial, updated), value in site_values.items()
                 )),
             )
 
