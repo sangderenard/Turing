@@ -96,6 +96,22 @@ BODIES = {
             self.phase = 0.0
         return x
 '''),
+    # the field is READ after the conditional write and returned: the read is
+    # the merge of the arm's version and the incoming one, not the arm's Load
+    "return_field": ("0.0", '''\
+        if x > self.threshold:
+            self.phase = self.phase + 1.0
+        return self.phase
+'''),
+    # control: no conditional at all -- the read after the write
+    "return_field_straight": ("0.0", '''        self.phase = self.phase + x
+        return self.phase
+'''),
+    "return_field_literal": ("5.0", '''\
+        if x > self.threshold:
+            self.phase = 1.0
+        return self.phase
+'''),
 }
 
 
