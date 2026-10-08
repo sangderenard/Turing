@@ -1820,7 +1820,10 @@ def _concord_region_value_metadata(
                 proven_shape_of = None
             if proven_shape_of is not None:
                 for value_id, source_id in source_value_ids.items():
-                    shape = proven_shape_of(source_function, source_id)
+                    shape = proven_shape_of(
+                        (program.extras or {}).get("source_shape_scope"),
+                        source_id,
+                    )
                     descriptor = None
                     shape_is_proven = bool(shape)
                     if not shape_is_proven and source_graphs:

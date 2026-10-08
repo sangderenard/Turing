@@ -593,8 +593,10 @@ COMPILE_POLICY = declare_page("compile_policy", (
 #: DERIVED from the ``compile_policy`` cell -- or read from the first
 #: same-signature callsite of the round -- ``("reused", digest)``, DERIVED
 #: from the policy cell and that callsite's row.  CONCORD, one row per round.
+#: Caller and callee are the shape scopes of the COPIES (two specializations
+#: of one caller are two callers).
 CALLSITE_DESCRIPTOR_REUSE = declare_page("callsite_descriptor_reuse", (
-    RowField("caller", K.NAME), RowField("callee", K.NAME),
+    RowField("caller", K.SCOPE), RowField("callee", K.SCOPE),
     RowField("call", K.VALUE_ID), RowField("round", K.INDEX),
 ), tuple)
 
@@ -816,6 +818,21 @@ IDENTITY_TRANSITION = declare_page("identity_transition", (
 SCOPE_ORIGIN = declare_page("scope_origin", (
     RowField("scope", K.SCOPE),
 ), ScopeFork)                          # mode CONCORD
+#: Per COPY (2026-10-07): a shape-proof scope.  ``proven_shape`` and the
+#: shape-transformation pages are keyed by the scope of the graph COPY that
+#: states a value's shape, never by the authored function name, so two
+#: specializations of one function (a 2x2 and a 3x3 ``_forward_substitute``)
+#: never share a row.  The scope is minted by the book
+#: (``identity_concordance.shape_scope_of``) and a specialized variant is a
+#: fork of its source's scope (``fork_shape_scope``), recorded on
+#: ``scope_origin`` DERIVED from the source scope's registry cell.
+SHAPE_SCOPE = declare_stage("shape_scope")
+#: The authored function a shape scope states shapes for -- the one fact a
+#: reader that needs the authored name asks the book for, instead of parsing
+#: it out of a lowered symbol.  DERIVED from the scope's registry cell.
+SHAPE_SCOPE_FUNCTION = declare_page("shape_scope_function", (
+    RowField("shape_scope", K.SCOPE),
+), str)                                # mode CONCORD
 SCALAR_ITEM_MERGE = declare_page("scalar_item_merge", (
     RowField("function_scope", K.SCOPE), RowField("item", K.VALUE_ID),
 ), Ref)                                # the merged source's ssa_value cell; CONCORD

@@ -6387,9 +6387,12 @@ def _structural_region_program_from_subgraph(
         *map(int, program.feeds),
         *map(int, program.outputs.values()),
     }
+    from .identity_concordance import shape_scope_of
+
     program.extras = {
         **dict(program.extras or {}),
         "source_function": str(graph_data.get("function_name") or ""),
+        "source_shape_scope": shape_scope_of(graph_data),
         "source_value_ids": {
             int(value_id): int(value_id)
             for value_id in sorted(exposed_values)
@@ -15420,10 +15423,13 @@ def _invalidate_tensor_descriptor_dependents(
             affected.add(node_id)
             data.pop("tensor", None)
             try:
-                from .identity_concordance import invalidate_proven_shape
+                from .identity_concordance import (
+                    invalidate_proven_shape,
+                    shape_scope_of,
+                )
 
                 invalidate_proven_shape(
-                    graph.G.graph.get("function_name"),
+                    shape_scope_of(graph),
                     int(data.get("value_id", node_id)),
                     int(causes[0]),
                     str(reason),
@@ -15647,10 +15653,26 @@ def _publish_callsite_return_members(
     return True
 
 
+#: Per compile book: the (callee graph, signature) answers a callsite-
+#: specialized copy's propagation has computed, and the callees whose answer
+#: is being computed now.
+_CHILD_SIGNATURE_RESULTS: dict[int, tuple[Any, dict]] = {}
+_CHILD_CALLS_IN_PROGRESS: set[tuple] = set()
+
+
+def _child_signature_results(book: Any) -> dict:
+    held = _CHILD_SIGNATURE_RESULTS.get(id(book))
+    if held is None or held[0] is not book:
+        _CHILD_SIGNATURE_RESULTS.clear()
+        held = _CHILD_SIGNATURE_RESULTS[id(book)] = (book, {})
+    return held[1]
+
+
 def _propagate_callsite_tensor_specializations(
     graph: Any,
     *,
     runtime_references: frozenset[int] | None = None,
+    publish_to_function_table: bool = True,
     _progress: Any = None,
 ) -> None:
     """Carry consistent tensor descriptors through the function table.
@@ -15696,7 +15718,8 @@ def _propagate_callsite_tensor_specializations(
         PLANNER_TENSOR_SPECIALIZATION,
     )
     from .identity_concordance import (
-        Derived, Mode, Novel, current_identity_book,
+        Derived, Mode, Novel, current_identity_book, fork_shape_scope,
+        shape_scope_of,
     )
     from .work_contract import active_contract
 
@@ -15716,7 +15739,15 @@ def _propagate_callsite_tensor_specializations(
     #: This round's (callee graph id, signature) -> (callee graph, output
     #: descriptors, output cells, the computing callsite's decision cell).
     #: Cleared at every round: the callee graphs change between rounds.
-    signature_results: dict[tuple, tuple] = {}
+    #: A callsite-specialized copy's call edges (``publish_to_function_table``
+    #: False) reach callees whose own call edges are not settled on the
+    #: function table either, so each propagation copy settles its own
+    #: (below); that nested answer is a function of the same inputs, so the
+    #: memo outlives the round and the invocation, per book.
+    signature_results: dict[tuple, tuple] = (
+        {} if publish_to_function_table
+        else _child_signature_results(_book)
+    )
 
     def call_result_descriptor(
         caller: Any,
@@ -15795,9 +15826,7 @@ def _propagate_callsite_tensor_specializations(
             # looking slow from outside.
             _page = _book.page("callsite_return_specialization")
             _row = (
-                str(caller.G.graph.get("function_name")),
-                str(callee.G.graph.get("function_name")),
-                int(node_id),
+                shape_scope_of(caller), shape_scope_of(callee), int(node_id),
             )
             _page.set(_row, len(_page.history(_row)), tuple(
                 None if item is None or not isinstance(item, Mapping)
@@ -15840,8 +15869,7 @@ def _propagate_callsite_tensor_specializations(
             repr(signature).encode("utf-8")
         ).hexdigest()[:12]
         reuse_row = (
-            str(caller.G.graph.get("function_name")),
-            str(callee.G.graph.get("function_name")),
+            shape_scope_of(caller), shape_scope_of(callee),
             int(node_id), int(round_index),
         )
         held = (
@@ -15860,6 +15888,9 @@ def _propagate_callsite_tensor_specializations(
             )
             return record_and_return(copy.deepcopy(held[1]), tuple(held[2]))
         specialized = extract_clean_process_subgraph(callee, callee.G)
+        # A propagation copy states the shapes of ITS callsite: its own shape
+        # scope, never the callee's (or another callsite's).
+        fork_shape_scope(specialized, "callsite_tensor_specialization")
         specialized.G.graph["planner_specializations"] = copy.deepcopy(
             specializations
         )
@@ -15876,6 +15907,21 @@ def _propagate_callsite_tensor_specializations(
         )
         if not _expand_specialized_unbroadcast_identity(specialized):
             _fold_callsite_structural_values(specialized)
+        if not publish_to_function_table and reuse_key not in (
+            _CHILD_CALLS_IN_PROGRESS
+        ):
+            # The copy's own call edges are settled the same way (a
+            # recursive callee is entered once: its re-entry answers
+            # nothing, never loops).
+            _CHILD_CALLS_IN_PROGRESS.add(reuse_key)
+            try:
+                _propagate_callsite_tensor_specializations(
+                    specialized,
+                    runtime_references=frozenset(),
+                    publish_to_function_table=False,
+                )
+            finally:
+                _CHILD_CALLS_IN_PROGRESS.discard(reuse_key)
         output_descriptors: list[dict[str, Any] | None] = []
         # Per published slot, the callee return value's cells: its identity
         # cell and its shape-state cell, read after the descriptor query
@@ -15885,7 +15931,7 @@ def _propagate_callsite_tensor_specializations(
         def return_value_cells(value_id: int) -> tuple:
             from ..common.tensors.topological_reducer import node_identity_cell
             from .identity_concordance import (
-                SHAPE_STATE_PAGE, current_identity_book,
+                SHAPE_STATE_PAGE, current_identity_book, shape_scope_of,
             )
 
             cells = []
@@ -15894,7 +15940,7 @@ def _propagate_callsite_tensor_specializations(
             except ValueError:
                 pass
             state = current_identity_book().latest_ref(SHAPE_STATE_PAGE, (
-                str(specialized.G.graph.get("function_name")),
+                shape_scope_of(specialized),
                 int(specialized.G.nodes[int(value_id)].get(
                     "value_id", value_id,
                 )),
@@ -15995,8 +16041,8 @@ def _propagate_callsite_tensor_specializations(
         if yield_rows and len({len(row) for row in yield_rows}) == 1:
             from .identity_concordance import record_shape_transformation
 
-            caller_scope = caller.G.graph.get("function_name")
-            callee_scope = str(callee.G.graph.get("function_name"))
+            caller_scope = shape_scope_of(caller)
+            callee_scope = shape_scope_of(specialized)
             call_value = int(
                 caller.G.nodes[int(node_id)].get("value_id", node_id)
             )
@@ -16022,7 +16068,7 @@ def _propagate_callsite_tensor_specializations(
                 shape, dtype = next(iter(facts))
                 state = {"shape": shape, "dtype": dtype, "rank": len(shape)}
                 record_shape_transformation(
-                    callee_scope, ("yield", callee_scope, column),
+                    callee_scope, ("yield", column),
                     caller_scope, ("yield_row", call_value, column),
                     stage="callsite_yield_observation",
                     operation="yield_row",
@@ -16100,8 +16146,10 @@ def _propagate_callsite_tensor_specializations(
     while changed:
         round_index += 1
         # A round's reuse table is that round's: the callee graphs it was
-        # derived on are mutated by the publications below.
-        signature_results.clear()
+        # derived on are mutated by the publications below.  (A specialized
+        # copy's memo is not: it publishes nowhere.)
+        if publish_to_function_table:
+            signature_results.clear()
         round_started = time.monotonic()
         callsites = 0
         mutation_counts = {
@@ -16221,6 +16269,7 @@ def _propagate_callsite_tensor_specializations(
                             from .identity_concordance import (
                                 record_proven_shape,
                                 record_shape_transformation,
+                                shape_scope_of,
                             )
 
                             # Publish on every fixed-point observation, not
@@ -16231,7 +16280,7 @@ def _propagate_callsite_tensor_specializations(
                             # final stable round must restore the call-edge
                             # fact to the concordance.
                             record_proven_shape(
-                                caller.G.graph.get("function_name"),
+                                shape_scope_of(caller),
                                 int(data.get("value_id", _node_id)),
                                 exact_shape,
                                 exact_result.get("dtype"),
@@ -16246,12 +16295,9 @@ def _propagate_callsite_tensor_specializations(
                             # transformation graph instead of keeping the
                             # gap's answer.
                             record_shape_transformation(
-                                str(callee.G.graph.get("function_name")),
-                                (
-                                    "return",
-                                    str(callee.G.graph.get("function_name")),
-                                ),
-                                caller.G.graph.get("function_name"),
+                                shape_scope_of(callee),
+                                ("return",),
+                                shape_scope_of(caller),
                                 int(data.get("value_id", _node_id)),
                                 stage="callsite_return_observation",
                                 operation="call_result",
@@ -16306,6 +16352,7 @@ def _propagate_callsite_tensor_specializations(
                                 current_identity_book,
                                 record_shape_transformation,
                                 record_proven_shape,
+                                shape_scope_of,
                             )
 
                             # The call edge has just replaced a provisional
@@ -16322,7 +16369,7 @@ def _propagate_callsite_tensor_specializations(
                             )
                             if replacement_shape:
                                 record_proven_shape(
-                                    caller.G.graph.get("function_name"),
+                                    shape_scope_of(caller),
                                     int(data.get("value_id", _node_id)),
                                     replacement_shape,
                                     replacement.get("dtype"),
@@ -16331,12 +16378,9 @@ def _propagate_callsite_tensor_specializations(
                                     )),
                                 )
                             record_shape_transformation(
-                                str(callee.G.graph.get("function_name")),
-                                (
-                                    "return",
-                                    str(callee.G.graph.get("function_name")),
-                                ),
-                                caller.G.graph.get("function_name"),
+                                shape_scope_of(callee),
+                                ("return",),
+                                shape_scope_of(caller),
                                 int(data.get("value_id", _node_id)),
                                 stage="callsite_return_specialization",
                                 operation="call_result",
@@ -16349,8 +16393,7 @@ def _propagate_callsite_tensor_specializations(
                                 "callsite_tensor_result_specialization"
                             )
                             mutation_row = (
-                                str(caller.G.graph.get("function_name")),
-                                int(_node_id),
+                                shape_scope_of(caller), int(_node_id),
                             )
                             mutation_page.set(
                                 mutation_row,
@@ -16439,7 +16482,9 @@ def _propagate_callsite_tensor_specializations(
                         # read the shared ('unbroadcast', 1) row and the
                         # (2, 3) reshape answered (), which spun the
                         # return-member fixed point forever.
-                        if descriptor_states_a_shape(descriptor):
+                        if publish_to_function_table and (
+                            descriptor_states_a_shape(descriptor)
+                        ):
                             formal_shape_changed = _publish_formal_shape(
                                 str(callee.G.graph.get("function_name")),
                                 str(parameter),
@@ -16514,6 +16559,7 @@ def _propagate_callsite_tensor_specializations(
         from .identity_concordance import (
             current_identity_book,
             proven_shape_contract_of,
+            shape_scope_of,
         )
 
         settlement_page = current_identity_book().page(
@@ -16521,7 +16567,7 @@ def _propagate_callsite_tensor_specializations(
         )
 
         for caller in graphs:
-            function_name = caller.G.graph.get("function_name")
+            function_name = shape_scope_of(caller)
             for value_id in _dependency_order(caller):
                 data = caller.G.nodes[int(value_id)]
                 semantic_id = int(data.get("value_id", value_id))
@@ -16540,9 +16586,7 @@ def _propagate_callsite_tensor_specializations(
                     # on the one concordance: a local ``seen`` cache would
                     # fork identity authority and made identical graph state
                     # spin forever with ``changed=True``.
-                    settlement_row = (
-                        str(function_name), int(semantic_id),
-                    )
+                    settlement_row = (function_name, int(semantic_id))
                     settlement_fact = (
                         tuple(map(int, after[0])), str(after[1]),
                     )
@@ -16566,6 +16610,11 @@ def _propagate_callsite_tensor_specializations(
             ):
                 continue
             by_reference.setdefault(reference, {})[parameter] = descriptors[0]
+        if not publish_to_function_table:
+            # A callsite-specialized copy settles only its own call edges;
+            # the shared function-table graphs belong to every callsite and
+            # are not narrowed to one copy's arguments.
+            by_reference = {}
         for reference, descriptors in by_reference.items():
             callee = function_table.entry(reference).graph
             if callee is None:
@@ -17060,6 +17109,7 @@ def _structured_output_descriptor(graph: Any, value_id: int) -> Any:
         authored_function_name,
         current_identity_book,
         proven_shape_contract_of,
+        shape_scope_of,
     )
 
     # The shared proof is keyed by the AUTHORED name, so every callsite copy
@@ -17076,7 +17126,7 @@ def _structured_output_descriptor(graph: Any, value_id: int) -> Any:
         if _owner_has_polymorphic_formal(formal_page, owner):
             return descriptor
     proof = proven_shape_contract_of(
-        graph.G.graph.get("function_name"),
+        shape_scope_of(graph),
         int(graph.G.nodes[value_id].get("value_id", value_id)),
     )
     if proof is None:
@@ -17352,6 +17402,7 @@ def _tensor_descriptor(
             concordant_shape_transformation_state,
             current_identity_book,
             descriptor_from_shape_transformation_state,
+            shape_scope_of,
         )
 
         data = graph.G.nodes[int(node_id)] if int(node_id) in graph.G else {}
@@ -17362,10 +17413,7 @@ def _tensor_descriptor(
             == "collection"
         )
         page = current_identity_book().page("proven_shape")
-        row = (
-            str(graph.G.graph.get("function_name")),
-            int(data.get("value_id", node_id)),
-        )
+        row = (shape_scope_of(graph), int(data.get("value_id", node_id)))
         from .identity_concordance import proven_shape_of
 
         concorded_state = concordant_shape_transformation_state(
@@ -17595,6 +17643,43 @@ def _shape_only_view_operations() -> frozenset[str]:
 
 
 _SHAPE_ONLY_VIEW_OPERATIONS = _shape_only_view_operations()
+
+
+def _promoting_sides(
+    graph: Any, operands: tuple[int, ...], sides: list[Any],
+) -> list[Any]:
+    """The operand descriptors that decide an elementwise result dtype.
+
+    An authored Python ``int``/``float`` literal is a weak scalar: against a
+    floating tensor it does not promote (``1 - float32_tensor`` stays
+    float32, as the eager reference does).  Giving it its own dtype made
+    every ``1 - mask`` over a float32 value float64 at the graph stage, so a
+    float32 program carried a float64 intermediate into a float32 formal."""
+
+    def weak_scalar(operand: int, side: Any) -> bool:
+        if tuple(side.get("shape") or ()):
+            return False
+        node = graph.G.nodes[operand]
+        if str(node.get("type")) not in {"Constant", "Const", "const"}:
+            return False
+        literal = node.get("constant")
+        if literal is None:
+            literal = (node.get("attributes") or {}).get("value")
+        return isinstance(literal, (bool, int, float)) and not isinstance(
+            literal, np.generic
+        )
+
+    strong = [
+        side for operand, side in zip(operands, sides)
+        if not weak_scalar(operand, side)
+    ]
+    if strong and len(strong) < len(sides) and any(
+        np.dtype(str(side.get("dtype"))).kind in "fc"
+        for side in strong
+        if str(side.get("dtype") or "unknown") != "unknown"
+    ):
+        return strong
+    return list(sides)
 
 
 def _tensor_descriptor_rule(
@@ -17907,6 +17992,7 @@ def _tensor_descriptor_rule(
         from .identity_concordance import (
             concordant_shape_transformation_state,
             descriptor_from_shape_transformation_state,
+            shape_scope_of,
         )
 
         target_value = int(data.get("value_id", node_id))
@@ -17943,7 +18029,7 @@ def _tensor_descriptor_rule(
                 graph.G.nodes[iterable].get("value_id", iterable)
             )
             state = concordant_shape_transformation_state(
-                graph.G.graph.get("function_name"),
+                shape_scope_of(graph),
                 ("yield_row", iterable_value, column),
             )
             described = descriptor_from_shape_transformation_state(state)
@@ -18052,10 +18138,13 @@ def _tensor_descriptor_rule(
             if len(element_sources) == 1:
                 element_node_id = int(element_sources[0])
                 element_data = graph.G.nodes[element_node_id]
-                from .identity_concordance import proven_shape_contract_of
+                from .identity_concordance import (
+                    proven_shape_contract_of,
+                    shape_scope_of,
+                )
 
                 element_contract = proven_shape_contract_of(
-                    graph.G.graph.get("function_name"),
+                    shape_scope_of(graph),
                     int(element_data.get("value_id", element_node_id)),
                 )
                 if element_contract is not None:
@@ -18398,7 +18487,9 @@ def _tensor_descriptor_rule(
                             }
                             else str(np.result_type(*(
                                 np.dtype(str(side.get("dtype")))
-                                for side in sides
+                                for side in _promoting_sides(
+                                    graph, operands, sides,
+                                )
                                 if str(side.get("dtype") or "unknown")
                                 != "unknown"
                             )))
@@ -20511,6 +20602,7 @@ def _fold_callsite_structural_values(
                         )
                         from .identity_concordance import (
                             SHAPE_STATE_PAGE, current_identity_book,
+                            shape_scope_of,
                         )
 
                         member_cells = []
@@ -20523,7 +20615,7 @@ def _fold_callsite_structural_values(
                         member_cells.append(
                             current_identity_book().latest_ref(
                                 SHAPE_STATE_PAGE, (
-                                    str(graph.G.graph.get("function_name")),
+                                    shape_scope_of(graph),
                                     int(data.get("value_id", node_id)),
                                 ),
                             )
@@ -21141,10 +21233,13 @@ def _fold_callsite_structural_values(
                     # ledger itself correct, splitting one formal identity
                     # into two incompatible facts.
                     data["tensor"] = copy.deepcopy(dict(callsite_descriptor))
-                    from .identity_concordance import record_proven_shape
+                    from .identity_concordance import (
+                        record_proven_shape,
+                        shape_scope_of,
+                    )
 
                     record_proven_shape(
-                        graph.G.graph.get("function_name"),
+                        shape_scope_of(graph),
                         int(data.get("value_id", node_id)),
                         tuple(callsite_descriptor.get("shape") or ()),
                         callsite_descriptor.get("dtype"),
@@ -22531,10 +22626,10 @@ def _callsite_specialized_shell_type(
         extents = tuple(descriptor.get("shape") or ())
         if not extents:
             return
-        from .identity_concordance import record_proven_shape
+        from .identity_concordance import record_proven_shape, shape_scope_of
 
         record_proven_shape(
-            str(caller.G.graph.get("function_name")),
+            shape_scope_of(caller),
             int(data.get("value_id", node_id)),
             extents,
             descriptor.get("dtype"),
@@ -22559,6 +22654,12 @@ def _callsite_specialized_shell_type(
         original,
         original.G,
     )
+    # A callsite specialization is a variant of the function: it states
+    # shapes in its own shape scope, never in the original's or a sibling
+    # specialization's.
+    from .identity_concordance import fork_shape_scope
+
+    fork_shape_scope(specialized, "callsite_specialization")
     # These are callsite facts, not accumulators.  A shared function-table
     # graph may already carry metadata from an earlier specialization; using
     # ``setdefault().update()`` allowed a scalar literal from one occurrence
@@ -26283,6 +26384,8 @@ def strategize_shell_deployment(
     dropping iterations.
     """
 
+    from .identity_concordance import shape_scope_is_variant
+
     if _selection_trace is None:
         _selection_trace = {
             "started_at": time.monotonic(),
@@ -26463,6 +26566,28 @@ def strategize_shell_deployment(
             lambda: _propagate_callsite_tensor_specializations(
                 graph,
                 runtime_references=runtime_specialization_references,
+                _progress=lambda facts: selection_event(
+                    "callsite-tensor-specialization",
+                    "progress",
+                    **facts,
+                ),
+            ),
+        )
+    elif graph.G.graph.get("planner_tensor_descriptors") and (
+        shape_scope_is_variant(graph)
+    ):
+        # A callsite-specialized copy (a child shell) has its own call
+        # edges, and the values its callees receive derive from its own
+        # specialized arguments: the root pass cannot have settled them.
+        # Settle this copy's call edges alone -- no function-table graph is
+        # entered or narrowed -- so each callee reached from it is
+        # specialized for ITS arguments.
+        selection_phase(
+            "propagate-callsite-tensor-specializations-specialized-copy",
+            lambda: _propagate_callsite_tensor_specializations(
+                graph,
+                runtime_references=frozenset(),
+                publish_to_function_table=False,
                 _progress=lambda facts: selection_event(
                     "callsite-tensor-specialization",
                     "progress",

@@ -339,9 +339,7 @@ def _shape_polymorphic_function(function_name: str) -> bool:
     )
 
 
-def _settle_operand_shapes(
-    function_name: str, values: Any, numeric_scope: str | None = None,
-) -> None:
+def _settle_operand_shapes(function: Any, values: Any) -> None:
     """Read each operand's shape from the concordance before dispatching.
 
     An SSAValue's shape is a field somebody filled in at construction, and
@@ -353,10 +351,13 @@ def _settle_operand_shapes(
     """
 
     try:
-        from .identity_concordance import proven_shape_of
+        from .identity_concordance import proven_shape_of, shape_scope_of
     except Exception:
         return
-    shape_polymorphic = _shape_polymorphic_function(function_name)
+    # The shapes proven for the COPY this function was lowered from; a
+    # sibling specialization's proofs live in its own scope.
+    scope = shape_scope_of(function)
+    shape_polymorphic = _shape_polymorphic_function(function.name)
     for value in values or ():
         # A shaped view shares its storage owner's value id and nothing else.
         # The resolver is keyed by that id, so asking it here answers with the
@@ -368,16 +369,10 @@ def _settle_operand_shapes(
         # that it speaks for itself.
         if (value.accounting or {}).get("ssa_storage_view"):
             continue
-        settled = None
-        for scope in (numeric_scope, function_name):
-            if scope is None:
-                continue
-            try:
-                settled = proven_shape_of(scope, int(value.id))
-            except Exception:
-                continue
-            if settled:
-                break
+        try:
+            settled = proven_shape_of(scope, int(value.id))
+        except Exception:
+            continue
         if settled and tuple(value.shape or ()) != settled:
             # The call-edge concordance has already proved that this helper
             # has no single formal shape.  A nonempty shape on its exact
@@ -395,7 +390,7 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
 ]:
     """Publish current exact actual/formal contracts after metadata settles."""
 
-    from .identity_concordance import record_proven_shape
+    from .identity_concordance import record_proven_shape, shape_scope_of
 
     page = identity_book(module).page("ssa_call_shape")
     contracts: dict[
@@ -480,7 +475,8 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                             row, len(evidence_page.history(row)), evidence
                         )
                     record_proven_shape(
-                        callee_name, int(formal.id), extents, actual.dtype,
+                        shape_scope_of(callee), int(formal.id), extents,
+                        actual.dtype,
                     )
                     contracts.setdefault(
                         (callee_name, int(formal.id)), []
@@ -528,28 +524,19 @@ def _settle_exact_ssa_call_shapes(
             }
 
 
-def _record_ssa_shape(function_name: str, value: Any) -> None:
-    """What the lowering actually reads, under the authored function's name.
-
-    The SSA name carries the module prefix and the callsite specialization
-    hash; the other stores are keyed by the authored name, so strip both or
-    the rows never line up and every value looks like it has one source.
-    """
+def _record_ssa_shape(function: Any, value: Any) -> None:
+    """What the lowering actually reads, under the shape scope of the copy
+    ``function`` was lowered from -- the key every other shape store uses, so
+    a value whose stores disagree is one row."""
 
     try:
-        from .identity_concordance import current_identity_book
+        from .identity_concordance import current_identity_book, shape_scope_of
 
         extents = tuple(int(e) for e in (value.shape or ()))
         if not extents:
             return
-        name = str(function_name)
-        if "__specialized_" in name:
-            name = name.split("__specialized_")[0]
-        if "__planned_region" in name:
-            name = name.split("__planned_region")[0]
-        name = name.rsplit("__", 1)[-1] if "__" in name else name
         page = current_identity_book().page("shape.ssa")
-        page.set((name, int(value.id)), 0, extents)
+        page.set((shape_scope_of(function), int(value.id)), 0, extents)
     except Exception:
         pass
 
@@ -974,10 +961,13 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
                         "shape_settlement_tie_policy": "unanimous",
                     }
                     try:
-                        from .identity_concordance import record_proven_shape
+                        from .identity_concordance import (
+                            record_proven_shape,
+                            shape_scope_of,
+                        )
 
                         record_proven_shape(
-                            function_name, int(result.id), shape,
+                            shape_scope_of(function), int(result.id), shape,
                             result.dtype or next((
                                 source.dtype for source in sources
                                 if source.dtype is not None
@@ -1132,7 +1122,7 @@ def propagate_repository_ssa_call_metadata(
 
     def enrich(
         function, value_id: int, source: SSAValue, *, authoritative: bool = False,
-        source_function: str | None = None,
+        source_function: Any = None,
         stage: str = "repository_ssa_enrichment",
     ) -> bool:
         changed = False
@@ -1249,7 +1239,10 @@ def propagate_repository_ssa_call_metadata(
                     key: source_contract_value,
                 }
                 changed = True
-            from .identity_concordance import record_shape_transformation
+            from .identity_concordance import (
+                record_shape_transformation,
+                shape_scope_of,
+            )
 
             source_rank = int(source_accounting.get(
                 "program_abi_rank", len(source_shape),
@@ -1260,12 +1253,11 @@ def propagate_repository_ssa_call_metadata(
                 "program_abi_rank", len(target_shape),
             ) or len(target_shape))
             record_shape_transformation(
-                (
-                    source_function
-                    or function_names_by_id.get(id(function), "?")
+                shape_scope_of(
+                    function if source_function is None else source_function
                 ),
                 int(source.id),
-                function_names_by_id.get(id(function), "?"),
+                shape_scope_of(function),
                 int(value.id),
                 stage=stage,
                 operation="ssa_metadata_transport",
@@ -2533,7 +2525,7 @@ def lower_tensor_calls_to_repository_ssa(
             if len(extents) != 1:
                 return None
             return next(iter(extents))
-        _settle_operand_shapes(function_name, function.args, numeric_scope)
+        _settle_operand_shapes(function, function.args)
         function_argument_ids = {int(value.id) for value in function.args}
         unresolved_argument_ids = {
             int(value.id)
@@ -2897,13 +2889,9 @@ def lower_tensor_calls_to_repository_ssa(
                 # the opcode falls through to the scalar emitter, which writes
                 # element zero and leaves the rest of the buffer untouched.
                 # Take the settled fact for the identity before deciding.
-                _settle_operand_shapes(
-                    function_name, instruction.args, numeric_scope,
-                )
+                _settle_operand_shapes(function, instruction.args)
                 if instruction.res is not None:
-                    _settle_operand_shapes(
-                        function_name, (instruction.res,), numeric_scope,
-                    )
+                    _settle_operand_shapes(function, (instruction.res,))
                 candidate_only = bool(
                     instruction.attributes.get("tensor_candidate") is not None
                     and instruction.attributes.get("tensor_operation") is None
@@ -3926,11 +3914,9 @@ def lower_tensor_calls_to_repository_ssa(
                 # structure (shape, axis, dtype, keepdim, ...).  Dropping a
                 # constant first operand made calls such as
                 # ``broadcast_to(1.0, (m, n))`` appear to have no source.
-                _settle_operand_shapes(function_name, args, numeric_scope)
+                _settle_operand_shapes(function, args)
                 if instruction.res is not None:
-                    _settle_operand_shapes(
-                        function_name, (instruction.res,), numeric_scope,
-                    )
+                    _settle_operand_shapes(function, (instruction.res,))
                 data_positions = (
                     frozenset({0, 1, 2})
                     if operation == "where" else frozenset({0})
@@ -4577,10 +4563,11 @@ def lower_tensor_calls_to_repository_ssa(
                         try:
                             from .identity_concordance import (
                                 record_proven_shape,
+                                shape_scope_of,
                             )
 
                             record_proven_shape(
-                                function_name, int(result.id),
+                                shape_scope_of(function), int(result.id),
                                 tuple(source.shape),
                                 result.dtype or source.dtype,
                             )
@@ -4920,10 +4907,13 @@ def lower_tensor_calls_to_repository_ssa(
                     # fact belongs to the identity, not to the occurrence --
                     # record it where every occurrence can read it.
                     try:
-                        from .identity_concordance import record_proven_shape
+                        from .identity_concordance import (
+                            record_proven_shape,
+                            shape_scope_of,
+                        )
 
                         record_proven_shape(
-                            function_name, int(result.id),
+                            shape_scope_of(function), int(result.id),
                             tuple(source.shape),
                             result.dtype or source.dtype,
                         )
@@ -5302,8 +5292,8 @@ def lower_tensor_calls_to_repository_ssa(
 
                 elif operation == "matmul" and len(data_args) == 2:
                     left, right = data_args
-                    _record_ssa_shape(function_name, left)
-                    _record_ssa_shape(function_name, right)
+                    _record_ssa_shape(function, left)
+                    _record_ssa_shape(function, right)
                     if (
                         len(left.shape) == len(right.shape) == 1
                         and left.shape[0] == right.shape[0]
