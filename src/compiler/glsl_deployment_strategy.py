@@ -19118,6 +19118,91 @@ def _tensor_descriptor_rule(
     }
 
 
+def _remove_dead_metadata_nodes(
+    graph: Any,
+    protected_values: Any,
+    remove_node: Any,
+) -> None:
+    """Remove unconsumed metadata nodes, first in node order, to exhaustion.
+
+    A node is dead metadata when it is unprotected, has no successor, and is
+    a structural-metadata or pure-tensor-call node (a structurally folded
+    constant is kept: other layers still name its identity).  The removal
+    order is the one the whole-graph restart scan produced -- always the
+    FIRST dead node in ``graph.G.nodes`` order -- because ``remove_node``
+    posts book rows per removal.  Removing a node only lowers the
+    out-degree of its predecessors (type and attributes are never touched),
+    so the only nodes whose deadness can newly flip are those predecessors;
+    a min-heap keyed by original node position pops the lowest-position dead
+    node each step, which is exactly what the restarted scan found.
+    """
+
+    def is_dead(node_id: int, data: Mapping[str, Any]) -> bool:
+        attributes = data.get("attributes") or {}
+        dead_pure_tensor_call = bool(
+            attributes.get("tensor_candidate") is not None
+            or str(attributes.get("static_python_reference") or "").startswith(
+                "AbstractTensor."
+            )
+        )
+        # A structurally folded constant is a PROVEN literal standing in
+        # for an authored producer, and other layers still name that value
+        # identity -- a loop's bound expression renders each leaf as the
+        # leaf's literal when it is resident and as a uniform reference
+        # when it is not.  Pruning it because its only consumer folded too
+        # is what made ``n`` (the matrix order) a formal that no caller
+        # could fill inside the substitution helpers, while the same fold
+        # in _masked_pivot_rows -- whose constant kept a consumer -- read
+        # as the literal 2.  An unconsumed Const costs one instruction the
+        # backend drops.
+        return (
+            node_id not in protected_values
+            and graph.G.out_degree(node_id) == 0
+            and not (
+                str(data.get("type")) in {"Constant", "Const", "const"}
+                and attributes.get("structural_specialization")
+            )
+            and (
+                str(data.get("type")) in {
+                    "GetAttr", "Attribute", "StaticReference",
+                    "Constant", "Const", "const",
+                    "Tuple", "List", "Set",
+                }
+                or dead_pure_tensor_call
+            )
+        )
+
+    import heapq
+
+    node_order = {
+        int(node_id): position
+        for position, node_id in enumerate(graph.G.nodes)
+    }
+    by_position = {position: node_id for node_id, position in node_order.items()}
+    queued: set[int] = set()
+    pending = [
+        node_order[int(node_id)]
+        for node_id, data in graph.G.nodes(data=True)
+        if is_dead(int(node_id), data)
+    ]
+    queued.update(by_position[position] for position in pending)
+    heapq.heapify(pending)
+    while pending:
+        node_id = by_position[heapq.heappop(pending)]
+        if node_id not in graph.G:
+            continue
+        predecessors = tuple(int(parent) for parent in graph.G.predecessors(node_id))
+        remove_node(node_id)
+        for parent in predecessors:
+            if (
+                parent not in queued
+                and parent in graph.G
+                and is_dead(parent, graph.G.nodes[parent])
+            ):
+                queued.add(parent)
+                heapq.heappush(pending, node_order[parent])
+
+
 def _fold_callsite_structural_values(
     graph: Any, *, _progress: Any = None,
 ) -> None:
@@ -21915,46 +22000,7 @@ def _fold_callsite_structural_values(
         for value_id in slots
         if value_id is not None and int(value_id) in graph.G
     }
-    dead_metadata = True
-    while dead_metadata:
-        dead_metadata = False
-        for node_id, data in tuple(graph.G.nodes(data=True)):
-            attributes = data.get("attributes") or {}
-            dead_pure_tensor_call = bool(
-                attributes.get("tensor_candidate") is not None
-                or str(attributes.get("static_python_reference") or "").startswith(
-                    "AbstractTensor."
-                )
-            )
-            # A structurally folded constant is a PROVEN literal standing in
-            # for an authored producer, and other layers still name that value
-            # identity -- a loop's bound expression renders each leaf as the
-            # leaf's literal when it is resident and as a uniform reference
-            # when it is not.  Pruning it because its only consumer folded too
-            # is what made ``n`` (the matrix order) a formal that no caller
-            # could fill inside the substitution helpers, while the same fold
-            # in _masked_pivot_rows -- whose constant kept a consumer -- read
-            # as the literal 2.  An unconsumed Const costs one instruction the
-            # backend drops.
-            if (
-                int(node_id) not in protected_values
-                and graph.G.out_degree(int(node_id)) == 0
-                and not (
-                    str(data.get("type")) in {"Constant", "Const", "const"}
-                    and attributes.get("structural_specialization")
-                )
-                and (
-                    str(data.get("type")) in {
-                        "GetAttr", "Attribute", "StaticReference",
-                        "Constant", "Const", "const",
-                        "Tuple", "List", "Set",
-                    }
-                    or dead_pure_tensor_call
-                )
-            ):
-                remove_node(int(node_id))
-                dead_metadata = True
-                break
+    _remove_dead_metadata_nodes(graph, protected_values, remove_node)
 
     unused_parameters = {
         int(node_id)
