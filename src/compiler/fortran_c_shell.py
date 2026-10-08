@@ -15115,7 +15115,10 @@ def _class_surface_ssa_program(
     # missing edge is visible as an absence rather than inferred from a fact
     # that never arrives.  A scalar argument with no edge here can never
     # receive its caller's literal, however well the propagation works.
-    edge_page = _shape_book().page("call_edge")
+    from .concordance_declarations import (
+        CALL_EDGE as _CALL_EDGE,
+        LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
+    )
     linked_value_edges = []
     from .hierarchical_plan import PlanCall as _ABIPlanCall
     for planned_shell in planned_shells:
@@ -15145,7 +15148,14 @@ def _class_surface_ssa_program(
                     str(caller_graph.graph.get("function_name")),
                     int(caller_id),
                 )
-                edge_page.set(edge_row, 0, "argument")
+                _frame_post(
+                    _CALL_EDGE, edge_row, "argument",
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(
+                        _frame_graph_cell(caller_graph, int(caller_id)),
+                        _frame_graph_cell(callee_graph, int(callee_id)),
+                    ),
+                )
             # Results carry the same exact value contract in the opposite
             # direction.  Keeping them in this fixed point lets a shaped
             # callee return feed the next call before either caller partitions
@@ -15453,8 +15463,14 @@ def _class_surface_ssa_program(
         abi_guard.round(changed)
     # One page per store, so a value whose stores disagree is a row rather
     # than a hunt.
-    _node_page = _shape_book().page("shape.node")
-    _linked_page = _shape_book().page("shape.linked")
+    from .concordance_declarations import (
+        LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
+        SHAPE_LINKED_STORE as _SHAPE_LINKED_STORE,
+        SHAPE_NODE_STORE as _SHAPE_NODE_STORE,
+    )
+    from .identity_concordance import (
+        Mode as _ShapeMode, SHAPE_STATE_PAGE as _SHAPE_STATE_PAGE,
+    )
     for _graph in planned_graphs_by_shell.values():
         _name = _abi_shape_scope_of(_graph)
         _contracts = linked_value_abi_by_graph.get(id(_graph), {})
@@ -15463,17 +15479,38 @@ def _class_surface_ssa_program(
             _row = (_name, _value_id)
             _tensor = _data.get("tensor") or {}
             _extents = tuple(_tensor.get("shape") or ())
+            _node_cell = _frame_graph_cell(_graph, _value_id)
             if _extents:
-                _node_page.set(_row, 0, _extents)
+                _frame_post(
+                    _SHAPE_NODE_STORE, _row, _extents,
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(
+                        _node_cell,
+                        _shape_book().latest_ref(
+                            _SHAPE_STATE_PAGE, (_name, _value_id),
+                        ),
+                    ),
+                    mode=_ShapeMode.REVISE,
+                )
             _contract = _contracts.get(_value_id) or {}
             _declared = tuple(_contract.get("shape") or ())
             if _declared:
-                _linked_page.set(_row, 0, tuple(map(int, _declared)))
+                _frame_post(
+                    _SHAPE_LINKED_STORE, _row, tuple(map(int, _declared)),
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(_node_cell,), mode=_ShapeMode.REVISE,
+                )
 
     # One page per store, so a value whose stores disagree is a row rather
     # than a hunt.
-    _node_page = _shape_book().page("shape.node")
-    _linked_page = _shape_book().page("shape.linked")
+    from .concordance_declarations import (
+        LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
+        SHAPE_LINKED_STORE as _SHAPE_LINKED_STORE,
+        SHAPE_NODE_STORE as _SHAPE_NODE_STORE,
+    )
+    from .identity_concordance import (
+        Mode as _ShapeMode, SHAPE_STATE_PAGE as _SHAPE_STATE_PAGE,
+    )
     for _graph in planned_graphs_by_shell.values():
         _name = _abi_shape_scope_of(_graph)
         _contracts = linked_value_abi_by_graph.get(id(_graph), {})
@@ -15482,12 +15519,27 @@ def _class_surface_ssa_program(
             _row = (_name, _value_id)
             _tensor = _data.get("tensor") or {}
             _extents = tuple(_tensor.get("shape") or ())
+            _node_cell = _frame_graph_cell(_graph, _value_id)
             if _extents:
-                _node_page.set(_row, 0, _extents)
+                _frame_post(
+                    _SHAPE_NODE_STORE, _row, _extents,
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(
+                        _node_cell,
+                        _shape_book().latest_ref(
+                            _SHAPE_STATE_PAGE, (_name, _value_id),
+                        ),
+                    ),
+                    mode=_ShapeMode.REVISE,
+                )
             _contract = _contracts.get(_value_id) or {}
             _declared = tuple(_contract.get("shape") or ())
             if _declared:
-                _linked_page.set(_row, 0, tuple(map(int, _declared)))
+                _frame_post(
+                    _SHAPE_LINKED_STORE, _row, tuple(map(int, _declared)),
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(_node_cell,), mode=_ShapeMode.REVISE,
+                )
 
     for planned_graph in planned_graphs_by_shell.values():
         contracts = linked_value_abi_by_graph.get(id(planned_graph), {})

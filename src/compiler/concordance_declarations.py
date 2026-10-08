@@ -2885,3 +2885,23 @@ CROSS_FUNCTION_REFERENCES = declare_page("cross_function_references", (
 #: over the same cells.
 SSA_CALL_EDGE_CELL_NOT_ON_BOOK = declare_reason("ssa_call_edge_cell_not_on_book")
 SSA_CALL_EDGE_CAUSE_NOT_ON_BOOK = declare_reason("ssa_call_edge_cause_not_on_book")
+
+# -- linked-value ABI phase stores (``_class_surface_ssa_program``) ----------
+#: One page per shape store, so a value whose stores disagree is a row rather
+#: than a hunt (``shape_store_report``).  ``(authored function, value id)`` ->
+#: extents.  ``shape.node``: what the planned graph's node says; ``shape.linked``:
+#: what the linked-value ABI contract declares.  REVISE, DERIVED(the node's
+#: ``canonical_value`` cell, and for ``.node`` its shape-transformation state).
+SHAPE_NODE_STORE = declare_page("shape.node", (
+    RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
+SHAPE_LINKED_STORE = declare_page("shape.linked", (
+    RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
+#: Every exact call edge the linked-value phase settles over:
+#: ``(callee, formal id, caller, actual id)`` -> ``"argument"``, DERIVED(the
+#: actual's and the formal's ``canonical_value`` cells).
+CALL_EDGE = declare_page("call_edge", (
+    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("caller", K.NAME), RowField("actual", K.VALUE_ID),
+), str)
