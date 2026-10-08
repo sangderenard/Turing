@@ -1264,7 +1264,7 @@ def post_control_program(
             return True
         stored = book.pages[page.name]
         newest = max(
-            stored.stamps[(row, column)] for column, _fact in stored.history(row)
+            stored.stamp_at(row, column) for column, _fact in stored.history(row)
         )
         previous_sources = {
             source.key for source, _stage in book.edges_into(latest)

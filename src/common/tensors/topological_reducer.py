@@ -3042,24 +3042,31 @@ def _set_operands(
 def fork_read_scope(
     graph: Any, cause: str, *, source_graph: Any = None,
 ) -> None:
-    """Give a graph copy its own read scope: a fork of its source's rows.
+    """Give a graph copy its own read scope: a COPY-ON-READ fork of its
+    source's rows.
 
-    Every page row whose first element is the source read scope (the
-    binding each operand read, loop carried bindings, operand structure) is
-    copied under a freshly minted scope, and the copy's graph names that
-    scope.  A copy's rewrites -- a callsite fold removing an operand -- then
-    revise only its own rows.  Sharing one scope, a fold in one
-    specialization retired rows the original and every other specialization
-    read.  Page ``scope_origin`` row ``(new scope,)`` records
-    ``ScopeFork(source scope, cause)``.
+    The copy's graph names a freshly minted scope, and a read under it
+    (the binding each operand read, loop carried bindings, operand
+    structure -- every page row whose first element is the scope) answers as
+    the source's row did when the fork was made.  No row is copied here: a
+    row under the fork gets its own cell when it is first WRITTEN (a callsite
+    fold removing an operand revises only the copy's row) or named as a
+    source, and that cell is what the eager copy posted -- column 0, the
+    source's fact, DERIVED from the source's cell at stage
+    ``read_scope_fork`` (``IdentityBook._materialise_row``).  Sharing one
+    scope, a fold in one specialization retired rows the original and every
+    other specialization read; a fork's reads are the snapshot the copy was,
+    and its writes are its own.  Page ``scope_origin`` row ``(new scope,)``
+    records ``ScopeFork(source scope, cause, projection, copy_on_read=True)``,
+    and the book holds the chain (``IdentityBook.register_read_through``).
 
     ``source_graph`` is the graph ``graph`` was cut from when ``graph`` is a
     PROPER induced subgraph of it (a planned dispatch region).  The copy then
     holds only the rows of its own nodes on the node-keyed pages
     (``READ_SCOPE_NODE_KEYED_PAGES``: ``row[1]`` is the consumer / value id):
-    the rows of the source's other nodes are not copied -- they were most of
-    every region's fork and nothing under a region's scope reads them.  That
-    is a declared projection, not a silent filter: the ``scope_origin`` fact
+    a read through the fork of the source's other nodes' rows is refused, and
+    of an id that was a node of neither graph finds nothing.  That is a
+    declared projection, not a silent filter: the ``scope_origin`` fact
     carries a ``ScopeProjection`` (the pages, the node count and digest, the
     rows carried / of source nodes the copy lacks / of retired ids), and a
     read under the forked scope of a node-keyed row of a source node the copy
@@ -3089,70 +3096,39 @@ def fork_read_scope(
         universe = frozenset(source_graph.G.nodes)
         not_held = universe - members
     inherited = book.__dict__.get("scope_projections", {}).get(source)
-    # A forked row on a declared page is DERIVED from the cell it copies
-    # (stage READ_SCOPE_FORK, same fact); a page the registry does not
-    # declare can only be copied through the raw primitive, tagged under
-    # the latch until it is declared.
-    registered = book.registry.pages
-    private = book.registry.private_pages
     # Every callee copy is its own variant (design section 7.1): the
     # planner's specialization rows -- the literal / default fold and the
     # tensor descriptors proven for the SOURCE graph's callers -- are not
-    # inherited.  The copy's writers post its own rows under the forked
-    # scope from ITS callsite; a copy never carries a literal proven for
-    # another caller.  The forked scope is therefore the copy's own
-    # specialization scope.
-    per_copy_pages = {"planner_specialization", "planner_tensor_descriptor"}
-    carried = excluded = stale = 0
+    # inherited (``READ_THROUGH_EXCLUDED_PAGES``).  The copy's writers post
+    # its own rows under the forked scope from ITS callsite; a copy never
+    # carries a literal proven for another caller.  The forked scope is
+    # therefore the copy's own specialization scope.
     node_keyed = frozenset(READ_SCOPE_NODE_KEYED_PAGES)
-    for page in tuple(book.pages.values()):
-        if page.name in private or page.name in per_copy_pages:
-            continue
-        declared = registered.get(page.name)
-        project = projecting and page.name in node_keyed
-        for row in page.scope_rows(source):
-            if page.name == "scope_origin":
-                # A scope's origin is its own fact, not inherited.
+    # The projection's counts: how many of the source's node-keyed rows the
+    # copy holds, lacks (rows of source nodes), or never could (retired ids).
+    # Counted, not copied -- only a declared projection states them.
+    carried = excluded = stale = 0
+    if projecting:
+        for page in tuple(book.pages.values()):
+            if page.name not in node_keyed:
                 continue
-            if (
-                (project or (inherited is not None and page.name in inherited.pages))
-                and len(row) > 1 and isinstance(row[1], int)
-            ):
+            for row in page.scope_rows(source):
+                if len(row) < 2 or not isinstance(row[1], int):
+                    continue
                 if inherited is not None and inherited.excludes(row[1]):
                     # The source scope does not hold this node either (a row
                     # here would be its Unresolved read receipt).
                     excluded += 1
-                    continue
-                if project and row[1] not in members:
-                    # A row of a node the copy does not hold: of a source
-                    # node (read-refused), or of an id retired before the
-                    # copy was cut.  Counted on the projection fact.
+                elif row[1] not in members:
+                    # A node the copy does not hold: of a source node
+                    # (read-refused), or of an id retired before the copy
+                    # was cut.
                     if row[1] in not_held:
                         excluded += 1
                     else:
                         stale += 1
-                    continue
-                if project:
+                else:
                     carried += 1
-            fact = page.latest(row)
-            if fact is None:
-                continue
-            # A declared page whose writer still writes raw facts of another
-            # shape (``identity_transition`` tuples before ``_set_operands``
-            # posts ``OperandTransition``) is copied through the raw
-            # primitive too: ``post`` would refuse the fact, and the row
-            # belongs to the writer's migration, not to the fork.
-            if declared is None or not (
-                isinstance(fact, _Unresolved)
-                or isinstance(fact, declared.fact_type)
-            ):
-                page.set((forked, *row[1:]), 0, fact)
-                continue
-            book.post(
-                declared, (forked, *row[1:]), fact, stage=_READ_SCOPE_FORK,
-                provenance=_Derived((book.latest_ref(declared, row),)),
-                mode=_Mode.CONCORD,
-            )
     # The fork's origin is its own fact on ``scope_origin``, DERIVED from the
     # source scope's registry cell (as ``fork_operand_position_scope`` posts
     # its fork).
@@ -3168,8 +3144,9 @@ def fork_read_scope(
             rows_carried=carried, rows_excluded=excluded, rows_stale=stale,
         )
     source_cell = book.latest_ref(SCOPE_REGISTRY, source)
-    book.post(
-        SCOPE_ORIGIN, (forked,), ScopeFork(source, str(cause), projection),
+    origin_cell = book.post(
+        SCOPE_ORIGIN, (forked,),
+        ScopeFork(source, str(cause), projection, copy_on_read=True),
         stage=_READ_SCOPE_FORK,
         provenance=(
             _Derived((source_cell,)) if source_cell is not None
@@ -3181,13 +3158,16 @@ def fork_read_scope(
     # Registered as the complement of the copy's own nodes in the (shared)
     # node set of its source, plus the source scope's own refusal: one
     # source-sized set per region, retained for the whole compile, was the
-    # cost of spelling it as ``not_held | inherited.excluded``.
-    if not_held or inherited is not None:
+    # cost of spelling it as ``not_held | inherited.excluded``.  A fork cut
+    # for a subgraph also READS only its own nodes' rows (``restricts``).
+    if projecting or inherited is not None:
         book.register_scope_projection(
             forked, node_keyed,
             universe=universe if projecting else None,
-            held=members, inherited=inherited,
+            held=members, inherited=inherited, restricts=projecting,
         )
+    # From here the fork reads through to its source.
+    book.register_read_through(forked, source, origin_cell)
     graph_data["lexical_read_scope"] = forked
     if tuple(graph_data.get("operand_position_scope") or ()) == source:
         graph_data["operand_position_scope"] = forked
@@ -3597,7 +3577,7 @@ def _cell_fact(book: Any, cell: Any) -> Any:
     page = book.pages.get(cell.page.name)
     if page is None:
         return None
-    return page.cells.get((cell.row, cell.column))
+    return page.cell(cell.row, cell.column)
 
 
 class _FieldStateView(Mapping):

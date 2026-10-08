@@ -2884,6 +2884,20 @@ class LiveScopeProjection:
     #: The projection of the scope this one was forked from, whose
     #: exclusions it inherits.
     inherited: "LiveScopeProjection | None" = None
+    #: This level HOLDS only ``held`` of the node-keyed rows of its origin
+    #: (a fork cut for a proper induced subgraph): a read-through of a node
+    #: outside ``held`` finds nothing, whether or not it is also refused
+    #: (``excludes``) -- the rows of ids that were nodes of neither graph
+    #: (``ScopeProjection.rows_stale``) are not held.
+    restricts: bool = False
+
+    def reaches(self, node: Any) -> bool:
+        """Whether a read-through of ``node``'s row under this scope may pass
+        on to the scope's origin: the node is not refused and, when this
+        level restricts to its own nodes, it is one of them."""
+        if self.excludes(node):
+            return False
+        return not self.restricts or node in self.held
 
     def excludes(self, node: Any) -> bool:
         """Whether a read of ``node``'s rows under this scope is refused."""
@@ -3212,6 +3226,15 @@ _PRIVATE_PAGE_NAMES = frozenset(
     page.name for page in (EDGE_PAGE, DEPENDENTS_PAGE, MINT_PAGE, UNSOURCED_PAGE)
 )
 
+#: Pages a copy-on-read fork (``fork_read_scope``) never reads through to its
+#: origin, besides the book's private pages: a scope's origin is its own fact
+#: (``scope_origin``), and the planner's specialization rows are per COPY
+#: (design section 7.1: a copy never carries a literal proven for another
+#: caller).  This is the set ``fork_read_scope`` skipped when it copied.
+READ_THROUGH_EXCLUDED_PAGES = frozenset({
+    "scope_origin", "planner_specialization", "planner_tensor_descriptor",
+})
+
 #: The stage recorded for a raw write when the book knows no better
 #: (``IdentityBook.active_stage`` unset), and the reason every such write
 #: is tagged with.
@@ -3261,7 +3284,38 @@ def _validate_fact(page: Page, fact: Any) -> None:
 
 @dataclass
 class IdentityPage:
-    """One pipeline stage's row (identity) x column (round) table of facts."""
+    """One pipeline stage's row (identity) x column (round) table of facts.
+
+    COPY-ON-READ SCOPES.  A scope forked with ``fork_read_scope`` holds no
+    copied rows: ``IdentityBook.read_through[forked] == (origin, stamp)``
+    (``IdentityBook.register_read_through``; the fork's ``scope_origin`` fact
+    says ``copy_on_read=True``).  A row under the fork that has no cell of its
+    own READS as the origin's row did when the fork was made -- the origin's
+    latest cell stamped before ``stamp`` (the snapshot the eager copy was), or,
+    if the origin is itself a fork, what it reads as, to the root.  Every read
+    api answers through that chain: ``latest``, ``latest_column``, ``history``
+    (``((0, fact),)``, the one cell the eager copy held), ``spans``, ``cell``,
+    ``stamp_at``, ``scope_rows``, ``scope_row_count``, ``alias_bindings``,
+    ``IdentityBook.latest_ref`` / ``edges_into`` / ``stamp_of``.
+
+    A WRITE under the fork (``set``, ``revise``, ``IdentityBook.post``, or a
+    ``Ref`` to the unwritten row named as a source) first MATERIALISES the
+    row: a cell at column 0 holding that fact, DERIVED from the origin's cell
+    at stage ``read_scope_fork`` (same fact, same edge, same stamp as the
+    eager copy had), then the write lands as the next column.  Nothing is
+    ever deleted; a fork's rows are never rewritten by the origin's later
+    writes (the snapshot), and an in-place overwrite of an origin cell
+    materialises its forks' rows first (``_stamp``).
+
+    ``rows()``, ``cells``, ``stamps``, ``row_columns`` and ``scopes`` are the
+    MATERIALISED book: an unwritten, unreferenced row of a fork is not a row
+    -- it has no cell, no edge, no stamp -- until it is read through and
+    written (or named as a source).  ``scope_rows(scope)`` is the resolved
+    view (materialised rows and the origin's rows not shadowed).
+    ``materialised_scope_rows(scope)`` is the book's own cells only; the
+    unsourced detector and ``tools/view_identity_concordance.py`` read those,
+    together with the ``scope_origin`` relation.
+    """
 
     name: str
     cells: dict[tuple[Any, int], Any] = field(default_factory=dict)
@@ -3335,13 +3389,19 @@ class IdentityPage:
         # bookkeeping, per cell of every page (the edge pages hold most of
         # the book).
         key = (row, column)
+        book = self.book
         if key not in self.cells:
             columns = self.row_columns.setdefault(row, [])
             columns.append(column)
             if len(columns) > 1 and positions[columns[-2]] > position:
                 columns.sort(key=positions.__getitem__)
+        elif book is not None and book.__dict__.get("read_through_origins"):
+            # An in-place overwrite of a cell some fork may read through to:
+            # the fork's snapshot is taken (its row materialised) first.
+            book._preserve_fork_snapshots(self, row, key, fact)
         self.cells[key] = fact
-        self.stamps[key] = self.clock[0]
+        stamp = None if book is None else book.__dict__.get("_stamp_override")
+        self.stamps[key] = self.clock[0] if stamp is None else stamp
         if isinstance(row, tuple) and row:
             self.scopes.setdefault(row[0], {}).setdefault(row, None)
 
@@ -3355,17 +3415,171 @@ class IdentityPage:
         """
         book = self.book
         if book is not None:
+            if book.__dict__.get("read_through"):
+                book._materialise_row(self, row)
             book._admit_raw_write(self, row)
         self._stamp(row, column, fact)
-        self.clock[0] += 1
+        if book is None or book.__dict__.get("_stamp_override") is None:
+            self.clock[0] += 1
 
-    def scope_rows(self, scope: Any) -> tuple[Any, ...]:
-        """Every row whose first element is ``scope``, in recorded order."""
+    # ------------------------------------------------- copy-on-read scopes
+    def _fork_of_scope(self, scope: Any) -> tuple[Any, int] | None:
+        """``(origin, stamp)`` when ``scope`` is a copy-on-read fork whose
+        rows on THIS page read through to the origin, else None."""
+        book = self.book
+        if book is None:
+            return None
+        forks = book.__dict__.get("read_through")
+        if not forks:
+            return None
+        fork = forks.get(scope)
+        if fork is None:
+            return None
+        name = self.name
+        if (
+            name in READ_THROUGH_EXCLUDED_PAGES
+            or name in book.registry.private_pages
+        ):
+            return None
+        return fork
+
+    def _reaches_origin(self, scope: Any, row: tuple) -> bool:
+        """Whether the fork ``scope``'s declared projection lets a read of
+        ``row`` pass on to its origin (see ``LiveScopeProjection``)."""
+        projections = self.book.__dict__.get("scope_projections")
+        if not projections:
+            return True
+        projection = projections.get(scope)
+        if projection is None or self.name not in projection.pages:
+            return True
+        if len(row) > 1 and isinstance(row[1], int):
+            return projection.reaches(row[1])
+        return True
+
+    def _resolved(
+        self, row: Any, asof: int | None = None, *, through: bool = False,
+    ) -> tuple[Any, int] | None:
+        """The ``(owner row, column)`` of the cell a read of ``row`` means.
+
+        ``row``'s own latest cell; failing that (and only on a copy-on-read
+        scope) the origin's row as the fork saw it -- cells stamped before
+        the fork -- recursively.  ``asof`` limits the cells to those stamped
+        before it.  ``through`` ignores ``row``'s own cells and starts at the
+        origin hop.  None when no cell is reached.  The owner row differs
+        from ``row`` exactly when the cell is virtual (a row read through)."""
+        if len(self.column_positions) != len(self.columns):
+            self._reindex()
+        row_columns = self.row_columns
+        stamps = self.stamps
+        while True:
+            columns = None if through else row_columns.get(row)
+            through = False
+            if columns:
+                if asof is None:
+                    return row, columns[-1]
+                for column in reversed(columns):
+                    if stamps[(row, column)] < asof:
+                        return row, column
+            fork = (
+                self._fork_of_scope(row[0])
+                if type(row) is tuple and row else None
+            )
+            if fork is None or not self._reaches_origin(row[0], row):
+                return None
+            origin, stamp = fork
+            asof = stamp if asof is None or stamp < asof else asof
+            row = (origin, *row[1:])
+
+    def _virtual_fact(self, row: Any) -> Any:
+        """The fact a copy-on-read row with no cell of its own reads as, or
+        None (no origin cell, or the origin's row was withdrawn: the eager
+        copy skipped a row whose fact was None)."""
+        found = self._resolved(row, through=True)
+        return None if found is None else self.cells[found]
+
+    def cell(self, row: Any, column: int, default: Any = None) -> Any:
+        """The fact of cell ``(row, column)``, resolved through a
+        copy-on-read scope (a virtual row's one cell is column 0)."""
+        key = (row, column)
+        if key in self.cells:
+            return self.cells[key]
+        if column == 0 and not self.row_columns.get(row):
+            fact = self._virtual_fact(row)
+            if fact is not None:
+                return fact
+        return default
+
+    def is_virtual(self, row: Any, column: int = 0) -> bool:
+        """Whether ``(row, column)`` is a cell a copy-on-read read resolves
+        but the book does not hold yet."""
+        return (
+            column == 0 and (row, column) not in self.cells
+            and not self.row_columns.get(row)
+            and self._virtual_fact(row) is not None
+        )
+
+    def stamp_at(self, row: Any, column: int) -> int:
+        """The clock reading of cell ``(row, column)``; a virtual cell was
+        made by its fork, whose stamp it carries (``KeyError`` if none)."""
+        key = (row, column)
+        if key in self.cells:
+            return self.stamps[key]
+        if self.is_virtual(row, column):
+            return self._fork_of_scope(row[0])[1]
+        raise KeyError(key)
+
+    def materialised_scope_rows(self, scope: Any) -> tuple[Any, ...]:
+        """The rows of ``scope`` the book holds cells for, in recorded
+        order.  For a scope that is not a copy-on-read fork this is
+        ``scope_rows``; for a fork it is the rows written or referenced
+        under it, without the origin's rows it reads through to."""
         return tuple(self.scopes.get(scope, ()))
 
+    def scope_rows(self, scope: Any) -> tuple[Any, ...]:
+        """Every row whose first element is ``scope``, in recorded order.
+
+        On a copy-on-read fork (``fork_read_scope``) this is the RESOLVED
+        view: the origin's rows as the fork saw them -- in the origin's order,
+        as the eager copy listed them -- then the rows only the fork holds.
+        A row the fork wrote shadows the origin's.  A row of the origin that
+        reads as withdrawn (fact None), or that the fork's projection does
+        not hold, is not listed, as the eager copy did not copy it."""
+        own = self.scopes.get(scope)
+        fork = self._fork_of_scope(scope)
+        if fork is None:
+            return tuple(own) if own else ()
+        resolved: dict[Any, None] = {}
+        row_columns = self.row_columns
+        for origin_row in self.scope_rows(fork[0]):
+            row = (scope, *origin_row[1:])
+            if row_columns.get(row) or self._virtual_fact(row) is not None:
+                resolved[row] = None
+        if own:
+            resolved.update(dict.fromkeys(own))
+        return tuple(resolved)
+
     def scope_row_count(self, scope: Any) -> int:
-        """How many rows ``scope`` owns, without materializing them."""
-        return len(self.scopes.get(scope, ()))
+        """How many rows ``scope`` owns (``len(scope_rows(scope))``); a plain
+        scope is counted without materializing them."""
+        fork = self._fork_of_scope(scope)
+        if fork is None:
+            return len(self.scopes.get(scope, ()))
+        counts = self.book.__dict__.setdefault("_read_through_counts", {})
+        key = (self.name, scope)
+        virtual = counts.get(key)
+        if virtual is None:
+            # The origin's rows as the fork saw them are fixed once the fork
+            # is made (their cells are stamped before it; a later write in
+            # place materialises the fork's row first), so they are counted
+            # once.
+            virtual = counts[key] = sum(
+                1 for origin_row in self.scope_rows(fork[0])
+                if self._virtual_fact((scope, *origin_row[1:])) is not None
+            )
+        return virtual + sum(
+            1 for row in self.scopes.get(scope, ())
+            if self._virtual_fact(row) is None
+        )
 
     def revise(self, row: Any, fact: Any) -> Any:
         """Append ``fact`` as ``row``'s next revision and return it.
@@ -3413,17 +3627,25 @@ class IdentityPage:
             self._reindex()
         columns = self.row_columns.get(row)
         if not columns:
+            if type(row) is tuple and row and self._fork_of_scope(row[0]):
+                fact = self._virtual_fact(row)
+                if fact is not None:
+                    return fact
             self._missed(row)
             return default
         return self.cells[(row, columns[-1])]
 
     def latest_column(self, row: Any) -> int | None:
         """The column of ``row``'s most recently recorded cell, or None --
-        ``history(row)[-1][0]`` without materializing the history."""
+        ``history(row)[-1][0]`` without materializing the history.  A row a
+        copy-on-read scope reads through to is at column 0, as its copy was."""
         if len(self.column_positions) != len(self.columns):
             self._reindex()
         columns = self.row_columns.get(row)
         if not columns:
+            if type(row) is tuple and row and self._fork_of_scope(row[0]):
+                if self._virtual_fact(row) is not None:
+                    return 0
             self._missed(row)
             return None
         return columns[-1]
@@ -3470,7 +3692,7 @@ class IdentityPage:
         """Materialize the latest alias facts owned by one planning scope."""
         return {
             int(row[1]): int(self.latest(row))
-            for row in self.rows()
+            for row in self.scope_rows(scope)
             if (
                 isinstance(row, tuple)
                 and len(row) == 2
@@ -3503,10 +3725,15 @@ class IdentityPage:
         if len(self.column_positions) != len(self.columns):
             self._reindex()
         cells = self.cells
-        return tuple(
-            (column, cells[(row, column)])
-            for column in self.row_columns.get(row, ())
-        )
+        columns = self.row_columns.get(row)
+        if not columns:
+            if type(row) is tuple and row and self._fork_of_scope(row[0]):
+                fact = self._virtual_fact(row)
+                if fact is not None:
+                    # The one cell the eager copy of this row held.
+                    return ((0, fact),)
+            return ()
+        return tuple((column, cells[(row, column)]) for column in columns)
 
     def spans(self, row: Any) -> tuple[tuple[int, int, Any], ...]:
         """This row's history collapsed to contiguous (start, end, fact) runs."""
@@ -3643,6 +3870,29 @@ class IdentityBook:
         #: scope without one costs nothing.
         self.scope_projections: dict[Any, LiveScopeProjection] = {}
         self._reporting_projected_read = False
+        #: Copy-on-read forks (``fork_read_scope``): forked scope ->
+        #: ``(origin scope, stamp)``, the clock reading of the fork's
+        #: ``scope_origin`` cell.  A row under the fork with no cell of its own
+        #: reads as the origin's row did before ``stamp`` (see
+        #: ``IdentityPage``).  Derived from the ``scope_origin`` facts that say
+        #: ``copy_on_read=True``; the relation itself is on that page.
+        self.read_through: dict[Any, tuple[Any, int]] = {}
+        #: origin scope -> the forks reading through to it, so an in-place
+        #: overwrite of an origin cell can take the forks' snapshots first.
+        self.read_through_origins: dict[Any, list[Any]] = {}
+        #: While a cell is being materialised or written: the clock reading
+        #: to stamp it with (the fork's), and the ``(page, row)`` whose own
+        #: write must not materialise again.
+        self._stamp_override: int | None = None
+        self._materialising: tuple | None = None
+
+    def __setstate__(self, state: dict) -> None:
+        # A book pickled before copy-on-read scopes existed has no forks.
+        self.__dict__.update(state)
+        self.__dict__.setdefault("read_through", {})
+        self.__dict__.setdefault("read_through_origins", {})
+        self.__dict__.setdefault("_stamp_override", None)
+        self.__dict__.setdefault("_materialising", None)
 
     def page(self, name: Any) -> IdentityPage:
         """The page named ``name`` (a str or a declared ``Page``), created
@@ -3762,7 +4012,16 @@ class IdentityBook:
             position = new_positions[0]
             row = row[:position] + (minted,) + row[position + 1:]
 
-        entries = target_page.history(row)
+        if self.__dict__.get("read_through"):
+            # A write under a copy-on-read fork lands on the row the eager
+            # copy would have held: take that copy first.
+            self._materialise_row(target_page, row)
+        if self.__dict__.get("_materialising") == (target_page.name, row):
+            # (This post IS that copy: the row has no cell of its own yet, and
+            # its virtual history is the very fact being written.)
+            entries = ()
+        else:
+            entries = target_page.history(row)
         if mode is Mode.CONCORD:
             if entries:
                 column, incumbent = entries[-1]
@@ -3847,7 +4106,10 @@ class IdentityBook:
             self.page(UNSOURCED_PAGE)._stamp(
                 (page.name, row, stage.name), 0, provenance.reason,
             )
-        self.clock[0] += 1
+        if self.__dict__.get("_stamp_override") is None:
+            # (A materialised copy is written at its fork's reading and
+            # ticks nothing: the order of every other write is unchanged.)
+            self.clock[0] += 1
         return target
 
     def _source_stamp(self, ref: Any) -> int:
@@ -3858,6 +4120,14 @@ class IdentityBook:
         if self.registry.pages.get(ref.page.name) != ref.page:
             raise ConcordanceRefusal(f"source names undeclared page {ref.page!r}")
         page = self.pages.get(ref.page.name)
+        if (
+            page is not None and self.__dict__.get("read_through")
+            and (ref.row, ref.column) not in page.cells
+            and page.is_virtual(ref.row, ref.column)
+        ):
+            # A cell a copy-on-read scope reads through to is named as a
+            # source: it exists from here on (with its edge to the origin).
+            self._materialise_row(page, ref.row)
         if page is None or (ref.row, ref.column) not in page.cells:
             raise ConcordanceRefusal(f"source cell does not exist: {ref!r}")
         return page.stamps[(ref.row, ref.column)]
@@ -3883,7 +4153,7 @@ class IdentityBook:
     def register_scope_projection(
         self, scope: Any, pages: Iterable[str], excluded: Iterable[Any] = (),
         *, universe: Iterable[Any] | None = None, held: Iterable[Any] = (),
-        inherited: LiveScopeProjection | None = None,
+        inherited: LiveScopeProjection | None = None, restricts: bool = False,
     ) -> None:
         """Hold the read-time form of ``scope``'s declared projection: reads
         of ``pages`` rows keyed by a node in ``excluded``, or by a node of
@@ -3900,8 +4170,122 @@ class IdentityBook:
             shared = interned.setdefault(universe, universe)
         self.scope_projections[scope] = LiveScopeProjection(
             frozenset(pages), frozenset(excluded), shared, frozenset(held),
-            inherited,
+            inherited, restricts,
         )
+
+    # ------------------------------------------------------ copy-on-read
+    def register_read_through(self, forked: Any, origin: Any, cell: Ref) -> None:
+        """Record that ``forked`` is a copy-on-read fork of ``origin``.
+
+        ``cell`` is the fork's ``scope_origin`` cell (posted with
+        ``ScopeFork(..., copy_on_read=True)``): its clock reading is the
+        moment the fork was taken.  The fork posts no copied rows; a read of a
+        row it has no cell for resolves through ``origin`` as of that reading
+        (``IdentityPage``), and a write materialises the row first
+        (``_materialise_row``)."""
+        stamp = self._source_stamp(cell)
+        self.read_through[forked] = (origin, stamp)
+        self.read_through_origins.setdefault(origin, []).append(forked)
+
+    def _virtual_edges_into(
+        self, page: IdentityPage, ref: Ref,
+    ) -> tuple[tuple[Ref, Stage], ...]:
+        """The edge a not-yet-written read-through cell will have: from the
+        origin's cell (as of the fork) at stage ``read_scope_fork``."""
+        from .concordance_declarations import READ_SCOPE_FORK
+
+        origin, stamp = page._fork_of_scope(ref.row[0])
+        origin_row = (origin, *ref.row[1:])
+        found = page._resolved(origin_row, stamp)
+        declared = self.registry.pages.get(page.name)
+        if found is None or declared is None:
+            return ()
+        owner, column = found
+        return ((
+            Ref(declared, origin_row, column if owner == origin_row else 0),
+            READ_SCOPE_FORK,
+        ),)
+
+    def _materialise_row(self, page: IdentityPage, row: Any) -> None:
+        """Give a copy-on-read row the cell the eager copy would have held.
+
+        A no-op unless ``row`` is under a copy-on-read fork, has no cell of
+        its own, and reads through to a fact.  Otherwise the row is written
+        exactly as ``fork_read_scope`` wrote its copies: a cell at column 0
+        with the origin's fact, DERIVED from the origin's cell (as of the
+        fork) at stage ``read_scope_fork``, mode CONCORD -- or, for a page
+        the registry does not declare / a fact it would not admit, through
+        the raw primitive, tagged under the latch as the eager copy was.  The
+        cell is stamped with the fork's clock reading and ticks nothing."""
+        if type(row) is not tuple or not row:
+            return
+        fork = page._fork_of_scope(row[0])
+        if fork is None or page.row_columns.get(row):
+            return
+        key = (page.name, row)
+        if self.__dict__.get("_materialising") == key:
+            return
+        origin, stamp = fork
+        if not page._reaches_origin(row[0], row):
+            return
+        origin_row = (origin, *row[1:])
+        found = page._resolved(origin_row, stamp)
+        if found is None:
+            return
+        if found[0] != origin_row:
+            # The origin is itself a fork and has not written this row: it
+            # exists there (with its own edge) before this copy derives it.
+            self._materialise_row(page, origin_row)
+            found = page._resolved(origin_row, stamp)
+            if found is None or found[0] != origin_row:
+                return
+        fact = page.cells[found]
+        if fact is None:
+            return
+        from .concordance_declarations import READ_SCOPE_FORK
+
+        declared = self.registry.pages.get(page.name)
+        previous = self.__dict__.get("_materialising")
+        previous_stamp = self.__dict__.get("_stamp_override")
+        previous_stage = self.active_stage
+        self._materialising = key
+        self._stamp_override = stamp
+        try:
+            if declared is None or not (
+                isinstance(fact, Unresolved)
+                or isinstance(fact, declared.fact_type)
+            ):
+                self.active_stage = READ_SCOPE_FORK
+                page.set(row, 0, fact)
+            else:
+                self.post(
+                    declared, row, fact, stage=READ_SCOPE_FORK,
+                    provenance=Derived((Ref(declared, origin_row, found[1]),)),
+                    mode=Mode.CONCORD,
+                )
+        finally:
+            self._materialising = previous
+            self._stamp_override = previous_stamp
+            self.active_stage = previous_stage
+
+    def _preserve_fork_snapshots(
+        self, page: IdentityPage, row: Any, key: tuple, fact: Any,
+    ) -> None:
+        """``page`` is about to overwrite cell ``key`` in place with ``fact``;
+        every copy-on-read fork of ``row``'s scope takes its snapshot of the
+        row first, so the overwrite does not change what the fork reads."""
+        old = page.cells[key]
+        if old is fact:
+            return
+        try:
+            if old == fact:
+                return
+        except Exception:
+            pass
+        if type(row) is not tuple or not row:
+            return
+        for forked in tuple(self.read_through_origins.get(row[0], ())):
+            self._materialise_row(page, (forked, *row[1:]))
 
     def _refuse_projected_read(self, page: IdentityPage, row: tuple) -> None:
         """Post ``Unresolved(ROW_PROJECTED_OUT_OF_SCOPE)`` at ``row`` (DERIVED
@@ -3949,6 +4333,12 @@ class IdentityBook:
         return Ref(page, row, column)
 
     def stamp_of(self, ref: Ref) -> int:
+        page = self.pages.get(ref.page.name)
+        if (
+            page is not None and self.__dict__.get("read_through")
+            and page.is_virtual(ref.row, ref.column)
+        ):
+            return page.stamp_at(ref.row, ref.column)
         return self._source_stamp(ref)
 
     def edges_into(self, ref: Ref) -> tuple[tuple[Ref, Stage], ...]:
@@ -3956,6 +4346,14 @@ class IdentityBook:
         edge_page = self.pages.get(EDGE_PAGE.name)
         if edge_page is None:
             return ()
+        page = self.pages.get(ref.page.name)
+        if (
+            page is not None and self.__dict__.get("read_through")
+            and page.is_virtual(ref.row, ref.column)
+        ):
+            # The cell the book has not written yet has the one edge its
+            # materialisation will write: to the origin's cell, at the fork.
+            return self._virtual_edges_into(page, ref)
         return tuple(
             (self._ref_from_key(row[1]), self.registry.stages[row[2]])
             for row in edge_page.scope_rows(ref.key)

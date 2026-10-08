@@ -4324,7 +4324,7 @@ class _ControlSSABuilder:
         if cell is None:
             return None
         page = self._book().pages.get(CONTROL_VALUE_BINDING.name)
-        return None if page is None else page.cells.get((cell.row, cell.column))
+        return None if page is None else page.cell(cell.row, cell.column)
 
     def _binding(self, graph_id: Any) -> SSAValue | None:
         """The SSA value bound to ``graph_id`` (the read view)."""
@@ -4676,7 +4676,7 @@ class _ControlSSABuilder:
     def _field_state_kind(self, cell: Ref) -> Any:
         """The ``FieldStateKind`` recorded at a ``reducer_field_state`` cell."""
         page = self._book().pages.get(cell.page.name)
-        fact = None if page is None else page.cells.get((cell.row, cell.column))
+        fact = None if page is None else page.cell(cell.row, cell.column)
         return getattr(fact, "kind", None)
 
     def _carried_field_arm(
