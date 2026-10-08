@@ -33,4 +33,5 @@ COMPILER_IMPLEMENTATION_FILES: tuple[str, ...] = (
     "src/compiler/frame_storage_roles.py",
     "src/compiler/resident_sequence_materialization.py",
     "src/compiler/sequence_storage_binding.py",
+    "src/compiler/lexical_control_placement.py",
 )
