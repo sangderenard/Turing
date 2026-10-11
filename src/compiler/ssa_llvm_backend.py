@@ -1784,7 +1784,7 @@ def _emit_repository_call_module(
     # travels on -- then measure that buffer's axis once through the artifact's
     # existing extents vector. Nothing is inferred from names or positions.
     span_origin: dict[tuple[str, int], tuple[str, int]] = {}
-    precision_extent_origin: dict[
+    shape_extent_origin: dict[
         tuple[str, int], tuple[str, int]
     ] = {}
     internal_callers: dict[str, set[str]] = {}
@@ -1803,11 +1803,26 @@ def _emit_repository_call_module(
                 "precision_extent_source_id"
             )
             if source_id is not None:
-                precision_extent_origin[(
+                shape_extent_origin[(
                     str(caller_name), int(value.id)
                 )] = (str(caller_name), int(source_id))
         for block in module.functions[caller_name].blocks.values():
             for instruction in block.instrs:
+                # A numeric Cast preserves axes. Its SSA operand is the
+                # exact shape edge (also used by the C origin resolver),
+                # not a new public buffer whose extents must be guessed.
+                # Without this edge a planned region's local cast result
+                # is unreachable from the real public span, despite its
+                # source formal having an exact caller binding.
+                if (instruction.op == "Cast" and instruction.res is not None
+                        and instruction.args
+                        and _declared_span_rank(instruction.res) > 0
+                        and _declared_span_rank(instruction.args[0]) ==
+                            _declared_span_rank(instruction.res)):
+                    shape_extent_origin.setdefault(
+                        (str(caller_name), int(instruction.res.id)),
+                        (str(caller_name), int(instruction.args[0].id)),
+                    )
                 if instruction.op != "Call":
                     continue
                 callee_name = str(instruction.attributes.get("callee") or "")
@@ -1831,7 +1846,7 @@ def _emit_repository_call_module(
             if current in seen:
                 return None
             seen.add(current)
-            origin = precision_extent_origin.get(current)
+            origin = shape_extent_origin.get(current)
             if origin is None:
                 origin = span_origin.get(current)
             if origin is None:
@@ -1859,7 +1874,8 @@ def _emit_repository_call_module(
         for instruction in block.instrs
         if instruction.res is not None
         and _declared_span_rank(instruction.res) > 0
-        and scalar_likeness(str(instruction.op)) is not None
+        and (scalar_likeness(str(instruction.op)) is not None
+             or instruction.op in {"Cast", "CastLike", "cast_like"})
         and not is_predicate_operation(instruction.op)
     )
     growing = True

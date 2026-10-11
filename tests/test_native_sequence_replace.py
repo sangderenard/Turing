@@ -11,7 +11,8 @@ from src.transmogrifier.ssa import IRModule, SSASequenceDescriptor, SSASequenceT
 
 
 @pytest.mark.parametrize('self_alias', [False, True])
-def test_native_keyed_replace_preserves_storage_and_failure_contents(tmp_path, self_alias):
+@pytest.mark.parametrize('backend', ['c', 'llvm'])
+def test_native_keyed_replace_preserves_storage_and_failure_contents(tmp_path, self_alias, backend):
     destination = SSASequenceDescriptor(10, (10, 11), 12, 13,
                                        column_dtypes=('int64', 'float64'), key_columns=(0,))
     source = destination if self_alias else SSASequenceDescriptor(
@@ -22,9 +23,16 @@ def test_native_keyed_replace_preserves_storage_and_failure_contents(tmp_path, s
     module = IRModule({'replace': function})
     module.sequence_tables['replace'] = SSASequenceTable(sequences={
         destination.sequence_id: destination, source.sequence_id: source})
-    artifact = emit_ssa_module_to_c(module, 'replace')
+    if backend == 'llvm':
+        from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm, compile_artifact
+        artifact = emit_ssa_function_to_llvm(module, 'replace')
+    else:
+        artifact = emit_ssa_module_to_c(module, 'replace')
     assert artifact.complete, artifact.shortfalls
-    artifact.compile(tmp_path / 'native')
+    if backend == 'llvm':
+        artifact = compile_artifact(artifact, directory=tmp_path / 'native')
+    else:
+        artifact.compile(tmp_path / 'native')
     payload = tmp_path / 'artifact.pkl'
     payload.write_bytes(pickle.dumps((artifact, self_alias, function.metadata['named_outputs'][0][1])))
     result = subprocess.run([sys.executable, '-c', '''
@@ -38,7 +46,11 @@ if not self_alias:
     feeds.update({20: np.array([8, 9, 10, 11, 12], dtype=np.int64),
                   21: np.array([8.5, 9.5, 10.5, 11.5, 12.5]),
                   22: np.array([2], dtype=np.int64), 23: np.array([5], dtype=np.int64)})
-execution = artifact.prepare_execution(feeds)
+if hasattr(artifact, 'prepare_execution'):
+    execution = artifact.prepare_execution(feeds)
+else:
+    from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+    execution = prepare_artifact_execution(artifact, feeds)
 b = execution.buffers
 if self_alias:
     for _ in range(3):

@@ -1,0 +1,201 @@
+diff --git a/src/compiler/ir_sequence_tables.py b/src/compiler/ir_sequence_tables.py
+index b258800d..7fdf7618 100644
+--- a/src/compiler/ir_sequence_tables.py
++++ b/src/compiler/ir_sequence_tables.py
+@@ -2694,8 +2694,12 @@ def lower_sequence_replace(
+     complete = builder.block("complete")
+     exhausted = builder.block("capacity_exhausted")
+     result = builder.block("result")
+-    zero = builder.const(entry, 0)
+-    one = builder.const(entry, 1)
++    # Replacement's length, index and backedge are int64 ABI cells. The
++    # default int seed emitted i32, so each N4 replacement helper joined
++    # i32 zero with an i64 backedge in an i64 Phi. Seed the same width at
++    # its producer; do not reinterpret or repair that merge in a backend.
++    zero = builder.const(entry, 0, dtype="int64")
++    one = builder.const(entry, 1, dtype="int64")
+     source_address = builder.fresh("ptr")
+     length = builder.fresh("int64")
+     builder.emit(entry, "GetElementPtr", [SSAValue(source.length_address_id, dtype="int64"), zero], source_address)
+diff --git a/src/compiler/ssa_llvm_backend.py b/src/compiler/ssa_llvm_backend.py
+index 5d9c580a..c71d69a8 100644
+--- a/src/compiler/ssa_llvm_backend.py
++++ b/src/compiler/ssa_llvm_backend.py
+@@ -1784,7 +1784,7 @@ def _emit_repository_call_module(
+     # travels on -- then measure that buffer's axis once through the artifact's
+     # existing extents vector. Nothing is inferred from names or positions.
+     span_origin: dict[tuple[str, int], tuple[str, int]] = {}
+-    precision_extent_origin: dict[
++    shape_extent_origin: dict[
+         tuple[str, int], tuple[str, int]
+     ] = {}
+     internal_callers: dict[str, set[str]] = {}
+@@ -1803,11 +1803,26 @@ def _emit_repository_call_module(
+                 "precision_extent_source_id"
+             )
+             if source_id is not None:
+-                precision_extent_origin[(
++                shape_extent_origin[(
+                     str(caller_name), int(value.id)
+                 )] = (str(caller_name), int(source_id))
+         for block in module.functions[caller_name].blocks.values():
+             for instruction in block.instrs:
++                # A numeric Cast preserves axes. Its SSA operand is the
++                # exact shape edge (also used by the C origin resolver),
++                # not a new public buffer whose extents must be guessed.
++                # Without this edge a planned region's local cast result
++                # is unreachable from the real public span, despite its
++                # source formal having an exact caller binding.
++                if (instruction.op == "Cast" and instruction.res is not None
++                        and instruction.args
++                        and _declared_span_rank(instruction.res) > 0
++                        and _declared_span_rank(instruction.args[0]) ==
++                            _declared_span_rank(instruction.res)):
++                    shape_extent_origin.setdefault(
++                        (str(caller_name), int(instruction.res.id)),
++                        (str(caller_name), int(instruction.args[0].id)),
++                    )
+                 if instruction.op != "Call":
+                     continue
+                 callee_name = str(instruction.attributes.get("callee") or "")
+@@ -1831,7 +1846,7 @@ def _emit_repository_call_module(
+             if current in seen:
+                 return None
+             seen.add(current)
+-            origin = precision_extent_origin.get(current)
++            origin = shape_extent_origin.get(current)
+             if origin is None:
+                 origin = span_origin.get(current)
+             if origin is None:
+@@ -1859,7 +1874,8 @@ def _emit_repository_call_module(
+         for instruction in block.instrs
+         if instruction.res is not None
+         and _declared_span_rank(instruction.res) > 0
+-        and scalar_likeness(str(instruction.op)) is not None
++        and (scalar_likeness(str(instruction.op)) is not None
++             or instruction.op in {"Cast", "CastLike", "cast_like"})
+         and not is_predicate_operation(instruction.op)
+     )
+     growing = True
+diff --git a/tests/test_native_sequence_replace.py b/tests/test_native_sequence_replace.py
+index 92cbc3bb..f3dbac00 100644
+--- a/tests/test_native_sequence_replace.py
++++ b/tests/test_native_sequence_replace.py
+@@ -11,7 +11,8 @@ from src.transmogrifier.ssa import IRModule, SSASequenceDescriptor, SSASequenceT
+ 
+ 
+ @pytest.mark.parametrize('self_alias', [False, True])
+-def test_native_keyed_replace_preserves_storage_and_failure_contents(tmp_path, self_alias):
++@pytest.mark.parametrize('backend', ['c', 'llvm'])
++def test_native_keyed_replace_preserves_storage_and_failure_contents(tmp_path, self_alias, backend):
+     destination = SSASequenceDescriptor(10, (10, 11), 12, 13,
+                                        column_dtypes=('int64', 'float64'), key_columns=(0,))
+     source = destination if self_alias else SSASequenceDescriptor(
+@@ -22,9 +23,16 @@ def test_native_keyed_replace_preserves_storage_and_failure_contents(tmp_path, s
+     module = IRModule({'replace': function})
+     module.sequence_tables['replace'] = SSASequenceTable(sequences={
+         destination.sequence_id: destination, source.sequence_id: source})
+-    artifact = emit_ssa_module_to_c(module, 'replace')
++    if backend == 'llvm':
++        from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm, compile_artifact
++        artifact = emit_ssa_function_to_llvm(module, 'replace')
++    else:
++        artifact = emit_ssa_module_to_c(module, 'replace')
+     assert artifact.complete, artifact.shortfalls
+-    artifact.compile(tmp_path / 'native')
++    if backend == 'llvm':
++        artifact = compile_artifact(artifact, directory=tmp_path / 'native')
++    else:
++        artifact.compile(tmp_path / 'native')
+     payload = tmp_path / 'artifact.pkl'
+     payload.write_bytes(pickle.dumps((artifact, self_alias, function.metadata['named_outputs'][0][1])))
+     result = subprocess.run([sys.executable, '-c', '''
+@@ -38,7 +46,11 @@ if not self_alias:
+     feeds.update({20: np.array([8, 9, 10, 11, 12], dtype=np.int64),
+                   21: np.array([8.5, 9.5, 10.5, 11.5, 12.5]),
+                   22: np.array([2], dtype=np.int64), 23: np.array([5], dtype=np.int64)})
+-execution = artifact.prepare_execution(feeds)
++if hasattr(artifact, 'prepare_execution'):
++    execution = artifact.prepare_execution(feeds)
++else:
++    from src.compiler.ssa_llvm_backend import prepare_artifact_execution
++    execution = prepare_artifact_execution(artifact, feeds)
+ b = execution.buffers
+ if self_alias:
+     for _ in range(3):
+diff --git a/tests/test_llvm_span_cast_extents.py b/tests/test_llvm_span_cast_extents.py
+--- /dev/null
++++ b/tests/test_llvm_span_cast_extents.py
+@@ -0,0 +1,72 @@
++"""A Cast's data edge preserves runtime extents through internal call frames."""
++import pickle
++import subprocess
++import sys
++
++import pytest
++
++from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
++from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm, compile_artifact
++
++
++def cast_module(rank=1, *, depth=1, source_bound=True):
++    shape = tuple(f'axis_{axis}' for axis in range(rank))
++    source = SSAValue(0, 'int64', shape)
++    output = SSAValue(1, 'float64', shape)
++    formal = SSAValue(10, 'int64', shape)
++    converted = SSAValue(11, 'float64', shape)
++    region = Function('region', [formal] if source_bound else [], {
++        'entry': BasicBlock('entry', [Instr('Cast', [formal], converted),
++                                     Instr('Ret', [converted], None)])})
++    functions = {'region': region}
++    callee = 'region'
++    if depth == 2:
++        middle_input, middle_output = SSAValue(20, 'int64', shape), SSAValue(21, 'float64', shape)
++        middle = Function('middle', [middle_input], {
++            'entry': BasicBlock('entry', [
++                Instr('Call', [middle_input], middle_output, attributes={'callee': 'region'}),
++                Instr('Ret', [middle_output], None)])})
++        functions['middle'] = middle
++        callee = 'middle'
++    root = Function('root', [source], {
++        'entry': BasicBlock('entry', [
++            Instr('Call', [source] if source_bound else [], output, attributes={'callee': callee}),
++            Instr('Ret', [output], None)])})
++    functions['root'] = root
++    return IRModule(functions)
++
++
++@pytest.mark.parametrize('shape', [(6,), (3, 4), (2, 3, 4)])
++@pytest.mark.parametrize('depth', [1, 2])
++def test_native_span_cast_uses_all_public_axes_without_precision_specific_metadata(tmp_path, shape, depth):
++    module = cast_module(len(shape), depth=depth)
++    artifact = emit_ssa_function_to_llvm(module, 'root')
++    assert artifact.complete, artifact.shortfalls
++    assert artifact.extent_order == tuple((0, 'dim', axis) for axis in range(len(shape)))
++    # The cast-only region must receive the vector, not just have slots added
++    # to the public ABI while its internal LLVM prototype omits %extents.
++    assert 'ptr %extents' in artifact.llvm_ir
++    native = compile_artifact(artifact, directory=tmp_path / 'native')
++    payload = tmp_path / 'native.pkl'
++    payload.write_bytes(pickle.dumps((native, shape)))
++    child = subprocess.run([sys.executable, '-u', '-c', '''
++import pickle, sys
++import numpy as np
++from src.compiler.ssa_llvm_backend import prepare_artifact_execution
++artifact, shape = pickle.load(open(sys.argv[1], 'rb'))
++values = (np.arange(np.prod(shape), dtype=np.int64) - 5).reshape(shape)
++for offset in (0, 2**40, -2**40):
++    source = values + offset
++    execution = prepare_artifact_execution(artifact, {0: source.copy()}, shapes={1: shape})
++    execution.run()
++    np.testing.assert_array_equal(execution.buffers[1], source.astype(np.float64))
++print('SPAN_CAST=exact')
++''', str(payload)], capture_output=True, text=True)
++    assert child.returncode == 0, child.stdout + child.stderr
++
++
++def test_missing_public_extent_origin_is_still_a_shortfall_not_a_scalar_standin():
++    artifact = emit_ssa_function_to_llvm(cast_module(source_bound=False), 'root')
++    assert not artifact.complete
++    assert any(item.operation == 'Cast' and 'needs its extents' in item.reason
++               for item in artifact.shortfalls)

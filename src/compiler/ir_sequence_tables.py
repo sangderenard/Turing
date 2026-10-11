@@ -2694,8 +2694,12 @@ def lower_sequence_replace(
     complete = builder.block("complete")
     exhausted = builder.block("capacity_exhausted")
     result = builder.block("result")
-    zero = builder.const(entry, 0)
-    one = builder.const(entry, 1)
+    # Replacement's length, index and backedge are int64 ABI cells. The
+    # default int seed emitted i32, so each N4 replacement helper joined
+    # i32 zero with an i64 backedge in an i64 Phi. Seed the same width at
+    # its producer; do not reinterpret or repair that merge in a backend.
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
     source_address = builder.fresh("ptr")
     length = builder.fresh("int64")
     builder.emit(entry, "GetElementPtr", [SSAValue(source.length_address_id, dtype="int64"), zero], source_address)
