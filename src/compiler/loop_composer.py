@@ -65,6 +65,46 @@ from .concordance_declarations import (
 )
 
 
+def _spliced_tuple_extent(graph_obj: Any, node_id: int, seen=frozenset()) -> str | None:
+    """Project cardinality from tuple/star edges, without allocating the row."""
+    if node_id in seen or node_id not in graph_obj:
+        return None
+    data = graph_obj.nodes[node_id]
+    expression = data.get('expr_obj')
+    if not isinstance(expression, ast.Tuple) or not any(
+        isinstance(item, ast.Starred) for item in expression.elts
+    ):
+        return None
+    # Controller tuple598 is (*failures, (dt, metrics, reasons)). Its extent
+    # is the incumbent failures length PLUS ONE row, not a public tensor's
+    # shape or the three leaves of that row. Exact operand/AST identities
+    # prove each splice. Existing lowering evaluates this bound at loop entry,
+    # so subsequent mutation of failures cannot extend the tuple iteration.
+    parents = [int(parent) for parent, role in data.get('parents', ())
+               if str(role).startswith('elts') and parent in graph_obj]
+    terms = []
+    for item in expression.elts:
+        if not isinstance(item, ast.Starred):
+            continue
+        wrappers = [parent for parent in parents if graph_obj.nodes[parent].get('expr_obj') is item]
+        if len(wrappers) != 1:
+            return None
+        sources = [int(parent) for parent, role in graph_obj.nodes[wrappers[0]].get('parents', ())
+                   if str(role) == 'value' and parent in graph_obj]
+        if len(sources) != 1:
+            return None
+        source = sources[0]
+        attributes = graph_obj.nodes[source].get('attributes') or {}
+        if attributes.get('aggregate_kind') not in {'list', 'tuple', 'bytes', 'bytearray'}:
+            return None
+        nested = _spliced_tuple_extent(graph_obj, source, seen | {node_id})
+        terms.append(nested or f"__iterable_extent_{int(graph_obj.nodes[source].get('value_id', source))}__")
+    fixed = sum(not isinstance(item, ast.Starred) for item in expression.elts)
+    if fixed:
+        terms.append(str(fixed))
+    return '(' + ' + '.join(terms) + ')'
+
+
 class LoopStrategy(str, Enum):
     CONSTANT = "constant"
     UNROLL = "unroll"
@@ -2475,7 +2515,9 @@ def materialize_retained_loop_ports(
         ))
 
     graph.G.graph["identity_table"] = {
-        name: tuple(dict.fromkeys(map(int, value_ids)))
+        # Preserve binding versions, including a final merge aliased back to
+        # an earlier value. Deduplicating it can make another arm current.
+        name: tuple(map(int, value_ids))
         for name, value_ids in identities.items()
     }
     _rebuild_graph_edges(graph)
@@ -4220,6 +4262,7 @@ def analyze_shader_loop_reductions(
         node_id: int,
         visiting: frozenset[int] = frozenset(),
         read: tuple | None = None,
+        *, aggregate_truth: bool = True,
     ) -> ControlExpression | None:
         # ``read`` is the operand position this node is read at, so a
         # ``value`` leaf carries the key of its ``lexical_read_binding`` row
@@ -4245,9 +4288,34 @@ def analyze_shader_loop_reductions(
             return ControlExpression("value", value_id=node_id, read=read)
         data = graph.G.nodes[int(resolved_node_id)]
         value_id = int(data.get("value_id", node_id))
+        if read is not None:
+            # The compiler's heap kernel computes ``size = size - 1`` in
+            # its outer loop, then the inner loop tests ``child < size``.
+            # Rebuilding the producer's Sub through that Name read made the
+            # inner predicate claim the outer region, and dependency-atom
+            # refinement sank ``replacement = heap[size]`` into the inner
+            # body. Its post-loop use then had no zero-trip definition.
+            # A lexical-read receipt already identifies the captured value:
+            # read it here, not its producing expression at this new site.
+            # An authored inline expression has no such binding receipt and
+            # still expands recursively below.
+            scope = graph.G.graph.get("lexical_read_scope")
+            if scope is not None:
+                from .identity_concordance import current_identity_book
+
+                binding = current_identity_book().page("lexical_read_binding").latest(
+                    (tuple(scope), *read)
+                )
+                if isinstance(binding, str):
+                    return ControlExpression("value", value_id=value_id, read=read)
         if value_id in carried_initial_value_ids:
             return ControlExpression("value", value_id=value_id, read=read)
         known, literal = _constant(graph, int(resolved_node_id))
+        # append((1.0, 2.0, (3.0,))) carries the nested row's data,
+        # not bool((3.0,)). The graph already retained the exact constant.
+        # Predicates still query aggregate length; data operands retain it.
+        if not aggregate_truth and known and isinstance(literal, (tuple, list)):
+            return ControlExpression("const", value_id=value_id, literal=literal)
         if known and isinstance(literal, (bool, int, float)):
             return ControlExpression(
                 "const", value_id=value_id, literal=literal
@@ -4404,7 +4472,18 @@ def analyze_shader_loop_reductions(
                 or effect.sequence_policy is None
             ):
                 continue
-            materializer_id = int(effect.argument_value_ids[0])
+            argument_id = int(effect.argument_value_ids[0])
+            # materialize_retained_loop_ports replaces the GeneratorExp
+            # argument by its LoopResult (11). That result already records
+            # its exact materializer (8) in LoopIterationOutput. Reading the
+            # LoopResult's missing AST lost the route and emitted both a
+            # generator append and the enclosing extend for one source call.
+            materializers = {int(output.materializer_node_id)
+                for producer in plans for output in producer.loop.iteration_outputs
+                if int(output.result_value_id) == argument_id}
+            if len(materializers) > 1:
+                raise ValueError('one generator result has conflicting materializers')
+            materializer_id = next(iter(materializers), argument_id)
             if materializer_id not in graph.G:
                 continue
             materializer = graph.G.nodes[materializer_id]
@@ -5206,7 +5285,7 @@ def analyze_shader_loop_reductions(
                     int(effect.effect_node_id)
                 ),
                 argument_expressions=tuple(
-                    structured_control_expression(int(value_id))
+                    structured_control_expression(int(value_id), aggregate_truth=False)
                     for value_id in mutation_arguments
                 ),
                 extraction_identity=(
@@ -5235,20 +5314,34 @@ def analyze_shader_loop_reductions(
                 if output_predicate is None
                 else ControlExpression("and", (output_predicate, predicate))
             )
-        sequence_mutations.extend(
-            ControlSequenceMutation(
+        def publication(output, kind):
+            # tuple((key,item) for key,item in value.items()): composer used
+            # to keep only flattened1/0, losing the actual yielded producer3
+            # before its object ABI was admitted. Preserve this transition
+            # on the shared book; SSA reads the original edge, not a guess
+            # reconstructed from a coincidentally matching pair of columns.
+            arguments = expanded_row_arguments((output.value_id,))
+            from .ssa_object_context import _object_source_contract
+            cell = _object_source_contract(graph.G, int(output.materializer_node_id),
+                'publication', {'source_argument_value_ids': (int(output.value_id),),
+                                'projected_argument_value_ids': arguments},
+                (output.materializer_node_id, output.value_id, *arguments))
+            return ControlSequenceMutation(
                 sequence_value_id=int(output.result_value_id),
                 operator=("update" if kind == "dict" else "add" if kind == "set" else "append"),
-                argument_value_ids=expanded_row_arguments((output.value_id,)),
+                argument_value_ids=arguments,
                 effect_node_id=int(output.materializer_node_id),
                 policy="unique" if kind in {"dict", "set"} else "duplicates",
                 argument_kind="mapping_items" if kind == "dict" else "value",
                 predicate_expression=output_predicate,
                 argument_expressions=tuple(
-                    structured_control_expression(int(value_id))
-                    for value_id in expanded_row_arguments((output.value_id,))
+                    structured_control_expression(int(value_id), aggregate_truth=False)
+                    for value_id in arguments
                 ),
+                object_contract_cell=cell,
             )
+        sequence_mutations.extend(
+            publication(output, kind)
             for output in loop.iteration_outputs
             for kind in ((graph.G.nodes[int(output.materializer_node_id)].get("attributes") or {}).get("aggregate_kind"),)
         )
@@ -5696,10 +5789,11 @@ def analyze_shader_loop_reductions(
                 literal = seed_data.get("constant")
                 if literal is None:
                     literal = (seed_data.get("attributes") or {}).get("value")
-                if isinstance(literal, (int, float)) and not isinstance(
-                    literal, bool
-                ):
-                    carried_seeds.append((initial, float(literal)))
+                # run_superstep's integer iters=0 was converted to 0.0 here;
+                # its Add backedge remains int64. Keep the source literal's
+                # representation for the control-owned seed, including bool.
+                if isinstance(literal, (bool, int, float)):
+                    carried_seeds.append((initial, literal))
             carried_seeds = tuple(carried_seeds)
             if loop.source_type == "While":
                 return WhileBlock(
@@ -5757,7 +5851,8 @@ def analyze_shader_loop_reductions(
                         is IterableAccess.CLOSURE_AGGREGATE
                         and plan.semantic.domain.source_value_ids
                     )
-                    else f"__iterable_extent_{iterable_extent_id}__"
+                    else (_spliced_tuple_extent(graph.G, int(iterable_extent_id))
+                          or f"__iterable_extent_{iterable_extent_id}__")
                     if loop.stop_node is None and loop.iterable_node is not None
                     and loop.iterable_constant is None
                     else str(len(loop.iterable_constant))

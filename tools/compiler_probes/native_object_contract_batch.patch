@@ -1,0 +1,855 @@
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -9911,29 +9911,32 @@
+     present: set[int] = set()
+     present_loops: set[int] = set()
+     loop_spans: list[tuple[int, int, int]] = []
+-
+-    def survey(block):
++    scope_depths: dict[int, int] = {}
++
++    def survey(block, depth=0):
+         if isinstance(block, ConditionalBlock):
+             if block.source_node_id is not None:
+                 present.add(int(block.source_node_id))
+-            survey(block.body)
++                scope_depths[int(block.source_node_id)] = depth
++            survey(block.body, depth + 1)
+             if block.orelse is not None:
+-                survey(block.orelse)
++                survey(block.orelse, depth + 1)
+         elif isinstance(block, SequenceBlock):
+             for child in block.blocks:
+-                survey(child)
++                survey(child, depth)
+         elif isinstance(block, (LoopBlock, WhileBlock)):
+             source_id = getattr(block, "source_loop_node_id", None)
+             if source_id is not None:
+                 present_loops.add(int(source_id))
++                scope_depths[int(source_id)] = depth
+                 expression = graph.G.nodes.get(int(source_id), {}).get("expr_obj")
+                 start = getattr(expression, "lineno", None)
+                 end = getattr(expression, "end_lineno", None)
+                 if start is not None and end is not None:
+                     loop_spans.append((int(start), int(end), int(source_id)))
+-            survey(block.body)
++            survey(block.body, depth + 1)
+         elif isinstance(block, CallBlock):
+-            survey(block.callee)
++            survey(block.callee, depth)
+ 
+     survey(control.root)
+ 
+@@ -10020,9 +10023,15 @@
+             if str(arm) in {"body", "orelse"} and int(owner) in present
+         ]
+         inserted = False
++        planned_loop_id = next((int(loop_id) for loop_id in reversed(
++            planned_calls[int(callsite_id)].enclosing_loop_ids) if int(loop_id) in present_loops), None)
+         if guards:
+-            owner, arm = max(guards, key=lambda item: node_position(item[0]))
+-            root, inserted = insert_in_conditional(root, owner, arm, marker)
++            owner, arm = max(guards, key=lambda item: scope_depths[item[0]])
++            # Once composition preserves If12 -> Loop14, the recursive call
++            # belongs to the deeper loop, not merely to its guarding arm.
++            # An inner conditional in a loop remains the deeper owner instead.
++            if planned_loop_id is None or scope_depths[owner] > scope_depths[planned_loop_id]:
++                root, inserted = insert_in_conditional(root, owner, arm, marker)
+         if not inserted:
+             # PlanCall carries the exact lexical loop ancestry.  Prefer it to
+             # source spans: comprehension AST nodes commonly have no usable
+@@ -16815,7 +16824,12 @@
+             (graph_obj.graph.get('linked_value_abi') or {}).items()
+             if abi.get('storage') == 'reference' and abi.get('dtype') == 'opaque_ref'}
+         native_collections = source_object_collections(graph_obj, native_handle_ids | reference_inputs) if native_object_context is not None else {}
+-        native_handle_ids = source_object_value_ids(graph_obj, native_seeds | set(native_collections))
++        native_handle_ids = source_object_value_ids(graph_obj, native_seeds | set(native_collections)
++            | (reference_inputs if native_object_context is not None else set()))
++        from .ssa_object_context import source_object_type_tests
++        native_type_tests = (source_object_type_tests(graph_obj,
++            source_object_value_ids(graph_obj, native_handle_ids | reference_inputs), native_object_context)
++            if native_object_context is not None else {})
+         control, lexical_sequence_shortfalls = _install_lexical_sequence_mutations(
+             control,
+             graph,
+@@ -18293,6 +18307,7 @@
+                 native_object_module=native_object_module,
+                 native_object_value_ids=native_handle_ids,
+                 native_object_collections=native_collections,
++                native_object_type_tests=native_type_tests,
+                 identity_table=dict(graph_obj.graph.get("identity_table") or {}),
+                 function_outputs=tuple(
+                     graph_obj.graph.get("function_outputs") or ()
+@@ -20666,6 +20681,12 @@
+             argument for argument in function.args
+             if not (
+                 (argument.accounting or {}).get("compiler_frame_storage")
++                # root(value,memo)->visit(item) only uses memo column zero
++                # before call frames are expanded. Column1 is already an
++                # admitted parameter member, not dead compiler scratch.
++                # Dropping it here made later restoration strip its owner
++                # and LLVM allocate one stack element for the whole arena.
++                and (argument.accounting or {}).get("program_abi_parameter") is None
+                 and id(argument) not in used_argument_objects
+             )
+         ]
+@@ -29667,14 +29688,19 @@
+                 # binding or the callee receives a valid pointer paired with
+                 # freshly zeroed extents (for example ``_section(payload)``
+                 # after ``payload = _vector(types)``).
+-                for caller_id, callee_id in planned_call.argument_bindings:
++                # visit(item) stores memo[id(item)]=result before recursively
++                # collecting children. Its call captures the mutation value,
++                # not the original Input: the concordance already proves
++                # mutation40 -> memo6. A by_id(40) lookup discarded that proof
++                # and leased column1 as private recursive scratch. Consume the
++                # SAME physical alias settlement for the whole descriptor.
++                caller_storage_aliases = _concordant_function_aliases(caller_function)
++                callee_storage_aliases = _concordant_function_aliases(callee_function)
++                for callee_id, caller_id in exact_bindings.items():
++                    caller_id = int(structural_caller_aliases.get(int(caller_id), int(caller_id)))
+                     bind_sequence_members(
+-                        callee_sequences.by_id(int(callee_id)),
+-                        caller_sequences.by_id(
+-                            int(structural_caller_aliases.get(
+-                                int(caller_id), int(caller_id)
+-                            ))
+-                        ),
++                        callee_sequences.by_id(int(callee_storage_aliases.get(int(callee_id), int(callee_id)))),
++                        caller_sequences.by_id(int(caller_storage_aliases.get(caller_id, caller_id))),
+                     )
+                 for transform_sequence_id, source_name, transform in (
+                     callee_function.metadata.get(
+@@ -44977,6 +45003,8 @@
+         # that point (no full-native policy) is settled here; for the
+         # others every substitution is already made and this finds none.
+         module = result[0] if isinstance(result, tuple) else result
++        from .ssa_object_context import publish_native_object_requirements
++        publish_native_object_requirements(module)
+         reconciled, _record_phi_temporal_repairs = (
+             _settle_late_dominance_repairs(module)
+         )
+diff --git a/src/compiler/precompile_to_ssa.py b/src/compiler/precompile_to_ssa.py
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -1431,6 +1431,7 @@
+         native_object_module: Any = None,
+         native_object_value_ids: Iterable[int] = (),
+         native_object_collections: Mapping[int, Mapping[str, Any]] | None = None,
++        native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+     ):
+         from .evolution_metagraph import (
+             active_evolution_metagraph,
+@@ -1680,6 +1681,9 @@
+         self.native_object_constructor_receipts = []
+         self.native_object_context_used = False
+         self.native_object_source_ids = set()
++        self.native_object_type_tests = dict(native_object_type_tests or {})
++        self.native_object_type_test_receipts = []
++        self.native_object_requires_member_storage = False
+         if native_object_context is not None:
+             from .ssa_object_context import context_values
+             for cell in context_values(native_object_context):
+@@ -3536,6 +3540,8 @@
+         follow_aliases: bool = True,
+     ) -> SSAValue:
+         value_id = int(value_id)
++        if value_id in self.native_object_type_tests and value_id not in self.external_values:
++            self._emit_native_object_type_test(value_id)
+         field_effect = self.scalar_field_effect_destinations.get(value_id)
+         if field_effect is not None and value_id not in self.external_values:
+             field_value_id, field_dtype = field_effect
+@@ -7873,7 +7879,31 @@
+         instruction.attributes['source_object_operation'] = (operation, reference_id,
+             tuple(value.id for value in operand_values), result_id)
+         self.emit(Handler.Call, instruction.args, instruction.res, attributes=instruction.attributes)
++        if operation in {'length', 'get', 'set', 'materialize', 'collect'}:
++            self.native_object_requires_member_storage = True
+         return result
++
++    def _emit_native_object_type_test(self, value_id):
++        # isinstance(item,tuple) retained an intrinsic/static type object but
++        # had no Boolean SSA producer. Read the optional introspection facet
++        # of the SAME identity table; storage-kind equality is not MRO evidence.
++        source = self.native_object_type_tests[value_id]
++        context = self.native_object_context
++        vocabulary = context.type_vocabulary
++        bits = sum(1 << vocabulary.index(token) for token in set(source['accepted_types']))
++        evidence = self._emit_native_object_operation('type_mask', source['reference_value_id'], (), None)
++        token = self.fresh_value(dtype='int64', transform=CONTROL_CONST, operands=(evidence,))
++        self.emit(Handler.Const, [], token, attributes={'value': bits})
++        selected = self.fresh_value(dtype='int64', transform=CONTROL_EXPRESSION, operands=(evidence, token))
++        self.emit(Handler.And, [evidence, token], selected)
++        zero = self.fresh_value(dtype='int64', transform=CONTROL_CONST, operands=(selected,))
++        self.emit(Handler.Const, [], zero, attributes={'value': 0})
++        result = self.produced_value(value_id, dtype='bool', claim_provisional_definition=True,
++                                     cause=(evidence, token, selected, zero))
++        receipt = {**source, 'context': context.to_mapping(), 'mask_value_id': evidence.id,
++                   'token_value_id': token.id, 'selected_value_id': selected.id, 'mask': bits}
++        self.emit(Handler.Ne, [selected, zero], result, attributes={'source_object_type_test': receipt})
++        self.native_object_type_test_receipts.append(receipt)
+ 
+     def _emit_native_object_constructor(self, mutation, *, location):
+         from .ssa_object_operations import object_call
+@@ -12309,6 +12339,8 @@
+             context = self.native_object_context
+             function.metadata['native_object_context'] = context.to_mapping()
+             function.metadata['source_object_constructors'] = tuple(self.native_object_constructor_receipts)
++            function.metadata['native_object_type_tests'] = tuple(self.native_object_type_test_receipts)
++            function.metadata['native_object_requires_member_storage'] = self.native_object_requires_member_storage
+             function.metadata['sequence_table'].register(context.objects)
+             function.metadata['sequence_table'].register(context.members)
+             from .ssa_object_context import context_values
+@@ -12732,6 +12764,7 @@
+     native_object_module: Any = None,
+     native_object_value_ids: Iterable[int] = (),
+     native_object_collections: Mapping[int, Mapping[str, Any]] | None = None,
++    native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+ ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
+     builder = _ControlSSABuilder(
+         program,
+@@ -12784,6 +12817,7 @@
+         native_object_module=native_object_module,
+         native_object_value_ids=native_object_value_ids,
+         native_object_collections=native_object_collections,
++        native_object_type_tests=native_object_type_tests,
+     )
+     builder.lower(program.root)
+     for kind, arguments in builder.table_epilogue_operations:
+@@ -15284,6 +15318,7 @@
+     native_object_module: Any = None,
+     native_object_value_ids: Iterable[int] = (),
+     native_object_collections: Mapping[int, Mapping[str, Any]] | None = None,
++    native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+ ) -> tuple[
+     IRModule,
+     tuple[SSALoweringShortfall, ...],
+@@ -17833,6 +17868,7 @@
+         native_object_module=native_object_module,
+         native_object_value_ids=native_object_value_ids,
+         native_object_collections=native_object_collections,
++        native_object_type_tests=native_object_type_tests,
+     )
+     report(
+         f"control lowering complete; blocks={len(control_function.blocks)} "
+diff --git a/src/compiler/ssa_object_context.py b/src/compiler/ssa_object_context.py
+--- a/src/compiler/ssa_object_context.py
++++ b/src/compiler/ssa_object_context.py
+@@ -15,6 +15,43 @@
+ )
+ from .ssa_heap_allocation import heap_release
+ from .ssa_object_operations import ObjectOperation, declare_object_helper
++
++
++def object_type_classes(vocabulary):
++    """Resolve only admitted builtin guards, never arbitrary MRO hooks."""
++    import builtins
++    supported = {"builtins." + name: getattr(builtins, name) for name in
++                 ('dict', 'list', 'tuple', 'set', 'frozenset', 'object',
++                  'bool', 'int', 'float', 'str', 'bytes')}
++    supported['builtins.NoneType'] = type(None)
++    if any(token not in supported for token in vocabulary):
++        raise ValueError('object type evidence supports declared builtin guards only')
++    return tuple(supported[token] for token in vocabulary)
++
++
++def source_object_type_tests(graph, admitted, context):
++    """Consume the intrinsic's incumbent static type objects and operand edge."""
++    if not context.type_vocabulary:
++        return {}
++    tests = {}
++    classes = dict(zip(object_type_classes(context.type_vocabulary), context.type_vocabulary))
++    for node_id, data in graph.nodes(data=True):
++        attributes = data.get('attributes') or {}
++        if attributes.get('extraction_identity') != 'builtins.isinstance':
++            continue
++        targets = (attributes.get('static_call_values') or {}).get('arg:1')
++        targets = targets if type(targets) is tuple else (targets,)
++        if not targets or any(type(target) is not type or target not in classes for target in targets):
++            continue
++        operands = [int(graph.nodes[parent].get('value_id', parent))
++                    for parent, role in data.get('parents') or () if role == 'arg:0']
++        if len(operands) != 1 or operands[0] not in admitted:
++            continue
++        value_id = int(data.get('value_id', node_id))
++        tests[value_id] = {'source_value_id': value_id, 'reference_value_id': operands[0],
++                          'accepted_types': tuple(classes[target] for target in targets),
++                          'intrinsic': 'builtins.isinstance'}
++    return tests
+ 
+ 
+ def source_constructor_mutations(graph, context):
+@@ -249,7 +286,8 @@
+     if objects is None or members is None:
+         raise ValueError('object context has a missing storage descriptor')
+     context = SSAObjectContext(receipt['storage_identity'], objects, members,
+-        receipt['next_handle_value_id'], tuple(receipt['kind_vocabulary']))
++        receipt['next_handle_value_id'], tuple(receipt['kind_vocabulary']),
++        tuple(receipt.get('type_vocabulary', ())))
+     if context.to_mapping() != receipt:
+         raise ValueError('object context disagrees with its live storage descriptors')
+     formals = {value.id: value for value in function.args}
+@@ -275,9 +313,68 @@
+     return definitions
+ 
+ 
++def native_object_requirement_sources(module, function_name):
++    """Existing call-graph reachability determines the lease's payload needs."""
++    operations = {'length', 'get', 'set', 'materialize', 'collect'}
++    return tuple(name for name in module.reachable_functions(function_name)
++        if module.functions[name].metadata.get('opaque_object_helper', {}).get('operation') in operations
++        or any((i.attributes.get('source_object_operation') or (None,))[0] in operations
++               for block in module.functions[name].blocks.values() for i in block.instrs))
++
++
++def publish_native_object_requirements(module):
++    if module is None:
++        return
++    for name, function in module.functions.items():
++        if (function.metadata.get('native_object_context') is not None
++                or function.metadata.get('object_context') is not None):
++            sources = native_object_requirement_sources(module, name)
++            function.metadata['native_object_requirement_sources'] = sources
++            function.metadata['native_object_requires_member_storage'] = bool(sources)
++
++
++def validate_native_object_requirements(module, function_name):
++    function = module.functions[function_name]
++    if 'native_object_requirement_sources' in function.metadata:
++        sources = native_object_requirement_sources(module, function_name)
++        if (function.metadata['native_object_requirement_sources'] != sources
++                or function.metadata.get('native_object_requires_member_storage') != bool(sources)):
++            raise ValueError('native object payload requirements disagree with live call graph')
++
++
+ def validate_source_object_instruction(module, function_name, instruction, *, _definitions=None, _helpers=None):
+     """Check authored object receipts against the live helper and context."""
+     validate_native_collection_instruction(module, function_name, instruction, _definitions=_definitions)
++    test = instruction.attributes.get('source_object_type_test')
++    if test is not None:
++        function = module.functions[function_name]
++        context = function.metadata.get('native_object_context')
++        definitions = source_object_definitions(function) if _definitions is None else _definitions
++        if (test not in function.metadata.get('native_object_type_tests', ())
++                or test['context'] != context or test['intrinsic'] != 'builtins.isinstance'
++                or instruction.op != 'Ne' or instruction.res is None
++                or instruction.res.id != test['source_value_id'] or instruction.res.dtype != 'bool'):
++            raise ValueError('source object type test has stale source/context receipt')
++        vocabulary = tuple(context.get('type_vocabulary', ()))
++        accepted = tuple(test['accepted_types'])
++        if not accepted or any(token not in vocabulary for token in accepted):
++            raise ValueError('source object type test has unadmitted targets')
++        bits = sum(1 << vocabulary.index(token) for token in set(accepted))
++        query, = definitions.get(test['mask_value_id'], ())
++        token, = definitions.get(test['token_value_id'], ())
++        selected, = definitions.get(test['selected_value_id'], ())
++        zero, = definitions.get(instruction.args[1].id, ())
++        if (test['mask'] != bits or query.attributes.get('source_object_operation') !=
++                ('type_mask', test['reference_value_id'], (), None)
++                or token.op != 'Const' or token.attributes.get('value') != bits
++                or token.res.dtype != 'int64' or selected.op != 'And'
++                or query.res.dtype != 'int64' or selected.res.dtype != 'int64'
++                or query.res.shape or selected.res.shape
++                or tuple(value.id for value in selected.args) != (query.res.id, token.res.id)
++                or instruction.args[0].id != selected.res.id or zero.op != 'Const'
++                or zero.attributes.get('value') != 0 or zero.res.dtype != 'int64' or instruction.res.shape):
++            raise ValueError('source object type test differs from live evidence/mask/predicate')
++        return
+     birth = instruction.attributes.get('source_object_constructor')
+     operation = instruction.attributes.get('source_object_operation')
+     if birth is None and operation is None:
+@@ -441,7 +538,14 @@
+         function_name=f'{prefix}_{label}_allocate'))
+         for label, descriptor in (('objects', context.objects), ('members', context.members))]
+     insert = add(lower_sequence_insert(context.objects, function_name=f'{prefix}_object_insert'))
+-    kind_lookup = add(lower_table_lookup(context.objects, function_name=f'{prefix}_kind_lookup'))
++    from dataclasses import replace
++    def object_projection(column):
++        return replace(context.objects,
++            column_value_ids=(context.objects.column_value_ids[0], context.objects.column_value_ids[column]),
++            column_dtypes=('opaque_ref', 'int64'), column_shapes=((), ()))
++    kind_lookup = add(lower_table_lookup(object_projection(1), function_name=f'{prefix}_kind_lookup'))
++    type_lookup = (add(lower_table_lookup(object_projection(2), function_name=f'{prefix}_type_lookup'))
++                   if context.type_vocabulary else None)
+     member_lookup = add(lower_table_lookup(context.members, function_name=f'{prefix}_member_lookup'))
+     store = add(lower_table_store(context.members, function_name=f'{prefix}_member_store'))
+ 
+@@ -534,7 +638,24 @@
+         attributes={'binding': 'object_context_mint', 'storage_identity': context.storage_identity})
+     row_ids = insert.metadata['sequence_row_argument_ids']
+     status = builder.fresh('int')
+-    call(builder, insert_block, insert, {row_ids[0]: handle, row_ids[1]: kind}, status)
++    row = {row_ids[0]: handle, row_ids[1]: kind}
++    if context.type_vocabulary:
++        mask = builder.const(insert_block, 0, dtype='int64')
++        classes = object_type_classes(context.type_vocabulary)
++        for index, label in enumerate(context.kind_vocabulary, 1):
++            try:
++                actual_class, = object_type_classes((label,))
++            except ValueError:
++                raise ValueError('native births with type evidence require builtin kind identities')
++            bits = sum(1 << bit for bit, target in enumerate(classes) if issubclass(actual_class, target))
++            matched, wide, weighted, combined = (builder.fresh(dtype) for dtype in ('bool', 'int64', 'int64', 'int64'))
++            builder.emit(insert_block, 'Eq', [kind, builder.const(insert_block, index, dtype='int64')], matched)
++            builder.emit(insert_block, 'Cast', [matched], wide)
++            builder.emit(insert_block, 'Mul', [wide, builder.const(insert_block, bits, dtype='int64')], weighted)
++            builder.emit(insert_block, 'Or', [mask, weighted], combined)
++            mask = combined
++        row[row_ids[2]] = mask
++    call(builder, insert_block, insert, row, status)
+     success = builder.fresh('bool')
+     builder.emit(insert_block, 'Eq', [status, builder.const(insert_block, 1)], success)
+     builder.cond(insert_block, success, publish, reject)
+@@ -550,15 +671,17 @@
+     builder.emit(complete, 'Ret', [result])
+     finish('construct', builder, (kind,), operation=ObjectOperation.CONSTRUCT)
+ 
+-    for label, helper, operation in (('kind', kind_lookup, ObjectOperation.KIND),
+-                                     ('get', member_lookup, ObjectOperation.GET)):
++    queries = [('kind', kind_lookup, ObjectOperation.KIND), ('get', member_lookup, ObjectOperation.GET)]
++    if type_lookup is not None:
++        queries.append(('type_mask', type_lookup, ObjectOperation.TYPE_MASK))
++    for label, helper, operation in queries:
+         builder = _Builder(0)
+         entry = builder.block('entry')
+         operands = tuple(builder.fresh(value.dtype) for value in arguments(helper,
+-            context.objects if label == 'kind' else context.members))
+-        returned = builder.fresh('int64' if label == 'kind' else 'opaque_ref')
++            object_projection(2 if label == 'type_mask' else 1) if label != 'get' else context.members))
++        returned = builder.fresh('opaque_ref' if label == 'get' else 'int64')
+         call(builder, entry, helper, dict(zip((v.id for v in arguments(helper,
+-            context.objects if label == 'kind' else context.members)), operands)), returned)
++            object_projection(2 if label == 'type_mask' else 1) if label != 'get' else context.members)), operands)), returned)
+         builder.emit(entry, 'Ret', [returned])
+         finish(label, builder, operands, reference=operands[0], operation=operation)
+ 
+@@ -788,4 +911,5 @@
+         builder.emit(entry, 'Store', [builder.const(entry, 0, dtype=value.dtype), slot])
+     builder.emit(entry, 'Ret', [])
+     finish('release', builder)
++    publish_native_object_requirements(module)
+     return module
+diff --git a/src/compiler/native_object_boundary.py b/src/compiler/native_object_boundary.py
+--- a/src/compiler/native_object_boundary.py
++++ b/src/compiler/native_object_boundary.py
+@@ -45,6 +45,9 @@
+         roots = tuple(roots)
+         self.retained = []
+         self._leaf_handles = set()
++        self._opaque_container_handles = set()
++        from .ssa_object_context import object_type_classes
++        inspection_classes = object_type_classes(context.type_vocabulary)
+         objects, members, pending, identities = [], [], deque(), {}
+ 
+         def reference(value):
+@@ -55,9 +58,16 @@
+             self.retained.append(handle)
+             identities[identity] = handle
+             label = _CONTAINERS.get(type(value), 'builtins.object')
+-            objects.append((handle, kinds[label]))
++            row = (handle, kinds[label])
++            if context.type_vocabulary:
++                mask = sum(1 << bit for bit, target in enumerate(inspection_classes)
++                           if isinstance(value, target))
++                row += (mask,)
++            objects.append(row)
+             if label == 'builtins.object':
+                 self._leaf_handles.add(handle)
++                if any(isinstance(value, target) for target in _CONTAINERS):
++                    self._opaque_container_handles.add(handle)
+             else:
+                 pending.append((handle, value))
+             return handle
+@@ -114,6 +124,9 @@
+         receipt = function.metadata.get('native_object_context', function.metadata.get('object_context'))
+         if receipt != self.receipt or artifact.name != function.name:
+             raise ValueError('native invocation does not implement the accepted object context/function')
++        if (function.metadata.get('native_object_requires_member_storage')
++                and self._opaque_container_handles):
++            raise ValueError('native member views cannot consume opaque container subclasses; type evidence is not payload storage')
+         from .ssa_object_context import context_values
+         from .ssa_llvm_backend import prepare_artifact_execution
+         cells = {value.id for value in context_values(self.context)}
+@@ -180,9 +193,12 @@
+         members = self._rows(self.context.members)
+         labels, children, keys = {}, {}, {}
+         vocabulary = self.context.kind_vocabulary
+-        for handle, kind in objects:
++        for row in objects:
++            handle, kind = row[:2]
+             if handle <= 0 or handle in labels or not 1 <= kind <= len(vocabulary):
+                 raise ValueError('invalid or duplicate native object identity/kind')
++            if self.context.type_vocabulary and not 0 <= row[2] < 1 << len(self.context.type_vocabulary):
++                raise ValueError('native object has invalid type evidence bits')
+             labels[handle] = vocabulary[kind - 1]
+             children[handle], keys[handle] = [], set()
+         counter = int(self.buffers[self.context.next_handle_value_id][0])
+diff --git a/src/compiler/ssa_object_operations.py b/src/compiler/ssa_object_operations.py
+--- a/src/compiler/ssa_object_operations.py
++++ b/src/compiler/ssa_object_operations.py
+@@ -16,6 +16,7 @@
+ 
+ class ObjectOperation(str, Enum):
+     KIND = "kind"
++    TYPE_MASK = "type_mask"
+     LENGTH = "length"
+     GET = "get"
+     SET = "set"
+@@ -27,6 +28,7 @@
+ 
+ _RESULT_DTYPES = {
+     ObjectOperation.KIND: "int64", ObjectOperation.LENGTH: "int64",
++    ObjectOperation.TYPE_MASK: "int64",
+     ObjectOperation.GET: "opaque_ref", ObjectOperation.SET: "bool",
+     ObjectOperation.CONSTRUCT: "opaque_ref", ObjectOperation.RELEASE: None,
+     ObjectOperation.MATERIALIZE: "opaque_ref",
+@@ -93,6 +95,11 @@
+         "result_value_ids": tuple(sorted({int(i.args[0].id) for b in function.blocks.values()
+                                            for i in b.instrs if i.op == "Ret" and i.args})),
+     }
++    if operation is ObjectOperation.TYPE_MASK:
++        vocabulary = tuple(function.metadata.get('object_context', {}).get('type_vocabulary', ()))
++        if not vocabulary:
++            raise ValueError('type evidence helper has no declared vocabulary')
++        receipt['type_vocabulary'] = vocabulary
+     return receipt
+ 
+ 
+@@ -208,8 +215,9 @@
+         visited.add(name)
+         function = module.functions[name]
+         from .ssa_object_context import (validate_context_function,
+-            validate_source_object_instruction, source_object_definitions)
++            validate_source_object_instruction, source_object_definitions, validate_native_object_requirements)
+         validate_context_function(module, name)
++        validate_native_object_requirements(module, name)
+         source_definitions = (source_object_definitions(function)
+             if function.metadata.get('native_object_context') is not None else {})
+         from .ssa_heap_allocation import validate_heap_context_projection
+diff --git a/src/transmogrifier/ssa.py b/src/transmogrifier/ssa.py
+--- a/src/transmogrifier/ssa.py
++++ b/src/transmogrifier/ssa.py
+@@ -1717,6 +1717,9 @@
+     members: SSASequenceDescriptor
+     next_handle_value_id: int
+     kind_vocabulary: tuple[str, ...]
++    # Optional introspection facet on the SAME object identity table. Bit i
++    # records the boundary's builtin isinstance evidence, not payload layout.
++    type_vocabulary: tuple[str, ...] = ()
+ 
+     def __post_init__(self) -> None:
+         if not self.storage_identity or not isinstance(self.storage_identity, str):
+@@ -1724,7 +1727,15 @@
+         if (not self.kind_vocabulary or len(set(self.kind_vocabulary)) != len(self.kind_vocabulary)
+                 or any(not isinstance(kind, str) or not kind for kind in self.kind_vocabulary)):
+             raise ValueError("object context requires a unique declared kind vocabulary")
+-        expected = ((self.objects, ("opaque_ref", "int64"), (0,)),
++        if (len(set(self.type_vocabulary)) != len(self.type_vocabulary)
++                or len(self.type_vocabulary) > 63):
++            raise ValueError("object type evidence requires a unique bounded vocabulary")
++        supported = {'builtins.' + name for name in ('dict', 'list', 'tuple', 'set',
++            'frozenset', 'object', 'bool', 'int', 'float', 'str', 'bytes', 'NoneType')}
++        if any(token not in supported for token in self.type_vocabulary):
++            raise ValueError('object type evidence supports declared builtin guards only')
++        object_dtypes = ("opaque_ref", "int64", "int64") if self.type_vocabulary else ("opaque_ref", "int64")
++        expected = ((self.objects, object_dtypes, (0,)),
+                     (self.members, ("opaque_ref", "opaque_ref", "opaque_ref"), (0, 1)))
+         occupied = set()
+         owner = self.objects.heap_owner_value_id
+@@ -1748,11 +1759,15 @@
+             raise ValueError("object context owner/counter must be distinct storage identities")
+ 
+     def to_mapping(self) -> Dict[str, Any]:
+-        return {"storage_identity": self.storage_identity,
++        receipt = {"storage_identity": self.storage_identity,
+                 "objects": self.objects.to_mapping(), "members": self.members.to_mapping(),
+                 "next_handle_value_id": self.next_handle_value_id,
+                 "kind_vocabulary": self.kind_vocabulary,
+                 "invalid_handle": 0, "member_key_semantics": "reference-identity"}
++        if self.type_vocabulary:
++            receipt["type_vocabulary"] = self.type_vocabulary
++            receipt["type_evidence_column"] = 2
++        return receipt
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/src/compiler/resident_sequence_materialization.py b/src/compiler/resident_sequence_materialization.py
+--- a/src/compiler/resident_sequence_materialization.py
++++ b/src/compiler/resident_sequence_materialization.py
+@@ -422,6 +422,15 @@
+     from .control_source import ControlSequenceMutation
+ 
+     aliases = _loop_carried_storage_aliases(graph_obj)
++    # The recursive metadata copier writes a caller-owned memo before its
++    # child calls. Requiring a dict materializer hoisted that IndexedStore
++    # into a numeric prelude before the branch's object constructor existed.
++    # The existing keyed Input ABI proves this is the same lexical mapping
++    # effect; its descriptor remains caller-owned, never a new local dict.
++    keyed_inputs = {int(node_id) for node_id, data in graph_obj.nodes(data=True)
++        if str(data.get('type') or data.get('op') or '').casefold() == 'input'
++        and (graph_obj.graph.get('linked_value_abi') or {}).get(
++            int(data.get('value_id', node_id)), {}).get('storage') == 'keyed'}
+     materializers = {}
+     for node_id, data in graph_obj.nodes(data=True):
+         attrs = data.get("attributes") or {}
+@@ -454,7 +463,7 @@
+         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+         base = roles.get("base")
+         base = aliases.get(base, base)
+-        if base not in materializers or "index" not in roles or "value" not in roles:
++        if base not in (materializers.keys() | keyed_inputs) or "index" not in roles or "value" not in roles:
+             continue
+         mutations.append(ControlSequenceMutation(
+             int(graph_obj.nodes[base].get("value_id", base)), "update",
+diff --git a/src/compiler/identity_concordance.py b/src/compiler/identity_concordance.py
+--- a/src/compiler/identity_concordance.py
++++ b/src/compiler/identity_concordance.py
+@@ -2708,9 +2708,10 @@
+                 ))
+         if (function.metadata.get("object_context") is not None
+                 or function.metadata.get("native_object_context") is not None):
+-            from .ssa_object_context import validate_context_function
++            from .ssa_object_context import validate_context_function, validate_native_object_requirements
+             try:
+                 validate_context_function(module, name)
++                validate_native_object_requirements(module, name)
+             except (KeyError, ValueError, TypeError) as error:
+                 found.append(Finding("object-context-contract", name, None, str(error)))
+         from .ssa_heap_allocation import validate_heap_context_projection
+@@ -2761,6 +2762,7 @@
+                             f"{block_name}#{index}: membership operands disagree with exact parameter descriptor"))
+                 if (attributes.get("source_object_constructor") is not None
+                         or attributes.get("source_object_operation") is not None
++                        or attributes.get("source_object_type_test") is not None
+                         or attributes.get("native_collection_row") is not None):
+                     from .ssa_object_context import validate_source_object_instruction
+                     try:
+diff --git a/tools/compiler_probes/probe_native_metadata_copy.py b/tools/compiler_probes/probe_native_metadata_copy.py
+--- a/tools/compiler_probes/probe_native_metadata_copy.py
++++ b/tools/compiler_probes/probe_native_metadata_copy.py
+@@ -46,10 +46,12 @@
+                 status_address_id=mint(), column_dtypes=dtypes, key_columns=keys,
+                 capacity_policy=SSASequenceCapacityPolicy.DYNAMIC, heap_owner_value_id=owner)
+         context_options['native_object_context'] = SSAObjectContext('compiler.metadata.context',
+-            table(('opaque_ref', 'int64'), (0,)),
++            table(('opaque_ref', 'int64', 'int64'), (0,)),
+             table(('opaque_ref', 'opaque_ref', 'opaque_ref'), (0, 1)), mint(),
+             ('builtins.dict', 'builtins.list', 'builtins.tuple', 'builtins.set',
+-             'builtins.frozenset', 'builtins.object'))
++             'builtins.frozenset', 'builtins.object'),
++            type_vocabulary=('builtins.dict', 'builtins.list', 'builtins.tuple',
++                'builtins.set', 'builtins.frozenset', 'builtins.object'))
+ 
+     # Native id(value) is the admitted stable integer handle. Its memo uses
+     # the incumbent integer-key/opaque-value table ABI, not reference-equality
+diff --git a/tests/test_native_object_contract_batch.py b/tests/test_native_object_contract_batch.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_native_object_contract_batch.py
+@@ -0,0 +1,205 @@
++"""Shared storage, type evidence, and payload views use one admitted context."""
++from dataclasses import replace
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from tests.test_source_object_context import context
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++from src.compiler.identity_concordance import concordance_report
++from src.compiler.monotonic_ids import GLOBAL_MONOTONIC_IDS
++from src.compiler.shell_external_references import ExternalReferenceValueCodec
++from src.compiler.ssa_object_context import lower_object_context
++from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution
++
++
++def typed_context():
++    scope = context()
++    objects = replace(scope.objects,
++        column_value_ids=(*scope.objects.column_value_ids, GLOBAL_MONOTONIC_IDS.mint()),
++        column_dtypes=('opaque_ref', 'int64', 'int64'), column_shapes=((), (), ()))
++    return replace(scope, objects=objects,
++        type_vocabulary=(*scope.kind_vocabulary, 'builtins.bool', 'builtins.int',
++                         'builtins.float', 'builtins.str', 'builtins.bytes', 'builtins.NoneType'))
++
++
++def policy(memo=False):
++    repository = Path(__file__).resolve().parents[1]
++    values = [{'function': 'root', 'parameter': 'value', 'storage': 'reference', 'python_type': 'builtins.object'}]
++    if memo:
++        values.append({'function': 'root', 'parameter': 'memo', 'storage': 'keyed',
++            'dtype': 'opaque_ref', 'mutable': True, 'key_encoding': 'integer_identity', 'python_type': 'builtins.dict'})
++    return ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_program_abi({
++        'records': {}, 'bindings': [], 'values': values,
++    }).with_execution_file(repository / 'extraction_contracts/vehicle_full_native_execution.yaml')
++
++
++def compile_source(source, scope, tmp_path, *, memo=False):
++    module, _, exports = lower_ast_source_to_ssa(source, 'root', extraction_contract=policy(memo),
++        native_object_context=scope, progress=lambda _: None, progress_bars=False)
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    function = module.functions[exports[0]]
++    artifact = emit_ssa_function_to_llvm(module, function.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'source')
++    release_module = lower_object_context(scope, prefix='release_contract_batch')
++    release = compile_artifact(emit_ssa_function_to_llvm(release_module, 'release_contract_batch_release'), directory=tmp_path / 'release')
++    output = next(i.args[0] for b in function.blocks.values() for i in b.instrs if i.op == 'Ret' and i.args)
++    return module, function, native, release, output
++
++
++class TupleLeaf(tuple):
++    pass
++
++
++def test_type_tuple_admission_requires_the_existing_static_type_receipt():
++    import networkx as nx
++    from src.compiler.ssa_object_context import source_object_type_tests
++    graph = nx.DiGraph()
++    graph.add_node(1, type='Input', value_id=1)
++    attributes = {'extraction_identity': 'builtins.isinstance',
++                  'static_call_values': {'arg:1': (int, tuple)}}
++    graph.add_node(2, type='Call', value_id=2, parents=((1, 'arg:0'),), attributes=attributes)
++    tests = source_object_type_tests(graph, {1}, typed_context())
++    assert tests[2]['accepted_types'] == ('builtins.int', 'builtins.tuple')
++    # Whole-source tuple targets currently lose this static receipt upstream.
++    # An empty aggregate or absent type receipt is NOT an accepted type union.
++    attributes['static_call_values']['arg:1'] = ()
++    assert source_object_type_tests(graph, {1}, typed_context()) == {}
++    attributes.pop('static_call_values')
++    assert source_object_type_tests(graph, {1}, typed_context()) == {}
++
++
++@pytest.mark.parametrize('target', ['dict', 'list', 'tuple', 'set', 'frozenset', 'int', 'bool', 'object'])
++def test_native_builtin_guards_read_type_evidence_not_storage_kind(tmp_path, target):
++    scope = typed_context()
++    source = (f'def classify(item):\n    if isinstance(item,{target}):\n'
++              '        result=1.0\n    else:\n        result=0.0\n    return result\n'
++              'def root(value):\n    return classify(value)\n')
++    module, function, native, release, output = compile_source(source, scope, tmp_path)
++    assert any(f.metadata.get('native_object_type_tests') for f in module.functions.values())
++    assert not function.metadata['native_object_requires_member_storage']
++    accepted = eval(target, {'int': int, 'bool': bool, 'tuple': tuple, 'dict': dict,
++                             'list': list, 'set': set, 'frozenset': frozenset})
++    for original in ({}, [], (), set(), frozenset(), 42, True, 1.25, 'text', b'bytes', None, object(), TupleLeaf((1,))):
++        boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++        try:
++            parameter = dict(function.metadata['parameter_names'])['value']
++            invocation = boundary.bind_execution(native, function, {parameter: np.array([boundary.roots[0]], dtype=np.int64)})
++            invocation.run()
++            assert invocation.native_invocations == 1
++            assert invocation.buffers[output.id].item() == float(isinstance(original, accepted))
++            result, = boundary.export()
++            assert result is original
++        finally:
++            prepare_artifact_execution(release, boundary.buffers).run()
++            boundary.close()
++
++
++def test_new_native_birth_publishes_the_same_type_evidence(tmp_path):
++    scope = typed_context()
++    source = ('def classify(item):\n    if isinstance(item,list):\n'
++              '        result=1.0\n    else:\n        result=0.0\n    return result\n'
++              'def root(value):\n    created=[]\n    return classify(created)\n')
++    _, function, native, release, output = compile_source(source, scope, tmp_path)
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, ())
++    try:
++        feeds = {v.id: np.zeros(1, dtype=np.int64) for v in function.args if v.id not in boundary.buffers}
++        invocation = boundary.bind_execution(native, function, feeds)
++        invocation.run()
++        assert invocation.buffers[output.id].item() == 1.0
++        rows = boundary._rows(scope.objects)
++        assert len(rows) == 1
++        assert rows[0][2] == ((1 << scope.type_vocabulary.index('builtins.list')) |
++                              (1 << scope.type_vocabulary.index('builtins.object')))
++    finally:
++        prepare_artifact_execution(release, boundary.buffers).run()
++        boundary.close()
++
++
++def test_payload_requirement_follows_native_call_graph_and_refuses_opaque_subclass(tmp_path):
++    scope = typed_context()
++    source = 'def copy(item):\n    return list(item)\ndef root(value):\n    return copy(value)\n'
++    _, function, native, release, _ = compile_source(source, scope, tmp_path)
++    assert function.metadata['native_object_requires_member_storage']
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (TupleLeaf((1,)),))
++    try:
++        parameter = dict(function.metadata['parameter_names'])['value']
++        with pytest.raises(ValueError, match='type evidence is not payload storage'):
++            boundary.bind_execution(native, function, {parameter: np.array([boundary.roots[0]], dtype=np.int64)})
++    finally:
++        prepare_artifact_execution(release, boundary.buffers).run()
++        boundary.close()
++
++
++@pytest.mark.parametrize('guard', ['isinstance(item,tuple)', 'len(item)>0'])
++def test_recursive_mutation_capture_binds_all_incumbent_memo_columns(tmp_path, guard):
++    scope = typed_context()
++    source = (f'def root(value,memo):\n    def visit(item):\n        if {guard}:\n'
++              '            result=[]\n            memo[id(item)]=result\n'
++              '            return tuple(visit(child) for child in item)\n'
++              '        return item\n    return visit(value)\n')
++    module, function, native, release, output = compile_source(source, scope, tmp_path, memo=True)
++    descriptor = next(d for d in module.sequence_tables[function.name].sequences.values()
++                      if d.column_dtypes == ('int64', 'opaque_ref'))
++    assert {*descriptor.column_value_ids, descriptor.length_address_id,
++            descriptor.capacity_value_id, descriptor.status_address_id,
++            descriptor.live_flags_value_id} <= set(native.buffer_order)
++    for depth in (0, 1, 7, 32):
++        original = ()
++        for _ in range(depth):
++            original = (original,)
++        boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++        feeds = {descriptor.column_value_ids[0]: np.zeros(64, dtype=np.int64),
++                 descriptor.column_value_ids[1]: np.zeros(64, dtype=np.int64),
++                 descriptor.length_address_id: np.zeros(1, dtype=np.int64),
++                 descriptor.capacity_value_id: np.array([64], dtype=np.int64),
++                 descriptor.status_address_id: np.zeros(1, dtype=np.int32),
++                 descriptor.live_flags_value_id: np.zeros(64, dtype=np.bool_)}
++        parameter = dict(function.metadata['parameter_names'])['value']
++        feeds[parameter] = np.array([boundary.roots[0]], dtype=np.int64)
++        expected = {handle for handle in boundary.retained
++                    if guard.startswith('isinstance') or boundary.codec.object(handle)}
++        try:
++            invocation = boundary.bind_execution(native, function, feeds)
++            invocation.run()
++            assert invocation.native_invocations == 1
++            result, = boundary.export((int(invocation.buffers[output.id].item()),))
++            for _ in range(depth):
++                assert type(result) is tuple and len(result) == 1
++                result, = result
++            assert result == ()
++            count = depth + int(guard.startswith('isinstance'))
++            assert feeds[descriptor.length_address_id][0] == count
++            assert set(feeds[descriptor.column_value_ids[0]][:count]) == expected
++            assert all(type(item) is list and item == [] for item in
++                       boundary.export(feeds[descriptor.column_value_ids[1]][:count]))
++        finally:
++            prepare_artifact_execution(release, boundary.buffers).run()
++            boundary.close()
++
++
++@pytest.mark.parametrize('fault', ['mask', 'reference', 'column', 'requirements'])
++def test_type_and_payload_receipts_refuse_stale_contracts(tmp_path, fault):
++    scope = typed_context()
++    source = ('def root(value):\n    if isinstance(value,tuple):\n'
++              '        result=1.0\n    else:\n        result=0.0\n    return result\n')
++    module, function, _, _, _ = compile_source(source, scope, tmp_path)
++    test = next(i for b in function.blocks.values() for i in b.instrs
++                if i.attributes.get('source_object_type_test'))
++    if fault == 'mask':
++        test.attributes['source_object_type_test']['mask'] ^= 1
++    elif fault == 'reference':
++        test.attributes['source_object_type_test']['reference_value_id'] = -1
++    elif fault == 'column':
++        function.metadata['native_object_context'] = {**function.metadata['native_object_context'],
++                                                     'type_evidence_column': 1}
++    else:
++        function.metadata['native_object_requires_member_storage'] = True
++    assert ('payload requirements disagree' if fault == 'requirements'
++            else 'source-object-contract') in concordance_report(module)
++    with pytest.raises(ValueError):
++        emit_ssa_function_to_llvm(module, function.name)

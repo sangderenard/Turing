@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
 from src.compiler.control_source import (
     ControlDeploymentLane,
@@ -56,6 +58,18 @@ from src.compiler.shell_reference_tables import (
     ClassNavigationTable,
 )
 from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
+
+
+@pytest.fixture(autouse=True)
+def _isolated_control_fixture_book():
+    # Independent synthetic programs reuse planned_control and graph IDs.
+    # They are not revisions of one compile: each needs its own book, while
+    # repeated lowerings inside a test still share and test concordance.
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
 from src.transmogrifier.function_table import ParameterContract
 
 
@@ -94,18 +108,21 @@ def test_field_receiver_uses_typed_columns_only_for_heterogeneous_slots():
         field_dtypes={0: "bool", 1: "int64"},
     )
 
-    assert locations == {0: (10, 0, "bool"), 1: (11, 0, "int64")}
+    from src.compiler.id_space import MINTED, has_flag
+    integer_column = locations[1][0]
+    assert has_flag(integer_column, MINTED)
+    assert locations == {0: (10, 0, "bool"), 1: (integer_column, 0, "int64")}
     assert [(value.id, value.dtype, value.shape) for value in lowered.args] == [
-        (10, "bool", (1,)), (11, "int64", (1,)), (7, "int64", ()),
+        (10, "bool", (1,)), (integer_column, "int64", (1,)), (7, "int64", ()),
     ]
     assert lowered.metadata["receiver_field_locations"] == (
-        (0, 10, 0, "bool"), (1, 11, 0, "int64"),
+        (0, 10, 0, "bool"), (1, integer_column, 0, "int64"),
     )
     geps = [
         instruction for instruction in lowered.blocks["entry"].instrs
         if instruction.op == "GetElementPtr"
     ]
-    assert [instruction.args[0].id for instruction in geps] == [10, 11]
+    assert [instruction.args[0].id for instruction in geps] == [10, integer_column]
 
 
 def test_field_write_versions_result_colliding_with_receiver_storage():
@@ -463,11 +480,12 @@ def test_native_fortran_ops_keep_mean_and_span_fill_in_ssa():
     instructions = function.blocks["entry"].instrs
     assert [instruction.op for instruction in instructions] == [
         "Call",
-        "Fill",
+        "Call",
         "Call",
         "Ret",
     ]
     assert instructions[0].attributes["tensor_operation"] == "mean"
+    assert instructions[1].attributes['tensor_operation'] == 'zeros_like'
 
 
 def test_class_navigation_has_general_ssa_semantic_procedures():
@@ -769,8 +787,9 @@ def test_record_field_getattr_becomes_a_loaded_region_capture():
         "output_value_ids": (8,),
     }
     assert [instruction.op for instruction in region_function.blocks["entry"].instrs] == [
-        "Add"
+        "Add", "Ret"
     ]
+    assert [v.id for v in region_function.blocks['entry'].instrs[-1].args] == [8]
     control_operations = [
         instruction.op
         for block in module.functions["planned_control"].blocks.values()
@@ -1443,7 +1462,9 @@ def test_in_place_store_chain_output_publishes_its_root_arena():
         if instruction.op == "Ret"
     )
     assert [value.id for value in ret.args] == [13, 14]
-    assert control_function.metadata["value_aliases"] == {12: 11, 13: 12}
+    # Canonical aliases now point directly to the storage root, not through
+    # incidental versions. Both authored store generations remain published.
+    assert control_function.metadata["value_aliases"] == {12: 11, 13: 11}
 def test_in_place_store_chain_on_a_parameter_publishes_nothing():
     """A store chain whose root is a CAPTURE is visible through that capture.
 
@@ -2290,7 +2311,9 @@ def test_nested_iterable_row_is_handle_stride_and_child_address():
         for instruction in block.instrs
         if instruction.attributes.get("binding") == "nested_row_base"
     )
-    assert call.args == [row_address]
+    # Call operands are derived typed/accounted views of the same identity.
+    assert [(v.id, v.dtype, v.shape) for v in call.args] == [(row_address.id, row_address.dtype, row_address.shape)]
+    assert call.args[0].accounting['ssa_storage_alias'] == row_address.id
 
 
 def test_explicit_iterable_binding_precedes_duplicate_closure_fallback():
@@ -2568,7 +2591,8 @@ def test_nested_loop_inner_result_port_rebinds_to_enclosing_exit():
         if instruction.attributes.get("region_index") == 4
     )
     assert outer_result.id == 40
-    assert post_loop_call.args == [outer_result]
+    assert [(v.id, v.dtype, v.shape) for v in post_loop_call.args] == [(outer_result.id, outer_result.dtype, outer_result.shape)]
+    assert post_loop_call.args[0].accounting['ssa_storage_alias'] == outer_result.id
     assert function.metadata["carried_port_values"][30] is outer_result
 
 
@@ -3501,7 +3525,34 @@ def test_scalar_field_write_effect_versions_feed_conditional_merge():
     assert check_definition_dominance(IRModule({function.name: function})) == []
 
 
-def test_inplace_scalar_field_effect_uses_resident_incumbent_on_false_arm():
+@pytest.fixture
+def scalar_field_version_fixture():
+    """Exact field-state revisions, rather than ambiguous reused effect IDs."""
+    from src.compiler.concordance_declarations import (
+        CANONICAL_VALUE, INGESTION, INGEST_SOURCE, READ_SCOPE_FORK,
+        REDUCER_FIELD_STATE, FieldState, FieldStateKind,
+    )
+    from src.compiler.identity_concordance import Derived, Mode, Novel
+    book, token = begin_identity_book()
+    try:
+        scope = book.mint_scope('scalar_field_fixture', READ_SCOPE_FORK)
+        nodes = {value_id: book.post(CANONICAL_VALUE, (scope, value_id), (),
+                    stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD)
+                 for value_id in (12, 30, 40, 42, 50)}
+        def state(kind, value, effect):
+            return book.post(REDUCER_FIELD_STATE, (scope, 1, 'field'),
+                FieldState(kind, nodes[value], nodes[effect]), stage=INGESTION,
+                provenance=Derived((nodes[value], nodes[effect])), mode=Mode.REVISE)
+        observed = state(FieldStateKind.OBSERVED, 30, 30)
+        written = state(FieldStateKind.WRITTEN, 12, 40)
+        merged = state(FieldStateKind.MERGED, 42, 50)
+        yield scope, observed, written, merged
+    finally:
+        end_identity_book(token)
+
+
+def test_inplace_scalar_field_effect_uses_resident_incumbent_on_false_arm(scalar_field_version_fixture):
+    scope, observed, written, merged = scalar_field_version_fixture
     control = ControlProgram(ConditionalBlock(
         predicate_value_id=10,
         body=SequenceBlock((ScalarFieldWriteBlock(
@@ -3509,15 +3560,18 @@ def test_inplace_scalar_field_effect_uses_resident_incumbent_on_false_arm():
             value_expression=ControlExpression("value", value_id=12),
             dtype="int64",
             effect_node_id=40,
+            field_state_cell=written,
         ),)),
         orelse=SequenceBlock(()),
         predicate_expression=ControlExpression("value", value_id=10),
         carried_aliases=((40, 40, 40, 42),),
+        carried_field_cells=((written, observed, merged),),
         source_node_id=50,
     ))
 
     function, shortfalls = lower_control_program_to_ssa(
         control,
+        lexical_read_scope=scope,
         region_value_meta={
             10: Meta((), "bool"),
             12: Meta((), "int64"),
@@ -3635,7 +3689,11 @@ def test_conditional_versions_join_when_graph_reuses_arm_identity():
         and instruction.res.accounting.get("ssa_conditional_write_version")
     )
     assert [value.id for value in carried.args] == [40, 30]
-    assert carried.res.id == 100
+    # first_value_id is no longer a private mint namespace. The shared book
+    # mints globally, retaining graph 40 only as the source-version identity.
+    from src.compiler.id_space import MINTED, has_flag
+    assert has_flag(carried.res.id, MINTED)
+    assert carried.res.id not in {10, 11, 12, 30, 40, 41}
     assert carried.res.accounting == {
         "source_value_id": 40,
         "ssa_conditional_write_version": True,

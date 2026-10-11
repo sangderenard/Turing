@@ -1,0 +1,785 @@
+--- a/src/transmogrifier/ssa.py
++++ b/src/transmogrifier/ssa.py
+@@ -1701,6 +1701,61 @@
+ 
+ 
+ @dataclass(frozen=True)
++class SSAObjectContext:
++    """An explicit native object domain over existing sequence storage.
++
++    This is an ABI view, not a second registry or a Python object model.
++    ``objects`` holds (opaque handle, declared kind); ``members`` holds
++    (owner handle, key handle, value handle). Both use one caller-owned heap.
++    Member keys compare by HANDLE IDENTITY, not Python equality/hash semantics.
++    Zero is the invalid handle. The caller initializes next_handle to a positive
++    unused identity; construction advances it only after successful publication.
++    """
++
++    storage_identity: str
++    objects: SSASequenceDescriptor
++    members: SSASequenceDescriptor
++    next_handle_value_id: int
++    kind_vocabulary: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        if not self.storage_identity or not isinstance(self.storage_identity, str):
++            raise ValueError("object context requires an explicit storage identity")
++        if (not self.kind_vocabulary or len(set(self.kind_vocabulary)) != len(self.kind_vocabulary)
++                or any(not isinstance(kind, str) or not kind for kind in self.kind_vocabulary)):
++            raise ValueError("object context requires a unique declared kind vocabulary")
++        expected = ((self.objects, ("opaque_ref", "int64"), (0,)),
++                    (self.members, ("opaque_ref", "opaque_ref", "opaque_ref"), (0, 1)))
++        occupied = set()
++        owner = self.objects.heap_owner_value_id
++        for descriptor, dtypes, keys in expected:
++            if (descriptor.column_dtypes != dtypes or descriptor.key_columns != keys
++                    or any(descriptor.column_shapes) or not descriptor.writable
++                    or descriptor.capacity_policy is not SSASequenceCapacityPolicy.DYNAMIC
++                    or descriptor.heap_owner_value_id is None
++                    or descriptor.heap_owner_value_id != owner
++                    or descriptor.status_address_id is None
++                    or descriptor.live_flags_value_id is not None
++                    or descriptor.child_table_pool is not None):
++                raise ValueError("object context requires typed dynamic tables with one shared owner")
++            ids = {descriptor.sequence_id, *descriptor.column_value_ids,
++                   descriptor.length_address_id, descriptor.capacity_value_id,
++                   descriptor.status_address_id}
++            if occupied & ids:
++                raise ValueError("object context tables must have disjoint storage identities")
++            occupied.update(ids)
++        if owner in occupied or self.next_handle_value_id in occupied | {owner} or self.next_handle_value_id < 0:
++            raise ValueError("object context owner/counter must be distinct storage identities")
++
++    def to_mapping(self) -> Dict[str, Any]:
++        return {"storage_identity": self.storage_identity,
++                "objects": self.objects.to_mapping(), "members": self.members.to_mapping(),
++                "next_handle_value_id": self.next_handle_value_id,
++                "kind_vocabulary": self.kind_vocabulary,
++                "invalid_handle": 0, "member_key_semantics": "reference-identity"}
++
++
++@dataclass(frozen=True)
+ class SSAChildTablePoolDescriptor:
+     """Caller-owned arenas addressed by handles stored in an outer table.
+ 
+--- a/src/compiler/ssa_object_operations.py
++++ b/src/compiler/ssa_object_operations.py
+@@ -56,6 +56,8 @@
+     if not isinstance(storage_identity, str) or not storage_identity:
+         raise ValueError("object helper requires an admitted storage identity")
+     function = module.functions[function_name]
++    from .ssa_object_context import validate_context_function
++    validate_context_function(module, function_name)
+     if function.metadata.get("native_interface"):
+         raise ValueError("object helper declaration currently requires its native SSA body")
+     context = tuple(map(int, context_formal_ids))
+@@ -201,6 +203,11 @@
+             continue
+         visited.add(name)
+         function = module.functions[name]
++        from .ssa_object_context import validate_context_function
++        validate_context_function(module, name)
++        from .ssa_heap_allocation import validate_heap_context_projection
++        for formal in function.args:
++            validate_heap_context_projection(module, name, formal)
+         for block in function.blocks.values():
+             for instruction in block.instrs:
+                 validate_object_call(module, instruction, _helpers=helpers)
+--- a/src/compiler/identity_concordance.py
++++ b/src/compiler/identity_concordance.py
+@@ -2578,10 +2578,10 @@
+         never matches its own lookup.  The entry goes missing rather than
+         failing loudly, which is the worst available outcome.
+         """
+-        integral = {
+-            "int", "int8", "int16", "int32", "int64",
+-            "uint8", "uint16", "uint32", "uint64", "bool",
+-        }
++        # The shared layout table spells opaque_ref as exact i64 storage.
++        # Native identity-keyed tables legitimately compare these handles;
++        # a second spelling inventory incorrectly called them float keys.
++        from ..transmogrifier.dtype_layout import layout_for
+         found: list[Finding] = []
+         for function_name, table in (
+             getattr(module, "sequence_tables", {}) or {}
+@@ -2594,7 +2594,11 @@
+                     if int(column) >= len(dtypes):
+                         continue
+                     dtype = str(dtypes[int(column)])
+-                    if dtype in integral:
++                    try:
++                        integral = layout_for(dtype).kind in {"int", "uint", "bool"}
++                    except KeyError:
++                        integral = False
++                    if integral:
+                         continue
+                     found.append(Finding(
+                         "key-column-not-integral",
+@@ -2702,6 +2706,18 @@
+                     "descriptor-member-shared", name, value_id,
+                     f"roles={roles!r}",
+                 ))
++        if function.metadata.get("object_context") is not None:
++            from .ssa_object_context import validate_context_function
++            try:
++                validate_context_function(module, name)
++            except (KeyError, ValueError, TypeError) as error:
++                found.append(Finding("object-context-contract", name, None, str(error)))
++        from .ssa_heap_allocation import validate_heap_context_projection
++        for formal in function.args:
++            try:
++                validate_heap_context_projection(module, name, formal)
++            except (KeyError, ValueError, TypeError) as error:
++                found.append(Finding("heap-context-projection", name, formal.id, str(error)))
+         # keyed helper operands
+         described = {
+             value_id for (function_name, value_id) in self.sequence_roles
+--- a/src/compiler/ssa_llvm_backend.py
++++ b/src/compiler/ssa_llvm_backend.py
+@@ -2062,6 +2062,12 @@
+                 body.append(
+                     f"  {converted} = fptosi double {loaded} to {wanted}"
+                 )
++                return converted
++            # Native context length counts Cast(Eq(owner, handle), int64).
++            # The old fallthrough returned its i1 register unchanged and then
++            # stored it as i64. Bool's numerical value is 0/1, not signed -1.
++            if wanted in {"i32", "i64"} and source_type == "i1":
++                body.append(f"  {converted} = zext i1 {loaded} to {wanted}")
+                 return converted
+             if wanted == "i64" and source_type == "i32":
+                 body.append(f"  {converted} = sext i32 {loaded} to i64")
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -40454,7 +40454,13 @@
+         if table is None:
+             continue
+         canonical_dtypes = {
+-            int(value_id): str(dtype)
++            # The descriptor's dtype is the ELEMENT contract. Heap columns
++            # themselves are ptr cells. The native context source-link micro
++            # observed this sweep turn the same ptr formal into opaque_ref
++            # (and its kind column into int64), destroying arena indirection.
++            int(value_id): (
++                "ptr" if descriptor.heap_owner_value_id is not None else str(dtype)
++            )
+             for descriptor in table.sequences.values()
+             for value_id, dtype in zip(
+                 descriptor.column_value_ids, descriptor.column_dtypes
+@@ -40473,6 +40479,12 @@
+             dtype = canonical_dtypes.get(int(value.id))
+             if dtype is not None:
+                 value.dtype = dtype
++
++    # Native heap cell/owner contracts cross the SAME exact linked call edge
++    # as its values. Raw ptr alone cannot state pointer-cell storage at the
++    # public buffer ABI; the imported formal is that declaration's authority.
++    from .ssa_heap_allocation import project_native_heap_call_contexts
++    project_native_heap_call_contexts(all_functions)
+ 
+     # Sequence helper calls are physical ABI operations.  Their row argument
+     # often inlines the producer expression, so updating only the Call's
+--- a/src/compiler/ssa_heap_allocation.py
++++ b/src/compiler/ssa_heap_allocation.py
+@@ -14,6 +14,109 @@
+ 
+ HEAP_RELEASE_SYMBOL = "turing_heap_release"
+ HEAP_COPY_SYMBOL = "llvm.memmove.p0.p0.i64"
++
++
++def project_native_heap_call_contexts(functions) -> None:
++    """Publish pointer-cell contracts through exact source-linked call edges.
++
++    The source context micro passed ptr cells through its native constructor,
++    but the caller kept only raw ``ptr`` (historically a typed address). Its
++    public ABI therefore said double and marshalling copied arena addresses
++    away. The native formal already declares the cell and owner: transport
++    that contract by callee_input_ids, never infer it from a pointer spelling.
++    """
++    from collections import deque
++    seeds = [name for name, function in functions.items() if any(
++        (value.accounting or {}).get('heap_owner')
++        or (value.accounting or {}).get('heap_owner_value_id') is not None for value in function.args)]
++    if not seeds:
++        return  # Ordinary compiler modules do not pay another instruction scan.
++    incoming = {}
++    inventories = {}
++    for function in functions.values():
++        occurrences = {}
++        for value in function.args:
++            occurrences.setdefault(value.id, []).append(value)
++        for block in function.blocks.values():
++            for instruction in block.instrs:
++                for value in (*instruction.args, *((instruction.res,) if instruction.res is not None else ())):
++                    occurrences.setdefault(value.id, []).append(value)
++        inventories[function.name] = occurrences
++        for block in function.blocks.values():
++            for instruction in block.instrs:
++                if instruction.op != 'Call' or not instruction.attributes.get('source_linked'):
++                    continue
++                callee = functions.get(instruction.attributes.get('callee'))
++                if callee is None:
++                    continue
++                incoming.setdefault(callee.name, []).append((function, instruction))
++    # A monotonic reverse-call worklist transports the same context through
++    # forwarding layers and recursive SCCs without depending on function order.
++    pending = deque(seeds)
++    queued = set(pending)
++    while pending:
++        callee = functions[pending.popleft()]
++        queued.remove(callee.name)
++        for function, instruction in incoming.get(callee.name, ()):
++            ids = tuple(instruction.attributes.get('callee_input_ids', ()))
++            if ids != tuple(value.id for value in callee.args) or len(ids) != len(instruction.args):
++                raise ValueError('native heap context projection requires exact live callee input identities')
++            bindings = dict(zip(ids, instruction.args))
++            changed = False
++            for formal in callee.args:
++                accounting = formal.accounting or {}
++                owner_id = accounting.get('heap_owner_value_id')
++                if not accounting.get('heap_owner') and owner_id is None:
++                    continue
++                actual = bindings[formal.id]
++                if actual.dtype != 'ptr':
++                    raise ValueError('native heap context requires a pointer-cell input, not an opaque handle')
++                if owner_id is not None and int(owner_id) not in bindings:
++                    raise ValueError('native heap context is missing its exact owner binding')
++                published = {'heap_owner': True} if accounting.get('heap_owner') else {
++                    'heap_element_dtype': accounting['heap_element_dtype'],
++                    'heap_owner_value_id': int(bindings[int(owner_id)].id),
++                }
++                for occurrence in inventories[function.name][actual.id]:
++                    current = dict(occurrence.accounting or {})
++                    for key, value in published.items():
++                        if key in current and current[key] != value:
++                            raise ValueError('native heap context projection conflicts with incumbent ownership')
++                    if all(current.get(key) == value for key, value in published.items()):
++                        continue
++                    occurrence.accounting = {**current, **published,
++                        'native_heap_context_from': (callee.name, formal.id,
++                            tuple((key, bindings[key].id) for key in ids))}
++                    changed = True
++            if changed and function.name not in queued:
++                pending.append(function.name)
++                queued.add(function.name)
++
++
++def validate_heap_context_projection(module, function_name, value) -> None:
++    receipt = (value.accounting or {}).get('native_heap_context_from')
++    if receipt is None:
++        return
++    callee_name, formal_id, pairs = receipt
++    callee = module.functions[callee_name]
++    formals = {formal.id: formal for formal in callee.args}
++    bindings = dict(pairs)
++    formal = formals[formal_id]
++    accounting = formal.accounting or {}
++    if bindings.get(formal_id) != value.id or value.dtype != 'ptr':
++        raise ValueError('native heap context projection has a stale storage identity')
++    keys = {'heap_owner': True} if accounting.get('heap_owner') else {
++        'heap_element_dtype': accounting['heap_element_dtype'],
++        'heap_owner_value_id': bindings[accounting['heap_owner_value_id']],
++    }
++    if any((value.accounting or {}).get(key) != expected for key, expected in keys.items()):
++        raise ValueError('native heap context projection disagrees with its live owner/layout')
++    if not any(instruction.op == 'Call' and instruction.attributes.get('source_linked')
++        and instruction.attributes.get('callee') == callee_name
++        and tuple(zip(instruction.attributes.get('callee_input_ids', ()),
++                      (argument.id for argument in instruction.args))) == pairs
++        for block in module.functions[function_name].blocks.values() for instruction in block.instrs):
++        raise ValueError('native heap context projection has no matching live call edge')
+ 
+ 
+ def require_heap_owner(owner: SSAValue) -> None:
+--- a/src/compiler/ir_sequence_tables.py
++++ b/src/compiler/ir_sequence_tables.py
+@@ -277,11 +277,16 @@
+ def _storage_values(
+     descriptor: SSASequenceDescriptor,
+ ) -> tuple[SSAValue, ...]:
++    from ..transmogrifier.dtype_layout import layout_for
+     values = [
+         *(SSAValue(
+             value_id, dtype="ptr" if descriptor.heap_owner_value_id is not None else dtype,
+             accounting={"sequence_row_shape": tuple(shape), **({
+-                "heap_element_dtype": dtype,
++                # Alloca publishes the shared layout's canonical name. Source
++                # linking copies formal accounting by exact identity; an
++                # opaque_ref spelling here otherwise displaces that allocator
++                # contract's int64 layout despite being the same physical type.
++                "heap_element_dtype": layout_for(dtype).name,
+                 "heap_owner_value_id": int(descriptor.heap_owner_value_id),
+             } if descriptor.heap_owner_value_id is not None else {})},
+         ) for value_id, dtype, shape in zip(
+--- /dev/null
++++ b/src/compiler/ssa_object_context.py
+@@ -0,0 +1,277 @@
++"""Executable native object context using the incumbent sequence/table ABI.
++
++No Python object registry, callback, handle-to-address cast or new opcode.
++These are SSA ABI helpers, NOT automatic lowering of arbitrary Python objects.
++The context's exact sequence tables remain the storage authority. Zero handles
++are explicit failure/absence. All allocation lives until context release.
++"""
++from __future__ import annotations
++
++from ..transmogrifier.ssa import Function, IRModule, SSAObjectContext, SSASequenceTable, SSAValue
++from .ir_sequence_tables import (
++    _Builder, _storage_values, lower_sequence_allocate, lower_sequence_insert,
++    lower_table_lookup, lower_table_store,
++)
++from .ssa_heap_allocation import heap_release
++from .ssa_object_operations import ObjectOperation, declare_object_helper
++
++
++def context_values(context: SSAObjectContext) -> tuple[SSAValue, ...]:
++    """One exact native ABI; duplicate owner references share one cell."""
++    values = {}
++    for descriptor in (context.objects, context.members):
++        for value in _storage_values(descriptor):
++            values[value.id] = value
++        status = SSAValue(descriptor.status_address_id, 'int', shape=(1,))
++        values[status.id] = status
++    owner = SSAValue(context.objects.heap_owner_value_id, 'ptr', shape=(1,),
++                     accounting={'heap_owner': True})
++    counter = SSAValue(context.next_handle_value_id, 'int64', shape=(1,))
++    values[owner.id], values[counter.id] = owner, counter
++    return tuple(values.values())
++
++
++def validate_context_function(module, function_name: str) -> None:
++    """A context receipt must still agree with its actual tables and ABI."""
++    function = module.functions[function_name]
++    receipt = function.metadata.get('object_context')
++    if receipt is None:
++        return
++    table = module.sequence_tables.get(function_name)
++    if table is None:
++        raise ValueError('object context has no live sequence table')
++    objects = table.by_id(int(receipt['objects']['sequence_id']))
++    members = table.by_id(int(receipt['members']['sequence_id']))
++    if objects is None or members is None:
++        raise ValueError('object context has a missing storage descriptor')
++    context = SSAObjectContext(receipt['storage_identity'], objects, members,
++        receipt['next_handle_value_id'], tuple(receipt['kind_vocabulary']))
++    if context.to_mapping() != receipt:
++        raise ValueError('object context disagrees with its live storage descriptors')
++    formals = {value.id: value for value in function.args}
++    for value in context_values(context):
++        actual = formals.get(value.id)
++        if actual is None or (actual.dtype, actual.shape) != (value.dtype, value.shape):
++            raise ValueError(f'object context has incompatible storage formal {value.id}')
++        for key in ('heap_owner', 'heap_owner_value_id', 'heap_element_dtype'):
++            if (actual.accounting or {}).get(key) != (value.accounting or {}).get(key):
++                raise ValueError(f'object context has incompatible ownership formal {value.id}')
++
++
++def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_object') -> IRModule:
++    """Create initialize/construct/kind/get/set/length/release native helpers.
++
++    Initialization requires zero pointer cells/counters and a null owner supplied
++    by the caller; it is not a reset of a live context. Tables begin empty at their
++    declared capacities. Contexts are invocation-owned, not safe for concurrent
++    mutation; distinct contexts may execute concurrently. Allocation failures
++    use the existing allocator's fail-fast policy. Construct returns zero for
++    invalid kinds, exhausted handles, collision or invalid storage extents.
++    """
++    values = context_values(context)
++    by_id = {value.id: value for value in values}
++    module = IRModule(functions={})
++
++    def add(lowering):
++        if not lowering.complete:
++            raise ValueError(f'object context storage lowering refused: {lowering.shortfalls}')
++        for function in lowering.functions:
++            if function.name in module.functions:
++                raise ValueError(f'duplicate object context helper {function.name}')
++            module.functions[function.name] = function
++        return lowering.functions[0]
++
++    allocate = [add(lower_sequence_allocate(descriptor,
++        function_name=f'{prefix}_{label}_allocate'))
++        for label, descriptor in (('objects', context.objects), ('members', context.members))]
++    insert = add(lower_sequence_insert(context.objects, function_name=f'{prefix}_object_insert'))
++    kind_lookup = add(lower_table_lookup(context.objects, function_name=f'{prefix}_kind_lookup'))
++    member_lookup = add(lower_table_lookup(context.members, function_name=f'{prefix}_member_lookup'))
++    store = add(lower_table_store(context.members, function_name=f'{prefix}_member_store'))
++
++    def call(builder, block, callee, extra, result=None):
++        bindings = {**by_id, **extra}
++        builder.emit(block, 'Call', [bindings[value.id] for value in callee.args], result,
++            attributes={'callee': callee.name,
++                        'callee_input_ids': tuple(value.id for value in callee.args)})
++
++    def arguments(callee, descriptor):
++        storage = {value.id for value in _storage_values(descriptor)}
++        storage.update((descriptor.status_address_id, descriptor.heap_owner_value_id))
++        return [value for value in callee.args if value.id not in storage]
++
++    def load_cell(builder, block, value):
++        zero = builder.const(block, 0, dtype='int64')
++        address, loaded = builder.fresh('ptr'), builder.fresh(value.dtype)
++        builder.emit(block, 'GetElementPtr', [value, zero], address)
++        builder.emit(block, 'Load', [address], loaded)
++        return address, loaded
++
++    def finish(label, builder, operands=(), reference=None, operation=None):
++        name = f'{prefix}_{label}'
++        # Exact IDs, not reconstructed signature positions, name the ABI.
++        # Each function owns its SSA occurrences. Sharing mutable SSAValue
++        # objects between functions lets one frame's accounting overwrite the
++        # other's history even though their immutable context view agrees.
++        local_values = context_values(context)
++        local_by_id = {value.id: value for value in local_values}
++        for block in builder.blocks.values():
++            for instruction in block.instrs:
++                instruction.args = [local_by_id.get(value.id, value) for value in instruction.args]
++        function = Function(name, [*local_values, *operands], builder.blocks,
++            metadata={'object_context': context.to_mapping(),
++                      'parameter_names': tuple((f'cell_{value.id}', value.id)
++                                               for value in (*values, *operands)),
++                      'sequence_array_argument_ids': tuple(value.id for value in values
++                          if value.dtype == 'ptr' or value.shape)})
++        module.functions[name] = function
++        table = SSASequenceTable(owner=name)
++        table.register(context.objects)
++        table.register(context.members)
++        module.sequence_tables[name] = table
++        returned = [instruction.args[0] for block in function.blocks.values()
++                    for instruction in block.instrs if instruction.op == 'Ret' and instruction.args]
++        if returned:
++            function.metadata['return_value'] = returned[0]
++            function.metadata['named_outputs'] = (('result', returned[0].id),)
++        if operation is not None:
++            declare_object_helper(module, name, operation, storage_identity=context.storage_identity,
++                reference_formal_id=None if reference is None else reference.id,
++                context_formal_ids=tuple(value.id for value in values),
++                operand_formal_ids=tuple(value.id for value in operands if value is not reference),
++                kind_vocabulary=context.kind_vocabulary if operation is ObjectOperation.KIND else ())
++        validate_context_function(module, name)
++        return function
++
++    builder = _Builder(0)
++    entry = builder.block('entry')
++    for helper in allocate:
++        call(builder, entry, helper, {})
++    counter_slot, _ = load_cell(builder, entry, by_id[context.next_handle_value_id])
++    builder.emit(entry, 'Store', [builder.const(entry, 1, dtype='int64'), counter_slot])
++    builder.emit(entry, 'Ret', [])
++    finish('initialize', builder)
++
++    builder = _Builder(0)
++    kind = builder.fresh('int64')
++    entry, insert_block = builder.block('entry'), builder.block('insert')
++    publish, reject, complete = builder.block('publish'), builder.block('reject'), builder.block('complete')
++    counter_slot, candidate = load_cell(builder, entry, by_id[context.next_handle_value_id])
++    zero, one = builder.const(entry, 0, dtype='int64'), builder.const(entry, 1, dtype='int64')
++    valid = []
++    for op, left, right in (
++        ('Gt', candidate, zero),
++        ('Lt', candidate, builder.const(entry, 2**63 - 1, dtype='int64')),
++        ('Ge', kind, one),
++        ('Le', kind, builder.const(entry, len(context.kind_vocabulary), dtype='int64'))):
++        result = builder.fresh('bool')
++        builder.emit(entry, op, [left, right], result)
++        valid.append(result)
++    accepted = valid[0]
++    for condition in valid[1:]:
++        result = builder.fresh('bool')
++        builder.emit(entry, 'LAnd', [accepted, condition], result)
++        accepted = result
++    builder.cond(entry, accepted, insert_block, reject)
++    handle = builder.fresh('opaque_ref')
++    builder.emit(insert_block, 'Cast', [candidate], handle,
++        attributes={'binding': 'object_context_mint', 'storage_identity': context.storage_identity})
++    row_ids = insert.metadata['sequence_row_argument_ids']
++    status = builder.fresh('int')
++    call(builder, insert_block, insert, {row_ids[0]: handle, row_ids[1]: kind}, status)
++    success = builder.fresh('bool')
++    builder.emit(insert_block, 'Eq', [status, builder.const(insert_block, 1)], success)
++    builder.cond(insert_block, success, publish, reject)
++    next_handle = builder.fresh('int64')
++    builder.emit(publish, 'Add', [candidate, one], next_handle)
++    builder.emit(publish, 'Store', [next_handle, counter_slot])
++    builder.branch(publish, complete)
++    failed = builder.const(reject, 0, dtype='opaque_ref')
++    builder.branch(reject, complete)
++    result = builder.fresh('opaque_ref')
++    builder.emit(complete, 'Phi', [handle, failed], result,
++        attributes={'incoming_blocks': (publish.name, reject.name)})
++    builder.emit(complete, 'Ret', [result])
++    finish('construct', builder, (kind,), operation=ObjectOperation.CONSTRUCT)
++
++    for label, helper, operation in (('kind', kind_lookup, ObjectOperation.KIND),
++                                     ('get', member_lookup, ObjectOperation.GET)):
++        builder = _Builder(0)
++        entry = builder.block('entry')
++        operands = tuple(builder.fresh(value.dtype) for value in arguments(helper,
++            context.objects if label == 'kind' else context.members))
++        returned = builder.fresh('int64' if label == 'kind' else 'opaque_ref')
++        call(builder, entry, helper, dict(zip((v.id for v in arguments(helper,
++            context.objects if label == 'kind' else context.members)), operands)), returned)
++        builder.emit(entry, 'Ret', [returned])
++        finish(label, builder, operands, reference=operands[0], operation=operation)
++
++    builder = _Builder(0)
++    entry, write = builder.block('entry'), builder.block('write')
++    reject, complete = builder.block('reject'), builder.block('complete')
++    queries = arguments(store, context.members)
++    operands = tuple(builder.fresh(value.dtype) for value in queries)
++    kind = builder.fresh('int64')
++    kind_query = arguments(kind_lookup, context.objects)[0]
++    call(builder, entry, kind_lookup, {kind_query.id: operands[0]}, kind)
++    live = builder.fresh('bool')
++    builder.emit(entry, 'Gt', [kind, builder.const(entry, 0, dtype='int64')], live)
++    builder.cond(entry, live, write, reject)
++    call(builder, write, store, dict(zip((value.id for value in queries), operands)))
++    _, status = load_cell(builder, write, by_id[context.members.status_address_id])
++    inserted, updated, succeeded = builder.fresh('bool'), builder.fresh('bool'), builder.fresh('bool')
++    builder.emit(write, 'Eq', [status, builder.const(write, 1)], inserted)
++    builder.emit(write, 'Eq', [status, builder.const(write, 3)], updated)
++    builder.emit(write, 'LOr', [inserted, updated], succeeded)
++    builder.branch(write, complete)
++    failed = builder.const(reject, 0, dtype='bool')
++    builder.branch(reject, complete)
++    result = builder.fresh('bool')
++    builder.emit(complete, 'Phi', [succeeded, failed], result,
++        attributes={'incoming_blocks': (write.name, reject.name)})
++    builder.emit(complete, 'Ret', [result])
++    finish('set', builder, operands, reference=operands[0], operation=ObjectOperation.SET)
++
++    builder = _Builder(0)
++    handle = builder.fresh('opaque_ref')
++    entry, header, body = builder.block('entry'), builder.block('header'), builder.block('body')
++    latch, complete = builder.block('latch'), builder.block('complete')
++    zero, one = builder.const(entry, 0, dtype='int64'), builder.const(entry, 1, dtype='int64')
++    _, length = load_cell(builder, entry, by_id[context.members.length_address_id])
++    builder.branch(entry, header)
++    index, count, next_index, next_count = (builder.fresh('int64') for _ in range(4))
++    for value, update in ((index, next_index), (count, next_count)):
++        builder.emit(header, 'Phi', [zero, update], value,
++            attributes={'incoming_blocks': (entry.name, latch.name)})
++    more = builder.fresh('bool')
++    builder.emit(header, 'Lt', [index, length], more)
++    builder.cond(header, more, body, complete)
++    address, row_owner, matches, increment = (builder.fresh(dtype)
++        for dtype in ('ptr', 'opaque_ref', 'bool', 'int64'))
++    builder.emit(body, 'GetElementPtr', [by_id[context.members.column_value_ids[0]], index], address)
++    builder.emit(body, 'Load', [address], row_owner)
++    builder.emit(body, 'Eq', [row_owner, handle], matches)
++    builder.emit(body, 'Cast', [matches], increment)
++    builder.emit(body, 'Add', [count, increment], next_count)
++    builder.branch(body, latch)
++    builder.emit(latch, 'Add', [index, one], next_index)
++    builder.branch(latch, header)
++    builder.emit(complete, 'Ret', [count])
++    finish('length', builder, (handle,), reference=handle, operation=ObjectOperation.LENGTH)
++
++    builder = _Builder(0)
++    entry = builder.block('entry')
++    entry.instrs.append(heap_release(by_id[context.objects.heap_owner_value_id]))
++    # Release invalidates addresses and counters together, never leaves a stale
++    # descriptor pointing at freed payload. Reinitialize to start a new domain.
++    for value in values:
++        if (value.accounting or {}).get('heap_owner_value_id') is not None:
++            # This is the pointer CELL itself, not element zero of its now
++            # freed payload. GEP would follow the arena and write freed bytes.
++            slot = value
++        else:
++            slot, _ = load_cell(builder, entry, value)
++        builder.emit(entry, 'Store', [builder.const(entry, 0, dtype=value.dtype), slot])
++    builder.emit(entry, 'Ret', [])
++    finish('release', builder)
++    return module
+--- /dev/null
++++ b/tests/test_ssa_object_context.py
+@@ -0,0 +1,188 @@
++"""Native context ABI tests, distinct from automatic Python-container lowering."""
++from dataclasses import replace
++
++import numpy as np
++import pytest
++
++from src.compiler.identity_concordance import concordance_report
++from src.compiler.monotonic_ids import GLOBAL_MONOTONIC_IDS
++from src.compiler.ssa_object_context import context_values, lower_object_context, validate_context_function
++from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution
++from src.transmogrifier.ssa import SSAObjectContext, SSASequenceDescriptor, SSASequenceCapacityPolicy
++
++
++def context():
++    mint = GLOBAL_MONOTONIC_IDS.mint
++    owner = mint()
++    def table(dtypes, keys):
++        columns = tuple(mint() for _ in dtypes)
++        return SSASequenceDescriptor(columns[0], columns, mint(), mint(),
++            status_address_id=mint(), column_dtypes=dtypes, key_columns=keys,
++            capacity_policy=SSASequenceCapacityPolicy.DYNAMIC, heap_owner_value_id=owner)
++    return SSAObjectContext('test.context', table(('opaque_ref', 'int64'), (0,)),
++        table(('opaque_ref', 'opaque_ref', 'opaque_ref'), (0, 1)), mint(),
++        ('builtins.dict', 'builtins.list', 'builtins.object'))
++
++
++def test_context_rejects_unrelated_owners_and_overlapping_storage():
++    scope = context()
++    with pytest.raises(ValueError, match='shared owner'):
++        replace(scope, members=replace(scope.members, heap_owner_value_id=GLOBAL_MONOTONIC_IDS.mint()))
++    with pytest.raises(ValueError, match='distinct storage'):
++        replace(scope, next_handle_value_id=scope.objects.length_address_id)
++
++
++def test_context_receipt_is_checked_against_live_descriptors():
++    scope = context()
++    module = lower_object_context(scope)
++    name = 'native_object_construct'
++    assert concordance_report(module).splitlines()[0].endswith('0 finding(s)')
++    table = module.sequence_tables[name]
++    table.sequences[scope.objects.sequence_id] = replace(scope.objects,
++        capacity_value_id=GLOBAL_MONOTONIC_IDS.mint())
++    with pytest.raises(ValueError, match='live storage'):
++        validate_context_function(module, name)
++    assert 'object-context-contract' in concordance_report(module)
++    with pytest.raises(ValueError, match='live storage'):
++        emit_ssa_function_to_llvm(module, name)
++
++
++def test_native_context_constructs_grows_accesses_and_releases(tmp_path):
++    scope = context()
++    module = lower_object_context(scope)
++    natives = {}
++    for label in ('initialize', 'construct', 'kind', 'set', 'get', 'length', 'release'):
++        name = 'native_object_' + label
++        artifact = emit_ssa_function_to_llvm(module, name)
++        assert artifact.complete, artifact.shortfalls
++        natives[label] = compile_artifact(artifact, directory=tmp_path / label)
++    buffers = {value.id: np.zeros(1, dtype=np.uint64 if value.dtype == 'ptr' else
++        np.int32 if value.dtype == 'int' else np.int64) for value in context_values(scope)}
++    def run(label, *operands):
++        function = module.functions['native_object_' + label]
++        receipt = function.metadata.get('opaque_object_helper', {})
++        ids = (() if receipt.get('reference_formal_id') is None else (receipt['reference_formal_id'],))
++        ids += receipt.get('operand_formal_ids', ())
++        bound = {**buffers, **{key: np.array([value], dtype=np.int64)
++                             for key, value in zip(ids, operands, strict=True)}}
++        execution = prepare_artifact_execution(natives[label], bound).run()
++        returned = function.metadata.get('return_value')
++        return None if returned is None else execution.buffers[returned.id].item()
++    run('initialize')
++    try:
++        # Handles and all rows live in caller-owned storage after helper return.
++        handles = [run('construct', 1 + index % 3) for index in range(17)]
++        assert handles == list(range(1, 18))
++        for index, handle in enumerate(handles):
++            assert run('kind', handle) == 1 + index % 3
++            assert run('set', handle, 2**60 + 3, 2**60 + 17 + index)
++            assert run('get', handle, 2**60 + 3) == 2**60 + 17 + index
++            assert run('length', handle) == 1
++        assert run('set', handles[0], 2**60 + 3, handles[0])
++        assert run('get', handles[0], 2**60 + 3) == handles[0]  # self-edge
++        assert run('set', handles[0], 2**60 + 4, handles[-1])
++        assert run('set', handles[-1], 2**60 + 4, handles[0])  # backedge
++        assert run('length', handles[0]) == 2
++        assert run('kind', 9999) == 0
++        assert run('get', handles[0], 9999) == 0
++        assert not run('set', 9999, 1, 2)
++        before = buffers[scope.next_handle_value_id].item()
++        assert run('construct', 0) == 0
++        assert buffers[scope.next_handle_value_id].item() == before
++        buffers[scope.next_handle_value_id][0] = 1
++        assert run('construct', 2) == 0  # collision cannot change kind
++        assert run('kind', 1) == 1
++        buffers[scope.next_handle_value_id][0] = 2**63 - 1
++        assert run('construct', 1) == 0  # no signed overflow
++    finally:
++        run('release')
++    assert all(not buffer.any() for buffer in buffers.values())
++    run('release')
++    run('initialize')
++    assert run('construct', 3) == 1
++    run('release')
++
++
++@pytest.mark.parametrize('forwarded', [False, True])
++def test_public_source_links_native_context_constructor_and_kind(tmp_path, forwarded):
++    from pathlib import Path
++    from src.compiler.extraction_contract import ExtractionContract
++    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++    scope = context()
++    native_module = lower_object_context(scope, prefix='linked_context')
++    cells = context_values(scope)
++    names = [f'cell_{value.id}' for value in cells]
++    signature = ','.join(names)
++    declared = {label: ','.join(name for name, _ in native_module.functions[
++        'linked_context_' + label].metadata['parameter_names']) for label in ('construct', 'kind')}
++    # These are link SIGNATURE declarations, not implementation bodies. The
++    # native roots supply the accepted physical results; the declaration must
++    # retain an authored return edge so the caller has a result projection.
++    source = (f'def construct({declared["construct"]}):\n    return 0\n'
++              f'def inspect({declared["kind"]}):\n    return 0\n'
++              f'def execute({signature},requested_kind):\n'
++              f'    handle=construct({signature},requested_kind)\n'
++              f'    return inspect({signature},handle)\n')
++    if forwarded:
++        source += (f'def relay({signature},requested_kind):\n'
++                   f'    return execute({signature},requested_kind)\n')
++    target = 'relay' if forwarded else 'execute'
++    source += (f'def root({signature},requested_kind,count):\n'
++               f'    total=0\n    for index in range(count):\n'
++               f'        total=total+{target}({signature},requested_kind)\n'
++               f'    return total\n')
++    values = []
++    for name, value in zip(names, cells, strict=True):
++        receipt = {'function': '*', 'parameter': name, 'dtype': value.dtype, 'mutable': True,
++                   'storage': 'span' if value.shape else 'scalar',
++                   'python_type': 'numpy.ndarray' if value.shape else 'builtins.int'}
++        if value.shape:
++            receipt.update(rank=1, shape=list(value.shape))
++        values.append(receipt)
++    values.append({'function': '*', 'parameter': 'requested_kind', 'storage': 'scalar',
++                   'dtype': 'int64', 'python_type': 'builtins.int'})
++    values.append({'function': '*', 'parameter': 'count', 'storage': 'scalar',
++                   'dtype': 'int64', 'python_type': 'builtins.int'})
++    policy = ExtractionContract(Path(__file__).resolve().parents[1] /
++        'extraction_contracts/program_extraction.yaml').with_program_abi(
++        {'records': {}, 'bindings': [], 'values': values}).with_execution_file(
++        Path(__file__).resolve().parents[1] / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    module, _, exports = lower_ast_source_to_ssa(source, 'root', name='context_source',
++        extraction_contract=policy, linked_repository_ssa={
++            'construct': (native_module, 'linked_context_construct', {
++                'linked_context_construct': (native_module.functions['linked_context_construct'].metadata['return_value'],)}),
++            'inspect': (native_module, 'linked_context_kind', {
++                'linked_context_kind': (native_module.functions['linked_context_kind'].metadata['return_value'],)}),
++        }, progress=lambda _: None, progress_bars=False)
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    native = compile_artifact(artifact, directory=tmp_path / 'source')
++    root = module.functions[exports[0]]
++    parameters = dict(root.metadata['parameter_names'])
++    buffers = {parameters[name]: np.zeros(1, dtype=np.uint64 if value.dtype == 'ptr' else
++        np.int32 if value.dtype == 'int' else np.int64) for name, value in zip(names, cells)
++        if name in parameters}
++    buffers[parameters[f'cell_{scope.next_handle_value_id}']][0] = 1
++    try:
++        for kind, count in ((1, 1), (3, 17), (2, 257)):
++            buffers[parameters['requested_kind']] = np.array([kind], dtype=np.int64)
++            buffers[parameters['count']] = np.array([count], dtype=np.int64)
++            execution = prepare_artifact_execution(native, buffers)
++            for name, value in zip(names, cells):
++                if value.dtype == 'ptr' and name in parameters:
++                    actual_id = parameters[name]
++                    assert dict(zip(artifact.buffer_order, artifact.buffer_dtypes))[actual_id] == 'ptr'
++                    assert np.shares_memory(execution.buffers[actual_id], buffers[actual_id])
++            execution.run()  # Whole count-row loop is ONE native invocation.
++            output = next(i.args[0] for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++            assert execution.buffers[output.id].item() == kind * count
++    finally:
++        release = emit_ssa_function_to_llvm(native_module, 'linked_context_release')
++        destructor = compile_artifact(release, directory=tmp_path / 'release_source')
++        release_buffers = {value.id: buffers[parameters[name]] for name, value in zip(names, cells)
++                           if name in parameters}
++        for value in cells:
++            release_buffers.setdefault(value.id, np.zeros(1, dtype=np.uint64 if value.dtype == 'ptr' else np.int64))
++        prepare_artifact_execution(destructor, release_buffers).run()
+

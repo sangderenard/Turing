@@ -7,6 +7,8 @@ each nested scope is an explicit closure with an explicit capture set.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from collections import OrderedDict
+from collections.abc import MutableMapping
 from functools import cached_property
 from typing import Any, Mapping
 
@@ -158,7 +160,8 @@ def expand_plan_regions(
     plan: PlanClosure, *, first_free_value_id: int = 0,
     function_scope: str = "<plan>",
     lexical_read_scope: tuple | None = None,
-) -> dict[tuple[str, int], tuple[Instr, ...]]:
+    resident_limit: int | None = None,
+) -> Mapping[tuple[str, int], tuple[Instr, ...]]:
     """Lower every top-level ``region_*`` closure of ``plan`` exactly once.
 
     A region's lowering may synthesize temporaries an authored graph never
@@ -177,7 +180,8 @@ def expand_plan_regions(
     """
 
     watermark = max(int(first_free_value_id), plan_value_id_watermark(plan))
-    expanded: dict[tuple[str, int], tuple[Instr, ...]] = {}
+    expanded = ({} if resident_limit is None else
+                RegionInstructionStore(resident_limit).view("expanded"))
     for item in plan.items:
         if not (
             isinstance(item, PlanClosure) and item.name.startswith("region_")
@@ -199,6 +203,118 @@ def expand_plan_regions(
     return expanded
 
 
+class RegionInstructionStore:
+    """Bound the canonical instruction snapshots, not the emitted SSA heap.
+
+    Control lowering rereads region expansions several times. Those reads must
+    not rerun the lowering operator (it mints identities and posts facts), nor
+    hold every expansion and its planning copy in memory. Both mappings use
+    this one cache and the existing registry-aware BookSpill segment codec.
+    Consumers copy instructions before mutating them, exactly as in the eager
+    expansion. A single region can still be larger than the cache's count
+    bound; region size belongs to the existing graph partitioner.
+    """
+
+    def __init__(self, limit: int):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("SSA instruction residency requires a positive region count")
+        from .identity_concordance import current_identity_book, Mode, Novel
+        from .concordance_declarations import COMPILE_POLICY, COMPILE_ENTRY, POLICY_DECLARATION
+        self.limit = limit
+        self.book = current_identity_book()
+        self.book.post(COMPILE_POLICY, ("ssa_resident_regions",), str(limit),
+                       stage=COMPILE_ENTRY, provenance=Novel(POLICY_DECLARATION, ()), mode=Mode.CONCORD)
+        self.resident = OrderedDict()
+        self.segments = {}
+        self.keys = {}
+        self.store = None
+        self.stats = dict(resident_peak=0, resident_instructions_peak=0,
+                          snapshots=0, spills=0, reloads=0)
+        self.closed = False
+
+    def view(self, namespace: str):
+        return _RegionInstructionView(self, str(namespace))
+
+    def _check(self):
+        if self.closed:
+            raise RuntimeError("region instruction store is closed")
+
+    def _admit(self):
+        self._check()
+        while len(self.resident) >= self.limit:
+            key, instructions = next(iter(self.resident.items()))
+            if key not in self.segments:
+                if self.store is None:
+                    from .identity_spill import BookSpill
+                    self.store = BookSpill(self.book.registry)
+                segment = self.store.write("ssa-region-instructions", repr(key), instructions,
+                                           cells=len(instructions), rows=len(instructions))
+                self.segments[key] = segment
+                self.stats["spills"] += 1
+            del self.resident[key]
+
+    def _measure(self):
+        self.stats["resident_peak"] = max(self.stats["resident_peak"], len(self.resident))
+        self.stats["resident_instructions_peak"] = max(
+            self.stats["resident_instructions_peak"], sum(len(value) for value in self.resident.values()))
+
+    def get(self, key):
+        self._check()
+        if key not in self.keys:
+            raise KeyError(key)
+        if key not in self.resident:
+            self._admit()
+            self.resident[key] = self.store.read(self.segments[key])
+            self.stats["reloads"] += 1
+            self._measure()
+        self.resident.move_to_end(key)
+        return self.resident[key]
+
+    def put(self, key, value):
+        self._check()
+        # The planning copy is updated for exact structural replacements. It
+        # must not alias the region body subsequently retyped by legalization.
+        snapshot = tuple(copy_region_instructions(tuple(value)))
+        self.resident.pop(key, None)
+        self.segments.pop(key, None)
+        self._admit()
+        self.keys[key] = None
+        self.resident[key] = snapshot
+        self.stats["snapshots"] = len(self.keys)
+        self._measure()
+
+    def close(self):
+        self.resident.clear()
+        self.segments.clear()
+        self.keys.clear()
+        if self.store is not None:
+            self.store._finalizer()
+        self.closed = True
+
+
+class _RegionInstructionView(MutableMapping):
+    def __init__(self, pool, namespace):
+        self.pool, self.namespace = pool, namespace
+
+    def __getitem__(self, key):
+        return self.pool.get((self.namespace, key))
+
+    def __setitem__(self, key, value):
+        self.pool.put((self.namespace, key), value)
+
+    def __delitem__(self, key):
+        scoped = (self.namespace, key)
+        del self.pool.keys[scoped]
+        self.pool.resident.pop(scoped, None)
+        self.pool.segments.pop(scoped, None)
+
+    def __iter__(self):
+        return (key for namespace, key in self.pool.keys if namespace == self.namespace)
+
+    def __len__(self):
+        return sum(namespace == self.namespace for namespace, _key in self.pool.keys)
+
+
 def copy_region_instructions(
     instructions: tuple[Instr, ...],
 ) -> list[Instr]:
@@ -211,9 +327,10 @@ def copy_region_instructions(
     return [
         replace(
             instruction,
-            args=[replace(value) for value in instruction.args],
+            args=[replace(value, accounting=dict(value.accounting or {})) for value in instruction.args],
             res=(
-                None if instruction.res is None else replace(instruction.res)
+                None if instruction.res is None else replace(
+                    instruction.res, accounting=dict(instruction.res.accounting or {}))
             ),
             arg_roles=list(instruction.arg_roles),
             attributes=dict(instruction.attributes),

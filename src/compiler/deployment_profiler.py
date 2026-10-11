@@ -310,6 +310,18 @@ class DeploymentProfiler:
             "device_events": tuple(self.device_trace_history),
         }
 
+    def summary_dataframe(self, *, window: int = 60):
+        """A pandas view of the existing accumulated report, on request only."""
+        import pandas as pd
+        summary = self.summary(window=window)
+        result = pd.DataFrame.from_records(summary["rows"], columns=(
+            "path", "section", "label", "cpu_mean_ms", "cpu_p95_ms",
+            "gpu_mean_ms", "gpu_p95_ms", "calls_mean", "dispatches_mean"))
+        result.attrs.update({key: value for key, value in summary.items()
+                             if key != "rows"})
+        result.attrs["timing_semantics"] = "inclusive timings; nested rows are not additive"
+        return result
+
     def summary(self, *, window: int = 60) -> dict[str, Any]:
         reports = list(self.history)[-max(1, int(window)):]
         if not reports:

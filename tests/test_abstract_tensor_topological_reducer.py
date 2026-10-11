@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import networkx as nx
+import pytest
 
 from src.common.tensors.topological_reducer import (
     _concorded_static_parameter_bindings,
@@ -28,6 +29,15 @@ from src.compiler.identity_concordance import (
     begin_identity_book,
     end_identity_book,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_reducer_fixture_book():
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
 
 
 class _StaticClassMethodFactory:
@@ -1303,7 +1313,8 @@ class Builder:
 
     contract = _field_slot_ops(executable)
     table_deletions = contract[13]
-    tombstone_sequence_ids = contract[17]
+    # Nested record fields now occupy slot 17; tombstones are the final slot.
+    tombstone_sequence_ids = contract[-1]
 
     assert table_deletions == ()
     assert tombstone_sequence_ids == (external_values,)
@@ -2452,15 +2463,16 @@ def repro(xs, ys):
     assert "address" not in attributes.get("loop_target_initials", {})
 
 
-def test_generator_target_leak_no_longer_crashes_the_real_aot_pipeline():
+@pytest.mark.parametrize('xs,ys,flag', [((), (), True), ((1, 2), (), True),
+                                     ((), (3, 4), True), ((1, 2), (3, 4), False)])
+def test_generator_target_leak_no_longer_crashes_the_public_pipeline(xs, ys, flag):
     # End-to-end regression for the bug these two tests isolate: compiling
     # the exact repro shape through the real compiler entrypoint (not just
     # the reducer) used to fail with a bare `KeyError` from deep inside
     # capture, referencing a node number with no readable connection to a
     # comprehension five lines above the code that actually failed.
-    from src.common.tensors.accelerator_backends.aot_compile import (
-        compile_ast_aot,
-    )
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.identity_concordance import concordance_report
 
     source = """
 def repro(xs, ys, flag):
@@ -2472,16 +2484,17 @@ def repro(xs, ys, flag):
         return total + len(tagged)
     return total
 """
-    for xs, ys, flag in [
-        ((), (), True),
-        ((1, 2), (), True),
-        ((), (3, 4), True),
-        ((1, 2), (3, 4), False),
-    ]:
-        compile_ast_aot(
-            source, "repro", {"xs": xs, "ys": ys, "flag": flag},
-            precompile_only=True,
-        )
+    # The old precompile-only projection accepts Python argument values; the
+    # public complete-program entry accepts authored source and an ABI. Keep
+    # these four source specializations as literal bindings in the program.
+    source = source.replace('def repro(xs, ys, flag):',
+        f'def repro():\n    xs = {xs!r}\n    ys = {ys!r}\n    flag = {flag!r}')
+    module, outputs, exports = lower_ast_source_to_ssa(source, 'repro',
+        extraction_contract='extraction_contracts/program_extraction.yaml',
+        progress=lambda _: None)
+    assert exports and outputs[exports[0]]
+    report = concordance_report(module)
+    assert report.splitlines()[0].endswith('0 finding(s)'), report
 
 
 def test_subscript_write_to_attribute_field_orders_before_later_bare_read():

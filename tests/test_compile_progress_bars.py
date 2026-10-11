@@ -96,6 +96,8 @@ def make_layer(stages=FAKE_STAGES, **options):
     options.setdefault("rss", lambda: int(1.5 * GIB))
     options.setdefault("heartbeat", None)
     options.setdefault("min_interval", 0.0)
+    # Isolate the existing nested-bar tests; table layout is checked below.
+    options.setdefault("timing_table", False)
     layer = CompileProgress(
         enabled=True, stages=stages, tqdm_class=tqdm_class,
         stream=io.StringIO(), clock=clock, **options,
@@ -116,7 +118,8 @@ def test_stage_bar_opens_first_advances_in_order_and_closes_last():
     layer, events, bars, clock = make_layer()
     with layer:
         main = bars[0]
-        assert main.total == 3 and main.leave is True
+        assert main.total is None and main.leave is True
+        assert "percentage" not in main.kwargs["bar_format"]
         assert main.n == 0 and "first stage" in main.desc
         clock.now += 5
         compile_stage("beta")
@@ -575,7 +578,7 @@ def test_every_guarded_fixed_point_loop_is_a_nested_round_bar():
         guard.round(True, state="a")
         guard.round(True, state="b")
         nested = bars[1]
-        assert nested.total == 50 and nested.n == 2 and not nested.closed
+        assert nested.total is None and nested.n == 2 and not nested.closed
         assert "toy-fixed-point rounds (bound 50)" in nested.desc
         guard.round(False, state="c")
         assert nested.closed
@@ -635,4 +638,118 @@ def test_with_real_tqdm_lines_scroll_above_the_bars(monkeypatch):
     assert "compile 2/3 second stage" in text
     assert "rss 1.00GB" in text
     assert "[compiler] a compiler line" in written
-    assert "compile 3/3 done" in text
+    assert "compile done (2 timed stages)" in text
+
+
+def test_timing_table_sits_above_measured_work_and_survives_logs():
+    layer, events, bars, clock = make_layer(timing_table=True)
+    with layer:
+        main = bars[0]
+        assert main.kwargs['position'] == len(FAKE_STAGES) + 1
+        table = layer.bars.table
+        assert [bar.kwargs['position'] for bar in table] == [0, 1, 2, 3]
+        assert 'Wall(s)' in table[0].desc and 'running' in table[1].desc
+        compile_count('items', 0, total=3)
+        nested = layer.bars.bars['items']
+        assert nested.kwargs['position'] > main.kwargs['position']
+        clock.now += 12
+        layer.log('scrolling message')
+        layer.stage('beta')
+        assert 'done' in table[1].desc and '12.00' in table[1].desc
+        assert 'running' in table[2].desc
+        assert not any(bar.closed for bar in table)
+    assert all(bar.closed for bar in bars)
+    assert any(e[0] == 'write' and 'scrolling message' in e[1] for e in events)
+
+
+def test_work_advances_after_processing_not_before_yield_and_retains_partial_failure():
+    layer, _events, _bars, _clock = make_layer()
+    with pytest.raises(RuntimeError):
+        with layer:
+            for item in layer.iterate([1, 2, 3], 'nodes'):
+                assert layer._counts['nodes']['n'] == item - 1
+                if item == 2:
+                    raise RuntimeError('second item failed')
+    assert layer.summary()['work']['alpha']['nodes'] == {
+        'done': 1, 'total': 3, 'label': 'nodes'}
+    assert layer.summary()['stages'][0]['state'] == 'failed'
+
+
+def test_interleaved_work_bars_never_reuse_an_occupied_row():
+    layer, _events, _bars, _clock = make_layer(timing_table=True)
+    with layer:
+        layer.count('first', 0, total=2)
+        layer.count('second', 0, total=2)
+        layer.count_close('first')
+        layer.count('third', 0, total=2)
+        assert layer.bars.positions['second'] != layer.bars.positions['third']
+
+
+def test_profile_collection_without_display_keeps_callbacks_and_counts():
+    clock = Clock()
+    layer = CompileProgress(enabled=False, collect_profile=True, stages=FAKE_STAGES,
+                            clock=clock, rss=lambda: GIB)
+    callback = lambda _: None
+    assert layer.progress_callback(callback) is callback
+    with layer:
+        clock.now += 2
+        list(layer.iterate([1, 2], 'nodes'))
+        layer.stage('beta')
+        clock.now += 5
+        layer.selection('fold', 'end', 0, 'root', {'duration_seconds': 0.125})
+    assert layer.bars is None
+    assert [row['seconds'] for row in layer.summary()['stages']] == [2, 5, 0]
+    assert [row['state'] for row in layer.summary()['stages']] == ['done', 'done', 'pending']
+    assert layer.summary()['work']['alpha']['nodes']['done'] == 2
+    assert all(record.detail.get('fraction_is_progress') is False
+               for record in layer.channel.of_kind('progress')
+               if record.detail.get('scope') in {'start', 'stage', 'substage', 'end'})
+    assert any(row['path'] == 'compile/planner/fold' and row['seconds'] == 0.125
+               for row in layer.channel.profile_summary())
+
+
+def test_timing_dataframe_uses_accumulated_stage_values():
+    pytest.importorskip('pandas')
+    layer, _events, _bars, clock = make_layer()
+    with layer:
+        clock.now += 2
+        layer.stage('beta')
+        clock.now += 3
+        layer.stage('alpha')
+        clock.now += 4
+    frame = layer.profile_dataframe().set_index('key')
+    assert frame.loc['alpha', 'seconds'] == 6
+    assert frame.loc['beta', 'seconds'] == 3
+    assert frame.loc['gamma', 'state'] == 'pending'
+
+
+def test_public_lowerer_retains_headless_profile_and_allows_explicit_opt_out():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    source = 'def root():\n    return 2 + 3\n'
+    options = {'extraction_contract': 'extraction_contracts/program_extraction.yaml',
+               'progress': lambda _: None, 'progress_bars': False}
+    module, _outputs, _exports = lower_ast_source_to_ssa(source, 'root', **options)
+    summary = module.metadata['compile_profile']
+    assert all(row['state'] == 'done' for row in summary['stages'])
+    assert any(row['section'] == 'planner' for row in summary['profiles'])
+    work = summary['work']['ssa-lowering']['functions']
+    assert work['done'] == work['total'] > 0
+    quiet, _, _ = lower_ast_source_to_ssa(source, 'root', compile_profile=False, **options)
+    assert 'compile_profile' not in quiet.metadata
+    pytest.importorskip('pandas')
+    frame = telemetry.compile_profile_dataframe(module)
+    assert frame['seconds'].sum() > 0
+    assert frame.attrs['work'] == summary['work']
+
+
+def test_filtered_channel_does_not_erase_failed_stage_summary():
+    clock = Clock()
+    layer = CompileProgress(enabled=False, collect_profile=True, stages=FAKE_STAGES,
+                            clock=clock, rss=lambda: GIB,
+                            channel=telemetry.TelemetryChannel(kinds=('progress',)))
+    with pytest.raises(RuntimeError):
+        with layer:
+            clock.now += 2
+            raise RuntimeError('failed')
+    row = layer.summary()['stages'][0]
+    assert row['state'] == 'failed' and row['seconds'] == 2 and row['rss_bytes'] == GIB

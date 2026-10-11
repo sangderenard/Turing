@@ -207,13 +207,13 @@ def test_existing_call_projection_is_enriched_by_later_exact_descriptor():
             graph.G.nodes[27]["attributes"]["aggregate_leaf_value_ids"]
         ) == leaves
         assert graph.G.nodes[permutation]["tensor"] == exact[2]
-        page = current_identity_book().page(
-            "callsite_projection_specialization"
-        )
-        history = page.history(("solve", 27, 2, permutation))
+        # Descriptor revisions now live on the shared declared member page,
+        # keyed by caller-copy scope, not the retired action-log name page.
+        page = current_identity_book().page("callsite_return_member")
+        history = page.history((("function", "solve"), 27, 2, permutation))
         assert history == (
-            (0, ("materialized", None)),
-            (1, ("enriched", ((2, 2), "float64"))),
+            (0, None),
+            (1, ((2, 2), "float64")),
         )
     finally:
         end_identity_book(token)

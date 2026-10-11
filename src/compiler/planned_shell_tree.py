@@ -5,6 +5,32 @@ from __future__ import annotations
 from typing import Any
 
 
+def _recursive_callsite_targets(shell: Any) -> dict[int, Any]:
+    """Read admitted SCC activation edges, not the whole definition catalogue."""
+    from .identity_concordance import current_identity_book
+
+    graph = getattr(getattr(shell, "process_graph", None), "G", None)
+    if graph is None:
+        return {}
+    page = current_identity_book().page("source_callsite_activation_concordance")
+    owner = str(graph.graph.get("qualified_name") or graph.graph.get("function_name") or "<module>")
+    targets = {}
+    for row in page.scope_rows(owner):
+        fact = page.latest(row)
+        if fact is None or fact[1] != "recursive_scc_backedge" or int(row[1]) not in graph:
+            continue
+        node_id = int(row[1])
+        attributes = graph.nodes[node_id].get("attributes") or {}
+        reference = attributes.get("callee_ref", attributes.get("method_ref"))
+        if reference is None or int(reference) != int(fact[0]):
+            raise ValueError(f"recursive activation disagrees with call edge: {row!r}")
+        target = getattr(shell, "function_shells", {}).get(int(reference))
+        if target is None:
+            raise ValueError(f"recursive activation has no catalogue signature: {row!r}")
+        targets[node_id] = target
+    return targets
+
+
 def _walk_planned_shells(
     shell: Any,
     *,
@@ -50,6 +76,11 @@ def _walk_planned_shells(
         pending.extend(
             getattr(current, "callsite_function_shells", {}).values()
         )
+        # A recursive call is an activation without a callsite clone.  Walking
+        # only the tree left right() absent from left()->right()->left(), so
+        # the linker dereferenced a missing callee. Admit just these exact
+        # dependency targets; seen bounds the SCC, without path expansion.
+        pending.extend(_recursive_callsite_targets(current).values())
 
 
 def _deployment_program_table_lines(shell: Any) -> tuple[str, ...]:

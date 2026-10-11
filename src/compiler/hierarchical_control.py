@@ -280,14 +280,13 @@ def compose_hierarchical_control(
                 for iterable, _target, _induction, _projection
                 in local.projected_iterable_bindings
             )
-            for local_iterable_id in local_iterable_ids:
-                local_marker = (
-                    f"__iterable_extent_{local_iterable_id}__"
-                )
-                global_marker = (
-                    f"__iterable_extent_{value(local_iterable_id)}__"
-                )
-                result = result.replace(local_marker, global_marker)
+            # A tuple splice's cardinality can reference resident lengths
+            # other than the final iterable's binding. Namespace every exact
+            # extent identity in one pass, including those derived operands;
+            # sequential substitutions can accidentally rename a global twice.
+            result = re.sub(r"__iterable_extent_(\d+)__",
+                            lambda match: f"__iterable_extent_{value(int(match.group(1)))}__",
+                            result)
             return result
         # Hierarchy identity reduction can legitimately prove that both sides
         # of a planner alias are the same canonical resident value.  Such an

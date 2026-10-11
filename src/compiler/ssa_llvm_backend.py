@@ -738,6 +738,22 @@ def integer_scalar_lines(
     evaluation converted back to the declared integer type.
     """
 
+    if operation == "FloorDiv" and len(operands) == 2:
+        # Heap-parent indexing in the compiler's own graph kernel uses
+        # (position - 1) // 2, including -1 // 2 at the root. LLVM sdiv
+        # truncates toward zero. Subtract one iff the remainder is nonzero
+        # and has the opposite sign to the divisor: Python's floor rule,
+        # in the integer domain, with no round trip through double.
+        return ([
+            f"{register}.quot = sdiv {operand_type} {operands[0]}, {operands[1]}",
+            f"{register}.rem = srem {operand_type} {operands[0]}, {operands[1]}",
+            f"{register}.mix = xor {operand_type} {register}.rem, {operands[1]}",
+            f"{register}.opposed = icmp slt {operand_type} {register}.mix, 0",
+            f"{register}.nonzero = icmp ne {operand_type} {register}.rem, 0",
+            f"{register}.fix = and i1 {register}.opposed, {register}.nonzero",
+            f"{register}.adjust = zext i1 {register}.fix to {operand_type}",
+            f"{register} = sub {operand_type} {register}.quot, {register}.adjust",
+        ], operand_type)
     if operation == "Mod" and len(operands) == 2:
         # Python ``%`` is FLOORED: the result carries the divisor's sign.
         # ``srem`` is C semantics -- ``-1 % 16`` gave -1 instead of 15, and a
@@ -791,6 +807,12 @@ def integer_scalar_lines(
         ], "i1")
     if operation == "Neg" and len(operands) == 1:
         return ([f"{register} = sub {operand_type} 0, {operands[0]}"],
+                operand_type)
+    if operation == "Invert" and len(operands) == 1:
+        # The canonical authored ``~mask`` opcode preserves its integer
+        # domain. The old double fallback rejected it, despite an i64
+        # likeness entry, then left the consuming branch Phi mismatched.
+        return ([f"{register} = xor {operand_type} {operands[0]}, -1"],
                 operand_type)
     if operation in {"Not", "LNot"} and len(operands) == 1:
         return ([f"{register} = xor {operand_type} {operands[0]}, 1"],
@@ -869,6 +891,9 @@ _LLVM_INTRINSIC_DECLARATIONS: dict[str, str] = {
     "llvm.memcpy.p0.p0.i64": (
         "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)"
     ),
+    "llvm.memmove.p0.p0.i64": (
+        "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1 immarg)"
+    ),
     # Zero fills reach this from the BACKWARD side: the derivative of any
     # step-like operation is zero almost everywhere, and the authored rule
     # spells that ``zeros_like``.
@@ -878,6 +903,26 @@ _LLVM_INTRINSIC_DECLARATIONS: dict[str, str] = {
     # Entry-frame storage past ``_FRAME_HEAP_BYTES`` lives on the heap.
     "malloc": "declare ptr @malloc(i64)",
     "free": "declare void @free(ptr)",
+    "llvm.trap": "declare void @llvm.trap() cold noreturn nounwind",
+    # Returned heap arenas live through their caller's explicit owner, not
+    # the allocating helper's entry-frame cleanup. The owner cell is reset
+    # before releasing the chain, making empty/repeated release well-defined.
+    "turing_heap_release": """define internal void @turing_heap_release(ptr %owner) {
+entry:
+  %first = load ptr, ptr %owner, align 8
+  store ptr null, ptr %owner, align 8
+  br label %scan
+scan:
+  %block = phi ptr [ %first, %entry ], [ %next, %release ]
+  %done = icmp eq ptr %block, null
+  br i1 %done, label %exit, label %release
+release:
+  %next = load ptr, ptr %block, align 8
+  call void @free(ptr %block)
+  br label %scan
+exit:
+  ret void
+}""",
     "turing_validation_error": (
         "declare void @turing_validation_error(i32)"
     ),
@@ -1011,6 +1056,11 @@ def _release_frame_before_returns(lines: list[str], frees: list[str]) -> None:
 
 def _value_llvm_type(value: _Any) -> str:
     accounting = getattr(value, "accounting", {}) or {}
+    if accounting.get("heap_owner") or accounting.get("heap_element_dtype") is not None:
+        # These are declared native pointer CELLS, not a typed address whose
+        # dtype names the pointee. Raw ptr spelling alone historically means
+        # the latter in SSA; the explicit heap ABI states the former.
+        return "ptr"
     if tuple(
         accounting.get(
             "ssa_aggregate_outputs", ()
@@ -1519,7 +1569,7 @@ def _emit_repository_call_module(
             for block in module.functions[name].blocks.values()
             for instruction in block.instrs
             if instruction.op in {"Ret", "ret", "Return", "return"}
-        ), ())
+        ), tuple(module.functions[name].metadata.get("declared_native_outputs", ())))
     for name in reachable:
         function = module.functions[name]
         returned = next((
@@ -1876,6 +1926,7 @@ def _emit_repository_call_module(
         aggregate_members: dict[int, dict[int, str]] = {}
         address_members: dict[int, str] = {}
         address_slots: dict[int, str] = {}
+        owned_heap_addresses: set[int] = set()
         # Dynamic tensor metadata crosses planned-region calls as ordinary SSA
         # formals.  A ``shape`` formal is an i32 span address, so a Load from
         # it reads the first extent just as a GEP-derived span address does.
@@ -2018,6 +2069,12 @@ def _emit_repository_call_module(
                     f"  {converted} = fptosi double {loaded} to {wanted}"
                 )
                 return converted
+            # Native context length counts Cast(Eq(owner, handle), int64).
+            # The old fallthrough returned its i1 register unchanged and then
+            # stored it as i64. Bool's numerical value is 0/1, not signed -1.
+            if wanted in {"i32", "i64"} and source_type == "i1":
+                body.append(f"  {converted} = zext i1 {loaded} to {wanted}")
+                return converted
             if wanted == "i64" and source_type == "i32":
                 body.append(f"  {converted} = sext i32 {loaded} to i64")
                 return converted
@@ -2056,6 +2113,36 @@ def _emit_repository_call_module(
             for block_name, block in function.blocks.items()
             for instruction in block.instrs
         ]
+        # Span/reference identity is shared storage; scalar SSA identity is a
+        # value. Include ranked call occurrences, not only result.shape (a
+        # dynamic heap span's static shape is empty), then follow exact Phi
+        # edges so a reference never becomes a one-element snapshot.
+        reference_ids = {
+            int(value.id)
+            for value in (*function.args, *(
+                value for _block, item in scheduled_instructions
+                for value in (*item.args, *((item.res,) if item.res is not None else ()))
+            ))
+            if _declared_span_rank(value) > 0 or _value_llvm_type(value) == "ptr"
+            or (value.accounting or {}).get("sequence_arena")
+        }
+        phi_dependents: dict[int, list[int]] = {}
+        for _block, item in scheduled_instructions:
+            if item.op in {"Phi", "phi"} and item.res is not None:
+                for value in item.args:
+                    phi_dependents.setdefault(int(value.id), []).append(int(item.res.id))
+        frontier = list(reference_ids)
+        while frontier:
+            for result_id in phi_dependents.get(frontier.pop(), ()):
+                if result_id not in reference_ids:
+                    reference_ids.add(result_id)
+                    frontier.append(result_id)
+        scalar_phi_ids = {
+            int(item.res.id)
+            for _block, item in scheduled_instructions
+            if item.op in {"Phi", "phi"} and item.res is not None
+            and int(item.res.id) not in reference_ids
+        }
         # Phi registers must be visible to every block regardless of render
         # order: a loop exit may render before a nested header (dict order),
         # and an outer phi's latch operand references the inner phi.  Left
@@ -2068,9 +2155,13 @@ def _emit_repository_call_module(
                 str(instruction.op) in {"Phi", "phi"}
                 and instruction.res is not None
             ):
-                pointers[int(instruction.res.id)] = (
-                    f"%phi.{int(instruction.res.id)}"
-                )
+                phi_id = int(instruction.res.id)
+                if phi_id in scalar_phi_ids:
+                    home = f"%phi.value.{phi_id}"
+                    _frame_slot(home, _value_llvm_type(instruction.res), 1, entry_allocas, entry_frees)
+                    pointers[phi_id] = home
+                else:
+                    pointers[phi_id] = f"%phi.{phi_id}"
         # A dead unpack pair -- GEP(aggregate_index) plus the Load of its
         # address whose result nothing consumes -- reads a slot the callee
         # never publishes (only live positions have out cells).  Skip both;
@@ -2259,6 +2350,16 @@ def _emit_repository_call_module(
         # Watch-shadow copies wait here until the phi group they follow has
         # been emitted in full; see the Phi branch below.
         pending_shadow: list[str] = []
+        pending_phi_loads: list[str] = []
+        pending_phi_stores: list[str] = []
+
+        def capture_phi_values() -> None:
+            # All merge reads precede all merge writes: Phi assignment is
+            # simultaneous, including a loop exchanging two carried values.
+            body.extend(pending_phi_loads)
+            body.extend(pending_phi_stores)
+            pending_phi_loads.clear()
+            pending_phi_stores.clear()
 
         def capture_block_history(block_name: str, tag: str) -> None:
             """Ring every ordinary history value this block defines.
@@ -2297,6 +2398,7 @@ def _emit_repository_call_module(
             # appends are posted when the next one opens.
             span.close()
             if block_name != active_block:
+                capture_phi_values()
                 if pending_shadow:
                     body.extend(pending_shadow)
                     pending_shadow.clear()
@@ -2307,6 +2409,8 @@ def _emit_repository_call_module(
                 span.take(UnitKind.BLOCK_LABEL, spelling=block_name, block=block_name)
             span.open(instruction)
             operation = str(instruction.op)
+            if operation not in {"Phi", "phi"}:
+                capture_phi_values()
             if pending_shadow and operation not in {"Phi", "phi"}:
                 body.extend(pending_shadow)
                 pending_shadow.clear()
@@ -2441,6 +2545,44 @@ def _emit_repository_call_module(
                     step_instruction.res
                     for _index, step_instruction, _step in run[1:]
                 ))
+                continue
+
+            if operation == "Alloca" and result is not None:
+                from .ssa_heap_allocation import validate_heap_allocation
+                try:
+                    count_value, owner, layout = validate_heap_allocation(instruction)
+                except (KeyError, ValueError) as error:
+                    shortfalls.append(LLVMEmissionShortfall(name, operation, str(error)))
+                    continue
+                count = load_as(count_value, "i64", f"heap.count.{tag}")
+                prefix = f"heap.{tag}"
+                # Check before multiplication. Negative and overflow counts
+                # fail rather than wrapping into a tiny successful allocation.
+                maximum = (2**63 - 1 - 8) // layout.byte_size
+                body.extend((
+                    f"  %{prefix}.valid = icmp ule i64 {count}, {maximum}",
+                    f"  br i1 %{prefix}.valid, label %{prefix}.allocate, label %{prefix}.failure",
+                    f"{prefix}.allocate:",
+                    f"  %{prefix}.bytes = mul i64 {count}, {layout.byte_size}",
+                    f"  %{prefix}.total = add i64 %{prefix}.bytes, 8",
+                    f"  %{prefix}.block = call ptr @malloc(i64 %{prefix}.total)",
+                    f"  %{prefix}.present = icmp ne ptr %{prefix}.block, null",
+                    f"  br i1 %{prefix}.present, label %{prefix}.ready, label %{prefix}.failure",
+                    f"{prefix}.failure:",
+                    "  call void @llvm.trap()",
+                    "  unreachable",
+                    f"{prefix}.ready:",
+                    f"  %{prefix}.previous = load ptr, ptr {pointer(owner)}, align 8",
+                    f"  store ptr %{prefix}.previous, ptr %{prefix}.block, align 8",
+                    f"  store ptr %{prefix}.block, ptr {pointer(owner)}, align 8",
+                    f"  %{prefix}.data = getelementptr i8, ptr %{prefix}.block, i64 8",
+                    f"  store ptr %{prefix}.data, ptr {pointer(result)}, align 8",
+                ))
+                if instruction.attributes.get("zero_initialize"):
+                    body.append("  call void @llvm.memset.p0.i64("
+                                f"ptr %{prefix}.data, i8 0, i64 %{prefix}.bytes, i1 false)")
+                block_exit_label[active_block] = f"{prefix}.ready"
+                register_cache.clear()
                 continue
 
             if operation in {"Const", "StaticRef"} and result is not None:
@@ -2658,6 +2800,26 @@ def _emit_repository_call_module(
                         "phi incoming blocks do not match incoming values",
                     ))
                     continue
+                element_type = _value_llvm_type(result)
+                incompatible = tuple(
+                    (int(value.id), _value_llvm_type(value))
+                    for value in incoming_values
+                    if _value_llvm_type(value) != element_type
+                )
+                if incompatible:
+                    # The compiler heap's int64 size Phi selected a double
+                    # backedge buffer. A ptr Phi compiled successfully but
+                    # its next i64 load interpreted 1.0 as 4607182418800017408
+                    # and indexed outside the arena. A selected pointer must
+                    # have the result's physical element representation on
+                    # EVERY edge. Only a preceding explicit conversion can
+                    # authorize a different representation, never this Phi.
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"phi {result_id} physical element {element_type} "
+                        f"disagrees with incoming {incompatible}",
+                    ))
+                    continue
                 register = f"%phi.{result_id}"
                 body.append(
                     f"  {register} = phi ptr "
@@ -2669,7 +2831,22 @@ def _emit_repository_call_module(
                         )
                     )
                 )
-                pointers[result_id] = register
+                if result_id in scalar_phi_ids:
+                    # ``heap[position] = target; size = size + 1`` may be
+                    # scheduled with the increment first under SSA value
+                    # semantics. A pointer Phi left position aliasing the
+                    # reusable size output slot and changed its value after
+                    # selection. Capture the scalar NOW into its own home;
+                    # span Phis above still select the original arena.
+                    captured_value = f"%phi.capture.{result_id}"
+                    pending_phi_loads.append(
+                        f"  {captured_value} = load {element_type}, ptr {register}, align {_align(element_type)}"
+                    )
+                    pending_phi_stores.append(
+                        f"  store {element_type} {captured_value}, ptr {pointers[result_id]}, align {_align(element_type)}"
+                    )
+                else:
+                    pointers[result_id] = register
                 shadow = watch_shadows.get(result_id)
                 if shadow is not None:
                     # Diagnostic copy only: reads what the phi already
@@ -2681,7 +2858,7 @@ def _emit_repository_call_module(
                     shadow_type = _value_llvm_type(result)
                     captured = f"%watch.load.{tag}"
                     pending_shadow.append(
-                        f"  {captured} = load {shadow_type}, ptr {register}, "
+                        f"  {captured} = load {shadow_type}, ptr {pointers[result_id]}, "
                         "align 8"
                     )
                     pending_shadow.append(
@@ -2955,8 +3132,21 @@ def _emit_repository_call_module(
                     name in extent_users or len(instruction.args) == 2
                 ):
                     base = instruction.args[0]
+                    # Generated sequence helpers recreate operand views, but
+                    # their formal with this EXACT identity owns the storage
+                    # contract. In particular a heap column formal is a
+                    # pointer cell, not a directly passed element arena.
+                    declared_base = values_by_function[name].get(int(base.id))
+                    if declared_base is not None and (declared_base.accounting or {}).get("heap_element_dtype") is not None:
+                        base = declared_base
+                    heap_element = (base.accounting or {}).get("heap_element_dtype")
+                    if heap_element is not None and len(instruction.args) != 2:
+                        shortfalls.append(LLVMEmissionShortfall(name, operation,
+                            "owned heap arenas require a single flat element index"))
+                        continue
+                    index_type = "i64" if heap_element is not None else "i32"
                     indices = [
-                        load_as(argument, "i32", f"{tag}.{position}")
+                        load_as(argument, index_type, f"{tag}.{position}")
                         for position, argument in enumerate(
                             instruction.args[1:]
                         )
@@ -3015,12 +3205,18 @@ def _emit_repository_call_module(
                             )
                             offset = summed
                         element_type = _value_llvm_type(base)
+                        base_pointer = pointer(base)
+                        heap_element = (base.accounting or {}).get("heap_element_dtype")
+                        if heap_element is not None:
+                            from ..transmogrifier.dtype_layout import layout_for
+                            element_type = layout_for(heap_element).llvm_type
+                            base_pointer = load_as(base, "ptr", f"heap.base.{tag}")
                         if element_type == "ptr":
                             element_type = "i64"
                         computed = f"%address.{tag}"
                         body.append(
                             f"  {computed} = getelementptr {element_type}, "
-                            f"ptr {pointer(base)}, i32 {offset}"
+                            f"ptr {base_pointer}, {index_type} {offset}"
                         )
                         # The addressed element *is* the storage; a later Load
                         # aliases it rather than copying, exactly as the
@@ -3028,6 +3224,8 @@ def _emit_repository_call_module(
                         pointers[result_id] = computed
                         span_addresses[result_id] = computed
                         span_address_types[result_id] = element_type
+                        if heap_element is not None:
+                            owned_heap_addresses.add(result_id)
                         continue
                     shortfalls.append(LLVMEmissionShortfall(
                         name, operation,
@@ -3055,7 +3253,14 @@ def _emit_repository_call_module(
                     addressed = pointer(address_argument)
                 if addressed is not None:
                     loaded_type = _value_llvm_type(result)
-                    if loaded_type in {"double", "i32", "i1"}:
+                    heap_address = int(address_argument.id) in owned_heap_addresses
+                    if heap_address and span_address_types.get(int(address_argument.id)) != loaded_type:
+                        shortfalls.append(LLVMEmissionShortfall(name, operation,
+                            "heap load result disagrees with its declared element layout; explicit conversion required"))
+                        continue
+                    if (loaded_type in {"double", "i32", "i1"}
+                            or int(address_argument.id) in owned_heap_addresses
+                            or (result.dtype in {'int64', 'uint64', 'opaque_ref'} and not result.shape)):
                         # Pin the loaded scalar to its own slot.
                         #
                         # Aliasing the result to the ADDRESS instead (what
@@ -3071,14 +3276,16 @@ def _emit_repository_call_module(
                         # already-overwritten operand, while emitting
                         # cleanly. See tests/test_llvm_inplace_store_aliasing.
                         #
-                        # Restricted to scalars on purpose: an i64 may be a
-                        # reference and a wider load may be an aggregate
-                        # base that later addressing still needs to reach
-                        # through, and both are handled below.
+                        # Exact scalar int64/opaque_ref is also a VALUE. The
+                        # native collection base loaded before collect must
+                        # not reread the length cell after collect: that made
+                        # end-base zero and silently skipped every body call.
+                        # Aggregate/address representations remain below;
+                        # LLVM i64 alone is not the semantic discriminator.
                         pinned = f"%pinned.load.{tag}"
                         body.append(
                             f"  {pinned} = load {loaded_type}, ptr "
-                            f"{addressed}, align 8"
+                            f"{addressed}, align {_align(loaded_type) if heap_address else 8}"
                         )
                         body.append(
                             f"  store {loaded_type} {pinned}, ptr "
@@ -3143,7 +3350,7 @@ def _emit_repository_call_module(
                 )
                 body.append(
                     f"  store {destination_type} {loaded_value}, "
-                    f"ptr {destination}, align 8"
+                    f"ptr {destination}, align {_align(destination_type) if int(address.id) in owned_heap_addresses else 8}"
                 )
                 register_cache.clear()
                 continue
@@ -3155,6 +3362,44 @@ def _emit_repository_call_module(
                 # call must not serve reads after it.
                 register_cache.clear()
                 symbol = str(callee)
+                if instruction.attributes.get("native_heap_abi") == "copy_elements":
+                    from .ssa_heap_allocation import validate_heap_copy, HEAP_COPY_SYMBOL
+                    try:
+                        destination, source, count_value, layout = validate_heap_copy(instruction)
+                    except (KeyError, ValueError) as error:
+                        shortfalls.append(LLVMEmissionShortfall(name, symbol, str(error)))
+                        continue
+                    count = load_as(count_value, "i64", f"heap.copy.count.{tag}")
+                    prefix = f"heap.copy.{tag}"
+                    maximum = (2**63 - 1 - 8) // layout.byte_size
+                    source_address = load_as(source, "ptr", f"heap.copy.source.{tag}")
+                    destination_address = load_as(destination, "ptr", f"heap.copy.destination.{tag}")
+                    body.extend((
+                        f"  %{prefix}.valid = icmp ule i64 {count}, {maximum}",
+                        f"  br i1 %{prefix}.valid, label %{prefix}.ready, label %{prefix}.failure",
+                        f"{prefix}.failure:",
+                        "  call void @llvm.trap()",
+                        "  unreachable",
+                        f"{prefix}.ready:",
+                        f"  %{prefix}.bytes = mul i64 {count}, {layout.byte_size}",
+                        f"  call void @{HEAP_COPY_SYMBOL}(ptr {destination_address}, ptr {source_address}, "
+                        f"i64 %{prefix}.bytes, i1 false)",
+                    ))
+                    block_exit_label[active_block] = f"{prefix}.ready"
+                    register_cache.clear()
+                    continue
+                from .ssa_heap_allocation import HEAP_RELEASE_SYMBOL, require_heap_owner
+                if instruction.attributes.get("native_heap_abi") == "release_owner":
+                    try:
+                        if symbol != HEAP_RELEASE_SYMBOL or len(instruction.args) != 1 or result is not None:
+                            raise ValueError("heap release requires one owner and no result")
+                        require_heap_owner(instruction.args[0])
+                    except ValueError as error:
+                        shortfalls.append(LLVMEmissionShortfall(name, symbol, str(error)))
+                        continue
+                    body.append(f"  call void @{HEAP_RELEASE_SYMBOL}(ptr {pointer(instruction.args[0])})")
+                    register_cache.clear()
+                    continue
                 if symbol == "turing_validation_error":
                     error_code = int(instruction.attributes.get(
                         "error_code", 0
@@ -4324,6 +4569,7 @@ def _emit_repository_call_module(
         entry_span.take(UnitKind.FORMAL, args=(value,), spelling=loaded)
         public_pointer[value_id] = loaded
     wrapper_frees: list[str] = []
+    allocated_counts: dict[int, int] = {}
     for storage_index, value in enumerate(root_internal_storage):
         llvm_type = _value_llvm_type(value)
         requirement = storage_requirements.get(int(value.id))
@@ -4336,6 +4582,30 @@ def _emit_repository_call_module(
         _frame_slot(local, llvm_type, count, wrapper, wrapper_frees)
         entry_span.take(UnitKind.DECLARATION, args=(value,), spelling=local)
         public_pointer[int(value.id)] = local
+        allocated_counts[int(value.id)] = count
+    # [10,20].append(30) emitted all three row writes correctly, but LLVM's
+    # root frame left the private capacity cell uninitialized. In the repro
+    # append read zero and reported full. Publish the ACTUAL bound, as the C
+    # wrapper already does; borrowed arenas and dynamic pointer cells retain
+    # their incoming ownership/capacity contract.
+    from .ir_sequence_tables import SSASequenceCapacityPolicy
+    root_sequences = getattr(module, "sequence_tables", {}).get(function_name)
+    root_arguments = {int(value.id): value for value in root.args}
+    if root_sequences is not None:
+        for sequence in root_sequences.sequences.values():
+            capacity_id = int(sequence.capacity_value_id)
+            if (sequence.capacity_policy != SSASequenceCapacityPolicy.FIXED
+                    or capacity_id not in allocated_counts
+                    or not all(int(column) in allocated_counts for column in sequence.column_value_ids)):
+                continue
+            row_shapes = sequence.column_shapes or tuple(() for _ in sequence.column_value_ids)
+            rows = min(allocated_counts[int(column)] // max(1, _math.prod(shape or (1,)))
+                       for column, shape in zip(sequence.column_value_ids, row_shapes, strict=True))
+            capacity = root_arguments[capacity_id]
+            llvm_type = _value_llvm_type(capacity)
+            wrapper.append(f"  store {llvm_type} {rows}, ptr {public_pointer[capacity_id]}, align {_align(llvm_type)}")
+            entry_span.take(UnitKind.STATEMENT, args=(capacity, *(root_arguments[int(column)]
+                for column in sequence.column_value_ids)), spelling=public_pointer[capacity_id])
     internal_call_records.append((
         None,
         internal_symbols[function_name],
@@ -4401,6 +4671,9 @@ def _emit_repository_call_module(
         if symbol in _LLVM_INTRINSIC_DECLARATIONS:
             declarations[symbol] = _LLVM_INTRINSIC_DECLARATIONS[symbol]
             symbol_origins[symbol] = ("intrinsic",)
+            pending_kernels.update(set(_re.findall(
+                r"@([A-Za-z_$.-][\w$.-]*)\s*\(", declarations[symbol],
+            )) - set(declarations) - set(definitions))
             continue
         try:
             definition = extract_llvm_function(symbol)
@@ -4532,6 +4805,11 @@ def _emit_repository_call_module(
     )
     return LLVMFunctionArtifact(
         name=entry_name,
+        linked_objects=tuple(dict.fromkeys(
+            tuple(obj) for piece in piece_records.values()
+            for obj in piece.get("linked_objects", ()))),
+        needs_validation_runtime=any(piece.get("needs_validation_runtime", False)
+                                     for piece in piece_records.values()),
         external_slots=external_slot_rows(module, slot_functions),
         llvm_ir=llvm_ir + "\n",
         buffer_order=tuple(buffer_order),
@@ -4565,6 +4843,9 @@ class LLVMFunctionArtifact:
     extent_order: tuple[tuple[int, str, int | None], ...]
     shortfalls: tuple[LLVMEmissionShortfall, ...]
     buffer_dtypes: tuple[str, ...] = ()
+    linked_objects: tuple[tuple[str, str], ...] = ()
+    object_path: _Path | None = None
+    needs_validation_runtime: bool = False
     needs_text_sink: bool = False
     output_publications: tuple[_Mapping[str, _Any], ...] = ()
     output_surfaces: _Mapping[str, _Any] | None = None
@@ -4592,6 +4873,9 @@ class LLVMFunctionArtifact:
     _library: _Any = _field(default=None, repr=False)
     _validation_error_reset: _Any = _field(default=None, repr=False)
     _validation_error_take: _Any = _field(default=None, repr=False)
+    _validation_source: _Any = _field(default=None, init=False, repr=False, compare=False)
+    _validation_flag: _Any = _field(default=None, init=False, repr=False, compare=False)
+    _validation_required: bool = _field(default=False, init=False, repr=False, compare=False)
     #: ``emission_concordance.ArtifactEmission``: the book and the
     #: MODULE_TEXT / BUFFER_ORDER cells ``compile_artifact`` derives its
     #: file, command and library rows from (plan 100, 4.2).  None when the
@@ -4618,8 +4902,22 @@ class LLVMFunctionArtifact:
             self._entry = function
         return self._entry
 
+    def _uses_validation_runtime(self) -> bool:
+        # The prepared object pocket was still scanning its 71,996-byte IR
+        # TWICE per native invocation (20 observed searches for 10 calls).
+        # This capability is an artifact fact, not runtime object work. Cache
+        # against the exact text object AND declared flag; a changed text,
+        # flag or dataclasses.replace artifact recomputes the original rule.
+        if (self._validation_source is not self.llvm_ir
+                or self._validation_flag != self.needs_validation_runtime):
+            self._validation_required = bool(self.needs_validation_runtime
+                or "@turing_validation_error(" in self.llvm_ir)
+            self._validation_source = self.llvm_ir
+            self._validation_flag = self.needs_validation_runtime
+        return self._validation_required
+
     def reset_validation_error(self) -> None:
-        if "@turing_validation_error(" not in self.llvm_ir:
+        if not self._uses_validation_runtime():
             return
         self.entry()
         if self._validation_error_reset is None:
@@ -4630,7 +4928,7 @@ class LLVMFunctionArtifact:
         self._validation_error_reset()
 
     def take_validation_error(self) -> int:
-        if "@turing_validation_error(" not in self.llvm_ir:
+        if not self._uses_validation_runtime():
             return 0
         self.entry()
         if self._validation_error_take is None:
@@ -5498,6 +5796,34 @@ def emit_ssa_function_to_llvm(
     shipped artifact depends on this existing.
     """
 
+    from .ssa_object_operations import validate_object_operations
+    validate_object_operations(module, function_name)
+    function = module.functions[function_name]
+    if function.metadata.get("native_interface"):
+        from .identity_concordance import CorrelationTable
+        findings = CorrelationTable._native_interface_findings(module)
+        if findings:
+            raise ValueError(f"native interface emission refused: {findings[:3]}")
+        if watch or history or text_sink:
+            raise ValueError("native interface has no body to watch or publish")
+        piece = function.metadata["llvm_piece"]
+        symbol = str(piece["symbol"])
+        exported = entry_name or function_name
+        if exported == symbol:
+            raise ValueError("native interface entry must differ from its object symbol")
+        # The public buffer ABI is unchanged. Only assembly remains here:
+        # forward the two ABI pointers to the accepted object, not a graph.
+        return LLVMFunctionArtifact(name=exported,
+            llvm_ir=(f"declare void @{symbol}(ptr, ptr)\n"
+                     f"define void @{exported}(ptr %buffers, ptr %extents) {{\n"
+                     f"  call void @{symbol}(ptr %buffers, ptr %extents)\n  ret void\n}}\n"),
+            buffer_order=tuple(piece["buffer_order"]),
+            buffer_shapes=tuple(piece["buffer_shapes"]),
+            buffer_dtypes=tuple(piece["buffer_dtypes"]),
+            extent_order=tuple(piece["extent_order"]), shortfalls=(),
+            linked_objects=tuple(piece["linked_objects"]),
+            needs_validation_runtime=bool(piece.get("needs_validation_runtime")))
+
     from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         extract_llvm_declaration,
         extract_llvm_function,
@@ -5525,6 +5851,8 @@ def emit_ssa_function_to_llvm(
         len(repository_closure) > 1
         or len(module.functions[function_name].blocks) > 1
         or calls_piece
+        or any(str(i.op) == "Alloca" or i.attributes.get("native_heap_abi")
+               for b in module.functions[function_name].blocks.values() for i in b.instrs)
     ):
         return _emit_repository_call_module(
             module,
@@ -6612,7 +6940,8 @@ def emit_ssa_function_to_llvm(
 
 def compile_artifact(
     artifact: LLVMFunctionArtifact, *, directory: _Path | None = None,
-    optimization: str = "O2",
+    optimization: str = "O3",
+    _object_only: bool = False,
 ) -> LLVMFunctionArtifact:
     """Build the emitted module with the LLVM compiler, ahead of time."""
 
@@ -6630,7 +6959,7 @@ def compile_artifact(
     build_dir.mkdir(parents=True, exist_ok=True)
     source = build_dir / f"{artifact.name}.ll"
     source.write_text(artifact.llvm_ir, encoding="utf-8")
-    library = build_dir / f"{artifact.name}.dll"
+    library = build_dir / f"{artifact.name}{'.obj' if _object_only else '.dll'}"
     # Same LLVM toolchain resolution the C backend uses: the ziglang package
     # bundles clang, invoked through the interpreter, no PATH assumptions.
     import importlib.util as _importlib_util
@@ -6655,7 +6984,7 @@ def compile_artifact(
         if zig_binary is not None
         else [_sys.executable, "-m", "ziglang"]
     ) + [
-        "cc", "-shared", optimization_flag,
+        "cc", "-c" if _object_only else "-shared", optimization_flag,
         "-o", str(library), str(source),
     ]
     if _fma_contract_enabled():
@@ -6666,13 +6995,22 @@ def compile_artifact(
 
     for extra_flag in _active_work_contract().compiler_flags:
         command.insert(command.index(optimization_flag) + 1, str(extra_flag))
-    if artifact.needs_text_sink:
+    if not _object_only:
+        import hashlib
+        for object_path, digest in artifact.linked_objects:
+            path = _Path(object_path)
+            with path.open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            if actual != digest:
+                raise ValueError(f"native tile object digest changed: {path}")
+            command.append(str(path))
+    if artifact.needs_text_sink and not _object_only:
         command.append(str(
             _Path(__file__).resolve().parents[1]
             / "common" / "tensors" / "accelerator_backends" / "c_backend"
             / "turing_stream_buffer.c"
         ))
-    if "@turing_validation_error(" in artifact.llvm_ir:
+    if not _object_only and (artifact.needs_validation_runtime or "@turing_validation_error(" in artifact.llvm_ir):
         command.append(str(
             _Path(__file__).resolve().parents[1]
             / "common" / "tensors" / "accelerator_backends" / "c_backend"
@@ -6690,7 +7028,10 @@ def compile_artifact(
             command, capture_output=True, text=True, check=False,
         )
         if completed.returncode == 0 and library.is_file():
-            artifact.library_path = library
+            if _object_only:
+                artifact.object_path = library
+            else:
+                artifact.library_path = library
             if artifact.emission is not None:
                 artifact.emission.build(
                     artifact.name, source_text=artifact.llvm_ir,
@@ -6704,3 +7045,10 @@ def compile_artifact(
         f"LLVM compile failed ({completed.returncode}):\n"
         + completed.stderr[-2000:]
     )
+
+
+def compile_object_artifact(artifact: LLVMFunctionArtifact, *, directory: _Path,
+                            optimization: str = "O2") -> _Path:
+    """Compile one tile with the existing target lane, without linking callees."""
+    compile_artifact(artifact, directory=directory, optimization=optimization, _object_only=True)
+    return artifact.object_path

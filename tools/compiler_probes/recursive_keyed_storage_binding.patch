@@ -1,0 +1,782 @@
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -26810,7 +26810,353 @@
+             dict.fromkeys(receipts)
+         )
+ 
+-    compile_substage("record and keyed-sequence ABI")
++    def bind_declared_keyed_storage(*, bind_query: bool = True) -> None:
++        # Settle borrowed keyed views before recursive invocation leasing.
++        # Reuse this binding after linking for parts produced by source calls.
++        # A table lookup on a keyed mapping walks the mapping's own declared
++        # vectors.  Its descriptor was built during lowering from anonymous
++        # storage -- (keys, values, length, capacity) fresh arguments -- because
++        # the slots exist only after record materialization or call-frame
++        # linking. Bind every available owner now: keys/values/length
++        # are the owner's parts, and a caller-supplied mapping is always exactly
++        # full, so capacity IS the length -- the same value fills both formal
++        # positions.  Both formals must therefore agree with that one value's
++        # real width (int64, matching keys/query below), not the generic
++        # scalar-arena default: declaring either as int32 while the caller's
++        # actual keyed-field length is int64 is a real Fortran ABI mismatch, not
++        # a cosmetic one, since a shared value can only have one true width.
++        # The status cell stays an ordinary frame-allocated scalar.
++        for function in all_functions.values():
++            parts_by_owner: dict[str, dict[str, Any]] = {}
++            key_identity_owners: set[str] = set()
++            for value in function.args:
++                accounting = value.accounting or {}
++                if (
++                    accounting.get("program_abi_value_identity") == "key"
++                    and accounting.get("program_abi_field") is not None
++                ):
++                    key_identity_owners.add(str(
++                        accounting["program_abi_field"]
++                    ))
++                owner_name = accounting.get("program_abi_keyed_owner")
++                part_name = accounting.get("program_abi_keyed_part")
++                if owner_name is None or part_name is None:
++                    continue
++                parts_by_owner.setdefault(str(owner_name), {})[
++                    str(part_name)
++                ] = value
++            for owner_name in key_identity_owners:
++                parts = parts_by_owner.get(owner_name)
++                if parts is not None and "keys" in parts:
++                    parts["values"] = parts["keys"]
++            if not parts_by_owner:
++                continue
++            replaced_storage_ids: set[int] = set()
++            keyed_storage_remap: dict[int, int] = {}
++            for block in function.blocks.values():
++                for instruction in block.instrs:
++                    owner_name = instruction.attributes.get("keyed_lookup_owner")
++                    if owner_name is None:
++                        continue
++                    # Both keyed helpers share the leading (keys, values,
++                    # length, capacity) storage; `lookup` then takes a status
++                    # cell and the key, `contains` only the key. Their helper
++                    # formals follow the same order, so the dtype table is the
++                    # lookup table with the status entry removed.
++                    sequence_operation = str(
++                        instruction.attributes.get("ssa_sequence_operation") or ""
++                    )
++                    parts = parts_by_owner.get(str(owner_name))
++                    if parts is None or any(
++                        name not in parts
++                        for name in ("length", "keys", "values")
++                    ):
++                        continue
++                    value_dtype = str(parts["values"].dtype or "unknown")
++                    keyed_helper_dtypes = (
++                        ("int64", None), (value_dtype, None),
++                        ("int64", (1,)), ("int64", None),
++                        ("int", (1,)), ("int64", None),
++                    )
++                    if sequence_operation == "contains":
++                        if len(instruction.args) < 5:
++                            continue
++                        helper_dtypes = (
++                            *keyed_helper_dtypes[:4], keyed_helper_dtypes[5],
++                        )
++                    else:
++                        if len(instruction.args) < 6:
++                            continue
++                        helper_dtypes = keyed_helper_dtypes
++                    replaced_storage_ids.update(
++                        int(argument.id) for argument in instruction.args[:4]
++                    )
++                    for old_argument, part in zip(
++                        instruction.args[:4],
++                        (parts["keys"], parts["values"],
++                         parts["length"], parts["length"]),
++                    ):
++                        keyed_storage_remap.setdefault(
++                            int(old_argument.id), int(part.id)
++                        )
++                    instruction.args[0] = parts["keys"]
++                    instruction.args[1] = parts["values"]
++                    instruction.args[2] = parts["length"]
++                    instruction.args[3] = parts["length"]
++                    if sequence_operation != "contains" and len(instruction.args) > 4:
++                        # The status cell is the lookup's own per-frame scratch
++                        # (found/missing).  It stays frame-allocated, but it is
++                        # this owner's cell: say so, or the formal carrying it
++                        # has no identity claim at all.
++                        status = instruction.args[4]
++                        status.accounting = {
++                            **dict(status.accounting or {}),
++                            "program_abi_keyed_owner": str(owner_name),
++                            "program_abi_keyed_part": "status",
++                        }
++                    helper = all_functions.get(
++                        str(instruction.attributes.get("callee") or "")
++                    )
++                    if helper is not None:
++                        # Only storage is settled before source-call discovery.
++                        # Query producers (including opaque identity casts) have
++                        # not been linked yet. Keep their incumbent formal type
++                        # until the existing post-link query binding runs.
++                        if not bind_query:
++                            helper_dtypes = (*helper_dtypes[:4], *(
++                                (argument.dtype, None) for argument in helper.args[4:]
++                            ))
++                        typed: dict[int, str] = {}
++                        for argument, (dtype, shape) in zip(
++                            helper.args, helper_dtypes
++                        ):
++                            prior_dtype = argument.dtype
++                            argument.dtype = dtype
++                            if shape is not None and not tuple(
++                                argument.shape or ()
++                            ):
++                                argument.shape = shape
++                            argument.accounting = {
++                                **dict(argument.accounting or {}),
++                                "physical_dtype": dtype,
++                                "physical_dtype_provenance": (
++                                    "keyed_helper_contract"
++                                ),
++                                "physical_dtype_tie_policy": "incumbent",
++                                **({
++                                    "replaced_physical_dtype": str(prior_dtype),
++                                    "replaced_physical_dtype_reason": (
++                                        "keyed_helper_contract_priority"
++                                    ),
++                                } if prior_dtype not in {
++                                    None, "", "unknown", "None", dtype,
++                                } else {}),
++                            }
++                            typed[int(argument.id)] = str(argument.dtype)
++                        # The body holds its own SSAValue instances for the same
++                        # ids; retype them too, and give each Load the element
++                        # type of the span it reads.
++                        span_element = {
++                            int(helper.args[0].id): "int64",
++                            int(helper.args[1].id): value_dtype,
++                        }
++                        address_element: dict[int, str] = {}
++                        for helper_block in helper.blocks.values():
++                            for helper_instruction in helper_block.instrs:
++                                for value in (
++                                    *helper_instruction.args,
++                                    *((helper_instruction.res,)
++                                      if helper_instruction.res is not None
++                                      else ()),
++                                ):
++                                    refined = typed.get(int(value.id))
++                                    if refined is not None:
++                                        value.dtype = refined
++                                if (
++                                    helper_instruction.op == "GetElementPtr"
++                                    and helper_instruction.res is not None
++                                    and helper_instruction.args
++                                ):
++                                    element = span_element.get(
++                                        int(helper_instruction.args[0].id)
++                                    )
++                                    if element is not None:
++                                        address_element[
++                                            int(helper_instruction.res.id)
++                                        ] = element
++                                if (
++                                    helper_instruction.op == "Load"
++                                    and helper_instruction.res is not None
++                                    and helper_instruction.args
++                                ):
++                                    element = address_element.get(
++                                        int(helper_instruction.args[0].id)
++                                    )
++                                    if element is not None:
++                                        helper_instruction.res.dtype = element
++                        helper_table = all_sequence_tables.get(str(helper.name))
++                        if helper_table is not None:
++                            from .concordance_declarations import SEQUENCE_DESCRIPTOR, TABLE_REGISTRATION
++                            for sequence_id, descriptor in tuple(helper_table.sequences.items()):
++                                refined_descriptor = replace(
++                                    descriptor,
++                                    column_dtypes=tuple(
++                                        typed.get(int(value_id), str(dtype))
++                                        for value_id, dtype in zip(
++                                            descriptor.column_value_ids,
++                                            descriptor.column_dtypes,
++                                        )
++                                    ),
++                                )
++                                if refined_descriptor != descriptor:
++                                    helper_table.sequences.assign(int(sequence_id), refined_descriptor,
++                                        sources=_frame_cells(
++                                            _frame_table_cell(helper_table, sequence_id, SEQUENCE_DESCRIPTOR),
++                                            *(_frame_value_cell(helper, value_id)
++                                              for value_id in descriptor.column_value_ids)),
++                                        stage=TABLE_REGISTRATION)
++            if not replaced_storage_ids:
++                continue
++            # The mapping's sequence descriptor was minted over the same
++            # anonymous storage the helper calls just stopped using.  Left as
++            # it was, the function carried the field twice -- the owner's parts
++            # (``error_channels.length/keys/values``, bound exactly at every
++            # call) and a private descriptor whose ids nothing binds -- so the
++            # caller-side propagation below mapped the private ids onto fresh
++            # frame slots and then registered a second descriptor for a
++            # sequence the caller already owned (``conflicting SSA sequence
++            # descriptor``, _propose_dt_pen -> _energy_time_limit over
++            # metrics.error_channels).  Move the descriptor onto the parts too:
++            # keys are its handle, values its second column, and the owner's
++            # length fills both length and capacity, exactly as the helper call
++            # was rebound above.  The status cell stays frame-allocated scratch.
++            keyed_symbol = next(
++                (
++                    candidate_symbol
++                    for candidate_symbol, candidate in all_functions.items()
++                    if candidate is function
++                ),
++                None,
++            )
++            keyed_table = (
++                None if keyed_symbol is None
++                else all_sequence_tables.get(keyed_symbol)
++            )
++            if keyed_table is not None:
++                keyed_values_by_id = {
++                    int(value.id): value for value in function.args
++                }
++                remapped: dict[int, Any] = {}
++                remap_sources: dict[int, tuple] = {}
++                from .concordance_declarations import SEQUENCE_DESCRIPTOR, TABLE_REGISTRATION
++                for old_sequence_id, descriptor in tuple(
++                    keyed_table.sequences.items()
++                ):
++                    touched = {
++                        int(descriptor.sequence_id),
++                        *map(int, descriptor.column_value_ids),
++                        int(descriptor.length_address_id),
++                        int(descriptor.capacity_value_id),
++                    }
++                    if not touched & set(keyed_storage_remap):
++                        remapped[int(old_sequence_id)] = descriptor
++                        continue
++                    moved = replace(
++                        descriptor,
++                        sequence_id=keyed_storage_remap.get(
++                            int(descriptor.sequence_id),
++                            int(descriptor.sequence_id),
++                        ),
++                        column_value_ids=tuple(
++                            keyed_storage_remap.get(int(value_id), int(value_id))
++                            for value_id in descriptor.column_value_ids
++                        ),
++                        length_address_id=keyed_storage_remap.get(
++                            int(descriptor.length_address_id),
++                            int(descriptor.length_address_id),
++                        ),
++                        capacity_value_id=keyed_storage_remap.get(
++                            int(descriptor.capacity_value_id),
++                            int(descriptor.capacity_value_id),
++                        ),
++                        # The Program-ABI parts are the physical incumbent for
++                        # this table.  Preserve their element widths in the
++                        # descriptor as well as on the SSA arguments; leaving
++                        # the pre-materialization ``unknown`` key width here made
++                        # the same keys arena carry two contracts.
++                        column_dtypes=tuple(
++                            str(
++                                keyed_values_by_id.get(
++                                    keyed_storage_remap.get(
++                                        int(value_id), int(value_id)
++                                    ),
++                                    SSAValue(-1),
++                                ).dtype
++                                or "unknown"
++                            )
++                            for value_id in descriptor.column_value_ids
++                        ),
++                    )
++                    incumbent = remapped.get(int(moved.sequence_id))
++                    if incumbent is not None and incumbent != moved:
++                        raise ValueError(
++                            "keyed mapping descriptors disagree after binding "
++                            f"to their owner's parts in {keyed_symbol}: "
++                            f"{incumbent!r} vs {moved!r}"
++                        )
++                    remapped[int(moved.sequence_id)] = moved
++                    remap_sources[int(moved.sequence_id)] = _frame_cells(
++                        *remap_sources.get(int(moved.sequence_id), ()),
++                        _frame_table_cell(keyed_table, old_sequence_id, SEQUENCE_DESCRIPTOR),
++                        *(_frame_value_cell(function, value_id) for value_id in (
++                            moved.sequence_id, *moved.column_value_ids,
++                            moved.length_address_id, moved.capacity_value_id)))
++                # Object length's keyed rebind previously replaced _BookRows with
++                # a dict here. Later retirement then bypassed descriptor/member
++                # revisions, leaving the book and the live table disagreeing.
++                # Preserve the incumbent table and derive each changed row from
++                # the exact old descriptor and the linked physical storage cells.
++                for old_sequence_id in tuple(keyed_table.sequences):
++                    if int(old_sequence_id) not in remapped:
++                        keyed_table.sequences.remove(int(old_sequence_id),
++                            sources=_frame_cells(_frame_table_cell(
++                                keyed_table, old_sequence_id, SEQUENCE_DESCRIPTOR)),
++                            stage=TABLE_REGISTRATION)
++                for sequence_id, descriptor in remapped.items():
++                    if keyed_table.by_id(sequence_id) != descriptor:
++                        keyed_table.sequences.assign(sequence_id, descriptor,
++                            sources=remap_sources[sequence_id], stage=TABLE_REGISTRATION)
++            # The anonymous cells the helper calls no longer read keep only
++            # their own entry initialisation (``ssa_local_sequence_length`` +
++            # ``ssa_local_sequence_initialize``); strip it so the leased
++            # formals below are genuinely unconsumed and get dropped.
++            part_ids = {
++                int(part.id)
++                for parts in parts_by_owner.values()
++                for part in parts.values()
++            }
++            _strip_dead_cell_bookkeeping(
++                function, set(keyed_storage_remap) - part_ids,
++            )
++            still_consumed = {
++                int(argument.id)
++                for block in function.blocks.values()
++                for instruction in block.instrs
++                for argument in instruction.args
++            }
++            dropped_positions = [
++                position
++                for position, value in enumerate(function.args)
++                if int(value.id) in replaced_storage_ids
++                and int(value.id) not in still_consumed
++            ]
++            if not dropped_positions:
++                continue
++            _drop_formals_and_call_operands(
++                all_functions, function, dropped_positions,
++            )
++
++    compile_substage("record and keyed-sequence ABI")
+     report("materializing record and keyed-sequence ABI")
+     _debug_loop_carried_operands(
+         all_functions, "shell-before-record-materialization",
+@@ -26824,9 +27170,10 @@
+     for source_symbol, source_graph in source_graphs_by_symbol.items():
+         materialize_program_abi_record_literals(source_symbol, source_graph)
+ 
+-    for source_symbol in source_graphs_by_symbol:
+-        materialize_record_phis(source_symbol)
+-    report("record and keyed-sequence ABI materialized")
++    for source_symbol in source_graphs_by_symbol:
++        materialize_record_phis(source_symbol)
++    bind_declared_keyed_storage(bind_query=False)
++    report("record and keyed-sequence ABI materialized")
+ 
+     # Literals are source-independent SSA producers. Record materialization
+     # can introduce them after control lowering (notably tuple field leaves
+@@ -38324,340 +38671,7 @@
+             rebuilt_records.append(record)
+         call_records[caller_symbol] = rebuilt_records
+ 
+-    # A table lookup on a keyed mapping walks the mapping's own declared
+-    # vectors.  Its descriptor was built during lowering from anonymous
+-    # storage -- (keys, values, length, capacity) fresh arguments -- because
+-    # the slots exist only after record materialization and call-frame
+-    # linking.  Every frame is linked now, so bind them: keys/values/length
+-    # are the owner's parts, and a caller-supplied mapping is always exactly
+-    # full, so capacity IS the length -- the same value fills both formal
+-    # positions.  Both formals must therefore agree with that one value's
+-    # real width (int64, matching keys/query below), not the generic
+-    # scalar-arena default: declaring either as int32 while the caller's
+-    # actual keyed-field length is int64 is a real Fortran ABI mismatch, not
+-    # a cosmetic one, since a shared value can only have one true width.
+-    # The status cell stays an ordinary frame-allocated scalar.
+-    for function in all_functions.values():
+-        parts_by_owner: dict[str, dict[str, Any]] = {}
+-        key_identity_owners: set[str] = set()
+-        for value in function.args:
+-            accounting = value.accounting or {}
+-            if (
+-                accounting.get("program_abi_value_identity") == "key"
+-                and accounting.get("program_abi_field") is not None
+-            ):
+-                key_identity_owners.add(str(
+-                    accounting["program_abi_field"]
+-                ))
+-            owner_name = accounting.get("program_abi_keyed_owner")
+-            part_name = accounting.get("program_abi_keyed_part")
+-            if owner_name is None or part_name is None:
+-                continue
+-            parts_by_owner.setdefault(str(owner_name), {})[
+-                str(part_name)
+-            ] = value
+-        for owner_name in key_identity_owners:
+-            parts = parts_by_owner.get(owner_name)
+-            if parts is not None and "keys" in parts:
+-                parts["values"] = parts["keys"]
+-        if not parts_by_owner:
+-            continue
+-        replaced_storage_ids: set[int] = set()
+-        keyed_storage_remap: dict[int, int] = {}
+-        for block in function.blocks.values():
+-            for instruction in block.instrs:
+-                owner_name = instruction.attributes.get("keyed_lookup_owner")
+-                if owner_name is None:
+-                    continue
+-                # Both keyed helpers share the leading (keys, values,
+-                # length, capacity) storage; `lookup` then takes a status
+-                # cell and the key, `contains` only the key. Their helper
+-                # formals follow the same order, so the dtype table is the
+-                # lookup table with the status entry removed.
+-                sequence_operation = str(
+-                    instruction.attributes.get("ssa_sequence_operation") or ""
+-                )
+-                parts = parts_by_owner.get(str(owner_name))
+-                if parts is None or any(
+-                    name not in parts
+-                    for name in ("length", "keys", "values")
+-                ):
+-                    continue
+-                value_dtype = str(parts["values"].dtype or "unknown")
+-                keyed_helper_dtypes = (
+-                    ("int64", None), (value_dtype, None),
+-                    ("int64", (1,)), ("int64", None),
+-                    ("int", (1,)), ("int64", None),
+-                )
+-                if sequence_operation == "contains":
+-                    if len(instruction.args) < 5:
+-                        continue
+-                    helper_dtypes = (
+-                        *keyed_helper_dtypes[:4], keyed_helper_dtypes[5],
+-                    )
+-                else:
+-                    if len(instruction.args) < 6:
+-                        continue
+-                    helper_dtypes = keyed_helper_dtypes
+-                replaced_storage_ids.update(
+-                    int(argument.id) for argument in instruction.args[:4]
+-                )
+-                for old_argument, part in zip(
+-                    instruction.args[:4],
+-                    (parts["keys"], parts["values"],
+-                     parts["length"], parts["length"]),
+-                ):
+-                    keyed_storage_remap.setdefault(
+-                        int(old_argument.id), int(part.id)
+-                    )
+-                instruction.args[0] = parts["keys"]
+-                instruction.args[1] = parts["values"]
+-                instruction.args[2] = parts["length"]
+-                instruction.args[3] = parts["length"]
+-                if sequence_operation != "contains" and len(instruction.args) > 4:
+-                    # The status cell is the lookup's own per-frame scratch
+-                    # (found/missing).  It stays frame-allocated, but it is
+-                    # this owner's cell: say so, or the formal carrying it
+-                    # has no identity claim at all.
+-                    status = instruction.args[4]
+-                    status.accounting = {
+-                        **dict(status.accounting or {}),
+-                        "program_abi_keyed_owner": str(owner_name),
+-                        "program_abi_keyed_part": "status",
+-                    }
+-                helper = all_functions.get(
+-                    str(instruction.attributes.get("callee") or "")
+-                )
+-                if helper is not None:
+-                    typed: dict[int, str] = {}
+-                    for argument, (dtype, shape) in zip(
+-                        helper.args, helper_dtypes
+-                    ):
+-                        prior_dtype = argument.dtype
+-                        argument.dtype = dtype
+-                        if shape is not None and not tuple(
+-                            argument.shape or ()
+-                        ):
+-                            argument.shape = shape
+-                        argument.accounting = {
+-                            **dict(argument.accounting or {}),
+-                            "physical_dtype": dtype,
+-                            "physical_dtype_provenance": (
+-                                "keyed_helper_contract"
+-                            ),
+-                            "physical_dtype_tie_policy": "incumbent",
+-                            **({
+-                                "replaced_physical_dtype": str(prior_dtype),
+-                                "replaced_physical_dtype_reason": (
+-                                    "keyed_helper_contract_priority"
+-                                ),
+-                            } if prior_dtype not in {
+-                                None, "", "unknown", "None", dtype,
+-                            } else {}),
+-                        }
+-                        typed[int(argument.id)] = str(argument.dtype)
+-                    # The body holds its own SSAValue instances for the same
+-                    # ids; retype them too, and give each Load the element
+-                    # type of the span it reads.
+-                    span_element = {
+-                        int(helper.args[0].id): "int64",
+-                        int(helper.args[1].id): value_dtype,
+-                    }
+-                    address_element: dict[int, str] = {}
+-                    for helper_block in helper.blocks.values():
+-                        for helper_instruction in helper_block.instrs:
+-                            for value in (
+-                                *helper_instruction.args,
+-                                *((helper_instruction.res,)
+-                                  if helper_instruction.res is not None
+-                                  else ()),
+-                            ):
+-                                refined = typed.get(int(value.id))
+-                                if refined is not None:
+-                                    value.dtype = refined
+-                            if (
+-                                helper_instruction.op == "GetElementPtr"
+-                                and helper_instruction.res is not None
+-                                and helper_instruction.args
+-                            ):
+-                                element = span_element.get(
+-                                    int(helper_instruction.args[0].id)
+-                                )
+-                                if element is not None:
+-                                    address_element[
+-                                        int(helper_instruction.res.id)
+-                                    ] = element
+-                            if (
+-                                helper_instruction.op == "Load"
+-                                and helper_instruction.res is not None
+-                                and helper_instruction.args
+-                            ):
+-                                element = address_element.get(
+-                                    int(helper_instruction.args[0].id)
+-                                )
+-                                if element is not None:
+-                                    helper_instruction.res.dtype = element
+-                    helper_table = all_sequence_tables.get(str(helper.name))
+-                    if helper_table is not None:
+-                        from .concordance_declarations import SEQUENCE_DESCRIPTOR, TABLE_REGISTRATION
+-                        for sequence_id, descriptor in tuple(helper_table.sequences.items()):
+-                            refined_descriptor = replace(
+-                                descriptor,
+-                                column_dtypes=tuple(
+-                                    typed.get(int(value_id), str(dtype))
+-                                    for value_id, dtype in zip(
+-                                        descriptor.column_value_ids,
+-                                        descriptor.column_dtypes,
+-                                    )
+-                                ),
+-                            )
+-                            if refined_descriptor != descriptor:
+-                                helper_table.sequences.assign(int(sequence_id), refined_descriptor,
+-                                    sources=_frame_cells(
+-                                        _frame_table_cell(helper_table, sequence_id, SEQUENCE_DESCRIPTOR),
+-                                        *(_frame_value_cell(helper, value_id)
+-                                          for value_id in descriptor.column_value_ids)),
+-                                    stage=TABLE_REGISTRATION)
+-        if not replaced_storage_ids:
+-            continue
+-        # The mapping's sequence descriptor was minted over the same
+-        # anonymous storage the helper calls just stopped using.  Left as
+-        # it was, the function carried the field twice -- the owner's parts
+-        # (``error_channels.length/keys/values``, bound exactly at every
+-        # call) and a private descriptor whose ids nothing binds -- so the
+-        # caller-side propagation below mapped the private ids onto fresh
+-        # frame slots and then registered a second descriptor for a
+-        # sequence the caller already owned (``conflicting SSA sequence
+-        # descriptor``, _propose_dt_pen -> _energy_time_limit over
+-        # metrics.error_channels).  Move the descriptor onto the parts too:
+-        # keys are its handle, values its second column, and the owner's
+-        # length fills both length and capacity, exactly as the helper call
+-        # was rebound above.  The status cell stays frame-allocated scratch.
+-        keyed_symbol = next(
+-            (
+-                candidate_symbol
+-                for candidate_symbol, candidate in all_functions.items()
+-                if candidate is function
+-            ),
+-            None,
+-        )
+-        keyed_table = (
+-            None if keyed_symbol is None
+-            else all_sequence_tables.get(keyed_symbol)
+-        )
+-        if keyed_table is not None:
+-            keyed_values_by_id = {
+-                int(value.id): value for value in function.args
+-            }
+-            remapped: dict[int, Any] = {}
+-            remap_sources: dict[int, tuple] = {}
+-            from .concordance_declarations import SEQUENCE_DESCRIPTOR, TABLE_REGISTRATION
+-            for old_sequence_id, descriptor in tuple(
+-                keyed_table.sequences.items()
+-            ):
+-                touched = {
+-                    int(descriptor.sequence_id),
+-                    *map(int, descriptor.column_value_ids),
+-                    int(descriptor.length_address_id),
+-                    int(descriptor.capacity_value_id),
+-                }
+-                if not touched & set(keyed_storage_remap):
+-                    remapped[int(old_sequence_id)] = descriptor
+-                    continue
+-                moved = replace(
+-                    descriptor,
+-                    sequence_id=keyed_storage_remap.get(
+-                        int(descriptor.sequence_id),
+-                        int(descriptor.sequence_id),
+-                    ),
+-                    column_value_ids=tuple(
+-                        keyed_storage_remap.get(int(value_id), int(value_id))
+-                        for value_id in descriptor.column_value_ids
+-                    ),
+-                    length_address_id=keyed_storage_remap.get(
+-                        int(descriptor.length_address_id),
+-                        int(descriptor.length_address_id),
+-                    ),
+-                    capacity_value_id=keyed_storage_remap.get(
+-                        int(descriptor.capacity_value_id),
+-                        int(descriptor.capacity_value_id),
+-                    ),
+-                    # The Program-ABI parts are the physical incumbent for
+-                    # this table.  Preserve their element widths in the
+-                    # descriptor as well as on the SSA arguments; leaving
+-                    # the pre-materialization ``unknown`` key width here made
+-                    # the same keys arena carry two contracts.
+-                    column_dtypes=tuple(
+-                        str(
+-                            keyed_values_by_id.get(
+-                                keyed_storage_remap.get(
+-                                    int(value_id), int(value_id)
+-                                ),
+-                                SSAValue(-1),
+-                            ).dtype
+-                            or "unknown"
+-                        )
+-                        for value_id in descriptor.column_value_ids
+-                    ),
+-                )
+-                incumbent = remapped.get(int(moved.sequence_id))
+-                if incumbent is not None and incumbent != moved:
+-                    raise ValueError(
+-                        "keyed mapping descriptors disagree after binding "
+-                        f"to their owner's parts in {keyed_symbol}: "
+-                        f"{incumbent!r} vs {moved!r}"
+-                    )
+-                remapped[int(moved.sequence_id)] = moved
+-                remap_sources[int(moved.sequence_id)] = _frame_cells(
+-                    *remap_sources.get(int(moved.sequence_id), ()),
+-                    _frame_table_cell(keyed_table, old_sequence_id, SEQUENCE_DESCRIPTOR),
+-                    *(_frame_value_cell(function, value_id) for value_id in (
+-                        moved.sequence_id, *moved.column_value_ids,
+-                        moved.length_address_id, moved.capacity_value_id)))
+-            # Object length's keyed rebind previously replaced _BookRows with
+-            # a dict here. Later retirement then bypassed descriptor/member
+-            # revisions, leaving the book and the live table disagreeing.
+-            # Preserve the incumbent table and derive each changed row from
+-            # the exact old descriptor and the linked physical storage cells.
+-            for old_sequence_id in tuple(keyed_table.sequences):
+-                if int(old_sequence_id) not in remapped:
+-                    keyed_table.sequences.remove(int(old_sequence_id),
+-                        sources=_frame_cells(_frame_table_cell(
+-                            keyed_table, old_sequence_id, SEQUENCE_DESCRIPTOR)),
+-                        stage=TABLE_REGISTRATION)
+-            for sequence_id, descriptor in remapped.items():
+-                if keyed_table.by_id(sequence_id) != descriptor:
+-                    keyed_table.sequences.assign(sequence_id, descriptor,
+-                        sources=remap_sources[sequence_id], stage=TABLE_REGISTRATION)
+-        # The anonymous cells the helper calls no longer read keep only
+-        # their own entry initialisation (``ssa_local_sequence_length`` +
+-        # ``ssa_local_sequence_initialize``); strip it so the leased
+-        # formals below are genuinely unconsumed and get dropped.
+-        part_ids = {
+-            int(part.id)
+-            for parts in parts_by_owner.values()
+-            for part in parts.values()
+-        }
+-        _strip_dead_cell_bookkeeping(
+-            function, set(keyed_storage_remap) - part_ids,
+-        )
+-        still_consumed = {
+-            int(argument.id)
+-            for block in function.blocks.values()
+-            for instruction in block.instrs
+-            for argument in instruction.args
+-        }
+-        dropped_positions = [
+-            position
+-            for position, value in enumerate(function.args)
+-            if int(value.id) in replaced_storage_ids
+-            and int(value.id) not in still_consumed
+-        ]
+-        if not dropped_positions:
+-            continue
+-        _drop_formals_and_call_operands(
+-            all_functions, function, dropped_positions,
+-        )
++    bind_declared_keyed_storage()
+ 
+     # A local sequence whose producer specialization selected away leaves a
+     # descriptor over storage nothing defines; retire it and its leased cells.
+diff --git a/tests/test_ssa_object_operations.py b/tests/test_ssa_object_operations.py
+--- a/tests/test_ssa_object_operations.py
++++ b/tests/test_ssa_object_operations.py
+@@ -229,21 +229,57 @@
+         assert arrays['objects[].members.lengths'].tolist() == facts['objects[].members.lengths']
+ 
+ 
+-def test_recursive_keyed_view_reports_unmaterialized_workspace():
+-    # This remains an explicit refusal, NOT a successful recursive/native
+-    # context proof. An authored keyed view still reaches recursive frame
+-    # leasing before its physical decomposition has been linked.
++def test_recursive_keyed_view_binds_storage_before_control_result_refusal():
++    # Borrowed storage must be settled before recursive leasing, without
++    # suppressing the separate, still-missing authored branch-result Phi.
+     source = ('def inspect(book,handle,index):\n    if index<=0:\n'
+               '        result=len(book.objects[id(handle)].members)\n'
+               '    else:\n        result=inspect(book,handle,index-1)\n'
+               '    return result\n'
+               'def root(book,handle,index):\n    return inspect(book,handle,index)\n')
+     from src.compiler.ssa_fortran_backend import FortranEmissionError
+-    with pytest.raises(FortranEmissionError,
+-            match="recursive invocation storage.*private_formal=6, dtype='unknown'.*declared_workspace=True"):
++    with pytest.raises(FortranEmissionError, match='structural_outputs=.*phi') as failure:
+         lower_ast_source_to_ssa(source, 'root', name='recursive_context',
+             extraction_contract=policy(), runtime_closure_only=True,
+             progress=lambda _: None, progress_bars=False)
++    # The rejected module is a diagnostic witness only; do not emit/execute
++    # malformed control SSA or weaken the full-native gate to obtain it.
++    traceback = failure.value.__traceback__
++    module = None
++    while traceback is not None:
++        candidate = traceback.tb_frame.f_locals.get('module')
++        if isinstance(candidate, IRModule):
++            module = candidate
++        traceback = traceback.tb_next
++    assert module is not None
++    recursive_calls = []
++    for function in module.functions.values():
++        for block in function.blocks.values():
++            for call in block.instrs:
++                if call.op == 'Call' and call.attributes.get('callee') == function.name:
++                    recursive_calls.append((function, call))
++    assert recursive_calls
++    paths = ('objects.length', 'objects.keys', 'objects.values',
++             'objects[].members.columns.key', 'objects[].members.columns.value',
++             'objects[].members.lengths', 'objects[].members.row_stride')
++    for function, call in recursive_calls:
++        fields = {v.accounting.get('program_abi_field'): v for v in function.args
++                  if v.accounting.get('program_abi_field')}
++        bindings = dict(zip(call.attributes['callee_input_ids'], call.args))
++        for path in paths:
++            assert bindings[fields[path].id].id == fields[path].id
++            assert 'linked_call_frame_storage' not in fields[path].accounting
++        assert not any(v.accounting.get('program_abi_storage') == 'keyed'
++                       for v in function.args)
++        sequence = module.sequence_tables[function.name].by_id(fields['objects.keys'].id)
++        assert sequence.column_value_ids == (fields['objects.keys'].id, fields['objects.values'].id)
++        assert sequence.column_dtypes == ('int64', 'int64')
++        assert sequence.length_address_id == sequence.capacity_value_id == fields['objects.length'].id
++        local_storage = [i for b in function.blocks.values() for i in b.instrs
++                         if i.attributes.get('binding') == 'recursive_invocation_storage']
++        assert len(local_storage) == 1
++        assert local_storage[0].res.dtype == 'int'
++        assert not local_storage[0].res.accounting.get('sequence_arena')
+ 
+ 
+ @pytest.mark.parametrize('operation', [ObjectOperation.KIND, ObjectOperation.LENGTH,
+

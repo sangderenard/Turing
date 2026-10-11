@@ -214,8 +214,31 @@ class WorkContract:
     # back, so the compile's output does not depend on it; each spill and
     # reload is a ``page_spill_receipt`` row derived from the policy cell.
     spill_cold_pages: bool = False
+    # Compile-wide bound on cached dispatch topologies, not a promise about
+    # source graphs, SSA, or the process RSS. None preserves eager residency.
+    graph_resident_regions: int | None = 8
+    # Dependency-only region scheduling. Publication remains coordinator-owned.
+    # More than one worker bootstraps the authored native graph foundation
+    # through our public source compiler before opening the program's book.
+    graph_workers: int = 1
+    # The existing dependency/control graph partitioner bounds each flat
+    # dispatch. Indivisible semantic groups retain their own veto.
+    graph_region_node_limit: int = 256
+    # Canonical expanded/planning instruction snapshots share one bounded
+    # cache per control lowering. This does NOT bound final SSA bodies or RSS.
+    ssa_resident_regions: int | None = 8
 
     def __post_init__(self) -> None:
+        for label, value, optional in (
+            ("graph_resident_regions", self.graph_resident_regions, True),
+            ("graph_workers", self.graph_workers, False),
+            ("graph_region_node_limit", self.graph_region_node_limit, False),
+            ("ssa_resident_regions", self.ssa_resident_regions, True),
+        ):
+            if not (optional and value is None) and not (
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+            ):
+                raise ValueError(f"{label} must be a positive int" + (" or None" if optional else ""))
         if not isinstance(self.spill_cold_pages, bool):
             raise ValueError(
                 f"spill_cold_pages must be a bool, got {self.spill_cold_pages!r}"
@@ -270,6 +293,8 @@ class WorkContract:
             f"glsl-gemm={self.shaders.blas_gemm}",
             f"deployment={self.deployment}",
             f"callsite-descriptor-reuse={self.callsite_descriptor_reuse}",
+            f"graph-resident-regions={self.graph_resident_regions}",
+            f"graph-workers={self.graph_workers}",
         ]
         return f"{self.name}: " + ", ".join(held)
 
@@ -285,6 +310,9 @@ PRESETS: dict[str, WorkContract] = {
     "develop": WorkContract(
         "develop", register_reuse=True, inexact_identities=False,
         contract_multiply_add=False,
+        # Native products target this host under the ordinary exact preset
+        # too. CPU tuning is not permission for fast-math or inexact laws.
+        compiler_flags=("-march=native",),
     ),
     "deploy": WorkContract(
         "deploy", register_reuse=True, inexact_identities=True,
@@ -368,6 +396,16 @@ def active_contract() -> WorkContract:
     spill = _flag("TURING_SPILL_COLD_PAGES")
     if spill is not None and spill != contract.spill_cold_pages:
         contract = dataclasses.replace(contract, spill_cold_pages=spill)
+
+    for variable, field in (
+        ("TURING_GRAPH_RESIDENT_REGIONS", "graph_resident_regions"),
+        ("TURING_GRAPH_WORKERS", "graph_workers"),
+        ("TURING_GRAPH_REGION_NODE_LIMIT", "graph_region_node_limit"),
+        ("TURING_SSA_RESIDENT_REGIONS", "ssa_resident_regions"),
+    ):
+        raw = os.environ.get(variable)
+        if raw:
+            contract = dataclasses.replace(contract, **{field: int(raw)})
 
     inexact = _flag("TURING_POW_INEXACT")
     fma = _flag("TURING_FMA_CONTRACT")

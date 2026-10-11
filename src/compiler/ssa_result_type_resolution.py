@@ -46,8 +46,9 @@ def settle_call_result_types(functions, emit_outputs, function_values):
         TransformationRule('provisional', 1),
         TransformationRule('callee_output', 2),
         TransformationRule('physical_storage', 3),
-    ), {'provisional': ('callee_output', 'physical_storage'),
-        'callee_output': ('physical_storage',)})
+        TransformationRule('addressed_element', 3),
+    ), {'provisional': ('callee_output', 'physical_storage', 'addressed_element'),
+        'callee_output': ('physical_storage', 'addressed_element')})
     for function in functions.values():
         for value in function_values(function).values():
             accounting = value.accounting or {}
@@ -85,6 +86,12 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 for instruction in block.instrs:
                     if (instruction.op not in {'Call', 'call'}
                             or instruction.attributes.get('result_convention') != 'ssa.aggregate'):
+                        if instruction.op in {'Call', 'call'} and instruction.res is not None:
+                            callee = functions.get(str(instruction.attributes.get('callee', '')))
+                            if callee is not None:
+                                outputs = tuple(emit_outputs(callee.name, callee))
+                                if len(outputs) == 1:
+                                    yield caller, instruction.res, callee, outputs[0]
                         continue
                     callee = functions.get(str(instruction.attributes.get('callee', '')))
                     ids = tuple(map(int, instruction.attributes.get('output_ids', ())))
@@ -149,6 +156,45 @@ def settle_call_result_types(functions, emit_outputs, function_values):
     while changed:
         changed = False
         rounds += 1
+        # Indexed's element type and the call result that publishes it are
+        # one connected type constraint, not two unrelated late passes.
+        # The compiler heap micro-test settled its int64 base after region
+        # carving but still returned float64 views of those integer bytes.
+        # Resolve this exact address edge here, then let the existing call
+        # edges carry the strengthened proof into the caller in this same
+        # fixed point. Raw opaque-pointer Loads keep their declared type.
+        for owner in functions.values():
+            instructions = [item for block in owner.blocks.values() for item in block.instrs]
+            addresses = {
+                int(item.res.id): item.args[0]
+                for item in instructions
+                if item.op == 'GetElementPtr' and item.res is not None and item.args
+            }
+            for item in instructions:
+                if (item.op != 'Load' or item.res is None or not item.args
+                        or item.attributes.get('lowered_from') not in {'Indexed', 'gather'}):
+                    continue
+                base = addresses.get(int(item.args[0].id))
+                if base is None or base.dtype in {None, '', 'unknown', 'ptr', 'ssa.aggregate'}:
+                    continue
+                target = item.res
+                proposal = (base.dtype, tuple(target.shape), base.device)
+                identity = (owner.name, int(target.id))
+                ledger.propose(
+                    identity, 'addressed_element',
+                    (owner.name, int(base.id), int(item.args[0].id), proposal),
+                    before=_type(target), after=proposal,
+                    sources=_value_cells((owner, base), (owner, target)),
+                )
+                winner = ledger.incumbent_target(identity)
+                if winner != _type(target):
+                    target.dtype, target.shape, target.device = winner
+                    changed = True
+                physical = (base.accounting or {}).get('physical_dtype')
+                if physical:
+                    target.accounting = {**dict(target.accounting or {}),
+                        'physical_dtype': physical,
+                        'physical_dtype_provenance': ('addressed_element', owner.name, int(base.id))}
         for caller, target, callee, source in bindings():
             if source.dtype in {None, '', 'unknown'} and not source.shape and source.device is None:
                 continue

@@ -106,7 +106,7 @@ class CFunctionArtifact:
         return not self.shortfalls
 
     def compile(
-        self, directory: str | Path, *, optimization: str = "O2",
+        self, directory: str | Path, *, optimization: str = "O3",
     ) -> "CFunctionArtifact":
         if not self.complete:
             raise ValueError("C artifact has emission shortfalls")
@@ -347,10 +347,18 @@ def emit_ssa_function_to_c(
     module: IRModule, function_name: str, *, entry_name: str | None = None,
     trig_solver: str = "lut",
 ) -> CFunctionArtifact:
+    from .ssa_object_operations import validate_object_operations
+    validate_object_operations(module, function_name)
     from .ir_identities import precision_backend_shortfalls
+    from .identity_concordance import CorrelationTable
+    findings = CorrelationTable._native_interface_findings(module)
+    if findings:
+        raise ValueError(f"native interface emission refused: {findings[:3]}")
     from .work_contract import active_contract
 
     function: Function = module.functions[function_name]
+    if function.metadata.get("native_interface"):
+        raise ValueError("native interfaces use emit_ssa_module_to_c, not the scalar C function ABI")
     name = str(entry_name or function_name)
     inexact_spellings = active_contract().inexact_identities
     # The capability table says C meets both precision obligations; this
@@ -882,7 +890,11 @@ class CModuleExecution:
     _extents: Any = field(default=None, repr=False)
 
     def run(self) -> "CModuleExecution":
+        self.artifact.reset_validation_error()
         self.artifact.entry()(self._pointers, self._extents)
+        validation_error = self.artifact.take_validation_error()
+        if validation_error:
+            raise RuntimeError(f"native tile runtime validation failed with code {validation_error}")
         if self.artifact.external_slots:
             from .external_functions import check_external_faults
 
@@ -948,12 +960,15 @@ class CModuleArtifact:
     #: ``link="dynamic"``, which links against these instead of recompiling
     #: ``linked_llvm``.
     linked_libraries: tuple[tuple[str, str], ...] = ()
+    linked_objects: tuple[tuple[str, str], ...] = ()
+    needs_validation_runtime: bool = False
     #: Declared externals this module calls through its exported slot table
     #: (``external_functions.external_slot_rows``); the host fills them at
     #: load with ``external_functions.bind_external_slots``.
     external_slots: tuple = ()
     library_path: Path | None = None
     _entry: Any = field(default=None, repr=False)
+    _library: Any = field(default=None, repr=False)
     #: Directories the OS loader must search for dynamically linked pieces,
     #: registered by ``entry()`` via ``os.add_dll_directory``.
     _dll_directories: tuple[str, ...] = field(default=(), repr=False)
@@ -1019,7 +1034,7 @@ class CModuleArtifact:
         return inputs, libraries
 
     def compile(
-        self, directory: str | Path, *, optimization: str = "O2",
+        self, directory: str | Path, *, optimization: str = "O3",
         link: str = "static",
     ) -> "CModuleArtifact":
         if link not in {"static", "dynamic"}:
@@ -1069,6 +1084,17 @@ class CModuleArtifact:
                 )
             pool_sources.append(str(destination / "turing_pool.c"))
         pieces: list[tuple[str, str, Any]] = []
+        for object_path, digest in self.linked_objects:
+            import hashlib
+            path = Path(object_path)
+            with path.open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            if actual != digest:
+                raise ValueError(f"native tile object digest changed: {path}")
+            pool_sources.append(str(path))
+        if self.needs_validation_runtime:
+            pool_sources.append(str(Path(__file__).resolve().parents[1] /
+                "common/tensors/accelerator_backends/c_backend/turing_validation_runtime.c"))
         if link == "dynamic":
             # link against the pieces' own DLLs; their IR is not recompiled
             link_inputs, piece_dlls = self._dynamic_link_inputs()
@@ -1128,7 +1154,8 @@ class CModuleArtifact:
                 import os
 
                 self._dll_handles = [os.add_dll_directory(d) for d in self._dll_directories]
-            function = getattr(ctypes.CDLL(str(self.library_path)), self.name)
+            self._library = ctypes.CDLL(str(self.library_path))
+            function = getattr(self._library, self.name)
             function.restype = None
             function.argtypes = [
                 ctypes.POINTER(ctypes.c_void_p),
@@ -1136,6 +1163,21 @@ class CModuleArtifact:
             ]
             self._entry = function
         return self._entry
+
+    def reset_validation_error(self) -> None:
+        if self.needs_validation_runtime:
+            self.entry()
+            reset = self._library.turing_validation_error_reset
+            reset.argtypes, reset.restype = [], None
+            reset()
+
+    def take_validation_error(self) -> int:
+        if not self.needs_validation_runtime:
+            return 0
+        self.entry()
+        take = self._library.turing_validation_error_take
+        take.argtypes, take.restype = [], ctypes.c_uint32
+        return int(take())
 
     def prepare_execution(
         self,
@@ -1427,6 +1469,16 @@ class CModuleArtifact:
                 f"unsupported C optimization level {optimization!r}"
             )
         linked_sources: list[str] = []
+        if self.needs_validation_runtime:
+            raise ValueError("standalone tile validation requires host error handling; use prepare_execution")
+        for object_path, digest in self.linked_objects:
+            import hashlib
+            path = Path(object_path)
+            with path.open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            if actual != digest:
+                raise ValueError(f"native tile object digest changed: {path}")
+            linked_sources.append(str(path))
         pieces: list[tuple[str, str, Any]] = []
         if link == "dynamic":
             # link against the pieces' DLLs and put a copy of each beside the
@@ -1580,7 +1632,13 @@ def emit_ssa_module_to_c(
     """
 
     from .ir_identities import precision_backend_shortfalls
+    from .ssa_object_operations import validate_object_operations
+    validate_object_operations(module, function_name)
     from .ssa_storage_requirements import module_storage_requirements
+    from .identity_concordance import CorrelationTable
+    findings = CorrelationTable._native_interface_findings(module)
+    if findings:
+        raise ValueError(f"native interface emission refused: {findings[:3]}")
     # Plan 100, 4.3: each unit of text is posted beside the append that
     # holds it, on the module's attached book (never the ambient one); the
     # text itself is untouched.
@@ -2202,6 +2260,8 @@ def emit_ssa_module_to_c(
     pooled_regions: list[tuple[str, int]] = []
     linked_llvm: list[tuple[str, str]] = []
     linked_libraries: list[tuple[str, str]] = []
+    linked_objects = []
+    needs_validation_runtime = False
     effect_guard_used = [False]
     deployment_outlines = {
         key: record
@@ -2347,8 +2407,12 @@ def emit_ssa_module_to_c(
                 if extern_line not in prototypes:
                     prototypes.append(extern_line)
                     recorder.unit(UnitKind.PROTOTYPE, extern_line, spelling=symbol)
-                linked_llvm.append((symbol, str(piece["llvm_ir"])))
-                linked_libraries.append((symbol, str(piece.get("library_path") or "")))
+                if piece.get("linked_objects"):
+                    linked_objects.extend(tuple(row) for row in piece["linked_objects"])
+                    needs_validation_runtime |= bool(piece.get("needs_validation_runtime"))
+                else:
+                    linked_llvm.append((symbol, str(piece["llvm_ir"])))
+                    linked_libraries.append((symbol, str(piece.get("library_path") or "")))
                 call_lines = [f"    {symbol}(piece_buffers, piece_extents);"]
             shim = [
                 f"    void *piece_buffers[{max(len(slots), 1)}] = {{"
@@ -5874,6 +5938,8 @@ def emit_ssa_module_to_c(
         external_slots=external_slot_rows(module, slot_functions),
         linked_llvm=tuple(linked_llvm),
         linked_libraries=tuple(linked_libraries),
+        linked_objects=tuple(dict.fromkeys(linked_objects)),
+        needs_validation_runtime=needs_validation_runtime,
         name=name,
         source=source,
         buffer_order=tuple(buffer_order),

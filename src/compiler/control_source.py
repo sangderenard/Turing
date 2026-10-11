@@ -63,7 +63,7 @@ class ControlExpression:
     op: str
     operands: tuple["ControlExpression", ...] = ()
     value_id: int | None = None
-    literal: bool | int | float | None = None
+    literal: bool | int | float | tuple | list | None = None
     # Where a ``value`` leaf was read: ``(consumer node, operand role,
     # ordinal)``, the key of its ``lexical_read_binding`` row.  Structure
     # only -- the binding it read is the book's fact, looked up by the
@@ -147,6 +147,8 @@ class ControlSequenceMutation:
     # preventing its result ID from becoming an invented function argument.
     argument_expressions: tuple[ControlExpression | None, ...] = ()
     extraction_identity: str | None = None
+    # Accepted object representation on the shared book, not a second schema.
+    object_contract_cell: Any = None
 
 
 @dataclass(frozen=True)
@@ -168,7 +170,7 @@ class LoopBlock:
     #: ``(initial id, literal)`` for carried seeds that folded to constants;
     #: the SSA lowering materializes these as Const instead of inventing a
     #: producerless argument for an evaporated node.
-    carried_seeds: tuple[tuple[int, float], ...] = ()
+    carried_seeds: tuple[tuple[int, bool | int | float], ...] = ()
     # The planner has proved that iterations communicate only through
     # induction-indexed publications.  A parallel backend may map one
     # iteration to one workgroup; ordinary renderers retain a serial loop.
@@ -227,7 +229,7 @@ class WhileBlock:
     body: "ControlBlock"
     carried_aliases: tuple[tuple[int, int], ...] = ()
     result_ports: tuple[tuple[int, int, int], ...] = ()
-    carried_seeds: tuple[tuple[int, float], ...] = ()
+    carried_seeds: tuple[tuple[int, bool | int | float], ...] = ()
     recursion_region_id: int | None = None
     predicate_expression: ControlExpression | None = None
     sequence_mutations: tuple[ControlSequenceMutation, ...] = ()
@@ -3462,6 +3464,8 @@ def overlay_scheduled_control(
     *,
     known_nesting: "Mapping[int, Iterable[int]] | None" = None,
     lexical_encloses: "Callable[[int, int], bool] | None" = None,
+    source_graph: Any = None,
+    region_source_nodes: Mapping[int, Iterable[int]] | None = None,
 ) -> ControlProgram:
     """Overlay planned control blocks on the flat scheduled region order.
 
@@ -3484,6 +3488,12 @@ def overlay_scheduled_control(
     they are wrongly treated as independent siblings both claiming the
     same regions, which is exactly the "maximal control blocks overlap
     without containment" failure this parameter exists to prevent.
+
+    For a declared nested loop with no regions, ``source_graph`` supplies
+    the exact authored arm/statement identity. ``region_source_nodes`` is
+    the incumbent dispatch region's deployment-node view, used only to
+    place that loop among the arm's existing statements. Missing evidence
+    refuses instead of running guarded work at the schedule root.
     """
 
     order = tuple(int(index) for index in region_indices)
@@ -3765,6 +3775,101 @@ def overlay_scheduled_control(
 
     nested_roots: dict[int, ControlBlock] = {}
 
+    def place_regionless_loop(root, child_root):
+        """Consume the declared nesting edge in its exact authored arm.
+
+        In root(value,memo)->visit(item), conditional 11 owns comprehension
+        13, but 13 has no numerical regions. The old overlay ignored that
+        edge and emitted 13 beside 11, making recursive child 0 a formal.
+        Source AST objects select the arm and statement slot; region nodes
+        only locate the existing scheduled statements. Neither coordinates
+        nor a scalar dtype is evidence of ownership.
+        """
+        import ast
+        from .glsl_deployment_strategy import _source_control_expression
+
+        graph = getattr(source_graph, "G", source_graph)
+        if graph is None:
+            raise ValueError("region-less nested loop lacks its source graph")
+
+        def expression(node_id):
+            if node_id is None:
+                return None
+            data = graph.nodes.get(int(node_id), {})
+            return data.get("authored_expr_obj") or data.get("expr_obj") or (
+                _source_control_expression(graph, int(node_id))
+            )
+
+        child_expression = expression(child_root.source_loop_node_id)
+
+        def source_ids(block):
+            if isinstance(block, StatementBlock):
+                marker = _region_marker(block)
+                if marker is not None:
+                    return tuple((region_source_nodes or {}).get(marker, ()))
+                callsite = _callsite_marker(block)
+                return () if callsite is None else (callsite,)
+            node_id = getattr(block, "source_node_id", None)
+            if node_id is None:
+                node_id = getattr(block, "source_loop_node_id", None)
+            if node_id is None:
+                node_id = getattr(block, "site_node_id", None)
+            return () if node_id is None else (node_id,)
+
+        def insert(block):
+            if isinstance(block, SequenceBlock):
+                found = False
+                children = []
+                for member in block.blocks:
+                    projected, owned = insert(member)
+                    if owned and found:
+                        raise ValueError("nested loop has multiple authored owners")
+                    found |= owned
+                    children.append(projected)
+                return replace(block, blocks=tuple(children)), found
+            parent_id = getattr(block, "source_node_id", None)
+            if parent_id is None:
+                parent_id = getattr(block, "source_loop_node_id", None)
+            parent_expression = expression(parent_id)
+            slots = []
+            for arm in ("body", "orelse"):
+                if not hasattr(block, arm):
+                    continue
+                statements = getattr(parent_expression, arm, ())
+                if isinstance(statements, ast.AST):
+                    statements = (statements,)
+                members = tuple(frozenset(map(id, ast.walk(statement)))
+                                for statement in statements)
+                matches = [i for i, nodes in enumerate(members)
+                           if id(child_expression) in nodes]
+                if matches:
+                    slots.append((arm, matches, members))
+            if not slots:
+                return block, False
+            if len(slots) != 1 or len(slots[0][1]) != 1:
+                raise ValueError("nested loop has ambiguous authored arm")
+            arm, (ordinal,), members = slots[0]
+            siblings = _flatten_control_sequence(getattr(block, arm))
+            offset = len(siblings)
+            for i, sibling in enumerate(siblings):
+                positions = {j for node in source_ids(sibling)
+                             for j, nodes in enumerate(members)
+                             if id(expression(node)) in nodes}
+                if not positions:
+                    raise ValueError("nested loop sibling lacks source identity")
+                if min(positions) < ordinal <= max(positions):
+                    raise ValueError("scheduled region crosses a nested loop slot")
+                if min(positions) >= ordinal:
+                    offset = i
+                    break
+            body = SequenceBlock((*siblings[:offset], child_root, *siblings[offset:]))
+            return replace(block, **{arm: body}), True
+
+        projected, found = insert(root)
+        if not found:
+            raise ValueError("declared nested loop has no exact authored arm")
+        return projected
+
     def nested_root(index: int, visiting=frozenset()) -> ControlBlock:
         if index in nested_roots:
             return nested_roots[index]
@@ -3783,6 +3888,12 @@ def overlay_scheduled_control(
         # sibling's test reads -- was nested into that arm.
         for child in sorted(direct_children.get(index, ())):
             control = controls[child]
+            if (not control.region_indices
+                    and isinstance(control.root, (LoopBlock, WhileBlock))):
+                root = place_regionless_loop(
+                    root, nested_root(child, visiting | {index}),
+                )
+                continue
             if not _anchored_control(control):
                 continue
             child_root = nested_root(child, visiting | {index})
@@ -3932,9 +4043,10 @@ def overlay_scheduled_control(
         if str(projection) == "induction"
     }
     blocks = [
-        control.root
-        for control in controls
+        nested_root(index)
+        for index, control in enumerate(controls)
         if not control.region_indices
+        and index not in nested_children_overall
         and (
             isinstance(control.root, LoopBlock)
             and (
@@ -3957,7 +4069,7 @@ def overlay_scheduled_control(
             continue
         anchored_top_level.setdefault(
             control.anchor_region, []
-        ).append(control.root)
+        ).append(nested_root(index))
     for region_index in order:
         for anchored in anchored_top_level.pop(region_index, ()):
             blocks.append(anchored)

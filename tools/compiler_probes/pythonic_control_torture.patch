@@ -1,0 +1,829 @@
+diff --git a/src/compiler/glsl_deployment_strategy.py b/src/compiler/glsl_deployment_strategy.py
+index 436c75c..b72db03 100644
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -8607,10 +8607,22 @@ def _source_control_nesting_hints(
+         if candidates:
+             _size, _span, parent_index = min(candidates)
+             children.setdefault(int(parent_index), set()).add(int(child_index))
+-    return {
+-        parent: frozenset(sorted(nested))
+-        for parent, nested in children.items() if nested
+-    }
++    # These are authored ancestor relations, not yet direct ownership edges.
++    # In the controller's `while -> if -> enumerate(failures)` the loop was
++    # claimed by both the conditional and its ancestor; overlay instantiated
++    # the SAME source loop twice, once guarded and once after the guard.
++    # Keep the Hasse diagram of the existing relation, not a second parent
++    # chosen by region sizes or coordinates. Reachability is unchanged.
++    import networkx as nx
++    ownership = nx.DiGraph()
++    ownership.add_edges_from((parent, child)
++                             for parent, nested in children.items()
++                             for child in nested)
++    if not nx.is_directed_acyclic_graph(ownership):
++        raise ValueError('authored control ownership contains a cycle')
++    direct = nx.transitive_reduction(ownership)
++    return {parent: frozenset(direct.successors(parent)) for parent in direct
++            if direct.out_degree(parent)}
+ 
+ 
+ def _overlay_control_or_require_subdivision(
+
+diff --git a/src/compiler/loop_composer.py b/src/compiler/loop_composer.py
+index ff97a9b..2d1d6d1 100644
+--- a/src/compiler/loop_composer.py
++++ b/src/compiler/loop_composer.py
+@@ -65,6 +65,46 @@ from .concordance_declarations import (
+ )
+ 
+ 
++def _spliced_tuple_extent(graph_obj: Any, node_id: int, seen=frozenset()) -> str | None:
++    """Project cardinality from tuple/star edges, without allocating the row."""
++    if node_id in seen or node_id not in graph_obj:
++        return None
++    data = graph_obj.nodes[node_id]
++    expression = data.get('expr_obj')
++    if not isinstance(expression, ast.Tuple) or not any(
++        isinstance(item, ast.Starred) for item in expression.elts
++    ):
++        return None
++    # Controller tuple598 is (*failures, (dt, metrics, reasons)). Its extent
++    # is the incumbent failures length PLUS ONE row, not a public tensor's
++    # shape or the three leaves of that row. Exact operand/AST identities
++    # prove each splice. Existing lowering evaluates this bound at loop entry,
++    # so subsequent mutation of failures cannot extend the tuple iteration.
++    parents = [int(parent) for parent, role in data.get('parents', ())
++               if str(role).startswith('elts') and parent in graph_obj]
++    terms = []
++    for item in expression.elts:
++        if not isinstance(item, ast.Starred):
++            continue
++        wrappers = [parent for parent in parents if graph_obj.nodes[parent].get('expr_obj') is item]
++        if len(wrappers) != 1:
++            return None
++        sources = [int(parent) for parent, role in graph_obj.nodes[wrappers[0]].get('parents', ())
++                   if str(role) == 'value' and parent in graph_obj]
++        if len(sources) != 1:
++            return None
++        source = sources[0]
++        attributes = graph_obj.nodes[source].get('attributes') or {}
++        if attributes.get('aggregate_kind') not in {'list', 'tuple', 'bytes', 'bytearray'}:
++            return None
++        nested = _spliced_tuple_extent(graph_obj, source, seen | {node_id})
++        terms.append(nested or f"__iterable_extent_{int(graph_obj.nodes[source].get('value_id', source))}__")
++    fixed = sum(not isinstance(item, ast.Starred) for item in expression.elts)
++    if fixed:
++        terms.append(str(fixed))
++    return '(' + ' + '.join(terms) + ')'
++
++
+ class LoopStrategy(str, Enum):
+     CONSTANT = "constant"
+     UNROLL = "unroll"
+@@ -5791,7 +5831,8 @@ def analyze_shader_loop_reductions(
+                         is IterableAccess.CLOSURE_AGGREGATE
+                         and plan.semantic.domain.source_value_ids
+                     )
+-                    else f"__iterable_extent_{iterable_extent_id}__"
++                    else (_spliced_tuple_extent(graph.G, int(iterable_extent_id))
++                          or f"__iterable_extent_{iterable_extent_id}__")
+                     if loop.stop_node is None and loop.iterable_node is not None
+                     and loop.iterable_constant is None
+                     else str(len(loop.iterable_constant))
+
+diff --git a/src/compiler/hierarchical_control.py b/src/compiler/hierarchical_control.py
+index 1e21cd0..201466c 100644
+--- a/src/compiler/hierarchical_control.py
++++ b/src/compiler/hierarchical_control.py
+@@ -280,14 +280,13 @@ def compose_hierarchical_control(
+                 for iterable, _target, _induction, _projection
+                 in local.projected_iterable_bindings
+             )
+-            for local_iterable_id in local_iterable_ids:
+-                local_marker = (
+-                    f"__iterable_extent_{local_iterable_id}__"
+-                )
+-                global_marker = (
+-                    f"__iterable_extent_{value(local_iterable_id)}__"
+-                )
+-                result = result.replace(local_marker, global_marker)
++            # A tuple splice's cardinality can reference resident lengths
++            # other than the final iterable's binding. Namespace every exact
++            # extent identity in one pass, including those derived operands;
++            # sequential substitutions can accidentally rename a global twice.
++            result = re.sub(r"__iterable_extent_(\d+)__",
++                            lambda match: f"__iterable_extent_{value(int(match.group(1)))}__",
++                            result)
+             return result
+         # Hierarchy identity reduction can legitimately prove that both sides
+         # of a planner alias are the same canonical resident value.  Such an
+
+diff --git a/src/compiler/precompile_to_ssa.py b/src/compiler/precompile_to_ssa.py
+index 28ce6d8..73a575e 100644
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -6171,6 +6171,8 @@ class _ControlSSABuilder:
+                 )
+                 return value
+             if isinstance(node, ast.Name):
++                if re.fullmatch(r"__iterable_extent_\d+__", node.id):
++                    return self.expression_value(node.id, location='iterable_cardinality')
+                 control = re.fullmatch(r"u_control_(\d+)", node.id)
+                 if control is not None:
+                     return self.external_value(int(control.group(1)))
+@@ -16377,6 +16379,12 @@ def lower_control_sections_to_ssa(
+             planned_instructions = region_instructions(planned)
+             planned_region_instructions[planned_index] = planned_instructions
+ 
++    captured_row_loads: set[int] = set()
++    planned_result_ids = {
++        int(instruction.res.id)
++        for instructions in planned_region_instructions.values()
++        for instruction in instructions if instruction.res is not None
++    }
+     if hierarchy_plan is not None:
+         for region in hierarchy_plan.items:
+             if not (
+@@ -16442,12 +16450,23 @@ def lower_control_sections_to_ssa(
+                         == "builtins.max"
+                     )
+                 ]
+-            row_loads = tuple(
++            row_loads = tuple(dict.fromkeys((*(
+                 row_load_by_result[int(instruction.res.id)]
+                 for instruction in instructions
+                 if instruction.res is not None
+                 and int(instruction.res.id) in row_load_by_result
+-            )
++            ), *(
++                # values[2] after append survives as an exact graph read but
++                # the numeric plan keeps only its scalar feed, not Indexed.
++                # Recover the existing row operation at its first consuming
++                # region ONLY when no region owns its defining instruction.
++                row_load_by_result[value_id]
++                for value_id in region_free_value_ids(instructions)
++                if value_id in row_load_by_result
++                and value_id not in planned_result_ids
++                and value_id not in captured_row_loads
++            ))))
++            captured_row_loads.update(int(operation[0]) for operation in row_loads)
+             row_stores = tuple(
+                 row_store_by_result[int(instruction.res.id)]
+                 for instruction in instructions
+
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+index 690e61c..0a71d80 100644
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -124,6 +124,7 @@ from .resident_sequence_materialization import (
+     _identity_return_aliases as _identity_return_aliases,
+     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
+     _joined_list_literal_mutations as _joined_list_literal_mutations,
++    _list_literal_mutations as _list_literal_mutations,
+     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
+     _loop_carried_storage_aliases as _loop_carried_storage_aliases,
+     _promote_conditional_sequence_aliases as _promote_conditional_sequence_aliases,
+@@ -12990,9 +12991,9 @@ def _sequence_row_operations(
+                             in sequence_declarations if policy == "duplicates"}
+     widths = {
+         int(sequence_id): int(column_count)
+-        for sequence_id, _policy, column_count, _writable
++        for sequence_id, policy, column_count, _writable
+         in sequence_declarations
+-        if int(column_count) > 1
++        if int(column_count) > 1 or policy == "duplicates" and int(column_count) == 1
+     }
+     if not widths:
+         return ()
+@@ -13066,11 +13067,23 @@ def _sequence_row_operations(
+     for node_id, data in sorted(graph_obj.nodes(data=True)):
+         kind = str(data.get("op") or data.get("type") or "").casefold()
+         node_roles = roles(data)
+-        if kind == "indexed":
++        if kind in {"indexed", "subscript"}:
+             outer_id = node_roles.get("base")
+             column_node = node_roles.get("index")
+             if outer_id is None or column_node is None:
+                 continue
++            # A scalar list row is column zero of the SAME resident table.
++            # [10,20].append(30); values[2] used to lose its producer because
++            # this collector admitted only multi-column rows. SSA then made
++            # that read an unnamed formal. Use the existing row-load route.
++            direct_sequence = resident_by_value.get(value_id(outer_id))
++            if direct_sequence in positional_sequences and widths[direct_sequence] == 1:
++                operations.append((
++                    "load", value_id(node_id), int(direct_sequence),
++                    value_id(column_node), integer_literal(column_node), 0,
++                    value_id(node_id),
++                ))
++                continue
+             outer = graph_obj.nodes[outer_id]
+             if str(outer.get("op") or outer.get("type") or "").casefold() != "indexed":
+                 continue
+@@ -17709,13 +17722,16 @@ def _class_surface_ssa_program(
+         joined_literal_mutations = _joined_list_literal_mutations(
+             graph_obj, joined_sequence_ids
+         )
+-        if joined_literal_mutations:
++        literal_mutations = (*joined_literal_mutations, *_list_literal_mutations(
++            graph_obj, declared_sequence_ids - set(joined_sequence_ids) - native_handle_ids,
++        ))
++        if literal_mutations:
+             control, joined_literal_shortfalls = (
+                 _install_lexical_sequence_mutations(
+                     control,
+                     graph,
+                     getattr(shell, "dispatch_subgraphs", ()),
+-                    extra_mutations=joined_literal_mutations,
++                    extra_mutations=literal_mutations,
+                 )
+             )
+             lexical_sequence_shortfalls = (
+@@ -19007,6 +19023,7 @@ def _class_surface_ssa_program(
+                 _static_sequence_capacity_bounds(
+                     graph_obj,
+                     nonmutating_call_ids=nonmutating_record_calls,
++                    control=control,
+                 )
+             )
+             module_ir.functions[symbol].metadata[
+
+diff --git a/src/compiler/resident_sequence_materialization.py b/src/compiler/resident_sequence_materialization.py
+index 50ccd0d..700d2bb 100644
+--- a/src/compiler/resident_sequence_materialization.py
++++ b/src/compiler/resident_sequence_materialization.py
+@@ -600,10 +600,158 @@ def _static_mapping_capacity_bounds(
+             if node_id not in unknown}
+ 
+ 
++def _control_sequence_capacity_bounds(control: Any, sequence_ids: Iterable[int]) -> dict[int, int]:
++    """Interval transfer over the existing lexical control tree, not a replay.
++
++    In the controller-shaped repro, failures grows at most once in a while
++    whose every path breaks, and lines starts with one row then grows at most
++    len(failures). Treating every loop as unbounded discarded both proofs;
++    the native frame defaulted to one row and append silently hit capacity.
++    Branches join by max; bounded loops multiply growth. Unknown backedges or
++    a loop mutating its own extent invalidate the affected bound, not guess.
++    """
++    import re
++    from .control_source import (CallBlock, ConditionalBlock, LoopBlock,
++        LoopControlBlock, SequenceBlock, SequenceMutationBlock, WhileBlock)
++
++    initial = {int(value_id): 0 for value_id in sequence_ids}
++    peaks = dict(initial)
++
++    def join(left, right):
++        return {key: None if left[key] is None or right[key] is None
++                else max(left[key], right[key]) for key in initial}
++
++    def effects(block):
++        if block is None:
++            return ()
++        result = list(getattr(block, "sequence_mutations", ()))
++        if isinstance(block, SequenceMutationBlock):
++            result.append(block.mutation)
++        for child in getattr(block, "blocks", ()):
++            result.extend(effects(child))
++        for arm in ("condition", "body", "orelse", "callee"):
++            result.extend(effects(getattr(block, arm, None)))
++        return tuple(result)
++
++    def outcomes(block):
++        if isinstance(block, LoopControlBlock):
++            return ({block.action} if block.predicate_value_id is None
++                    and block.predicate_expression is None else {"normal", block.action})
++        if isinstance(block, SequenceBlock):
++            result = {"normal"}
++            for child in block.blocks:
++                if "normal" not in result:
++                    break
++                result = (result - {"normal"}) | outcomes(child)
++            return result
++        if isinstance(block, ConditionalBlock):
++            return outcomes(block.body) | outcomes(block.orelse)
++        return {"normal"}
++
++    def extent(text, state):
++        def expression(node):
++            if isinstance(node, ast.Constant) and isinstance(node.value, int):
++                return int(node.value)
++            if isinstance(node, ast.Name):
++                match = re.fullmatch(r"__iterable_extent_(\d+)__", node.id)
++                return state.get(int(match[1])) if match else None
++            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
++                left, right = expression(node.left), expression(node.right)
++                return None if left is None or right is None else left + right
++            return None
++        try:
++            return expression(ast.parse(str(text), mode="eval").body)
++        except (SyntaxError, ValueError, TypeError):
++            return None
++
++    def mutate(mutation, state):
++        sequence_id = int(mutation.sequence_value_id)
++        if sequence_id not in state:
++            return state
++        state = dict(state)
++        current = state[sequence_id]
++        if mutation.operator == "clear" and mutation.predicate_expression is None:
++            state[sequence_id] = 0
++        elif mutation.operator == "append" and current is not None:
++            state[sequence_id] = current + 1
++        elif mutation.operator not in {"clear", "pop", "remove"}:
++            state[sequence_id] = None
++        peaks[sequence_id] = (None if peaks[sequence_id] is None or state[sequence_id] is None
++                              else max(peaks[sequence_id], state[sequence_id]))
++        return state
++
++    def visit(block, state):
++        if block is None:
++            return state
++        if isinstance(block, SequenceMutationBlock):
++            return mutate(block.mutation, state)
++        if isinstance(block, SequenceBlock):
++            for child in block.blocks:
++                state = visit(child, state)
++                if outcomes(child) <= {"break", "return", "continue"}:
++                    break
++            return state
++        if isinstance(block, ConditionalBlock):
++            return join(visit(block.body, dict(state)), visit(block.orelse, dict(state)))
++        if isinstance(block, CallBlock):
++            return visit(block.callee, state)
++        if isinstance(block, (LoopBlock, WhileBlock)):
++            writes = {int(m.sequence_value_id) for m in effects(block)} & set(initial)
++            count = None
++            if isinstance(block, WhileBlock):
++                body_outcomes = outcomes(SequenceBlock((block.body, *block.terminal_controls)))
++                if body_outcomes <= {"break", "return"}:
++                    count = 1
++            else:
++                start, stop, step = (extent(text, state) for text in (block.start, block.stop, block.step))
++                reads = {int(value_id) for value_id in re.findall(
++                    r"__iterable_extent_(\d+)__", str(block.stop))}
++                if (not reads & writes and start is not None and stop is not None
++                        and step is not None and step > 0):
++                    count = len(range(start, stop, step))
++            if count is None:
++                state = dict(state)
++                for key in writes:
++                    state[key] = peaks[key] = None
++                return state
++            if count == 0:
++                return state
++            before = dict(state)
++            state = visit(getattr(block, "condition", None), dict(state))
++            state = visit(block.body, state)
++            for mutation in block.sequence_mutations:
++                state = mutate(mutation, state)
++            if count > 1:
++                # Nested bounds must be invariant over the outer body. A
++                # written extent could grow each iteration; do not extrapolate
++                # the first iteration's work in that case.
++                def variable_extent(candidate):
++                    if isinstance(candidate, LoopBlock) and writes & {
++                        int(v) for v in re.findall(r"__iterable_extent_(\d+)__", str(candidate.stop))}:
++                        return True
++                    return any(variable_extent(child) for child in getattr(candidate, "blocks", ())) or any(
++                        variable_extent(getattr(candidate, arm)) for arm in ("body", "orelse", "callee")
++                        if getattr(candidate, arm, None) is not None)
++                unsafe = variable_extent(block.body)
++                for key in writes:
++                    if unsafe or before[key] is None or state[key] is None or peaks[key] is None:
++                        state[key] = peaks[key] = None
++                    else:
++                        growth = max(0, state[key] - before[key], peaks[key] - before[key])
++                        state[key] = before[key] + count * growth
++                        peaks[key] = max(peaks[key], state[key])
++            return join(before, state)
++        return state
++
++    visit(control.root, initial)
++    return {key: value for key, value in peaks.items() if value is not None}
++
++
+ def _static_sequence_capacity_bounds(
+     graph_obj: Any,
+     *,
+     nonmutating_call_ids: Iterable[int] = (),
++    control: Any = None,
+ ) -> dict[int, int]:
+     bounds = _static_mapping_capacity_bounds(
+         graph_obj,
+@@ -613,6 +761,7 @@ def _static_sequence_capacity_bounds(
+                    for node_id, data in graph_obj.nodes(data=True)
+                    if isinstance(data.get("expr_obj"), ast.List)}
+     unknown = set()
++    escaped = set()
+     loops = [data["expr_obj"] for _, data in graph_obj.nodes(data=True)
+              if isinstance(data.get("expr_obj"), (ast.For, ast.While))]
+     for mutation in _sequence_append_call_mutations(graph_obj):
+@@ -631,12 +780,17 @@ def _static_sequence_capacity_bounds(
+         if not isinstance(expression, ast.Call):
+             continue
+         identity = (data.get("attributes") or {}).get("extraction_identity")
+-        if identity in {"builtins.tuple", "builtins.len", "builtins.bool"}:
++        if identity in {"builtins.tuple", "builtins.len", "builtins.bool", "builtins.enumerate"}:
+             continue
+         for parent, role in data.get("parents") or ():
+             if str(role).startswith("arg:") and int(parent) in local_lists:
+                 unknown.add(int(parent))
++                escaped.add(int(parent))
+     bounds.update({key: count for key, count in local_lists.items() if key not in unknown})
++    if control is not None:
++        bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
++            control, local_lists,
++        ).items() if key not in escaped})
+     for mutation in _source_sequence_snapshots(graph_obj):
+         source = int(mutation.argument_value_ids[0])
+         if source in bounds:
+@@ -898,6 +1052,61 @@ def _joined_byte_sequence_ids(
+     return tuple(sorted(joined))
+ 
+ 
++def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tuple[Any, ...]:
++    """Publish ordinary list rows at their exact authored construction site.
++
++    ``lines=[10.0]; lines.append(20.0)`` retained List->Constant edges but
++    received only the frame's zero-length initializer. A list birth is a
++    lexical clear followed by its ordered rows, just like a dict birth. The
++    accepted joined-byte and opaque-object representations retain their own
++    materializers; callers pass only ordinary declared sequence identities.
++    """
++    from .control_source import ControlExpression, ControlSequenceMutation
++    from .string_table import string_token
++
++    accepted = set(map(int, sequence_ids))
++    mutations = []
++    for node_id, data in graph_obj.nodes(data=True):
++        sequence_id = int(data.get("value_id", node_id))
++        expression = data.get("expr_obj")
++        attributes = data.get("attributes") or {}
++        if (sequence_id not in accepted or not isinstance(expression, ast.List)
++                or not expression.elts
++                or attributes.get("producer_kind") != "aggregate"
++                or attributes.get("materialization_kind") is not None):
++            continue
++        parents = tuple((int(parent), graph_obj.nodes[parent])
++                        for parent, role in data.get("parents", ())
++                        if str(role).startswith("elts") and parent in graph_obj)
++        rows = []
++        for element in expression.elts:
++            exact = tuple((parent, row) for parent, row in parents
++                          if row.get("expr_obj") is element)
++            if len(exact) != 1 or isinstance(element, ast.Starred):
++                raise ValueError(f"List {sequence_id} lacks one exact element producer")
++            parent, row = exact[0]
++            value_id = int(row.get("value_id", parent))
++            leaves = tuple(map(int, (row.get("attributes") or {}).get(
++                "aggregate_leaf_value_ids", ())))
++            arguments = (leaves if isinstance(element, ast.Tuple) and leaves else (value_id,))
++            expressions = ()
++            if isinstance(element, ast.Constant) and isinstance(element.value, (bool, int, float, str)):
++                literal = string_token(element.value) if isinstance(element.value, str) else element.value
++                expressions = (ControlExpression("const", literal=literal),)
++            rows.append(ControlSequenceMutation(
++                sequence_value_id=sequence_id, operator="append",
++                argument_value_ids=arguments, effect_node_id=parent,
++                policy="duplicates", argument_kind="row" if len(arguments) > 1 else "value",
++                argument_expressions=expressions,
++            ))
++        mutations.append(ControlSequenceMutation(
++            sequence_value_id=sequence_id, operator="clear", argument_value_ids=(),
++            effect_node_id=int(node_id), policy="duplicates",
++        ))
++        mutations.extend(rows)
++    return tuple(mutations)
++
++
+ def _joined_list_literal_mutations(
+     graph_obj: Any, joined_sequence_ids: Iterable[int]
+ ) -> tuple[Any, ...]:
+
+diff --git a/src/compiler/ssa_llvm_backend.py b/src/compiler/ssa_llvm_backend.py
+index 8a1e398..9a9c212 100644
+--- a/src/compiler/ssa_llvm_backend.py
++++ b/src/compiler/ssa_llvm_backend.py
+@@ -4563,6 +4563,7 @@ def _emit_repository_call_module(
+         entry_span.take(UnitKind.FORMAL, args=(value,), spelling=loaded)
+         public_pointer[value_id] = loaded
+     wrapper_frees: list[str] = []
++    allocated_counts: dict[int, int] = {}
+     for storage_index, value in enumerate(root_internal_storage):
+         llvm_type = _value_llvm_type(value)
+         requirement = storage_requirements.get(int(value.id))
+@@ -4575,6 +4576,30 @@ def _emit_repository_call_module(
+         _frame_slot(local, llvm_type, count, wrapper, wrapper_frees)
+         entry_span.take(UnitKind.DECLARATION, args=(value,), spelling=local)
+         public_pointer[int(value.id)] = local
++        allocated_counts[int(value.id)] = count
++    # [10,20].append(30) emitted all three row writes correctly, but LLVM's
++    # root frame left the private capacity cell uninitialized. In the repro
++    # append read zero and reported full. Publish the ACTUAL bound, as the C
++    # wrapper already does; borrowed arenas and dynamic pointer cells retain
++    # their incoming ownership/capacity contract.
++    from .ir_sequence_tables import SSASequenceCapacityPolicy
++    root_sequences = getattr(module, "sequence_tables", {}).get(function_name)
++    root_arguments = {int(value.id): value for value in root.args}
++    if root_sequences is not None:
++        for sequence in root_sequences.sequences.values():
++            capacity_id = int(sequence.capacity_value_id)
++            if (sequence.capacity_policy != SSASequenceCapacityPolicy.FIXED
++                    or capacity_id not in allocated_counts
++                    or not all(int(column) in allocated_counts for column in sequence.column_value_ids)):
++                continue
++            row_shapes = sequence.column_shapes or tuple(() for _ in sequence.column_value_ids)
++            rows = min(allocated_counts[int(column)] // max(1, _math.prod(shape or (1,)))
++                       for column, shape in zip(sequence.column_value_ids, row_shapes, strict=True))
++            capacity = root_arguments[capacity_id]
++            llvm_type = _value_llvm_type(capacity)
++            wrapper.append(f"  store {llvm_type} {rows}, ptr {public_pointer[capacity_id]}, align {_align(llvm_type)}")
++            entry_span.take(UnitKind.STATEMENT, args=(capacity, *(root_arguments[int(column)]
++                for column in sequence.column_value_ids)), spelling=public_pointer[capacity_id])
+     internal_call_records.append((
+         None,
+         internal_symbols[function_name],
+
+diff --git a/tests/test_source_control_direct_ownership.py b/tests/test_source_control_direct_ownership.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_source_control_direct_ownership.py
+@@ -0,0 +1,62 @@
++"""A retained loop has its closest authored owner, not every ancestor."""
++import pickle
++import subprocess
++import sys
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++
++SOURCE = '''
++def root(rejected):
++    failures = []
++    lines = [10.0]
++    while True:
++        if rejected:
++            failures.append((1.0, 2.0, (3.0,)))
++        if rejected:
++            for index, (dt_f, m, why) in enumerate(failures, 1):
++                lines.append(20.0)
++        break
++    return len(lines)
++'''
++
++def lower():
++    policy = ExtractionContract('extraction_contracts/program_extraction.yaml').with_execution_file(
++        'extraction_contracts/vehicle_full_native_execution.yaml').with_program_abi({
++        'bindings': [], 'values': [{'function': 'root', 'parameter': 'rejected',
++        'storage': 'scalar', 'dtype': 'bool', 'rank': 0, 'python_type': 'builtins.bool'}]})
++    return lower_ast_source_to_ssa(SOURCE, 'root', name='direct_control_owner',
++                                 extraction_contract=policy, progress=lambda message: None)
++
++def test_loop_inside_conditional_inside_while_is_lowered_once():
++    module, _, exports = lower()
++    function = module.functions[exports[0]]
++    headers = [instruction for block in function.blocks.values() for instruction in block.instrs
++               if instruction.op == 'Phi' and instruction.attributes.get('source_loop_node_id') is not None]
++    assert len(headers) == 1, [(instruction.attributes['source_loop_node_id'], instruction.res.id)
++                               for instruction in headers]
++
++def test_guarded_loop_executes_once_and_only_in_its_authored_arm(tmp_path):
++    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
++    module, outputs, exports = lower()
++    function = module.functions[exports[0]]
++    artifact = emit_ssa_module_to_c(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    artifact.compile(tmp_path / 'native')
++    parameter = dict(function.metadata['parameter_names'])['rejected']
++    result = outputs[function.name][0].id
++    saved = tmp_path / 'proof.pkl'
++    saved.write_bytes(pickle.dumps((artifact, parameter, result)))
++    probe = subprocess.run([sys.executable, '-u', '-c', '''
++import pickle, sys
++import numpy as np
++artifact, parameter, result = pickle.load(open(sys.argv[1], 'rb'))
++execution = artifact.prepare_execution({parameter: np.array([False], dtype=np.bool_)})
++for rejected, expected in ((False, 1), (True, 2), (False, 1), (True, 2)):
++    execution.buffers[parameter][0] = rejected
++    execution.run()
++    actual = execution.buffers[result].item()
++    print('GUARDED_NATIVE', rejected, actual, expected, flush=True)
++    assert actual == expected, (rejected, actual, expected)
++''', str(saved)], capture_output=True, text=True)
++    print(probe.stdout, end='')
++    assert probe.returncode == 0, probe.stdout + probe.stderr
+diff --git a/tests/test_spliced_tuple_extent.py b/tests/test_spliced_tuple_extent.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_spliced_tuple_extent.py
+@@ -0,0 +1,48 @@
++"""Iteration cardinality is projected from exact tuple/star operand edges."""
++import pickle
++import subprocess
++import sys
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++from src.compiler.ssa_c_backend import emit_ssa_module_to_c
++
++SOURCE = '''
++def root(rejected):
++    failures = []
++    if rejected:
++        failures.append((1.0, 2.0, (3.0,)))
++    count = 0.0
++    for index, (dt_f, m, why) in enumerate((*failures, (4.0, 5.0, (6.0,))), 1):
++        count += 1.0
++    return count
++'''
++
++def test_spliced_tuple_count_uses_resident_length_without_a_tuple_buffer(tmp_path):
++    policy = ExtractionContract('extraction_contracts/program_extraction.yaml').with_execution_file(
++        'extraction_contracts/vehicle_full_native_execution.yaml').with_program_abi({
++        'bindings': [], 'values': [{'function': 'root', 'parameter': 'rejected',
++        'storage': 'scalar', 'dtype': 'bool', 'rank': 0, 'python_type': 'builtins.bool'}]})
++    module, outputs, exports = lower_ast_source_to_ssa(SOURCE, 'root', name='spliced_extent',
++        extraction_contract=policy, progress=lambda message: None)
++    function = module.functions[exports[0]]
++    artifact = emit_ssa_module_to_c(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    artifact.compile(tmp_path / 'native')
++    parameter = dict(function.metadata['parameter_names'])['rejected']
++    result = outputs[function.name][0].id
++    saved = tmp_path / 'proof.pkl'
++    saved.write_bytes(pickle.dumps((artifact, parameter, result)))
++    probe = subprocess.run([sys.executable, '-u', '-c', '''
++import pickle, sys
++import numpy as np
++artifact, parameter, result = pickle.load(open(sys.argv[1], 'rb'))
++execution = artifact.prepare_execution({parameter: np.array([False], dtype=np.bool_)})
++for rejected, expected in ((False, 1.0), (True, 2.0), (False, 1.0), (True, 2.0)):
++    execution.buffers[parameter][0] = rejected
++    execution.run()
++    actual = execution.buffers[result].item()
++    print('SPLICE_NATIVE', rejected, actual, expected, flush=True)
++    assert actual == expected, (rejected, actual, expected)
++''', str(saved)], capture_output=True, text=True)
++    print(probe.stdout, end='')
++    assert probe.returncode == 0, probe.stdout + probe.stderr
+diff --git a/tests/test_pythonic_control_torture.py b/tests/test_pythonic_control_torture.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_pythonic_control_torture.py
+@@ -0,0 +1,120 @@
++"""Small authored programs must preserve effects, not just lower successfully.
++
++These cases deliberately separate collection population from the enclosing
++guard: correlating those booleans hid both flattened and duplicated loops.
++The oracle is exact literal cardinality plus the number of authored appends.
++"""
++import pickle
++import subprocess
++import sys
++
++import pytest
++
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++from src.compiler.ssa_c_backend import emit_ssa_module_to_c
++
++
++CASES = {
++    "literal": ("""
++def root():
++    values = [10.0, 20.0]
++    values.append(30.0)
++    return len(values)
++""", (({}, 3), ({}, 3))),
++    "literal_payload": ("""
++def root():
++    values = [10.0, 20.0]
++    values.append(30.0)
++    return values[0] + values[1] + values[2]
++""", (({}, 60.0), ({}, 60.0))),
++    "literal_inside_while": ("""
++def root():
++    while True:
++        values = [10.0, 20.0]
++        values.append(30.0)
++        break
++    return len(values)
++""", (({}, 3), ({}, 3))),
++    "guarded_rows": ("""
++def root(guard, populated):
++    failures = []
++    lines = [10.0]
++    while True:
++        if populated:
++            failures.append((1.0, 2.0, (3.0,)))
++        if guard:
++            for index, (dt_f, metrics, reasons) in enumerate(failures, 1):
++                lines.append(20.0)
++        break
++    return len(lines)
++""", tuple((dict(guard=guard, populated=populated), 1 + int(guard and populated))
++             for guard, populated in ((True, False), (False, True), (True, True),
++                                      (False, False), (True, True), (True, False)))),
++}
++
++_source, _trials = CASES["guarded_rows"]
++_append = "            failures.append((1.0, 2.0, (3.0,)))"
++CASES["guarded_rows_two"] = (_source.replace(_append, _append + "\n" + _append),
++    tuple((inputs, 1 + 2 * int(inputs["guard"] and inputs["populated"])) for inputs, _ in _trials))
++CASES["guarded_rows_seventeen"] = (_source.replace(_append, "\n".join([_append] * 17)),
++    tuple((inputs, 1 + 17 * int(inputs["guard"] and inputs["populated"])) for inputs, _ in _trials))
++CASES["guarded_splice"] = (_source.replace("enumerate(failures, 1)",
++    "enumerate((*failures, (4.0, 5.0, (6.0,))), 1)"),
++    tuple((inputs, 1 + int(inputs["guard"]) * (1 + int(inputs["populated"]))) for inputs, _ in _trials))
++
++
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize("backend", ("c", "llvm"))
++def test_pythonic_control_native_effects(tmp_path, case, backend):
++    source, trials = CASES[case]
++    policy = ExtractionContract("extraction_contracts/program_extraction.yaml").with_execution_file(
++        "extraction_contracts/vehicle_full_native_execution.yaml").with_program_abi({
++        "bindings": [], "values": [
++            {"function": "root", "parameter": name, "storage": "scalar", "dtype": "bool",
++             "rank": 0, "python_type": "builtins.bool"}
++            for name in trials[0][0]
++        ]})
++    module, outputs, exports = lower_ast_source_to_ssa(source, "root", name="pythonic_" + case,
++        extraction_contract=policy, progress=lambda _: None)
++    function = module.functions[exports[0]]
++    from src.compiler.identity_concordance import concordance_report
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith("0 finding(s)"), report
++    if backend == "c":
++        artifact = emit_ssa_module_to_c(module, function.name)
++        assert artifact.complete, artifact.shortfalls
++        artifact.compile(tmp_path / "native")
++    else:
++        from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
++        emitted = emit_ssa_function_to_llvm(module, function.name)
++        assert emitted.complete, emitted.shortfalls
++        artifact = compile_artifact(emitted, directory=tmp_path / "native")
++    proof = tmp_path / "proof.pkl"
++    proof.write_bytes(pickle.dumps((artifact, dict(function.metadata["parameter_names"]),
++                                  outputs[function.name][0].id, trials, backend)))
++    # A native fault cannot take down pytest, and repeated calls reuse the
++    # same artifact/buffers. There is no timeout or interpreter fallback.
++    invocation = subprocess.run([sys.executable, "-u", "-c", """
++import pickle, sys
++import numpy as np
++artifact, parameters, result, trials, backend = pickle.load(open(sys.argv[1], 'rb'))
++feeds = {parameters[name]: np.array([value], dtype=np.bool_) for name, value in trials[0][0].items()}
++if backend == 'c':
++    execution = artifact.prepare_execution(feeds)
++else:
++    from src.compiler.ssa_llvm_backend import prepare_artifact_execution
++    execution = prepare_artifact_execution(artifact, feeds)
++failures = []
++for inputs, expected in trials:
++    for name, value in inputs.items():
++        execution.buffers[parameters[name]][0] = value
++    execution.run()
++    actual = execution.buffers[result].item()
++    print('PYTHONIC_NATIVE', backend, inputs, 'actual', actual, 'expected', expected, flush=True)
++    if actual != expected:
++        failures.append((inputs, actual, expected))
++assert not failures, failures
++""", str(proof)], capture_output=True, text=True)
++    print(invocation.stdout, end="")
++    assert invocation.returncode == 0, invocation.stdout + invocation.stderr
+diff --git a/tests/test_control_sequence_capacity_bounds.py b/tests/test_control_sequence_capacity_bounds.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_control_sequence_capacity_bounds.py
+@@ -0,0 +1,31 @@
++"""Finite control proofs size arenas; unknown backedges remain unknown."""
++from src.compiler.control_source import (ControlProgram, ControlSequenceMutation,
++    LoopBlock, LoopControlBlock, SequenceBlock, SequenceMutationBlock, WhileBlock)
++from src.compiler.resident_sequence_materialization import _control_sequence_capacity_bounds
++
++
++def append(sequence):
++    return SequenceMutationBlock(ControlSequenceMutation(sequence_value_id=sequence,
++        operator="append", argument_value_ids=(100,), effect_node_id=101))
++
++
++def test_nested_constant_loops_multiply_growth_without_unrolling():
++    inner = LoopBlock("j", "0", "3", "1", SequenceBlock((append(1),)))
++    outer = LoopBlock("i", "0", "1000000", "1", SequenceBlock((inner,)))
++    assert _control_sequence_capacity_bounds(ControlProgram(
++        SequenceBlock((append(1), outer))), (1,)) == {1: 3000001}
++
++
++def test_single_entry_while_is_bounded_by_its_unconditional_exit():
++    loop = WhileBlock(10, SequenceBlock(()), SequenceBlock((append(1), LoopControlBlock("break"))))
++    assert _control_sequence_capacity_bounds(ControlProgram(loop), (1,)) == {1: 1}
++
++
++def test_unknown_while_does_not_fabricate_a_capacity():
++    loop = WhileBlock(10, SequenceBlock(()), SequenceBlock((append(1),)))
++    assert _control_sequence_capacity_bounds(ControlProgram(loop), (1,)) == {}
++
++
++def test_mutating_the_iterated_sequence_does_not_freeze_its_bound():
++    loop = LoopBlock("i", "0", "__iterable_extent_1__", "1", SequenceBlock((append(1),)))
++    assert _control_sequence_capacity_bounds(ControlProgram(SequenceBlock((append(1), loop))), (1,)) == {}

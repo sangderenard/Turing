@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import dataclasses
 
-from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
 
 _GATHER = ("Indexed", "gather")
@@ -31,8 +30,8 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
     ``functions`` is a mapping of name -> repository SSA ``Function``.
     """
 
-    def fresh() -> SSAValue:
-        return SSAValue(GLOBAL_MONOTONIC_IDS.mint())
+    from .concordance_declarations import ADDRESS, CONTROL_SSA_FINISH
+    from .ssa_record_return_state import mint_ssa_value
 
     for function in functions.values():
 
@@ -86,7 +85,13 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     rewritten.append(instruction)
                 elif canonical_op in _GATHER and len(instruction.args) >= 2:
                     base, *indices = instruction.args
-                    address = fresh()
+                    # The energy audit's four raw GEP ids had no mint edge.
+                    # This address is made from the exact indexing operands,
+                    # not an unrelated global-counter identity.
+                    address = SSAValue(mint_ssa_value(
+                        function, ADDRESS, (base, *indices, instruction.res),
+                        stage=CONTROL_SSA_FINISH,
+                    ))
                     lowered_attributes = {
                         **dict(instruction.attributes or {}),
                         "lowered_from": str(canonical_op),
@@ -105,7 +110,10 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     base = instruction.args[0]
                     value = instruction.args[-1]
                     indices = instruction.args[1:-1]
-                    address = fresh()
+                    address = SSAValue(mint_ssa_value(
+                        function, ADDRESS, (base, *indices, instruction.res),
+                        stage=CONTROL_SSA_FINISH,
+                    ))
                     rewritten.append(
                         Instr("GetElementPtr", [base, *indices], address)
                     )
@@ -171,7 +179,7 @@ def _propagate_scalar_dtypes(functions) -> None:
     floats = {"float", "float16", "float32", "float64", "double", "f32", "f64"}
     preserving = {
         "Add", "Sub", "Mul", "FloorDiv", "Mod", "Pow", "Min", "Max",
-        "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Abs",
+        "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Abs", "Invert",
     }
     predicates = {
         "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "ULt", "ULe",
@@ -179,9 +187,9 @@ def _propagate_scalar_dtypes(functions) -> None:
     }
 
     from .concordance_declarations import (
-        CONST_DECLARED_WIDTH_NOT_ON_BOOK, INFERRED_INTEGER_WIDEN,
+        CONST_DECLARED_WIDTH_NOT_ON_BOOK, LOAD_DECLARED_WIDTH_NOT_ON_BOOK, INFERRED_INTEGER_WIDEN,
         IntegerWidthDecision, IntegerWidthFact, SCALAR_DTYPE_SETTLEMENT,
-        SCALAR_INTEGER_WIDTH, SSA_VALUE, WIDENED_VALUE_NOT_ON_BOOK,
+        SCALAR_INTEGER_WIDTH, SSA_VALUE, WIDENED_VALUE_NOT_ON_BOOK, SSAValueFact,
     )
     from .identity_concordance import (
         Derived, Mode, Novel, Unsourced, current_identity_book,
@@ -224,6 +232,8 @@ def _propagate_scalar_dtypes(functions) -> None:
                 instructions.append(instruction)
                 for value in (
                     *instruction.args,
+                    *(value for _, value in (instruction.attributes.get("incoming") or ())
+                      if instruction.op in {"Phi", "phi"}),
                     *((instruction.res,) if instruction.res is not None else ()),
                 ):
                     values.setdefault(int(value.id), []).append(value)
@@ -258,6 +268,23 @@ def _propagate_scalar_dtypes(functions) -> None:
             and isinstance(
                 instruction.attributes.get("value"), (bool, int, float)
             )
+        }
+        aggregate_result_ids = {
+            int(instruction.res.id) for instruction in instructions
+            if instruction.op == "Call" and instruction.res is not None
+            and instruction.attributes.get("result_convention") == "ssa.aggregate"
+        }
+        declared_load_ids = {
+            int(instruction.res.id) for instruction in instructions
+            if instruction.op == "Load" and instruction.res is not None
+            and instruction.attributes.get("lowered_from") not in _GATHER
+            # A planned Call -> GEP -> Load is an abstract return projection,
+            # not a physical memory-width declaration. The oscillator's
+            # source output69 retains an int placeholder with int64 on its
+            # identity book; its existing projection settlement still applies.
+            and (not instruction.args or address_base.get(int(instruction.args[0].id))
+                 not in aggregate_result_ids)
+            and str(instruction.res.dtype or "") in _DECLARED_LITERAL_DTYPES
         }
 
         def declared_float(instruction) -> str | None:
@@ -310,22 +337,45 @@ def _propagate_scalar_dtypes(functions) -> None:
                     )
                 elif instruction.op == "Cast":
                     inferred = instruction.attributes.get("target_dtype")
+                elif instruction.op in {"Phi", "phi"}:
+                    # A merge is storage selection, not numeric promotion.
+                    # Metrics.hard_failure's incoming bool slots settle after
+                    # call linking, but its provisional merge stayed double.
+                    # Follow the exact incoming identities to a fixed point;
+                    # mixed representations still require explicit edge Casts
+                    # and are deliberately left for the backend to reject.
+                    incoming = instruction.attributes.get("incoming")
+                    incoming_values = (tuple(value for _, value in incoming)
+                                       if incoming else tuple(instruction.args))
+                    incoming_types = {dtype_of.get(int(value.id)) for value in incoming_values}
+                    if len(incoming_types) == 1 and None not in incoming_types:
+                        inferred = next(iter(incoming_types))
                 elif instruction.op == "Load" and instruction.args:
                     declared = str(instruction.res.dtype or "")
-                    if declared and "ptr" not in declared.casefold():
+                    base_id = address_base.get(int(instruction.args[0].id))
+                    candidate = None if base_id is None else dtype_of.get(base_id)
+                    if (
+                        instruction.attributes.get("lowered_from") in _GATHER
+                        and candidate in integers | floats | {"bool"}
+                    ):
+                        # The compiler's heap micro-test reads an int64 span
+                        # whose LoopResult base was provisional float64 when
+                        # its Indexed result was cut. Linking settles the
+                        # base, but retaining that provisional Load dtype
+                        # read integer 1's bits as a subnormal double, then
+                        # stored zero back into the heap. Indexed is an
+                        # element read, not a conversion: its exact GEP base
+                        # supplies the element type after settlement. A raw
+                        # typed Load from an opaque pointer keeps its declared
+                        # contract in the branch below.
+                        inferred = candidate
+                    elif declared and "ptr" not in declared.casefold():
                         # LLVM opaque pointers do not state a pointee type.
                         # The Load result does, as does the original Indexed
                         # result retained by address lowering; never replace
                         # that explicit scalar contract with ``ptr``.
                         inferred = declared
                     else:
-                        base_id = address_base.get(
-                            int(instruction.args[0].id)
-                        )
-                        candidate = (
-                            None if base_id is None
-                            else dtype_of.get(base_id)
-                        )
                         inferred = (
                             None
                             if candidate is not None
@@ -369,13 +419,19 @@ def _propagate_scalar_dtypes(functions) -> None:
                 # WIDENED is NOVEL(INFERRED_INTEGER_WIDEN) from the value's
                 # own ``ssa_value`` cell.  The book and the instruction
                 # disagreeing about a declared width is a missing edge: raise.
-                if inferred in narrow_integers:
+                if inferred in narrow_integers and instruction.op not in {"Phi", "phi"}:
                     declared = str(instruction.res.dtype or "")
                     if (
-                        instruction.op == "Const"
+                        (instruction.op == "Const" or result_id in declared_load_ids)
                         and declared in _DECLARED_LITERAL_DTYPES
                         and inferred == declared
                     ):
+                        # Source-linked native object SET reaches the dynamic
+                        # store's i32 status cell. Widening its raw typed Loads
+                        # alone changed both incoming statuses to i64 while
+                        # their explicit Phi stayed i32. Load is a memory read,
+                        # not an implicit conversion. Keep its declared width
+                        # at this writer, under the same identity check as Const.
                         declared_cell, declared_fact = value_cell(result_id)
                         if declared_cell is not None and str(
                             getattr(declared_fact, "dtype", None)
@@ -407,7 +463,8 @@ def _propagate_scalar_dtypes(functions) -> None:
             fact = IntegerWidthFact(decision, source_dtype, dtype)
             if source_cell is None:
                 provenance = Unsourced(
-                    CONST_DECLARED_WIDTH_NOT_ON_BOOK
+                    (LOAD_DECLARED_WIDTH_NOT_ON_BOOK if result_id in declared_load_ids
+                     else CONST_DECLARED_WIDTH_NOT_ON_BOOK)
                     if decision is IntegerWidthDecision.KEPT_DECLARED
                     else WIDENED_VALUE_NOT_ON_BOOK
                 )
@@ -424,3 +481,19 @@ def _propagate_scalar_dtypes(functions) -> None:
         for value_id, dtype in dtype_of.items():
             for value in values.get(value_id, ()):
                 value.dtype = dtype
+        # The Phi's SSA record is the same identity, revised from its exact
+        # incoming records. Keep this settlement visible to the concordance.
+        for instruction in instructions:
+            if instruction.op not in {"Phi", "phi"} or instruction.res is None:
+                continue
+            previous, fact = value_cell(int(instruction.res.id))
+            if previous is None or fact.dtype == instruction.res.dtype:
+                continue
+            incoming = instruction.attributes.get("incoming")
+            incoming_values = tuple(v for _, v in incoming) if incoming else instruction.args
+            sources = tuple(cell for value in incoming_values
+                            for cell in (value_cell(int(value.id))[0],) if cell is not None)
+            book.post(SSA_VALUE, (scope, int(instruction.res.id)),
+                      SSAValueFact(instruction.res.dtype, fact.shape, fact.origin),
+                      stage=SCALAR_DTYPE_SETTLEMENT,
+                      provenance=Derived((previous, *sources)), mode=Mode.REVISE)

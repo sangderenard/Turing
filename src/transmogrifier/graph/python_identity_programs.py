@@ -278,6 +278,11 @@ PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
         description="fixed resident product sequence",
     ),
     PythonIdentityProgram(
+        identities=("builtins.frozenset",), kind="object",
+        object_type="resident_frozen_set",
+        description="immutable resident identity-keyed member collection",
+    ),
+    PythonIdentityProgram(
         identities=(
             "src.common.tensors.abstract_nn.utils.set_seed",
             "random.seed", "numpy.random.seed", "torch.manual_seed",

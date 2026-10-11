@@ -32,6 +32,37 @@ FIELDS = (
 COLD, HOT, COLD2 = "cold_a", "hot_b", "cold_c"
 
 
+def test_independent_spill_reads_cannot_exchange_registry_identities(monkeypatch, tmp_path):
+    """Independent workers must resolve Ref leaves in their own book."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event, current_thread
+    from src.compiler import identity_spill
+
+    books = [make_book()[0] for _ in range(2)]
+    stores = [identity_spill.BookSpill(book.registry, str(tmp_path)) for book in books]
+    segments = [store.write("probe", "ref", Ref(book.registry.pages[COLD], ("s", 0), 0), cells=1, rows=1)
+                for book, store in zip(books, stores)]
+    rendezvous = Barrier(2)
+    first_resolved = Event()
+    resolve = identity_spill._registry_object
+
+    def interleaved(kind, name):
+        rendezvous.wait(timeout=5)
+        if current_thread().name.endswith("_0"):
+            result = resolve(kind, name)
+            first_resolved.set()
+            return result
+        assert first_resolved.wait(timeout=5)
+        return resolve(kind, name)
+
+    monkeypatch.setattr(identity_spill, "_registry_object", interleaved)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [workers.submit(store.read, segment) for store, segment in zip(stores, segments)]
+        refs = [future.result(timeout=5) for future in futures]
+    assert refs[0].page is books[0].registry.pages[COLD]
+    assert refs[1].page is books[1].registry.pages[COLD]
+
+
 def make_book():
     registry = Registry()
     pages = {
@@ -41,6 +72,42 @@ def make_book():
     stage = registry.declare_stage("spill_test")
     root = registry.declare_transform("spill_root", 0)
     return IdentityBook(registry=registry), pages, stage, root
+
+
+def test_acceptance_cell_projection_preserves_exact_predecessors_without_siblings():
+    book, pages, stage, root = make_book()
+    origin = book.post(pages[COLD], ("chosen", 0), "source", stage=stage,
+        provenance=Novel(root, ()), mode=Mode.CONCORD)
+    first = book.post(pages[HOT], ("chosen", 1), "first", stage=stage,
+        provenance=Derived((origin,)), mode=Mode.REVISE)
+    second_source = book.post(pages[COLD], ("chosen", 2), "second-source", stage=stage,
+        provenance=Novel(root, ()), mode=Mode.CONCORD)
+    second = book.post(pages[HOT], ("chosen", 1), "second", stage=stage,
+        provenance=Derived((first, second_source)), mode=Mode.REVISE)
+    unrelated = book.post(pages[COLD], ("excluded", 3), "unrelated", stage=stage,
+        provenance=Novel(root, ()), mode=Mode.CONCORD)
+    projected = pickle.loads(pickle.dumps(book.project_cells((second,))))
+    for ref in (origin, first, second_source, second):
+        assert projected.page(ref.page.name).cell(ref.row, ref.column) == book.page(ref.page.name).cell(ref.row, ref.column)
+        assert projected.stamp_of(ref) == book.stamp_of(ref)
+        assert projected.edges_into(ref) == book.edges_into(ref)
+        assert projected.mint_of(ref) == book.mint_of(ref)
+    assert projected.page(HOT).latest(("chosen", 1)) == "second"
+    assert projected.page(COLD).cell(unrelated.row, unrelated.column) is None
+    assert projected.clock == book.clock
+    projected.post(pages[HOT], ("new", 4), "accepted", stage=stage,
+        provenance=Derived((second,)), mode=Mode.CONCORD)
+    assert book.page(HOT).latest(("new", 4)) is None
+
+
+def test_acceptance_cell_projection_does_not_hide_unsourced_roots():
+    from src.compiler.identity_concordance import Unsourced
+    book, pages, stage, _root = make_book()
+    reason = book.registry.declare_reason("projection_test_unsourced")
+    ref = book.post(pages[COLD], ("chosen", 0), "unproved", stage=stage,
+                    provenance=Unsourced(reason), mode=Mode.CONCORD)
+    projected = book.project_cells((ref,))
+    assert projected.unsourced_rows() == book.unsourced_rows()
 
 
 class Rows:

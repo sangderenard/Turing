@@ -1230,7 +1230,10 @@ def _class_schema_from_ast(definition):
     class_identity = (
         ".".join(part for part in source_identity if part)
         if source_identity is not None
-        else definition.name
+        # Owner ingestion has already recorded lexical qualification. Two
+        # Visitor classes in lexical_calls/lexical_return_calls are distinct
+        # declarations, not two records for the bare spelling "Visitor".
+        else getattr(definition, "_turing_source_qualname", definition.name)
     )
     schema = {
         "class_name": definition.name,

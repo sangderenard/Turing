@@ -140,7 +140,9 @@ class BoundedFixedPoint:
         )
         # The round counter of every guarded loop is a nested progress bar.
         compile_count(
-            f"fixed-point:{self.name}", index, total=self.bound,
+            # This bound guarantees refusal, not the number of rounds until
+            # convergence. 2/50 must not be displayed as 4% compiled.
+            f"fixed-point:{self.name}", index,
             label=f"{self.name} rounds (bound {self.bound})",
             detail=f"changed={count}",
         )

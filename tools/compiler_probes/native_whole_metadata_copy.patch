@@ -1,0 +1,1708 @@
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/fortran_c_shell.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/fortran_c_shell.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/fortran_c_shell.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/fortran_c_shell.py
+index aa75d9e..690e61c 100644
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -8366,7 +8366,9 @@ def _field_slot_ops(
+             str(role): int(parent)
+             for parent, role in (data.get("parents") or ())
+         }
+-        base_id = by_role.get("operand") or by_role.get("value")
++        # Value zero is an exact graph identity, not absence. memo.get(id(x))
++        # on parameter0 was dropped here although indexed reads used its ABI.
++        base_id = by_role.get("operand", by_role.get("value"))
+         key_id = by_role.get("arg:0")
+         if base_id is None or key_id is None or base_id not in graph_obj:
+             continue
+@@ -9234,8 +9236,40 @@ def _attach_graph_control_expressions(
+                 predicate_expression=predicate_expression,
+             )
+         if isinstance(block, SequenceBlock):
++            children = list(attach(item) for item in block.blocks)
++            # Overlay orders region-bearing controls by region ordinals and
++            # appends regionless controls. Consecutive authored conditionals
++            # are lexical effects, not independent numerical units: moving
++            # a memo-return guard behind a later copying arm changes meaning.
++            # Consume the incumbent source_span ROW (module, owner, AST path),
++            # not coordinates or names. Its final (body/orelse, ordinal) is
++            # the author's exact statement order. Never cross other units.
++            start = 0
++            while start < len(children):
++                if not isinstance(children[start], ConditionalBlock) or children[start].source_node_id is None:
++                    start += 1
++                    continue
++                stop = start + 1
++                while stop < len(children) and isinstance(children[stop], ConditionalBlock) and children[stop].source_node_id is not None:
++                    stop += 1
++                from .glsl_deployment_strategy import _source_control_records
++                from .identity_concordance import current_identity_book
++                from .concordance_declarations import SOURCE_SPAN
++                records = _source_control_records(graph_obj)
++                rows = [getattr(records.get(child.source_node_id, {}).get('expression'),
++                                '_turing_source_span_row', None)
++                        for child in children[start:stop]]
++                book = current_identity_book()
++                if all(row is not None and row[2] and book.latest_ref(SOURCE_SPAN, row) is not None
++                       for row in rows):
++                    owners = {(row[0], row[1], row[2][:-1], row[2][-1][0]) for row in rows}
++                    ordinals = {row[2][-1][1]: child for row, child in zip(rows, children[start:stop])}
++                    if len(owners) == 1 and len(ordinals) == stop - start and min(ordinals) >= 0:
++                        children[start:stop] = [ordinals[index] for index in range(max(ordinals) + 1)
++                                               if index in ordinals]
++                start = stop
+             return replace(
+-                block, blocks=tuple(attach(item) for item in block.blocks)
++                block, blocks=tuple(children)
+             )
+         if isinstance(block, LoopBlock):
+             return replace(block, body=attach(block.body))
+@@ -9554,6 +9588,15 @@ def _loop_control_block_position(
+     candidates = [node_position(site_id)]
+     if block.action != "return":
+         return candidates[0]
++    # A return of a previously born container names the SAME value as its
++    # constructor, not the return statement's position. Sorting return result
++    # by Dict3's line4 moved it ahead of its line5 generator/update, making
++    # the whole recursive copier's work unreachable. The reducer already
++    # owns the distinct return construct cell and its span join; consume it.
++    from .ssa_record_return_state import return_site_cells
++    for span, cell in return_site_cells(graph_obj.graph).items():
++        if cell == block.return_site_cell:
++            candidates.append((int(span[2]), int(span[3]), site_id))
+     for value_id in (site_id, *(
+         int(value_id) for value_id in block.return_value_ids
+         if value_id is not None
+@@ -10867,7 +10910,36 @@ def _install_lexical_sequence_mutations(
+                 root = insert_in_enclosing_loop(
+                     root, mutation_block, int(mutation.effect_node_id)
+                 )
+-    return replace(control, root=root), tuple(unplaced)
++    # A source effect now owned by lexical control must not also leave a
++    # numerical-region marker. Copier stores40/85/92 were removed from their
++    # numerical bodies, but their markers emitted undefined numerical_region
++    # calls with zero operands. Retire only regions wholly covered by actual
++    # installed effect identities; mixed numerical work remains scheduled.
++    installed_effects = existing_effect_ids | {
++        int(mutation.effect_node_id) for mutation in mutations
++        if int(mutation.effect_node_id) not in unplaced}
++    retired_regions = {index for index, region in enumerate(dispatch_subgraphs)
++        if (nodes := set(map(int, region.G.graph.get('deployment_nodes', ()))))
++        and nodes <= installed_effects}
++    def retire_effect_regions(block):
++        if isinstance(block, StatementBlock) and len(block.lines) == 1:
++            match = re.fullmatch(r'__scheduled_region_(\d+)__', block.lines[0])
++            if match and int(match[1]) in retired_regions:
++                return SequenceBlock(())
++        if isinstance(block, SequenceBlock):
++            return replace(block, blocks=tuple(retire_effect_regions(child) for child in block.blocks))
++        if isinstance(block, ConditionalBlock):
++            return replace(block, body=retire_effect_regions(block.body),
++                           orelse=None if block.orelse is None else retire_effect_regions(block.orelse))
++        if isinstance(block, WhileBlock):
++            return replace(block, condition=retire_effect_regions(block.condition), body=retire_effect_regions(block.body))
++        if isinstance(block, LoopBlock):
++            return replace(block, body=retire_effect_regions(block.body))
++        if isinstance(block, CallBlock):
++            return replace(block, callee=retire_effect_regions(block.callee))
++        return block
++    return replace(control, root=retire_effect_regions(root),
++                   region_indices=tuple(index for index in control.region_indices if index not in retired_regions)), tuple(unplaced)
+ 
+ 
+ def _control_expression_value_ids(expression: Any) -> frozenset[int]:
+@@ -15568,6 +15640,21 @@ def _class_surface_ssa_program(
+                 continue
+             child_shell = callsite_shells.get(int(planned_call.callsite_id))
+             callee_graph = planned_graphs_by_shell.get(id(child_shell))
++            if callee_graph is None:
++                # visit(child) inside its own generator has an exact PlanCall
++                # result edge (formal1 -> call5), but recursion has no child
++                # activation shell. Skipping that edge left tuple6's component
++                # unknown and invented an unowned recursive scratch formal.
++                # Consume the book's SCC edge and the SAME activation graph;
++                # do not infer the result layout from the calling expression.
++                owner = str(caller_graph.graph.get('qualified_name')
++                            or caller_graph.graph.get('function_name') or '<module>')
++                activation = current_identity_book().page(
++                    'source_callsite_activation_concordance').latest(
++                        (owner, int(planned_call.callsite_id)))
++                if (activation is not None and activation[1] == 'recursive_scc_backedge'
++                        and int(activation[0]) == caller_graph.graph.get('function_ref')):
++                    callee_graph = caller_graph
+             if callee_graph is None:
+                 continue
+             for caller_id, callee_id in planned_call.argument_bindings:
+@@ -16913,6 +17000,13 @@ def _class_surface_ssa_program(
+         native_type_tests = (source_object_type_tests(graph_obj,
+             source_object_value_ids(graph_obj, native_handle_ids | reference_inputs), native_object_context)
+             if native_object_context is not None else {})
++        from .ssa_object_context import source_object_identity_reductions, install_object_identity_reductions
++        native_identity_reductions = (source_object_identity_reductions(graph_obj, native_handle_ids | reference_inputs)
++                                     if native_object_context is not None else {})
++        control = install_object_identity_reductions(control, graph_obj,
++            getattr(shell, 'dispatch_subgraphs', ()), native_identity_reductions)
++        from .control_source import post_control_rewrite as _post_control_rewrite
++        _post_control_rewrite(graph, control)
+         control, lexical_sequence_shortfalls = _install_lexical_sequence_mutations(
+             control,
+             graph,
+@@ -17653,6 +17747,7 @@ def _class_surface_ssa_program(
+             **dict(graph_obj.graph.get("planner_specializations") or {}),
+         }
+         parameter_value_dtypes = {value_id: 'opaque_ref' for value_id in native_handle_ids}
++        parameter_value_dtypes.update((value_id, 'bool') for value_id in native_identity_reductions)
+         parameter_value_shapes = {}
+         # Control-owned tuple members have authored scalar/span contracts.
+         # Numerical helpers may publish a padded one-element view for a
+@@ -21369,7 +21464,6 @@ def _class_surface_ssa_program(
+                     recovered_by_id = {
+                         int(item.res.id): item for item in insertions if item.res is not None
+                     }
+-                    insertion_objects = {id(item) for item in insertions}
+                     for recovered in reversed(insertions):
+                         if recovered.res is None:
+                             continue
+@@ -21378,7 +21472,11 @@ def _class_surface_ssa_program(
+                             for offset, candidate in enumerate(
+                                 candidate_block.instrs
+                             ):
+-                                if id(candidate) in insertion_objects:
++                                # Recovered consumers become real consumers as
++                                # soon as they are inserted. Ignoring them let
++                                # a subsequent identity-hoist move Cast36 back
++                                # AFTER its recovered contains37 call.
++                                if candidate is recovered:
+                                     continue
+                                 matching_positions = tuple(
+                                     position
+@@ -21512,6 +21610,9 @@ def _class_surface_ssa_program(
+                             continue
+                         if blocking:
+                             continue
++                        # Keep the consumer's instruction identity, not an
++                        # ordinal that changes when its producer is removed.
++                        placement_anchor = use_block.instrs[consumer_index] if consumer_index < len(use_block.instrs) else None
+                         for candidate_block in function.blocks.values():
+                             candidate_block.instrs = [
+                                 item for item in candidate_block.instrs
+@@ -21520,9 +21621,9 @@ def _class_surface_ssa_program(
+                         if consumer is not None:
+                             consumer_index = use_block.instrs.index(consumer)
+                         else:
+-                            consumer_index = min(
+-                                consumer_index, len(use_block.instrs)
+-                            )
++                            consumer_index = (use_block.instrs.index(placement_anchor)
++                                               if placement_anchor is not None and placement_anchor in use_block.instrs
++                                               else min(consumer_index, len(use_block.instrs)))
+                         use_block.instrs[consumer_index:consumer_index] = moving
+                     break
+             function.metadata["recovered_structural_outputs"] = tuple(
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/ssa_object_context.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/ssa_object_context.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/ssa_object_context.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/ssa_object_context.py
+index 0ef71e1..a50f791 100644
+--- a/src/compiler/ssa_object_context.py
++++ b/src/compiler/ssa_object_context.py
+@@ -89,6 +89,110 @@ def source_object_type_tests(graph, admitted, context):
+     return tests
+ 
+ 
++def source_object_identity_reductions(graph, admitted):
++    """Fuse the exact pure all(map(is, zip(a,b))) causal island.
++
++    Consume incumbent producer/ownership edges. An extra use, filter, async
++    generator or effectful body is not this reduction and is never discarded.
++    """
++    import ast
++    from .dependency_cone import parent_record_dependents
++    users = parent_record_dependents(graph)
++    reductions = {}
++    for node, data in graph.nodes(data=True):
++        if (data.get('attributes') or {}).get('extraction_identity') != 'builtins.all':
++            continue
++        args = [parent for parent, role in data.get('parents') or () if role == 'arg:0']
++        if len(args) != 1 or args[0] not in graph:
++            continue
++        collection = args[0]
++        collected = graph.nodes[collection]
++        attrs = collected.get('attributes') or {}
++        edges = dict((role, parent) for parent, role in collected.get('parents') or ())
++        if (attrs.get('result_kind') != 'collection' or set(edges) != {'value', 'control'}
++                or any(user != node for user in users.get(collection, ()))):
++            continue
++        predicate, loop_id = edges['value'], edges['control']
++        materializer = attrs.get('materializer_node_id')
++        iterable = attrs.get('collection_iterable_value_id')
++        if any(value not in graph for value in (predicate, loop_id, materializer, iterable)):
++            continue
++        test, loop, zipper = (graph.nodes[value] for value in (predicate, loop_id, iterable))
++        expression = test.get('expr_obj')
++        generator = graph.nodes[materializer].get('expr_obj')
++        targets = tuple(((loop.get('attributes') or {}).get('loop_target_bindings') or {}).values())
++        components = dict((role, parent) for parent, role in test.get('parents') or ())
++        sources = tuple(parent for parent, role in sorted(zipper.get('parents') or (), key=lambda p: p[1])
++                        if str(role).startswith('arg:'))
++        if (not isinstance(expression, ast.Compare) or len(expression.ops) != 1
++                or not isinstance(expression.ops[0], ast.Is)
++                or not isinstance(generator, ast.GeneratorExp) or len(generator.generators) != 1
++                or generator.generators[0].ifs or generator.generators[0].is_async
++                or len(targets) != 2 or components != {'lhs': targets[0], 'rhs': targets[1]}
++                or (zipper.get('attributes') or {}).get('extraction_identity') != 'builtins.zip'
++                or len(sources) != 2 or any(str(role).startswith('kw:') for _, role in zipper.get('parents') or ())
++                or any(int(graph.nodes[source].get('value_id', source)) not in admitted for source in sources)):
++            continue
++        result_id = int(data.get('value_id', node))
++        fact = {'result_value_id': result_id, 'source_node_id': int(node),
++                'source_value_ids': tuple(int(graph.nodes[source].get('value_id', source)) for source in sources),
++                'loop_node_id': int(loop_id), 'owned_value_ids': (int(collection), int(materializer),
++                    int(iterable), int(predicate), *map(int, targets))}
++        cell = _object_source_contract(graph, result_id, 'identity_reduction', fact,
++                                       (node, collection, materializer, iterable, predicate, loop_id, *sources, *targets))
++        reductions[result_id] = {**fact, 'contract_cell': cell}
++    return reductions
++
++
++def install_object_identity_reductions(control, graph, dispatch_subgraphs, reductions):
++    """Replace accepted pure generator control with its native scalar fold."""
++    from dataclasses import replace
++    import re
++    from .control_source import (ControlSequenceMutation, SequenceMutationBlock, SequenceBlock,
++        StatementBlock, ConditionalBlock, LoopBlock, WhileBlock, CallBlock)
++    if not reductions:
++        return control
++    by_loop = {receipt['loop_node_id']: receipt for receipt in reductions.values()}
++    covered = {value for receipt in reductions.values()
++               for value in (receipt['source_node_id'], *receipt['owned_value_ids'])}
++    retired_regions = {index for index, region in enumerate(dispatch_subgraphs)
++                       if (nodes := set(region.G.graph.get('deployment_nodes', ()))) and nodes <= covered}
++    removed_inductions, installed = set(), set()
++    def rebuild(block):
++        if isinstance(block, LoopBlock) and block.source_loop_node_id in by_loop:
++            receipt = by_loop[block.source_loop_node_id]
++            accepted = object_source_contract(receipt['contract_cell'])
++            if block.terminal_controls:
++                raise ValueError('pure identity reduction acquired terminal effects')
++            removed_inductions.add(block.induction)
++            installed.add(accepted['result_value_id'])
++            return SequenceMutationBlock(ControlSequenceMutation(accepted['result_value_id'],
++                'object_identity_reduce', accepted['source_value_ids'], accepted['source_node_id'],
++                object_contract_cell=receipt['contract_cell']))
++        if isinstance(block, StatementBlock) and len(block.lines) == 1:
++            match = re.fullmatch(r'__scheduled_region_(\d+)__', block.lines[0])
++            if match and int(match[1]) in retired_regions:
++                return SequenceBlock(())
++        if isinstance(block, SequenceBlock):
++            return replace(block, blocks=tuple(rebuild(child) for child in block.blocks))
++        if isinstance(block, ConditionalBlock):
++            return replace(block, body=rebuild(block.body), orelse=None if block.orelse is None else rebuild(block.orelse))
++        if isinstance(block, WhileBlock):
++            return replace(block, condition=rebuild(block.condition), body=rebuild(block.body))
++        if isinstance(block, LoopBlock):
++            return replace(block, body=rebuild(block.body))
++        if isinstance(block, CallBlock):
++            return replace(block, callee=rebuild(block.callee))
++        return block
++    root = rebuild(control.root)
++    if installed != set(reductions):
++        raise ValueError('native identity reduction lost its exact owning loop')
++    return replace(control, root=root,
++        region_indices=tuple(index for index in control.region_indices if index not in retired_regions),
++        iterable_bindings=tuple(binding for binding in control.iterable_bindings if binding[2] not in removed_inductions),
++        projected_iterable_bindings=tuple(binding for binding in control.projected_iterable_bindings if binding[2] not in removed_inductions))
++
++
+ def source_constructor_mutations(graph, context):
+     """Read native object births from exact authored literal nodes.
+ 
+@@ -134,9 +238,9 @@ def source_constructor_mutations(graph, context):
+             # receipt but removes the AST object. Read that incumbent record,
+             # not an inferred variable name or source-coordinate match.
+             if (attributes.get('producer_kind') == 'aggregate'
+-                    and attributes.get('aggregate_kind') in {'dict', 'list'}
++                    and attributes.get('aggregate_kind') in {'dict', 'list', 'set', 'frozenset'}
+                     and not attributes.get('aggregate_leaf_value_ids')
+-                    and type(literal) in {dict, list} and not literal
++                    and type(literal) in {dict, list, set, frozenset} and not literal
+                     and type(literal).__name__ == attributes['aggregate_kind']):
+                 kind = 'builtins.' + attributes['aggregate_kind']
+         if kind is None:
+@@ -183,7 +287,7 @@ def source_constructor_mutations(graph, context):
+     collections = source_object_collections(graph, admitted)
+     admitted = source_object_value_ids(graph, admitted | set(collections))
+     for node_id, data in graph.nodes(data=True):
+-        if data.get('op') != 'update':
++        if data.get('op') not in {'update', 'extend'}:
+             continue
+         roles = dict((role, parent) for parent, role in data.get('parents') or ())
+         destination, source = roles.get('operand'), roles.get('arg:0')
+@@ -196,7 +300,7 @@ def source_constructor_mutations(graph, context):
+         source_id = int(graph.nodes[source].get('value_id', source))
+         cell = _object_source_contract(graph, effect_id, 'update',
+             {'destination_value_id': target_id, 'source_value_id': source_id,
+-             'effect_value_id': effect_id}, (node_id, destination, source))
++             'effect_value_id': effect_id, 'operation': data['op']}, (node_id, destination, source))
+         mutations.append(ControlSequenceMutation(target_id, 'object_update', (source_id,),
+             effect_id, object_contract_cell=cell))
+     return tuple(mutations)
+@@ -206,7 +310,7 @@ def native_materialization_source(graph, data):
+     """Use the admitted builtin identity and exact argument/producer ledger."""
+     attributes = data.get('attributes') or {}
+     kind = attributes.get('aggregate_kind')
+-    if (kind not in {'list', 'tuple'}
++    if (kind not in {'list', 'tuple', 'frozenset'}
+             or attributes.get('producer_kind') != 'aggregate_materialization'
+             or attributes.get('extraction_identity') != 'builtins.' + kind):
+         return None
+@@ -250,9 +354,14 @@ def source_object_collections(graph, admitted):
+         paired = mapping_source is not None and len(targets) == 2
+         generator = str(graph.nodes[materializer_id].get('type', '')).casefold() == 'generatorexp'
+         consumers = [graph.nodes[user] for user in consumers_by_value.get(node_id, ())
+-                     if graph.nodes[user].get('op') == 'update'
++                     if graph.nodes[user].get('op') in {'update', 'extend'}
+                      and (node_id, 'arg:0') in (graph.nodes[user].get('parents') or ())]
+         finite_update = generator and len(consumers) == 1
++        if kind is None and finite_update:
++            # A finite generator of scalar handles has no tuple literal whose
++            # aggregate_kind could be inherited. Its admitted transport is
++            # the same resident tuple collection used by paired generators.
++            kind = 'tuple'
+         if (physical_source not in admitted or kind not in {'list', 'tuple'}
+                 or not (materializer.get('extraction_identity') == 'builtins.' + kind or finite_update)
+                 or materializer.get('collection_owner_id') != node_id
+@@ -434,7 +543,7 @@ def source_object_definitions(function):
+ 
+ def native_object_requirement_sources(module, function_name):
+     """Existing call-graph reachability determines the lease's payload needs."""
+-    operations = {'length', 'get', 'set', 'materialize', 'collect', 'update'}
++    operations = {'length', 'get', 'set', 'materialize', 'materialize_frozen', 'collect', 'update', 'extend', 'identity_all'}
+     return tuple(name for name in module.reachable_functions(function_name)
+         if module.functions[name].metadata.get('opaque_object_helper', {}).get('operation') in operations
+         or any((i.attributes.get('source_object_operation') or (None,))[0] in operations
+@@ -556,8 +665,9 @@ def validate_source_object_instruction(module, function_name, instruction, *, _d
+         raise ValueError('source object operation disagrees with its live helper')
+     materialization = instruction.attributes.get('source_object_materialization')
+     if materialization is not None:
+-        if (interface['operation'] != 'materialize' or materialization['context'] != context
+-                or materialization['kind'] not in {'builtins.list', 'builtins.tuple'}
++        expected_operation = 'materialize_frozen' if materialization['kind'] == 'builtins.frozenset' else 'materialize'
++        if (interface['operation'] != expected_operation or materialization['context'] != context
++                or materialization['kind'] not in {'builtins.list', 'builtins.tuple', 'builtins.frozenset'}
+                 or instruction.res.accounting.get('native_object_source_kind') != materialization['kind']):
+             raise ValueError('source materialization has stale kind/storage receipt')
+         operand, = interface['operand_formal_ids']
+@@ -589,10 +699,17 @@ def validate_source_object_instruction(module, function_name, instruction, *, _d
+     if update is not None:
+         from .identity_concordance import identity_book
+         accepted = object_source_contract(update['contract_cell'], book=identity_book(module))
+-        if (interface['operation'] != 'update'
+-                or operation != ('update', accepted['destination_value_id'], (accepted['source_value_id'],), None)):
++        if (interface['operation'] != accepted['operation']
++                or operation != (accepted['operation'], accepted['destination_value_id'], (accepted['source_value_id'],), None)):
+             raise ValueError('source update differs from its authoritative concordance cell')
+     projection = instruction.attributes.get('native_pair_projection')
++    reduction = instruction.attributes.get('source_object_identity_reduction')
++    if reduction is not None:
++        from .identity_concordance import identity_book
++        accepted = object_source_contract(reduction['contract_cell'], book=identity_book(module))
++        left, right = accepted['source_value_ids']
++        if operation != ('identity_all', left, (right,), accepted['result_value_id']):
++            raise ValueError('native identity reduction differs from its concordance edges')
+     if projection is not None:
+         from .identity_concordance import identity_book
+         accepted = object_source_contract(projection['contract_cell'], book=identity_book(module))
+@@ -904,12 +1021,13 @@ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_obj
+     # or run the unique member-table scan for every copied edge. Reserve once,
+     # then write the new owner's disjoint rows directly. Stable handles, not
+     # payload addresses, retain aliases/backedges through reserve relocation.
+-    materialize_kinds = {'builtins.list', 'builtins.tuple'} & set(context.kind_vocabulary)
++    materialize_kinds = {'builtins.list', 'builtins.tuple', 'builtins.frozenset'} & set(context.kind_vocabulary)
+     if materialize_kinds:
+         reserve = add(lower_sequence_reserve(context.members,
+             function_name=f'{prefix}_materialize_reserve'))
+         for label, operation in (('materialize', ObjectOperation.MATERIALIZE),
+-                                 ('collect', ObjectOperation.COLLECT)):
++                                 ('collect', ObjectOperation.COLLECT),
++                                 ('materialize_frozen', ObjectOperation.MATERIALIZE_FROZEN)):
+             builder = _Builder(0)
+             source, requested = builder.fresh('opaque_ref'), builder.fresh('int64')
+             blocks = {label: builder.block(label) for label in (
+@@ -940,7 +1058,8 @@ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_obj
+                 return combined
+             source_valid = kind_is(entry, kind, ('builtins.dict', 'builtins.list',
+                 'builtins.tuple', 'builtins.set', 'builtins.frozenset'))
+-            target_valid = kind_is(entry, requested, sorted(materialize_kinds))
++            target_valid = kind_is(entry, requested, ('builtins.frozenset',)
++                if operation is ObjectOperation.MATERIALIZE_FROZEN else ('builtins.list', 'builtins.tuple'))
+             valid = builder.fresh('bool')
+             builder.emit(entry, 'LAnd', [source_valid, target_valid], valid)
+             positional = kind_is(entry, kind, ('builtins.list', 'builtins.tuple'))
+@@ -1000,7 +1119,46 @@ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_obj
+             live = builder.fresh('bool')
+             builder.emit(blocks['construct'], 'Gt', [destination,
+                 builder.const(blocks['construct'], 0, dtype='opaque_ref')], live)
+-            builder.cond(blocks['construct'], live, blocks['copy_entry'], reject)
++            frozen_complete = None
++            if operation is ObjectOperation.MATERIALIZE_FROZEN:
++                # Keep the positional bulk helper free of per-member stores.
++                # Keyed immutable construction has a separate accepted ABI.
++                frozen_entry, frozen_header, frozen_body, frozen_write, frozen_latch, frozen_complete = (
++                    builder.block(name) for name in ('frozen_entry', 'frozen_header', 'frozen_body',
++                                                      'frozen_write', 'frozen_latch', 'frozen_complete'))
++                builder.cond(blocks['construct'], live, frozen_entry, reject)
++                builder.branch(frozen_entry, frozen_header)
++                frozen_index, frozen_next = builder.fresh('int64'), builder.fresh('int64')
++                builder.emit(frozen_header, 'Phi', [zero, frozen_next], frozen_index,
++                             attributes={'incoming_blocks': (frozen_entry.name, frozen_latch.name)})
++                frozen_more = builder.fresh('bool')
++                builder.emit(frozen_header, 'Lt', [frozen_index, original_length], frozen_more)
++                builder.cond(frozen_header, frozen_more, frozen_body, frozen_complete)
++                def frozen_row(block, column):
++                    address, value = builder.fresh('ptr'), builder.fresh('opaque_ref')
++                    builder.emit(block, 'GetElementPtr', [by_id[column], frozen_index], address)
++                    builder.emit(block, 'Load', [address], value)
++                    return value
++                frozen_owner = frozen_row(frozen_body, context.members.column_value_ids[0])
++                frozen_matches = builder.fresh('bool')
++                builder.emit(frozen_body, 'Eq', [frozen_owner, source], frozen_matches)
++                builder.cond(frozen_body, frozen_matches, frozen_write, frozen_latch)
++                frozen_key = frozen_row(frozen_write, context.members.column_value_ids[1])
++                frozen_item = frozen_row(frozen_write, context.members.column_value_ids[2])
++                frozen_payload, frozen_status = builder.fresh('opaque_ref'), builder.fresh('bool')
++                builder.emit(frozen_write, 'Select', [dictionary, frozen_key, frozen_item], frozen_payload)
++                setter = module.functions[f'{prefix}_set']
++                setter_roles = setter.metadata['opaque_object_helper']
++                call(builder, frozen_write, setter,
++                     {setter_roles['reference_formal_id']: destination,
++                      setter_roles['operand_formal_ids'][0]: frozen_payload,
++                      setter_roles['operand_formal_ids'][1]: frozen_payload}, frozen_status)
++                builder.cond(frozen_write, frozen_status, frozen_latch, reject)
++                builder.emit(frozen_latch, 'Add', [frozen_index, one], frozen_next)
++                builder.branch(frozen_latch, frozen_header)
++                builder.branch(frozen_complete, blocks['complete'])
++            else:
++                builder.cond(blocks['construct'], live, blocks['copy_entry'], reject)
+             start, header, body, write, latch = (blocks[label] for label in
+                 ('copy_entry', 'copy_header', 'copy_body', 'copy_write', 'copy_latch'))
+             builder.branch(start, header)
+@@ -1051,81 +1209,161 @@ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_obj
+             failed = builder.const(reject, 0, dtype='opaque_ref')
+             builder.branch(reject, blocks['complete'])
+             result = builder.fresh('opaque_ref')
+-            builder.emit(blocks['complete'], 'Phi', [source, destination, failed], result,
+-                attributes={'incoming_blocks': (blocks['same'].name, blocks['publish'].name, reject.name)})
++            incoming = [source, destination, failed]
++            incoming_blocks = [blocks['same'].name, blocks['publish'].name, reject.name]
++            if frozen_complete is not None:
++                incoming.insert(2, destination)
++                incoming_blocks.insert(2, frozen_complete.name)
++            builder.emit(blocks['complete'], 'Phi', incoming, result,
++                attributes={'incoming_blocks': tuple(incoming_blocks)})
+             builder.emit(blocks['complete'], 'Ret', [result])
+             finish(label, builder, (source, requested), reference=source,
+                 operation=operation)
+ 
+-    # Consume a finite paired-generator materialization in one native call.
+-    # Stable handles survive set/reserve relocation; no payload pointer crosses
+-    # those calls, and the initial source extent excludes newly inserted rows.
+-    builder = _Builder(0)
+-    destination, source = builder.fresh('opaque_ref'), builder.fresh('opaque_ref')
+-    entry, header, body, consume, latch, complete, reject = (builder.block(name)
+-        for name in ('entry', 'header', 'body', 'consume', 'latch', 'complete', 'reject'))
+-    zero, one = builder.const(entry, 0, dtype='int64'), builder.const(entry, 1, dtype='int64')
+-    kind_helper, get_helper, set_helper = (module.functions[f'{prefix}_{name}'] for name in ('kind', 'get', 'set'))
+-    def invoke(block, helper, reference, operands, result):
+-        interface = helper.metadata['opaque_object_helper']
+-        extra = {interface['reference_formal_id']: reference,
+-                 **dict(zip(interface['operand_formal_ids'], operands, strict=True))}
+-        call(builder, block, helper, extra, result)
+-    destination_kind, source_kind = builder.fresh('int64'), builder.fresh('int64')
+-    invoke(entry, kind_helper, destination, (), destination_kind)
+-    invoke(entry, kind_helper, source, (), source_kind)
+-    valid_destination, valid = (builder.fresh('bool') for _ in range(2))
+-    builder.emit(entry, 'Eq', [destination_kind, builder.const(entry,
+-        context.kind_vocabulary.index('builtins.dict') + 1 if 'builtins.dict' in context.kind_vocabulary else -1,
+-        dtype='int64')], valid_destination)
+-    target_types = []
+-    for kind in ('builtins.tuple', 'builtins.list'):
+-        if kind in context.kind_vocabulary:
++    # One resident sequence fold: dictionaries consume pairs, sets consume
++    # identity members, lists consume ordered members. No host item dispatch.
++    # Handles survive reserve; the initial extent excludes newly inserted rows.
++    for label, operation, kinds in (
++            ('update', ObjectOperation.UPDATE, ('builtins.dict', 'builtins.set')),
++            ('extend', ObjectOperation.EXTEND, ('builtins.list',))):
++        builder = _Builder(0)
++        destination, source = builder.fresh('opaque_ref'), builder.fresh('opaque_ref')
++        entry, header, body, consume, pair_block, member_block, store_block, written, latch, complete, reject = (
++            builder.block(name) for name in ('entry', 'header', 'body', 'consume', 'pair',
++                'member', 'store', 'written', 'latch', 'complete', 'reject'))
++        zero, one = builder.const(entry, 0, dtype='int64'), builder.const(entry, 1, dtype='int64')
++        def invoke(block, helper, reference, operands, result):
++            interface = helper.metadata['opaque_object_helper']
++            call(builder, block, helper, {interface['reference_formal_id']: reference,
++                **dict(zip(interface['operand_formal_ids'], operands, strict=True))}, result)
++        kind_helper, get_helper, set_helper, length_helper = (
++            module.functions[f'{prefix}_{name}'] for name in ('kind', 'get', 'set', 'length'))
++        destination_kind, source_kind = builder.fresh('int64'), builder.fresh('int64')
++        invoke(entry, kind_helper, destination, (), destination_kind)
++        invoke(entry, kind_helper, source, (), source_kind)
++        def matches_kind(value, kind):
+             predicate = builder.fresh('bool')
+-            builder.emit(entry, 'Eq', [source_kind, builder.const(entry, context.kind_vocabulary.index(kind) + 1, dtype='int64')], predicate)
+-            target_types.append(predicate)
+-    source_valid = builder.const(entry, 0, dtype='bool')
+-    for predicate in target_types:
+-        merged = builder.fresh('bool')
+-        builder.emit(entry, 'LOr', [source_valid, predicate], merged)
+-        source_valid = merged
+-    builder.emit(entry, 'LAnd', [valid_destination, source_valid], valid)
+-    _, extent = load_cell(builder, entry, by_id[context.members.length_address_id])
+-    builder.cond(entry, valid, header, reject)
+-    index, next_index = builder.fresh('int64'), builder.fresh('int64')
+-    builder.emit(header, 'Phi', [zero, next_index], index,
+-                 attributes={'incoming_blocks': (entry.name, latch.name)})
+-    more = builder.fresh('bool')
+-    builder.emit(header, 'Lt', [index, extent], more)
+-    builder.cond(header, more, body, complete)
+-    owner_address, owner, pair_address, pair = (builder.fresh(dtype)
+-        for dtype in ('ptr', 'opaque_ref', 'ptr', 'opaque_ref'))
+-    builder.emit(body, 'GetElementPtr', [by_id[context.members.column_value_ids[0]], index], owner_address)
+-    builder.emit(body, 'Load', [owner_address], owner)
+-    matches = builder.fresh('bool')
+-    builder.emit(body, 'Eq', [owner, source], matches)
+-    builder.cond(body, matches, consume, latch)
+-    builder.emit(consume, 'GetElementPtr', [by_id[context.members.column_value_ids[2]], index], pair_address)
+-    builder.emit(consume, 'Load', [pair_address], pair)
+-    key, item, status = builder.fresh('opaque_ref'), builder.fresh('opaque_ref'), builder.fresh('bool')
+-    positions = []
+-    for ordinal in (1, 2):
+-        position = builder.fresh('opaque_ref')
+-        builder.emit(consume, 'Cast', [builder.const(consume, ordinal, dtype='int64')], position,
+-                     attributes={'binding': 'object_context_position'})
+-        positions.append(position)
+-    invoke(consume, get_helper, pair, (positions[0],), key)
+-    invoke(consume, get_helper, pair, (positions[1],), item)
+-    invoke(consume, set_helper, destination, (key, item), status)
+-    builder.cond(consume, status, latch, reject)
+-    builder.emit(latch, 'Add', [index, one], next_index)
+-    builder.branch(latch, header)
+-    builder.emit(complete, 'Ret', [builder.const(complete, 1, dtype='bool')])
+-    builder.emit(reject, 'Ret', [builder.const(reject, 0, dtype='bool')])
+-    finish('update', builder, (destination, source), reference=destination, operation=ObjectOperation.UPDATE)
++            builder.emit(entry, 'Eq', [value, builder.const(entry,
++                context.kind_vocabulary.index(kind) + 1 if kind in context.kind_vocabulary else -1,
++                dtype='int64')], predicate)
++            return predicate
++        def accepts(value, kinds):
++            result = builder.const(entry, 0, dtype='bool')
++            for kind in kinds:
++                merged = builder.fresh('bool')
++                builder.emit(entry, 'LOr', [result, matches_kind(value, kind)], merged)
++                result = merged
++            return result
++        valid = builder.fresh('bool')
++        builder.emit(entry, 'LAnd', [accepts(destination_kind, kinds),
++                     accepts(source_kind, ('builtins.tuple', 'builtins.list'))], valid)
++        dictionary = matches_kind(destination_kind, 'builtins.dict')
++        _, extent = load_cell(builder, entry, by_id[context.members.length_address_id])
++        initial_count = builder.fresh('int64')
++        invoke(entry, length_helper, destination, (), initial_count)
++        builder.cond(entry, valid, header, reject)
++        index, next_index, count, next_count = (builder.fresh('int64') for _ in range(4))
++        builder.emit(header, 'Phi', [zero, next_index], index,
++                     attributes={'incoming_blocks': (entry.name, latch.name)})
++        builder.emit(header, 'Phi', [initial_count, next_count], count,
++                     attributes={'incoming_blocks': (entry.name, latch.name)})
++        more = builder.fresh('bool')
++        builder.emit(header, 'Lt', [index, extent], more)
++        builder.cond(header, more, body, complete)
++        def row(block, column):
++            address, value = builder.fresh('ptr'), builder.fresh('opaque_ref')
++            builder.emit(block, 'GetElementPtr', [by_id[column], index], address)
++            builder.emit(block, 'Load', [address], value)
++            return value
++        owner = row(body, context.members.column_value_ids[0])
++        matches = builder.fresh('bool')
++        builder.emit(body, 'Eq', [owner, source], matches)
++        builder.cond(body, matches, consume, latch)
++        member = row(consume, context.members.column_value_ids[2])
++        builder.cond(consume, dictionary, pair_block, member_block)
++        pair_key, pair_item = builder.fresh('opaque_ref'), builder.fresh('opaque_ref')
++        for ordinal, result in ((1, pair_key), (2, pair_item)):
++            position = builder.fresh('opaque_ref')
++            builder.emit(pair_block, 'Cast', [builder.const(pair_block, ordinal, dtype='int64')], position,
++                         attributes={'binding': 'object_context_position'})
++            invoke(pair_block, get_helper, member, (position,), result)
++        builder.branch(pair_block, store_block)
++        numbered = builder.fresh('int64')
++        builder.emit(member_block, 'Add', [count, one], numbered)
++        member_key = member
++        if operation is ObjectOperation.EXTEND:
++            member_key = builder.fresh('opaque_ref')
++            builder.emit(member_block, 'Cast', [numbered], member_key,
++                         attributes={'binding': 'object_context_position'})
++        builder.branch(member_block, store_block)
++        key, item, status = builder.fresh('opaque_ref'), builder.fresh('opaque_ref'), builder.fresh('bool')
++        for result, incoming_values in ((key, [pair_key, member_key]), (item, [pair_item, member])):
++            builder.emit(store_block, 'Phi', incoming_values, result,
++                         attributes={'incoming_blocks': (pair_block.name, member_block.name)})
++        invoke(store_block, set_helper, destination, (key, item), status)
++        builder.cond(store_block, status, written, reject)
++        updated_count = builder.fresh('int64')
++        builder.emit(written, 'Add', [count, one], updated_count)
++        builder.branch(written, latch)
++        builder.emit(latch, 'Phi', [count, updated_count], next_count,
++                     attributes={'incoming_blocks': (body.name, written.name)})
++        builder.emit(latch, 'Add', [index, one], next_index)
++        builder.branch(latch, header)
++        builder.emit(complete, 'Ret', [builder.const(complete, 1, dtype='bool')])
++        builder.emit(reject, 'Ret', [builder.const(reject, 0, dtype='bool')])
++        finish(label, builder, (destination, source), reference=destination, operation=operation)
+ 
+     builder = _Builder(0)
+     entry = builder.block('entry')
++    # all(map(is, zip(a,b))) is scalar control, not collection storage.
++    # Positions are resolved through the incumbent native member ABI, never
++    # Python iteration or value equality; false short-circuits and empty is true.
++    reduction_builder = _Builder(0)
++    left, right = reduction_builder.fresh('opaque_ref'), reduction_builder.fresh('opaque_ref')
++    reduction_blocks = {name: reduction_builder.block(name) for name in
++                        ('entry', 'header', 'body', 'latch', 'complete', 'reject')}
++    re = reduction_blocks['entry']
++    rz = reduction_builder.const(re, 0, dtype='int64')
++    ro = reduction_builder.const(re, 1, dtype='int64')
++    lengths = []
++    length_helper = module.functions[f'{prefix}_length']
++    for source in (left, right):
++        length = reduction_builder.fresh('int64')
++        call(reduction_builder, re, length_helper,
++             {length_helper.metadata['opaque_object_helper']['reference_formal_id']: source}, length)
++        lengths.append(length)
++    shorter, extent = reduction_builder.fresh('bool'), reduction_builder.fresh('int64')
++    reduction_builder.emit(re, 'Lt', lengths, shorter)
++    reduction_builder.emit(re, 'Select', [shorter, *lengths], extent)
++    reduction_builder.branch(re, reduction_blocks['header'])
++    rh, rb, rl = (reduction_blocks[name] for name in ('header', 'body', 'latch'))
++    index, next_index = reduction_builder.fresh('int64'), reduction_builder.fresh('int64')
++    reduction_builder.emit(rh, 'Phi', [rz, next_index], index,
++                           attributes={'incoming_blocks': (re.name, rl.name)})
++    more = reduction_builder.fresh('bool')
++    reduction_builder.emit(rh, 'Lt', [index, extent], more)
++    reduction_builder.cond(rh, more, rb, reduction_blocks['complete'])
++    ordinal, position = reduction_builder.fresh('int64'), reduction_builder.fresh('opaque_ref')
++    reduction_builder.emit(rb, 'Add', [index, ro], ordinal)
++    reduction_builder.emit(rb, 'Cast', [ordinal], position, attributes={'binding': 'object_context_position'})
++    getter = module.functions[f'{prefix}_get']
++    roles = getter.metadata['opaque_object_helper']
++    members = []
++    for source in (left, right):
++        member = reduction_builder.fresh('opaque_ref')
++        call(reduction_builder, rb, getter, {roles['reference_formal_id']: source,
++             roles['operand_formal_ids'][0]: position}, member)
++        members.append(member)
++    same = reduction_builder.fresh('bool')
++    reduction_builder.emit(rb, 'Eq', members, same)
++    reduction_builder.cond(rb, same, rl, reduction_blocks['reject'])
++    reduction_builder.emit(rl, 'Add', [index, ro], next_index)
++    reduction_builder.branch(rl, rh)
++    for name, truth in (('complete', 1), ('reject', 0)):
++        block = reduction_blocks[name]
++        reduction_builder.emit(block, 'Ret', [reduction_builder.const(block, truth, dtype='bool')])
++    finish('identity_all', reduction_builder, (left, right), reference=left, operation=ObjectOperation.IDENTITY_ALL)
++
+     entry.instrs.append(heap_release(by_id[context.objects.heap_owner_value_id]))
+     # Release invalidates addresses and counters together, never leaves a stale
+     # descriptor pointing at freed payload. Reinitialize to start a new domain.
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/ssa_object_operations.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/ssa_object_operations.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/ssa_object_operations.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/ssa_object_operations.py
+index 1941b19..80c887c 100644
+--- a/src/compiler/ssa_object_operations.py
++++ b/src/compiler/ssa_object_operations.py
+@@ -22,8 +22,11 @@ class ObjectOperation(str, Enum):
+     SET = "set"
+     CONSTRUCT = "construct"
+     MATERIALIZE = "materialize"
++    MATERIALIZE_FROZEN = "materialize_frozen"
+     COLLECT = "collect"
+     UPDATE = "update"
++    EXTEND = "extend"
++    IDENTITY_ALL = "identity_all"
+     RELEASE = "release"
+ 
+ 
+@@ -33,8 +36,11 @@ _RESULT_DTYPES = {
+     ObjectOperation.GET: "opaque_ref", ObjectOperation.SET: "bool",
+     ObjectOperation.CONSTRUCT: "opaque_ref", ObjectOperation.RELEASE: None,
+     ObjectOperation.MATERIALIZE: "opaque_ref",
++    ObjectOperation.MATERIALIZE_FROZEN: "opaque_ref",
+     ObjectOperation.COLLECT: "opaque_ref",
+     ObjectOperation.UPDATE: "bool",
++    ObjectOperation.EXTEND: "bool",
++    ObjectOperation.IDENTITY_ALL: "bool",
+ }
+ 
+ 
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/precompile_to_ssa.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/precompile_to_ssa.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/precompile_to_ssa.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/precompile_to_ssa.py
+index c397b7e..28ce6d8 100644
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -7960,7 +7960,8 @@ class _ControlSSABuilder:
+         self.emit(Handler.Const, [], token,
+             attributes={'value': context.kind_vocabulary.index(kind) + 1})
+         source, = mutation.argument_value_ids
+-        result = self._emit_native_object_operation('materialize', int(source),
++        operation = 'materialize_frozen' if kind == 'builtins.frozenset' else 'materialize'
++        result = self._emit_native_object_operation(operation, int(source),
+             (token,), int(mutation.sequence_value_id))
+         result.accounting.update(native_object_storage_identity=context.storage_identity,
+                                  native_object_source_kind=kind)
+@@ -7977,6 +7978,16 @@ class _ControlSSABuilder:
+     ) -> None:
+         operation = str(mutation.operator)
+         location = f"{path}.sequence_mutation[{mutation.effect_node_id}]"
++        if operation == 'object_identity_reduce':
++            from .ssa_object_context import object_source_contract
++            accepted = object_source_contract(mutation.object_contract_cell, book=self._book())
++            if (mutation.sequence_value_id != accepted['result_value_id']
++                    or mutation.argument_value_ids != accepted['source_value_ids']):
++                raise ValueError(f'{location}: identity reduction differs from its concordance edges')
++            left, right = accepted['source_value_ids']
++            self._emit_native_object_operation('identity_all', left, (right,), accepted['result_value_id'])
++            self.current.instrs[-1].attributes['source_object_identity_reduction'] = {'contract_cell': mutation.object_contract_cell}
++            return
+         if operation == 'object_construct':
+             self._emit_native_object_constructor(mutation, location=location)
+             return
+@@ -7989,7 +8000,7 @@ class _ControlSSABuilder:
+             if (mutation.sequence_value_id != accepted['destination_value_id']
+                     or mutation.argument_value_ids != (accepted['source_value_id'],)):
+                 raise ValueError(f'{location}: update differs from its authoritative concordance cell')
+-            self._emit_native_object_operation('update', mutation.sequence_value_id, mutation.argument_value_ids, None)
++            self._emit_native_object_operation(accepted['operation'], mutation.sequence_value_id, mutation.argument_value_ids, None)
+             self.current.instrs[-1].attributes['source_object_update'] = {'contract_cell': mutation.object_contract_cell}
+             return
+         if int(mutation.sequence_value_id) in self.native_object_source_ids:
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/glsl_deployment_strategy.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/glsl_deployment_strategy.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/glsl_deployment_strategy.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/glsl_deployment_strategy.py
+index 1f18417..436c75c 100644
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -8587,9 +8587,15 @@ def _source_control_nesting_hints(
+             else:
+                 descendants = tuple(ast.walk(parent_expression))
+             child_signature = _ast_source_signature(child_expression)
++            # All comprehension clauses lack their own source coordinates.
++            # Their identical (type,None,None,...) signatures are NOT source
++            # identity: copier loops63/67/71 became a containment cycle and
++            # overlay silently lost their bodies. Exact AST identity remains
++            # authoritative; a signature fallback requires a located node.
++            located_child = getattr(child_expression, 'lineno', None) is not None
+             if not any(
+                 id(member) == id(child_expression)
+-                or _ast_source_signature(member) == child_signature
++                or located_child and _ast_source_signature(member) == child_signature
+                 for member in descendants
+             ):
+                 continue
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/topological_reducer.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/common/tensors/topological_reducer.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/topological_reducer.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/common/tensors/topological_reducer.py
+index 0f1799c..8c66265 100644
+--- a/src/common/tensors/topological_reducer.py
++++ b/src/common/tensors/topological_reducer.py
+@@ -6104,7 +6104,7 @@ def _normalize_lexical_values(
+                 isinstance(callee, _StaticPythonReference)
+                 and any(
+                     callee.value is kind
+-                    for kind in (tuple, list, set, dict, bytes, bytearray)
++                    for kind in (tuple, list, set, frozenset, dict, bytes, bytearray)
+                 )
+                 and node_id in graph.G
+             ):
+@@ -6122,13 +6122,13 @@ def _normalize_lexical_values(
+                 constructor_attributes.update({
+                     "aggregate_kind": aggregate_kind,
+                     "sequence_key_columns": (
+-                        (0,) if aggregate_kind in {"set", "dict"} else ()
++                        (0,) if aggregate_kind in {"set", "frozenset", "dict"} else ()
+                     ),
+                     "sequence_column_count": (
+                         2 if aggregate_kind == "dict" else 1
+                     ),
+                     "sequence_writable": aggregate_kind not in {
+-                        "tuple", "bytes"
++                        "tuple", "frozenset", "bytes"
+                     },
+                 })
+                 constructor_attributes.setdefault(
+@@ -6651,7 +6651,7 @@ def _normalize_lexical_values(
+         if (
+             isinstance(expression, ast.Call)
+             and isinstance(expression.func, ast.Name)
+-            and expression.func.id in {"tuple", "list"}
++            and expression.func.id in {"tuple", "list", "frozenset"}
+             and len(expression.args) == 1
+             and node_id in graph.G
+         ):
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/python_identity_programs.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/transmogrifier/graph/python_identity_programs.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/python_identity_programs.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/transmogrifier/graph/python_identity_programs.py
+index 8ed4d0c..a109d01 100644
+--- a/src/transmogrifier/graph/python_identity_programs.py
++++ b/src/transmogrifier/graph/python_identity_programs.py
+@@ -277,6 +277,11 @@ PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
+         object_type="resident_tuple",
+         description="fixed resident product sequence",
+     ),
++    PythonIdentityProgram(
++        identities=("builtins.frozenset",), kind="object",
++        object_type="resident_frozen_set",
++        description="immutable resident identity-keyed member collection",
++    ),
+     PythonIdentityProgram(
+         identities=(
+             "src.common.tensors.abstract_nn.utils.set_seed",
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/native_compiler_accelerators.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/native_compiler_accelerators.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/native_compiler_accelerators.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/native_compiler_accelerators.py
+index 913b956..9b00011 100644
+--- a/src/compiler/native_compiler_accelerators.py
++++ b/src/compiler/native_compiler_accelerators.py
+@@ -29,6 +29,7 @@ DEPENDENCY_LEVELS = "compiler.graph.dependency_levels"
+ BROADCAST_SHAPES = "compiler.graph.broadcast_shapes"
+ DEAD_METADATA_ORDER = "compiler.graph.dead_metadata_order"
+ READ_ONLY_MODULE = "compiler.ssa.read_only_module"
++METADATA_COPY = "compiler.graph.isolate_metadata_batch"
+ 
+ 
+ @dataclass
+@@ -110,6 +111,198 @@ def _python_lexicographical_topological_order(graph, *, key=None):
+ 
+ 
+ compiler_accelerators = CompilerAcceleratorRegistry()
++compiler_accelerators.register_fallback(
++    METADATA_COPY, lambda values, *, copier: tuple(copier(value) for value in values),
++    name="python:authored-metadata-copier",
++)
++
++
++def metadata_copy_batch(values, *, copier, registry=compiler_accelerators):
++    """One shared identity domain for graph and node metadata; no item dispatch."""
++    return registry.resolve(METADATA_COPY).run(values, copier=copier)
++
++
++def metadata_copy_source():
++    """Wrap the unchanged incumbent copier, never author a substitute."""
++    import ast
++    import inspect
++    from .process_graph_fusion import extract_clean_process_subgraph
++    extractor = ast.parse(inspect.getsource(extract_clean_process_subgraph)).body[0]
++    copier = next(node for node in extractor.body if isinstance(node, ast.FunctionDef)
++                  and node.name == 'isolate_metadata')
++    root = ast.parse('def metadata_copy_program(value, metadata_memo):\n'
++                     '    return isolate_metadata(value)\n').body[0]
++    root.body.insert(0, copier)
++    return ast.unparse(ast.fix_missing_locations(ast.Module(body=[root], type_ignores=[])))
++
++
++def _native_metadata_copy_runner(artifact, abi):
++    import numpy as np
++    from .shell_external_references import ExternalReferenceValueCodec
++    from .ssa_llvm_backend import prepare_artifact_execution
++    artifact.entry()
++    release = abi['release']
++    release.entry()
++    context, function, memo = abi['context'], abi['function'], abi['memo']
++
++    def run(values, *, copier):
++        # The synthetic tuple is only the batch root. The original recursive
++        # program copies it with the same memo as every graph/node value.
++        values = tuple(values)
++        boundary = ExternalReferenceValueCodec().bind_native_objects(context, (values,))
++        try:
++            if boundary._opaque_container_handles:
++                # The incumbent Python copier accepts builtin subclasses;
++                # type evidence alone does not admit their native payload.
++                # Decide BEFORE execution, never retry a native fault.
++                return tuple(copier(value) for value in values)
++            # One memo key per imported container identity is a proven bound,
++            # including tuple reentry. Native temporary births add no keys.
++            capacity = max(1, int(boundary.buffers[context.objects.length_address_id][0]))
++            feeds = {
++                abi['parameter']: np.array([boundary.roots[0]], dtype=np.int64),
++                memo.column_value_ids[0]: np.zeros(capacity, dtype=np.int64),
++                memo.column_value_ids[1]: np.zeros(capacity, dtype=np.int64),
++                memo.length_address_id: np.zeros(1, dtype=np.int64),
++                memo.capacity_value_id: np.array([capacity], dtype=np.int64),
++                memo.status_address_id: np.zeros(1, dtype=np.int32),
++                memo.live_flags_value_id: np.zeros(capacity, dtype=np.bool_),
++            }
++            invocation = boundary.bind_execution(artifact, function, feeds).run()
++            if int(feeds[memo.status_address_id][0]) == 2:
++                raise RuntimeError('native metadata copier exhausted its identity memo')
++            result, = boundary.export((int(invocation.buffers[abi['output']].item()),))
++            if type(result) is not tuple or len(result) != len(values):
++                raise RuntimeError('native metadata copier returned an invalid batch')
++            return result
++        finally:
++            prepare_artifact_execution(release, boundary.buffers).run()
++            boundary.close()
++    return run
++
++
++def _metadata_copy_install_directory(directory=None):
++    return (Path(directory) if directory is not None else
++            Path(__file__).resolve().parents[2] / 'build/compiler_foundations/metadata_copy').resolve()
++
++
++def _metadata_copy_install_key(store):
++    import hashlib
++    import platform
++    import struct
++    from .project_compilation_product import compiler_toolchain_fingerprint
++    digest = hashlib.sha256(compiler_toolchain_fingerprint()['sha256'].encode())
++    for filename in ('native_compiler_accelerators.py', 'native_object_boundary.py',
++                     'ssa_object_context.py', 'ssa_object_operations.py'):
++        digest.update(Path(__file__).with_name(filename).read_bytes())
++    digest.update(metadata_copy_source().encode())
++    digest.update(repr((platform.system(), platform.machine(), struct.calcsize('P'))).encode())
++    return store.key('executable', METADATA_COPY, digest.hexdigest())
++
++
++def load_metadata_copy_accelerator(directory=None, *, registry=compiler_accelerators):
++    """Load matching compiler code only; missing/stale code stays serial."""
++    import dataclasses
++    import hashlib
++    from .opportunistic_pipeline import ArtifactCheckpointStore
++    directory = _metadata_copy_install_directory(directory)
++    if not (directory / 'checkpoints').is_dir():
++        return None
++    store = ArtifactCheckpointStore(directory / 'checkpoints')
++    checkpoint = store.load(_metadata_copy_install_key(store))
++    if checkpoint is None:
++        return None
++    if checkpoint.kind != 'executable' or checkpoint.meta.get('semantic') != METADATA_COPY:
++        raise ValueError('installed metadata copier has a different semantic ABI')
++    abi = dict(checkpoint.meta['abi'])
++    artifacts = []
++    for product, digest in ((checkpoint.value, checkpoint.meta['library_sha256']),
++                            (abi['release'], checkpoint.meta['release_sha256'])):
++        library = (directory / product.library_path).resolve()
++        if not library.is_relative_to(directory) or not library.is_file():
++            raise ValueError('installed metadata copier library is absent or outside its installation')
++        if hashlib.sha256(library.read_bytes()).hexdigest() != digest:
++            raise ValueError('installed metadata copier library digest changed')
++        artifacts.append(dataclasses.replace(product, library_path=library))
++    artifact, abi['release'] = artifacts
++    return registry.register_native(METADATA_COPY, _native_metadata_copy_runner(artifact, abi),
++        name='turing:authored-metadata-copier', library_path=artifact.library_path,
++        exports=(artifact.name,), metadata={**checkpoint.meta, 'artifact': artifact,
++            'installation': str(directory), 'loaded_without_compilation': True})
++
++
++def compile_and_register_metadata_copy_accelerator(directory=None, *, registry=compiler_accelerators, progress=None):
++    """Build the whole ORIGINAL copier through our sanctioned source entry."""
++    import dataclasses
++    import hashlib
++    from types import SimpleNamespace
++    from .opportunistic_pipeline import Artifact, ArtifactCheckpointStore
++    from .extraction_contract import ExtractionContract
++    from .fortran_c_shell import lower_ast_source_to_ssa
++    from .identity_concordance import concordance_report
++    from .monotonic_ids import GLOBAL_MONOTONIC_IDS
++    from .ssa_object_context import lower_object_context
++    from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
++    from ..transmogrifier.ssa import SSAObjectContext, SSASequenceDescriptor, SSASequenceCapacityPolicy
++    directory = _metadata_copy_install_directory(directory)
++    incumbent = load_metadata_copy_accelerator(directory, registry=registry)
++    if incumbent is not None:
++        return incumbent
++    store = ArtifactCheckpointStore(directory / 'checkpoints')
++    key = _metadata_copy_install_key(store)
++    mint = GLOBAL_MONOTONIC_IDS.mint
++    owner = mint()
++    def table(dtypes, keys):
++        columns = tuple(mint() for _ in dtypes)
++        return SSASequenceDescriptor(columns[0], columns, mint(), mint(),
++            status_address_id=mint(), column_dtypes=dtypes, key_columns=keys,
++            capacity_policy=SSASequenceCapacityPolicy.DYNAMIC, heap_owner_value_id=owner)
++    kinds = tuple('builtins.' + name for name in ('dict', 'list', 'tuple', 'set', 'frozenset', 'object'))
++    context = SSAObjectContext('compiler.metadata.context',
++        table(('opaque_ref', 'int64', 'int64'), (0,)),
++        table(('opaque_ref', 'opaque_ref', 'opaque_ref'), (0, 1)), mint(), kinds,
++        type_vocabulary=(*kinds, *( 'builtins.' + name for name in ('bool','int','float','str','bytes','NoneType'))))
++    repository = Path(__file__).resolve().parents[2]
++    contract = ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_program_abi({
++        'records': {}, 'bindings': [], 'values': [
++            {'function': 'metadata_copy_program', 'parameter': 'value', 'storage': 'reference', 'python_type': 'builtins.object'},
++            {'function': 'metadata_copy_program', 'parameter': 'metadata_memo', 'storage': 'keyed', 'dtype': 'opaque_ref',
++             'mutable': True, 'key_encoding': 'integer_identity', 'python_type': 'builtins.dict'}]
++    }).with_execution_file(repository / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    module, _, exports = lower_ast_source_to_ssa(metadata_copy_source(), 'metadata_copy_program',
++        extraction_contract=contract, native_object_context=context, runtime_closure_only=True,
++        progress=progress or (lambda _: None), progress_bars=False)
++    report = concordance_report(module)
++    if not report.splitlines()[0].endswith('0 finding(s)'):
++        raise ValueError(report)
++    function = module.functions[exports[0]]
++    artifact = emit_ssa_function_to_llvm(module, function.name)
++    release_module = lower_object_context(context, prefix='metadata_copy_release')
++    release = emit_ssa_function_to_llvm(release_module, 'metadata_copy_release_release')
++    if not artifact.complete or not release.complete:
++        raise ValueError((artifact.shortfalls, release.shortfalls))
++    product = directory / 'products' / key
++    artifact = compile_artifact(artifact, directory=product / 'copier')
++    release = compile_artifact(release, directory=product / 'release')
++    def portable(value):
++        return dataclasses.replace(value, emission=None, _entry=None, _library=None,
++            _validation_error_reset=None, _validation_error_take=None,
++            library_path=value.library_path.relative_to(directory))
++    # Boundary ABI only, not a second saved graph or provenance registry.
++    boundary_function = SimpleNamespace(name=function.name, args=tuple(function.args), metadata={
++        name: function.metadata[name] for name in ('native_object_context', 'native_object_requires_member_storage')
++        if name in function.metadata})
++    memo = next(d for d in module.sequence_tables[function.name].sequences.values()
++                if d.column_dtypes == ('int64', 'opaque_ref'))
++    output = next(i.args[0].id for b in function.blocks.values() for i in b.instrs if i.op == 'Ret' and i.args)
++    abi = dict(context=context, function=boundary_function, memo=memo,
++        parameter=dict(function.metadata['parameter_names'])['value'], output=output, release=portable(release))
++    metadata = dict(semantic=METADATA_COPY, abi=abi,
++        library_sha256=hashlib.sha256(artifact.library_path.read_bytes()).hexdigest(),
++        release_sha256=hashlib.sha256(release.library_path.read_bytes()).hexdigest())
++    if store.save(key, Artifact('executable', portable(artifact), metadata)) is None:
++        raise RuntimeError('could not save the compiled metadata copier')
++    return load_metadata_copy_accelerator(directory, registry=registry)
+ compiler_accelerators.register_fallback(
+     TOPOLOGICAL_ORDER,
+     _python_lexicographical_topological_order,
+@@ -783,6 +976,11 @@ def load_storage_effects_accelerator(directory=None, *, registry=compiler_accele
+ 
+ 
+ __all__ = [
++    "METADATA_COPY",
++    "metadata_copy_source",
++    "metadata_copy_batch",
++    "compile_and_register_metadata_copy_accelerator",
++    "load_metadata_copy_accelerator",
+     "TOPOLOGICAL_ORDER",
+     "DEPENDENCY_LEVELS",
+     "BROADCAST_SHAPES",
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/process_graph_fusion.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/process_graph_fusion.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/process_graph_fusion.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/src/compiler/process_graph_fusion.py
+index ab98e48..3dd3d0e 100644
+--- a/src/compiler/process_graph_fusion.py
++++ b/src/compiler/process_graph_fusion.py
+@@ -260,7 +260,19 @@ def extract_clean_process_subgraph(
+                     for node_id in included
+                     if node_id in table
+                 }
+-    extracted.G.graph = isolate_metadata(metadata)
++    from .native_compiler_accelerators import METADATA_COPY, compiler_accelerators
++    provider = compiler_accelerators.resolve(METADATA_COPY)
++    copied_node_values = None
++    if provider.tier == 'native':
++        # One admitted batch and one memo across graph AND node metadata.
++        # Do not cross the Python/native boundary once per attribute.
++        node_slots = tuple((node_id, key, value) for node_id in extracted.G
++                           for key, value in extracted.G.nodes[node_id].items() if key != 'expr_obj')
++        copied = provider.run((metadata, *(value for _, _, value in node_slots)), copier=isolate_metadata)
++        extracted.G.graph = copied[0]
++        copied_node_values = tuple(zip(node_slots, copied[1:], strict=True))
++    else:
++        extracted.G.graph = isolate_metadata(metadata)
+     extracted.G.graph.update(shared_metadata)
+     # The copy owns its read facts from here on; its operand rewrites are
+     # recorded in its own scope, never in its source's.
+@@ -270,10 +282,13 @@ def extract_clean_process_subgraph(
+             graph if included and len(included) < len(graph.G) else None
+         ),
+     )
++    if copied_node_values is not None:
++        for (node_id, key, _source), value in copied_node_values:
++            extracted.G.nodes[node_id][key] = value
+     for node_id in extracted.G:
+         data = extracted.G.nodes[node_id]
+         for key, value in tuple(data.items()):
+-            if key != "expr_obj":
++            if key != "expr_obj" and copied_node_values is None:
+                 data[key] = isolate_metadata(value)
+         _set_operands(extracted, node_id, [
+             (parent, role)
+warning: in the working copy of 'C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/probe_native_metadata_copy.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/tools/compiler_probes/probe_native_metadata_copy.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/C:/Users/alber/AppData/Local/Temp/turing-copier-connected-baseline-20261010/probe_native_metadata_copy.py b/C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/tools/compiler_probes/probe_native_metadata_copy.py
+index 3cc7065..16ea752 100644
+--- a/tools/compiler_probes/probe_native_metadata_copy.py
++++ b/tools/compiler_probes/probe_native_metadata_copy.py
+@@ -4,7 +4,6 @@ The source is taken from the production extractor, not reimplemented. Its
+ memo is an explicit boundary input because one extraction shares it across
+ graph metadata and every node. No deadline and no production route mutation.
+ """
+-import ast
+ from pathlib import Path
+ import sys
+ import time
+@@ -15,15 +14,8 @@ sys.path.insert(0, str(ROOT))
+ 
+ 
+ def authored_program():
+-    tree = ast.parse((ROOT / "src/compiler/process_graph_fusion.py").read_text())
+-    extractor = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+-                     and node.name == "extract_clean_process_subgraph")
+-    copier = next(node for node in extractor.body if isinstance(node, ast.FunctionDef)
+-                  and node.name == "isolate_metadata")
+-    root = ast.parse("def metadata_copy_program(value, metadata_memo):\n"
+-                     "    return isolate_metadata(value)\n").body[0]
+-    root.body.insert(0, copier)
+-    return ast.unparse(ast.fix_missing_locations(ast.Module(body=[root], type_ignores=[])))
++    from src.compiler.native_compiler_accelerators import metadata_copy_source
++    return metadata_copy_source()
+ 
+ 
+ def main():
+@@ -71,6 +63,9 @@ def main():
+     print("EXACT_METADATA_COPIER_SUBMISSION: " + str(len(source.splitlines()))
+           + " authored lines; full-native, no Python callbacks", flush=True)
+     started = time.perf_counter()
++    if '--control-writes' in sys.argv:
++        from tools.compiler_probes.observe_copier_contract_batch import trace
++        sys.settrace(trace)
+     try:
+         module, _outputs, exports = lower_ast_source_to_ssa(
+             source, "metadata_copy_program", name="compiler_metadata_copy",
+@@ -79,7 +74,22 @@ def main():
+             if str(message).startswith("ssa-source:") else None, progress_bars=False,
+             **context_options,
+         )
++        if '--details' in sys.argv[1:]:
++            for function in module.functions.values():
++                for block in function.blocks.values():
++                    for instruction in block.instrs:
++                        if instruction.op == 'Call' and not instruction.attributes.get('callee'):
++                            print('UNBOUND_CALL', function.name, block.name, repr(instruction), flush=True)
++            def emission_trace(frame, event, argument):
++                if frame.f_code.co_name != '_emit_repository_call_module':
++                    return None
++                if event == 'line' and frame.f_lineno == 4435:
++                    print('EMISSION_REFUSAL', frame.f_locals.get('name'), repr(frame.f_locals.get('instruction')), flush=True)
++                return emission_trace
++            sys.settrace(emission_trace)
+         artifact = emit_ssa_function_to_llvm(module, exports[0])
++        if '--details' in sys.argv[1:]:
++            sys.settrace(None)
+         print("LLVM_COMPLETE: " + repr((artifact.complete, artifact.shortfalls)), flush=True)
+         return 0 if artifact.complete else 2
+     except Exception as error:
+@@ -88,6 +98,7 @@ def main():
+         traceback.print_exc(file=sys.stdout)
+         return 2
+     finally:
++        sys.settrace(None)
+         print("ELAPSED: " + str(time.perf_counter() - started), flush=True)
+ 
+ 
+diff --git a/tools/compiler_probes/observe_copier_contract_batch.py b/tools/compiler_probes/observe_copier_contract_batch.py
+new file mode 100644
+--- /dev/null
++++ b/tools/compiler_probes/observe_copier_contract_batch.py
+@@ -0,0 +1,171 @@
++"""Observe actual graph/formal identities in tiny copier source lowerings."""
++from pathlib import Path
++import sys
++import traceback
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++from tests.test_native_object_contract_batch import policy, typed_context
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++
++SOURCES = {
++    'recursive_dict': ('def root(value):\n    def visit(item):\n'
++        '        if isinstance(item,dict):\n            result={}\n'
++        '            result.update((key,visit(child)) for key,child in item.items())\n'
++        '            return result\n        return item\n    return visit(value)\n'),
++    'identity_all': ('def root(value):\n    copied=tuple(item for item in value)\n'
++        '    return all(new is old for new,old in zip(copied,value))\n'),
++    'extend': ('def root(value):\n    result=[]\n'
++        '    result.extend(item for item in value)\n    return result\n'),
++    'set': ('def root(value):\n    result=set()\n'
++        '    result.update(item for item in value)\n    return result\n'),
++    'frozenset': 'def root(value):\n    return frozenset(value)\n',
++    'get': 'def root(value,memo):\n    return memo.get(id(value))\n',
++}
++observed_functions = {}
++previous_line = {}
++
++def trace(frame, event, arg):
++    if event == 'return' and frame.f_code.co_name == '_attach_graph_control_expressions':
++        graph = frame.f_locals['graph_obj']
++        if graph.graph.get('function_name') == 'isolate_metadata':
++            from src.compiler.glsl_deployment_strategy import _source_control_records
++            print('AUTHORED_PATHS', tuple((node, getattr(record['expression'], '_turing_source_span_row', None))
++                  for node, record in _source_control_records(graph).items()), flush=True)
++    if event == 'return' and frame.f_code.co_name in {
++        '_place_plan_callsites_lexically', '_install_lexical_sequence_mutations',
++        '_install_lexical_sequence_queries', '_attach_graph_control_expressions',
++    } and hasattr(arg, 'root'):
++        from src.compiler.control_source import SequenceBlock, ConditionalBlock
++        from src.compiler.fortran_c_shell import _authored_node_position
++        graph = frame.f_locals.get('graph')
++        if graph is not None and graph.G.graph.get('function_name') == 'isolate_metadata':
++            blocks = arg.root.blocks if isinstance(arg.root, SequenceBlock) else (arg.root,)
++            print('ROOT_ORDER', frame.f_code.co_name, tuple(
++                (type(block).__name__, getattr(block, 'source_node_id', None),
++                 _authored_node_position(graph.G, block.source_node_id)
++                 if isinstance(block, ConditionalBlock) else None)
++                for block in blocks), flush=True)
++    if event == 'return' and frame.f_code.co_name in {'project_control_regions', 'overlay_scheduled_control'}:
++        from src.compiler.control_source import SequenceBlock, LoopBlock, WhileBlock, ConditionalBlock
++        def loops(block):
++            found = set()
++            if isinstance(block, SequenceBlock):
++                for child in block.blocks:
++                    found.update(loops(child))
++            if isinstance(block, (LoopBlock,WhileBlock)):
++                found.add(block.source_loop_node_id)
++                found.update(loops(block.body))
++            if isinstance(block, ConditionalBlock):
++                found.update(loops(block.body))
++                if block.orelse is not None:
++                    found.update(loops(block.orelse))
++            return found
++        before = set()
++        for program in frame.f_locals.get('controls', (frame.f_locals.get('program'),)):
++            if program is not None:
++                before.update(loops(program.root))
++        after = set() if arg is None else loops(arg.root)
++        if before != after:
++            print('CONTROL_LOSS', frame.f_code.co_name, 'BEFORE',before,'AFTER',after,
++                  'PARENT', frame.f_back.f_code.co_name, frame.f_back.f_lineno,
++                  'NESTING', frame.f_locals.get('known_nesting'),flush=True)
++    if event == 'return' and frame.f_code.co_name == 'analyze_shader_loop_reductions':
++        print('LOOP_REDUCTIONS', tuple((r.loop_node_id,r.blockers) for r in arg), flush=True)
++    if event == 'return' and frame.f_code.co_name == '_install_lexical_sequence_mutations':
++        if frame.f_locals['graph'].G.graph.get('function_name') == 'isolate_metadata':
++            print('INSTALLED_EFFECTS', tuple((m.effect_node_id,getattr(m,'operator',None))
++                for m in frame.f_locals.get('mutations', ())),
++                'EXISTING', frame.f_locals.get('existing_effect_ids'), flush=True)
++    if event in {'call','return'} and frame.f_code.co_name == '_place_plan_callsites_lexically':
++        from src.compiler.control_source import SequenceBlock, LoopBlock, WhileBlock, ConditionalBlock, StatementBlock
++        def paths(block, owners=()):
++            if isinstance(block, StatementBlock) and block.lines and '__plan_callsite_' in block.lines[0]:
++                print('PLACED_CALL', block.lines, owners, flush=True)
++            if isinstance(block, SequenceBlock):
++                for child in block.blocks:
++                    paths(child, owners)
++            if isinstance(block, (LoopBlock, WhileBlock)):
++                print('PLACED_LOOP', event, block.source_loop_node_id, owners, flush=True)
++                paths(block.body, (*owners, ('loop', block.source_loop_node_id)))
++            if isinstance(block, ConditionalBlock):
++                paths(block.body, (*owners, ('if', block.source_node_id, 'body')))
++                if block.orelse is not None:
++                    paths(block.orelse, (*owners, ('if', block.source_node_id, 'orelse')))
++        if frame.f_locals['graph'].G.graph.get('function_name') == 'isolate_metadata':
++            from src.compiler.hierarchical_plan import PlanCall
++            print('PLANNED_CALLS', event, [(c.callsite_id,c.enclosing_loop_ids) for c in frame.f_locals['hierarchy_plan'].items
++                                         if isinstance(c,PlanCall)], flush=True)
++            paths((frame.f_locals['control'] if event == 'call' else arg).root)
++    if event == 'line' and frame.f_code.co_name == '_class_surface_ssa_program' and '--writes' in sys.argv:
++        for label, function in frame.f_locals.get('all_functions', {}).items():
++            if label == 'root__visit':
++                signature = tuple((block.name, tuple((ins.op,ins.attributes.get('callee'))
++                    for ins in block.instrs)) for block in function.blocks.values())
++                if observed_functions.get(label) != signature:
++                    print('FUNCTION_WRITE', previous_line.get(id(frame)), '->', frame.f_lineno, signature, flush=True)
++                    observed_functions[label] = signature
++        previous_line[id(frame)] = frame.f_lineno
++    if event == 'return' and frame.f_code.co_name == 'source_constructor_mutations':
++        graph = frame.f_locals['graph']
++        if graph.graph.get('function_name') in {'visit', 'root'}:
++            print('BIRTHS', tuple((m.sequence_value_id,m.operator) for m in arg),
++                  'ABI', graph.graph.get('linked_value_abi'), flush=True)
++            if graph.graph.get('function_name') == 'visit':
++                from src.compiler.glsl_deployment_strategy import _source_control_records
++                print('CONTROLS', _source_control_records(graph), flush=True)
++            if any((data.get('attributes') or {}).get('extraction_identity') == 'builtins.all'
++                   for _, data in graph.nodes(data=True)):
++                print('REDUCTION_GRAPH', tuple((node, data.get('type'), data.get('op'), data.get('parents'),
++                    {key: value for key, value in (data.get('attributes') or {}).items()
++                     if key in {'aggregate_kind','producer_kind','extraction_identity','loop_target_bindings',
++                        'loop_id','materializer_node_id','result_kind','collection_iterable_value_id'}})
++                    for node, data in graph.nodes(data=True)), flush=True)
++    if event == 'exception' and frame.f_code.co_name == 'recursive_frame_lease':
++        local = frame.f_locals
++        source, callee = local['source'], local['callee']
++        print('CALLEE_FORMALS', callee.name, callee.metadata.get('parameter_names'),
++              tuple((v.id,v.dtype,v.accounting) for v in callee.args), flush=True)
++        print('LEASE', repr(source), 'ACCOUNTING', source.accounting, flush=True)
++        if '--brief' in sys.argv:
++            return trace
++        for block in callee.blocks.values():
++            for instruction in block.instrs:
++                if (instruction.res is not None and instruction.res.id == source.id
++                        or any(value.id == source.id for value in instruction.args)):
++                    print('CONSUMER', block.name, repr(instruction), flush=True)
++        graph = local['caller_graph']
++        print('GRAPH_ABI', graph.graph.get('linked_value_abi'), flush=True)
++        for node, data in graph.nodes(data=True):
++            print('GRAPH', node, data.get('type'), data.get('op'), data.get('parents'),
++                {key: value for key, value in (data.get('attributes') or {}).items()
++                 if key in {'aggregate_kind', 'producer_kind', 'extraction_identity',
++                    'loop_target_bindings', 'callee_ref', 'structural_identity_actual_value_id',
++                    'collection_owner_id', 'materialized_source_value_ids'}}, flush=True)
++    return trace
++
++if __name__ == '__main__':
++    for name in sys.argv[1:] or SOURCES:
++        print('CASE', name, flush=True)
++        sys.settrace(trace)
++        try:
++            module, _, exports = lower_ast_source_to_ssa(SOURCES[name], 'root',
++                extraction_contract=policy(name == 'get'), native_object_context=typed_context(),
++                progress=lambda _: None, progress_bars=False,
++                runtime_closure_only=True)
++            print('LOWERED', exports, flush=True)
++            if name == 'recursive_dict':
++                for function in module.functions.values():
++                    if function.metadata.get('native_object_collections'):
++                        print('FUNCTION', function.name, 'FORMALS', [(v.id,v.dtype) for v in function.args], flush=True)
++                        for block in function.blocks.values():
++                            print('BLOCK', block.name, block.successors, flush=True)
++                            for ins in block.instrs:
++                                print('SSA', ins.op, tuple(v.id for v in ins.args),
++                                      None if ins.res is None else ins.res.id, ins.attributes, flush=True)
++            from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
++            artifact = emit_ssa_function_to_llvm(module, exports[0])
++            print('EMITTED', artifact.complete, artifact.shortfalls, flush=True)
++        except Exception:
++            traceback.print_exc(file=sys.stdout)
++        finally:
++            sys.settrace(None)
+diff --git a/tools/compiler_probes/probe_metadata_copy_timing.py b/tools/compiler_probes/probe_metadata_copy_timing.py
+new file mode 100644
+--- /dev/null
++++ b/tools/compiler_probes/probe_metadata_copy_timing.py
+@@ -0,0 +1,46 @@
++"""Whole authored copier: eager vs installed native, ALL boundary cost included."""
++from pathlib import Path
++import statistics
++import sys
++import time
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++from src.compiler.native_compiler_accelerators import (
++    compile_and_register_metadata_copy_accelerator, metadata_copy_source,
++)
++
++
++def main():
++    namespace = {}
++    exec(metadata_copy_source(), namespace)
++    original = namespace['metadata_copy_program']
++    started = time.perf_counter()
++    provider = compile_and_register_metadata_copy_accelerator()
++    print('BUILD_OR_LOAD_SECONDS', time.perf_counter() - started, provider.library_path, flush=True)
++    for count in (1, 4, 16, 64):
++        leaf = object()
++        shared = [leaf]
++        values = tuple({'row': row, 'left': shared, 'right': shared} for row in range(count))
++        def eager():
++            return original(values, {})
++        def native():
++            return provider.run(values, copier=lambda value: (_ for _ in ()).throw(
++                AssertionError('unexpected Python fallback')))
++        timings = {}
++        for label, run in (('python', eager), ('native_with_boundary', native)):
++            samples = []
++            for _ in range(5):
++                started = time.perf_counter()
++                result = run()
++                samples.append(time.perf_counter() - started)
++                assert result == values and result is not values
++                assert result[0]['left'] is result[-1]['right'] and result[0]['left'] is not shared
++                assert result[0]['left'][0] is leaf
++            timings[label] = statistics.median(samples)
++        print('ROWS', count, 'SECONDS', timings, 'NATIVE_SPEEDUP',
++              timings['python'] / timings['native_with_boundary'], flush=True)
++    return 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/tests/test_copier_connected_contract.py b/tests/test_copier_connected_contract.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_copier_connected_contract.py
+@@ -0,0 +1,266 @@
++"""Connected copier operations, through the public compiler and native ABI."""
++import numpy as np
++import pytest
++
++from tests.test_native_object_contract_batch import typed_context, compile_source
++from src.compiler.shell_external_references import ExternalReferenceValueCodec
++from src.compiler.ssa_llvm_backend import prepare_artifact_execution
++from tools.compiler_probes.probe_native_metadata_copy import authored_program
++
++
++@pytest.mark.parametrize('source,target', [
++    ('def root(value):\n    result=[]\n    result.extend(item for item in value)\n    return result\n', list),
++    ('def root(value):\n    result=set()\n    result.update(item for item in value)\n    return result\n', set),
++    ('def root(value):\n    return frozenset(value)\n', frozenset),
++])
++def test_native_connected_container_operations(tmp_path, source, target):
++    scope = typed_context()
++    _, function, native, release, output = compile_source(source, scope, tmp_path)
++    for count in (0, 1, 3, 64):
++        leaves = [object() for _ in range(count)]
++        original = tuple(leaves + leaves)
++        boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++        try:
++            parameter = dict(function.metadata['parameter_names'])['value']
++            invocation = boundary.bind_execution(native, function,
++                {parameter: np.array([boundary.roots[0]], dtype=np.int64)}).run()
++            assert invocation.native_invocations == 1
++            result, = boundary.export((int(invocation.buffers[output.id].item()),))
++            assert type(result) is target
++            assert result == target(original)
++            if target is list:
++                assert all(a is b for a, b in zip(result, original, strict=True))
++        finally:
++            prepare_artifact_execution(release, boundary.buffers).run()
++            boundary.close()
++
++
++def test_recursive_dictionary_calls_use_recorded_result_edges(tmp_path):
++    from tools.compiler_probes.observe_copier_contract_batch import SOURCES
++    scope = typed_context()
++    _, function, native, release, output = compile_source(SOURCES['recursive_dict'], scope, tmp_path)
++    leaf = object()
++    original = {'first': {'second': {'third': leaf}}, 'leaf': leaf}
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++    try:
++        parameter = dict(function.metadata['parameter_names'])['value']
++        invocation = boundary.bind_execution(native, function,
++            {parameter: np.array([boundary.roots[0]], dtype=np.int64)}).run()
++        result, = boundary.export((int(invocation.buffers[output.id].item()),))
++        assert invocation.native_invocations == 1
++        assert result == original and result is not original
++        assert result['first'] is not original['first']
++        assert result['first']['second'] is not original['first']['second']
++        assert result['first']['second']['third'] is leaf and result['leaf'] is leaf
++    finally:
++        prepare_artifact_execution(release, boundary.buffers).run()
++        boundary.close()
++
++
++def test_identity_reduction_is_scalar_and_uses_reference_identity(tmp_path):
++    from tools.compiler_probes.observe_copier_contract_batch import SOURCES
++    scope = typed_context()
++    module, function, native, release, output = compile_source(SOURCES['identity_all'], scope, tmp_path)
++    assert any(i.attributes.get('source_object_identity_reduction')
++               for block in function.blocks.values() for i in block.instrs)
++    assert all(d.column_dtypes != ('bool',) for d in module.sequence_tables[function.name].sequences.values())
++    for count in (0, 1, 3, 64):
++        original = tuple(object() for _ in range(count))
++        boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++        try:
++            parameter = dict(function.metadata['parameter_names'])['value']
++            invocation = boundary.bind_execution(native, function,
++                {parameter: np.array([boundary.roots[0]], dtype=np.int64)}).run()
++            assert invocation.native_invocations == 1
++            assert invocation.buffers[output.id].item() == 1
++        finally:
++            prepare_artifact_execution(release, boundary.buffers).run()
++            boundary.close()
++
++
++@pytest.fixture(scope='module')
++def compiled_whole_copier(tmp_path_factory):
++    from pathlib import Path
++    from src.compiler.extraction_contract import ExtractionContract
++    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++    from src.compiler.identity_concordance import concordance_report
++    from src.compiler.ssa_object_context import lower_object_context
++    from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
++    scope = typed_context()
++    repository = Path(__file__).resolve().parents[1]
++    contract = ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_program_abi({
++        'records': {}, 'bindings': [], 'values': [
++            {'function': 'metadata_copy_program', 'parameter': 'value', 'storage': 'reference',
++             'python_type': 'builtins.object'},
++            {'function': 'metadata_copy_program', 'parameter': 'metadata_memo', 'storage': 'keyed',
++             'dtype': 'opaque_ref', 'mutable': True, 'key_encoding': 'integer_identity', 'python_type': 'builtins.dict'}]
++    }).with_execution_file(repository / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    module, _, exports = lower_ast_source_to_ssa(authored_program(), 'metadata_copy_program',
++        extraction_contract=contract, native_object_context=scope, progress=lambda _: None,
++        progress_bars=False, runtime_closure_only=True)
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    function = module.functions[exports[0]]
++    import os
++    if os.environ.get('TURING_DEBUG_COPIER'):
++        for f in module.functions.values():
++            if f.metadata.get('native_object_collections'):
++                for block in f.blocks.values():
++                    print('COPIER_BLOCK', block.name, flush=True)
++                    for instruction in block.instrs:
++                        print('COPIER_SSA', instruction.op, tuple((v.id,v.dtype,v.shape) for v in instruction.args),
++                            None if instruction.res is None else instruction.res.id,
++                            {key:value for key,value in instruction.attributes.items()
++                             if key in {'callee','value','binding','true_target','false_target','target'}}, flush=True)
++    artifact = emit_ssa_function_to_llvm(module, function.name)
++    assert artifact.complete, artifact.shortfalls
++    directory = tmp_path_factory.mktemp('whole_copier')
++    native = compile_artifact(artifact, directory=directory / 'copier')
++    release_module = lower_object_context(scope, prefix='whole_copier_release')
++    release = compile_artifact(emit_ssa_function_to_llvm(release_module, 'whole_copier_release_release'),
++                               directory=directory / 'release')
++    descriptor = next(d for d in module.sequence_tables[function.name].sequences.values()
++                      if d.column_dtypes == ('int64', 'opaque_ref'))
++    output = next(i.args[0] for block in function.blocks.values() for i in block.instrs if i.op == 'Ret' and i.args)
++    return scope, function, native, release, descriptor, output
++
++
++@pytest.mark.parametrize('kind', ['leaf', 'dict', 'list', 'tuple', 'set', 'frozenset', 'cycle', 'mixed_cycle'])
++def test_entire_authored_copier_executes_native(compiled_whole_copier, kind):
++    scope, function, native, release, memo, output = compiled_whole_copier
++    leaf = object()
++    if kind == 'leaf':
++        original = leaf
++    elif kind == 'dict':
++        shared = [leaf]
++        original = {'left': shared, 'right': shared}
++    elif kind == 'list':
++        shared = {'leaf': leaf}
++        original = [shared, shared]
++    elif kind == 'tuple':
++        original = (leaf, 7, None)
++    elif kind == 'set':
++        original = {leaf, 7}
++    elif kind == 'frozenset':
++        original = frozenset((leaf, 7))
++    elif kind == 'cycle':
++        original = []
++        original.append(original)
++    else:
++        child = []
++        original = (child, leaf)
++        child.append(original)
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++    feeds = {memo.column_value_ids[0]: np.zeros(256, dtype=np.int64),
++             memo.column_value_ids[1]: np.zeros(256, dtype=np.int64),
++             memo.length_address_id: np.zeros(1, dtype=np.int64),
++             memo.capacity_value_id: np.array([256], dtype=np.int64),
++             memo.status_address_id: np.zeros(1, dtype=np.int32),
++             memo.live_flags_value_id: np.zeros(256, dtype=np.bool_)}
++    parameter = dict(function.metadata['parameter_names'])['value']
++    feeds[parameter] = np.array([boundary.roots[0]], dtype=np.int64)
++    try:
++        invocation = boundary.bind_execution(native, function, feeds).run()
++        assert invocation.native_invocations == 1
++        result, = boundary.export((int(invocation.buffers[output.id].item()),))
++        assert type(result) is type(original)
++        if kind in {'leaf', 'tuple', 'frozenset'}:
++            assert result is original
++        elif kind == 'cycle':
++            assert result is not original and result[0] is result
++        elif kind == 'mixed_cycle':
++            assert result is not original and result[0] is not original[0]
++            assert result[0][0] is result and result[1] is leaf
++        else:
++            assert result == original and result is not original
++            if kind == 'dict':
++                assert result['left'] is result['right'] and result['left'] is not original['left']
++            elif kind == 'list':
++                assert result[0] is result[1] and result[0] is not original[0]
++        size = int(feeds[memo.length_address_id][0])
++        assert 0 <= size <= 256
++        if kind != 'leaf':
++            assert boundary.roots[0] in feeds[memo.column_value_ids[0]][:size]
++    finally:
++        prepare_artifact_execution(release, boundary.buffers).run()
++        boundary.close()
++
++
++def test_installed_copier_loads_without_compilation_and_batches_real_extraction(tmp_path, monkeypatch):
++    from src.compiler import native_compiler_accelerators as accelerators
++    from src.compiler.process_graph_fusion import extract_clean_process_subgraph
++    from src.transmogrifier.graph.graph_express2 import ProcessGraph
++    from tests.test_scheduled_process_graph_dispatches import _add
++    registry = accelerators.compiler_accelerators
++    previous = registry._native.get(accelerators.METADATA_COPY)
++    try:
++        provider = accelerators.compile_and_register_metadata_copy_accelerator(tmp_path)
++        registry.unregister_native(accelerators.METADATA_COPY)
++        def forbidden(*args, **kwargs):
++            raise AssertionError('installed code must load without lowering/emission/build')
++        monkeypatch.setattr('src.compiler.fortran_c_shell.lower_ast_source_to_ssa', forbidden)
++        monkeypatch.setattr('src.compiler.ssa_llvm_backend.emit_ssa_function_to_llvm', forbidden)
++        monkeypatch.setattr('src.compiler.ssa_llvm_backend.compile_artifact', forbidden)
++        loaded = accelerators.load_metadata_copy_accelerator(tmp_path)
++        assert loaded.metadata['loaded_without_compilation']
++        calls = []
++        native = loaded.run
++        def observe(values, *, copier):
++            calls.append(len(values))
++            return native(values, copier=forbidden)
++        loaded.run = observe
++        graph = ProcessGraph(materialize_memory=False)
++        _add(graph, 1, 'input')
++        shared = {'leaf': object()}
++        shared['backedge'] = shared
++        graph.G.graph['metadata'] = shared
++        graph.G.nodes[1]['attributes']['same'] = shared
++        result = extract_clean_process_subgraph(graph, (1,))
++        copied = result.G.graph['metadata']
++        assert len(calls) == 1 and calls[0] > 1
++        assert copied is not shared and copied['backedge'] is copied
++        assert result.G.nodes[1]['attributes']['same'] is copied
++        assert copied['leaf'] is shared['leaf']
++        assert graph.G.graph['metadata'] is shared
++        # One admission decision for the WHOLE batch, before any native call.
++        class ListSubclass(list):
++            pass
++        legacy = ListSubclass([shared['leaf']])
++        fallbacks = []
++        result = native((legacy,), copier=lambda value: fallbacks.append(value) or list(value))
++        assert result[0] == legacy and type(result[0]) is list and fallbacks == [legacy]
++        # Matching checkpoints with altered DLL bytes are rejected at load.
++        import hashlib
++        original_sha = hashlib.sha256
++        class WrongDigest:
++            def hexdigest(self):
++                return 'invalid'
++        # Alter only the verification answer, not the installation or user data.
++        library_bytes = provider.library_path.read_bytes()
++        monkeypatch.setattr(hashlib, 'sha256', lambda value=b'': WrongDigest()
++                            if value == library_bytes else original_sha(value))
++        with pytest.raises(ValueError, match='digest changed'):
++            accelerators.load_metadata_copy_accelerator(tmp_path)
++    finally:
++        registry.unregister_native(accelerators.METADATA_COPY)
++        if previous is not None:
++            registry._native[accelerators.METADATA_COPY] = previous
++
++
++def test_source_nesting_does_not_equate_spanless_sibling_comprehensions():
++    import ast
++    from types import SimpleNamespace
++    import networkx as nx
++    from src.compiler.glsl_deployment_strategy import _source_control_nesting_hints
++    expressions = [ast.parse('(item for item in value)').body[0].value,
++                   ast.parse('(item for item in value)').body[0].value]
++    graph = nx.DiGraph()
++    for index, expression in enumerate(expressions):
++        clause = expression.generators[0]
++        graph.add_node(index, expr_obj=clause)
++    from src.compiler.glsl_deployment_strategy import _ast_source_signature
++    assert _ast_source_signature(expressions[0].generators[0]) == _ast_source_signature(expressions[1].generators[0])
++    assert expressions[0].generators[0] is not expressions[1].generators[0]
++    reductions = tuple(SimpleNamespace(loop_node_id=index, control_program=None, region_indices=())
++                       for index in range(2))
++    assert _source_control_nesting_hints(reductions, (), (), SimpleNamespace(G=graph)) == {}

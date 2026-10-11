@@ -133,12 +133,33 @@ def llvm_piece_of(value: Any) -> Any | None:
     A piece is recognised by what it DECLARES: an ``artifact`` that is an
     ``LLVMFunctionArtifact`` together with the ``argument_ids`` and
     ``output_ids`` that bind a positional call to that artifact's buffers.
-    Nothing is inferred from names.
+    An installed authored fallback retains that exact declaration through
+    ``__turing_deployed_callable__``. Nothing is inferred from names, runtime
+    verification flags, or ``__wrapped__`` (which points at Python source).
     """
 
     artifact = getattr(value, "artifact", None)
     if artifact is None:
-        return None
+        # deployed_with_authored_fallback(authored, piece) retains the piece
+        # by identity, but the installed function has no artifact of its own.
+        # Previously decide() classified that wrapper as Python and source
+        # pursuit called inspect.getsource on the fallback instead of linking
+        # the already accepted callee. Follow ONLY the installer's existing
+        # deployed edge, then apply the ordinary declared-ABI checks below.
+        deployed = getattr(value, "__turing_deployed_callable__", None)
+        if deployed is None:
+            return None
+        seen = {id(value)}
+        while artifact is None:
+            if id(deployed) in seen:
+                return None
+            value = deployed
+            seen.add(id(value))
+            artifact = getattr(value, "artifact", None)
+            if artifact is None:
+                deployed = getattr(value, "__turing_deployed_callable__", None)
+                if deployed is None:
+                    return None
     from .external_functions import ExternalSlotABI
     from .ssa_llvm_backend import LLVMFunctionArtifact
 

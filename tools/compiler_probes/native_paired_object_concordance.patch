@@ -1,0 +1,900 @@
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -10327,7 +10327,7 @@
+ 
+     extra_mutations = tuple(extra_mutations)
+     native_effects = {int(mutation.effect_node_id) for mutation in extra_mutations
+-        if mutation.operator in {'object_construct', 'object_materialize'}}
++        if mutation.operator in {'object_construct', 'object_materialize', 'object_update'}}
+     mutations = tuple((
+         *(mutation for mutation in _sequence_append_call_mutations(graph.G)
+           if int(mutation.effect_node_id) not in native_effects),
+@@ -10480,11 +10480,62 @@
+         decorated.append((
+             block_position(mutation_block), len(decorated), mutation_block,
+         ))
+-        return SequenceBlock(tuple(
++        ordered = tuple(
+             child for _position, _index, child in sorted(
+                 decorated, key=lambda item: (item[0], item[1])
+             )
+-        ))
++        )
++        if (isinstance(mutation_block, SequenceMutationBlock)
++                and mutation_block.mutation.operator in {'object_construct', 'object_update', 'object_materialize'}):
++            from .dependency_cone import iter_dependency_cone
++            def parents(node):
++                return tuple(int(parent) for parent, role in graph.G.nodes.get(node, {}).get('parents') or ()
++                             if role != 'generators' and parent in graph.G)
++            def source_id(child):
++                if isinstance(child, (LoopBlock, WhileBlock)):
++                    return child.source_loop_node_id
++                if isinstance(child, SequenceMutationBlock):
++                    return child.mutation.effect_node_id
++                if isinstance(child, StatementBlock) and len(child.lines) == 1:
++                    line = child.lines[0]
++                    if line.startswith('__plan_callsite_') and line.endswith('__'):
++                        return int(line[len('__plan_callsite_'):-2])
++                return None
++            # Stable topological order of this scope's existing units. Source
++            # coordinates put publication12 before calls5/6 and tuple7; merely
++            # inserting tuple7 into that already-wrong order cannot fix it.
++            # Read only each unit's actual cone; no whole-graph scan/cache.
++            import heapq
++            identities = [source_id(child) for child in ordered]
++            positions = {}
++            for index, identity in enumerate(identities):
++                if identity is not None:
++                    positions.setdefault(identity, []).append(index)
++            incoming = [set() for _ in ordered]
++            outgoing = [set() for _ in ordered]
++            for consumer, node in enumerate(identities):
++                if node is None:
++                    continue
++                dependencies = set(iter_dependency_cone((node,), parents, include_roots=False))
++                for identity in dependencies:
++                    for producer in positions.get(identity, ()):
++                        if producer != consumer:
++                            incoming[consumer].add(producer)
++                            outgoing[producer].add(consumer)
++            ready = [index for index, required in enumerate(incoming) if not required]
++            heapq.heapify(ready)
++            settled = []
++            while ready:
++                index = heapq.heappop(ready)
++                settled.append(ordered[index])
++                for consumer in sorted(outgoing[index]):
++                    incoming[consumer].remove(index)
++                    if not incoming[consumer]:
++                        heapq.heappush(ready, consumer)
++            if len(settled) != len(ordered):
++                raise ValueError('native object effects have cyclic causal placement')
++            ordered = tuple(settled)
++        return SequenceBlock(ordered)
+ 
+     retained_mutation_records = (
+         graph.G.graph.get("source_sequence_mutation_records") or {}
+@@ -10625,9 +10676,41 @@
+ 
+     root = control.root
+     unplaced = []
++    def insert_declared_loop(block, owner, item):
++        if isinstance(block, (LoopBlock, WhileBlock)):
++            if block.source_loop_node_id == owner:
++                return replace(block, body=insert_ordered(block.body, item)), True
++            body, inserted = insert_declared_loop(block.body, owner, item)
++            return replace(block, body=body), inserted
++        if isinstance(block, SequenceBlock):
++            for index, child in enumerate(block.blocks):
++                replacement, inserted = insert_declared_loop(child, owner, item)
++                if inserted:
++                    return replace(block, blocks=(*block.blocks[:index], replacement, *block.blocks[index+1:])), True
++        elif isinstance(block, ConditionalBlock):
++            body, inserted = insert_declared_loop(block.body, owner, item)
++            if inserted:
++                return replace(block, body=body), True
++            if block.orelse is not None:
++                orelse, inserted = insert_declared_loop(block.orelse, owner, item)
++                return replace(block, orelse=orelse), inserted
++        elif isinstance(block, CallBlock):
++            callee, inserted = insert_declared_loop(block.callee, owner, item)
++            return replace(block, callee=callee), inserted
++        return block, False
+     for mutation in mutations:
+         mutation_block = (mutation if isinstance(mutation, ScalarFieldWriteBlock)
+                           else SequenceMutationBlock(mutation))
++        if (getattr(mutation, 'operator', None) == 'object_construct'
++                and mutation.object_contract_cell is not None):
++            from .ssa_object_context import object_source_contract
++            accepted = object_source_contract(mutation.object_contract_cell)
++            owner = accepted['owner_loop_node_id']
++            if owner is not None:
++                root, inserted = insert_declared_loop(root, owner, mutation_block)
++                if not inserted:
++                    raise ValueError('native object constructor lost its declared loop owner')
++                continue
+         guarded = tuple(dict.fromkeys((
+             *tuple(
+             (int(owner), str(arm))
+diff --git a/src/compiler/precompile_to_ssa.py b/src/compiler/precompile_to_ssa.py
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -7879,7 +7879,7 @@
+         instruction.attributes['source_object_operation'] = (operation, reference_id,
+             tuple(value.id for value in operand_values), result_id)
+         self.emit(Handler.Call, instruction.args, instruction.res, attributes=instruction.attributes)
+-        if operation in {'length', 'get', 'set', 'materialize', 'collect'}:
++        if operation in {'length', 'get', 'set', 'materialize', 'collect', 'update'}:
+             self.native_object_requires_member_storage = True
+         return result
+ 
+@@ -7911,7 +7911,12 @@
+         module = self.native_object_module
+         bindings = self._native_object_bindings()
+         kind = str(mutation.argument_kind)
+-        if kind not in context.kind_vocabulary or mutation.argument_value_ids:
++        from .ssa_object_context import object_source_contract
++        accepted = object_source_contract(mutation.object_contract_cell, book=self._book())
++        members = tuple(accepted['member_value_ids'])
++        if (kind not in context.kind_vocabulary or accepted['kind'] != kind
++                or members != mutation.argument_value_ids
++                or accepted['source_value_id'] != mutation.sequence_value_id):
+             raise ValueError(f'{location}: source object constructor contract disagrees')
+         helper = next(function for function in module.functions.values()
+             if function.metadata.get('opaque_object_helper', {}).get('operation') == 'construct')
+@@ -7920,19 +7925,30 @@
+         self.emit(Handler.Const, [], token,
+                   attributes={'value': context.kind_vocabulary.index(kind) + 1})
+         result = self.produced_value(int(mutation.sequence_value_id), dtype='opaque_ref',
+-            claim_provisional_definition=True, cause=(token,))
++            claim_provisional_definition=True, cause=(token, mutation.object_contract_cell))
+         result.accounting.update(native_object_storage_identity=context.storage_identity,
+                                  native_object_source_kind=kind)
+         operand_id, = helper.metadata['opaque_object_helper']['operand_formal_ids']
+         instruction = object_call(module, helper.name, None, context=bindings,
+             operands={operand_id: token}, result=result)
+-        instruction.attributes.update(source_object_constructor={
++        instruction.attributes.update(source_object_constructor={**accepted,
+             'source_value_id': int(mutation.sequence_value_id),
+             'source_node_id': int(mutation.effect_node_id),
+             'kind': kind, 'initial_extent': 0,
+-            'context': context.to_mapping()})
++            'context': context.to_mapping(), 'contract_cell': mutation.object_contract_cell,
++            'member_value_ids': members})
+         self.emit(Handler.Call, instruction.args, instruction.res, attributes=instruction.attributes)
+         self.native_object_constructor_receipts.append(instruction.attributes['source_object_constructor'])
++        for position, member_id in enumerate(members, 1):
++            member = self.external_value(member_id)
++            if member.dtype != 'opaque_ref' or member.shape:
++                raise ValueError(f'{location}: tuple member has no accepted reference layout')
++            ordinal = self.fresh_value(dtype='int64', transform=CONTROL_CONST,
++                                   operands=(mutation.object_contract_cell,))
++            self.emit(Handler.Const, [], ordinal, attributes={'value': position})
++            key = self.fresh_value(dtype='opaque_ref', transform=CONTROL_EXPRESSION, operands=(ordinal,))
++            self.emit(Handler.Cast, [ordinal], key, attributes={'binding': 'object_context_position'})
++            self._emit_native_object_operation('set', result.id, (key, member), None)
+ 
+     def _emit_native_object_materialization(self, mutation, *, location):
+         context = self.native_object_context
+@@ -7967,11 +7983,27 @@
+         if operation == 'object_materialize':
+             self._emit_native_object_materialization(mutation, location=location)
+             return
++        if operation == 'object_update':
++            from .ssa_object_context import object_source_contract
++            accepted = object_source_contract(mutation.object_contract_cell, book=self._book())
++            if (mutation.sequence_value_id != accepted['destination_value_id']
++                    or mutation.argument_value_ids != (accepted['source_value_id'],)):
++                raise ValueError(f'{location}: update differs from its authoritative concordance cell')
++            self._emit_native_object_operation('update', mutation.sequence_value_id, mutation.argument_value_ids, None)
++            self.current.instrs[-1].attributes['source_object_update'] = {'contract_cell': mutation.object_contract_cell}
++            return
+         if int(mutation.sequence_value_id) in self.native_object_source_ids:
+             workspace = self.native_object_collection_rows.get(int(mutation.sequence_value_id))
+             if workspace is not None and operation == 'append':
+                 receipt, base, induction = workspace
+-                if (mutation.argument_value_ids != (receipt['source_value_id'],)
++                from .ssa_object_context import object_source_contract
++                arguments = mutation.argument_value_ids
++                if mutation.object_contract_cell is not None:
++                    publication = object_source_contract(mutation.object_contract_cell, book=self._book())
++                    if arguments != publication['projected_argument_value_ids']:
++                        raise ValueError(f'{location}: publication differs from its concordance projection')
++                    arguments = publication['source_argument_value_ids']
++                if (arguments != (receipt['source_value_id'],)
+                         or mutation.predicate_expression is not None
+                         or int(mutation.effect_node_id) != receipt['materializer_node_id']):
+                     raise ValueError(f'{location}: native collection publication differs from its loop edge')
+@@ -10038,6 +10070,9 @@
+             if len(collections) != 1 or str(loop.start) != '0' or str(loop.step) != '1' or loop.terminal_controls:
+                 raise ValueError(f'{path}: native collection requires one dense unit-step loop')
+             receipt, = collections
++            from .ssa_object_context import object_source_contract
++            receipt = {**object_source_contract(receipt['contract_cell'], book=self._book()),
++                       'contract_cell': receipt['contract_cell']}
+             def dense_publications(block):
+                 if isinstance(block, SequenceBlock):
+                     return [mutation for child in block.blocks for mutation in dense_publications(child)]
+@@ -10047,13 +10082,21 @@
+                     raise ValueError(f'{path}: filtered/nested collection control is not admitted')
+                 return []
+             publications = [*dense_publications(loop.body), *loop.sequence_mutations]
++            publications = [mutation for mutation in publications if mutation.operator != 'object_construct']
+             if (len(publications) != 1 or publications[0].operator != 'append'
+                     or publications[0].sequence_value_id != receipt['collection_value_id']):
+                 raise ValueError(f'{path}: native collection requires exactly one unconditional publication')
+-            bindings = [binding for binding in self.program.iterable_bindings if binding[2] == loop.induction]
+-            if (len(bindings) != 1 or bindings[0][0] != receipt['iterable_value_id']
+-                    or bindings[0][1] != receipt['target_value_id']):
+-                raise ValueError(f'{path}: native collection iterable differs from its exact loop binding')
++            if 'target_projection_ids' in receipt:
++                bindings = [binding for binding in self.program.projected_iterable_bindings if binding[2] == loop.induction]
++                expected = tuple((receipt['iterable_value_id'], target, loop.induction, column)
++                                 for column, target in enumerate(receipt['target_projection_ids']))
++                if tuple(bindings) != expected:
++                    raise ValueError(f'{path}: native pair projections differ from their exact loop bindings')
++            else:
++                bindings = [binding for binding in self.program.iterable_bindings if binding[2] == loop.induction]
++                if (len(bindings) != 1 or bindings[0][0] != receipt['iterable_value_id']
++                        or bindings[0][1] != receipt['target_value_id']):
++                    raise ValueError(f'{path}: native collection iterable differs from its exact loop binding')
+             cell = self._native_object_bindings()[self.native_object_context.members.length_address_id]
+             zero = self.fresh_value(dtype='int64', transform=CONTROL_CONST, operands=(cell,))
+             self.emit(Handler.Const, [], zero, attributes={'value': 0})
+@@ -10063,7 +10106,7 @@
+             self.emit(Handler.Load, [length_address], base)
+             token = self.fresh_value(dtype='int64', transform=CONTROL_CONST, operands=(receipt['collection_value_id'],))
+             self.emit(Handler.Const, [], token, attributes={'value': self.native_object_context.kind_vocabulary.index(receipt['kind']) + 1})
+-            result = self._emit_native_object_operation('collect', receipt['iterable_value_id'], (token,), receipt['collection_value_id'])
++            result = self._emit_native_object_operation('collect', receipt.get('source_iterable_value_id', receipt['iterable_value_id']), (token,), receipt['collection_value_id'])
+             result.accounting.update(native_object_storage_identity=self.native_object_context.storage_identity,
+                                      native_object_source_kind=receipt['kind'])
+             self.current.instrs[-1].attributes['source_object_collection'] = dict(receipt)
+@@ -10357,6 +10400,17 @@
+             self.native_object_collection_rows[receipt['collection_value_id']] = (receipt, base, induction)
+         restored_values: dict[int, SSAValue | None] = {}
+         bound_loop_target_ids: set[int] = set()
++        if native_collection is not None and 'target_projection_ids' in receipt:
++            pair_receipt, base = native_collection
++            key_id, value_id = pair_receipt['target_projection_ids']
++            address = self._native_collection_address(pair_receipt, base, induction)
++            key = self.produced_value(key_id, dtype='opaque_ref', claim_provisional_definition=True,
++                cause=(address, pair_receipt['contract_cell']))
++            self.emit(Handler.Load, [address], key, attributes={'native_collection_row': {
++                **pair_receipt, 'action': 'iterate', 'base_value_id': base.id, 'index_value_id': induction.id}})
++            value = self._emit_native_object_operation('get', pair_receipt['source_iterable_value_id'], (key,), value_id)
++            self.current.instrs[-1].attributes['native_pair_projection'] = {'contract_cell': pair_receipt['contract_cell']}
++            bound_loop_target_ids.update((key_id, value_id))
+         for iterable_id, target_id, induction_name in (
+             self.program.iterable_bindings
+         ):
+@@ -10455,6 +10509,8 @@
+             self.program.projected_iterable_bindings
+         ):
+             if induction_name != loop.induction:
++                continue
++            if native_collection is not None and int(target_id) in bound_loop_target_ids:
+                 continue
+             bound_loop_target_ids.add(int(target_id))
+             restored_values[int(target_id)] = self.external_values.get(
+diff --git a/src/compiler/ssa_object_context.py b/src/compiler/ssa_object_context.py
+--- a/src/compiler/ssa_object_context.py
++++ b/src/compiler/ssa_object_context.py
+@@ -29,6 +29,41 @@
+     return tuple(supported[token] for token in vocabulary)
+ 
+ 
++def _object_source_contract(graph, value_id, role, fact, nodes):
++    from .concordance_declarations import NATIVE_OBJECT_SOURCE, PLANNER_HIERARCHY
++    from .identity_concordance import current_identity_book, Derived, Mode
++    from ..common.tensors.topological_reducer import node_identity_cell
++    book = current_identity_book()
++    cells = tuple(dict.fromkeys(node_identity_cell(graph, int(node)) for node in nodes))
++    row = (cells[0].row[0], int(value_id), role)
++    contents = tuple(sorted(fact.items()))
++    previous = book.latest_ref(NATIVE_OBJECT_SOURCE, row)
++    if previous is not None and book.page(NATIVE_OBJECT_SOURCE).latest(row) == contents:
++        return previous
++    return book.post(NATIVE_OBJECT_SOURCE, row, contents, stage=PLANNER_HIERARCHY,
++                     provenance=Derived(cells), mode=Mode.REVISE)
++
++
++def object_source_contract(cell, *, book=None):
++    from .concordance_declarations import NATIVE_OBJECT_SOURCE
++    from .identity_concordance import current_identity_book
++    book = current_identity_book() if book is None else book
++    if cell is None or cell.page != NATIVE_OBJECT_SOURCE:
++        raise ValueError('native object source has no accepted concordance cell')
++    if book.latest_ref(NATIVE_OBJECT_SOURCE, cell.row) != cell:
++        raise ValueError('native object source contract was superseded')
++    return dict(book.page(NATIVE_OBJECT_SOURCE).latest(cell.row))
++
++
++def _mapping_items_source(graph, node_id):
++    """The reducer's items operation and exact receiver edge, not a name lookup."""
++    node = graph.nodes.get(node_id, {})
++    if node.get('op') != 'items':
++        return None
++    sources = [parent for parent, role in node.get('parents') or () if role == 'operand']
++    return sources[0] if len(sources) == 1 and sources[0] in graph else None
++
++
+ def source_object_type_tests(graph, admitted, context):
+     """Consume the intrinsic's incumbent static type objects and operand edge."""
+     if not context.type_vocabulary:
+@@ -64,6 +99,28 @@
+     """
+     import ast
+     from .control_source import ControlSequenceMutation
++    from .dependency_cone import iter_dependency_cone
++    aggregate_users = {}
++    for user, data in graph.nodes(data=True):
++        for parent, role in data.get('parents') or ():
++            if role in {'elts', 'elt'}:
++                aggregate_users.setdefault(parent, []).append(user)
++    def loop_owner(node_id):
++        owners = set()
++        for user in iter_dependency_cone((node_id,), lambda node: aggregate_users.get(node, ())):
++            data = graph.nodes[user]
++            if str(data.get('type', '')).casefold() == 'generatorexp':
++                owners.update(int(parent) for parent, role in data.get('parents') or ()
++                              if role == 'generators')
++        if len(owners) > 1:
++            raise ValueError('native object birth has ambiguous generator ownership')
++        return next(iter(owners), None)
++    def constructor_contract(node_id, value_id, kind, members):
++        owner = loop_owner(node_id)
++        return _object_source_contract(graph, value_id, 'constructor',
++            {'source_value_id': value_id, 'source_node_id': int(node_id), 'kind': kind,
++             'member_value_ids': members, 'owner_loop_node_id': owner},
++            (node_id, *members, *((owner,) if owner is not None else ())))
+     mutations = []
+     for node_id, data in graph.nodes(data=True):
+         expression = data.get('expr_obj')
+@@ -86,14 +143,34 @@
+             continue
+         if kind not in context.kind_vocabulary:
+             raise ValueError(f'native object context has no admitted constructor kind {kind}')
+-        mutations.append(ControlSequenceMutation(int(data.get('value_id', node_id)),
+-            'object_construct', (), int(node_id), argument_kind=kind))
++        value_id = int(data.get('value_id', node_id))
++        cell = constructor_contract(node_id, value_id, kind, ())
++        mutations.append(ControlSequenceMutation(value_id,
++            'object_construct', (), int(node_id), argument_kind=kind, object_contract_cell=cell))
+     reference_inputs = {int(value_id) for value_id, abi in
+         (graph.graph.get('linked_value_abi') or {}).items()
+         if abi.get('storage') == 'reference' and abi.get('dtype') == 'opaque_ref'}
+     admitted = source_object_value_ids(graph, reference_inputs | {
+         mutation.sequence_value_id for mutation in mutations})
+     for node_id, data in graph.nodes(data=True):
++        attrs = data.get('attributes') or {}
++        leaves = tuple(attrs.get('aggregate_leaf_value_ids', ()))
++        # Pair producer3 retains leaves1/0, while the collector's inherited
++        # ledger on LoopResult11 is NOT a new tuple literal. Admit only the
++        # actual tuple producer with all components already admitted handles.
++        if (str(data.get('type', '')).casefold() != 'tuple' or not leaves
++                or attrs.get('producer_kind') != 'aggregate'
++                or not all(leaf in graph and int(graph.nodes[leaf].get('value_id', leaf)) in admitted for leaf in leaves)):
++            continue
++        value_id = int(data.get('value_id', node_id))
++        members = tuple(int(graph.nodes[leaf].get('value_id', leaf)) for leaf in leaves)
++        kind = 'builtins.tuple'
++        if kind not in context.kind_vocabulary:
++            raise ValueError('native tuple producer has no admitted constructor kind')
++        cell = constructor_contract(node_id, value_id, kind, members)
++        mutations.append(ControlSequenceMutation(value_id, 'object_construct', members,
++            int(node_id), argument_kind=kind, object_contract_cell=cell))
++    for node_id, data in graph.nodes(data=True):
+         attributes = data.get('attributes') or {}
+         source = native_materialization_source(graph, data)
+         if source is None or source not in admitted:
+@@ -103,6 +180,25 @@
+             raise ValueError(f'native object context has no admitted materialization kind {kind}')
+         mutations.append(ControlSequenceMutation(int(data.get('value_id', node_id)),
+             'object_materialize', (source,), int(node_id), argument_kind=kind))
++    collections = source_object_collections(graph, admitted)
++    admitted = source_object_value_ids(graph, admitted | set(collections))
++    for node_id, data in graph.nodes(data=True):
++        if data.get('op') != 'update':
++            continue
++        roles = dict((role, parent) for parent, role in data.get('parents') or ())
++        destination, source = roles.get('operand'), roles.get('arg:0')
++        if (destination not in graph or source not in graph
++                or int(graph.nodes[destination].get('value_id', destination)) not in admitted
++                or int(graph.nodes[source].get('value_id', source)) not in collections):
++            continue
++        effect_id = int(data.get('value_id', node_id))
++        target_id = int(graph.nodes[destination].get('value_id', destination))
++        source_id = int(graph.nodes[source].get('value_id', source))
++        cell = _object_source_contract(graph, effect_id, 'update',
++            {'destination_value_id': target_id, 'source_value_id': source_id,
++             'effect_value_id': effect_id}, (node_id, destination, source))
++        mutations.append(ControlSequenceMutation(target_id, 'object_update', (source_id,),
++            effect_id, object_contract_cell=cell))
+     return tuple(mutations)
+ 
+ 
+@@ -129,6 +225,8 @@
+     opaque_ref members; no scalar or unresolved result is cast into a handle.
+     """
+     collections = {}
++    from .dependency_cone import parent_record_dependents
++    consumers_by_value = parent_record_dependents(graph)
+     for node_id, data in graph.nodes(data=True):
+         attributes = data.get('attributes') or {}
+         parents = dict((str(role), int(parent)) for parent, role in data.get('parents') or ())
+@@ -146,14 +244,24 @@
+         source_id = int(graph.nodes[iterable_id].get('value_id', iterable_id))
+         control = graph.nodes[parents['control']]
+         targets = (control.get('attributes') or {}).get('loop_target_bindings') or {}
+-        if (source_id not in admitted or kind not in {'list', 'tuple'}
+-                or materializer.get('extraction_identity') != 'builtins.' + kind
++        mapping_source = _mapping_items_source(graph, iterable_id)
++        physical_source = (source_id if mapping_source is None else
++                           int(graph.nodes[mapping_source].get('value_id', mapping_source)))
++        paired = mapping_source is not None and len(targets) == 2
++        generator = str(graph.nodes[materializer_id].get('type', '')).casefold() == 'generatorexp'
++        consumers = [graph.nodes[user] for user in consumers_by_value.get(node_id, ())
++                     if graph.nodes[user].get('op') == 'update'
++                     and (node_id, 'arg:0') in (graph.nodes[user].get('parents') or ())]
++        finite_update = generator and len(consumers) == 1
++        if (physical_source not in admitted or kind not in {'list', 'tuple'}
++                or not (materializer.get('extraction_identity') == 'builtins.' + kind or finite_update)
+                 or materializer.get('collection_owner_id') != node_id
+                 or tuple(materializer.get('materialized_source_value_ids', ())) != (node_id,)
+-                or attributes.get('loop_id') != parents['control'] or len(targets) != 1):
+-            continue
+-        target, = targets.values()
+-        if target not in graph:
++                or attributes.get('loop_id') != parents['control'] or (len(targets) != 1 and not paired)):
++            continue
++        target_ids = tuple(targets.values())
++        target = target_ids[0]
++        if any(target not in graph for target in target_ids):
+             continue
+         element = parents['value']
+         seen = set()
+@@ -163,12 +271,19 @@
+             if actual is None or actual not in graph:
+                 break
+             element = actual
+-        collections[value_id] = {'collection_value_id': value_id,
++        receipt = {'collection_value_id': value_id,
+             'iterable_value_id': source_id, 'source_value_id': int(graph.nodes[parents['value']].get('value_id', parents['value'])),
+             'member_value_id': int(graph.nodes[element].get('value_id', element)),
+             'target_value_id': int(graph.nodes[target].get('value_id', target)),
+             'loop_node_id': parents['control'], 'materializer_node_id': materializer_id,
+             'kind': 'builtins.' + kind}
++        if paired:
++            receipt.update(source_iterable_value_id=physical_source,
++                target_projection_ids=tuple(int(graph.nodes[target].get('value_id', target)) for target in target_ids))
++        cells = (node_id, parents['control'], materializer_id, iterable_id,
++                 parents['value'], *target_ids, *((mapping_source,) if paired else ()))
++        cell = _object_source_contract(graph, value_id, 'collection', receipt, cells)
++        collections[value_id] = {**object_source_contract(cell), 'contract_cell': cell}
+     return collections
+ 
+ 
+@@ -202,15 +317,19 @@
+             # The loop target is a member handle of its admitted iterable.
+             targets = (data.get('attributes') or {}).get('loop_target_bindings') or {}
+             iterable = parents.get('iter')
+-            if iterable is not None and len(targets) == 1:
+-                target, = targets.values()
+-                if target not in graph or iterable not in graph:
+-                    continue
+-                result = int(graph.nodes[target].get('value_id', target))
+-                needed = int(graph.nodes[iterable].get('value_id', iterable))
+-                rules[result] = {needed}
+-                dependents.setdefault(needed, []).append(result)
+-            continue
++            mapping_source = _mapping_items_source(graph, iterable)
++            source = mapping_source if mapping_source is not None and len(targets) == 2 else iterable
++            if source is not None and (len(targets) == 1 or mapping_source is not None and len(targets) == 2):
++                for target in targets.values():
++                    if target not in graph or source not in graph:
++                        continue
++                    result = int(graph.nodes[target].get('value_id', target))
++                    needed = int(graph.nodes[source].get('value_id', source))
++                    rules[result] = {needed}
++                    dependents.setdefault(needed, []).append(result)
++            continue
++        elif kind == 'tuple' and attributes.get('producer_kind') == 'aggregate':
++            dependencies = tuple(attributes.get('aggregate_leaf_value_ids', ())) or None
+         if materialized_source is not None:
+             # This source is already a VALUE identity, unlike parent node keys.
+             result = int(data.get('value_id', node_id))
+@@ -315,7 +434,7 @@
+ 
+ def native_object_requirement_sources(module, function_name):
+     """Existing call-graph reachability determines the lease's payload needs."""
+-    operations = {'length', 'get', 'set', 'materialize', 'collect'}
++    operations = {'length', 'get', 'set', 'materialize', 'collect', 'update'}
+     return tuple(name for name in module.reachable_functions(function_name)
+         if module.functions[name].metadata.get('opaque_object_helper', {}).get('operation') in operations
+         or any((i.attributes.get('source_object_operation') or (None,))[0] in operations
+@@ -396,6 +515,10 @@
+                 or actual.accounting.get('native_object_context_storage_identity') != context['storage_identity']):
+             raise ValueError('source object operation has stale context bindings')
+     if birth is not None:
++        from .identity_concordance import identity_book
++        accepted = object_source_contract(birth.get('contract_cell'), book=identity_book(module))
++        if any(birth.get(key) != value for key, value in accepted.items()):
++            raise ValueError('source constructor differs from its authoritative concordance cell')
+         if (operation is not None or interface['operation'] != 'construct'
+                 or birth['context'] != context or birth['initial_extent'] != 0
+                 or birth['kind'] not in context['kind_vocabulary']):
+@@ -409,6 +532,26 @@
+         if (len(tokens) != 1 or tokens[0].op != 'Const'
+                 or tokens[0].attributes.get('value') != tuple(context['kind_vocabulary']).index(birth['kind']) + 1):
+             raise ValueError('source constructor kind token differs from its live producer')
++        if accepted['member_value_ids']:
++            from .identity_concordance import resolved_concordant_alias_bindings
++            from .concordance_declarations import PLANNING_VALUE
++            aliases = resolved_concordant_alias_bindings(str(function.name),
++                function.metadata.get('value_aliases', {}),
++                page=identity_book(module).page(PLANNING_VALUE))
++            stores = [i for b in function.blocks.values() for i in b.instrs
++                if (i.attributes.get('source_object_operation') or (None, None))[:2]
++                == ('set', accepted['source_value_id'])]
++            if len(stores) != len(accepted['member_value_ids']):
++                raise ValueError('native tuple fields differ from their concordance arity')
++            for ordinal, (store, member) in enumerate(zip(stores, accepted['member_value_ids'], strict=True), 1):
++                key_id, stored_member = store.attributes['source_object_operation'][2]
++                casts = definitions.get(key_id, ())
++                if (stored_member != aliases.get(member, member) or len(casts) != 1 or casts[0].op != 'Cast'
++                        or casts[0].attributes.get('binding') != 'object_context_position'):
++                    raise ValueError('native tuple field differs from its concordance component')
++                literal, = definitions.get(casts[0].args[0].id, ())
++                if literal.op != 'Const' or literal.attributes.get('value') != ordinal:
++                    raise ValueError('native tuple field has a different declared position')
+     elif operation[0] != interface['operation']:
+         raise ValueError('source object operation disagrees with its live helper')
+     materialization = instruction.attributes.get('source_object_materialization')
+@@ -425,12 +568,16 @@
+             raise ValueError('source materialization kind token differs from its live producer')
+     collection = instruction.attributes.get('source_object_collection')
+     if collection is not None:
++        from .identity_concordance import identity_book
++        accepted = object_source_contract(collection.get('contract_cell'), book=identity_book(module))
++        if {key: value for key, value in collection.items() if key != 'contract_cell'} != accepted:
++            raise ValueError('source collection differs from its authoritative concordance cell')
+         if (interface['operation'] != 'collect' or collection not in function.metadata.get('native_object_collections', ())
+                 or instruction.res.id != collection['collection_value_id']
+                 or instruction.res.accounting.get('native_object_source_kind') != collection['kind']):
+             raise ValueError('source collection has stale ownership/helper receipt')
+         reference = actuals[bindings[interface['reference_formal_id']]]
+-        if reference.id != collection['iterable_value_id']:
++        if reference.id != collection.get('source_iterable_value_id', collection['iterable_value_id']):
+             raise ValueError('source collection has stale iterable binding')
+         operand, = interface['operand_formal_ids']
+         definitions = source_object_definitions(function) if _definitions is None else _definitions
+@@ -438,6 +585,20 @@
+         if (len(tokens) != 1 or tokens[0].op != 'Const'
+                 or tokens[0].attributes.get('value') != tuple(context['kind_vocabulary']).index(collection['kind']) + 1):
+             raise ValueError('source collection kind differs from its live token')
++    update = instruction.attributes.get('source_object_update')
++    if update is not None:
++        from .identity_concordance import identity_book
++        accepted = object_source_contract(update['contract_cell'], book=identity_book(module))
++        if (interface['operation'] != 'update'
++                or operation != ('update', accepted['destination_value_id'], (accepted['source_value_id'],), None)):
++            raise ValueError('source update differs from its authoritative concordance cell')
++    projection = instruction.attributes.get('native_pair_projection')
++    if projection is not None:
++        from .identity_concordance import identity_book
++        accepted = object_source_contract(projection['contract_cell'], book=identity_book(module))
++        key, value = accepted['target_projection_ids']
++        if operation != ('get', accepted['source_iterable_value_id'], (key,), value):
++            raise ValueError('native pair projection differs from its concordance binding')
+ 
+ 
+ def validate_native_collection_instruction(module, function_name, instruction, *, _definitions=None):
+@@ -896,6 +1057,73 @@
+             finish(label, builder, (source, requested), reference=source,
+                 operation=operation)
+ 
++    # Consume a finite paired-generator materialization in one native call.
++    # Stable handles survive set/reserve relocation; no payload pointer crosses
++    # those calls, and the initial source extent excludes newly inserted rows.
++    builder = _Builder(0)
++    destination, source = builder.fresh('opaque_ref'), builder.fresh('opaque_ref')
++    entry, header, body, consume, latch, complete, reject = (builder.block(name)
++        for name in ('entry', 'header', 'body', 'consume', 'latch', 'complete', 'reject'))
++    zero, one = builder.const(entry, 0, dtype='int64'), builder.const(entry, 1, dtype='int64')
++    kind_helper, get_helper, set_helper = (module.functions[f'{prefix}_{name}'] for name in ('kind', 'get', 'set'))
++    def invoke(block, helper, reference, operands, result):
++        interface = helper.metadata['opaque_object_helper']
++        extra = {interface['reference_formal_id']: reference,
++                 **dict(zip(interface['operand_formal_ids'], operands, strict=True))}
++        call(builder, block, helper, extra, result)
++    destination_kind, source_kind = builder.fresh('int64'), builder.fresh('int64')
++    invoke(entry, kind_helper, destination, (), destination_kind)
++    invoke(entry, kind_helper, source, (), source_kind)
++    valid_destination, valid = (builder.fresh('bool') for _ in range(2))
++    builder.emit(entry, 'Eq', [destination_kind, builder.const(entry,
++        context.kind_vocabulary.index('builtins.dict') + 1 if 'builtins.dict' in context.kind_vocabulary else -1,
++        dtype='int64')], valid_destination)
++    target_types = []
++    for kind in ('builtins.tuple', 'builtins.list'):
++        if kind in context.kind_vocabulary:
++            predicate = builder.fresh('bool')
++            builder.emit(entry, 'Eq', [source_kind, builder.const(entry, context.kind_vocabulary.index(kind) + 1, dtype='int64')], predicate)
++            target_types.append(predicate)
++    source_valid = builder.const(entry, 0, dtype='bool')
++    for predicate in target_types:
++        merged = builder.fresh('bool')
++        builder.emit(entry, 'LOr', [source_valid, predicate], merged)
++        source_valid = merged
++    builder.emit(entry, 'LAnd', [valid_destination, source_valid], valid)
++    _, extent = load_cell(builder, entry, by_id[context.members.length_address_id])
++    builder.cond(entry, valid, header, reject)
++    index, next_index = builder.fresh('int64'), builder.fresh('int64')
++    builder.emit(header, 'Phi', [zero, next_index], index,
++                 attributes={'incoming_blocks': (entry.name, latch.name)})
++    more = builder.fresh('bool')
++    builder.emit(header, 'Lt', [index, extent], more)
++    builder.cond(header, more, body, complete)
++    owner_address, owner, pair_address, pair = (builder.fresh(dtype)
++        for dtype in ('ptr', 'opaque_ref', 'ptr', 'opaque_ref'))
++    builder.emit(body, 'GetElementPtr', [by_id[context.members.column_value_ids[0]], index], owner_address)
++    builder.emit(body, 'Load', [owner_address], owner)
++    matches = builder.fresh('bool')
++    builder.emit(body, 'Eq', [owner, source], matches)
++    builder.cond(body, matches, consume, latch)
++    builder.emit(consume, 'GetElementPtr', [by_id[context.members.column_value_ids[2]], index], pair_address)
++    builder.emit(consume, 'Load', [pair_address], pair)
++    key, item, status = builder.fresh('opaque_ref'), builder.fresh('opaque_ref'), builder.fresh('bool')
++    positions = []
++    for ordinal in (1, 2):
++        position = builder.fresh('opaque_ref')
++        builder.emit(consume, 'Cast', [builder.const(consume, ordinal, dtype='int64')], position,
++                     attributes={'binding': 'object_context_position'})
++        positions.append(position)
++    invoke(consume, get_helper, pair, (positions[0],), key)
++    invoke(consume, get_helper, pair, (positions[1],), item)
++    invoke(consume, set_helper, destination, (key, item), status)
++    builder.cond(consume, status, latch, reject)
++    builder.emit(latch, 'Add', [index, one], next_index)
++    builder.branch(latch, header)
++    builder.emit(complete, 'Ret', [builder.const(complete, 1, dtype='bool')])
++    builder.emit(reject, 'Ret', [builder.const(reject, 0, dtype='bool')])
++    finish('update', builder, (destination, source), reference=destination, operation=ObjectOperation.UPDATE)
++
+     builder = _Builder(0)
+     entry = builder.block('entry')
+     entry.instrs.append(heap_release(by_id[context.objects.heap_owner_value_id]))
+diff --git a/src/compiler/ssa_object_operations.py b/src/compiler/ssa_object_operations.py
+--- a/src/compiler/ssa_object_operations.py
++++ b/src/compiler/ssa_object_operations.py
+@@ -23,6 +23,7 @@
+     CONSTRUCT = "construct"
+     MATERIALIZE = "materialize"
+     COLLECT = "collect"
++    UPDATE = "update"
+     RELEASE = "release"
+ 
+ 
+@@ -33,6 +34,7 @@
+     ObjectOperation.CONSTRUCT: "opaque_ref", ObjectOperation.RELEASE: None,
+     ObjectOperation.MATERIALIZE: "opaque_ref",
+     ObjectOperation.COLLECT: "opaque_ref",
++    ObjectOperation.UPDATE: "bool",
+ }
+ 
+ 
+diff --git a/src/compiler/control_source.py b/src/compiler/control_source.py
+--- a/src/compiler/control_source.py
++++ b/src/compiler/control_source.py
+@@ -147,6 +147,8 @@
+     # preventing its result ID from becoming an invented function argument.
+     argument_expressions: tuple[ControlExpression | None, ...] = ()
+     extraction_identity: str | None = None
++    # Accepted object representation on the shared book, not a second schema.
++    object_contract_cell: Any = None
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/src/compiler/concordance_declarations.py b/src/compiler/concordance_declarations.py
+--- a/src/compiler/concordance_declarations.py
++++ b/src/compiler/concordance_declarations.py
+@@ -3130,6 +3130,15 @@
+     "aggregate_ledger_cause_not_on_book"
+ )
+ 
++# Native object admission owns representation, not source identity. Its facts
++# are DERIVED from the incumbent producer/operand/loop cells. Control and SSA
++# carry only this cell reference; they must read the book before allocating or
++# projecting, rather than trust an independently copied row receipt.
++NATIVE_OBJECT_SOURCE = declare_page("native_object_source", (
++    RowField("read_scope", K.SCOPE), RowField("value", K.VALUE_ID),
++    RowField("role", K.LABEL),
++), tuple)
++
+ #: ``_callsite_specialized_shell_type.record_and_return``: the return shape a
+ #: callsite specialization published in one round, ``(caller, callee, call)``
+ #: -> ``(shape, dtype)`` per output, REVISE (one column per round, so
+diff --git a/src/compiler/resident_sequence_materialization.py b/src/compiler/resident_sequence_materialization.py
+--- a/src/compiler/resident_sequence_materialization.py
++++ b/src/compiler/resident_sequence_materialization.py
+@@ -779,7 +779,9 @@
+             leaves = tuple(map(
+                 int, attributes.get("aggregate_leaf_value_ids", ())
+             ))
+-            if attributes.get("aggregate_kind") == "tuple" and leaves:
++            abi = (graph_obj.graph.get('linked_value_abi') or {}).get(int(value_id), {})
++            if (attributes.get("aggregate_kind") == "tuple" and leaves
++                    and not (abi.get('storage') == 'reference' and abi.get('dtype') == 'opaque_ref')):
+                 arguments.extend(leaves)
+             else:
+                 arguments.append(int(value_id))
+diff --git a/src/compiler/loop_composer.py b/src/compiler/loop_composer.py
+--- a/src/compiler/loop_composer.py
++++ b/src/compiler/loop_composer.py
+@@ -5255,20 +5255,34 @@
+                 if output_predicate is None
+                 else ControlExpression("and", (output_predicate, predicate))
+             )
+-        sequence_mutations.extend(
+-            ControlSequenceMutation(
++        def publication(output, kind):
++            # tuple((key,item) for key,item in value.items()): composer used
++            # to keep only flattened1/0, losing the actual yielded producer3
++            # before its object ABI was admitted. Preserve this transition
++            # on the shared book; SSA reads the original edge, not a guess
++            # reconstructed from a coincidentally matching pair of columns.
++            arguments = expanded_row_arguments((output.value_id,))
++            from .ssa_object_context import _object_source_contract
++            cell = _object_source_contract(graph.G, int(output.materializer_node_id),
++                'publication', {'source_argument_value_ids': (int(output.value_id),),
++                                'projected_argument_value_ids': arguments},
++                (output.materializer_node_id, output.value_id, *arguments))
++            return ControlSequenceMutation(
+                 sequence_value_id=int(output.result_value_id),
+                 operator=("update" if kind == "dict" else "add" if kind == "set" else "append"),
+-                argument_value_ids=expanded_row_arguments((output.value_id,)),
++                argument_value_ids=arguments,
+                 effect_node_id=int(output.materializer_node_id),
+                 policy="unique" if kind in {"dict", "set"} else "duplicates",
+                 argument_kind="mapping_items" if kind == "dict" else "value",
+                 predicate_expression=output_predicate,
+                 argument_expressions=tuple(
+                     structured_control_expression(int(value_id))
+-                    for value_id in expanded_row_arguments((output.value_id,))
++                    for value_id in arguments
+                 ),
+-            )
++                object_contract_cell=cell,
++            )
++        sequence_mutations.extend(
++            publication(output, kind)
+             for output in loop.iteration_outputs
+             for kind in ((graph.G.nodes[int(output.materializer_node_id)].get("attributes") or {}).get("aggregate_kind"),)
+         )
+diff --git a/src/compiler/page_lifecycle.py b/src/compiler/page_lifecycle.py
+--- a/src/compiler/page_lifecycle.py
++++ b/src/compiler/page_lifecycle.py
+@@ -293,6 +293,7 @@
+     "source_field_identity_concordance": PageLifecycle(CLOSURE, REPAIRS, REPAIRS),
+     "source_function_reachability_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+     "source_method_identity_concordance": PageLifecycle(CLOSURE, CLOSURE, CLOSURE),
++    "native_object_source": PageLifecycle(LOWERING, EMISSION, EMISSION),
+     "source_numeric_specialization_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+     "source_pursuit_activation_concordance": PageLifecycle(CLOSURE, CLOSURE, CLOSURE),
+     "source_python_identity_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+diff --git a/tests/test_native_paired_object_generators.py b/tests/test_native_paired_object_generators.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_native_paired_object_generators.py
+@@ -0,0 +1,110 @@
++"""Paired/native aggregate producers consume shared concordance cells."""
++import numpy as np
++import pytest
++
++from tests.test_native_object_contract_batch import typed_context, compile_source
++from src.compiler.identity_concordance import identity_book, concordance_report, Derived, Mode
++from src.compiler.concordance_declarations import NATIVE_OBJECT_SOURCE, PLANNER_HIERARCHY
++from src.compiler.shell_external_references import ExternalReferenceValueCodec
++from src.compiler.ssa_llvm_backend import prepare_artifact_execution, emit_ssa_function_to_llvm
++
++
++@pytest.mark.parametrize('expression', ['(key,item)', '(item,key)', '(key,(item,key))'])
++def test_native_pair_generator_preserves_nested_and_shared_values(tmp_path, expression):
++    scope = typed_context()
++    source = f'def root(value):\n    return tuple({expression} for key,item in value.items())\n'
++    module, function, native, release, output = compile_source(source, scope, tmp_path)
++    book = identity_book(module)
++    page = book.page(NATIVE_OBJECT_SOURCE)
++    birth = next(i for b in function.blocks.values() for i in b.instrs
++                 if i.attributes.get('source_object_constructor'))
++    cell = birth.attributes['source_object_constructor']['contract_cell']
++    assert page.scope_row_count(cell.row[0]) > 0
++    assert book.latest_ref(NATIVE_OBJECT_SOURCE, cell.row) == cell
++    assert book.edges_into(cell)
++    for count in (0, 1, 3, 64):
++        leaf = object()
++        shared = [leaf]
++        original = {f'key-{i}': shared for i in range(count)}
++        if count:
++            shared.append(original)  # An imported backedge, not a flattened tensor.
++        expected = tuple(eval(expression, {}, {'key': key, 'item': item})
++                         for key, item in original.items())
++        boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++        try:
++            parameter = dict(function.metadata['parameter_names'])['value']
++            invocation = boundary.bind_execution(native, function,
++                {parameter: np.array([boundary.roots[0]], dtype=np.int64)})
++            invocation.run()
++            assert invocation.native_invocations == 1
++            result, = boundary.export((int(invocation.buffers[output.id].item()),))
++            assert type(result) is tuple and len(result) == count
++            for row, expected_row in zip(result, expected, strict=True):
++                assert type(row) is tuple
++                if expression == '(key,(item,key))':
++                    assert row[0] is expected_row[0]
++                    assert row[1][0] is shared and row[1][1] is expected_row[0]
++                else:
++                    assert all(actual is wanted for actual, wanted in zip(row, expected_row, strict=True))
++            if count:
++                assert shared[-1] is original and shared[0] is leaf
++        finally:
++            prepare_artifact_execution(release, boundary.buffers).run()
++            boundary.close()
++
++
++@pytest.mark.parametrize('fault', ['copied_projection', 'superseded_constructor', 'missing_cell'])
++def test_backend_reads_the_book_not_a_copied_pair_receipt(tmp_path, fault):
++    scope = typed_context()
++    source = 'def root(value):\n    return tuple((key,item) for key,item in value.items())\n'
++    module, function, _, _, _ = compile_source(source, scope, tmp_path)
++    birth = next(i for b in function.blocks.values() for i in b.instrs
++                 if i.attributes.get('source_object_constructor'))
++    receipt = birth.attributes['source_object_constructor']
++    if fault == 'copied_projection':
++        collection = next(i for b in function.blocks.values() for i in b.instrs
++                          if i.attributes.get('source_object_collection'))
++        collection.attributes['source_object_collection']['target_projection_ids'] = (0, 1)
++    elif fault == 'missing_cell':
++        receipt['contract_cell'] = None
++    else:
++        book = identity_book(module)
++        cell = receipt['contract_cell']
++        fact = dict(book.page(NATIVE_OBJECT_SOURCE).latest(cell.row))
++        fact['member_value_ids'] = tuple(reversed(fact['member_value_ids']))
++        book.post(NATIVE_OBJECT_SOURCE, cell.row, tuple(sorted(fact.items())),
++                  stage=PLANNER_HIERARCHY, provenance=Derived((cell,)), mode=Mode.REVISE)
++    assert 'source-object-contract' in concordance_report(module)
++    with pytest.raises(ValueError):
++        emit_ssa_function_to_llvm(module, function.name)
++
++
++def test_native_mapping_update_consumes_paired_generator_once(tmp_path):
++    scope = typed_context()
++    source = ('def identity(item):\n    return item\n'
++              'def root(value):\n    result={}\n'
++              '    result.update((identity(key),identity(item)) for key,item in value.items())\n'
++              '    return result\n')
++    _, function, native, release, output = compile_source(source, scope, tmp_path)
++    for count in (0, 1, 3, 64):
++        leaf = object()
++        shared = [leaf]
++        original = {f'key-{i}': shared for i in range(count)}
++        if count:
++            shared.append(original)
++        boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++        try:
++            parameter = dict(function.metadata['parameter_names'])['value']
++            invocation = boundary.bind_execution(native, function,
++                {parameter: np.array([boundary.roots[0]], dtype=np.int64)})
++            invocation.run()
++            result, = boundary.export((int(invocation.buffers[output.id].item()),))
++            assert invocation.native_invocations == 1
++            assert type(result) is dict and result is not original
++            assert list(result) == list(original)
++            assert all(item is shared for item in result.values())
++            if count:
++                assert shared[-1] is original
++        finally:
++            prepare_artifact_execution(release, boundary.buffers).run()
++            boundary.close()

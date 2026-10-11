@@ -1,0 +1,1022 @@
+diff --git a/src/compiler/glsl_deployment_strategy.py b/src/compiler/glsl_deployment_strategy.py
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -20142,7 +20142,7 @@
+                 "bool": (bool,), "int": (int,), "float": (float,),
+                 "str": (str,), "bytes": (bytes,), "tuple": (tuple,),
+                 "list": (list,), "dict": (dict,), "set": (set,),
+-                "range": (range,),
++                "range": (range,), "object": (object,), "frozenset": (frozenset,),
+             }.get(expression.id)
+         if isinstance(expression, ast.Tuple):
+             result = tuple(
+@@ -20846,6 +20846,21 @@
+             if len(values) >= 3 and values[2] is not unresolved:
+                 return values[2]
+         if name == "isinstance" and values:
++            if values[0] is unresolved and arguments:
++                # ``value={}; isinstance(value,dict)`` retained Dict0, but
++                # Dict has no foldable payload in this evaluator: Call2 saw
++                # an unresolved value and lost the constructor's known type.
++                # Ask the exact argument producer, not its binding name.
++                # Type inspection never freezes a mutable container's data.
++                producer = graph.G.nodes.get(int(arguments[0]), {})
++                producer_attributes = producer.get("attributes") or {}
++                literal_types = {"Dict": dict, "List": list, "Tuple": tuple, "Set": set}
++                object_type = literal_types.get(str(producer.get("type")))
++                accepted = safe_types(expression.args[1] if len(expression.args) > 1 else None)
++                if (object_type is not None and accepted is not None
++                        and producer_attributes.get("producer_kind") == "aggregate"
++                        and producer_attributes.get("aggregate_kind") == object_type.__name__):
++                    return issubclass(object_type, accepted)
+             if isinstance(values[0], _ProgramABIValueFact):
+                 if values[0].token_vocabulary:
+                     # This is a runtime vocabulary token.  The SSA ABI pass
+diff --git a/src/compiler/identity_concordance.py b/src/compiler/identity_concordance.py
+--- a/src/compiler/identity_concordance.py
++++ b/src/compiler/identity_concordance.py
+@@ -1074,6 +1074,14 @@
+     # --------------------------------------------------------------- findings
+     def findings(self, module: Any) -> list[Finding]:
+         found: list[Finding] = []
++        for name, table in (getattr(module, "record_tables", {}) or {}).items():
++            sequences = (getattr(module, "sequence_tables", {}) or {}).get(name)
++            for record in table.records.values():
++                for record_field in record.fields:
++                    if record_field.sequence_id is not None and (
++                            sequences is None or sequences.by_id(record_field.sequence_id) is None):
++                        found.append(Finding("record-sequence-unknown", str(name), int(record.record_id),
++                            f"field {record_field.storage_identity!r} names absent sequence {record_field.sequence_id}"))
+         found.extend(self._native_interface_findings(module))
+         found.extend(self._region_instruction_residency_findings(module))
+         for name, function in module.functions.items():
+@@ -2706,6 +2714,16 @@
+         for block_name, block in function.blocks.items():
+             for index, instruction in enumerate(block.instrs):
+                 attributes = instruction.attributes or {}
++                if attributes.get("opaque_object_operation") is not None:
++                    from .ssa_object_operations import validate_object_call
++                    try:
++                        validate_object_call(module, instruction)
++                    except (KeyError, ValueError) as error:
++                        found.append(Finding(
++                            "opaque-object-contract", name,
++                            None if instruction.res is None else int(instruction.res.id),
++                            f"{block_name}#{index}: {error}",
++                        ))
+                 if attributes.get("allocation_kind") == "owned_heap":
+                     from .ssa_heap_allocation import validate_heap_allocation
+                     try:
+diff --git a/src/transmogrifier/ssa.py b/src/transmogrifier/ssa.py
+--- a/src/transmogrifier/ssa.py
++++ b/src/transmogrifier/ssa.py
+@@ -96,6 +96,25 @@
+     args: List[SSAValue]
+     blocks: Dict[str, BasicBlock]
+     metadata: Dict[str, Any] = field(default_factory=dict)
++
++
++@dataclass(frozen=True)
++class SSAOpaqueObject:
++    """An object reference in an explicitly admitted storage domain.
++
++    This is a semantic view of an existing value, not another physical dtype
++    or object store. The owner implements inspection; the handle itself is
++    never an address. Context/owner operands travel on ordinary native calls.
++    """
++
++    reference: SSAValue
++    storage_identity: str
++
++    def __post_init__(self) -> None:
++        if self.reference.dtype != "opaque_ref" or self.reference.shape:
++            raise ValueError("opaque object requires a scalar opaque_ref")
++        if not isinstance(self.storage_identity, str) or not self.storage_identity:
++            raise ValueError("opaque object requires an admitted storage identity")
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -12804,6 +12804,9 @@
+ ) -> tuple[tuple[Any, ...], ...]:
+     """Recover positional reads/writes of fixed-width sequence rows."""
+ 
++    sequence_declarations = tuple(sequence_declarations)
++    positional_sequences = {int(sequence_id) for sequence_id, policy, _width, _writable
++                            in sequence_declarations if policy == "duplicates"}
+     widths = {
+         int(sequence_id): int(column_count)
+         for sequence_id, _policy, column_count, _writable
+@@ -12914,6 +12917,32 @@
+             if base_node is None or row_index_node is None or row_value_node is None:
+                 continue
+             sequence_id = resident_by_value.get(value_id(base_node))
++            if sequence_id is None:
++                # ``item.members[index][1]=value`` is a column write to the
++                # existing row, not a dereference of a scalar row payload.
++                # Previously Store12's base Indexed11 was not a resident:
++                # it became a float load of column0 followed by a Store into
++                # that temporary. Follow the exact two index edges instead.
++                row = graph_obj.nodes[base_node]
++                row_roles = roles(row)
++                resident_node = row_roles.get("base")
++                row_index = row_roles.get("index")
++                if (str(row.get("op") or row.get("type") or "").casefold() == "indexed"
++                        and resident_node is not None and row_index is not None):
++                    sequence_id = resident_by_value.get(value_id(resident_node))
++                    column = integer_literal(row_index_node)
++                    if sequence_id in positional_sequences and column is not None:
++                        width = widths[sequence_id]
++                        column = column + width if column < 0 else column
++                        if 0 <= column < width:
++                            leaves = tuple(value_id(row_value_node) if index == column else None
++                                           for index in range(width))
++                            operations.append((
++                                "store", value_id(node_id), int(sequence_id),
++                                value_id(row_index), integer_literal(row_index),
++                                leaves, value_id(base_node),
++                            ))
++                            continue
+             row_attributes = graph_obj.nodes[row_value_node].get("attributes") or {}
+             leaves = tuple(map(
+                 int, row_attributes.get("aggregate_leaf_value_ids", ())
+@@ -14305,7 +14334,26 @@
+                     ),
+                     "compiler_frame_orphaned_descriptor": True,
+                 }
+-            del table.sequences[sequence_id]
++            # ``len(book.objects[id(handle)].members)`` keeps only the
++            # physical lengths column. Retiring its unused row descriptor
++            # while retaining Object.members' sequence claim left a dangling
++            # record field, which Fortran's native API correctly rejected.
++            # Retire that claim at this same owning pass; the source schema
++            # and old field/descriptor revisions remain in the shared book.
++            from .concordance_declarations import RECORD_DESCRIPTOR, SEQUENCE_DESCRIPTOR, TABLE_REGISTRATION
++            sequence_cell = _frame_table_cell(table, int(sequence_id), SEQUENCE_DESCRIPTOR)
++            retirement = table.sequences.remove(int(sequence_id),
++                sources=_frame_cells(sequence_cell), stage=TABLE_REGISTRATION)
++            record_table = (all_record_tables or {}).get(str(symbol))
++            if record_table is not None:
++                for record_id, record in tuple(record_table.records.items()):
++                    fields = tuple(field for field in record.fields
++                                   if field.sequence_id != int(sequence_id))
++                    if fields != record.fields:
++                        record_table.records.assign(int(record_id), replace(record, fields=fields),
++                            sources=_frame_cells(
++                                _frame_table_cell(record_table, int(record_id), RECORD_DESCRIPTOR),
++                                retirement), stage=TABLE_REGISTRATION)
+             removed += 1
+             _drop_formals_and_call_operands(
+                 all_functions, function, [
+@@ -19721,7 +19769,16 @@
+             )
+             insertions.append(Instr(
+                 "Cast", [source], result,
+-                attributes={"tensor_operation": "tensor_identity", "reference_cast": True},
++                attributes={
++                    "reference_cast": True,
++                    # An admitted opaque handle already carries identity.
++                    # Calling this Cast a tensor operation made C/Fortran
++                    # reject native object helpers before their lookup. Keep
++                    # tensor identity semantics only for actual tensor feeds.
++                    **({"binding": "opaque_reference_identity"}
++                       if str(source.dtype) == "opaque_ref"
++                       else {"tensor_operation": "tensor_identity"}),
++                },
+             ))
+             values[int(value_id)] = result
+             return result
+@@ -38395,8 +38452,9 @@
+                                     helper_instruction.res.dtype = element
+                     helper_table = all_sequence_tables.get(str(helper.name))
+                     if helper_table is not None:
+-                        helper_table.sequences = {
+-                            int(sequence_id): replace(
++                        from .concordance_declarations import SEQUENCE_DESCRIPTOR, TABLE_REGISTRATION
++                        for sequence_id, descriptor in tuple(helper_table.sequences.items()):
++                            refined_descriptor = replace(
+                                 descriptor,
+                                 column_dtypes=tuple(
+                                     typed.get(int(value_id), str(dtype))
+@@ -38406,9 +38464,13 @@
+                                     )
+                                 ),
+                             )
+-                            for sequence_id, descriptor
+-                            in helper_table.sequences.items()
+-                        }
++                            if refined_descriptor != descriptor:
++                                helper_table.sequences.assign(int(sequence_id), refined_descriptor,
++                                    sources=_frame_cells(
++                                        _frame_table_cell(helper_table, sequence_id, SEQUENCE_DESCRIPTOR),
++                                        *(_frame_value_cell(helper, value_id)
++                                          for value_id in descriptor.column_value_ids)),
++                                    stage=TABLE_REGISTRATION)
+         if not replaced_storage_ids:
+             continue
+         # The mapping's sequence descriptor was minted over the same
+@@ -38441,6 +38503,8 @@
+                 int(value.id): value for value in function.args
+             }
+             remapped: dict[int, Any] = {}
++            remap_sources: dict[int, tuple] = {}
++            from .concordance_declarations import SEQUENCE_DESCRIPTOR, TABLE_REGISTRATION
+             for old_sequence_id, descriptor in tuple(
+                 keyed_table.sequences.items()
+             ):
+@@ -38497,7 +38561,27 @@
+                         f"{incumbent!r} vs {moved!r}"
+                     )
+                 remapped[int(moved.sequence_id)] = moved
+-            keyed_table.sequences = remapped
++                remap_sources[int(moved.sequence_id)] = _frame_cells(
++                    *remap_sources.get(int(moved.sequence_id), ()),
++                    _frame_table_cell(keyed_table, old_sequence_id, SEQUENCE_DESCRIPTOR),
++                    *(_frame_value_cell(function, value_id) for value_id in (
++                        moved.sequence_id, *moved.column_value_ids,
++                        moved.length_address_id, moved.capacity_value_id)))
++            # Object length's keyed rebind previously replaced _BookRows with
++            # a dict here. Later retirement then bypassed descriptor/member
++            # revisions, leaving the book and the live table disagreeing.
++            # Preserve the incumbent table and derive each changed row from
++            # the exact old descriptor and the linked physical storage cells.
++            for old_sequence_id in tuple(keyed_table.sequences):
++                if int(old_sequence_id) not in remapped:
++                    keyed_table.sequences.remove(int(old_sequence_id),
++                        sources=_frame_cells(_frame_table_cell(
++                            keyed_table, old_sequence_id, SEQUENCE_DESCRIPTOR)),
++                        stage=TABLE_REGISTRATION)
++            for sequence_id, descriptor in remapped.items():
++                if keyed_table.by_id(sequence_id) != descriptor:
++                    keyed_table.sequences.assign(sequence_id, descriptor,
++                        sources=remap_sources[sequence_id], stage=TABLE_REGISTRATION)
+         # The anonymous cells the helper calls no longer read keep only
+         # their own entry initialisation (``ssa_local_sequence_length`` +
+         # ``ssa_local_sequence_initialize``); strip it so the leased
+diff --git a/src/compiler/precompile_to_ssa.py b/src/compiler/precompile_to_ssa.py
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -2837,7 +2837,7 @@
+ 
+     def _emit_sequence_row_store(
+         self, result_id: int, sequence_id: int, index_id: int,
+-        index_literal: int | None, row_value_ids: tuple[int, ...],
++        index_literal: int | None, row_value_ids: tuple[int | None, ...],
+         _row_aggregate_id: int,
+     ) -> None:
+         descriptor = self.sequence_descriptors.get(int(sequence_id))
+@@ -2849,12 +2849,23 @@
+                 f"sequence {sequence_id} row width is unresolved",
+             ))
+             return
++        if not descriptor.writable:
++            self.shortfalls.append(SSALoweringShortfall(
++                "ssa-sequence", "row-store", self.function_name,
++                f"sequence {sequence_id} is declared read-only",
++            ))
++            return
+         index = self._sequence_row_index(
+             int(sequence_id), int(index_id), index_literal
+         )
+         for column, (column_id, value_id) in enumerate(zip(
+             descriptor.column_value_ids, row_value_ids
+         )):
++            # A sparse row update carries None for untouched columns. It
++            # updates the selected reference slot without loading/copying
++            # the other payloads or inventing a temporary row allocation.
++            if value_id is None:
++                continue
+             column_value = self.external_value(int(column_id))
+             address = self.fresh_value(
+                 dtype="ptr", transform=ADDRESS, operands=(column_value, index),
+@@ -2878,11 +2889,12 @@
+                     "column": int(column),
+                 },
+             )
+-        self._bind(
+-            int(result_id), self.external_value(int(sequence_id)),
+-            BindingKind.SEQUENCE_RESULT,
+-            self._sequence_contract_cell(int(sequence_id)), index,
+-        )
++        if all(value_id is not None for value_id in row_value_ids):
++            self._bind(
++                int(result_id), self.external_value(int(sequence_id)),
++                BindingKind.SEQUENCE_RESULT,
++                self._sequence_contract_cell(int(sequence_id)), index,
++            )
+ 
+     def _emit_table_delete(
+         self, effect_id: int, key_id: int | tuple[int, ...],
+@@ -15610,7 +15622,7 @@
+                 (sequence_column_dtypes or {}).get(int(sequence_id), ())
+             )
+             for column, leaf_id in enumerate(leaves):
+-                if column < len(contract):
++                if leaf_id is not None and column < len(contract):
+                     region_value_meta[int(leaf_id)] = Meta(
+                         (), str(contract[column])
+                     )
+@@ -16133,7 +16145,12 @@
+                     ))
+                 for operation in row_stores:
+                     result_id, sequence_id = map(int, operation[:2])
+-                    bind_resident(result_id, sequence_id)
++                    # Whole-row assignment returns the sequence; a sparse
++                    # column assignment retains its already-concorded row
++                    # view. Rebinding Store12 from Indexed11 to Sequence10
++                    # would publish a second identity for the same effect.
++                    if all(value is not None for value in operation[4]):
++                        bind_resident(result_id, sequence_id)
+                     table_region_operations.setdefault(
+                         region_index, []
+                     ).append(("row_store", operation))
+diff --git a/src/compiler/sequence_storage_binding.py b/src/compiler/sequence_storage_binding.py
+--- a/src/compiler/sequence_storage_binding.py
++++ b/src/compiler/sequence_storage_binding.py
+@@ -24,6 +24,44 @@
+         for value_id in identity.get(str(parameter_name), ())
+         if int(value_id) in declared
+     }
++    # A writable member table selected from a caller-owned keyed record is
++    # still caller storage. ``book.objects[id(handle)].members`` previously
++    # missed the parameter-only test and emitted a local length reset before
++    # the selected-row pointer existed. Propagate ownership only along exact
++    # storage-selection edges, then verify the declared field on its exact
++    # receiver schema. This is a derived view, not another object registry.
++    from collections import deque
++    from .identity_concordance import publish_program_abi_graph_identities
++    publish_program_abi_graph_identities(graph_obj)
++    caller_values = {
++        int(history[0])
++        for parameter_name in graph_obj.graph.get("function_parameters") or ()
++        for history in (tuple(identity.get(str(parameter_name), ())),)
++        if history
++    }
++    caller_owned = {int(node_id) for node_id, data in graph_obj.nodes(data=True)
++                    if int(data.get("value_id", node_id)) in caller_values}
++    children = {}
++    for node_id, data in graph_obj.nodes(data=True):
++        if str(data.get("op") or data.get("type") or "").casefold() not in {
++            "getattr", "indexed", "load",
++        }:
++            continue
++        for parent, role in data.get("parents") or ():
++            if str(role) in {"value", "object", "base", "receiver"}:
++                children.setdefault(int(parent), []).append(int(node_id))
++    pending = deque(caller_owned)
++    while pending:
++        for child in children.get(pending.popleft(), ()):
++            if child not in caller_owned:
++                caller_owned.add(child)
++                pending.append(child)
++    schemas = {}
++    for record in ((graph_obj.graph.get("program_abi") or {}).get("records") or {}).values():
++        schemas.setdefault(str(record.get("identity") or ""), []).append(record)
++    for record in (graph_obj.graph.get("parameter_record_abi") or {}).values():
++        if str(record.get("identity") or "") not in schemas:
++            schemas[str(record.get("identity") or "")] = [record]
+     self_fields = {
+         str(field_name)
+         for field_name, receipt in dict(
+@@ -49,6 +87,17 @@
+             source_ids.add(value_id)
+             continue
+         operation = str(data.get("op") or data.get("type") or "").casefold()
++        if operation == "getattr" and int(node_id) in caller_owned:
++            receivers = [int(parent) for parent, role in data.get("parents") or ()
++                         if str(role) in {"value", "object", "base", "receiver"}
++                         and int(parent) in graph_obj and int(parent) in caller_owned]
++            if len(receivers) == 1:
++                receiver_attributes = graph_obj.nodes[receivers[0]].get("attributes") or {}
++                records = schemas.get(str(receiver_attributes.get("program_abi_record_identity") or ""), ())
++                if len(records) == 1:
++                    field = (records[0].get("fields") or {}).get(str(attributes.get("attribute") or "")) or {}
++                    if field.get("storage") in {"span", "table", "keyed"}:
++                        source_ids.add(value_id)
+         if (
+             operation == "getattr"
+             and str(attributes.get("attribute") or "") in self_fields
+diff --git a/src/compiler/ssa_llvm_backend.py b/src/compiler/ssa_llvm_backend.py
+--- a/src/compiler/ssa_llvm_backend.py
++++ b/src/compiler/ssa_llvm_backend.py
+@@ -5709,6 +5709,8 @@
+     shipped artifact depends on this existing.
+     """
+ 
++    from .ssa_object_operations import validate_object_operations
++    validate_object_operations(module, function_name)
+     function = module.functions[function_name]
+     if function.metadata.get("native_interface"):
+         from .identity_concordance import CorrelationTable
+diff --git a/src/compiler/ssa_c_backend.py b/src/compiler/ssa_c_backend.py
+--- a/src/compiler/ssa_c_backend.py
++++ b/src/compiler/ssa_c_backend.py
+@@ -347,6 +347,8 @@
+     module: IRModule, function_name: str, *, entry_name: str | None = None,
+     trig_solver: str = "lut",
+ ) -> CFunctionArtifact:
++    from .ssa_object_operations import validate_object_operations
++    validate_object_operations(module, function_name)
+     from .ir_identities import precision_backend_shortfalls
+     from .identity_concordance import CorrelationTable
+     findings = CorrelationTable._native_interface_findings(module)
+@@ -1630,6 +1632,8 @@
+     """
+ 
+     from .ir_identities import precision_backend_shortfalls
++    from .ssa_object_operations import validate_object_operations
++    validate_object_operations(module, function_name)
+     from .ssa_storage_requirements import module_storage_requirements
+     from .identity_concordance import CorrelationTable
+     findings = CorrelationTable._native_interface_findings(module)
+diff --git a/src/compiler/ssa_fortran_backend.py b/src/compiler/ssa_fortran_backend.py
+--- a/src/compiler/ssa_fortran_backend.py
++++ b/src/compiler/ssa_fortran_backend.py
+@@ -4359,6 +4359,9 @@
+     """
+ 
+     functions = module.functions if isinstance(module, IRModule) else module
++    from .ssa_object_operations import validate_object_operations
++    from types import SimpleNamespace
++    validate_object_operations(SimpleNamespace(functions=functions))
+     if any(function.metadata.get("native_interface") for function in functions.values()):
+         raise FortranEmissionError("native object interfaces currently require the C/LLVM backend")
+     _emit_module_started = time.time()
+diff --git a/tests/test_native_structural_producers.py b/tests/test_native_structural_producers.py
+--- a/tests/test_native_structural_producers.py
++++ b/tests/test_native_structural_producers.py
+@@ -33,8 +33,11 @@
+     parameter_id = dict(root.metadata['parameter_names'])['value']
+     assert 'unused' not in dict(root.metadata['parameter_names'])
+     identity = [i for b in root.blocks.values() for i in b.instrs
+-                if i.attributes.get('tensor_operation') == 'tensor_identity']
++                if i.attributes.get('binding') == 'opaque_reference_identity']
+     assert len(identity) == 1
++    assert identity[0].op == 'Cast'
++    assert identity[0].args[0].dtype == 'opaque_ref'
++    assert 'tensor_operation' not in identity[0].attributes
+     assert identity[0].args[0].id == parameter_id
+     artifact = emit_ssa_function_to_llvm(module, exports[0])
+     assert artifact.complete, artifact.shortfalls
+diff --git a/src/compiler/ssa_object_operations.py b/src/compiler/ssa_object_operations.py
+new file mode 100644
+--- /dev/null
++++ b/src/compiler/ssa_object_operations.py
+@@ -0,0 +1,260 @@
++"""Object operations over opaque references, using ordinary native SSA calls.
++
++The existing module function is the implementation and interface authority.
++There is no object registry, handle-to-pointer cast, Python callback, or new
++opcode here. A helper declares exact formal identities for its object, storage
++context and additional operands. Its body owns the actual storage semantics.
++"""
++from __future__ import annotations
++
++from enum import Enum
++from typing import Mapping
++
++from ..transmogrifier.ssa import Instr, SSAOpaqueObject, SSAValue
++from .monotonic_ids import GLOBAL_MONOTONIC_IDS
++
++
++class ObjectOperation(str, Enum):
++    KIND = "kind"
++    LENGTH = "length"
++    GET = "get"
++    SET = "set"
++    CONSTRUCT = "construct"
++    RELEASE = "release"
++
++
++_RESULT_DTYPES = {
++    ObjectOperation.KIND: "int64", ObjectOperation.LENGTH: "int64",
++    ObjectOperation.GET: "opaque_ref", ObjectOperation.SET: "bool",
++    ObjectOperation.CONSTRUCT: "opaque_ref", ObjectOperation.RELEASE: None,
++}
++
++
++def _result_layout(function):
++    returns = [i.args for b in function.blocks.values() for i in b.instrs
++               if i.op == "Ret"]
++    if not returns or any(len(values) > 1 for values in returns):
++        raise ValueError("object helper requires a defined single-result or void body")
++    layouts = {(values[0].dtype, tuple(values[0].shape or ())) if values else (None, ())
++               for values in returns}
++    if len(layouts) != 1:
++        raise ValueError("object helper return paths disagree about result layout")
++    return next(iter(layouts))
++
++
++def _helper_receipt(module, function_name: str, operation: ObjectOperation | str,
++                          *, storage_identity: str, reference_formal_id: int | None,
++                          context_formal_ids=(), operand_formal_ids=(), kind_vocabulary=()):
++    """Read an object interface from an incumbent, compiled SSA function.
++
++    All roles use exact callee value IDs, never signature positions or guessed
++    names. This API cannot bless an absent external symbol or unknown layout.
++    Construct has no input object; release has no result. Ownership and effects
++    stay in the helper's real instructions and existing interprocedural analysis.
++    """
++    operation = ObjectOperation(operation)
++    if not isinstance(storage_identity, str) or not storage_identity:
++        raise ValueError("object helper requires an admitted storage identity")
++    function = module.functions[function_name]
++    if function.metadata.get("native_interface"):
++        raise ValueError("object helper declaration currently requires its native SSA body")
++    context = tuple(map(int, context_formal_ids))
++    operands = tuple(map(int, operand_formal_ids))
++    reference = None if reference_formal_id is None else int(reference_formal_id)
++    if (reference is None) != (operation is ObjectOperation.CONSTRUCT):
++        raise ValueError("only object construction has no reference formal")
++    roles = (*(() if reference is None else (reference,)), *context, *operands)
++    formals = {int(value.id): value for value in function.args}
++    if len(formals) != len(function.args) or len(set(roles)) != len(roles) or set(roles) != set(formals):
++        raise ValueError("object helper roles must cover each exact formal once")
++    if reference is not None:
++        SSAOpaqueObject(formals[reference], storage_identity)
++    if any(value.dtype in {None, "unknown"} for value in function.args):
++        raise ValueError("object helper has an unresolved formal layout")
++    expected_result = (_RESULT_DTYPES[operation], ())
++    if _result_layout(function) != expected_result:
++        raise ValueError(f"{operation.value} helper requires result {expected_result}")
++    vocabulary = tuple(kind_vocabulary)
++    if vocabulary and (operation is not ObjectOperation.KIND or
++                       any(not isinstance(token, str) or not token for token in vocabulary)
++                       or len(set(vocabulary)) != len(vocabulary)):
++        raise ValueError("kind vocabulary requires unique declared tokens on a kind helper")
++    receipt = {
++        "operation": operation.value, "storage_identity": storage_identity,
++        "reference_formal_id": reference, "context_formal_ids": context,
++        "operand_formal_ids": operands, "result_layout": expected_result,
++        "kind_vocabulary": vocabulary,
++        "result_value_ids": tuple(sorted({int(i.args[0].id) for b in function.blocks.values()
++                                           for i in b.instrs if i.op == "Ret" and i.args})),
++    }
++    return receipt
++
++
++def declare_object_helper(module, function_name: str, operation: ObjectOperation | str,
++                          *, storage_identity: str, reference_formal_id: int | None,
++                          context_formal_ids=(), operand_formal_ids=(), kind_vocabulary=()):
++    """Publish one checked interface on the existing native function."""
++    receipt = _helper_receipt(module, function_name, operation,
++        storage_identity=storage_identity, reference_formal_id=reference_formal_id,
++        context_formal_ids=context_formal_ids, operand_formal_ids=operand_formal_ids,
++        kind_vocabulary=kind_vocabulary)
++    function = module.functions[function_name]
++    incumbent = function.metadata.get("opaque_object_helper")
++    if incumbent is not None and incumbent != receipt:
++        raise ValueError("object helper already has a different interface")
++    function.metadata["opaque_object_helper"] = receipt
++    # The native API's result is the helper's own Ret value, not a caller's
++    # projection ID. Structural source getters can leave named_outputs empty;
++    # without this established return_value contract Fortran saw kind's
++    # six-input call as an outputless procedure and refused its scalar result.
++    returned = {int(i.args[0].id): i.args[0] for b in function.blocks.values()
++                for i in b.instrs if i.op == "Ret" and i.args}
++    if len(returned) == 1 and function.metadata.get("return_value") is None:
++        function.metadata["return_value"] = next(iter(returned.values()))
++    return receipt
++
++
++def object_call(module, function_name: str, object_: SSAOpaqueObject | None,
++                *, context: Mapping[int, SSAValue], operands: Mapping[int, SSAValue],
++                result: SSAValue | None, source_span=None) -> Instr:
++    """Lower an object operation to the same Call consumed by all backends."""
++    function = module.functions[function_name]
++    receipt = function.metadata["opaque_object_helper"]
++    reference = receipt["reference_formal_id"]
++    if reference is None:
++        if object_ is not None:
++            raise ValueError("construct does not consume an existing object")
++    elif object_ is None or object_.storage_identity != receipt["storage_identity"]:
++        raise ValueError("object and helper disagree about storage identity")
++    if set(context) != set(receipt["context_formal_ids"]) or set(operands) != set(receipt["operand_formal_ids"]):
++        raise ValueError("object call must bind the exact declared context and operand identities")
++    bindings = {**context, **operands}
++    if reference is not None:
++        bindings[reference] = object_.reference
++    args = [bindings[int(formal.id)] for formal in function.args]
++    instruction = Instr("Call", args, result, source_span=source_span, attributes={
++        "callee": function_name, "callee_input_ids": tuple(int(v.id) for v in function.args),
++        "source_linked": True, "opaque_object_operation": dict(receipt),
++        "opaque_object_bindings": tuple((int(formal.id), int(actual.id))
++                                        for formal, actual in zip(function.args, args)),
++        "native_result_contract": (
++            ((receipt["result_value_ids"][0], *receipt["result_layout"]),)
++            if len(receipt["result_value_ids"]) == 1 else ()
++        ),
++    })
++    validate_object_call(module, instruction)
++    return instruction
++
++
++def validate_object_call(module, instruction: Instr, *, _helpers=None) -> None:
++    """Check the operation against its live implementation, not a stale copy."""
++    receipt = instruction.attributes.get("opaque_object_operation")
++    if receipt is None:
++        return
++    if instruction.op != "Call":
++        raise ValueError("opaque object operation must use the existing Call opcode")
++    function = module.functions.get(instruction.attributes.get("callee"))
++    if function is None or function.metadata.get("opaque_object_helper") != receipt:
++        raise ValueError("opaque object call has no matching live helper interface")
++    # Revalidate the live body: changing its signature/results cannot silently
++    # leave an old call receipt apparently valid.
++    live = None if _helpers is None else _helpers.get(function.name)
++    if live is None:
++        live = _helper_receipt(module, function.name, receipt["operation"],
++            storage_identity=receipt["storage_identity"],
++            reference_formal_id=receipt["reference_formal_id"],
++            context_formal_ids=receipt["context_formal_ids"],
++            operand_formal_ids=receipt["operand_formal_ids"], kind_vocabulary=receipt["kind_vocabulary"])
++        if _helpers is not None:
++            _helpers[function.name] = live
++    if live != receipt:
++        raise ValueError("opaque object call disagrees with its live helper layout")
++    expected_returns = (((receipt["result_value_ids"][0], *receipt["result_layout"]),)
++                        if len(receipt["result_value_ids"]) == 1 else ())
++    if instruction.attributes.get("native_result_contract") != expected_returns:
++        raise ValueError("opaque object call has stale native result identities")
++    expected_ids = tuple(int(v.id) for v in function.args)
++    if instruction.attributes.get("callee_input_ids") != expected_ids or len(instruction.args) != len(function.args):
++        raise ValueError("opaque object call disagrees with exact callee input identities")
++    if instruction.attributes.get("opaque_object_bindings") != tuple(
++            (int(formal.id), int(actual.id)) for formal, actual in zip(function.args, instruction.args)):
++        raise ValueError("opaque object call has stale context/reference binding identities")
++    for formal, actual in zip(function.args, instruction.args):
++        if (formal.dtype, tuple(formal.shape or ())) != (actual.dtype, tuple(actual.shape or ())):
++            raise ValueError(f"opaque object argument {formal.id} has incompatible physical layout")
++    actual_result = ((instruction.res.dtype, tuple(instruction.res.shape or ()))
++                     if instruction.res is not None else (None, ()))
++    if actual_result != receipt["result_layout"]:
++        raise ValueError("opaque object call has incompatible result layout")
++
++
++def validate_object_operations(module, function_name: str | None = None) -> None:
++    # Validate only the emitted call closure. Each live helper body is checked
++    # once per read-only emission boundary, not once per caller occurrence.
++    # This avoids calls x helper-body work and unrelated module-body scans.
++    pending = list(module.functions) if function_name is None else [function_name]
++    visited = set()
++    helpers = {}
++    while pending:
++        name = pending.pop()
++        if name in visited:
++            continue
++        visited.add(name)
++        function = module.functions[name]
++        for block in function.blocks.values():
++            for instruction in block.instrs:
++                validate_object_call(module, instruction, _helpers=helpers)
++                callee = instruction.attributes.get("callee") if instruction.op == "Call" else None
++                if callee in module.functions and callee not in visited:
++                    pending.append(callee)
++
++
++def object_identity(object_: SSAOpaqueObject, result: SSAValue) -> Instr:
++    if result.dtype != "int64" or result.shape:
++        raise ValueError("object identity requires a scalar int64 result")
++    return Instr("Cast", [object_.reference], result, attributes={
++        "binding": "opaque_object_identity", "storage_identity": object_.storage_identity,
++    })
++
++
++def object_kind_matches(module, helper_name: str, object_: SSAOpaqueObject, *,
++                        context: Mapping[int, SSAValue], accepted: tuple[str, ...],
++                        kind_result: SSAValue, result: SSAValue) -> list[Instr]:
++    """A native test against the owner's declared one-based kind vocabulary.
++
++    This is closed-domain kind membership, not an implementation of arbitrary
++    Python metaclasses/subclass hooks. A future isinstance lowering must admit
++    that semantics explicitly instead of silently treating kind as full MRO.
++    """
++    receipt = module.functions[helper_name].metadata["opaque_object_helper"]
++    vocabulary = receipt["kind_vocabulary"]
++    if not vocabulary or not accepted or any(token not in vocabulary for token in accepted):
++        raise ValueError("kind test requires tokens from the helper's declared vocabulary")
++    if result.dtype != "bool" or result.shape:
++        raise ValueError("kind test requires a scalar bool result")
++    instructions = [object_call(module, helper_name, object_, context=context,
++                                operands={}, result=kind_result)]
++    predicates = []
++    for token in dict.fromkeys(accepted):
++        constant = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), 'int64')
++        compared = result if len(set(accepted)) == 1 else SSAValue(GLOBAL_MONOTONIC_IDS.mint(), 'bool')
++        instructions.extend((Instr('Const', [], constant, attributes={
++            'value': vocabulary.index(token) + 1, 'program_abi_vocabulary_token': token,
++        }), Instr('Eq', [kind_result, constant], compared)))
++        predicates.append(compared)
++    combined = predicates[0]
++    for index, compared in enumerate(predicates[1:], 1):
++        merged = result if index == len(predicates) - 1 else SSAValue(GLOBAL_MONOTONIC_IDS.mint(), 'bool')
++        instructions.append(Instr('Or', [combined, compared], merged))
++        combined = merged
++    return instructions
++
++
++def object_same(left: SSAOpaqueObject, right: SSAOpaqueObject, result: SSAValue) -> Instr:
++    if left.storage_identity != right.storage_identity:
++        raise ValueError("identity comparison requires the same admitted storage domain")
++    if result.dtype != "bool" or result.shape:
++        raise ValueError("object identity comparison requires a scalar bool result")
++    return Instr("Eq", [left.reference, right.reference], result, attributes={
++        "binding": "opaque_object_same", "storage_identity": left.storage_identity,
++    })
+diff --git a/tests/test_ssa_object_operations.py b/tests/test_ssa_object_operations.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_ssa_object_operations.py
+@@ -0,0 +1,290 @@
++"""Checked object helper calls, compiled by our public source compiler."""
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from src.transmogrifier.ssa import SSAOpaqueObject, SSAValue, Function, BasicBlock, Instr, IRModule
++from src.compiler.monotonic_ids import GLOBAL_MONOTONIC_IDS
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++from src.compiler.ssa_object_operations import (
++    ObjectOperation, declare_object_helper, object_call,
++    object_identity, object_same, validate_object_operations,
++    object_kind_matches,
++)
++from src.compiler.ssa_llvm_backend import (
++    emit_ssa_function_to_llvm, compile_artifact, prepare_artifact_execution,
++)
++from src.compiler.identity_concordance import concordance_report
++
++
++ROOT = Path(__file__).resolve().parents[1]
++KINDS = ('builtins.dict', 'builtins.list', 'builtins.tuple', 'builtins.set',
++         'builtins.frozenset', 'builtins.object')
++
++
++def policy(mutable=False):
++    return ExtractionContract(ROOT / 'extraction_contracts/program_extraction.yaml').with_program_abi({
++        'records': {
++            'Book': {'identity': 'metadata.Book', 'fields': {'objects': {
++                'storage': 'keyed', 'dtype': 'int64', 'key_encoding': 'integer_identity',
++                'value_record': 'Object',
++            }}},
++            'Object': {'identity': 'metadata.Object', 'fields': {
++                'kind': {'storage': 'scalar', 'dtype': 'int64', 'token_vocabulary': list(KINDS)},
++                'members': {'storage': 'table', 'mutable': mutable, 'columns': [
++                    {'name': 'key', 'dtype': 'opaque_ref'},
++                    {'name': 'value', 'dtype': 'opaque_ref'},
++                ]},
++            }},
++        },
++        'bindings': [{'function': '*', 'parameter': 'book', 'record': 'Book'}],
++        'values': [
++            {'function': '*', 'parameter': 'handle', 'storage': 'reference',
++             'python_type': 'builtins.object'},
++            {'function': '*', 'parameter': 'value', 'storage': 'reference',
++             'python_type': 'builtins.object'},
++            {'function': '*', 'parameter': 'index', 'storage': 'scalar',
++             'dtype': 'int64', 'python_type': 'builtins.int'},
++        ],
++    }).with_execution_file(ROOT / 'extraction_contracts/vehicle_full_native_execution.yaml')
++
++
++def compile_helper(operation, mutable_members=None):
++    body = {
++        ObjectOperation.KIND: '    return item.kind\n',
++        ObjectOperation.LENGTH: '    return len(item.members)\n',
++        ObjectOperation.GET: '    return item.members[index][1]\n',
++        ObjectOperation.SET: '    item.members[index][1]=value\n    return True\n',
++    }[operation]
++    source = ('def inspect(book,handle,index,value):\n    identity=id(handle)\n'
++              '    item=book.objects[identity]\n' + body)
++    module, _, exports = lower_ast_source_to_ssa(source, 'inspect', name='object_operations',
++        extraction_contract=policy(mutable=(operation is ObjectOperation.SET
++                                           if mutable_members is None else mutable_members)), runtime_closure_only=True,
++        progress=lambda _: None, progress_bars=False)
++    helper = module.functions[exports[0]]
++    parameters = dict(helper.metadata['parameter_names'])
++    reference_id = parameters['handle']
++    formal_ids = {v.id for v in helper.args}
++    operand_ids = tuple(parameters[name] for name in ('index', 'value')
++                        if parameters.get(name) in formal_ids)
++    context_ids = tuple(v.id for v in helper.args if v.id not in {reference_id, *operand_ids})
++    declare_object_helper(module, helper.name, operation, storage_identity='metadata.Book.objects',
++        reference_formal_id=reference_id, context_formal_ids=context_ids, operand_formal_ids=operand_ids,
++        kind_vocabulary=KINDS if operation is ObjectOperation.KIND else ())
++    # The helper body goes through the public source entry. The caller below
++    # is an SSA API test, NOT proof that source-level implicit object dispatch
++    # or nested-record context forwarding through a source caller is solved.
++    bindings = {v.id: v for v in helper.args}
++    helper_output = next(i.args[0] for b in helper.blocks.values() for i in b.instrs if i.op == 'Ret')
++    result = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), helper_output.dtype, helper_output.shape)
++    lowered = object_call(module, helper.name,
++        SSAOpaqueObject(bindings[reference_id], 'metadata.Book.objects'),
++        context={key: bindings[key] for key in context_ids},
++        operands={key: bindings[key] for key in operand_ids}, result=result)
++    root = Function('object_operation_caller', list(helper.args),
++        {'entry': BasicBlock('entry', [lowered, Instr('Ret', [result], None)])},
++        metadata={'parameter_names': helper.metadata.get('parameter_names', ()),
++                  'storage_formals': tuple({'value_id': key, 'kind': 'native-object-context'}
++                                           for key in context_ids)})
++    module.functions[root.name] = root
++    return module, root, helper, lowered
++
++
++def test_read_only_member_table_cannot_be_mutated():
++    with pytest.raises(ValueError, match='read-only'):
++        compile_helper(ObjectOperation.SET, mutable_members=False)
++
++
++@pytest.mark.parametrize('accepted', [('builtins.dict',), ('builtins.dict', 'builtins.list')])
++def test_native_kind_membership_uses_the_owner_vocabulary(accepted, tmp_path):
++    module, root, helper, call = compile_helper(ObjectOperation.KIND)
++    receipt = helper.metadata['opaque_object_helper']
++    bindings = dict(zip(call.attributes['callee_input_ids'], call.args))
++    result = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), 'bool')
++    root.blocks['entry'].instrs = [*object_kind_matches(module, helper.name,
++        SSAOpaqueObject(bindings[receipt['reference_formal_id']], receipt['storage_identity']),
++        context={key: bindings[key] for key in receipt['context_formal_ids']},
++        accepted=accepted, kind_result=call.res, result=result), Instr('Ret', [result], None)]
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    artifact = emit_ssa_function_to_llvm(module, root.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'kind_match')
++    facts = {'objects.length': [3], 'objects.keys': [2**60+3, 17, 29],
++             'objects.values': [0, 1, 2], 'objects[].kind.column': [1, 2, 6]}
++    buffers = {v.id: np.array(facts[v.accounting['program_abi_field']], dtype=np.int64)
++               for v in root.args if v.accounting.get('program_abi_field') in facts}
++    handle_id = dict(root.metadata['parameter_names'])['handle']
++    for handle, kind in [(2**60+3, 'builtins.dict'), (17, 'builtins.list'), (29, 'builtins.object')]:
++        buffers[handle_id] = np.array([handle], dtype=np.int64)
++        assert prepare_artifact_execution(native, buffers).run().buffers[result.id].item() is (kind in accepted)
++
++
++def test_backend_text_emission_keeps_checked_native_calls():
++    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
++    from src.compiler.ssa_fortran_backend import emit_module
++    for operation in (ObjectOperation.KIND, ObjectOperation.LENGTH, ObjectOperation.GET, ObjectOperation.SET):
++        module, root, helper, call = compile_helper(operation)
++        c = emit_ssa_module_to_c(module, root.name)
++        assert c.complete, c.shortfalls
++        fortran = emit_module(module, outputs={root.name: (call.res,)}, progress=lambda _: None)
++        assert fortran.complete, fortran.shortfalls
++
++
++def test_changed_callee_body_and_context_identities_invalidate_calls():
++    module, root, helper, call = compile_helper(ObjectOperation.KIND)
++    call.args[0] = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), call.args[0].dtype, call.args[0].shape)
++    with pytest.raises(ValueError, match='stale context/reference'):
++        validate_object_operations(module)
++    assert 'opaque-object-contract' in concordance_report(module)
++
++
++def test_native_result_identity_and_record_sequence_claim_are_audited():
++    module, root, helper, call = compile_helper(ObjectOperation.GET)
++    call.attributes['native_result_contract'] = ()
++    with pytest.raises(ValueError, match='stale native result'):
++        validate_object_operations(module)
++    assert 'opaque-object-contract' in concordance_report(module)
++    # A record field cannot keep naming a retired table descriptor.
++    records = module.record_tables[helper.name]
++    sequence_id = next(field.sequence_id for record in records.records.values()
++                       for field in record.fields if field.sequence_id is not None)
++    module.sequence_tables[helper.name].sequences.pop(sequence_id)
++    assert 'record-sequence-unknown' in concordance_report(module)
++
++
++def test_source_caller_nested_object_member_context_remains_an_explicit_gap():
++    # Retain the actual failing source composition, rather than presenting
++    # the SSA caller test as an automatic front-end binding success.
++    source = ('def inspect(book,handle):\n    identity=id(handle)\n'
++              '    return len(book.objects[identity].members)\n'
++              'def root(book,handle):\n    return inspect(book,handle)\n')
++    with pytest.raises(ValueError, match='metadata.Object.members.*has no such field'):
++        lower_ast_source_to_ssa(source, 'root', name='object_context_gap',
++            extraction_contract=policy(), runtime_closure_only=True,
++            progress=lambda _: None, progress_bars=False)
++
++
++@pytest.mark.parametrize('operation', [ObjectOperation.KIND, ObjectOperation.LENGTH,
++                                       ObjectOperation.GET, ObjectOperation.SET])
++def test_native_object_helpers_over_existing_descriptor_domain(operation, tmp_path):
++    module, root, helper, call = compile_helper(operation)
++    validate_object_operations(module)
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    artifact = emit_ssa_function_to_llvm(module, root.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / operation.value)
++    facts = {
++        'objects.length': np.array([3], dtype=np.int64),
++        'objects.keys': np.array([2**60+3, 17, 29], dtype=np.int64),
++        'objects.values': np.array([0, 1, 2], dtype=np.int64),
++        'objects[].kind.column': np.array([1, 2, 6], dtype=np.int64),
++        'objects[].members.lengths': np.array([2, 0, 1], dtype=np.int64),
++        'objects[].members.row_stride': np.array([2], dtype=np.int64),
++        'objects[].members.columns.key': np.array([7, 11, 0, 0, 13, 0], dtype=np.int64),
++        'objects[].members.columns.value': np.array([2**60+19, 23, 0, 0, 31, 0], dtype=np.int64),
++    }
++    buffers = {v.id: facts[v.accounting['program_abi_field']] for v in root.args
++               if v.accounting.get('program_abi_field') in facts}
++    parameters = dict(root.metadata['parameter_names'])
++    output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    cases = [(2**60+3, 0, 1, 2, 2**60+19), (29, 0, 6, 1, 31)]
++    if operation in {ObjectOperation.KIND, ObjectOperation.LENGTH}:
++        cases.append((17, 0, 2, 0, None))
++    for handle, index, kind, length, member in cases:
++        replacement = 2**60+43
++        for name, value in [('handle', handle), ('index', index), ('value', replacement)]:
++            if parameters.get(name) in {v.id for v in root.args}:
++                buffers[parameters[name]] = np.array([value], dtype=np.int64)
++        execution = prepare_artifact_execution(native, buffers).run()
++        expected = {ObjectOperation.KIND: kind, ObjectOperation.LENGTH: length,
++                    ObjectOperation.GET: member, ObjectOperation.SET: True}[operation]
++        assert execution.buffers[output].item() == expected
++        if operation is ObjectOperation.SET:
++            row = 0 if handle == 2**60+3 else 2
++            assert facts['objects[].members.columns.value'][row*2+index] == replacement
++    assert all(i.op != 'PtrCast' for b in root.blocks.values() for i in b.instrs)
++
++
++def test_wrong_context_domain_and_stale_helper_are_refused_and_audited():
++    module, root, helper, call = compile_helper(ObjectOperation.KIND)
++    call.attributes['opaque_object_operation'] = {**call.attributes['opaque_object_operation'],
++                                                  'storage_identity': 'different.owner'}
++    with pytest.raises(ValueError, match='matching live helper'):
++        emit_ssa_function_to_llvm(module, root.name)
++    assert 'opaque-object-contract' in concordance_report(module)
++    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
++    from src.compiler.ssa_fortran_backend import emit_module
++    for emit in [lambda: emit_ssa_module_to_c(module, root.name),
++                 lambda: emit_module(module, progress=lambda _: None)]:
++        with pytest.raises(ValueError, match='matching live helper'):
++            emit()
++
++
++def test_object_identity_is_not_dereference_or_a_payload_type_guess():
++    reference = SSAValue(7, 'opaque_ref')
++    object_ = SSAOpaqueObject(reference, 'owner')
++    assert object_identity(object_, SSAValue(8, 'int64')).op == 'Cast'
++    assert object_same(object_, object_, SSAValue(9, 'bool')).op == 'Eq'
++    with pytest.raises(ValueError, match='scalar opaque_ref'):
++        SSAOpaqueObject(SSAValue(7, 'ptr'), 'owner')
++    with pytest.raises(ValueError, match='same admitted'):
++        object_same(object_, SSAOpaqueObject(reference, 'other'), SSAValue(9, 'bool'))
++
++
++@pytest.mark.parametrize('operation', ['identity', 'same'])
++def test_native_identity_preserves_reference_bits(operation, tmp_path):
++    left, right = SSAValue(0, 'opaque_ref'), SSAValue(1, 'opaque_ref')
++    result = SSAValue(2, 'int64' if operation == 'identity' else 'bool')
++    first, second = SSAOpaqueObject(left, 'owner'), SSAOpaqueObject(right, 'owner')
++    instruction = (object_identity(first, result) if operation == 'identity'
++                   else object_same(first, second, result))
++    root = Function('identity', [left, right], {'entry': BasicBlock('entry', [
++        instruction, Instr('Ret', [result], None)])})
++    artifact = emit_ssa_function_to_llvm(IRModule(functions={root.name: root}), root.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / operation)
++    for other in (2**60+3, 2**60+5):
++        execution = prepare_artifact_execution(native, {
++            0: np.array([2**60+3], dtype=np.int64),
++            1: np.array([other], dtype=np.int64),
++        }).run()
++        assert execution.buffers[result.id].item() == (
++            2**60+3 if operation == 'identity' else other == 2**60+3)
++
++
++def test_helper_roles_and_result_layout_are_not_guessed():
++    handle, wrong_result = SSAValue(0, 'opaque_ref'), SSAValue(1, 'float64')
++    helper = Function('bad_kind', [handle], {'entry': BasicBlock('entry', [
++        Instr('Const', [], wrong_result, attributes={'value': 1.0}),
++        Instr('Ret', [wrong_result], None)])})
++    module = IRModule(functions={helper.name: helper})
++    with pytest.raises(ValueError, match='cover each exact formal once'):
++        declare_object_helper(module, helper.name, ObjectOperation.KIND,
++            storage_identity='owner', reference_formal_id=handle.id,
++            context_formal_ids=(handle.id,))
++    with pytest.raises(ValueError, match='requires result'):
++        declare_object_helper(module, helper.name, ObjectOperation.KIND,
++            storage_identity='owner', reference_formal_id=handle.id)
++
++
++@pytest.mark.parametrize('expression, accepted, expected', [
++    ('{}', 'dict', True), ('{}', 'list', False), ('{}', 'object', True),
++    ('[]', '(dict,list)', True), ('set()', 'dict', False),
++])
++def test_known_constructor_kind_is_not_lost_with_unfoldable_payload(expression, accepted, expected, tmp_path):
++    # No reference domain is needed when the constructor already proves kind.
++    source = f'def root():\n    value={expression}\n    return isinstance(value,{accepted})\n'
++    module, _, exports = lower_ast_source_to_ssa(source, 'root', name='known_object_kind',
++        extraction_contract=policy(), runtime_closure_only=True,
++        progress=lambda _: None, progress_bars=False)
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'kind')
++    root = module.functions[exports[0]]
++    output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    assert prepare_artifact_execution(native, {}).run().buffers[output].item() is expected

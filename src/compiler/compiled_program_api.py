@@ -163,6 +163,8 @@ def describe_fortran_function(
     dynamic_array_dimensions: Mapping[int, Sequence[str]] | None = None,
     array_argument_ids: Iterable[int] = (),
     reference_argument_ids: Iterable[int] = (),
+    value_dtypes: Mapping[int, str] | None = None,
+    value_shapes: Mapping[int, Sequence[int]] | None = None,
 ) -> EntryPoint:
     """Describe one emitted Fortran subroutine's calling contract.
 
@@ -172,6 +174,14 @@ def describe_fortran_function(
     """
 
     parameters: list[Parameter] = []
+    # The emitter's resolved declaration is the ABI authority. Raw SSA
+    # occurrences may be rankless placeholders for compiler-owned arrays.
+    from dataclasses import replace
+    def declared(value):
+        return replace(value,
+            dtype=(value_dtypes or {}).get(int(value.id), value.dtype),
+            shape=tuple((value_shapes or {}).get(int(value.id), value.shape)))
+    outputs = tuple(declared(value) for value in outputs)
     source_names = dict(source_names or {})
     source_transforms = dict(source_transforms or {})
     dynamic_array_extents = {
@@ -198,7 +208,8 @@ def describe_fortran_function(
             )
         )
     output_ids = {value.id for value in outputs}
-    for value in function.args:
+    for occurrence in function.args:
+        value = declared(occurrence)
         c_type, ctypes_name = _c_type_for(value.dtype)
         dynamic_extent = dynamic_array_extents.get(int(value.id))
         array = (
@@ -221,7 +232,8 @@ def describe_fortran_function(
                 or accounting.get("compiler_frame_storage") is not None
             )
         )
-        dimensions = dynamic_array_dimensions.get(int(value.id), ())
+        dimensions = dynamic_array_dimensions.get(int(value.id), ()) or tuple(
+            f"extent_{int(size)}" for size in value.shape)
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
@@ -267,7 +279,8 @@ def describe_fortran_function(
         if value.id in {argument.id for argument in function.args}:
             continue
         c_type, ctypes_name = _c_type_for(value.dtype)
-        dimensions = dynamic_array_dimensions.get(int(value.id), ())
+        dimensions = dynamic_array_dimensions.get(int(value.id), ()) or tuple(
+            f"extent_{int(size)}" for size in value.shape)
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
@@ -282,7 +295,8 @@ def describe_fortran_function(
                     if len(dimensions) == 1
                     else (
                         str(extent_names[-1])
-                        if extent_names and not dimensions
+                        if (value.shape or int(value.id) in array_argument_ids)
+                        and extent_names and not dimensions
                         else None
                     )
                 ),

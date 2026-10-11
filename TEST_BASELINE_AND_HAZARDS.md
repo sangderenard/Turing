@@ -1,5 +1,2865 @@
 # Test baseline and hazards — read before running any test
 
+FINAL VERIFICATION (2026-10-11): combined affected+telemetry gate653 passed
+361.18s, zero failures/skips/exclusions; final profiling-only gate60 passed
+3.77s (includes two tests added after combined collection). Third-party cffi
+imp deprecation warning remains unsuppressed. Native storage-effects unit
+refreshed/load-only verified: dcf60218adf76c0b6f38b40d6682c3f7,1690 rows,
+188 functions,0 structural findings/0 unposted IDs;1116 unsourced FACTS OPEN.
+32 probe_job_observation.patch removes a stale hardcoded concurrent-main claim:
+null means not measured, not a claim that any main job exists or is absent.
+1973 Python/contract files compared against both copies: compiler sources,
+tests and contracts agree. Only repair probe_four_rule_timing.py differs with
+its preserved --capture-ssa exact598 diagnostics and --piece-cache option.
+No changes were dropped to force those diagnostic probes byte-identical.
+The pending combined-gate sentence below records an earlier point in this turn.
+
+2026-10-11 CANONICAL INTEGRATION / PROFILING UPDATE:
+
+Canonical compiler: C:/dev/Powershell/turing (its own main repository).
+All29 saved repair patches,30 four_rule_copier_options.patch, and31
+compiler_profile_summary.patch are installed here and in the benchmark copy
+C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing
+and its build/n4-repair/turing copy. Those copies are ignored children of a
+root-only coordination worktree, NOT Turing Git branches. Parent merging
+cannot transfer them. Existing compiler foundation edits were preserved.
+Prior claims below that live source is untouched/unapplied are historical.
+
+Before telemetry changes: live affected gate595 passed335.79s without exclusions.
+Profiler/progress/fixed-point gate60 passed3.77s. Combined gate rerun pending
+at this receipt; latest completion will be appended before handoff.
+Seven live concordance audits:0 structural findings/0 unposted minted IDs;
+unsourced fact latch remains OPEN392/759/272/642/533/20/230.
+
+Public lower_ast_source_to_ssa now retains module.metadata['compile_profile']
+by default even headless; compile_profile=False disables headless collection.
+The TTY display has scrolling logs, persistent stage wall/RSS table and work
+counters below. Stage order is not a percent, fixed-point safety limits are
+not work totals, and iterator counters advance after processing. Known totals
+show completed work fractions; unknown totals have counts, no invented ETA.
+Timings are source-to-SSA only, NOT emission/build. Partitioned compilation
+keeps its existing manifest unit timings. Planner aggregates retain existing
+phase durations and slowest function context without per-dispatch graph copies.
+Use src.compiler.shell_telemetry.compile_profile_dataframe(module) afterwards;
+TelemetryChannel.profile_dataframe() and DeploymentProfiler.summary_dataframe()
+are lazy pandas views. Nested/inclusive timing rows are not additive walltime.
+No new dependencies, no tracemalloc, no agent N4/main run, no killed processes.
+
+Recovery: build/integration_recovery_20261011_29/manifest.json and original
+affected files; combined29 applicability artifact build/compiler_integration_all.patch.
+Remaining: user fresh N4 LLVM run; no whole-main speedup/parallel residency
+claim, and the OPEN provenance writers remain work. Native whole copier is
+optional; the original Python copier and faster serial route remain available.
+
+
+2026-10-11 NEGATIVE-MARK FOLLOW-UP / MERGE READINESS:
+
+Current verified repair set supersedes the process/test status in older receipts.
+Repair copy: benchmark worktree build/n4-repair/turing. Combined regression gate
+595 passed in 325.72s, zero failures/skips/exclusions. Includes all precompile,
+dispatcher, compilation-unit, loop-composer, shell-reference and reducer tests,
+native records/collections/copier contracts and C/LLVM/Fortran torture cases.
+The Fortran shell file's whole-object conditional regression is included; this
+is not a claim that every test in that file or the entire repository was run.
+
+After installation into the ACTUAL benchmark copy, focused verification:
+352 passed in 127.52s, zero failures/skips; all newly fixed native cases included.
+21 installed files match repair source after normalizing line endings/terminal
+whitespace. Patch28 negative_contract_followup.patch applies cleanly before
+installation and reverse-checks afterwards. Patch29 rule_probe_cli.patch
+reverse-checks the already installed N/all CLI. Prior27 remain installed.
+Live C:/dev/Powershell/turing compiler source was NOT edited by this repair.
+
+Obsolete assertions/fixtures were modernized, not used to excuse failures:
+scoped synthetic graphs get existing ingestion/value declarations; independent
+programs get separate identity books; output assertions use current exact
+identity/storage contracts; deprecated precompile-only checks become public
+whole-program lowering; mutation bootstrap checks actual authored occurrences.
+All four formerly excluded dispatcher tests now pass. Full precompile/
+dispatcher gate is139 green; the eight loop-composer negatives and adjacent
+reference/reducer negatives have all been resolved in the combined gate.
+
+Observed production faults fixed at their writers:
+* Carried initial resolution followed its own future loop output alias.
+* ParallelDeployment field traversal treated ControlBlock lanes as .body owners.
+* AugAssign's Store-context target was omitted from implicit-read discovery:
+  flags was minted inside an arm and discarded. Entry snapshots now include it.
+* Unary-plus retirement dropped the return expression's already-posted identity.
+* Static selected aggregate members were classified dynamic despite literal ids.
+* Generator extend forgot its exact LoopIterationOutput materializer route.
+* Deferred recursive child construction consulted an empty function catalogue.
+* Lexically separate Visitor classes were keyed by bare class name.
+* Unknown loop-exit field VALUE discarded known effect ordering; exact recorded
+  body writes/nested exits now join the construct before its later field read.
+* Unrolled tuple materialization elements were mistaken for constructor args;
+  empty materializations counted their seed as an element.
+* Alias folding deduplicated ordered binding versions and selected another arm
+  as the final return. Histories now retain their exact ordered versions.
+The last two faults reproduce on untouched C:/dev/tg-base: the two-element
+generator leaves len's operand18 undefined and root returns old total7 instead
+of selected result19. All four generator variants now execute exact on all
+three native backends (12 tests), including repeated calls.
+
+Audit contracts retain declared helper ABI values rather than replacing them
+with root-only values. The top-level audit uses the actual five-argument
+proposal API and an authored compiled distribution callable. Exact address/
+cast/projection writers use the incumbent Novel/mint_ssa_value posts.
+All seven concordance cases: zero structural findings, zero unposted minted
+identities. Rows/functions: view493/24; top780/45; energy488/22; controller520/27;
+untyped520/27; mapping27/2; oscillator334/22. UNSOURCED FACT LATCH REMAINS OPEN:
+392/759/272/642/533/20/230 facts respectively. These are outstanding provenance
+writer migrations, not eliminated or renamed as passing tests. The only pytest
+warning is third-party cffi's deprecated imp import; it was not suppressed.
+
+Patch27 already installed before this follow-up: scalar Phi physical types,
+integer loop seeds/induction casts, Fortran API shape/extent handling, native
+tuple truth and per-procedure IEEE imports. Actual Fortran steady numeric/row
+micro .577us vs122.4us before the IEEE import correction; NOT a four-law speed
+claim. The user's5m28s/6.11GB LLVM Phi failure is not a successful artifact.
+No new N4/full-main was launched by the agent. Complete N4 parity/timing and
+main source/SSA parallelism/residency tiling remain unverified/unfinished.
+
+Existing sanctioned storage-effects builder refreshed the benchmark asset:
+products/f8aec357b935ef27baf0ffc3ac7b1840/compiler_storage_effects__read_only_storage_effects.dll.
+Load-only validation succeeded. Its own source audit1690rows/188functions,
+zero findings/unposted ids;1116 unsourced facts/latch OPEN. No stale-fingerprint
+bypass, whole-copier replacement, packages or other Python compiler.
+
+Git integration detail verified: live turing is its own repo on main, with
+existing dirty work preserved. The benchmark turing directory is an UNTRACKED
+COPY beneath the parent coordination worktree (detached HEAD); Git reports
+the parent Powershell root, NOT a compiler branch. A parent-worktree merge
+will not transfer this compiler. Integrate the preserved ordered patches into
+turing's own repository; do not force-add the ignored child to the parent.
+No merge/commit/stash/reset was performed. Tested repairs are ready for that
+integration, not proof of a completely green historical repository manifest.
+
+2026-10-11 PYTHONIC CONTROL TORTURE — VERIFIED REPAIRS IN BENCHMARK WORKTREE:
+
+Latest state supersedes the historical active-process/"no changes yet" receipts
+below. No main or N4 is running. User requested a small program that breaks the
+compiler, followed by iteration. Seven ordinary authored programs all FAIL on
+untouched C:/dev/tg-base (7 failed/24.38s), by wrong native results or an unnamed
+index-read formal. The repaired corpus passes both OUR C and LLVM backends:
+14 tests/58.96s, 60 native invocations, same artifacts/buffers reused. No trace,
+process deadline, interpreter fallback, package installation or alternate
+Python compiler. Inputs separate population from the surrounding guard; cases
+include empty/1/2/17 rows, nonempty literal contents, literal birth in a while,
+enumerate, nested guards, break, and starred tuple cardinality. Expected values
+are exact cardinality/effect arithmetic, not the compiler interpreter lane.
+
+Observed causal chains and fixes:
+* Patch22 newly consumed redundant while->for and while->if->for ownership
+  edges, inserting the same source loop in both scopes. In-memory removal of
+  patch22's overlay logic restores zero-loop old output. Transitive reduction
+  preserves containment reachability and gives the retained loop one owner.
+* List->literal edges survive ingestion, but ordinary resident list birth
+  supplied only zero-length initialization. Existing lexical sequence effects
+  now publish nonempty literal rows at their exact AST construction sites.
+  Joined-byte and accepted opaque-object materializers retain their routes.
+* All loop mutations were discarded as unbounded. Interval transfer over
+  existing Control IR joins branches by max, multiplies bounded-loop growth,
+  and proves single-entry while bodies from terminal edges. Unknown backedges
+  or mutated extents remain unknown. A million-trip nested-loop bound is
+  computed without unrolling. Existing capacity metadata/storage requirements
+  allocate the resulting spans; no guessed capacity or new container runtime.
+* enumerate was mistakenly counted as an escaping/mutating call, suppressing
+  the two/17-row prefix capacity. Exact builtins.enumerate identity now uses
+  the incumbent nonmutating builtin classification.
+* A scalar list's appended-element index read was excluded by the multi-column
+  row collector; the numeric plan retained only its feed. Existing row-load
+  lowering now admits column zero and restores an otherwise-unowned graph read
+  at its first consuming region, without reloading region-owned definitions.
+* LLVM root-frame capacity was uninitialized even when the arena was allocated.
+  Its wrapper now publishes the actual allocation capacity for private FIXED
+  sequences. Borrowed and dynamic pointer-cell contracts are untouched.
+* The earlier tuple-splice repair derives prefix length + row count from exact
+  graph operands through existing extent/arithmetic lowering and namespace IDs.
+
+An extra empty-list clear initially broke the existing sequence-truth prefix
+test; removed the redundant entry-birth effect, keeping the incumbent empty
+initializer. Regression was NOT excluded. Final repair-copy gate:127 passed,
+160.26s, including native collections, source contexts, control compartments,
+sequence truth/snapshot/replacement and owned-heap tests. Ordinary view/controller
+audits agree before/after:493/24/0 and522/27/1, including the SAME restore-type
+operand15 finding; unsourced latch remains OPEN. New torture tests also assert
+zero structural findings, in addition to native execution assertions.
+
+Applied verified core changes and four new test files to the ACTUAL benchmark
+worktree C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing
+after verification in build/n4-repair/turing. Live C:/dev/Powershell/turing
+compiler source remains untouched. Patch26 tools/compiler_probes/
+pythonic_control_torture.patch preserves the whole delta after existing25;
+reverse applicability in the benchmark worktree is checked. Ordered26 live
+apply-check passed before the final LLVM/test additions; repeat final check.
+Compiler fingerprints invalidate previous accelerator assets normally: refresh
+through existing sanctioned builders before another N4. No whole-N4 success,
+main speedup, memory tiling, main parallelism or general-Python support claim.
+
+2026-10-10 USER-AUTHORIZED ITERATIVE FOUR-LAW REPAIR:
+
+User explicitly requested diagnosis/iteration until4 laws work, then the full
+available law set. Subsequently ordered all Python except newest run killed.
+Verified exact process identity, stopped old main33064/7196 and native N4
+23236/14620; only newest diagnostic launcher/worker remained. Native N4 is
+USER-TERMINATED, not completed; no final copier counters or verdict. No files
+removed. Separate exact-source repair copy under snapshot
+build/n4-repair/turing protects the prior compiler snapshot and preserves25
+promotion patches. Four existing original-copier law assets reused for diagnosis.
+Initial graph-checkpoint hooks failed after100.9899s (local callback pickle)
+and77.5540s (write-only stdout pickle); these are DIAGNOSTIC TOOL failures,
+not compiler outcomes. Corrected hook prints source rows without serializing
+the whole graph, then captures final SSA without aborting compilation if a
+checkpoint fails. Current diagnostic session78998; no deadline/trace.
+No compiler implementation changed yet. Small tuple-splice controller loop
+repro exposes unnamed-formal admission failure; relation to N4 remains unproven.
+
+2026-10-10 USER-REQUESTED N4 — ORIGINAL COPIER FAILED, NATIVE STILL RUNNING:
+
+Original-copier comparator session9750 exit1 after561.4117003s (9m21.41s).
+All4 laws built by175.6213412s; combined source/SSA385.7903545s total,
+begin->SSA359.9601409s. Native storage17calls/143271facts/.6692912s including
+transfers. Native copier absent, original route explicitly verified; SAME
+snapshot compiler fixes retained. No full-system native artifact or emitted-C
+hash available: C emission refuses two extent findings on %t598 plus two
+downstream unavailable operands in step_3__step_with_dt_control_used specialized
+body. Both missing operands have an EXACT producer Call(%t598), respectively
+if_true.15 and if_merge.15, consumed by loop_header / loop_header.1. No matching
+formals; diagnostic provenance {}. These producer instructions exist, so this
+is NOT evidence those two values were dropped from SSA. Unavailable extent
+emission can leave its results unbound; causal writer chain remains unobserved.
+Do not call it a copier fault or prove historical content loss from this raise.
+
+Read-only comparison of the4 current law LLVM files: function counts Python /
+native are6/6(properties),13/13(inverse),71/71(stage0),38/38(stage1); instruction
+opcode counts agree exactly for each. Properties LLVM SHA agrees; other3 differ
+(sampled inverse diff includes differing SSA numbering/placement). Counts are
+NOT semantic parity. Both initial combined graphs18829nodes/21599edges.
+Original copier is unchanged; generic lowering fixes remain independently of
+provider selection. Earlier successful507.330979s N4 is NOT a direct successful
+timing baseline for today's failed561.4117003s. Historical dropped content is
+possible but unproven; no old-vs-current producer/consumer/concordance replay yet.
+Native law-build milestone1229.3s vs175.6s original (~7x) is observed, NOT a full
+compile speed ratio or precise boundary/kernel attribution. Native session52547
+continues; worker14620 CPU increased1703.27->1762.27s during observation, RSS
+~4556MiB at later sample. No intervention/restart/timeout/compiler edits. Final
+native counters/outcome/peak remain pending; main33064/7196 left untouched.
+
+SECOND comparator explicitly authorized and launched22:28:25 America/Chicago:
+python -u tools/compiler_probes/probe_four_rule_timing.py --graph-workers 1 --fresh-pieces
+Parent11844/worker32076, session9750; SAME current snapshot compiler/fixes and
+storage unit d5d7dc1bdd73dace2db368d4e04801f6, original Python copier confirmed.
+Output build/profile_memory_n4_native_storage_tixr18_u/profile_memory_n2;
+independent empty law_cache forces all4 builds and avoids cross-run cache writes.
+Both N4s and earlier main initially left running; no trace/deadline/intervention. Concurrent
+wall times are not isolated estimates. All4 original-copier laws built by+175.6s;
+combined source graph18829nodes/21599edges, SSA starts+412.3s. Native laws complete
++1229.3s; same combined graph18829/21599 observed, still deployment specialization
+at+1554.1s. Native final time/artifacts/retention comparison remain PENDING;
+original terminal outcome is recorded above.
+
+User requested afterwards: reason about previously dropped content now retained,
+and consider original copier with native-enabling compiler fixes kept. Do not
+discard those fixes, silently disable native route, or claim content parity from
+matching initial graph counts alone. User asked observation only while runs proceed.
+
+Initial explicit user request: "so can we do a 4 rule test". Launched snapshot
+python -u tools/compiler_probes/probe_four_rule_timing.py --graph-workers 1 --native-copier
+at22:09:37 America/Chicago. Parent23236/worker14620, execution session52547.
+NODUS_TENSOR_CORE=live nodus build/Release/nodus_tensor_core.dll;
+TURING_PROBE_EXTERNAL_ROOT=C:/dev/Powershell/turing. Existing main33064/7196
+untouched. No trace, deadline, orbital target execution or live-source edits.
+Serial source route/one graph worker/eight resident regions, matching prior N4.
+Native storage unit refreshed through OUR compiler BEFORE timed submission:
+d5d7dc1bdd73dace2db368d4e04801f6. Copier LOAD ONLY0ac1ded2afe6cb7887bf3b2eb1fb44b2.
+Fresh output build/profile_memory_n4_native_storage_l7gvdp8m/profile_memory_n2.
+Probe counts real native batches separately from pre-execution subclass fallback
+roots/batches, with boundary-inclusive copier time; no per-item native tracing.
+
+First law rebuilt; first batch1847roots native1/fallback0 in1.6493831s. Native
+storage first pass594facts/.0014769s. Inverse law reached source catalogue
+function extraction at~44s. It ended+353.2s:7406nodes/8894edges,308.985s for
+extract-function-subgraph. At+431.1s inverse graph1494nodes/2936edges published
+6of8 regions, one-worker residency6/limit8. NOT a completed N4, final timings,
+native batch totals or peak-memory result. This is large-source evidence of
+substantial extraction cost; precise copier attribution awaits final counters.
+
+
+2026-10-10 WHOLE original metadata copier executes natively — SNAPSHOT ONLY:
+
+Patch25 tools/compiler_probes/native_whole_metadata_copy.patch UNAPPLIED after24.
+Ordered concatenated25 git apply --check0 against live dirty checkout. This is
+applicability, NOT promotion. Live compiler/source untouched. Existing main
+33064/7196 (Oct9 18:25:20 local launch) untouched; no main/N4 launched, timeout,
+kill, package installation or alternative Python compiler this turn.
+
+The exact50 authored lines of isolate_metadata are taken from production AST,
+wrapped once as metadata_copy_program(value, metadata_memo), submitted through
+lower_ast_source_to_ssa under existing full-native/no-callback contract. Entire
+source lowers/emits complete LLVM (2.722457s preliminary emission probe). Native
+execution proves dict/list/tuple/set/frozenset, leaves, shared containers, self
+cycle and tuple/list cycle. One outer invocation; recursion, memo, iteration,
+construction, updates and identity reduction native. Original copier unchanged.
+
+Observed losing writers and connected fixes:
+* Self PlanCall has exact result bindings but no child activation shell. ABI
+  settlement skipped it; it now consumes the existing recursive_scc_backedge
+  receipt for the SAME function and graph, not an invented clone/signature.
+* Returning Dict3 born atline4 was placed before line5 update. Actual return
+  construct cell/span join, not returned container birth, owns the return edge.
+* Spanless sibling comprehension signatures collided; source nesting now uses
+  exact AST identity, restricting signature fallback to located nodes.
+* memo.get lost valid node0 through operand-or-value truthiness; exact key lookup
+  retains0. Shared storage contract and private recursive guard remain intact.
+* Existing lexical stores40/85/92 replaced their source numerical work, but
+  scheduled markers3/5/7 survived as undefined region calls. Only regions whose
+  complete deployment node sets are installed effects retire; mixed regions stay.
+* Overlay emitted list/tuple/set/frozen controls BEFORE memo guard38. Guard was
+  present atroot[4], not missing. Shared list handle3 copied to8 then11. Source
+  SOURCE_SPAN rows prove guard/body ordinal2, dict3, list4, tuple5, set6, frozen7.
+  Conditional-only sibling runs now consume those exact concordance-owned AST
+  paths/ordinals; no coordinates/name proxy, no crossing producer/loop/effect.
+* Recovered contains37 consumed Cast36. Recovery ignored other recovered uses,
+  then reused a stale instruction offset after removing Cast36, moving it after
+  contains. Real consumer instruction identity now anchors the dependency move.
+
+Connected operations reuse existing context/sequence storage and accepted
+native_object_source facts. List extend, set update, frozenset materialization
+are native helpers. Exact all(new is old for zip(...)) uses a scalar intrinsic
+identity reduction, not a Boolean collection arena/general Python generator.
+The existing4097-row bulk materializer test caught an unwanted member-set
+dependency introduced during this batch; separate accepted frozen helper fixed
+it without weakening the original bulk-copy guard. No new SSA opcode, object
+registry, Python callback or generic Python runtime introduced.
+
+Reusable deployment uses existing compiler accelerator registry and checkpoint
+store. compile_and_register_metadata_copy_accelerator builds through OUR entry;
+load_metadata_copy_accelerator never lowers/emits/builds. Fingerprint/platform,
+source identity and BOTH library digests checked. Missing/stale assets stay
+serial; matching corrupt assets refuse. Explicit load/register activates native
+extraction; no automatic compile on import. Graph AND node metadata share one
+native batch and memo. Memo capacity bounded by imported identity count; context
+births/growth use incumbent owner/release. Builtin subclasses take original
+serial copier BEFORE native execution; execution faults never silently retry.
+Boundary ABI checkpoint is not a duplicate ProcessGraph/provenance registry.
+Matching asset: build/compiler_foundations/metadata_copy/products/
+0ac1ded2afe6cb7887bf3b2eb1fb44b2/copier/metadata_copy_program__metadata_copy_program.dll.
+
+FINAL gate after all source changes:132pass/4 same known stale exclusions in
+125.67s; no new failure. Final fresh-process LOAD ONLY provider active during
+whole-copier compilation/execution AND original clean-extraction/compartment
+tests:12pass/30 unrelated deselected6.63s. Guestbook dry-run exit0, no --apply.
+
+Gates:67pass71.76s before deployment;78pass/4 known stale dispatcher exclusions
+66.40s before final source-path refinement. Final connected15pass18.73s after
+source-path refinement. Native loaded real-extraction4pass0.68s and whole-copier
+8pass5.92s in fresh process before final source-path refinement. Installation
+test forbids lowering/emission/build during reload, forbids Python item fallback
+on real cyclic graph+node batch, checks subclass admission and corrupted digest.
+Seven ordinary audit structural counts unchanged493/24/0;360/36/1;488/22/0;
+522/27/1;525/27/5;24/2/0;331/22/0, rerun after final source-path refinement.
+Full copier structural audit0; provenance unsourced latch remains OPEN. Context
+release helper emission reports no attached book, an existing helper limitation,
+not closed provenance. Wider gate first hit documented stale scalar comparison
+test (30pass/1fail19.15s); excluded same4 previously baselined fixture defects.
+
+PERFORMANCE IS NOT WON. Whole-section medians including import/export/release:
+solo64rows Python .111400ms / native2.740800ms (24.60x slower); prior concurrent
+64rows .147000/3.546200ms. After final refinement under concurrent gates:
+1/4/16/64 rows .007100/.012000/.040500/.152000ms Python versus
+.413500/.539600/1.131100/3.410100ms native. Build4.739261s; prior matching
+load-only .137912s. Five samples per mode/size, identical original source and
+alias assertions. NOT N4/end-to-end speedup. Cold single-call profile at64rows
+24,776calls/12ms includes6ms export plus import costs; not warm causal timing.
+Native member get/set/memo remain linear scans, potentially quadratic. Native
+temporaries still survive until context release and exporter reifies them all.
+NEXT: warm separate boundary/kernel/export measurements; use existing graph
+identity/observability contracts to eliminate unnecessary rehydration and resident
+lookup work, not another dynamic Python runtime. Main parallelism and whole-source
+memory tiling still unfinished. All earlier options/investments preserved.
+
+Repros (snapshot, NODUS_TENSOR_CORE points at live nodus Release DLL):
+python -u tools/compiler_probes/probe_native_metadata_copy.py --object-context
+python -u tools/compiler_probes/probe_metadata_copy_timing.py
+python -u -m pytest tests/test_copier_connected_contract.py -q --tb=short --show-capture=no -x
+
+
+2026-10-10 paired generators consume concordance-owned representations — SNAPSHOT ONLY:
+
+Patch24 tools/compiler_probes/native_paired_object_concordance.patch UNAPPLIED,
+after23. Ordered24git apply --check0 on live dirty checkout; applicability is
+NOT promotion. Live compiler unchanged. No main/N4 launch, timeout, process
+kill, package, alternative Python compiler or rewrite of the production copier.
+
+Exact tiny source: def root(value): return tuple((key,item) for key,item in value.items()).
+Pre24 source-loader replay of all nine changed compiler modules refuses two
+unnamed row-column formals (source6 and minted column1),0.913166s. This is an
+actual public-source lowering refusal, not an API/import or test assertion gap.
+Observed source graph retains tuple3 leaves1/0, loop8 targets key1/item0 and
+LoopResult11 value3/control8. The object collector refused two targets and
+the dictionary-items view; lower_loop10526-10551 then invented those columns.
+Composer expanded_row_arguments kept only1/0 BEFORE object admission (no
+accepted constructor cell then). Mutation placement used source spans; the
+comprehension has no span, so tuple3's native constructor landed at entry,
+reading loop-local1/0. These exact writer/consumer chains were observed inline.
+
+The existing book now owns native_object_source representation acceptance,
+DERIVED from incumbent producer, component, receiver and loop identity cells.
+Source identity/edges are not duplicated into another registry. Publication
+preserves the original producer-to-projected-columns transition on that same
+page. Control carries Ref cells; SSA reads their latest facts before allocating,
+unpacking, publishing or updating. Emission reads the module's ATTACHED book,
+including exact planning aliases, and validates actual tuple component writes,
+position casts, pair projections and collection/update operands. Missing or
+superseded cells and copied projection changes refuse. Page lifecycle is
+LOWERING->EMISSION, explicitly classified and spillable after its last reader.
+
+Paired dictionary iteration reuses context member key/value columns and existing
+collect/get helpers. Fixed tuple producers now store their admitted reference
+components in existing context storage. Original consumer/update generator is
+finite and materialized through the incumbent collection contract. Native UPDATE
+walks that pair collection in one native call and uses incumbent native get/set;
+no Python item callback. Keys still have declared reference-identity semantics,
+NOT general Python equality/hash/custom items behavior. Existing heap owner and
+release cover all births. The recursive storage guard is unchanged.
+
+Birth loop ownership comes from exact aggregate-user/generator edges, recorded
+in the book, not coordinates. Stable topological placement uses the existing
+dependency-cone helper and exact scoped units. It also fixes linked-call case
+publication12-before-calls5/6: calls -> tuple7 -> publication. It visits relevant
+cones, not whole-graph scans per birth or a persistent graph/cache. Numeric
+tuple-row expansion retains its old route; admitted object handles remain one
+value. Position literals use explicit existing object_context_position casts;
+raw opaque Const integers had been widened and propagated into helper formals.
+
+Native tests execute (key,item), reversed pairs, nested tuple components and
+dictionary update with linked identity calls at0/1/3/64entries. Shared leaf
+identities, insertion order, imported backedges, fresh output containers, one
+outer invocation and explicit release are checked. New7 plus lifecycle1:8pass
+10.85s. Focused new/prior/lifecycle25pass31.68s before the final attached-book
+alias reader adjustment. Broad74pass73.50s before final validation strengthening;
+Final75pass77.19s after all changes, including attached-book aliases, tuple
+field/projection validation and page lifecycle. Guestbook dry-run0, no --apply.
+NODUS_TENSOR_CORE=C:/dev/Powershell/nodus/build/Release/nodus_tensor_core.dll.
+python -m pytest tests/test_native_paired_object_generators.py tests/test_native_object_contract_batch.py tests/test_native_object_collection.py tests/test_regionless_loop_ownership.py tests/test_source_object_context.py tests/test_native_memo_membership.py tests/test_identity_book_spill.py::test_every_declared_page_is_classified_and_the_table_is_consistent -q --tb=short --show-capture=no -x
+Before/after ordinary audits unchanged493/24/0;360/36/1;488/22/0;522/27/1;
+525/27/5;24/2/0;331/22/0. Existing findings exit1; provenance latch OPEN.
+Syntax10changed sources0; added patch whitespace0; ordered24check0.
+
+Production50-line copier now clears row97 and refuses Boolean collection98,
+1.808068s. Observed98=value26/control79/materializer80/iterable70. Node26 is
+new is old; node70 is zip(isolated,value); node80 is its generator expression,
+consumed by the source all predicate. NEXT: retain this as its intrinsic Boolean
+reduction through existing zip/all identity programs, not a private bool arena.
+Simpler recursive dict-copy variants still refuse private formal6 (without memo)
+or8 (with memo),dtype=None/shape()/declared_workspace=False. Losing writer there
+UNKNOWN; no native recursive paired-copy success is claimed. Do not weaken the
+guard. No whole copier artifact/execution, N4 timing/speedup, hash acceleration,
+whole-program memory tiling or main parallelism claim. Native get/set remain
+linear scans; compiling them is NOT an asymptotic improvement.
+
+2026-10-10 connected native object contract batch — SNAPSHOT ONLY:
+
+Patch23 tools/compiler_probes/native_object_contract_batch.patch UNAPPLIED,
+after patch22. All23 ordered patches pass combined git apply --check0 against
+the live dirty checkout. This is applicability only, NOT promotion. Live source
+unchanged. No main/N4 launch, deadline, process kill, package, alternate Python
+compiler or rewrite of the production copier. Existing main processes left alone.
+
+Observed ownership writers, not inferred storage guesses:
+* Full copier call14 captures mutation40; existing value_aliases proves40->memo6.
+  by_id(40) missed its descriptor. Binder now consumes settled exact_bindings
+  and incumbent caller/callee aliases for ALL members of the shared descriptor.
+  Its span/rank1 column accounting was legitimate, not corruption.
+* Tiny memo IndexedStore was hoisted before its branch-local [] constructor.
+  Existing keyed Input ABI now admits the SAME lexical mapping mutation path.
+* Composed If12 owns Loop14. Call5 has both owners; old placement chose If12,
+  outside the child Load in Loop14. Actual composed depth now selects the
+  deepest declared owner, including conditional-inside-loop and reverse order.
+* An early Function.args pruning slice dropped the root memo's unused-before-
+  expansion value column despite its program_abi_parameter owner. Later missing-
+  formal restoration stripped that owner; LLVM leased one stack i64 instead of
+  the public arena. First native recursion crashed with access violation.
+  Watched argument removal/accounting writes identify the exact chain. Pruning
+  now preserves existing ProgramABI-owned members until call expansion; native
+  tests assert every descriptor cell is a real public buffer. No storage guard
+  was weakened and no opaque reference was cast into an address.
+
+Optional builtin type evidence extends SSAObjectContext's SAME identity table
+with a third int64 column, one bit per explicitly admitted builtin guard.
+Default two-column ABI/mapping unchanged. Boundary stamps once; native births
+stamp matching evidence; source builtins.isinstance consumes existing intrinsic,
+actual static class objects and exact operand edge. Ordinary Call/And/Ne SSA
+reads this evidence natively; no per-element Python callback or separate table.
+New helper interface TYPE_MASK is not a new SSA opcode. This is NOT arbitrary
+Python metaclass/MRO behavior. Scalar bool/int guards and opaque tuple-subclass
+type guards are tested without claiming the subclass has native member rows.
+
+Payload requirements derive from incumbent IRModule.reachable_functions and
+live helper/source operations. Concordance/backend validate exact requirements
+and type predicate helper/mask/operand/context receipts. Boundary refuses
+opaque container subclasses if a reachable pocket requires member storage;
+type evidence alone never authorizes payload access. Native release clears
+the third column through the existing shared heap allocation/release contract.
+
+Final batch17pass20.66s, with recursive assertions checking exact memo keys,
+exported [] values and one outer invocation. Earlier17pass22.08s preceded those
+stronger assertions. Syntax10changed sources0; added patch whitespace0; patch's
+205-line new test exactly matches snapshot. Guestbook dry-run0, no --apply.
+Broad92pass75.09s before that test-only strengthening and final graph-receipt
+unit addition. Command:
+python -m pytest tests/test_native_object_contract_batch.py tests/test_native_memo_membership.py tests/test_native_object_collection.py tests/test_native_object_boundary.py tests/test_source_object_context.py tests/test_regionless_loop_ownership.py tests/test_linked_reference_kind_folding.py -q --tb=short --show-capture=no -x
+Focused command: python -m pytest tests/test_native_object_contract_batch.py -q --tb=short --show-capture=no -x
+NODUS_TENSOR_CORE=C:/dev/Powershell/nodus/build/Release/nodus_tensor_core.dll.
+Native recursive fixtures execute depths0/1/7/32 with BOTH isinstance(tuple)
+and len(item)>0 guards, shared caller-owned memo and no callbacks. Public-source
+pre23 source-loader replay (FCS/precompile/resident modules, old default context)
+refuses private opaque memo column at recursive call5 in0.885788s. This is an
+actual lowering refusal, not a missing API or obsolete assertion baseline.
+Before/after ordinary audit outcomes unchanged493/24/0;360/36/1;488/22/0;
+522/27/1;525/27/5;24/2/0;331/22/0. Exit1 existing findings; provenance latch OPEN.
+
+Unchanged50-line production copier STILL REFUSES call14: collection97 unknown
+scalar row,2.311162s. Its observed graph says LoopResult/collection, loop75,
+materializer76, aggregate tuple leaves14/15, iterable19. It is a paired generator
+row (dict items/update), not the now-bound memo6 column. No whole copier artifact
+or native execution, N4 speedup, asymptotic lookup, main tiling or parallelism
+claim. Next connected group: pair-row ownership/projection, paired iteration,
+mapping update and sequence extend, set/frozenset materialization, zip/all and
+optional memo.get. Keep known-type/extent and recursive allocation guards.
+Static tuple type targets in source currently lose their class-object receipt
+upstream: (int,tuple) becomes an empty structural aggregate. Type helper admits
+a real existing tuple receipt and declines empty/missing evidence; whole-source
+union guard remains OPEN, not a claimed native pass. No source-name guessing.
+
+2026-10-10 region-less loops consume declared control ownership — SNAPSHOT ONLY:
+
+Patch22 tools/compiler_probes/regionless_loop_ownership.patch UNAPPLIED.
+All22 ordered patches pass combined git apply --check0. Live compiler unchanged.
+No main/N4, timeout, process kill, package, alternative compiler or source-copier rewrite.
+
+Observed writer: _source_control_nesting_hints supplies {2:{0}} for the tiny
+visit graph: catalogue conditional2/source11 owns loop0/source13. Exact AST
+object13 is inside If11.body, not orelse. _overlay_control_or_require_subdivision
+passes that edge into overlay_scheduled_control. nested_root ignores region-less
+loops because _anchored_control admits only conditionals; the root loop list
+then emits loop13 independently. Output Loop13/If11 are siblings. Later call3
+is in If11 while member Load0 is in Loop13, inventing recursive formal0.
+
+Overlay now CONSUMES that existing declared edge for a region-less loop.
+The same graph source objects choose the exact arm/statement slot; incumbent
+dispatch deployment nodes place it among existing arm statements. Missing or
+cloned identity and a region crossing that slot refuse; no source-coordinate
+or dtype guess. Nested children cannot also be emitted at root. Zero-region
+parents retain composed children. Existing control_block_placement publication
+and concordance reused; no new ABI/schema/registry/opcode or allocation change.
+
+New9tests plus linked-reference12:21pass8.71s. Native conditional tuple generator
+with a linked identity function executes both body/orelse variants at lengths
+0/1/17/257, both predicate outcomes. One outer invocation, leaf identities
+preserved, no new object when the arm is unselected, one native birth when
+selected, explicit native release. Both source modules have zero concordance
+findings. Same public-source native test on exact pre22 sources refuses an
+unaccounted loop-target formal1 (4.29s), not a syntax/API-only baseline failure.
+Broader gate75pass70.22s (before the final two negative tests were added):
+python -m pytest tests/test_control_source.py tests/test_overlay_scope_refusal.py tests/test_regionless_loop_ownership.py tests/test_native_object_collection.py tests/test_source_object_context.py tests/test_native_memo_membership.py -q --tb=short --show-capture=no -x
+Final21case command:
+python -m pytest tests/test_regionless_loop_ownership.py tests/test_linked_reference_kind_folding.py -q --tb=short --show-capture=no -x
+NODUS_TENSOR_CORE=C:/dev/Powershell/nodus/build/Release/nodus_tensor_core.dll.
+Before/after seven ordinary audits unchanged493/24/0;360/36/1;488/22/0;522/27/1;
+525/27/5;24/2/0;331/22/0. Exit1 existing findings, provenance latch OPEN.
+Syntax5files0; added patch whitespace0; combined22apply-check0.
+
+Tiny recursive tuple repro no longer refuses private target0. It reaches the
+full-native gate and refuses undefined isinstance predicate10 instead; graph
+preservation is still NOT native recursive execution success. Full unchanged
+50-line copier lowering still REFUSES at callsite14,4.570708s; no artifact or
+speedup. Exception-frame observation identifies its current opaque formal as
+compiler_frame_sequence_id6/member1, program_abi_parameter=metadata_memo,
+sequence_arena=True, program_abi_storage=span, rank1, shape(), provenance
+exact_call_argument_sequence_member. It is a memo column, not a fresh opaque
+object. The writer losing its shared keyed binding is NOT yet observed.
+NEXT: trace that memo-column owner/binding at the writer; retain the recursive
+storage guard. Runtime isinstance admission is also unfinished; existing KIND
+helper is closed-vocabulary, not arbitrary Python MRO/metaclass behavior.
+No full copier execution, main speedup, hash indexing, memory tiling or parallelism claim.
+
+2026-10-10 linked reference facts preserve dynamic type control — SNAPSHOT ONLY:
+
+User: extend the EXISTING contract with details needed by interior native
+elements; proceed carefully, future-proof, in elegant steps toward running.
+Patch21 tools/compiler_probes/linked_reference_kind_fact.patch UNAPPLIED.
+Twenty-one ordered patches pass combined git apply --check0; live compiler
+unchanged. One source change in glsl_deployment_strategy.py plus new tests.
+No main/N4, deadline, process kill, package, alternative compiler or copier rewrite.
+
+Actual observed cause chain in an11-line public-entry recursive tuple repro:
+1. ABI fixed point admits visit.item Input1 and child Input0 as
+   storage=reference,dtype=opaque_ref,rank0,shape(). Collection17 initially
+   retains parents3(value)/13(control), materializer15, target0 and iterable1.
+2. _fold_callsite_structural_values.evaluate(Input) ignored the linked receipt
+   when parameter_value_abi was absent. Its tensor fallback RETURNED
+   _ProgramABIValueFact(python_type='opaque_ref',storage='scalar',dtype='opaque_ref').
+3. evaluate(isinstance(item,tuple)) RETURNED False against that fabricated fact.
+   Conditional pruning at22538 removed the body nodes. Instrumented parents
+   assignment caught _set_operands/remove_node deleting Collection17's value
+   edge after its control edge was removed; its parents became[].
+4. source_object_collections then returned{}; lowering used tensor extent on
+   the opaque input and mixed i32 counters with i64 backedges. This was NOT
+   merely missing batch layout: structural folding had deleted live source.
+
+Fix consumes the SAME linked reference ABI at the Input evaluator BEFORE its
+weaker tensor fallback. Existing python_type is retained when present; unknown
+dynamic type stays unknown, not the spelling of physical dtype. Existing
+_ProgramABIValueFact and positive reference/subtype rules reused. No new
+contract/schema/page/opcode; existing structural-fold concordance owns the fact.
+
+New12cases2.64s: five builtin target kinds remain runtime, exact value identity
+distinct from node key, positive declared type, generic base not negative proof,
+numeric scalar evidence unchanged, weaker tensor hint cannot override reference,
+forwarded native id executes1/17/2**60+3 with zero concordance findings, and
+recursive collection retains exact value/control edges through ABI settlement.
+The final test proves graph preservation ONLY; its existing recursive-frame
+refusal is NOT counted as native execution success. Exact pre21 replay of the
+first regression fails Constant versus Call1.63s. Broad58pass58.55s (before the
+12th graph-preservation test was added); then final new12pass. Command:
+python -m pytest tests/test_linked_reference_kind_folding.py tests/test_native_memo_membership.py tests/test_native_reference_boundary.py tests/test_native_object_collection.py tests/test_source_object_context.py -q --tb=short --show-capture=no -x
+NODUS_TENSOR_CORE=C:/dev/Powershell/nodus/build/Release/nodus_tensor_core.dll.
+Additional hierarchical gate20pass then old _sequence_concat_ops two-result
+unpack fails1.68s; exact pre21 replay SAME1.56s. No relaxation or unrelated fix.
+Before/after seven audits unchanged493/24/0;360/36/1;488/22/0;522/27/1;525/27/5;
+24/2/0;331/22/0, exit1 existing findings, provenance latch OPEN. Syntax2files,
+patch-added whitespace and ordered apply-check0.
+
+Corrected understanding of patch20's source gate: passing it was NOT proof
+the copier was semantically sound. Incorrect reference kind folding had
+removed live container branches. Preserving them reveals earlier blockers.
+Final exact50-line copier probe1.876627s refuses recursive invocation storage
+at callsite14 for opaque private formal2305843010213694858, declared_workspace=True.
+This is a lowering REFUSAL, not a compile or performance result.
+Tiny tuple repro refuses private target0. Observed Loop13 and owning If11 are
+SIBLINGS in composed control; call3 is placed in If11 while Load0 is in Loop13.
+A trial deepest-call-owner change did not repair that source control ownership
+and was fully removed (fortran_c_shell normalized content equals pre21).
+Also observed forwarded runtime isinstance conditional has no source producer;
+existing object_kind_matches is explicitly closed-vocabulary membership, NOT
+arbitrary Python MRO/metaclass semantics. Do not silently equate the two.
+
+NEXT: repair loop/conditional ownership at the existing composition writer using
+the source/control graph records, then connect admissible runtime type predicates
+to the existing object contract and helpers. Keep recursive-frame refusal intact;
+do not allocate opaque scratch or cast handles to pointers. No main speedup,
+hash indexing, bounded object batches, whole-RAM tiling or parallelism claim.
+
+2026-10-10 integer memo membership/capture — SNAPSHOT ONLY:
+
+User: "This the in operator we're needing? Should we make a hash cache find/sort
+in the best algorithms"; then "Proceed".
+
+Patch20 tools/compiler_probes/native_memo_membership.patch UNAPPLIED. Twenty
+ordered patches pass combined git apply --check0; live source unchanged.
+Implementation remains native-fallback-link/Powershell/turing. No main/N4,
+process kill, timeout, package, alternative Python compiler or rewritten copier.
+
+Observed exact tiny failures, fixed at their writers:
+1. key in memo rejected membership-field because structural recovery required
+   GetAttr/base/record despite the parameter's existing sequence descriptor.
+   It now consumes that exact descriptor. Earlier control pruning had removed
+   its two column arguments; recovery restores the SAME admitted parameter
+   arenas, not anonymous storage. Late scalar uses update the incumbent
+   declared_parameter/function_parameter pages (shared with id(value)).
+2. contains used int32 induction with int64 length; its bool Phi received
+   int32 true/false. Native LLVM emission now uses int64 counters and bool
+   constants. The tiny native test actually executes hits/misses, empty,
+   deleted-row flags, zero, negative and 2**60+3 keys.
+3. The EXISTING call-edge ABI fixed point carried storage=keyed to captured
+   memo Input6, but omitted mutability/key encoding/owner, and row declaration
+   read only top-level receipts. Those exact contracts now propagate; row
+   declarations consume linked INPUT identities and refuse conflicting
+   declared/linked layouts. Complete descriptor members retain the same caller
+   ownership, including columns/length/capacity/status/live flags. No parallel
+   registry or integer-to-object-reference key substitution.
+4. Existing builtins.id contract explicitly means stable identity-table handle,
+   never a CPython address. --object-context copier probe now declares the
+   incumbent integer-key/opaque-value memo ABI. Default probe remains unchanged.
+   This is a lowering boundary declaration, NOT Python memo import/export.
+5. New structural_membership_parameter receipts name exact graph target/query
+   and descriptor. Concordance validates helper, arity and ordered operands;
+   corrupt storage/query/target tests diagnose membership-parameter-contract.
+
+Final47pass52.38s, one existing cffi warning:
+python -m pytest tests/test_native_memo_membership.py tests/test_native_reference_boundary.py tests/test_native_object_collection.py tests/test_source_object_context.py -q --tb=short --show-capture=no -x
+New test file has10 cases (five source/native modes, two exact-contract cases,
+three corrupt receipts). Earlier13pass7.73s; broader gate61pass49.20s then
+test_keyed_tensor_lookup_feeds_tensor_property_region_as_span StopIteration.
+Exact pre20 source-loader replay reproduces SAME failure2.76s; not waived/fixed.
+Seven ordinary audits unchanged493/24/0;360/36/1;488/22/0;522/27/1;525/27/5;
+24/2/0;331/22/0. Audit exit1 for existing findings, provenance latch OPEN.
+Syntax6files/added-whitespace0; combined patch apply-check0; guestbook dry-run0
+(no --apply cleanup or archive moves).
+Use NODUS_TENSOR_CORE=C:/dev/Powershell/nodus/build/Release/nodus_tensor_core.dll.
+
+Exact unchanged50-line copier now CLEARS full-native source gate: no undefined
+predicate37, unmaterialized values, unresolved calls or unaccounted formals.
+Final normal lowering+LLVM attempt2.154057s. LLVM_COMPLETE=False: five loop
+Phi i32/i64 disagreements (loops58/63/67/71/75) and four unhandled extent Calls.
+Observed body still issues GetElementPtr/extent against opaque iterable handles
+11/56; another extent input is projected dictionary-items19. Its collection
+receipt is empty. These must be admitted through existing graph-owned object
+iteration/collection contracts, not retagged as tensors or cast to pointers.
+Entire copier has NOT executed natively. This duration is not a native timing.
+
+Hash/direct indexing and a shared find(found,row) are NOT implemented. Current
+contains/lookup/store remain linear; repeated growing-memo probes can remain
+quadratic. No compiler speedup, general Python dict equality/hash, main
+parallelism or whole-memory tiling claim. NEXT: tiny exact captured-object
+iteration repro, observe loss of existing collection ownership, then close
+those producer contracts; integer memo row indexing still needs growth and
+mutation-validity contracts, not an answer cache or sort on every lookup.
+
+2026-10-10 native graph-owned generator collections — SNAPSHOT ONLY:
+
+User: "Is this the need to make a native generator for irreduceable generators"
+User: "Let's proceed to fix it"
+
+Patch19 tools/compiler_probes/native_object_collection.patch UNAPPLIED. All
+nineteen ordered patches pass combined git apply --check0; live source unchanged.
+Implementation: native-fallback-link/Powershell/turing. No main/N4, process kill,
+package, alternative Python compiler, rewritten copier or live installation.
+No full-source probe deadline added. The existing conditional-call regression
+does retain its own existing20s subprocess parity deadline.
+
+The actual generator LoopResult/materializer/iterable/target/member edges now
+own a native collection handle. Dense single-iterable, unconditional unit-step
+tuple/list generators use the existing context and SSA operators. COLLECT is
+an object helper operation (ordinary Call/Phi/Load/Store), NOT a new SSA opcode
+or suspended Python generator runtime. It shares materialization lowering but
+always creates fresh rows, even tuple->tuple. One native reservation/stamp pass
+pair prepares contiguous destination rows; existing authored body calls then
+replace their values directly. Stable row indices survive recursive/member
+arena relocation: each GEP reloads the incumbent heap pointer CELL after calls.
+The extent is the admitted member-count delta, not a static tensor shape of1.
+No per-element ctypes/Python/get/set/member-search dispatch. Shared mutable
+context loops are not advertised as parallel candidates. Filtered/nested or
+non-unit-step collection control is not newly admitted. No general lazy
+generator, scalar boxing, equality/hash, GC, whole-memory tiling or main
+parallelism claim. Preparation remains O(GLOBAL members); body stamping O(N),
+excluding authored body work and existing allocation/table scans.
+
+Observed losing writers, not patched guesses:
+1. Tiny generator initially emitted an unknown private array and stop1. Exact
+   graph collection ownership now reaches its native producer and loop extent.
+   Direct-input lowering carries append in loop.sequence_mutations; the other
+   retained route places it in the body. Both existing locations are honored.
+2. fresh(item) returning [] was typed only at final linking, after its caller
+   created three useless array bookkeeping formals. Native graph births/handles
+   now participate in the EXISTING bounded ABI fixed point and exact result
+   edges before frame declarations. Scalar/unknown leaves are not guessed.
+3. Emitted LLVM reread the length address for BOTH end and base after collect,
+   computing zero and silently skipping the body. Exact scalar int64/uint64/
+   opaque_ref loads now capture their SSA values, like existing float/int32.
+   Aggregate/address representations are not classified by LLVM i64 alone.
+   New isolated pre-edit-backend reproduction returns0 instead of expected12;
+   fixed native test returns12. No on-disk compiler swapping/revert was used.
+4. Member-growth repro copy(item):return list(item) had source result binding
+   (0,2), live native Ret2, formal input0. Observer on Instr.args caught linker
+   line35359 rewriting publication2 to0 based on the stale source result id.
+   Aliased-return selection now consults the live callee output identity, so
+   fresh native results remain fresh. Existing structural identity receipts
+   separately resolve genuine identity(item) without inventing an identity.
+5. Concordance/emission now validate collection births, live kind Consts,
+   source ownership, exact row column/base/index, dense induction/extent and
+   opaque member producers. Corrupt column/index/kind/member cases refuse;
+   definition inventories are reused, not rescanned for every row operation.
+
+New15 tests passed19.06s: tuple/list, direct/identity/native fresh allocation/
+native child-copy bodies; N0/1/17/257, identity cases also4097; one invocation,
+order/aliasing, distinct new objects, member arena growth, int64 snapshot, and
+four stale-contract refusals. Earlier31-test batch passed38.14s. FINAL broad
+125 passed98.65s, one existing cffi deprecation warning:
+python -m pytest tests/test_native_object_collection.py tests/test_native_object_materialize.py tests/test_source_object_context.py tests/test_ssa_object_context.py tests/test_native_object_boundary.py tests/test_shell_external_references.py tests/test_ssa_owned_heap.py tests/test_ssa_object_operations.py -q --tb=short --show-capture=no -x
+Set NODUS_TENSOR_CORE=C:/dev/Powershell/nodus/build/Release/nodus_tensor_core.dll.
+
+Additional backend/call gate:20passed/3existing disabled-XOR skips, then existing
+conditional tuple test fails KeyError tuple_merge__tick (11.36s). Exact pre19
+source-loader replay has SAME KeyError3.14s; untouched C:/dev/tg-base SAME2.70s.
+Separate root-frame test1passed1.20s. In-place-store gate's first test hits an
+existing i32/i64 Phi mismatch; exact pre19 sources reproduce it2.68s. Clean
+tg-base has3passes then its existing old IR-symbol assertion fails. These
+failures were not waived, changed or attributed to this patch. Seven ordinary
+audits remain493/24/0;360/36/1;488/22/0;522/27/1;525/27/5;24/2/0;331/22/0,
+exit1 for existing findings; provenance latch OPEN. Syntax/added-whitespace0.
+
+Unchanged50-line copier passes collection93 and private recursive frame guards.
+Final normal retry2.353027s: no unmaterialized values, unresolved calls, or
+unaccounted formals; ONE undefined predicate37 at if_merge.4 CondBr. Observer
+identifies node37 EXACTLY as identity in metadata_memo, parents36(lhs)/6(rhs),
+not a guessed generator/tuple failure. Observed retry with source tracing8.24s.
+NEXT: bind memo membership/lookup under their actual identity/key contract and
+the incumbent table/query route, then retry the unchanged copier. Integer
+identity keys are NOT interchangeable with reference-identity member keys.
+Full copier native execution and end-to-end compiler speedup remain unproved.
+
+2026-10-10 bulk native materialization and reusable ctypes boundary — SNAPSHOT ONLY:
+
+User: "Move forward and recognize the delays from dispatch stack up extremely quickly right on boundaries we're trying to use native pockets to fix the speed of, so in the ideal world this may involve making a special wrapper object to sit on the option side and use ctypes to have fast object stamping"
+
+Patch18 tools/compiler_probes/native_object_materialization.patch UNAPPLIED;
+all eighteen ordered promotion patches pass combined git apply --check0. Live
+compiler unchanged. Existing SSAObjectContext now emits a MATERIALIZE helper
+using ordinary Call/Phi/Load/Store, incumbent reserve/construct and shared heap.
+tuple/list conversion preserves shallow member identities; dict iteration
+yields keys, sequence positions are preserved even if table rows are interleaved,
+and tuple(existing exact tuple) returns the same handle. Extent/position bounds
+refuse before invalid address calculation. Zero remains failure, not an object.
+Stamping counts in one member-table pass, reserves once, then copies in one
+pass with no per-item lookup/store/constructor dispatch or Python callback.
+Both passes still scan GLOBAL member rows: O(total members), not per-object
+adjacency indexing. All native allocation remains owned until context release.
+
+Our public source entry lowers ordinary tuple(value), list(value), and their
+composition when the source is admitted as an opaque object reference. Exact
+builtin extraction identity, argument edges and materialized-source ledger
+are the authority; generator-produced unknown collections are not guessed.
+Native source effects replace the old sequence replace effect at the SAME
+source identity. Observer caught that old replace winning for tuple(list(value)).
+Another observed intermediate sent the already-defined kind-token SSAValue
+through source aliases and invented an untyped formal; exact occurrences now
+remain exact. Source materialization receipts validate live kind tokens/helper
+contracts at concordance/emission. The pre-change tiny root(value):tuple(value)
+even emitted LLVM_COMPLETE with a phantom unknown output formal and lost its
+real input. Final source tests actually execute and check identity, not just emit.
+
+NativeObjectBoundary.bind_execution returns NativeObjectInvocation over the
+EXISTING LLVMExecution/ctypes ABI. It binds context/input buffers once, rejects
+overridden context cells/missing feeds, verifies real shared addresses, caches
+the native entry and guards the exclusive lease. Native-to-native calls need
+no intervening export/import. No PyObject pointer ABI, second registry or
+alternative runtime; export remains explicit and context ownership is unchanged.
+
+Actual observer:10 native calls triggered20 substring searches through71,996
+bytes of LLVM IR in reset/take validation. LLVMFunctionArtifact now caches that
+capability against exact text identity AND declared flag (replace resets it).
+Validation calls/fault checks remain; test executes real native error7 twice.
+The dispatch micro uses1000 calls to the SAME source tuple identity operation:
+first51.4574us prepare-each vs23.2019us reuse; after capability cache, final
+31.7249us prepare-each vs0.6329us reuse (50.126x boundary-only comparison).
+Native stamping4097 elements1call0.0312ms; import1.48ms, bind0.0858ms,
+export6.0894ms. Cold first invocation costs are reported separately. These are
+micros, NOT eager-Python or whole-compiler speedup, parallelism or memory tiling.
+Command: python -u tools/compiler_probes/probe_native_object_dispatch.py
+Final artifacts: C:/Users/alber/AppData/Local/Temp/turing-object-dispatch-c7mst6ci.
+
+Earlier broad107 passed77.22s; post-cache backend/heap/shell batch59 passed,
+3 existing disabled whole-XOR skips24.26s; final new materialization11 passed9.50s.
+One test-command typo named nonexistent test_external_functions.py: no tests ran.
+An initial single-block validation fixture hit the existing fast emitter's
+unhandled validation symbol; the real multi-block control fixture verifies the
+guard lane without changing emission. Seven ordinary audits unchanged; latch
+OPEN. Syntax/addition-whitespace checks0. FINAL broad rerun110 passed78.45s.
+Command: python -m pytest tests/test_native_object_materialize.py tests/test_source_object_context.py tests/test_ssa_object_context.py tests/test_native_object_boundary.py tests/test_shell_external_references.py tests/test_ssa_owned_heap.py tests/test_ssa_object_operations.py -q --tb=short --show-capture=no -x
+
+Unchanged50-line copier now passes members=tuple(value)56, refuses collection93
+at recursive call14 (final retry2.1322359s). Trace identifies93 as LoopResult
+collection, source29/control58, materializer60, iterable56: the authored
+tuple(isolate_metadata(item) for item in members) generator collection. NEXT:
+connect that existing graph loop's item/result/extent identities to native
+collection storage and fuse its stamping in the native caller, not per-item
+ctypes. Dict equality/hash, generic opaque leaf operations, indexed adjacency
+and full copier execution remain unfinished. No main/N4/timeout/kill/package/
+alternative source compiler/copier installation this turn.
+
+2026-10-10 ordinary source object births execute — SNAPSHOT ONLY:
+
+Patch17 tools/compiler_probes/source_object_context.patch staged UNAPPLIED.
+All seventeen ordered patches pass combined git apply --check0. Live compiler
+source unchanged. The public source entry now accepts native_object_context,
+the existing SSAObjectContext descriptor. Ordinary {} and [] birth at their
+authored control positions and produce opaque_ref handles, not private unknown
+columns. Shared context cells cross existing exact call-frame bindings through
+forwarding and recursion. The original codec boundary exports their results.
+No Python callback, second registry, new opcode or substitute copier.
+
+Observed intermediates: context owner/counter initially missed formal storage
+accounting; filtering stale survey declarations preceded the actual field-slot
+writer and did not prevent unknown columns; [] reduction retained aggregate
+birth metadata but removed its AST. Fixed those producers, not formal guards.
+Dictionary IndexedStore was unclaimed after private declarations were removed,
+so a planned region emitted GEP(opaque_ref,key) and Store; returned dict empty.
+Exact handle identities now use the existing lexical table-operation route and
+native object helper. len(item) mapped to the correct object but finish only
+materialized descriptor-owned lengths; it now admits declared object lengths.
+Phi/LoopResult aggregate metadata also created unnecessary unknown arenas.
+Graph-edge handle propagation requires both branch alternatives or exact loop
+initial/update identities; zero trips keep the initial handle. It is a bounded
+dependency worklist, not a name/dtype guess. Loops with break bindings are not
+newly admitted by that rule.
+
+Sixteen source tests execute direct/forwarded/recursive/loop/conditional dict
+and list construction (depths0/1/7/32), reference-key dict set/get/length, and
+refuse corrupted context roles/kind tokens/module acceptance. Concordance and
+emission validate source receipts against live helpers/tables/formals; definition
+and helper inventories are reused, not rescanned per birth. Native dictionaries
+STILL use reference-key identity, not general Python equality/hash. Imported
+opaque-container iteration, tuple materialization, generator update/extend and
+general leaf/key semantics are NOT complete.
+
+Regression gates:66 passed39.72s (source/context/boundary/shell/heap), then final
+66 passed53.26s (source/object-operations/index-store/scalar-promotion), one cffi
+deprecation warning. Seven ordinary audits retain exact493/24/0;360/36/1;
+488/22/0;522/27/1;525/27/5;24/2/0;331/22/0; provenance latch OPEN.
+The audit command returns1 for the existing findings, not a clean gate.
+
+Snapshot commands (set NODUS_TENSOR_CORE to the existing live Release DLL):
+python -m pytest tests/test_source_object_context.py tests/test_ssa_object_context.py tests/test_native_object_boundary.py tests/test_shell_external_references.py tests/test_ssa_owned_heap.py -q --tb=short --show-capture=no -x
+python -m pytest tests/test_source_object_context.py tests/test_ssa_object_operations.py tests/test_native_scalar_index_store.py tests/test_mixed_domain_scalar_promotion.py -q --tb=short --show-capture=no -x
+python -u tools/compiler_probes/probe_native_metadata_copy.py --object-context
+
+Exact unchanged50-line copier with --object-context now passes workspace12 and
+refuses private_formal56/call14. Trace observer identifies56 as members=tuple(value)
+(aggregate_materialization, materialized_source_value_ids=(11,)), still lowered
+to unknown private sequence storage. Final retry2.0368875s, no native copier
+execution or speedup claim. NEXT: wire iteration/materialization from the
+accepted object context at the existing source producer, preserving actual
+copier memo/aliases/backedges and dictionary equality obligations. No main/N4
+started, timeout, kill, package, other compiler or live installation this turn.
+
+2026-10-10 Python/native object conversion boundary works — SNAPSHOT ONLY:
+
+User authorized the API/ABI boundary for piecemeal Python/native replacement.
+Patch16 tools/compiler_probes/native_object_boundary.patch is staged UNAPPLIED.
+All sixteen ordered patches pass combined git apply --check0. Live compiler
+source remains unchanged. Implementation is in native-fallback-link/Powershell/turing.
+
+ExternalReferenceValueCodec.bind_native_objects(context, roots) leases the
+EXISTING codec handle domain and projects builtin dict/list/tuple/set/frozenset
+graphs into the EXISTING SSAObjectContext's exact object/member tables. It does
+not create another registry or expose PyObject pointers. Multiple roots share
+one identity traversal. Leaves/subclasses remain retained opaque identities.
+Borrowed NumPy columns live through the lease; native geometric growth copies
+them into the incumbent caller-owned heap. Native execution has no per-item
+Python callbacks. Export synchronizes imported mutable objects only after
+graph validation, preserving their original Python identities; newly native
+handles get fresh representations posted to the SAME codec so repeated exports
+return the same objects. Imported immutable handles must retain exact members;
+changes require a new handle. Mutable shells and an immutable dependency
+worklist preserve cycles/backedges without recursive Python conversion.
+Explicit native context release precedes close when native arenas exist;
+close drops retentions and zeros ABI cells. No finalizer frees native memory.
+This is a trusted in-process ABI, not a parser for untrusted native addresses.
+
+Dictionary insertion order/key identities are retained. Native member lookup
+STILL compares reference identity, not Python equality/hash. At export, real
+Python dictionaries/sets apply their own semantics; invalid distinct refs that
+collapse to equal keys refuse before publication. This is NOT generic native
+Python equality/hash support. Traversal/worklists are graph-linear excluding
+host hashing/equality costs. Whole imported graphs remain resident during the
+lease; this is not the requested whole-compiler memory tiling or parallelism.
+
+Observed source-link defect: native member-store's explicit i32 status Loads
+were rewritten to int64 at ir_indexing._propagate_scalar_dtypes line436; its
+Phi remained i32, and LLVM correctly refused. A setter observer recorded
+initial four int incoming statuses and the two Load int->int64 writes at that
+pass. Raw declared memory widths now remain declared, with existing width
+decision records and a dedicated missing-Load-identity reason. Abstract
+Call->GEP->Load return projections are distinguished by their exact existing
+call-result edge, not names. The first broader fix incorrectly treated the
+oscillator's output69 projection placeholder as raw memory and caused a new
+book/width refusal; that intermediate is retained here. Exact aggregate edges
+keep the incumbent projection rule; oscillator returns to331/22/0 findings.
+Clean C:/dev/tg-base confirms raw int8/int16/int32/int Loads previously widened
+to int64. It also confirms release(retain(None)) falsely raised unknown handle;
+codec release now checks membership instead of treating None as absence.
+An initial baseline script reused numeric IDs and properly hit concordance;
+the corrected baseline uses the incumbent monotonic issuer.
+
+PUBLIC lower_ast_source_to_ssa compiles a whole loop using accepted native
+constructor/store links. One invocation creates1/17/257 fresh dictionaries,
+links every dictionary back to the imported list, grows resident tables, then
+exports exact cycles and original leaf/list identities. Pointer/counter feeds
+are checked to share actual boundary buffers BEFORE execution. Both native
+context and source module have structural0. Provenance latch remains OPEN.
+Other tests cover2500-deep immutable graphs, aliases, sets/frozensets, actual
+dict key identity, subclass opacity, equal-key refusal, immutable mutation and
+impossible cycles, bad extents, borrowed-array preservation, ownership release
+and repeated export identity. These are explicit-boundary source tests, NOT
+automatic ordinary-container lowering or a substitute production copier.
+
+Final broad gate100 passed/62.89s; after final collision-check placement,
+boundary/shell gate17 passed/4.36s. One existing cffi deprecation warning.
+Command: python -m pytest tests/test_native_object_boundary.py tests/test_shell_external_references.py tests/test_ssa_object_context.py tests/test_ssa_owned_heap.py tests/test_ssa_object_operations.py tests/test_native_scalar_index_store.py tests/test_mixed_domain_scalar_promotion.py -q --tb=short --show-capture=no
+Seven ordinary audit outcomes unchanged after aggregate-edge distinction:
+493/24/0;360/36/1;488/22/0;522/27/1;525/27/5;24/2/0;331/22/0;
+unsourced counts unchanged. Syntax and diff whitespace checks exit0.
+
+Exact50-line production copier retry1.7746843s still refuses dictionary
+workspace12 at recursive call14. User correction: "of course {} is both an
+object and an unknown recursive workspace, that's the nature of the syntax
+as it interacts with the user". UNKNOWN CONTENTS ARE NOT UNKNOWN STORAGE:
+{} supplies a known dictionary kind and initial extent zero. The missing
+producer must publish its native handle/context representation before recursive
+leasing; no requirement to statically enumerate future Python contents.
+Next: connect actual source object birth/inspection to this accepted context
+and preserve dictionary equality/hash obligations, aliases, memo/backedges.
+No production copier installed, main/N4 run, process kill, package install,
+alternative source compiler, full-main parallelism or speedup claimed.
+
+2026-10-10 explicit native object context executes and crosses source calls — SNAPSHOT ONLY:
+
+User: "okay, this sounds like a subtle thing but like a backbone architectural
+object that would help us to do it right, please proceed". New patch15:
+tools/compiler_probes/native_object_context.patch, UNAPPLIED. All fifteen
+ordered promotion patches pass combined git apply --check0. Implementation is
+in native-fallback-link/Powershell/turing, not the live compiler. No N4/main,
+package, alternative source compiler, process kill or production installation.
+
+SSAObjectContext is a backend-neutral ABI view of TWO EXISTING typed dynamic
+sequence tables (object handle/kind; owner handle/key handle/value handle),
+one shared caller-owned heap and a handle counter. No additional Python
+registry, pointer masquerading as a handle, new opcode or generic object model.
+The kind vocabulary is explicit. Member keys compare by REFERENCE IDENTITY,
+not Python dict equality/hash; this is not permission to lower arbitrary
+Python dictionaries as this domain. Counter is positive, zero invalid, and
+construction refuses invalid kind, collision or exhaustion without advancing
+the counter or overwriting the incumbent kind. Allocation failure retains
+the existing fail-fast allocator behavior. Initialization is for an empty
+caller-supplied context, not reset of live storage. Mutation requires exclusive
+ownership of one context; different contexts have separate storage.
+
+ssa_object_context.lower_object_context emits real initialize, construct,
+kind, get, set, length and release helpers through incumbent sequence/table
+and object-operation interfaces. Growth, insertion/store and typed transfer
+use the previously implemented native paths. Release frees shared ownership
+and clears pointer cells/counters; it never GEPs through freed payload.
+Each function owns its SSAValue occurrences, sharing only immutable context
+descriptors, not mutable cross-function accounting. Context receipts validate
+against live descriptors and actual formals at emission/concordance.
+
+OBSERVED source-link defects, fixed at their writers:
+- Final sequence dtype settlement at fortran_c_shell.py formerly wrote
+  ptr -> opaque_ref/int64 from COLUMN ELEMENT dtype. It now preserves the
+  pointer-cell contract when the descriptor has an explicit heap owner.
+- The public source caller retained raw ptr without the callee's heap-cell
+  accounting, so its buffer ABI said double and preparation copied pointer
+  cells. First invocation could work, then retained length with lost addresses
+  caused an access violation on a later invocation. Exact callee_input_ids now
+  transport cell/pointee/shared-owner contracts over source-linked call edges.
+  A monotonic reverse-call worklist covers forwarding and SCCs; conflicts or
+  missing owner bindings refuse. Normal modules without heap contracts skip
+  the instruction inventory. The projection receipt is audited against the
+  LIVE exact call edge and formal contract, not names or pointer spelling.
+- Existing _storage_values published opaque_ref whereas Alloca published its
+  canonical int64 layout. Observed later formal accounting propagation replaced
+  that canonical layout, creating four allocator findings. Storage publication
+  now uses the shared layout table's canonical name at its original producer.
+- LLVM Cast(bool,int64) returned i1 unchanged, then stored it as i64. Observed
+  invalid LLVM is fixed with exact zero-extension (0/1, not sign-extension).
+- Key-column auditing now consults the shared integral-layout authority;
+  opaque_ref is exact i64, not a float key. Float/unresolved keys still fail.
+
+Tests: real native construction/growth/access/release, 17 distinct objects,
+references >2**60, overwrite, self-edge, backedge, missing references,
+invalid kinds, handle collision/exhaustion and release/reinitialize. Actual
+source programs use the PUBLIC lower_ast_source_to_ssa with accepted native
+signature declarations, not compiled Python callback bodies. Whole 1/17/257
+object loops run in ONE native invocation, repeatedly on the same context,
+directly and through an extra relay. Outputs equal kind*count exactly;
+pointer buffers are asserted ptr and share caller storage BEFORE execution.
+Both source modules have zero structural findings. The provenance latch is
+OPEN (including helper IDs born outside the source book), not fully closed.
+
+Broad gate168 passed/5 SAME PREVIOUSLY RECORDED failures80.77s; final gate
+after per-function occurrence isolation66 passed45.33s:
+python -m pytest -q --tb=short --show-capture=no tests/test_ssa_object_context.py tests/test_ssa_owned_heap.py tests/test_ssa_object_operations.py
+Seven ordinary audits unchanged:493/24/0;360/36/1;488/22/0;522/27/1;
+525/27/5;24/2/0;331/22/0 (rows/functions/findings). Unsourced counts unchanged.
+The earlier native source test access violation is retained above as a real
+failed intermediate, not a green run; subsequent repeated execution passes.
+
+Production exact50-line copier retry1.6916952s STILL refuses unknown dictionary
+workspace12 at recursive call14. The explicit native context now exists and
+links, but {} and the copier's ordinary Python-object inputs are NOT yet
+bound to it. No compiled production copier, native replacement installation,
+N4 speedup, main tiling or main parallelism claimed. Next: connect admitted
+source constructors/inspection and the existing Python-object boundary to
+this context without silently changing dictionary semantics or leaf identity.
+
+2026-10-10 typed owned dynamic storage path completed; source birth remains — SNAPSHOT ONLY:
+
+User: "okay let's clean everything around the dynamic allocation contract and
+see if we can make that the last rivit". Patch14 dynamic_owned_sequence_storage.patch
+staged UNAPPLIED; all fourteen ordered patches pass combined git apply --check0.
+Snapshot changes: ir_sequence_tables.py, ssa_heap_allocation.py, ssa_llvm_backend.py,
+identity_concordance.py, sequence_storage_binding.py, transmogrifier/ssa.py,
+test_ssa_owned_heap.py. No live compiler/copier install, main/N4, process kill,
+package or alternative Python compiler. Native LLVM emission uses our incumbent lane.
+
+PRE-EDIT OBSERVATIONS:
+Exact50-line copier rejects sequence12, actual {} producer, columns(12, secondID),
+column_dtypes unknown/unknown, scalar rows, FIXED policy, heap_owner=None.
+Graph retains Dict/aggregate_kind=dict and two-column writable/key0 shape, but
+provides no native object-domain/owned allocation descriptor. Existing allocator
+already implements runtime size + caller-owned lifetime. Existing typed owned
+DYNAMIC descriptor still gives dynamic-growth-unavailable from insert; initializer
+also refused DYNAMIC policy. Separately, heap length/capacity aliases were accepted
+and int64 heap columns bound to float64 heap columns through ptr ABI unchanged.
+All three gaps were observed before their respective changes, not guessed.
+
+IMPLEMENTED in the EXISTING descriptor/storage path:
+- Empty typed owned columns can initialize with FIXED or DYNAMIC capacity policy.
+- lower_sequence_reserve validates nonnegative live length/required count,
+  length<=capacity and allocator byte-overflow bounds BEFORE copying. Chooses
+  max(required, checked double capacity), capped at the shared safe row maximum.
+- Allocates/zeroes all new columns, byte-copies live rows, then publishes exact
+  pointer cells and capacity together. Length unchanged. Same-cell column aliases
+  reuse one allocation; incompatible aliased element layouts are refused.
+- Existing fixed insert/table-store bodies remain the mutation authority. A shared
+  dynamic wrapper validates extents before scanning, tries the incumbent operation,
+  reserves ONLY on full, then retries. Duplicate keys and existing-key updates do
+  not grow. Existing statuses retained, no Python callback.
+- Extend includes exact destination owner, binds row formals by their declared
+  IDs and retains the ENTIRE insert/fixed/reserve helper closure. Heap element
+  contracts match; shaped rows/liveness/child pools without supported replacement
+  are still named shortfalls, not silent truncation.
+- Native typed element transfer is ordinary Call to LLVM memmove through the
+  existing heap ABI. Integer element counts checked before byte multiplication;
+  scalar count width limited to64bits (no truncating a wider count). No opaque
+  handle becomes an address. Byte-copy preserves float32 bits without numeric
+  widening/narrowing and supports overlap. Allocation operation itself validated.
+- Owned descriptors reject overlapping length/capacity/pointer cells, owner/status
+  collision and pointee-layout ambiguity. Cross-call heap binding checks exact
+  layouts and normalized row shapes, not merely ptr ABI equality.
+- Concordance audits heap-copy-contract beside existing heap-allocation-contract.
+  No new object registry, datatype, source opcode or allocation-guard relaxation.
+
+LIFETIME / COMPLEXITY:
+One caller-owned heap cell retains current AND retired arenas until explicit
+release. Pointer-CELL identities stay stable; interior addresses are arena-version
+views and must be reacquired after growth. No claim that an old interior view
+magically follows replacement. Geometric growth amortizes row-copy work; retired
+payload is geometrically bounded for monotonic insertion. Owner release frees
+the chain and clears its cell. Unique-key scanning itself remains linear, NOT
+a new hash table, and no main compile speedup/parallelism is claimed.
+
+NATIVE VERIFICATION (SSA allocation-contract tests, not automatic source binding):
+Five layouts int64/opaque_ref/float64/float32/bool reserve through1/2/7/4097 rows,
+preserve byte patterns/retired views and zero new capacity; no-op reserve and
+invalid counts preserve state. Native insert AND table-store loops run whole
+1/257/4097-row jobs in ONE native call, for int64 and opaque_ref, exact values
+above2**60; re-inserting keys preserves capacity/owner/columns. Native extend
+copies257 borrowed rows twice without modifying source or duplicating rows.
+Invalid extents reject before touching null columns. Overlap copy preserves
+memmove semantics. Explicit release resets owners. Valid dynamic module audit
+observed124 rows/6functions/0 findings; standalone SSA module has no attached
+book, so this is not proof of source-born emission provenance.
+
+Final targeted gate163 pass/5 PREVIOUSLY BASELINED failures73.98s:
+python -m pytest -q --tb=short --show-capture=no tests/test_ssa_object_operations.py tests/test_native_reference_inspection.py tests/test_native_reference_boundary.py tests/test_native_structural_producers.py tests/test_ssa_owned_heap.py tests/test_control_branch_compartments.py tests/test_native_conditional_call_result.py tests/test_ir_sequence_tables.py tests/test_sequence_contract_concordance.py
+Same three stale ID/helper-name expectations and two real int32/int64 exact-region
+feed conflicts, no exclusions. Final seven audits unchanged0,1,0,1,5,0,0 with
+identical unsourced counts, latch OPEN. Guestbook validation dry-run only.
+
+NOT THE LAST RIVET YET:
+Final production exact copier retry2.2399622s still refuses unknown dictionary workspace12
+at recursive call14/SCC0. New code does not pretend that {} has a native object
+handle/domain, element layout or shared allocation owner just because malloc exists.
+Remaining SOURCE bridge: constructor materialization must publish its accepted
+object-domain representation, runtime capacity and shared-owner descriptor before
+recursive leasing, and schedule the real allocation producer. Existing opaque
+construct helper interface alone is not a generic object implementation.
+Previously observed early-return missing recursive Call remains unresolved.
+No compiled/installed production copier, source-constructor success, N4 gain,
+whole-main tiling or parallelism claim.
+
+
+2026-10-10 reducer-owned result Phis retained; declared recursion executes — SNAPSHOT ONLY:
+
+User: "okay, let's proceed". Patch13 conditional_result_phi.patch staged UNAPPLIED;
+all thirteen ordered patches pass combined git apply --check (exit0). Changes
+are snapshot glsl_deployment_strategy.py and test_ssa_object_operations.py only.
+No live compiler/copier install, main/N4 launch, process kill, packages or new
+compilation route. Existing public source entry and native LLVM lane used.
+
+OBSERVED CAUSAL CHAIN, before editing:
+Graph Phi18 has test4/body17/orelse9, binding result, source_conditional_id5,
+and NO initial_value_id. _ordinary_conditional_control_programs reaches its
+initial-value check and skips this Phi. lower_conditional receives result_aliases
+empty while sequence_length_values is already {17:14}, descriptors14/6 present.
+No one requests len-result17, so no Load or Phi is emitted; Ret reads call9.
+The graph knew the complete merge; this was planner loss, not missing type data.
+
+Fix: reducer Phis without an entered version use the EXISTING conditional-result
+path with their exact arm IDs. No invented merge from names, no new SSA opcode,
+no backend repair or allocation-guard relaxation. Existing control lowering
+requests len17 on its true edge, publishes Phi18 and the concordance derivations;
+existing linked result-type propagation settles recursive result to int64.
+
+A second minimal case ("if index: result=23; else: result=41") exposed the earlier
+retention guard: no numerical predicate/arm regions, calls or field-state merge,
+but graph Phi4(test0/body2/orelse3) owns source conditional1. Observed guard drops
+that conditional despite this exact Phi. Retention now admits reducer-owned
+body/orelse merges as well as the prior field-state merges. No-Phi no-invention
+regression remains green.
+
+Actual source common-return recursive table-length program now lowers under the
+unchanged full-native gate, has zero concordance findings, and executes LLVM
+native at depths0/1/7/32 for three objects: lengths2/0/1, one handle above2**60.
+All twelve executions return the base-case length; all caller columns remain
+unchanged. Recursive feeds share exact declared keys/values/length and member
+column pools/lengths/stride; only int lookup-status scratch is invocation-local.
+Fortran text emission complete. C module text still explicitly reports missing
+zeros spelling for the two invocation-local status producers; NOT C completeness.
+
+Four additional source assignment programs execute nine branch cases: bare
+predicate, comparison predicate, nested merge, and an entered carried version.
+Five focused tests pass6.31s. Saved pre-edit strategy replay gives three failures/
+one pass7.26s for the comparison/nested/recursive/entered set; the bare-predicate
+failure was observed separately before changing its retention guard. Thus both
+losses are deterministic and reproduced, not inferred from a post-edit success.
+
+Final targeted gate148 pass/5 PREVIOUSLY BASELINED failures69.15s:
+python -m pytest -q --tb=short --show-capture=no tests/test_ssa_object_operations.py tests/test_native_reference_inspection.py tests/test_native_reference_boundary.py tests/test_native_structural_producers.py tests/test_ssa_owned_heap.py tests/test_control_branch_compartments.py tests/test_native_conditional_call_result.py tests/test_ir_sequence_tables.py tests/test_sequence_contract_concordance.py
+Same three stale ID/helper-name expectations and two real int32/int64 exact-region
+feed conflicts, no exclusions. Earlier reference/control subset93 pass62.94s
+before adding bare-predicate regression. Seven final audits unchanged0,1,0,1,5,0,0
+and identical unsourced counts; provenance latch OPEN. Guestbook dry-run only.
+
+Production exact50-line copier retry2.1632375s still refuses dynamic dictionary
+workspace12 at recursive call14/SCC0. Borrowed declared contexts and ordinary
+fresh branch results are now demonstrated, NOT generic native dictionary
+construction, Python object-domain binding or installed copier acceleration.
+Separate early-return kind variant rechecked: recursive Call remains absent,
+exported Ret dtypeNone; losing writer still unobserved, never executed as native.
+Remaining frontiers: that call-retention defect, and the dynamic constructor's
+actual element/extent/owner contract. No main speedup, tiling or parallelism claim.
+
+
+2026-10-10 recursive declared keyed storage settled before leasing — SNAPSHOT ONLY:
+
+User: "how is our gap now", then "proceed".
+Patch12 recursive_keyed_storage_binding.patch staged UNAPPLIED; all twelve
+ordered patches pass combined git apply --check (exit0). Only snapshot
+fortran_c_shell.py and test_ssa_object_operations.py changed. Live compiler,
+copier and processes unchanged. No main/N4, package, timeout or process kill.
+
+Pre-edit observation at record-ABI completion: authored GetAttr6 book.objects
+still has anonymous unknown keys/value arenas and descriptor, but the lookup
+already names its owner and the exact declared length/keys/values formals exist.
+The incumbent late keyed binding pass is now a single reused closure. It runs
+after record ABI materialization BEFORE source-call discovery/recursive leasing,
+then again at its original post-link stage. Its existing remap retires anonymous
+storage and derives descriptor revisions from old descriptors and physical cells.
+No new logical sequence-field claim, allocation fallback or guard relaxation.
+
+First relocation also typed opaque queries too early: six native reference cases
+hit opaque_ref/int64 physical input disagreements. The early invocation now
+settles STORAGE only; query producers/formals retain their incumbent types until
+the original post-link query binding. Saved pre-edit compiler replay confirms
+those six pass (5.73s), revised current reference/object batch45 pass29.69s.
+
+Common-return recursive source now passes the storage guard. Diagnostic witness
+asserts recursive feeds share exactly the same declared keys/values/length and
+pooled columns/lengths/stride identities; descriptor keys/values are int64 and
+capacity=length. Only one int lookup-status scratch is invocation-local, no
+borrowed table arena. Regression1 pass2.27s is NOT recursive native success.
+
+Next observed blocker: full-native structural_outputs reports missing Phi18
+(test4, body17, orelse9). Rejected SSA has base-case selected table length address
+but no Load/result17 or Phi18; if_merge Ret reads recursive Call9 alone with
+dtype=None. Recursive call DOES survive (unlike the previously recorded
+early-return variant). This malformed module was inspected from the refusal
+traceback, never emitted/executed; full-native refusal remains enforced.
+The original writer losing the length-result/control merge is NOT yet traced.
+Next repair must observe that producer/control reduction, not patch the backend.
+
+Final targeted gate128 pass/5 PREVIOUSLY BASELINED failures56.18s:
+python -m pytest -q --tb=short --show-capture=no tests/test_ssa_object_operations.py tests/test_native_reference_inspection.py tests/test_native_reference_boundary.py tests/test_native_structural_producers.py tests/test_ssa_owned_heap.py tests/test_ir_sequence_tables.py tests/test_sequence_contract_concordance.py
+Same three stale ID/helper-name expectations and two genuine int32/int64
+exact-region feed disagreements, no exclusions. Existing NODUS_TENSOR_CORE used.
+Seven audits unchanged0,1,0,1,5,0,0, same unsourced counts, latch OPEN.
+
+Original50-line copier was NOT rerun this step; prior measured dictionary12/
+call14 refusal remains the last production evidence. No installed native copier,
+main speedup, automatic object binding, dynamic constructor completion, main
+tiling or parallelism claim. Storage ordering gap closed; recursive control and
+the broader copier/native object gaps remain.
+
+
+2026-10-10 complete declared member-table context through source calls — SNAPSHOT ONLY:
+
+User: "continue", following the industry-pattern discussion of reference,
+descriptor, runtime extent and owner contracts. Patch11
+object_table_source_context.patch staged UNAPPLIED; all eleven patches in
+order pass combined git apply --check0. Only snapshot fortran_c_shell.py and
+test_ssa_object_operations.py changed. No live compiler/copier/accelerator
+installation changed, main/N4 launched, process killed, timeout or package added.
+
+Observed original source root->inspect chain: materialize_declared_row_columns
+published metadata.Object with kind span only and deferred objects[].members
+table. _linked_caller_member then refused callee members' capacity/stride formal
+against that incomplete caller record. Callee table columns/length vector also
+had no record claims and were being leased as unrelated private storage.
+
+Both row materializers now share materialize_row_table_context over the existing
+declared ABI. It publishes caller-owned column pools, lengths and stride as real
+record fields. Its per-function cache keys the exact owner record ID + declared
+field path; this is materialization reuse, not an object registry. Mints derive
+from existing schema/owner cells. Selected row GEPs stay the incumbent sequence
+view. The existing record_field_decomposition maps only row capacity to stride;
+it does NOT confuse pooled lengths/columns with row-selected addresses/pointers.
+Call linking itself is unchanged and follows existing exact record pairs/claims.
+
+Second forwarding level exposed an older duplicate-storage-across-call finding.
+Observed materialize_parameter_record_abi: relay has field_read_ids=(), no writes,
+propagated read demand, incoming_slot=None, mapping=None. Its fallback minted a
+logical mapping as an extra input beside existing length/keys/values. That ghost
+input had no record claim, so root leased it despite resident field storage.
+An unread keyed field now publishes its physical decomposition without minting
+the nonexistent input. Reuse also consults the existing exact decomposition row.
+Saved pre-change compiler reproduced the same duplicate finding before this fix.
+
+Eight real source-call cases, one/two forwarding levels, execute kind/length/get/
+set with exact reference values above2**60, empty/nonempty lengths and writes to
+caller buffers. All assert zero structural findings and one unleased copy of
+each table-context formal. No manually constructed SSA caller in these cases.
+C and Fortran text emission complete for all eight; Fortran uses the public
+lowerer's COMPLETE outputs map, not a root-only map that omits callee results.
+Only LLVM artifacts were compiled/executed, through our existing compiler lane.
+
+Final focused gate74 pass43.83s:
+python -m pytest -q --tb=short --show-capture=no tests/test_ssa_object_operations.py tests/test_native_reference_inspection.py tests/test_native_reference_boundary.py tests/test_native_structural_producers.py tests/test_ssa_owned_heap.py
+Existing NODUS_TENSOR_CORE=nodus/build/Release/nodus_tensor_core.dll.
+Separate final sequence/concordance gate54 pass/5 old failures7.04s:
+python -m pytest -q --tb=short --show-capture=no tests/test_ir_sequence_tables.py tests/test_sequence_contract_concordance.py
+Same three ID/helper-name expectations and two real int32/int64 exact-region
+feed conflicts; no exclusions. Earlier combined run127 pass/5 fail51.58s before
+adding the explicit recursive refusal regression. Seven audits before/after
+retain0,1,0,1,5,0,0 and identical unsourced counts; provenance latch OPEN.
+
+RECURSION IS NOT CLOSED. New explicit refusal regression uses:
+def inspect(book,handle,index):
+    if index<=0:
+        result=len(book.objects[id(handle)].members)
+    else:
+        result=inspect(book,handle,index-1)
+    return result
+def root(book,handle,index):
+    return inspect(book,handle,index)
+It refuses private_formal6 (authored GetAttr book.objects), unknown shape(), at
+recursive call9. Observed sequence_member claims (6,column0)/(6,handle), while
+Book record only owns length/keys/values and rows: no record->sequence6 claim.
+The existing physical decomposition is established too late to prevent recursive
+frame leasing. Saved pre-change compiler gives the identical refusal. A late
+sequence-field claim attempt preserved provisional unknown key-column contracts
+and did not fix recursion; it was fully removed, not layered onto the working fix.
+The passing refusal regression protects the guard, NOT successful native recursion.
+Next: settle the authored keyed view from its existing owner/decomposition at the
+producer BEFORE recursive lease selection, with exact descriptor/type receipts.
+
+Also observed a separate early-return version:
+def inspect(book,handle,index):
+    if index<=0:
+        return book.objects[id(handle)].kind
+    return inspect(book,handle,index-1)
+def root(book,handle,index):
+    return inspect(book,handle,index)
+Saved pre-change and current forms lower without the recursive Call; exported
+Ret values have dtype=None. No native execution of that malformed candidate;
+backend completeness is NOT semantic success. Its original losing writer is
+not yet observed. Preserve this diagnostic for control/call retention repair.
+
+Original50-line metadata copier retry1.6806848s still refuses unknown dictionary
+workspace12 at recursive call14/SCC0. Ordinary Python object->descriptor binding,
+builtin runtime dispatch, recursive result/storage constraints and constructors'
+runtime extent/owner lifetime remain. No copier install, speedup, main tiling or
+main parallelism claim. The nonrecursive SOURCE forwarding gap is now closed;
+the broader opaque-reference/recursive copier gaps are not.
+
+2026-10-10 opaque object SSA/backend contract — SNAPSHOT ONLY:
+
+User: "what it sounds like to me is we want an opaque object type and helpers for ssa and the backends"
+User: "can you realize this"
+
+Patch10 opaque_object_operations.patch staged UNAPPLIED. All ten patches in
+order pass combined git apply --check0; no promotion applied. Implementation
+is in native-fallback-link/Powershell/turing. Live compiler/copier and any
+previously running main process untouched; no main/N4 launched or process killed.
+
+SSAOpaqueObject is a semantic view of the existing scalar opaque_ref plus an
+explicit admitted storage domain, NOT a new physical dtype or object registry.
+ssa_object_operations declares kind/length/get/set/construct/release interfaces
+on incumbent SSA function bodies, partitioning exact formal IDs into reference,
+context and operands. Calls remain ordinary native Call instructions. Helpers'
+actual Ret operands provide result identities/layouts; existing return_value
+metadata supplies Fortran's scalar result contract. No signature-name/position
+guess, opaque-to-pointer cast, per-item Python callback or alternate compiler.
+LLVM/C/Fortran validate the live helper, actual bindings and result contract at
+emission; concordance diagnoses stale contracts and dangling field-sequence IDs.
+Kind membership uses an explicit one-based owner vocabulary, NOT arbitrary
+Python isinstance/MRO/metaclass semantics. Identity/equality are native Cast/Eq.
+Bodyless imported helper interfaces are still refused by this new helper API;
+existing native linking mechanisms remain unchanged.
+
+Actual native KIND/LENGTH/GET/SET helper bodies compile through the sanctioned
+lower_ast_source_to_ssa entry against existing Book.objects keyed-record ABI.
+The test caller is SSA API composition, NOT automatic source dispatch. Tests
+execute caller-owned kind/member/length columns, exact handles above2**60,
+read-only mutation refusal, native identity/equality and kind membership. C and
+Fortran emit all four helper/caller programs complete; neither was compiled by
+an external C/Fortran compiler. LLVM products execute using our existing toolchain.
+Construct/release interface shapes exist, but no generic object constructor or
+lifetime implementation is supplied by this layer. Incumbent heap ABI is separate.
+
+Observed/fixed writer chains:
+- literal {} already had Dict producer + aggregate_kind=dict but unresolved
+  payload; isinstance Call discarded that exact kind. Known constructor kind
+  now survives without requiring mutable payload constant folding.
+- nested positional row-column Store12 had Indexed11 as base, yet row ops were
+  empty. Old lowering loaded row0 as a float and wrote through a temporary.
+  _sequence_row_operations follows the two authored index edges; sparse row
+  stores write only the selected column, retain row alias, and reject read-only
+  descriptors. No execution of the old malformed store was used as a baseline.
+- caller-owned table field was classified local and initialized before row
+  pointer selection. _authored_source_sequence_ids now follows existing ABI
+  graph identities/owner edges, preserving borrowed storage and lengths.
+- opaque id Cast was tagged tensor_identity, rejected by C/Fortran. Its writer
+  now marks opaque_reference_identity; genuine tensor feeds retain their tag.
+  Existing regression assertions now require this correct contract and still
+  execute unchanged identity/parity checks.
+- keyed rebind at former38557 overwrote _BookRows with dict (observed before/
+  after), bypassing book descriptor/member updates. Both keyed table rewriting
+  sites now revise incumbent rows from old descriptor + exact physical cells.
+  Dead-sequence pruning retires exact dependent record field claims in the same
+  pass, retaining historical book revisions and authored schema. Fortran length
+  had refused metadata.Object.members' absent sequence6; it now emits complete.
+
+Final focused gate66 passed37.47s:
+python -m pytest -q --tb=short --show-capture=no tests/test_ssa_object_operations.py tests/test_native_reference_inspection.py tests/test_native_reference_boundary.py tests/test_native_structural_producers.py tests/test_ssa_owned_heap.py
+NODUS_TENSOR_CORE uses existing nodus/build/Release/nodus_tensor_core.dll.
+Extended gate adds test_ir_sequence_tables.py/test_sequence_contract_concordance.py:
+119 pass/5 prior failures43.90s before last additional contract/claim detector test
+(separately1 pass2.04s, included in final focused gate). Same five previously
+reproduced on clean tg-base: three obsolete ID/helper-name expectations and
+two real exact-region-feed int32/int64 conflicts. No exclusions or masking.
+New object test file has21 cases. Seven audits retain0,1,0,1,5,0,0 structural
+findings and unchanged unsourced fact/identity counts; provenance latch OPEN.
+
+Remaining observed source-composition gap: inspect(book,handle) reading members
+works directly, but root(book,handle)->inspect receives a matching Object row
+with only kind span; caller materialize_declared_row_columns defers table leaf.
+It refuses metadata.Object.members absent, NOT a different Book/Object identity.
+This expected refusal test is not a claim that automatic binding is solved.
+Ordinary Python object entry still has no accepted descriptor-domain conversion.
+Exact original50-line copier retry3.0152095s remains blocked at recursive workspace
+12/callsite14/SCC0, unknown type/extent. No copier installed or speedup measured.
+Next: preserve complete table-field context along exact source call binding,
+then native runtime builtin dispatch, recursive result/storage constraints and
+constructor extent/owner lifetime. Do not fabricate a registry or opaque ABI
+simply to bypass unresolved payload storage. No main tiling/parallelism claim.
+
+2026-10-10 steps1-3 started: native descriptor inspection — SNAPSHOT ONLY:
+
+User: "Go ahead and start on 1-3"
+Patch9 native_reference_inspection.patch staged UNAPPLIED. All nine patches
+combined git apply --check0. Only snapshot fortran_c_shell.py,
+precompile_to_ssa.py and new test_native_reference_inspection.py changed.
+Live source/copier/accelerator installation and running main7196 untouched.
+
+Observed chain: keyed row4 already has metadata.Object identity, but members
+GetAttrs5/6/10 were not table declarations. _field_slot_ops recognized root
+parameters or Sequence[Record] rows only. New _graph_record_abi_by_value is a
+DERIVED view of existing published graph identities + declared ProgramABI
+schemas, indexed once (nodes+schemas), not a new object registry or name guess.
+Detached accepted parameter-record receipts remain valid authorities. This view
+feeds both table declarations and column dtypes before SSA planning handoff.
+
+Direct len already had sequence_length_values {6:4}, yet finish dropped it
+because no region published it. Control finish now materializes a required,
+already-declared resident length; no provisional ABI formal. Nested record
+materialization previously accepted projected-loop formals only; it now binds
+direct resident descriptor members to the same existing column/length/stride
+ABI. It keeps the exact GetAttr identity as the native first-column pointer.
+Repeated reads of one exact owner/field publish planning aliases and retire
+duplicate provisional descriptors with derived book edges. Intermediate audit
+caught a dropped handle producer and shared-member claims; both are fixed.
+
+New native public-source cases: len(item.members), both indexed reference
+columns, zero-trip/nonempty traversal, and combined repeated-field reads.
+All use incumbent keyed value_record/table ABI, caller-provided columns, one
+compiled program invocation, no host callback in traversal. Payloads above2**60
+survive exactly in indexed and combined tests. Each native case asserts zero
+STRUCTURAL concordance findings. The unsourced provenance latch is still OPEN.
+Traversal count is explicitly floating; it does NOT prove integer accumulation.
+
+Observed resident length int64 vs hard-coded int/i32 loop header caused invalid
+Phi while latch settled i64. Header/latch counter now follows range operands;
+preheader seeds widen by explicit Cast. This fixes this table traversal, NOT
+the inherited simple-indexed-loop/pair-update Phi failures, still1 fail/3 errors
+in3.19s. Integer accumulator probes also found loop_composer float(literal)
+seed conversion and int64 carried seed vs float64 planned body result. A direct
+reference carried assignment/return also exposed an unnamed externalized output.
+Their age has not been established by this turn; both remain unresolved, not
+papered over. No compiler-wide integer/alias completion claim.
+
+Step3 now derives an empty dictionary's row from ALL exact IndexedStore operand
+constraints: declared scalar/reference parameter ABI, linked scalar/reference ABI,
+or literal operands. Unknown/conflicting stores do not become known from one
+write. Public source copied={}; copied[key]=value; return len(copied) has
+(int64,opaque_ref) descriptor. This is layout proof only: source constructor
+capacity/owned allocation is still step4 and that local-dictionary artifact was
+NOT executed. No invented bound for dynamic keys or memo population.
+
+Final focused gate45 passed/29.47s:
+python -u -m pytest -q --tb=short --show-capture=no tests/test_native_reference_inspection.py tests/test_native_reference_boundary.py tests/test_native_structural_producers.py tests/test_ssa_owned_heap.py
+NODUS_TENSOR_CORE remains the existing nodus/build/Release/nodus_tensor_core.dll.
+Extended gate97 pass/5 existing failures37.33s before adding two binding-authority
+unit tests. Same five previously baselined failures; no exclusions. Seven audits
+before/after retain0,1,0,1,5,0,0, unsourced latch OPEN. Saved pre-edit modules used
+read-only in fresh process for the before audit; no checkout/stash manipulation.
+
+Exact original50-line copier final retry2.1708728s: same recursive workspace12,
+callsite14/callee_reference1/SCC0, unknown dtype/extent. Generic opaque input
+still lacks an accepted runtime descriptor binding; builtin runtime kind dispatch
+and recursive result row constraints are NOT finished. The explicit descriptor
+inspection gap is closed, not all of steps1-3. No replacement copier installed,
+no N4 run or end-to-end speedup inferred. Capacity/arena placement remains separate.
+
+2026-10-10 reference-valued native boundary — SNAPSHOT ONLY:
+
+User: "Can we take care of everything and try to leave the where and how do we allocate an arena ideally"
+
+Incremental patch8 native_reference_boundary.patch is staged, NOT applied.
+All eight promotion patches combined git apply --check returned0. Compiler
+implementation/test edits remain in native-fallback-link/Powershell/turing;
+live main7196 and incumbent copier are untouched. No copier accelerator installed.
+
+Observed public source memo[key]=value; return memo[key] with explicit keyed
+ProgramABI initially emitted flat GEP/Store/Load, despite existing row receipt.
+No unsafe generated code was executed. _field_slot_ops required aggregate_kind
+on Input, weaker than the exact committed boundary. It now derives parameter
+row declarations/dtypes from incumbent ProgramABI/annotations and recognizes
+their exact initial SSA identities. object annotation means opaque_ref SLOT,
+not inspectable object payload. Conflicting row contracts refuse.
+
+Next observed native root ignored caller buffers and allocated six singleton
+uninitialized private frame cells. _ControlSSABuilder._sequence_descriptor now
+publishes borrowed parameter ownership for explicitly declared known row
+layouts at creation. An initially broader ownership change misclassified a
+provisional unknown text-key view, redirecting keyed tensor payloads; observer
+identified exact writer, and explicit-layout requirement fixes that regression.
+lower_table_store also publishes length/index/latch arithmetic as int64, matching
+descriptor cells. Storage-member binding carries owner identity and refuses
+direct-arena/heap-pointer-cell mismatch before mutating bindings.
+
+Native source tests through lower_ast_source_to_ssa execute identity-key memo
+insert/lookup/update with handles above2**60, exact length/rows, caller capacity4.
+Both explicit ABI and dict[int,object] annotation paths pass. Existing keyed
+value_record Book.objects -> Object.kind ABI executes native kind lookup using
+caller-provided descriptor columns. This is NOT an automatic opaque-handle
+object registry, generic Python dictionary equality, or full copier completion.
+
+Focused new boundary/heap/public-source gate:35 pass/18.37s.
+Repro (set NODUS_TENSOR_CORE to nodus/build/Release/nodus_tensor_core.dll):
+python -u -m pytest -q --tb=short --show-capture=no tests/test_native_reference_boundary.py tests/test_ssa_owned_heap.py tests/test_native_structural_producers.py
+Extended gate adds test_ir_sequence_tables.py and
+test_sequence_contract_concordance.py:89 pass/5 fail/26.96s. Same five previously
+reproduced on untouched tg-base: obsolete fresh-ID expectation, two fixed helper
+name expectations, two real exact-region-feed int32/int64 conflicts. No exclusions.
+Inherited earlier native loop Phi regression remains OPEN (see prior receipt).
+Seven concordance cases retain0,1,0,1,5,0,0 findings; unsourced latch remains OPEN.
+
+Exact original copier retry:2.0398794s, refuses isolate_metadata callsite14,
+callee_reference1/SCC0/private_formal12, dtype unknown/shape(), workspace=True.
+The empty dictionary's row layout and extent are still unresolved. A nested
+Object.members sequence experiment also still rejects len(item.members)
+structural Call result16/argument6. Neither was hidden by weakening full-native.
+Bare opaque input has no automatic descriptor-column binding; generic container
+construction, iteration, immutable publication, and memo growth are not closed.
+Therefore arena placement is NOT the only remaining problem. No N4/main speedup
+is inferred from these small correctness tests.
+
+Ownership requirement, independent of allocation policy: shared memo and copied
+results must outlive recursive calls. Existing caller-owned heap owner can express
+that lifetime; allocation backend/placement/capacity policy has not been chosen.
+Continue from exact source identities and existing reference/sequence/record ABI,
+not a substitute copier or a Python callback per member.
+
+2026-10-10 owned runtime-sized heap allocation — SNAPSHOT ONLY:
+
+Uses incumbent Alloca/Call vocabulary and strict dtype_layout authority.
+An explicit caller-owned native pointer cell holds the allocation chain;
+arenas survive helper returns and later allocations until explicit native
+release. Opaque reference handles are not treated as dereferenceable pointers.
+LLVM guards negative/overflow counts and malloc failure with trap. This is
+owned storage, not generic Python object semantics or a compiled copier.
+
+Existing SSASequenceDescriptor now carries optional heap_owner_value_id;
+existing sequence book member rows retain it, and concordance checks malformed
+allocation contracts. Runtime-sized FIXED capacity is distinct from dynamic
+growth. lower_sequence_allocate initializes typed scalar columns; existing
+insert/lookup consume pointer cells by exact formal SSA identity. Unsupported
+growth, shaped-row initialization, child pools and live-flag initialization
+remain explicit refusals. No ordinary source constructor automatically selects
+this ABI yet. No per-item Python callback or alternative source compiler.
+
+Native allocator tests cover 0,1,7,4097 elements and int64/int32/float64/float32/
+opaque-handle layouts. Returned allocations persist through subsequent helper
+calls. One native caller allocates columns, inserts at the final runtime row,
+looks up a key above2**60, releases storage, and returns the exact int64 result
+for capacities1,7,4097, without host materialization between those operations.
+These are internal SSA ABI tests, not public-source copier acceptance.
+Final focused heap + real public-source producer regression:29 passed /16.51s
+(13 allocation/sequence tests and16 public-source tests). Guestbook dry-run0.
+
+That chain exposed an incumbent LLVM insertion bug: a ptr-only length operand
+overrode the declared int64 cell, storing double1.0. Untouched C:/dev/tg-base
+reproduced length4607182418800017408 (bits of1.0). The helper now derives the
+length operand from its storage formal; insert/lookup lengths and scan induction
+values use matching int64 contracts. Direct-column native regression passes.
+Heap-address Load pins its value before release; heap loads/stores honor actual
+element alignment and refuse incompatible load layouts.
+
+Final extended batch:83 passed,5 failed /26.77s. All five fail on untouched
+C:/dev/tg-base: obsolete exact fresh-ID assertion, two helper-name assertions,
+and two genuine keyed tensor feed dtype conflicts. Earlier wider batch:
+79 passed,6 failed,3 errors /27.73s. Native loop controls fail on the EXACT
+saved pre-heap snapshot too (1 fail,3 errors /3.31s), though two native numerical
+tests pass on clean tg-base: an earlier staged-patch regression remains OPEN,
+not attributed to this heap change or dismissed as an outdated test.
+Audit case counts remain0,1,0,1,5,0,0; unsourced latch OPEN. No audit suppression.
+
+Unchanged50-line full-native metadata copier retry:2.015371s, still refuses
+callsite14/private formal12, ordinary empty-dict arena, unknown element dtype
+and no proven runtime extent. This ABI removes an allocator/backend absence;
+it does NOT resolve source element layouts, runtime object inspection,
+memo growth or source-to-heap constructor/frame wiring. No copier installed;
+no N4 speedup or main parallelism claim. Main7196 observed alive, untouched.
+
+Promotion patch7:tools/compiler_probes/owned_heap_allocation.patch, UNAPPLIED.
+All seven staged patches pass combined git apply --check. Live compiler source
+and installed accelerator remain unchanged. Snapshot source:
+C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing.
+
+2026-10-10 reference predicates / invocation storage / indexed effect repair — SNAPSHOT ONLY:
+
+Declared builtin reference types now prove positive isinstance predicates through
+the existing ProgramABI fact/fold producer. Unknown dynamic subtypes remain
+unresolved; no negative fold, suffix-name type guess, Python callback or object
+layout assumption. Real native dict/dict, list/(dict,list), object/object micros
+return True. custom.dict is NOT assumed to be builtins.dict.
+
+An admitted SCC edge now leases typed, fixed-size private workspace into a real
+local zeros SSA producer instead of caller.args. Existing mint/lease cells and
+LLVM function-frame allocation are reused; descriptor/accounting authority must
+prove workspace ownership. Unknown/dynamic/opaque storage still refuses before
+minting. Shared caller-bound storage is not made invocation-local.
+
+Mutable repro exposed two exact structural-fold writers: IndexedStore's authored
+ast.Subscript(ctx=Store) was evaluated as a read of [0.0], erasing the effect; after
+preserving the write, folding its initializer still reconstructed distinct region
+arenas. The fold now retains stores and follows their exact base edges to protect
+initializers using the incumbent mutation rule. Untouched live nonrecursive repro
+had zero Stores and lost input n. Snapshot native writes/readbacks exact0,1,4,12;
+recursive parent value survives child call and returns0,1,10,78 at those depths.
+New audit assertion then caught root-only pruning orphaning live capacity/status
+descriptor members; root cleanup now uses the existing callee member-liveness rule.
+
+Final targeted native_structural_producers:16 passed /14.85s; root-prune units:
+3 passed /2.02s. Intermediate broad gate125 passed/1 failed /136.49s caught the
+descriptor defect above (fixed, not excluded). Final focused cross-module gate:
+59 passed/86 unrelated deselected /73.63s. Seven final audits retain counts
+0,1,0,1,5,0,0. Existing unsourced migration remains OPEN; no whole-book-clean claim.
+Combined six-patch apply-check0; guestbook dry-run0, no --apply cleanup.
+
+Exact unchanged50-line copier retried AFTER small success: refuses in1.940700s,
+isolate_metadata/callsite14/callee_ref1/SCC0/private arena12, dtype unknown,
+shape(), declared_workspace=True. Generic object/container operations and dynamic
+arena layout/lifetime remain required. NO native copier installed or measured
+four-rule speedup. Source stays isolated; cumulative native_structural_producers
+promotion patch staged only. Full-main7196 and live compiler/accelerator unchanged.
+
+2026-10-10 structural producer / recursive activation cleanup — SNAPSHOT ONLY:
+
+Corrects the historical identity diagnosis below: id(value) already had a
+native Cast. Its parameter was finalized CALL_ONLY before late materialization,
+and private leaf(id(value)) feeds bypassed that producer altogether. One shared
+producer now handles both, promotes the exact declared parameter through existing
+book cells, and publishes its adopted SSA value. Unused parameters stay unused.
+The existing graph descriptor rule now declares id's int64 result before caller
+planning: native helper forwarding previously rounded handles above 2**53.
+Actual native public/private results are exact at1,4660,2**60+3; no CPython
+object/address parity claim. Public identity concordance has0 gating findings.
+
+The existing SCC activation record was posted, but hierarchy freezing required
+a callsite clone and dropped recursive PlanCalls. Freeze now uses the catalogue
+only for the signature, retaining the actual call without unfolding its body.
+Runtime dependency walking admits those exact catalogue targets, not all registry
+entries. SCC owners are visited once with an iterative worklist; their completed
+plans are frozen after activation. Actual OUR-compiler/LLVM native direct/nested
+recursion returns0,1,4,12; mutual recursion returns0,1,4,11. Full-native/no callback,
+runtime_closure_only=True. No replacement compiler/package or Python dispatcher.
+Original public/private/self/mutual regressions reproduce on untouched LIVE.
+
+Full copier still NOT native. After call recovery it reached6 unresolved calls,
+14 undefined operands,7 structural shortfalls (previous19/13). Inspection found
+another real defect: allocate_result_storage cloned private callee frame slots
+into caller.args along the same SCC; later recursive sites cloned those leases
+again. This produced thousands of extra formals, not a missing-frame-input list
+(unresolved_frame_value_ids was empty). Now refuse BEFORE mint/signature mutation
+on that exact admitted recursive edge. Exact50-line copier rejects in1.918846 s:
+caller isolate_metadata, callsite14, callee reference1, SCC0, private formal12;
+requires per-invocation native storage, not caller-signature propagation.
+This SAFETY REFUSAL is not implementation of invocation-local scratch allocation.
+Dynamic isinstance over opaque_ref and opaque memo membership remain unimplemented;
+their no-native-substitution refusal tests stay explicit. Earlier integer-return
+recursion also exposed an LLVM Phi int64/double mismatch; not repaired here.
+Next: native invocation-local frame ownership plus the accepted object operations
+ABI, keeping shared memo explicit and distinct from each invocation's scratch.
+
+New targeted test_native_structural_producers:8 pass /7.53 s;5 native positive
+cases plus3 explicit capability refusals. Pre-final-safety extended gate154 pass,
+1 skipped,2 documented hierarchy cases deselected /129.24 s. One native-loop
+execution timeout reproduces unchanged on BOTH live and snapshot /23.68,23.67 s;
+do not hide it or remove its existing execution bound. Final-source extended gate:
+155 passed,1 skipped,2 documented hierarchy cases deselected /132.22 s. Seven
+final-source audits retain0,1,0,1,5,0,0 findings; OPEN-latch unsourced migration
+debt still exists. Guestbook dry-run validator0, no --apply cleanup performed.
+Six staged patches, including native_structural_producers.patch, pass combined
+git apply --check; NONE promoted live. Native source fingerprint changed again;
+rebuild normally before future accelerated timing. Full-main7196 left untouched;
+no long benchmark or main restart launched in this cleanup.
+
+2026-10-10 requested N4 completed; exact metadata copier native pursuit BLOCKED:
+
+User requested four-rule test. Snapshot (ABI sharing + dependency cone) ran
+existing probe_four_rule_timing --graph-workers1,8 resident regions,no trace or
+deadline, matching726431cbf86656cc6973da89e78cf980 native storage unit, original
+external examples. All4 stale laws rebuilt; OUR snapshot compiler path printed.
+Exit0 /507.330979 s (8m27.33):47.617967 s /8.5806% below previous554.948946,
+but20.951189 s /4.3076% above older486.379790. Single runs, full-main concurrent;
+no causal attribution or orbital execution/parity claim.996 functions.
+Combined begin172.714214;begin->SSA300.786486;combined whole334.614719 s.
+Remaining delta vs older:13.032525 s pre-combined,7.918600 s combined; prior
+combined355.558314 ->300.786486 recovers54.771828 s. Native17 calls/143043 facts
+cost0.622484 s INCLUDING transfers, not the hundreds-of-seconds bottleneck.
+Output root snapshot build/profile_memory_n4_native_storage_rmf6odxo/profile_memory_n2.
+C SHAd73885274cde3e219393c8bdb73b7f3c5a94a611732cc7e9b6d9cd499fe1ef0c;
+not identical to older artifacts. Max printed stage RSS6157 MiB (prior6460),
+progress peak6141 is a different sample. Book2203575 resident cells/0 spills
+(prior1590383,38.56% more); edge/dependents715970 each. Cause of book growth NOT
+attributed. Final concordance detector reports its own Unresolved.value_id
+exception; compilation exit0 is NOT a clean concordance audit.
+
+User challenged full-main provenance: actual worker7196/parent33064 created
+Oct9 18:25:20 America/Chicago under earlier explicit full-source lower request
+and timeout-removal request; NOT restarted this turn. Today N4 worker22236/
+parent30192 created Oct10 07:35:52, now finished. Main remains untouched.
+
+Read-only follow-up tiny profile (with metadata/caller-work observers):
+21.35M calls /9.198 s profile;165 folds/2.048 cumulative seconds,18625 descriptor
+calls/1.251 s,515987 copier calls/.860 s,24372 book.post/1.042 s. These costs
+OVERLAP; observer itself adds~.452 s, wall9.910813 s is instrumented.33 whole
+copies traverse213733 ssa_identity_tokens entries,60 region copies39054; other
+receipt copies remain. This does not attribute N4 timing or show a native win.
+
+User then explicitly requested fully compiling the~500k-call dispatcher.
+Submitted EXACT incumbent isolate_metadata nested function (50 authored lines)
+inside one root taking value+shared memo, through sanctioned public lowerer,
+existing reference ProgramABI and full-native/no-callback contract. No copy
+algorithm substitution, packing walk, per-item callback or production route
+switch. Initial~1 s refusal: predicate comprehension for `if all(new is old
+for ...)` assigned to branch body by full AST.walk containment. Existing
+ordinary-conditional nesting uses arm slots instead. Same source-slot policy
+now applied to heterogeneous loop/conditional nesting in SNAPSHOT ONLY.
+Fail-first predicate test fails on snapshot ANDlive;body test already passes.
+After fix24 ownership/control tests pass /1.58 s. This is NOT a native copier.
+Whole exact source now reaches SSA but full-native gate reports19 undefined
+operands plus recursive call-result-unavailable/type/membership structural
+results; no LLVM artifact or installed replacement. Minimal reference-input
+`return id(value)` rejects unnamed/unaccounted formal; `isinstance(value,dict)`
+has unavailable result. tuple(value)/list(value.items()) emit complete LLVM in
+minimal compile-only checks, NOT object execution/identity parity. Do not
+claim all dynamic container primitives absent or those emissions correct.
+Actual blocker is runtime object identity/type and recursive result producers
+under existing reference ABI; not performance of integer graph arithmetic.
+Need native object-operation lowering/accepted exact object ABI before this
+entire copier can run compiled. A wrapper forwarding to Python does NOT meet
+the request; no such wrapper installed. Existing copier stays unchanged.
+Repro snapshot tools/compiler_probes/probe_native_metadata_copy.py, no timeout.
+metadata_copy_control_ownership.patch preserves fix/test/exact repro; all5
+staged patches pass combined apply-check, NONE promoted live. Snapshot glsl
+change intentionally invalidates the7264 native storage fingerprint; refresh
+normally before a later native-accelerated benchmark, never force stale load.
+Final combined gate169 passed /41.74 s, same4 audited stale exclusions, actual
+nodus DLL env enabled. Seven-case concordance audit after ownership fix retains
+0,1,0,1,5,0,0 findings. Guestbook validator dry-run exit0, no --apply cleanup.
+
+2026-10-10 audit of the four original dispatcher failures:
+
+Reproduced on LIVE:4 failed,29 deselected /3.77 s. No compiler or test edits
+for this audit. These four are test-maintenance defects, not demonstrated
+compiler shortfalls. Do not silently turn the exclusions into passing tests.
+
+- tensor_accessor_and_its_scalar_comparison_stay_with_coordinator: accessor
+  verdict COORDINATOR_ACCESSOR still holds; comparison verdict NUMERICAL_WORK
+  contradicts the test's old metadata expectation. This is the explicit
+  Sept30 scalar-expression-deferral removal, documented in
+  docs/DECISION_scalar_expression_deferral_2026-09-30.md. The scalar must have
+  one recorded producer, not deferred recomputation by selected consumers.
+  Existing public-entry annotated-scalar probe rerun:all3 forms pass.
+- a_lookup_nobody_reads_is_not_a_region_boundary:fixture has no ingestion
+  scope; raises while deriving output Store identity, before boundary assertions.
+- dispatch_exports_a_value_routed_by_identity:same missing scope/identity rows.
+- dispatch_exports_an_internal_value_used_outside_the_region:same fixture flaw.
+
+Diagnostic-only wrapper declares ingestion/lexical/operand scopes and posts
+INGESTION_VALUE NodeFacts exactly as the existing scoped dispatch-cut fixture
+does; actual _dispatch_subgraph and original test assertions unchanged. All3
+then PASS: lookup outputs(1,3) ->(3,) when inert ignored; identity export(1,2);
+external consumer export(1,2) with2 Store nodes. No production fallback, identity
+guard suppression, weakened provenance or altered boundary expectation.
+Next authorized test-maintenance pass should modernize these fixtures and the
+scalar expectation, preserving all boundary assertions and identity refusal.
+This does not establish whole-compiler correctness or GPU dispatch efficiency.
+
+2026-10-10 reusable dependency cone — isolated, prior authorized work:
+
+src/compiler/dependency_cone.py accepts exact identities plus existing relation
+readers, FIFO O(Vcone+Econe), or incumbent sweep order to preserve invalidation
+cause/event order. parent_record_dependents derives one phase-local O(V+E)
+index from authoritative operand records, including absent producer keys;
+caller owns rebuilding after writes. No new graph/book/descriptor cache.
+Descriptor withdrawal and call-result descendant re-settlement now reuse it.
+Reverse64 chain fail-first2016 reads ->126; sizes32/64/128/256 ->62/126/254/510.
+40 deterministic mixed-graph oracles retain exact final data/cause/event order;
+FIFO re-evaluation retains old visit order. Final focused gate145 pass /44.72 s,
+same4 audited exclusions; this gate ran without nodus DLL env and warned about
+pure-Python tensor backend. It is a correctness gate, not a timing comparison.
+Cold fixed-PYTHONHASHSEED=0 DT original-cone3.9488375 s vs new3.7688789 s:
+same730 ABI publications/24106 summed sizes,40 functions,0 findings; both LLVM
+hash570695ad11b99133402dc4ffe833b8f658a147584dc611d74538c39e621e7b34.
+One sample pair does NOT establish wall gain. Global165 prefolds unchanged.
+Optional descendant-wave publication batching was removed; final code retains
+original per-query publication policy. No N4 rerun/speedup claim.
+dependency_cone.patch plus updated serial_graph_scaling.patch diagnostic and
+previous ABI/native-link patches pass combined git apply --check; unapplied
+live. Full-main7196 left alone, last read46907.62 CPU seconds/1193.6 MiB RSS.
+Snapshot native storage rebuilt/load-verified through OUR public lowerer/LLVM
+under726431cbf86656cc6973da89e78cf980:0 findings,1306 unsourced facts/93 identities,
+latch OPEN. Native DT actual outputs exact0.9/.25 /11.7404743 s total probe;
+0 findings,888 unsourced facts/0 identities, OPEN. Seven existing audit counts
+unchanged0,1,0,1,5,0,0. Guestbook validator dry-run exit0, no cleanup --apply.
+
+2026-10-10 shared declarative ABI — isolated, measured work reduction:
+
+User: "Proceed" after the slower N4 handoff. No new long orbital run launched.
+Small real _propose_dt_pen public-entry profiling:93 graph extractions,575688
+isolate_metadata calls,165 structural-fold calls /13428 fold descriptor reads.
+Shape settlement/folding remains a larger candidate, not replaced here.
+Exact field counter identifies59460 recursive ABI metadata visits across60
+proper regions. Public lowerer additionally deep-copied all schemas per function,
+before AND after canonical reduction. Writer inspection: program_abi installed
+by whole assignment; readers derive mutable parameter_record_abi views and do
+not mutate the declaration in place.
+
+Snapshot now shares that compilation-owned receipt across catalogue functions
+and proper compartments, via existing _COMPARTMENT_SHARED_METADATA ownership.
+Whole-callsite specialization still deep-isolates its containers. No provenance
+disabled, graph identity guessed, native shim, new compiler or package. Schema
+assignment work O(functions*schema size) ->O(functions+schema size), and region
+receipt copies eliminated; NOT a whole-compiler asymptotic/memory bound.
+Fail-first2 tests ->2 pass: actual public catalogue pointer sharing,32 singleton
+regions/128 schema records with0 schema traversal; nested specialization edits
+cannot alter source. Full gate97 passed /41.32 s with same4 known exclusions.
+Tests now split across test_plan_descriptor_publication and
+test_shared_program_abi_receipt; new file2 pass /1.38 s after separation.
+
+Metadata profiler now516168 calls (59520 fewer, ~10.34%). Region ABI counter0;
+whole-specialization ABI visits remain32703. Cold DT LLVM hash still
+570695ad11b99133402dc4ffe833b8f658a147584dc611d74538c39e621e7b34.
+Actual native execution via OUR lowerer ->existing LLVM emitter returns exact
+0.9/.25;0 concordance findings,888 unsourced facts/0 identities, latch OPEN.
+All seven existing audit cases rerun: finding counts remain0,1,0,1,5,0,0.
+Before unprofiled DT times3.258604/3.147716/3.400177 s; after metadata-observed
+3.072286/3.346539/3.699394 s overlapped regression gate and full-main. NO causal
+wall gain established. Repeated same-process LLVM hashes still differ; only
+cold identity is asserted. Profiling itself costs~8-10 s vs~3 s unprofiled.
+io.open also varies greatly (.776/1.970/.358 s exclusive across samples); one
+string-table write accounted for1.584 s in second pre-change profile. Do not
+attribute elapsed variance to graph changes. Pool still92 writes/220 reloads
+in the slice. No spill format/policy/cache invalidation weakened.
+
+Live promotion patch tools/compiler_probes/shared_program_abi_receipt.patch,
+independent core hunks; serial_graph_scaling.patch diagnostic updated. All3
+staged patches pass one combined git apply --check, NOT applied live. After
+promotion native asset must be rebuilt under its actual fingerprint as usual.
+Snapshot storage unit rebuilt and load-verified at fingerprint
+718d64f3130504f1fc1db1746f5016ba through OUR public entry/LLVM. Asset audit0
+findings, same1306 unsourced facts/93 identities, OPEN latch. Live full-main
+PID7196 remains active and untouched, last read45512.125 CPU s/1273.5 MiB.
+Next: repeated fold/descriptor work and remaining immutable receipt copies,
+using exact writer/reader boundaries and tiny repros. N4 benefit of THIS ABI
+change has not been measured; previous554.948946 s remains the large-run receipt.
+
+2026-10-10 remaining receipt scans — isolated, N4 COMPLETED, NO wall gain:
+
+Fail-first real48-add lowering found97 settlement and49 dispatch-carving ABI
+publications per fixed graph. Existing settlement walk now publishes once at
+the original first read; existing immutable dispatch index owns the same lazy
+first-read boundary. Each value still gets a fresh _DescriptorQuery. No shared
+descriptor answers, disabled provenance or altered transfer rules.
+Gate95 passed /40.29 s; same four known dispatcher failures explicitly excluded.
+Real128/256/512 arithmetic:45 publication calls at EACH size, summed graph sizes
+14731/29323/58507, vs partial implementation113547/423563/1634445. This receipt
+work now doubles rather than quadruples; whole compilation is NOT proved linear.
+Observed times1.584164/3.011236/6.743024 s with caller-work observer and concurrent
+full-main: no additional wall gain established against partial512 time6.570869.
+All three LLVM hashes below still match; zero arithmetic concordance findings.
+
+Existing storage-effects native unit rebuilt through OUR public lowerer/LLVM in
+snapshot, fingerprint619c4b55579500dfada7e845e9fab6bf. Asset source audit1690 rows,
+188 functions,0 findings, but latch OPEN (1306 unsourced facts /93 identities).
+N4 ran from the snapshot with that matching asset, --graph-workers 1,
+resident regions8, no trace/deadline, compile only. External original examples
+selected via TURING_PROBE_EXTERNAL_ROOT=C:/dev/Powershell/turing; compiler source
+path explicitly verified as snapshot. Output root build/
+profile_memory_n4_native_storage_mo1powht. Full-main PID7196 still concurrent and
+untouched: timing is NOT isolated. Promotion patch refreshed
+and git apply --check passes; NOT applied while live source pursuit continues.
+Remaining mutable-fold restarts/global work are not fixed by receipt batching.
+The Oct9 next-step notes below are historical; the asset and snapshot benchmark
+no longer need to wait for promotion. Live promotion still waits for main exit.
+
+Completed exit0:554.948946 s (9m14.95), vs prior486.379790 s (8m06.38):
+68.569156 s /14.097863% SLOWER. Both1 graph worker/8 regions/no trace/deadline,
+both rebuilt all four laws, both concurrent with full-main. Snapshot additionally
+includes staged native-link fix and all serial graph cuts, so this is NOT an
+isolated attribution to either one.17 native calls/143043 facts cost0.646459 s
+INCLUDING transfers: still not the minutes-long bottleneck. Combined begin
+165.077906 s; begin->SSA355.558314 s (old296.812716); combined whole389.868437 s
+(old326.696119). About58.75 s of68.57 s extra is in combined source-to-SSA.
+996 functions. Max printed stage RSS6460 MiB vs6437; progress peak6180 MiB is
+a different sampling measure. Book1590383 resident cells /0 spills. NO memory
+gain established. C SHAea56fd8317c754affc0b502870d15262ad67a2ea209ea58c4ae00b7f924b5bb7
+differs from prior hash below: value numbering plus storage/call ordering differ.
+Not byte parity, and no orbital execution/numerical-parity claim. Small arithmetic
+LLVM parity remains established. Do not promote this as a four-law optimization.
+Next: attribute combined planning/instantiation and SSA cost with tiny targeted
+repros before another long benchmark; fold whole-graph restart/descriptor snapshot
+work remains a candidate, not a measured cause of this timing difference.
+Full-main last observation PID7196 CPU23235 s /1260.4 MiB; still active, no new
+output on session poll. No timeout, source mutation or interruption.
+
+2026-10-09 serial asymptotic reductions — isolated, NOT live:
+
+User: "we need to be cutting down the minutes long processes, we need to be making powers of O reductions".
+Implemented in current-source snapshot C:/Users/alber/.codex/worktrees/
+native-fallback-link/Powershell/turing; no live compiler source/asset changed
+under the no-deadline full-main pursuit. Promotion patch:
+tools/compiler_probes/serial_graph_scaling.patch (git apply --check passes).
+This patch is independent of the staged native-fallback link patch.
+
+Existing graph/ABI/concordance rules remain authoritative. Changes:
+1. ABI identity publication: dirty round worklist over exact parent records,
+   with loop-target writes invalidating their actual consumers. Same transfer
+   and insertion/round ordering, bounded fixed-point guard retained. Reverse
+   record chain changes O(N^2) node work to O(N); NOT a general convergence
+   guarantee of O(V+E) for arbitrary conflicting/cyclic identity rules.
+2. Region identity-token projection: keyed lookups for region members, not
+   scan all function tokens per region. O(R*V) -> O(sum of region sizes)
+   for THIS projection only, not all metadata copying or whole compilation.
+3. Read-only plan freezing publishes ABI at first descriptor read once.
+   Fresh existing _DescriptorQuery per value, no shared descriptor answers.
+4. Structural folding batches publication between actual operand/topology
+   writes and resets at each sweep. Literal replacement, removal, aliasing
+   invalidate the boundary. All descriptor/provenance writes remain active.
+   48-add public-entry repro observed388 checks with0 operand writes BEFORE;
+   now <=4 per fold invocation. Plan freezing49 ->1 per invocation.
+
+Gate:94 passed /44.29 s, four known dispatcher tests explicitly deselected.
+Full dispatcher module: those same four failures reproduced on untouched LIVE
+sources (metadata comparison and three ingestion-scope-less synthetic graphs).
+Hierarchical gate45 passed /2 failed; both failures also reproduce live:
+legacy _sequence_concat_ops unpack count; packet function_address disagreement.
+Formal-shape gate16 passed /1 failed; same empty history failure reproduced live.
+No fixes/relaxations for those unrelated failures. Original seven-case concordance
+finding counts 0,1,0,1,5,0,0 are the comparison baseline; latch remains OPEN.
+The graph worklist is compared against frozen original transfer code on48
+cases incl40 mixed-rule graphs, loop targets and exact span shape book facts.
+
+Small real public-entry arithmetic scaling (single runs, concurrent unchanged
+full-main job; NOT a controlled four-law timing):
+128 ops old/new1.994243/1.911884 s; publication calls12019/429.
+256 ops old/new3.314352/2.910634 s; publication calls23923/813.
+512 ops old/new8.141574/6.570869 s (~19.3% lower observed wall);
+publication calls47736/1582; publication time1.256325/.090277 s.
+Summed graph sizes checked60064147 ->1634445 at512. Remaining checks still
+grow quadratically: whole compiler is NOT O(N), and minutes saved NOT proven.
+All three corresponding emitted LLVM texts are BYTE-IDENTICAL (SHA256):
+128 b8aed9007c1e95d0a2c76f2075b32c8c0533ea988cc0fdbb157f3c948e48bdbe
+256 3b52979e2f0893230363a2b072301465b4ce718911ef0aeae27508fb2512ce97
+512 422dcd034394410e30364950594ee7b2409d802127bb16a7e5308bab2dc2e7fb
+All three have0 concordance findings. Existing DT proposal native execution
+also passes exact outputs0.9 and0.25, public lowering -> existing LLVM emitter.
+Cold DT lowering old/new3.806376/3.780554 s: NO meaningful tiny-DT wall gain.
+Publication calls15922 ->1372; summed sizes1780234 ->54288. Cold emitted LLVM
+SHA570695ad11b99133402dc4ffe833b8f658a147584dc611d74538c39e621e7b34
+is identical. Repeated same-process DT emissions are NOT consistently identical
+across old/new (second emission differs, third agrees); cause unestablished.
+Do not claim universal byte parity from the cold proof or native examples.
+
+Repro in snapshot: python -u tools/compiler_probes/probe_serial_graph_scaling.py --arithmetic-scaling --llvm-proof
+Add --original-passes for frozen publication + original per-query policy.
+Diagnostic baseline keeps one extra cached publication at each batch boundary;
+it is NOT a byte-for-byte historical compiler. No trace or lowering deadline.
+For DT probe, set TURING_PROBE_EXAMPLES to live turing/examples in this snapshot,
+and NODUS_TENSOR_CORE to the already-built live DLL. No packages/foreign source
+compilers installed; no new native compiler unit claimed for these Python passes.
+Next: remaining unbatched receipt scans and mutable-fold restart/global scans;
+measure exact writer/read boundaries before batching. Promote both staged patches
+AFTER main job exits, rebuild native assets with existing fingerprint gate, then
+the user can launch the four-law comparison. Do not edit under source pursuit.
+
+2026-10-09 user-authorized N4 native-analysis benchmark — COMPLETED:
+
+Repro: python -u tools/compiler_probes/probe_four_rule_timing.py --graph-workers 1
+No trace/deadline; explicit serial source route; 8 resident regions; fresh output
+build/profile_memory_n4_native_storage_xl7u1you/profile_memory_n2. Existing
+unmodified full-main job runs concurrently: NOT an isolated timing. New native-
+link patch is still staged, NOT applied; compiler sources/assets untouched.
+Load-only matching native storage-effects asset observed. First actual call
+594 value facts /1.4493 ms including transfers. Completed exit0, 486.379790 s
+wall (8m06.38), all four stale pieces rebuilt. This is113.068210 s /18.8620%
+below latest599.448 s, but21.839790 s /4.7014% slower than older464.540 s.
+NOT an isolated causal accelerator-only comparison; see changed settings below.
+Installed native analysis:17 calls,143043 value facts,0.510050 s total INCLUDING
+packing/unpacking. Combined begin159.681689 s, begin->SSA296.812716 s,
+combined end-to-end326.696119 s. Module996 functions, C source SHA256
+561cc7e1061aa4f454206e5d0db3308cd910d346ef5c7ae37abf9ae59aae910b.
+Maximum printed stage RSS6437 MiB (old5606 MiB); sampled progress peak6255 MiB
+is a DIFFERENT sampling measure. No memory improvement. Peak book1623974 cells
+resident, zero pages spilled. Compile only, no orbital execution/parity claim.
+User has now prioritized RAW SPEED, not parallel/memory-tiling prerequisites.
+Use phase timings to select the next substantive SERIAL native conversion.
+
+Initial same-config 4-worker attempt FAILED before its first law: public entry
+ensure_graph_foundation -> compile_and_register_dependency_levels_accelerator
+-> OUR public lowerer -> _class_surface_ssa_program refused exact carried arms
+63/initial21 and34/initial11 as name_arm_version_missing. This is a regression
+in the native graph-foundation bootstrap; do not hide it or claim 4-worker gain.
+Retry explicitly selects preserved graph-workers=1 lane; comparison with old
+599.448 s (4 workers) is confounded by that setting, overlapping full-main job,
+and reduced per-AST-node console printing in this new diagnostic. Existing
+profiler's stage/RSS/histogram work remains; law staleness/rebuilds remain real.
+No compiler fix/change to evade refusal and no other source compiler/packages.
+
+2026-10-09 native-link / authored-fallback boundary — isolated, NOT live:
+
+The no-deadline main self-lowering is still running. Its compiler sources and
+installed assets remain unchanged. A current dirty-source snapshot under
+C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing holds
+the fix and tests; it is NOT the clean historical baseline or a new compiler.
+Promotion patch: tools/compiler_probes/native_fallback_link_boundary.patch.
+git apply --check succeeds on the live dirty tree; DO NOT apply under the
+running main source-pursuit job. Promote afterward, then regenerate the native
+storage-effects asset under the existing changed-toolchain fingerprint gate.
+
+Observed: installed.__turing_deployed_callable__ IS the real LLVMPiece, but
+llvm_piece_of(installed) returned None. Public lowering reached graph source
+pursuit -> ExtractionContract.decide -> subject -> inspect.getsource on the
+installed fallback; the source-read trap failed there. Fix follows only that
+existing deployed edge and validates the ordinary piece ABI; no graph/ABI copy,
+name inference, foreign source compiler, or new package. Native verification
+flags alone remain insufficient; unrelated __wrapped__ decorators and cyclic
+deployment references do not become native links.
+
+Further trapped consumers: declare_external discarded the resolved piece and
+compiled a new signature; retained mapping/sequence factories checked .module
+on the wrapper and published no native bindings. They now consult the resolved
+piece. External slots reuse exact buffer/value IDs and the native entry address,
+not a Python callback. Retained-container tests stop at the actual source graph
+boundary; they are NOT whole-record native execution proofs.
+
+Explicitly rebuilding a submitted root must still compile its authored body.
+The old auto-link writer attached the existing bodyless native module to that
+submitted definition; deployment yielded None and the tail failed on .metadata.
+The existing selected/whole-source root election now excludes its native
+binding from dependency auto-linking. Other native dependencies stay linked.
+
+14 boundary regressions pass in 12.30 s. Actual caller native execution agrees
+exactly: [5,1,13.25]; direct/wrapped links contain just caller plus one bodyless
+declaration, 0 fallback source reads and 0 concordance findings. Direct/wrapped
+lowering .549430/.540208 s, single overlapping-run samples NOT a speed claim.
+Existing source/activation/extraction and payload retention gates also run in
+the isolated snapshot: final combined gate 59 passed /46.25 s. Repro there:
+python -u -m pytest tests/test_native_fallback_link_boundary.py tests/test_source_realization.py tests/test_compiler_bootstrap_runtime.py tests/test_extraction_contract.py tests/test_llvm_piece_runtime_payload.py -q --tb=short
+A native runtime adapter lacking a declared link ABI is
+NOT covered by this change; do not bypass source ingestion based on a DLL flag.
+Initial fresh-snapshot tensor imports automatically built the existing CFFI
+bridge; that is incidental backend initialization, not the compiled test unit.
+Later gates point NODUS_TENSOR_CORE at the existing live DLL and reuse cached
+bridge state. No package installed. All tested program compilation uses the
+sanctioned lower_ast_source_to_ssa entry and existing LLVM emitter/toolchain.
+
+2026-10-09 entire main compiler submitted to its own public lowerer:
+
+User explicitly removed the diagnostic timeout. The current repro below has
+NO parent deadline and no periodic faulthandler "Timeout" dumps. A new run
+was launched without either; the45/90-second results below are historical
+terminated attempts, not the current run or semantic compiler refusals.
+
+Repro: python -u tools/compiler_probes/probe_main_compiler_lowering.py
+Unchanged complete fortran_c_shell.py (45,000 lines), selected public entry
+lower_ast_source_to_ssa; full-native execution overlay on the existing
+program_extraction contract, actual module bindings, normal reachable closure.
+Source SHA256 ef4ba61f2107de15b3ec51a9aa7a0f6fdf4b035fc70cf98577bf4b24f7d74036.
+No extracted helper, substitute compiler, target execution or compiler edits.
+
+Initial45-second and stack-observed90-second children reached source closure
+but hit their diagnostic deadlines BEFORE ProcessGraph build/SSA completion.
+This is NOT a semantic refusal or proof of an unsupported construct/ABI.
+The90-second run discovered the real main implementation at work item33 and
+ProcessGraph at438, then graph linking at443. At25 and50 seconds both stacks
+showed deepcopy(cached) in graph_express2._source_ast_definition line788,
+called by class-field/constructor reference resolution. One route was
+_ast_definition_bindings -> _class_field_reference; both ran beneath
+_expand_unresolved_ast_parents, invoked by main entry line44277 and impl42848.
+At75 seconds the stack was traversing AST children. These samples identify
+observed front-end work, not a complete timing attribution or infinite loop.
+No main SSA module/native artifact produced; no concordance-success claim.
+Probe streams progress through sys.__stdout__ because discovery internally
+redirects incidental stdout. Repeating25-second stack dumps are CPU-stack
+diagnostics only, NOT malloc tracing. Parent kills only its own timed-out child.
+Installed fused analysis component remains unchanged and compatible.
+
+2026-10-09 FUSED native effects + pointer-storage inference — latest:
+
+Both whole-module analyses now execute in ONE invocation of the same authored
+~230-line program through OUR compiler. Pointer inference preserves the exact
+local GEP/PtrCast relation (NOT View/call edges), Load-result/Store-value dtype
+occurrences, no-evidence/exact-type/conflict joins and 'ptr' publication veto.
+Known physical types/accounting survive. Imported effect facts override body
+effects while original local typed-memory inference still reads the body.
+Native owns both fixed points, CSR/queue work and final tables. Host only packs
+existing SSA facts and publishes final formal accounting. Scratch is reused;
+native zeros allocate directly, without duplicate Python zero lists.
+
+Matching default asset: build/compiler_foundations/storage_effects/products/
+e2727d33f52be72e48858609d2d2a5ff/compiler_storage_effects__read_only_storage_effects.dll.
+Same build-once/checkpoint/fingerprint/digest LOAD ONLY deployment. No alternate
+source compiler/packages. The historical asset and numbers below predate fusion.
+62 modules / 61 native calls, exact all-value effects and complete formal
+accounting on 27 pointer modules. Fresh-process real serial lowering reuses
+the component in 3 rounds / 2090 facts, binary outputs .9/.25 unchanged.
+Native/audit gate: 4 passed / 32.59 s. Focused branches/adapters: 17 / 17.66 s.
+
+SOLO combined-section medians, packing/unpacking/publication included:
+25 values .059400/.134200 ms Python/native (tiny loss).
+648 values 10.843000/1.061175 ms (10.218x).
+5400 values / 384 queries / 5040 instructions / 9970 operand occurrences:
+471.711250/8.369925 ms (56.358x), saved 463.341325 ms per section pass.
+Separate Python stages on the largest input: pointer inference 14.593350 ms,
+read-only queries 454.328100 ms. Independent medians need not sum; 56x is NOT
+incremental pointer-only or end-to-end/N4 speedup. Cold lookup/load .070959 s.
+Repro: python -u tools/compiler_probes/probe_storage_effect_timing.py
+35-second child bound; public source entry forbidden during section benchmark.
+
+Exact trapped faults fixed at their writers: true-only store-version 462
+rebound Phi319 -> Phi321, then used on parent false edge in Phi322(321,321).
+Carried readers now require existing exact-object CFG dominance, then use the
+existing concorded alias/snapshot rules. Separately incumbent/proposed shared
+366; only proposed merges to 373/374. Blanket merge publication changed366
+to374 and compared proposed with itself. Existing name_binding facts protect
+the other binding's source. Tiny native branch regression trapped the later
+reconcile_conditional_phi_continuations writer repeating 0->Phi18; it honors
+the same Phi receipt. Audit verifies the receipt against scope_rows of its
+declared read scope, including copy-on-read scope_origin projections.
+Observers: build/observe_storage_phi.py, build/observe_shared_conditional.py.
+0 structural findings; unsourced latch OPEN, not a closed provenance audit.
+Legacy whole-object conditional test still returns None module and also fails
+untouched C:/dev/tg-base (2.66 s); excluded from final green gate, not hidden.
+Baseline cannot lower the whole larger source, so its Phi fault's age is unknown.
+No N4 launched. Main refinement/planning is NOT converted to native yet;
+whole-source/final-SSA memory tiling and main compile parallelism unfinished.
+
+2026-10-09 whole-module native storage-effect component — historical before fusion:
+
+OUR public compiler compiled graph_refinement_kernels.read_only_storage_effects
+as a complete program: dependency construction, reverse CSR, definitions and
+write seeds, alias/call fixed point, queue and final Boolean table are native.
+No Python callback/per-value native call inside that analysis. SSA marshalling
+and consuming its results remain host boundaries, not a replacement compiler.
+The physical-call adaptation round now uses one table per whole module. Missing
+or stale installation retains the existing _read_only_feed route, never auto-
+compiles this component. Existing ArtifactCheckpointStore saves a stripped
+artifact under a content-addressed immutable product directory; exact compiler,
+authored/host source and platform fingerprint plus DLL digest guard load-only.
+Explicit builder/load APIs live in native_compiler_accelerators.py.
+
+Default installed asset: build/compiler_foundations/storage_effects/products/
+6d37c031b07e725a640a6ef274295df1/compiler_storage_effects__read_only_storage_effects.dll.
+Changing fingerprinted compiler files intentionally invalidates the installation;
+explicitly regenerate it after such edits, never weaken the matching gate.
+
+Latest native gate: 2 passed in 26.41 s. 35 SSA modules (one empty), 34 native
+calls, every value agrees with the original recursive analyzer; pure recursion,
+recursive writes, alias definitions vs address effects, Store value/index roles,
+imported read-only facts and exact callee formals included. Fresh child loads
+without compilation, actual serial compiler performs 3 whole-module calls /
+2090 value facts and native outputs .9/.25 exactly. DT is only an integration
+input, not what was compiled. Structural findings 0, unsourced latch OPEN.
+
+Section benchmark is NOT a DT or whole-compile benchmark. Repro:
+python -u tools/compiler_probes/probe_storage_effect_timing.py
+35-second parent; public compiler entry is forbidden, proving LOAD ONLY.
+Five-sample medians include input packing and complete output table unpacking:
+1 function/4 formal queries/21 values: Python .03475 ms, native .09485 ms.
+8 functions/64 queries/584 values: 8.78095 / .95705 ms (9.175x).
+24 functions/384 queries/5016 values, 4656 instructions/9586 operands:
+434.70860 / 7.904625 ms (54.994x), saves 426.80398 ms. Native supplies ALL
+value facts in one call, Python is timed only on actual formal-query usage.
+Fresh-process asset lookup/DLL load separately .068812 s. Synthetic SSA call
+chains, not N4 or an end-to-end compiler speedup. Tiny inputs remain slower.
+
+This larger authored program exposed invalid nested conditional pointer Phis:
+arm 215/216 (entered loop versions) was rebound to child Phi145/Phi169 by
+lower_conditional->_rebind_view->_bind; parent false edges then consumed the
+child Phi. Observed stacks/old-new writes in build/observe_storage_phi.py.
+lower_conditional now snapshots already-bound true/false arm identities through
+the existing carried_snapshot rows, not only source initials 37/38. No future
+branch-local value is materialized. LLVM accepts the unchanged large program.
+The clean baseline cannot lower this whole program (overlapping-control-region
+refusal), so it did NOT establish the age of the Phi defect. No baseline claim.
+
+The earlier native dead-metadata worklist is preserved but not the active
+component: 81 graph cases (80 native calls) match exact removal order; real
+energy lowering's 26 passes match graph/book rows, 25.24 s. Its Python graph/
+book publisher boundary was rejected by the user as insufficient. Keep that
+history distinct from the now-complete native storage-effect analysis.
+
+2026-10-09 first native serial-unit checkpoint:
+
+Descriptor broadcast integer law now has SAME authored Python eager/native
+body in graph_refinement_kernels.py. Explicit existing-registry builder:
+native_compiler_accelerators.compile_and_register_broadcast_shapes_accelerator.
+Only admitted proven operand extents cross the ABI; original unknown/conflict
+guards, dtype/Precision and concordance publication remain. No automatic
+compilation/registration or foreign source compiler/packages. Per-invocation
+scratch/feeds; two overlapping native invocations matched 407 exact cases.
+Int64-inadmissible extents use SAME eager body before execution, not coercion
+or native-fault rescue. 2**63/2**64-1/2**100/non-integer cases gated.
+
+Real SERIAL DT proposal Python/native/Python: exact .9/.25 every time, 0
+structural findings, unsourced latch OPEN. Only 53 admitted broadcasts, .170-
+.175 ms eager TOTAL vs 4.326 ms native. Public lowering 3.765/3.812/3.907 s;
+whole check 11.131/10.970/11.104 s: NO compiler speedup. Final solo bulk ABI
+check (packing/unpacking included): 4096 rank8 7.504/6.753 ms eager/native;
+rank32 19.926/17.303 ms. Single rank2 1.435/36.367 us, 256 rank2 .271/.305 ms.
+Native availability is verified; performance is workload-dependent. Keep
+eager/default serial and both preserved routes. Do NOT launch N4 for this.
+
+Final targeted gate 16 pass/1 deselected in 12.58 s. The excluded projection
+history test ALSO fails unchanged on clean C:/dev/tg-base (0.60 s):
+test_callsite_formal_shape_concordance.py::test_existing_call_projection_is_enriched_by_later_exact_descriptor.
+It reads () instead of two callsite_projection_specialization rows. No fix
+or identity-key weakening. Earlier combined gate: 13 pass/that 1 fail,11.13 s.
+Syntax/whitespace pass. Bounded probe tools/compiler_probes/probe_native_shape_transfer.py
+has 55-second parent and ten-second native children; --benchmark-only skips
+DT runs. Artifacts build/native-shape-transfer-checkpoint / -solo. No N4 run.
+
+New CPU-only serial profile 20,292,830 calls/7.850 s. Fold 1.901 s cumulative
+but .083 self; descriptor 1.447/.309, shape publication .314, ABI identity
+publication .199, book post .903 s. These overlap and are not normal timings.
+Next native selection must measure an actual larger structural/dataflow
+island, not treat whole-query cumulative time as extent arithmetic cost.
+See sibling speaktome/todo/turing_graph_residency_workers.stub.md.
+
+2026-10-09 preserved-route / native-serial roadmap checkpoint:
+
+User redirected further architectural tiling work toward identifying native
+units in the reliable serial process. Nothing was broadly reverted. Both DT
+routes are explicit: lowered_system(source_compilation="serial"|"units").
+The previously enabled units default is unchanged; serial omits partitioned
+source options entirely. Public lower_ast_source_to_ssa remains serial when
+partitioned_directory is absent. Full orbital compatibility of units is NOT
+established. The current roadmap is in
+speaktome/todo/turing_graph_residency_workers.stub.md (workspace sibling).
+
+Real DT proposal now lowers/links/executes through four units (84/24/135/10
+nodes), peak two workers, exact outputs 0.9 and 0.25. Clean serial/native control
+also returns both exactly. Unit/native total 25.943 s vs clean serial 10.801 s:
+NOT a speedup. Artifacts: build/dt-proposal-native-owned-q7cwmwj3 and
+build/dt-proposal-native-baseline-24cl0x44. Worker peak RSS 510-550 MB, private
+1.55-1.59 GB; these small slices do not prove total/compiler-wide memory bounds.
+Structural findings zero; the unsourced latch remains OPEN, not fully closed.
+Distribution=None/dx/dt_current facts use the existing specialization operator
+before the source cut. Trapped writers: literal-formal prune at ~29690;
+conceptual-record prunes at ~26613/~30046/~37391. All now respect imported
+native ownership. Accepted authored/physical formals, not old source positions,
+drive native argument binding after specialization.
+
+Canonical expanded/planning instruction snapshots share one BookSpill cache
+per control lowering, default 8, with audited policy receipts. Existing graph
+region partitioning uses work-contract graph_region_node_limit (default 256).
+TURING_GRAPH_REGION_NODE_LIMIT / TURING_SSA_RESIDENT_REGIONS provide the bounds;
+WorkContract.ssa_resident_regions=None retains eager snapshots. These bounds
+do NOT page final SSA bodies/source ingress or automatically subdivide an
+oversized source SCC. Do not describe that unfinished work as complete.
+
+Receipts: 7 new cache/literal/specialization checks passed in 28.31 s; two-worker
+two-chain conditional, graph limit 8/cache limit 1, passed exact native
+64701152/-4 in 19.48 s. 10 cache/audit/counted/while/carried-alias checks passed
+in 16.45 s under 8/1. Three record/default/nested-return regressions passed in
+48.43 s. Final route/dispatch/hierarchy selection: 33 passed, 4 failed in
+4.81 s. ALL FOUR were reproduced on untouched C:/dev/tg-base tests in 3.12 s:
+tensor_accessor_and_its_scalar_comparison_stay_with_coordinator plus
+a_lookup_nobody_reads_is_not_a_region_boundary / dispatch_exports_a_value_routed_by_identity /
+dispatch_exports_an_internal_value_used_outside_the_region. The latter three
+construct graphs with no ingestion scope; do not suppress their identity
+requirements or blame this checkpoint. Earlier typo in a selected test name
+ran no tests and is not a passing gate.
+
+Small serial CPU profile, no allocation tracing: 20,293,257 calls / 7.694 s
+instrumented. Structural fold 1.852 s cumulative, tensor descriptors 18,627
+queries / 1.378 s, call metadata 0.439 s, result type settlement 0.098 s.
+Times overlap and are NOT uninstrumented benchmarks. Metadata isolation
+575,688 calls / 0.879 s; book posting 0.889 s. SCC 0.000079 s and effect walk
+0.005353 s are not first priorities on this evidence. No new native conversion
+was implemented; existing topology/levels providers remain available. Observer
+build/profile_serial_dt_slice.py is 35-second bounded and prints inline.
+
+Final isolated route selection gate: 3 passed in 1.49 s (default units,
+explicit units, explicit serial). Syntax/whitespace checks and guestbook
+filename validation passed; validator was dry-run only. No Python probe remains.
+
+2026-10-09 deterministic native-frontier contraction checkpoint:
+
+A record-identity-changing root(Actual)->relay(Declared)->leaf(Declared)
+micro returned native 16 rather than 59 under separate generic headers,
+despite zero structural concordance findings. Untouched C:/dev/tg-base serial
+compiler returned exact 59 (5.40 s). The interface planner now computes finite
+reachability over exact record-parameter forwarding edges. Those indivisible
+edges enter the EXISTING SCC operator as reverse planning edges; convex
+components stay together, unrelated scalar branches remain separate, original
+semantic recursion remains unchanged. No physical field-name/type matching was
+added. Worker validation re-derives the same relation from its sealed input;
+the source-node cap still refuses oversized components before admission.
+
+Record-only callsite variants were also absent from native symbol identity.
+The existing variant scope/record ABI now supplies that key. A separate exact
+writer fault was found: the child bytes-join scan overwrote enclosing
+function_reference, stamping relay with leaf's reference and root with relay's.
+The child variable is separate now. Native imports join accepted source refs,
+not positional exports or name proxies; only canonical function entries are
+headers, while specialized bodies remain in their own object/diagnostic SSA.
+
+The exact native 59 case now passes with two worker processes; a later caller
+also imports the contracted component and returns 59 (20.83 s). Final checks:
+3 record/serial/import cases in 45.52 s; 4 tuple/tensor/law regressions in
+58.68 s; 5 record/default/convexity/node-cap/acceptance checks in 28.80 s.
+All 12 passed. Syntax, whitespace and guestbook-name validation passed. This is a small
+real lowering/ABI correction, NOT an end-to-end bounded-RAM/multicore N4 claim.
+The last actual DT proposal cut has separate 84-node energy, 24-node scalar,
+135-node record component and 10-node root inputs. Record forwarding proceeds;
+it remains PARTIAL at source call 8 / untyped distribution formal 0, and its
+caller refuses the incomplete dependency. No execution or speedup claimed.
+The default DT unit route remains unverified for complete orbital programs.
+Initial source closure and the worker's fixed tensor basis remain resident.
+
+tests/test_compilation_units.py has two book-lifetime failures on both the
+dirty compiler and pre-imported clean baseline: function_address disagreement
+in plan_identity_uses_qualified_names_not_reference_order and
+portable_plan_receipt_is_recorded_on_the_project_graph. Do not attribute these
+to contraction or silence them. The new convexity/recursion constraint test
+passes separately. An earlier combined micro regression hit its outer 80 s
+bound; that interrupted run was NOT a suite pass and left no compiler process.
+
+2026-10-09 main unit-boundary completion checkpoint:
+
+Normal `examples/llvm_dt_system.lowered_system` link-mode C/LLVM compilation
+now requests the existing public source-unit runner, with at least two jobs
+and a fresh `source-units_*` directory. Inline mode is unchanged. A plumbing
+test verifies the actual `dt_system_over` entry requests this path. This is
+NOT yet an end-to-end N4 compatibility or performance verification: full DT
+can still hit the explicit sequence/reference/nested-record/runtime-extent,
+runtime-slot/text-sink and oversized-SCC refusals. No long compile was launched.
+
+Record boundaries carry existing boundary-closed SSARecordDescriptor rows.
+The existing record-field forwarding graph now consumes bodyless callee
+descriptors, rather than treating required fields as uninitialized scratch.
+Authored return slots/aggregate edges supply native output paths; authored
+and native calls use one shared projection operator. Nested tuple tests link
+and execute exact 189; flat tuple 105; record caller 13; retained native law
+42. Accepted linked pieces reuse their existing native IR, never lower an
+empty declaration as an implementation. Scalar Return/Phi boundaries use
+their actual published SSA value. Late unused private root inputs are pruned
+with the existing root prune. Unit conditional accounting reads the existing
+source receipt, not a source graph already mutated by deployment.
+
+The actual DT-helper slice first exposed a broken archive boundary:
+ReturnBlock.source_cell retained an ingestion Ref without its fact cell.
+`IdentityBook.project_cells` now transports the exact predecessor closure:
+unchanged Ref keys, facts, stamps, mint rows, edge/dependent order and unsourced
+receipts. The source archive keeps that acceptance view so legacy later cuts
+also work after the active book closes. Each worker gets only its selected
+acceptance subgraph; the complete source diagnostic book stays separately
+stowed. Exact cell/index transport and exclusion of unrelated siblings are
+tested. This is a graph restriction, not a second provenance schema.
+
+`tools/compiler_probes/probe_dt_unit_interfaces.py FRESH_DIRECTORY` compiles
+the actual unmodified `_energy_time_limit`, `_no_exchange_observed`, `_scalar`
+and a small calling program through the public compiler. One-participant
+contract, four units, peak two distinct processes, 84/24/34/16 source nodes
+and 15/15/10/5 acceptance cells; no dependency bodies imported. Latest bounded
+run completed lowering/link/native check in 20.464 s, four compiled-unverified
+receipts, zero findings, exact native output 0.0. Its participant extent proves
+the two early returns: this is NOT broad DT numerical/optional-field coverage.
+Artifacts: build/dt-unit-micro-6knmgfqx. Native execution is isolated at 10 s;
+compile workers at 20 s; outer probe at 60 s in this session.
+
+Initial ingestion still holds the source closure. A supplied tensor repository
+is serialized once, but each worker presently loads that complete fixed basis;
+it is not yet reduced to the worker's operator dependency closure. Admission
+limits and sampled per-worker limits do not make arbitrary growth a hard RAM
+bound. Do not call this the complete architectural conversion or an N4 speedup.
+
+Regression receipt: 119 passed in 140.62 s across identity-book, main boundary,
+scoped-input and project-product suites. A subsequent one-tensor-element test
+exposed overbroad projection ownership: `leaf(x)[0]` must remain a numerical
+Indexed region when leaf returns one tensor, not an authored tuple. The native
+projection set now consults the accepted return kind/arity. Final six main
+boundary checks passed in 72.41 s, including exact tensor element result 43.
+Syntax and whitespace checks pass. Guestbook validator reports conforming names.
+
+2026-10-09 four-law link-interface measurement and same-Python kernel probe:
+
+`lower_ast_source_to_ssa(..., retain_linked_piece_bodies=False)` imports each
+retained LLVMPiece as a bodyless, copied ABI/effect declaration instead of all
+private SSA functions. The full piece/archive remains unchanged. The existing
+`llvm_dt_system.lowered_system` now requests this in link mode; inline mode and
+the public compiler's default retain bodies. `linked_piece_interface` receipts
+preserve actual SSA IDs, types, shapes, argument effects, native buffer/extent
+order and LLVM digest; concordance detects disagreement. Aggregate-layout
+interfaces unsupported by this seam refuse rather than lose their descriptors.
+
+User-authorized N4, no trace, graph workers 4/resident regions 8, four stale law
+rebuilds, fresh TEMP/TMP output directory: 599.448 s, exit 0, versus preceding
+697.227 s (14.0% lower in one sample). Combined-system begin -> SSA lowered:
+146.1 -> 550.4 s (404.3 s), versus 175.1 -> 608.4 (433.3 s). Module functions
+1066 -> 996. Maximum RSS in printed stage rows 5632 -> 5606 MiB: essentially
+unchanged. The book still has 1,828,426 resident cells, zero spills. Observed
+CPU remains approximately one core. Earlier 464.540 s is STILL faster than
+this run. Do not describe this as end-to-end bounded-memory/multicore success.
+C SHA a0c6ae19fe4fd577830bf7d17ee6b167e5650d39e90576790fbfc87fc469f1e7;
+artifacts: build/profile_memory_n4_link_headers_20261009_133215/profile_memory_n2.
+This benchmark compiles; it does not execute orbital physics or prove parity.
+
+New bounded probe `tools/compiler_probes/probe_graph_kernel_modes.py` directly
+runs the existing authored `graph_refinement_kernels.dependency_levels` eagerly,
+uses an already registered native provider / explicit trusted native-worker
+payload, or `--compile FRESH_DIRECTORY` builds through the existing public
+source compiler accelerator API. Fresh builds save a native-worker payload
+with source/payload/library digest receipt for `--native-payload PATH` reuse.
+No package or other source compiler is introduced. Invocation-local CSR and
+scratch spans support `--workers 2`; packing/setup is timed separately.
+4096 nodes/8186 edges, 16 ASAP + 16 ALAP repeats: eager kernel sum 138.34 ms,
+native sum 0.8374 ms; wall 179.90 vs 12.53 ms. Two workers wall 13.52 ms,
+not faster at this size. These are one-sample kernel timings, NOT compiler
+speedup; the production Python registry fallback still uses ILPScheduler.
+Focused checks: 13 piece-retention/accelerator tests in 35.75 s; 7 probe tests
+in 12.78 s, including optional compile/reuse, two owned arenas and stale-source
+refusal. Native child execution is bounded to 10/15 s; compilation check 30 s.
+LLVM arithmetic and direct C linked buffer returns are exact. An unrelated C
+publication defect for adding two unpacked tensor results reproduces both with
+full/compact imports and on untouched C:/dev/tg-base at 54c67fbd (8.51 s).
+Do not silently classify it as fixed or add a numerical tolerance.
+
+2026-10-09 native interface/body separation (supersedes the limits of the next checkpoint):
+
+The canonical `lower_ast_source_to_ssa` now accepts `partitioned_directory`
+and `partitioned_options` (jobs, source-node bound, worker memory/time limits).
+This opt-in lane plans through that same public entry, releases the planning
+heap, and compiles SCC bodies in bounded separate processes. Worker inputs
+contain ONLY their SCC, not transitive authored dependencies. Callers import
+digest-checked bodyless declarations and already-compiled native objects;
+dependency SSA/graphs are not reloaded. Final C/LLVM emission links object paths,
+not all SSA bodies. C's existing standalone host also links these objects.
+CLI product lane: add `--interface-tiles` to `--partitioned-source`.
+Use a fresh directory. Reusing a completed source-product directory refuses
+before overwriting its inputs; resume the existing frozen resolved plan instead.
+Requested entrypoints are selected by their recorded function reference, not
+by reconstructing an export name. Unit/plan/source-SSA digests are cross-checked.
+
+The interface is a derived view of accepted SSA values, preserving their IDs,
+dtype/shape/accounting, actual native buffer/extent order, and per-formal
+read/write summaries. The concordance detects declaration/ABI disagreements.
+Both emission and link acceptance refuse stale contracts or object hashes.
+Headers are created AND unpickled under isolated declaration-book scopes:
+SSA table unpickling otherwise reattaches onto the caller's active book and
+accumulates unrelated rows. Source and complete unit histories remain archived
+for diagnostics. Units remain compiled-unverified, NOT installed native compiler
+replacements; the existing replacement verification gates are unchanged.
+
+Real micro: left/right/root/unrelated/top, two admitted workers, maximum eight
+source nodes per SCC. Root imports two callee declarations with no blocks;
+top contains only its own body and links top/root/left/right objects. Scalar
+and four-element AbstractTensor span contracts reproduce exact native 105 and
+210 outputs. The tensor micro caught shape discovery still requiring a callee
+graph: it now reads the accepted result descriptor before the provisional
+scalar domain. This fixes the writer/query, not the final output extent.
+No new packages or substitute source compiler. No long orbital run launched.
+
+IMPORTANT LIMITS: opt-in, not an automatic conversion of the orbital benchmark.
+Initial ingestion/reduction still holds the source project. Native tile imports
+currently require static scalar/span boundaries with one result per call.
+Record/sequence/reference layouts, multi-result projection planning, runtime
+extent transport and runtime-slot/text publication imports explicitly refuse.
+Precompiled SSA imports must already be bodyless; a hidden old piece body is
+not admitted as though it were a compact header. This lane currently emits
+C/LLVM objects. Fortran refuses these declarations instead of printing empty
+function bodies; its ordinary source/SSA lane is unchanged.
+Oversized SCCs refuse before admission; a smaller proven region cut is still
+needed. Aggregate RSS is still an admission budget, not a hard cap on later
+process growth. Standalone validation-bearing objects explicitly refuse until
+that host checks the shared validation runtime; C/LLVM managed executions
+reset/take the existing runtime's errors. This is a real separate-compilation
+path, but NOT the complete graph/compiler conversion or an orbital speedup claim.
+
+Expanded aggregate-call regression: six failures also reproduced on clean
+`C:/dev/tg-base`, with its compiler pre-imported before loading the live tests.
+Do not attribute those pre-existing failures to native interface work.
+
+API (supply the program's existing extraction/ABI contract):
+
+```python
+module, outputs, exports = lower_ast_source_to_ssa(
+    source, entrypoint, extraction_contract=contract,
+    partitioned_directory="build/fresh_native_tiles",
+    partitioned_options={"jobs": 2, "max_unit_source_nodes": 4096},
+)
+artifact = emit_ssa_function_to_llvm(module, exports[0])
+compile_artifact(artifact, directory=Path("build/fresh_native_tiles/image"))
+```
+
+Final focused batch: **88 passed in 76.87 s**, with crash-isolated native
+executions bounded at 10 s and compilation workers bounded at 30 s in the micro:
+`python -u -m pytest tests/test_scoped_compilation_inputs.py tests/test_project_compilation_product.py tests/test_llvm_piece_runtime_payload.py tests/test_native_call_input_receipts.py -q --tb=short --show-capture=no`.
+Compilation/syntax and whitespace checks pass. No workers remain after the run.
+
+2026-10-09 actual source-unit execution/input cuts:
+
+The existing `compile_resolved_process_graph_plan` worker runner now publishes
+per-SCC/dependency input archives BEFORE launch. Workers read only their indexed,
+SHA-matched cut, not the entire resolved project. Function addresses/contracts
+remain in their original slots; excluded graph bodies and catalogue topology
+are absent. Selected graph nodes/edges/read scopes and table aliasing survive.
+Source planning still uses the canonical public compiler. New
+`compile_partitioned_source` ends that pass before deployment, streams cuts,
+stows the source concordance intact in `source-concordance.pkl` with a digest,
+and collects the original planning heap before bounded worker admission. Worker
+artifacts retain a diagnostic reference to that source book, not a live copy.
+Worker stdout is inline and unbuffered. Admission counts at least the configured
+reservation for every live worker, including just-launched/unmeasured workers.
+
+The source-unit lane requires an explicit source-node bound (default 4096).
+An over-bound dependency closure is neither serialized nor admitted. It produces
+the existing resource-failure/subdivision records. This is a bound on GRAPH NODE
+WORK INPUT, NOT a theorem about RSS. Existing sampled private-memory/time limits
+remain; aggregate RSS is an admission ceiling, not a hard cap on later growth.
+
+New failing micro: left/right/root/unrelated, requesting left, formerly loaded
+all four bodies. The same failure was confirmed with the compiler pre-imported
+from clean `C:/dev/tg-base`; an earlier absolute-test-path attempt imported the
+live tree and is NOT baseline evidence. The repaired worker sees only left.
+Actual two-process test: three independent source functions, at most 5 source
+nodes per cut, peak 2 admitted processes, 3 distinct worker PIDs. Weak references
+prove all original source graph wrappers are gone before any worker starts.
+All three unit modules have zero structural concordance findings and produce
+exact LLVM native outputs 43, 62, 3 for input 21 (children bounded at 10 s).
+Units remain `compiled-unverified`; no native compiler replacement is installed.
+Source-book archive round-trip, exact node/edge/scope/address preservation,
+refusal of digest drift, no whole-archive worker read and oversized-cut refusal
+are tested. Final focused batch: 73 passed in 23.30 s:
+`python -u -m pytest tests/test_scoped_compilation_inputs.py tests/test_project_compilation_product.py -q --tb=short --show-capture=no`.
+The compilation-unit planner suite separately retains two function-address
+disagreement failures, reproduced on the clean short baseline (3 pass / 2 fail).
+
+CLI entry: `python -u -m tools.compile_project_catalogue --partitioned-source
+--source <program.py> --output <new-directory> --jobs 2 --max-tile-nodes 4096
+--extraction-contract <contract.yaml>` (one line when actually invoking it).
+
+LIMITS: this is the existing catalogue/unit PRODUCT lane, NOT a replacement for
+the ordinary monolithic source-to-single-module return. The orbital benchmark
+still uses that ordinary lane. Source ingestion/reduction remains whole-project.
+Unverified callees still require their authored dependency closure, so an
+interface-only bounded tiler and streamed final image assembly are NOT delivered.
+An explicit bound now prevents silently expanding those closures without limit;
+it does not make an over-bound program successfully compile. The next central
+change is fixed type/shape/storage/effect/precision interfaces at call boundaries,
+so workers need body + boundary summaries rather than transitive bodies. No
+physics, numerical substrate, lowering equations or concordance gate was weakened.
+
+2026-10-09 user-requested real four-rule orbital benchmark, after bounded
+graph-work integration (dirty `54c67fbd`):
+
+`python -u tools/compiler_probes/profile_memory_n2.py 4`, with
+`TURING_GRAPH_WORKERS=4` and `TURING_GRAPH_RESIDENT_REGIONS=8`, completed
+with exit 0 in **697.227 seconds wall** (11m 37s). No `--trace`, no packages,
+no compiler edits during the run. TEMP/TMP pointed at a fresh output directory;
+old artifacts and the user's dirty probes were preserved. All four orbital
+pieces were stale and rebuilt. Authored graph foundations were also compiled.
+
+The previous dispatch-indexing N4 run was 464.540 s, also rebuilding all four
+pieces. Current total wall is about 50% worse. Combined lowering began at
+175.1 s (previous 121.3), repository SSA finished at 608.4 s (previous 398.4),
+deployment released at 614.1 s, and compiler end occurred at 640.8 s.
+Combined-start to SSA completion is **433.3 s versus 277.1 s** (about 56%
+worse), so piece rebuilding alone does not explain the difference. These are
+single profiled runs, not an isolated attribution to any one compiler change.
+The probe's GC object histograms/book reports remain enabled even without
+tracemalloc; the result is not bare compiler time. The remaining wall includes
+artifact emission/build, final reporting and process teardown.
+
+Maximum printed stage-table RSS: **5,632 MiB**, versus the previous 5,600 MiB.
+Sampled Windows process peak: 5,655 MiB. The probe's separate 5%-threshold peak
+report says 5,449 MiB and is NOT the table maximum. Its retained book at that
+report held 1,828,277 cells, ALL resident, with 0 book pages spilled. Histograms
+included 2,607,842 dicts and 7,107,443 lists. Topology spilling does not bound
+this whole-book/source/SSA residency. Sampled process CPU tracked wall within
+a few seconds through roughly ten minutes: about one core overall, not four.
+The completed piece reports used one participating graph worker despite the
+four-worker cap; the 64-region piece kept at most eight topology units, spilled
+56, and reloaded zero. The existing orbital wrapper does not expose the final
+combined module's complete graph-work counters, so no combined worker-count
+or topology-peak assertion is made.
+
+The result contains 1,066 functions. C SHA256:
+`cac028f5d0b6fc878be426ba4ed7c522782e12b8a94b00a956d21bff5e7acda1`.
+Output: `build/profile_memory_n4_graph_work_20261009_114435/profile_memory_n2/`.
+The C hash differs from the previous run; this probe compiles but does not
+execute orbital numerical parity checks. Exit 0 is not a physics-parity claim.
+This benchmark shows NO whole-process memory improvement or compile speedup.
+Read-only timing attribution and a failing performance micro are the next
+steps, not another large run or an unmeasured compiler patch.
+
+2026-10-09 integrated dispatch work/residency checkpoint (dirty `54c67fbd`):
+
+`graph_work.py` is now wired into the canonical source entry and real dispatch
+extraction. Carving/finalization stays on the coordinator. Dependency-only
+snapshots enter a bounded window; results publish in region ordinal order,
+after checking the snapshot still agrees with the live cut. Completed results
+count against admission, so an early slow unit cannot grow a reorder buffer.
+Topology slots are reserved BEFORE carving, and cached plus in-flight dispatch
+topologies share one compile-wide limit across all shell specializations.
+
+Regions keep their actual ProcessGraph headers and NetworkX API. Node/edge
+topology and level tables spill through the existing `BookSpill` segment codec
+in a separate transient store. AST and other semantic leaves retain identity;
+the book, Python bindings and source catalogue are not recursively pickled into
+each segment. Cached NetworkX views route through the current resident payload.
+Read containers are immutable; writes use generation-checked region leases.
+Nested dict/list/set mutations and escaped old-generation writes are guarded;
+cycles and current-generation container aliases survive spill/reload. Attribute
+wrapping is deferred until a read/write actually needs it. This source-SSA path
+normally consumes headers only and does not reload the spilled topology.
+Deep compilers and ephemerals use their existing constructors lazily, share the
+same headers, and retire with the existing dispatch-copy release boundary.
+The transient store is removed at compile end, including failure cleanup.
+
+Worker policy is explicit (`WorkContract.graph_workers`, default 1;
+`TURING_GRAPH_WORKERS`). Dispatch residency defaults to 8 regions
+(`graph_resident_regions`, `TURING_GRAPH_RESIDENT_REGIONS`; None is the eager
+compatibility policy). More than one worker bootstraps both authored integer
+foundations through `lower_ast_source_to_ssa`, before the program book opens:
+lexical Kahn/min-heap ordering AND the existing ILPScheduler ASAP/ALAP equations.
+Code and per-call arenas are shared/isolated respectively; neither kernel has
+process-global validation-error state. This is not threads around a Python
+replacement compiler. No foreign source implementation or package installation
+was used. Worker pools are reused across shells within a compile. Foundation
+builds get unique directories so separate processes never overwrite loaded DLLs.
+
+`graph_work_publication` records the snapshot digest, method, counts, providers,
+admission and exact carved read scope, derived from region/policy/scope/origin
+cells. The concordance checks its schema, region method, resource policy and
+exact provenance; lifecycle permits cold spill after repairs. Work/residency,
+spill bytes, participating worker count and coordinator/worker/wait/publication
+timings are returned in `module.metadata['graph_work']`. Resource policies are
+also on the book. A worker cap is NOT a claim that all capped threads ran.
+
+Reproductions (no tracing; runtime children bounded at 10/15 seconds):
+
+- `python -u tools/compiler_probes/probe_graph_work.py --matrix`
+- `python -u tools/compiler_probes/probe_graph_work.py --calls 32 --workers 8 --resident-regions 8`
+- `python -u tools/compiler_probes/probe_graph_work.py --mechanics --unit-nodes 4096`
+- `python -u -m pytest tests/test_graph_work.py tests/test_memory_regulation.py tests/test_identity_book_spill.py -q --tb=short --show-capture=no`
+
+The first 2/4/8-worker source matrix passed exact native output at 4/8/16 calls.
+It used different residency limits at 8 workers; do NOT attribute its timings
+solely to threads. The matrix command now fixes all points to the same residency
+limit (at least 8). A subsequent 32-call/8-cap probe lowered in 4.0298 s,
+produced 35 functions/34 region publications, spilled 26 topologies, kept cached
+plus in-flight topologies at most 8, and returned exact native
+`[11944, 8528, 13946, 14864]`. Only 3 worker threads participated. This is NOT
+the orbital N32 or N4 timing. Latest 16-call/4-cap/8-resident probe lowered in
+1.7316 s, with 19 functions/18 publications, 10 spills, 3 participating workers
+and exact output. Foundation setup and native build are excluded from lowering;
+setup has been ~5.4 s alone and 12.27 s alongside tests. Child import/startup is
+included in total probe time, not in lowering time.
+
+Sixteen larger DAG units through the SAME admitted scheduling operation, with
+8 resident slots and exactly 8 spills at EVERY point, matched the authoritative
+scheduler exactly. These are graph-mechanics probes, not source/physics timings:
+
+| Nodes / edges per unit | 1 inline | 2 cap | 4 cap | 8 cap |
+| --- | ---: | ---: | ---: | ---: |
+| 1,024 / 2,976 | 0.763 s | 0.692 s | 0.626 s | 0.618 s |
+| 4,096 / 11,904 | 2.790 s | 2.726 s | 2.724 s | 2.661 s |
+
+The larger 4-cap and 8-cap runs both used only 4 worker threads. Timings are
+single-sample smoke measurements, not a statistically demonstrated speedup.
+They locate the remaining cost: coordinator graph construction/packing, snapshot
+validation and spilling; more worker capacity alone barely helps. Worker wall
+time is summed and can overlap coordinator time; it is not CPU utilization.
+
+Verification receipts: the graph/kernel/spill/adapters batch passed 63 in
+61.92 s; graph-work/memory/copy-on-read/loop-scope passed 60 in 11.68 s before
+the final extra audit/alias micros; native providers passed 7 in 22.74 s,
+including 60 ASAP/ALAP random-DAG checks in two synchronized native threads.
+Graph-work/spill/memory passed 70 in 17.11 s before the last alias micro.
+The current focused graph-work suite also passed 20 in 18.86 s before adding
+the alias identity micro; that micro failed on copying an already-managed
+container, then passed alongside cycle/set/generation checks (4 in 0.24 s).
+Final graph-work/spill/memory rerun: 71 passed in 17.69 s (21 graph-work tests,
+including the repaired alias micro). The declared-page/lifecycle consistency
+check passed separately after assigning the new auditor's repair-stage read.
+
+LLVM/layout/dispatch regression batch: working 51 passed, 6 failed, 3 skipped
+in 8.99 s; clean short baseline 46 passed, the EXACT SAME 6 failed, 3 skipped
+in 8.81 s. Five extra passing tests are our existing LLVM/dispatch regression
+micros. The six failures are the four historical dispatch failures listed
+below plus `test_graph_only_reshape_builds_region_and_emits_wasm` and
+`test_graph_only_tobytes_builds_region_and_emits_wasm` (legacy AOT programs
+contain bit operations, not the expected reshape/tobytes). Do not repair those
+as part of this work or call them new regressions. The earlier eight
+loop-composer failures and separate historical native timeout remain recorded.
+
+Limits: this bounds dispatch topology units, NOT all process bytes. Mutable
+source graphs, graph metadata/semantic leaves, the source catalogue and whole
+module SSA still reside in memory; most refinement remains coordinator-serial.
+It is not a finished full out-of-core/parallel compiler. Region spill files are
+transient storage, not resumable deployment/checkpoints. A first kernel variant
+returning the conditionally used mutable `levels` reference exposed a dominance
+finding; the final kernel publishes through its declared mutable output span
+and returns processed count. No detector was suppressed; conditional arena-return
+lowering remains a separate micro-test/repair task.
+
+2026-10-09 self-hosted graph-mechanics checkpoint (baseline `54c67fbd`):
+`compile_and_register_topology_accelerator` now compiles authored integer CSR
+Kahn/min-heap mechanics through `lower_ast_source_to_ssa`, then uses the existing
+LLVM artifact route. The hand-written Fortran descriptor remains historical;
+it is not the active provider build. Registration is explicit, never an import
+side effect. The existing canonical reducer consults this provider when it is
+registered. A bounded child probe runs 100 deterministic small DAGs/multigraphs
+through two synchronized worker threads, with invocation-owned arenas and equal
+lexical-key ties; all results exactly match the registry's NetworkX oracle
+(7.52 s including compilation/imports). This proves independent concurrent
+invocations, NOT compiler-wide parallel refinement or measured CPU speedup.
+
+Meaningful public-entry heap/frontier micros exposed and repaired lost RHS
+read receipts, captured-value expression re-expansion, indexed-element/result
+type disagreement, Store/GEP read-only classification, signed integer floor
+division, loop-entry/latch selection by binding, unchanged break-edge state,
+and scalar Phi value capture before a reused buffer is overwritten. A scalar
+Phi previously selected 17 but returned 31 after its selected slot was reused.
+LLVM now captures scalar merges simultaneously into owned homes, preserves
+ranked/reference Phi arenas, and refuses incompatible incoming physical element
+representations. Heap tests cover zero trips, both heap directions, cycles,
+empty graphs and differing outgoing-neighbour order. Native failures are run
+in child processes with 10/15-second bounds, not in pytest's process.
+
+New `name_binding_capture` rows connect exact source/target binding versions
+and their AST-owned loop; canonicalization carries those rows, the concordance
+checks them, and page lifecycle permits cold spill after pre-native repairs.
+One sealed-scope index is built per SSA builder, not a full capture-page scan
+for each read. The compiler does not infer capture ownership from line numbers.
+The existing spill reader's load registry is now context-local: the forced
+two-book reload interleaving failed on clean HEAD and now resolves both books'
+registry objects independently. This is NOT permission for concurrent writes
+to one IdentityBook or BookSpill.
+
+Focused LLVM/adapters/spill/graph micros: 82 passed, 3 skipped in 63.91 s,
+including the final one-index-per-builder micro. That new micro and the real
+inside-loop capture proof also pass alone (5.87 s). Memory regulation, copy-on-read,
+loop-scope concordance and self-hosted provider group: 47 passed in 17.33 s.
+Result-type/transformation/control/operand/loop-composer group: 100 passed and
+the same eight failures on this tree (9.91 s) and the clean short worktree
+`C:/dev/tg-base` (9.66 s). Adding five existing native binding-read cases gives
+105 passed, the same eight failures, one deliberately deselected historical
+`call-argument-carried` case (30.36 s). That case's 30 s native timeout was
+separately reproduced on clean HEAD; it is not a new regression.
+
+The four-call PUBLIC micro (not the orbital four-law benchmark) remains exact:
+lower 1.344 s, total 1.683 s, 10 functions, zero structural findings; emitted C
+SHA256 `3f43760e36b1f3aec4cad2b11008b03d1a32325bc6c84359b81e13a8ea41af69`,
+byte-identical to its clean baseline. Its 148 unsourced facts remain OPEN.
+No new long orbital compile was launched. No packages were installed.
+
+REMAINING: the all-in-one overhaul is not complete. Source graphs, expanded
+regions and whole-function collections still have resident/serial ownership.
+The self-hosted primitive has compact per-invocation storage, but a true bounded
+region lease/admission path and parallel worker proposal/deterministic book
+publication path have NOT been implemented. Do not report this checkpoint as
+breaking the whole-graph RAM requirement or making the whole compiler a swarm.
+
+2026-10-09 four-law benchmark after dispatch indexing: untraced
+`python -u tools/compiler_probes/profile_memory_n2.py 4` completed with exit 0
+in 464.540 seconds wall. The prior run was 531.749 seconds, including two
+piece builds; the new compiler stamp caused all four pieces to rebuild.
+The new profile's combined-lowering start is at 121.3 seconds, repository
+SSA completion at 398.4 seconds, and deployment release at 403.2 seconds.
+Approximately 343 seconds of the wrapper wall remained after the recorded
+combined-start event (including profiling and emission/build overhead),
+versus approximately 377 seconds previously. These single runs have
+different cache preparation and do not isolate the change's speedup.
+Highest RSS in the printed stage table: 5,600 MiB. The profiler's separate
+5%-threshold peak report says 5,403 MiB and is not the maximum of that table.
+There are 1,066 functions. Emitted C SHA256:
+`0ba0512e8bb5712c23c17955b0be562915a65eb5b1e498322c361f4ce1e67b65`.
+This differs from the prior N=4 hash after rebuilding all input pieces;
+no semantic equivalence or runtime parity claim is made for this benchmark.
+Output: `build/profile_memory_n4_graph_frontier_temp/profile_memory_n2/`.
+The run still used the serial, fully resident lowering path. It does not
+satisfy bounded graph residency or parallel compiler refinement.
+
+2026-10-09 dispatch frontier checkpoint (baseline `54c67fbd`): dispatch
+carving now derives one immutable edge/operand index per planning phase and
+queries each region's members and boundary neighbours. The index is released
+at phase completion. It changes no identity ownership or region membership.
+`python -u tools/compiler_probes/probe_graph_region_frontiers.py 2` (also
+`4` and `8`) exercises the public whole-source compiler entry and the existing
+native artifact route. All three have exact numerical parity and zero
+structural concordance findings. Unsourced facts remain OPEN, unchanged in
+the four/eight-call before/after comparisons (148 and 248 respectively).
+The four-call case goes from 164 per-region source adjacency queries to 31
+index-build queries and zero per-region queries; eight calls go from 556 to
+47 and zero. Both emit byte-identical C to the baseline. These are traversal
+counts, not a claimed large-program timing or memory improvement. Full
+region copies and whole-function residency remain.
+
+`tests/test_scheduled_process_graph_dispatches.py`: 29 passed / 4 failed on
+the changed tree, versus 27 passed / the same 4 failed on the clean short-path
+worktree at `54c67fbd`. Both new tests pass. The unchanged failures are
+`test_tensor_accessor_and_its_scalar_comparison_stay_with_coordinator`
+(classifier returns False) and `test_a_lookup_nobody_reads_is_not_a_region_boundary`,
+`test_dispatch_exports_a_value_routed_by_identity`,
+`test_dispatch_exports_an_internal_value_used_outside_the_region`
+(hand-built graph has no ingestion scope). Adjacent copy-on-read, kernel
+deduplication and repository SSA dispatch tests: 18 passed in 1.42 seconds.
+The N=35 memory probe was stopped under explicit user authorization after
+2,417.556 seconds wall, in deployment instantiation, to permit tiny architectural
+proofs; it produced no completed combined artifact. Its completed piece
+caches were retained.
+
 2026-10-03 orbital archive reconstruction update (`7d984b78`): the
 `ArgumentBindingFact` pickle defect mentioned in the return-site port below
 is fixed at its existing declaration. Nine focused archive tests pass, and

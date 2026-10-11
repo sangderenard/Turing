@@ -3,9 +3,10 @@
 The compiler may retain whole-project source and name context without keeping
 every function's ProcessGraph deployment resident at once.  This module turns
 the resolved FunctionTable call graph into dependency-ordered compilation
-units.  A unit contains exactly one call-graph strongly connected component:
-ordinary functions remain independently compilable, while mutual recursion is
-kept together because no correct linker boundary exists inside the cycle.
+units. A unit is one strongly connected component of the planning relation:
+authored calls plus explicitly indivisible specialization edges. Ordinary
+functions remain independent; cycles and unresolved record-specialization
+components stay together until a correct native frontier exists.
 
 Qualified authored names are the durable identities.  Function references are
 carried only as the already-resolved correlation needed to select graphs in
@@ -147,8 +148,10 @@ def _strong_components(
     return tuple(components)
 
 
-def plan_compilation_units(function_table: Any) -> CompilationUnitPlan:
-    """Divide all graph-backed functions into dependency-first SCC units.
+def plan_compilation_units(
+    function_table: Any, *, indivisible_edges: Iterable[tuple[int, int]] = (),
+) -> CompilationUnitPlan:
+    """Divide graph-backed functions into dependency-first SCC units.
 
     The input must already have completed source ingestion and topology
     reduction, because resolved ``callee_ref``/``method_ref`` correlations are
@@ -177,7 +180,23 @@ def plan_compilation_units(function_table: Any) -> CompilationUnitPlan:
         dynamic[reference] = tuple(sorted(dynamic_nodes))
         source_nodes[reference] = int(graph.number_of_nodes())
 
-    components = _strong_components(entries, edges, names)
+    # A native frontier is legal only after its callsite specialization has
+    # settled. Contract an explicitly coupled edge by adding its reverse to
+    # the planning relation, not by expanding a worker's dependency closure.
+    # The semantic call graph stays unchanged (including recursion claims).
+    semantic_components = _strong_components(entries, edges, names)
+    recursive_references = {
+        member for component in semantic_components
+        if len(component) > 1 or any(member in edges[member] for member in component)
+        for member in component
+    }
+    planning_edges = {reference: set(callees) for reference, callees in edges.items()}
+    for caller, callee in indivisible_edges:
+        caller, callee = int(caller), int(callee)
+        if caller not in entries or callee not in edges.get(caller, ()):
+            raise ValueError(f"indivisible edge is not a resolved authored call: {(caller, callee)!r}")
+        planning_edges[callee].add(caller)
+    components = _strong_components(entries, planning_edges, names)
     component_by_reference = {
         reference: component_index
         for component_index, component in enumerate(components)
@@ -238,18 +257,84 @@ def plan_compilation_units(function_table: Any) -> CompilationUnitPlan:
                 for node_id in dynamic[reference]
             )),
             source_nodes=sum(source_nodes[reference] for reference in component),
-            recursive=(
-                len(component) > 1
-                or any(reference in edges[reference] for reference in component)
-            ),
+            recursive=bool(set(component) & recursive_references),
         ))
     return CompilationUnitPlan(tuple(units), reference_to_unit)
 
 
-def record_compilation_unit_plan(graph: Any) -> CompilationUnitPlan:
+def native_interface_coupling_edges(function_table: Any) -> tuple[dict[str, Any], ...]:
+    """Close identity-changing record transfers over exact forwarding edges.
+
+    root(Actual)->relay(Declared)->leaf(Declared) formerly published generic
+    headers and silently returned 16 instead of 59. The ordinary planner
+    specializes these bodies to the actual record. Keep that causal component
+    together until its accepted ABI exists; unrelated scalar calls remain
+    separate. This is finite reachability over parameter identities already
+    present in the source graphs, not matching physical fields by name/type.
+    """
+    from collections import deque
+    from .glsl_deployment_strategy import (
+        _callsite_parameter_name, _expanded_callsite_argument_edges,
+        _method_parameter_layout,
+    )
+
+    entries = {int(entry.reference.address): entry for entry in function_table
+               if _entry_graph(entry) is not None}
+    forwarding: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    coupled: dict[tuple[int, int, int, str], dict[str, Any]] = {}
+    pending = deque()
+    visited = set()
+    for caller_ref, entry in entries.items():
+        caller = entry.graph
+        records = caller.G.graph.get("parameter_record_abi") or {}
+        identities = caller.G.graph.get("identity_table") or {}
+        record_by_value = {}
+        for parameter, record in records.items():
+            for value_id in identities.get(parameter, ()):
+                record_by_value.setdefault(int(value_id), []).append((str(parameter), record))
+        for callsite, data in caller.G.nodes(data=True):
+            attrs = data.get("attributes") or {}
+            reference = attrs.get("callee_ref", attrs.get("method_ref"))
+            if reference is None or int(reference) not in entries:
+                continue
+            callee_ref = int(reference)
+            callee = entries[callee_ref].graph
+            receiver, positional, _all = _method_parameter_layout(callee.G)
+            declared = callee.G.graph.get("parameter_record_abi") or {}
+            for actual, role in _expanded_callsite_argument_edges(caller, int(callsite)):
+                parameter = _callsite_parameter_name(str(role), receiver, positional)
+                matches = record_by_value.get(int(actual), ())
+                if parameter not in declared or len(matches) != 1:
+                    continue
+                caller_parameter, actual_record = matches[0]
+                row = {"caller_reference": caller_ref, "callsite_id": int(callsite),
+                       "actual_value_id": int(actual), "caller_parameter": caller_parameter,
+                       "callee_reference": callee_ref, "callee_parameter": str(parameter),
+                       "actual_record_identity": str(actual_record["identity"]),
+                       "declared_record_identity": str(declared[parameter]["identity"])}
+                forwarding.setdefault((caller_ref, caller_parameter), []).append(row)
+                if row["actual_record_identity"] != row["declared_record_identity"]:
+                    coupled[(caller_ref, int(callsite), callee_ref, str(parameter))] = row
+                    pending.append((callee_ref, str(parameter)))
+    while pending:
+        endpoint = pending.popleft()
+        if endpoint in visited:
+            continue
+        visited.add(endpoint)
+        for row in forwarding.get(endpoint, ()):
+            key = (row["caller_reference"], row["callsite_id"],
+                   row["callee_reference"], row["callee_parameter"])
+            coupled[key] = row
+            pending.append((row["callee_reference"], row["callee_parameter"]))
+    return tuple(coupled[key] for key in sorted(coupled))
+
+
+def record_compilation_unit_plan(
+    graph: Any, *, indivisible_edges: Iterable[tuple[int, int]] = (),
+) -> CompilationUnitPlan:
     """Plan the resolved project and retain its portable receipt on the graph."""
 
-    plan = plan_compilation_units(graph.function_table)
+    plan = plan_compilation_units(graph.function_table, indivisible_edges=indivisible_edges)
     graph.G.graph["compilation_unit_plan"] = plan.to_mapping()
     return plan
 
@@ -259,4 +344,5 @@ __all__ = [
     "CompilationUnitPlan",
     "plan_compilation_units",
     "record_compilation_unit_plan",
+    "native_interface_coupling_edges",
 ]

@@ -1,0 +1,492 @@
+diff --git a/src/compiler/authored_parameter_abi.py b/src/compiler/authored_parameter_abi.py
+index ca00d07..586980d 100644
+--- a/src/compiler/authored_parameter_abi.py
++++ b/src/compiler/authored_parameter_abi.py
+@@ -111,7 +111,12 @@ def _authored_sequence_annotation_contract(
+         "int": "int64",
+         "float": "float64",
+         # Repository SSA represents authored text by its deterministic token.
+-        "str": "int64",
++        "str": "int64",
++        # An arbitrary object is carried by the incumbent reference ABI:
++        # one fixed-width identity handle, not its unknown physical payload.
++        # This proves a collection's SLOT layout without claiming the handle
++        # can be dereferenced or its runtime object type inspected.
++        "object": "opaque_ref",
+     }
+ 
+     def scalar_dtype(node: ast.AST) -> str | None:
+@@ -149,13 +154,40 @@ def _authored_sequence_annotation_contract(
+     dtype = scalar_dtype(element_nodes[0])
+     if dtype is None:
+         return None
+-    return (
+-        "unique" if container in {"Set", "set", "FrozenSet", "frozenset"}
++    return (
++        "unique" if container in {"Set", "set", "FrozenSet", "frozenset"}
+         else "duplicates",
+         1,
+         container in {"List", "list", "Set", "set"},
+-        (dtype,),
+-    )
++        (dtype,),
++    )
++
++
++def _authored_parameter_sequence_contracts(graph_obj: Any):
++    """Derive parameter row contracts from the existing boundary receipts.
++
++    A top-level ProgramABI keyed value previously received only scalar dtype
++    accounting: memo[key] emitted a flat GEP rather than keyed-table access.
++    The normalized boundary already states this row layout; consume it at
++    the same declaration site as authored collection annotations.
++    """
++    contracts = {}
++    for parameter, annotation in _current_authored_parameter_annotations(graph_obj).items():
++        contract = _authored_sequence_annotation_contract(annotation)
++        if contract is not None:
++            contracts[str(parameter)] = contract
++    for parameter, receipt in dict(graph_obj.graph.get("parameter_value_abi") or {}).items():
++        if receipt.get("storage") != "keyed":
++            continue
++        if receipt.get("value_record") is not None:
++            raise ValueError("top-level keyed value_record requires its existing record-row binding; scalar row lowering cannot discard it")
++        contract = ("unique", 2, bool(receipt.get("mutable", False)),
++                    ("int64", str(receipt["dtype"])))
++        incumbent = contracts.get(str(parameter))
++        if incumbent is not None and (incumbent[0:2], incumbent[3]) != (contract[0:2], contract[3]):
++            raise ValueError(f"parameter {parameter!r} annotation and ProgramABI disagree about sequence row layout")
++        contracts[str(parameter)] = contract
++    return contracts
+ 
+ 
+ def _authored_text_parameter_transforms(
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+index 24d1a20..10ee086 100644
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -85,7 +85,8 @@ from .native_shell_abi import (
+     _source_name as _source_name,
+ )
+ from .authored_parameter_abi import (
+-    _authored_sequence_annotation_contract as _authored_sequence_annotation_contract,
++    _authored_sequence_annotation_contract as _authored_sequence_annotation_contract,
++    _authored_parameter_sequence_contracts as _authored_parameter_sequence_contracts,
+     _authored_tensor_parameter_value_abi as _authored_tensor_parameter_value_abi,
+     _authored_text_parameter_transforms as _authored_text_parameter_transforms,
+     _current_authored_parameter_annotations as _current_authored_parameter_annotations,
+@@ -7515,12 +7516,9 @@ def _field_slot_ops(
+             continue
+         for value_id in identity.get(str(binding_name), ()):
+             annotated_row_widths[int(value_id)] = int(width)
+-    for parameter_name, annotation in (
+-        _current_authored_parameter_annotations(graph_obj).items()
+-    ):
+-        contract = _authored_sequence_annotation_contract(annotation)
+-        history = tuple(map(int, identity.get(str(parameter_name), ())))
+-        if contract is None or not history:
++    for parameter_name, contract in _authored_parameter_sequence_contracts(graph_obj).items():
++        history = tuple(map(int, identity.get(str(parameter_name), ())))
++        if not history:
+             continue
+         policy, column_count, writable, _dtypes = contract
+         commit_sequence_contract(
+@@ -7529,7 +7527,7 @@ def _field_slot_ops(
+             policy,
+             int(column_count),
+             bool(writable),
+-            source=f"authored parameter {parameter_name}: {annotation}",
++            source=f"authored/ProgramABI parameter {parameter_name}",
+         )
+     for binding_name, record in _graph_sequence_record_abi(graph_obj).items():
+         width = len(_sequence_record_storage_columns(record))
+@@ -7733,12 +7731,9 @@ def _field_slot_ops(
+         for sequence_id, _policy, _columns, _writable
+         in sequence_declarations
+     }
+-    for parameter_name, annotation in (
+-        _current_authored_parameter_annotations(graph_obj).items()
+-    ):
+-        contract = _authored_sequence_annotation_contract(annotation)
+-        history = tuple(map(int, identity.get(str(parameter_name), ())))
+-        if contract is None or not history:
++    for parameter_name, contract in _authored_parameter_sequence_contracts(graph_obj).items():
++        history = tuple(map(int, identity.get(str(parameter_name), ())))
++        if not history:
+             continue
+         sequence_id = int(history[0])
+         if sequence_id in declared_sequence_ids:
+@@ -7920,10 +7915,17 @@ def _field_slot_ops(
+         }:
+             nested_sequence_ids.add(sequence_id)
+     mapping_storage_aliases = _loop_carried_storage_aliases(graph_obj)
+-    declared_mapping_ids = {
+-        int(sequence_id) for sequence_id, policy, columns, _writable in sequence_declarations
+-        if policy == "unique" and columns >= 2
+-    }
++    declared_mapping_ids = {
++        int(sequence_id) for sequence_id, policy, columns, _writable in sequence_declarations
++        if policy == "unique" and columns >= 2
++    }
++    parameter_mapping_ids = {
++        int(history[0])
++        for parameter_name, contract in _authored_parameter_sequence_contracts(graph_obj).items()
++        if contract[0] == "unique" and contract[1] == 2
++        for history in (tuple(identity.get(parameter_name, ())),)
++        if history
++    }
+     lexical_mapping_effects = {
+         int(mutation.effect_node_id) for mutation in _source_mapping_mutations(graph_obj)
+         if mutation.operator == "update"
+@@ -7989,12 +7991,19 @@ def _field_slot_ops(
+                 field_sequence_ids[canonical],
+                 f"{owner}.{canonical}",
+             )
+-        if str(field_name) in keyed_field_sequence_ids:
+-            return (
+-                keyed_field_sequence_ids[str(field_name)],
+-                f"keyed.{field_name}",
+-            )
+-        if attributes.get("aggregate_kind") != "dict":
++        if str(field_name) in keyed_field_sequence_ids:
++            return (
++                keyed_field_sequence_ids[str(field_name)],
++                f"keyed.{field_name}",
++            )
++        # A detached ProgramABI/annotation declaration owns this exact SSA
++        # storage identity even without an aggregate_kind on the Input node.
++        # Requiring that weaker AST attribute made memo[key] emit a flat
++        # pointer index despite its already committed keyed row contract.
++        value_id = int(base_data.get("value_id", base_id))
++        if value_id in parameter_mapping_ids:
++            return value_id, f"materialized-mapping:{value_id}"
++        if attributes.get("aggregate_kind") != "dict":
+             return None, None
+         binding_name = attributes.get("binding_name")
+         binding_kind = attributes.get("binding_kind")
+@@ -12957,15 +12966,19 @@ def _sequence_column_dtype_contracts(
+         for sequence_id, _policy, column_count, _writable
+         in sequence_declarations
+     }
+-    if not declared:
+-        return {}
++    if not declared:
++        return {}
+     identities = graph_obj.graph.get("identity_table") or {}
+     scalar_dtypes = {
+         "bool": "bool",
+         "int": "int64",
+         "float": "float64",
+     }
+-    contracts: dict[int, tuple[str, ...]] = {}
++    contracts: dict[int, tuple[str, ...]] = {}
++    for parameter_name, contract in _authored_parameter_sequence_contracts(graph_obj).items():
++        for value_id in identities.get(str(parameter_name), ()):
++            if int(value_id) in declared and len(contract[3]) == declared[int(value_id)]:
++                contracts[int(value_id)] = tuple(contract[3])
+     repository_records = dict(
+         (graph_obj.graph.get("program_abi") or {}).get("records") or {}
+     )
+diff --git a/src/compiler/ir_sequence_tables.py b/src/compiler/ir_sequence_tables.py
+index de87832..e798b95 100644
+--- a/src/compiler/ir_sequence_tables.py
++++ b/src/compiler/ir_sequence_tables.py
+@@ -1992,7 +1992,7 @@ def lower_table_lookup(
+     return SSASequenceLowering((function,))
+ 
+ 
+-def lower_table_store(
++def lower_table_store(
+     descriptor: SSASequenceDescriptor,
+     *,
+     function_name: str | None = None,
+@@ -2032,12 +2032,15 @@ def lower_table_store(
+     insert = builder.block("insert")
+     full = builder.block("capacity_exhausted")
+     complete = builder.block("complete")
+-    zero = builder.const(entry, 0)
+-    one = builder.const(entry, 1)
++    # All sequence extent cells are declared int64. Keep their scan and
++    # increment values int64 too; source call-type settlement otherwise
++    # widens the latch Add but leaves an incompatible i32 header Phi.
++    zero = builder.const(entry, 0, dtype="int64")
++    one = builder.const(entry, 1, dtype="int64")
+     two = builder.const(entry, 2)
+     three = builder.const(entry, 3)
+     length_slot = builder.fresh("ptr")
+-    length = builder.fresh("int")
++    length = builder.fresh("int64")
+     status_slot = builder.fresh("ptr")
+     builder.emit(entry, "GetElementPtr", [
+         SSAValue(descriptor.length_address_id, dtype="int64", shape=(1,)), zero
+@@ -2045,8 +2048,8 @@ def lower_table_store(
+     builder.emit(entry, "Load", [length_slot], length)
+     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
+     builder.branch(entry, header)
+-    index = builder.fresh("int")
+-    next_index = builder.fresh("int")
++    index = builder.fresh("int64")
++    next_index = builder.fresh("int64")
+     builder.emit(header, "Phi", [zero, next_index], index, attributes={
+         "incoming_blocks": (entry.name, latch.name)
+     })
+@@ -2115,7 +2118,7 @@ def lower_table_store(
+             SSAValue(descriptor.live_flags_value_id, dtype="bool"), length
+         ], live_address)
+         builder.emit(insert, "Store", [one, live_address])
+-    next_length = builder.fresh("int")
++    next_length = builder.fresh("int64")
+     builder.emit(insert, "Add", [length, one], next_length)
+     builder.emit(insert, "Store", [next_length, length_slot])
+     builder.emit(insert, "Store", [one, status_slot])
+diff --git a/src/compiler/precompile_to_ssa.py b/src/compiler/precompile_to_ssa.py
+index b9dff07..a99d77d 100644
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -7393,9 +7393,42 @@ class _ControlSSABuilder:
+             data, *extra_columns, length_address, capacity,
+             *((live_flags,) if live_flags is not None else ()),
+         )
+-        if status_address is not None:
+-            self.sequence_status_values[value_id] = status_address
+-        return descriptor
++        if status_address is not None:
++            self.sequence_status_values[value_id] = status_address
++        # A sequence rooted at an authored parameter is BORROWED storage.
++        # Its generated columns/counters belong to that same parameter, not
++        # the compiler's private frame. Otherwise native_memo(memo,key,value)
++        # emitted six uninitialized singleton root.frame slots and ignored
++        # the caller's table entirely. Derive ownership at descriptor creation
++        # from the exact initial parameter identity, before ABI publication.
++        parameter_owner = next((
++            name for name in self.parameter_names
++            if self.value_name_histories.get(name, ())
++            and int(self.value_name_histories[name][0]) == int(value_id)
++        ), None)
++        # The parameter identity alone is NOT a native arena declaration.
++        # A text-key formal also gets a provisional unknown sequence view;
++        # promoting that view redirected keyed tensor payloads to its scalar
++        # key storage. Require the explicit row-layout contract supplied to
++        # this descriptor constructor, not its provisional inferred dtype.
++        if parameter_owner is not None and column_dtypes and all(
++            dtype not in {None, "", "unknown"} for dtype in column_dtypes
++        ):
++            members = (
++                *self.sequence_storage_values[value_id],
++                *((status_address,) if status_address is not None else ()),
++            )
++            arena_ids = {*descriptor.column_value_ids,
++                         *((descriptor.live_flags_value_id,) if descriptor.live_flags_value_id is not None else ())}
++            for member in members:
++                span = int(member.id) in arena_ids or bool(member.shape)
++                member.accounting = {
++                    **dict(member.accounting or {}),
++                    "program_abi_parameter": str(parameter_owner),
++                    "program_abi_storage": "span" if span else "scalar",
++                    "program_abi_rank": 1 if span else 0,
++                }
++        return descriptor
+ 
+     def _sequence_status_address(self, status_arena: SSAValue) -> SSAValue:
+         zero = self.constant_value(0, status_arena)
+diff --git a/src/compiler/sequence_storage_binding.py b/src/compiler/sequence_storage_binding.py
+index bd2e76a..8cd5f78 100644
+--- a/src/compiler/sequence_storage_binding.py
++++ b/src/compiler/sequence_storage_binding.py
+@@ -141,12 +141,14 @@ def _bind_sequence_storage_members(
+ ) -> bool:
+     """Bind every physical member of one exact sequence argument."""
+ 
+-    if (
+-        callee_sequence is None
+-        or caller_sequence is None
+-        or len(callee_sequence.column_value_ids)
+-        != len(caller_sequence.column_value_ids)
+-    ):
++    if (
++        callee_sequence is None
++        or caller_sequence is None
++        or len(callee_sequence.column_value_ids)
++        != len(caller_sequence.column_value_ids)
++        or (getattr(callee_sequence, "heap_owner_value_id", None) is None)
++        != (getattr(caller_sequence, "heap_owner_value_id", None) is None)
++    ):
+         return False
+     provisional_targets = set(map(int, provisional_targets))
+ 
+@@ -175,7 +177,7 @@ def _bind_sequence_storage_members(
+         int(callee_sequence.capacity_value_id),
+         int(caller_sequence.capacity_value_id),
+     )
+-    for attribute in ("status_address_id", "live_flags_value_id"):
++    for attribute in ("status_address_id", "live_flags_value_id", "heap_owner_value_id"):
+         callee_member = getattr(callee_sequence, attribute, None)
+         caller_member = getattr(caller_sequence, attribute, None)
+         if callee_member is not None and caller_member is not None:
+diff --git a/tests/test_native_reference_boundary.py b/tests/test_native_reference_boundary.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_native_reference_boundary.py
+@@ -0,0 +1,162 @@
++"""Public source compiler regressions for reference-valued keyed storage."""
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from src.compiler.authored_parameter_abi import (
++    _authored_sequence_annotation_contract, _authored_parameter_sequence_contracts,
++)
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++from src.compiler.ssa_llvm_backend import (
++    emit_ssa_function_to_llvm, compile_artifact, prepare_artifact_execution,
++)
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def boundary_policy(annotated=False):
++    values = [
++        {'function': 'root', 'parameter': 'key', 'storage': 'scalar',
++         'dtype': 'int64', 'python_type': 'builtins.int'},
++        {'function': 'root', 'parameter': 'value', 'storage': 'reference',
++         'python_type': 'builtins.object'},
++    ]
++    if not annotated:
++        values.append({'function': 'root', 'parameter': 'memo', 'storage': 'keyed',
++            'dtype': 'opaque_ref', 'mutable': True, 'key_encoding': 'integer_identity',
++            'python_type': 'builtins.dict'})
++    return ExtractionContract(ROOT / 'extraction_contracts/program_extraction.yaml').with_program_abi(
++        {'records': {}, 'bindings': [], 'values': values}
++    ).with_execution_file(ROOT / 'extraction_contracts/vehicle_full_native_execution.yaml')
++
++
++@pytest.mark.parametrize('annotated', [False, True])
++def test_memo_rows_keep_handle_layout_and_execute_native_store_lookup(annotated, tmp_path):
++    annotation = ': dict[int, object]' if annotated else ''
++    module, _, exports = lower_ast_source_to_ssa(
++        f'def root(memo{annotation}, key, value):\n'
++        '    memo[key] = value\n'
++        '    return memo[key]\n',
++        'root', name='reference_boundary', extraction_contract=boundary_policy(annotated),
++        runtime_closure_only=True, progress=lambda _: None, progress_bars=False,
++    )
++    function = module.functions[exports[0]]
++    descriptors = tuple(module.sequence_tables[function.name].sequences.values())
++    assert len(descriptors) == 1, 'the declared mapping must not become a flat indexed pointer'
++    descriptor = descriptors[0]
++    assert descriptor.column_dtypes == ('int64', 'opaque_ref')
++    assert descriptor.key_columns == (0,)
++    assert all(value_id in {value.id for value in function.args}
++               for value_id in (*descriptor.column_value_ids, descriptor.length_address_id,
++                                descriptor.capacity_value_id, descriptor.status_address_id))
++    calls = [i.attributes.get('callee', '') for b in function.blocks.values() for i in b.instrs if i.op == 'Call']
++    assert any(str(name).endswith('_store') for name in calls)
++    assert any(str(name).endswith('_lookup') for name in calls)
++    artifact = emit_ssa_function_to_llvm(module, function.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'memo')
++    parameters = dict(function.metadata['parameter_names'])
++    output = next(i.args[0].id for b in function.blocks.values() for i in b.instrs if i.op == 'Ret')
++    # Allocation is deliberately supplied by the caller; storage semantics
++    # and native execution must not depend on a chosen arena placement.
++    capacity = 4
++    keys, handles = np.zeros(capacity, dtype=np.int64), np.zeros(capacity, dtype=np.int64)
++    length, status = np.zeros(1, dtype=np.int64), np.zeros(1, dtype=np.int32)
++    buffers = {
++        descriptor.column_value_ids[0]: keys, descriptor.column_value_ids[1]: handles,
++        descriptor.length_address_id: length,
++        descriptor.capacity_value_id: np.array([capacity], dtype=np.int64),
++        descriptor.status_address_id: status,
++    }
++    if descriptor.live_flags_value_id is not None:
++        buffers[descriptor.live_flags_value_id] = np.zeros(capacity, dtype=np.bool_)
++    for key, handle in ((2**60 + 3, 2**60 + 17), (23, 2**60 + 29), (2**60 + 3, 31)):
++        buffers[parameters['key']] = np.array([key], dtype=np.int64)
++        buffers[parameters['value']] = np.array([handle], dtype=np.int64)
++        execution = prepare_artifact_execution(native, buffers).run()
++        assert execution.buffers[output].item() == handle
++    assert length[0] == 2
++    assert list(keys[:2]) == [2**60 + 3, 23]
++    assert list(handles[:2]) == [31, 2**60 + 29]
++
++
++def test_object_annotation_proves_handle_slots_not_object_payload():
++    assert _authored_sequence_annotation_contract('dict[int, object]') == (
++        'unique', 2, True, ('int64', 'opaque_ref'))
++    assert _authored_sequence_annotation_contract('list[object]') == (
++        'duplicates', 1, True, ('opaque_ref',))
++
++
++def test_conflicting_boundary_row_contract_is_not_silently_overridden():
++    import networkx as nx
++    graph = nx.DiGraph()
++    graph.graph['function_parameter_annotations'] = {'memo': 'dict[int, float]'}
++    graph.graph['parameter_value_abi'] = {'memo': {
++        'storage': 'keyed', 'dtype': 'opaque_ref', 'mutable': True,
++    }}
++    with pytest.raises(ValueError, match='disagree about sequence row layout'):
++        _authored_parameter_sequence_contracts(graph)
++
++
++def test_existing_keyed_record_view_exposes_runtime_kind_natively(tmp_path):
++    # This uses the incumbent keyed value_record ABI, not a second object
++    # registry. Caller-owned descriptor columns provide the runtime facts;
++    # this does NOT claim an opaque Python handle supplies those columns.
++    kinds = ('builtins.dict', 'builtins.list', 'builtins.tuple',
++             'builtins.set', 'builtins.frozenset', 'leaf')
++    policy = ExtractionContract(ROOT / 'extraction_contracts/program_extraction.yaml').with_program_abi({
++        'records': {
++            'Book': {'identity': 'metadata.Book', 'fields': {'objects': {
++                'storage': 'keyed', 'dtype': 'int64', 'key_encoding': 'integer_identity',
++                'value_record': 'Object',
++            }}},
++            'Object': {'identity': 'metadata.Object', 'fields': {'kind': {
++                'storage': 'scalar', 'dtype': 'int64', 'token_vocabulary': kinds,
++            }}},
++        },
++        'bindings': [{'function': 'root', 'parameter': 'book', 'record': 'Book'}],
++        'values': [{'function': 'root', 'parameter': 'handle', 'storage': 'reference',
++                    'python_type': 'builtins.object'}],
++    }).with_execution_file(ROOT / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    module, _, exports = lower_ast_source_to_ssa(
++        'def root(book, handle):\n    item = book.objects[handle]\n    return item.kind\n',
++        'root', name='reference_kind', extraction_contract=policy,
++        runtime_closure_only=True, progress=lambda _: None, progress_bars=False,
++    )
++    function = module.functions[exports[0]]
++    artifact = emit_ssa_function_to_llvm(module, function.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'kind')
++    facts = {
++        'objects.length': np.array([3], dtype=np.int64),
++        'objects.keys': np.array([2**60 + 3, 17, 29], dtype=np.int64),
++        'objects.values': np.array([0, 1, 2], dtype=np.int64),
++        'objects[].kind.column': np.array([1, 2, 6], dtype=np.int64),
++    }
++    buffers = {v.id: facts[v.accounting['program_abi_field']]
++               for v in function.args if v.accounting.get('program_abi_field') in facts}
++    assert len(buffers) == len(facts)
++    parameter = dict(function.metadata['parameter_names'])['handle']
++    output = next(i.args[0].id for b in function.blocks.values() for i in b.instrs if i.op == 'Ret')
++    for handle, kind in ((2**60 + 3, 1), (17, 2), (29, 6)):
++        buffers[parameter] = np.array([handle], dtype=np.int64)
++        execution = prepare_artifact_execution(native, buffers).run()
++        assert execution.buffers[output].item() == kind
++
++
++def test_sequence_call_binding_keeps_owner_and_refuses_storage_kind_change():
++    from src.compiler.sequence_storage_binding import _bind_sequence_storage_members
++    from src.transmogrifier.ssa import SSASequenceDescriptor
++    callee = SSASequenceDescriptor(1, (2,), 3, 4,
++        column_dtypes=('opaque_ref',), heap_owner_value_id=5)
++    caller = SSASequenceDescriptor(11, (12,), 13, 14,
++        column_dtypes=('opaque_ref',), heap_owner_value_id=15)
++    bindings = {}
++    assert _bind_sequence_storage_members(bindings, callee, caller)
++    assert bindings == {1: 11, 2: 12, 3: 13, 4: 14, 5: 15}
++    direct = SSASequenceDescriptor(11, (12,), 13, 14, column_dtypes=('opaque_ref',))
++    unchanged = {99: 100}
++    assert not _bind_sequence_storage_members(unchanged, callee, direct)
++    assert unchanged == {99: 100}

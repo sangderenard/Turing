@@ -437,6 +437,8 @@ class FortranSubroutine:
     # caller's projection cell must match these at the call, bridging any
     # difference with an explicit conversion after the call returns.
     output_dtypes: tuple[str, ...] = ()
+    argument_shapes: tuple[tuple[int, ...], ...] = ()
+    output_shapes: tuple[tuple[int, ...], ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -3302,7 +3304,9 @@ class _FunctionEmitter:
                 return f"int({expression}, {kind})"
             return f"real({expression}, c_double)"
 
-        if op == "invert" and len(args) == 1:
+        # Public source lowering uses the canonical Invert opcode. Both
+        # spellings name the same existing integer/logical complement rule.
+        if op in {"invert", "Invert"} and len(args) == 1:
             source_dtype = str(self._typed(instr.args[0]).dtype).casefold()
             if source_dtype in _LOGICAL_DTYPES:
                 return f"(.not. {args[0]})"
@@ -4123,10 +4127,19 @@ class _FunctionEmitter:
 
         name = self.function.name
         native_name = self.native_symbol
+        # Unconditional IEEE_ARITHMETIC import made GNU Fortran wrap every
+        # scalar numeric/append helper in _gfortran_ieee_procedure_entry/exit.
+        # In the 256-row mixed probe these environment saves ran inside each
+        # iteration. Import only the actual intrinsic tokens emitted here,
+        # and never host-associate the IEEE module into unrelated procedures.
+        ieee_symbols = sorted(set(re.findall(
+            r"\b(ieee_(?:fma|is_nan|is_finite|value|quiet_nan|positive_inf|negative_inf))\b",
+            "\n".join((*declarations, *body)))))
         lines = [
             f"  subroutine {native_name}({', '.join(arguments)}) bind(C, name=\"{name}\")",
             "    use, intrinsic :: iso_c_binding",
-            "    use, intrinsic :: ieee_arithmetic",
+            *(("    use, intrinsic :: ieee_arithmetic, only: " + ", ".join(ieee_symbols),)
+              if ieee_symbols else ()),
             "    implicit none",
             *declarations,
             "",
@@ -4152,6 +4165,10 @@ class _FunctionEmitter:
                 str(self._typed(value).dtype or self.dtype)
                 for value in self.outputs
             ),
+            argument_shapes=tuple(tuple(self._typed(value).shape)
+                for value in self.function.args),
+            output_shapes=tuple(tuple(self._typed(value).shape)
+                for value in self.outputs),
         )
 
 
@@ -4199,6 +4216,8 @@ def emit_function(
         module_machine_dialect_occurrences,
     )
 
+    if function.metadata.get("native_interface"):
+        raise FortranEmissionError("native object interfaces currently require the C/LLVM backend")
     machine_residuals = module_machine_dialect_occurrences(
         {function.name: function}
     )
@@ -4356,6 +4375,12 @@ def emit_module(
     suppress it.
     """
 
+    functions = module.functions if isinstance(module, IRModule) else module
+    from .ssa_object_operations import validate_object_operations
+    from types import SimpleNamespace
+    validate_object_operations(SimpleNamespace(functions=functions))
+    if any(function.metadata.get("native_interface") for function in functions.values()):
+        raise FortranEmissionError("native object interfaces currently require the C/LLVM backend")
     _emit_module_started = time.time()
     _promote_mixed_arithmetic_results(module, dtype)
 
@@ -5701,7 +5726,6 @@ def emit_module(
     lines = [
         f"module {name}",
         "  use, intrinsic :: iso_c_binding",
-        "  use, intrinsic :: ieee_arithmetic",
         "  implicit none",
         "contains",
         "",
@@ -5738,6 +5762,7 @@ def emit_module(
         return "numerical"
 
     entry_points = []
+    subroutine_by_name = {item.name: item for item in subroutines}
     for function_name, function in functions.items():
         kind = _kind(function_name)
         note = None
@@ -5839,6 +5864,16 @@ def emit_module(
                 reference_argument_ids=emitted_reference_arguments.get(
                     function_name, ()
                 ),
+                value_dtypes={int(value.id): resolved
+                    for values, resolved_types in (
+                        (function.args, subroutine_by_name[function_name].argument_dtypes),
+                        (named_outputs.get(function_name, ()), subroutine_by_name[function_name].output_dtypes))
+                    for value, resolved in zip(values, resolved_types, strict=True)},
+                value_shapes={int(value.id): shape
+                    for values, resolved_shapes in (
+                        (function.args, subroutine_by_name[function_name].argument_shapes),
+                        (named_outputs.get(function_name, ()), subroutine_by_name[function_name].output_shapes))
+                    for value, shape in zip(values, resolved_shapes, strict=True)},
             )
         )
     control_entries = [e.name for e in entry_points if e.kind == "control"]
@@ -6269,8 +6304,8 @@ def compile_module(
         # GCC's LTO plugin publishes the shim's weak PE symbol as a different
         # symbol type from the archive reference.  Compile this small static
         # runtime link without LTO; ordinary optimized modules keep LTO.
-        compile_flags = tuple(flag for flag in compile_flags if flag != "-flto")
-        link_flags = tuple(flag for flag in link_flags if flag != "-flto")
+        compile_flags = tuple(flag for flag in compile_flags if not flag.startswith("-flto"))
+        link_flags = tuple(flag for flag in link_flags if not flag.startswith("-flto"))
     command = [
         compiler,
         "-shared",
@@ -6331,16 +6366,30 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 import numpy as np
+from ..transmogrifier.dtype_layout import c_abi_type_table, shell_numpy_dtype
+
+# Reuse the common dtype authority, once. np.dtype(ctypes.c_double) runs
+# NumPy's ctypes introspection on EVERY preparation slot; the mixed probe
+# measured roughly 200us to stamp nine parameters that need only typed cells.
+_FORTRAN_ABI_NUMPY_DTYPES = {
+    ctypes_name: np.dtype(numpy_name)
+    for name, (_c_type, ctypes_name) in c_abi_type_table().items()
+    for numpy_name in (shell_numpy_dtype(name),)
+    if numpy_name is not None
+}
 
 
 class FortranCoreExecution:
     """Allocated buffers and a bound packed entry, mirroring the LLVM face."""
 
-    def __init__(self, buffers, entry, pointers, count):
+    def __init__(self, buffers, entry, pointers, count, slots=()):
         self.buffers = buffers
         self._entry = entry
         self._pointers = pointers
         self._count = count
+        # Pointer-table entries do not own their NumPy allocations. Extent
+        # cells also need to live through every repeated native invocation.
+        self._slots = tuple(slots)
 
     def run(self) -> "FortranCoreExecution":
         if not self._entry(self._pointers, self._count):
@@ -6370,10 +6419,11 @@ class FortranCoreNative:
     #: happening too.
     _LIBRARIES: dict = {}
 
-    def __init__(self, library_path: Path, entry_record):
+    def __init__(self, library_path: Path, entry_record, api=None):
         import ctypes
 
         self._entry_record = entry_record
+        self._api = api
         symbol = f"{entry_record.symbol}__packed"
         resolved = str(Path(library_path).resolve())
         library = FortranCoreNative._LIBRARIES.get(resolved)
@@ -6388,35 +6438,75 @@ class FortranCoreNative:
         ]
         self._packed = function
 
-    def prepare_execution(self, feeds) -> FortranCoreExecution:
+    def prepare_execution(self, feeds, *, extent_overrides=None) -> FortranCoreExecution:
         import ctypes
         import re
 
         parameters = tuple(self._entry_record.parameters)
+        from .native_shell_abi import _element_count, _extent_values
+        overrides = dict(extent_overrides or {})
+        for parameter in parameters:
+            if parameter.role != "extent" or parameter.name in overrides:
+                continue
+            matched = re.search(r"_(\d+)_(\d+)$", str(parameter.name))
+            if matched and int(matched.group(1)) in feeds:
+                measured = np.atleast_1d(np.asarray(feeds[int(matched.group(1))]))
+                axis = int(matched.group(2)) - 1
+                if axis >= measured.ndim:
+                    raise ValueError(f"feed rank cannot resolve {parameter.name}")
+                overrides[parameter.name] = int(measured.shape[axis])
+        extents = _extent_values(self._entry_record, overrides)
         slots = []
         buffers: dict[int, Any] = {}
         for parameter in parameters:
-            dtype = "int32" if str(parameter.c_type) == "int32_t" else "float64"
+            # The published type is authoritative: int64 lengths and bool
+            # controls must not be stamped into an eight-byte float cell.
+            try:
+                dtype = _FORTRAN_ABI_NUMPY_DTYPES[str(parameter.ctypes_name)]
+            except KeyError as error:
+                raise ValueError(f"unsupported Fortran native type {parameter.ctypes_name!r}") from error
             if str(getattr(parameter, "role", "")) == "extent":
-                # extent_dynamic_<hash>_<value_id>_<axis>: the runtime
-                # length of the array that value id was fed with.
-                matched = re.search(r"_(\d+)_(\d+)$", str(parameter.name))
-                measured = np.asarray(feeds[int(matched.group(1))])
-                held = np.asarray([measured.size], dtype=dtype)
+                held = np.asarray([extents[parameter.name]], dtype=dtype)
             else:
                 value_id = int(str(parameter.name).lstrip("t"))
                 fed = feeds.get(value_id)
-                held = np.ascontiguousarray(
-                    np.atleast_1d(np.asarray(
-                        0 if fed is None else fed
-                    )), dtype=dtype,
-                )
+                count = _element_count(parameter, extents)
+                if fed is None:
+                    if parameter.role in {"input", "inout"}:
+                        raise ValueError(f"missing Fortran feed {value_id}")
+                    held = np.zeros(count, dtype=dtype)
+                else:
+                    held = np.ascontiguousarray(np.atleast_1d(np.asarray(fed)), dtype=dtype)
+                    if held.size != count:
+                        raise ValueError(f"Fortran feed {value_id} has {held.size} elements; ABI needs {count}")
                 buffers[value_id] = held
             slots.append(held)
+        # Local sequence workspaces are caller-owned in Fortran. Publish the
+        # capacity of the actual allocations through the EXISTING descriptor,
+        # just as C/LLVM publish their privately owned root allocations.
+        metadata = {} if self._api is None else dict(self._api.metadata)
+        descriptors = {int(item["sequence_id"]): item for item in
+            (metadata.get("sequence_tables") or {}).get(self._entry_record.name, ())}
+        for binding in (metadata.get("sequence_runtime_bindings") or {}).get(self._entry_record.name, ()):
+            descriptor = descriptors[int(binding["sequence_id"])]
+            rows = []
+            row_shapes = dict(zip(descriptor["column_value_ids"], descriptor["column_shapes"], strict=True))
+            for column in binding["column_parameters"]:
+                column_id = int(column.lstrip("t"))
+                width = int(np.prod(row_shapes[column_id])) if row_shapes[column_id] else 1
+                rows.append(buffers[column_id].size // width)
+            if not rows:
+                continue
+            capacity_id = int(binding["capacity_parameter"].lstrip("t"))
+            allocated_rows = min(rows)
+            if capacity_id not in feeds:
+                buffers[capacity_id][0] = allocated_rows
+            elif not 0 <= int(buffers[capacity_id][0]) <= allocated_rows:
+                raise ValueError("Fortran sequence capacity exceeds its resident columns")
         pointers = (ctypes.c_void_p * len(slots))(*(
             ctypes.c_void_p(int(held.ctypes.data)) for held in slots
         ))
         return FortranCoreExecution(
-            buffers, self._packed, pointers, len(slots),
+            buffers, self._packed, pointers, len(slots), slots,
         )
 

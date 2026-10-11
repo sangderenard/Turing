@@ -1,9 +1,10 @@
 """Memory profile of the N-piece orbital dt lowering (the user runs it).
 
-    python -u tools/compiler_probes/profile_memory_n2.py [N] [--trace]
-        [--budget-bytes B] [--digest-only]
+    python -u tools/compiler_probes/profile_memory_n2.py [N|all] --backend llvm
+        [--trace] [--budget-bytes B] [--save-ssa]
 
-PYTHONPATH must include C:\\dev\\Powershell\\engine_toy.  Lowers the first N
+TURING_PROBE_EXTERNAL_ROOT can select the original examples/engine_toy roots
+while compiler imports stay in this worktree. Lowers the first N
 pieces of the orbital craft in link mode, as ``lowered_system`` does (a piece
 that is missing or stale is rebuilt through ``equation_piece``, only those N),
 and prints, inline:
@@ -14,7 +15,7 @@ and prints, inline:
 * at the PEAK resident set seen at a progress message: the top 15 object
   types by estimated size, the identity book's largest pages, the retained
   planning memos, and (``--trace``) the top 10 tracemalloc sites;
-* the sha256 of the emitted C module, so a regulated run
+* the sha256 of the emitted C or LLVM module, so a regulated run
   (``--budget-bytes``) can be compared with the unregulated one.
 
 It compiles; it is not run by the agents that edit the compiler.
@@ -22,6 +23,7 @@ It compiles; it is not run by the agents that edit the compiler.
 from __future__ import annotations
 
 import gc
+import os
 import hashlib
 import sys
 import tempfile
@@ -31,7 +33,8 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-for _entry in (ROOT.parent / "engine_toy", ROOT / "examples", ROOT):
+EXTERNAL_ROOT = Path(os.environ.get("TURING_PROBE_EXTERNAL_ROOT", str(ROOT)))
+for _entry in (EXTERNAL_ROOT.parent / "engine_toy", EXTERNAL_ROOT / "examples", ROOT):
     sys.path.insert(0, str(_entry))
 
 from src.compiler.shell_telemetry import process_rss_bytes  # noqa: E402
@@ -84,11 +87,26 @@ def book_report() -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    pieces_wanted = int(next((a for a in argv[1:] if a.isdigit()), 2))
+    import argparse
+    parser = argparse.ArgumentParser(description="Compile N orbital rules through OUR public compiler; no target execution or deadline.")
+    parser.add_argument("N", nargs="?", default="2", help="positive rule count, or all")
+    parser.add_argument("--backend", choices=("c", "llvm"), default="c")
+    parser.add_argument("--source-compilation", choices=("serial", "units"), default="serial")
+    parser.add_argument("--optimization", choices=("O0", "O1", "O2", "O3"), default="O3")
+    parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--save-ssa", action="store_true", help="retain the public lowerer's SSA before backend emission, for failure analysis")
+    parser.add_argument("--budget-bytes", type=int)
+    parser.add_argument("--digest-only", action="store_true", help="retained compatibility option")
+    options = parser.parse_args(argv[1:])
+    os.chdir(ROOT)
+    try:
+        pieces_wanted = None if options.N == "all" else int(options.N)
+    except ValueError:
+        parser.error("N must be positive, or all")
+    if pieces_wanted is not None and pieces_wanted < 1:
+        parser.error("N must be positive, or all")
     tracing = "--trace" in argv
-    budget = None
-    if "--budget-bytes" in argv:
-        budget = int(argv[argv.index("--budget-bytes") + 1])
+    budget = options.budget_bytes
     if tracing:
         tracemalloc.start(10)
 
@@ -144,8 +162,14 @@ def main(argv: list[str]) -> int:
 
     craft = orbital_craft()
     paths = []
-    for name, equations in list(
-            craft_machine_equations(craft, 1, green_coast=True))[:pieces_wanted]:
+    rules = list(craft_machine_equations(craft, 1, green_coast=True))
+    if pieces_wanted is not None and pieces_wanted > len(rules):
+        parser.error(f"N={pieces_wanted} exceeds this craft's {len(rules)} rules")
+    selected = rules if pieces_wanted is None else rules[:pieces_wanted]
+    print(f"RULE_SUBMISSION count={len(selected)} available={len(rules)} backend={options.backend} "
+          f"source_compilation={options.source_compilation} optimization={options.optimization} "
+          f"trace={tracing} compiler_root={ROOT}", flush=True)
+    for name, equations in selected:
         path = (honorary._LLVM_LAW_CACHE_DIR / name / "b1"
                 / honorary._llvm_piece_cache_key(name, 1, tuple(equations))
                 / f"{name}.piece")
@@ -154,23 +178,46 @@ def main(argv: list[str]) -> int:
             honorary.equation_piece(name, equations, batch=1)
         paths.append(path)
 
-    build = Path(tempfile.gettempdir()) / "profile_memory_n2"
+    (ROOT / "build").mkdir(exist_ok=True)
+    build = Path(tempfile.mkdtemp(prefix=f"profile_rules_{len(selected)}_{options.backend}_", dir=ROOT / "build"))
+    print("RULE_BUILD_DIRECTORY=" + str(build), flush=True)
     progress("profile: lowered_system begin")
-    system = lds.lowered_system(
-        paths, directory=build, piece_mode="link",
-        channel_names=ORBITAL_CHANNEL_NAMES, progress=progress,
-    )
-    progress("profile: lowered_system done")
-
-    print(f"\n{'t(s)':>8} {'RSS MiB':>9} {'traced MiB':>11}  stage")
-    for when, label, resident, trace in table:
-        print(f"{when:8.1f} {resident / MIB:9.0f} {trace / MIB:11.0f}  {label}")
-    print(f"\npeak resident set at a progress message: {peak['rss'] / MIB:.0f} MiB "
-          f"({peak['label'][:90]})")
-    print("\n".join(peak["report"]))
-    source = build / f"{system.artifact.name}.c"
+    from src.compiler import fortran_c_shell
+    ordinary_lower = fortran_c_shell.lower_ast_source_to_ssa
+    def capture_ssa(*args, **kwargs):
+        result = ordinary_lower(*args, **kwargs)
+        import pickle
+        destination = build / "repository-ssa.pkl"
+        try:
+            with destination.open("wb") as stream:
+                pickle.dump(result, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as error:
+            print(f"SSA_CAPTURE_FAILED {type(error).__name__}: {error}; compile continues", flush=True)
+        else:
+            print(f"SSA_CAPTURE {destination} bytes={destination.stat().st_size}", flush=True)
+        return result
+    if options.save_ssa:
+        fortran_c_shell.lower_ast_source_to_ssa = capture_ssa
+    try:
+        system = lds.lowered_system(
+            paths, directory=build, piece_mode="link",
+            channel_names=ORBITAL_CHANNEL_NAMES, progress=progress,
+            backend=lds.LLVM_BACKEND if options.backend == "llvm" else lds.C_BACKEND,
+            source_compilation=options.source_compilation, optimization=options.optimization,
+        )
+        progress("profile: lowered_system done")
+    finally:
+        fortran_c_shell.lower_ast_source_to_ssa = ordinary_lower
+        print(f"\n{'t(s)':>8} {'RSS MiB':>9} {'traced MiB':>11}  stage")
+        for when, label, resident, trace in table:
+            print(f"{when:8.1f} {resident / MIB:9.0f} {trace / MIB:11.0f}  {label}")
+        print(f"\npeak resident set at a progress message: {peak['rss'] / MIB:.0f} MiB "
+              f"({peak['label'][:90]})")
+        print("\n".join(peak["report"]))
+        print(f"PROBE_ELAPSED {time.time() - STARTED:.3f}s BUILD_DIRECTORY {build}", flush=True)
+    source = build / f"{system.artifact.name}{'.ll' if options.backend == 'llvm' else '.c'}"
     if source.is_file():
-        print(f"\nemitted C {source.name}: sha256 "
+        print(f"\nemitted {options.backend} {source.name}: sha256 "
               f"{hashlib.sha256(source.read_bytes()).hexdigest()}")
     print(f"{len(system.module.functions)} functions")
     return 0

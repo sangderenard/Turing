@@ -1,0 +1,344 @@
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -22505,6 +22505,72 @@
+             )
+             return tuple(filter(None, (identity(member) for member in members)))
+ 
++        pooled_table_contexts: dict[tuple[int, str], tuple] = {}
++
++        def materialize_row_table_context(
++            schema_identity: str, parameter_name: str, field_path: str,
++            field: Mapping[str, Any],
++        ) -> tuple:
++            """The declared table's pooled storage, independent of row selection.
++
++            root(book, handle)->inspect(book, handle) previously published only
++            Object.kind in root's row record and deferred Object.members. The
++            callee's table arenas/length vector had no record claims, so they
++            were leased as private scratch; its stride then refused binding.
++            Both materializers now publish the SAME declared physical context.
++            A selected row is still the existing sequence view, not this pool.
++            """
++            key = (int(record_id), str(field_path))
++            if key in pooled_table_contexts:
++                return pooled_table_contexts[key]
++            columns = tuple(dict(column) for column in field.get("columns") or ())
++            if not columns or any(not column.get("name") or not column.get("dtype")
++                                  for column in columns):
++                raise ValueError(f"declared row table {field_path!r} requires named typed columns")
++            mutable = bool(field.get("mutable", False))
++            specs = [
++                (f"columns.{column['name']}", str(column["dtype"]), "span", 1,
++                 mutable, tuple(map(str, column.get("token_vocabulary") or ())))
++                for column in columns
++            ]
++            specs.extend((("lengths", "int64", "span", 1, mutable, ()),
++                          ("row_stride", "int64", "scalar", 0, False, ())))
++            context_values = []
++            context_fields = []
++            declaration = current_identity_book().latest_ref(
++                CONTRACT_DEMAND_PAGE, (DemandKind.PARAMETER_RECORD, schema_identity))
++            for member_name, member_dtype, storage, rank, writable, vocabulary in specs:
++                path = f"{field_path}.{member_name}"
++                value = SSAValue(
++                    _frame_mint(function, NESTED_RECORD_PART,
++                        _frame_cells(declaration, _frame_graph_cell(graph, record_id)),
++                        dtype=member_dtype, stage=RECORD_ABI_MATERIALIZATION),
++                    dtype=member_dtype,
++                    accounting={
++                        "program_abi_record": schema_identity,
++                        "program_abi_parameter": str(parameter_name),
++                        "program_abi_field": path,
++                        "program_abi_storage": storage,
++                        "program_abi_rank": rank,
++                        "program_abi_mutable": writable,
++                        "program_abi_field_written": False,
++                        "program_abi_row_identity": "deterministic_graph_node_id",
++                        "program_abi_token_vocabulary": vocabulary,
++                    },
++                )
++                function.args.append(value)
++                values[int(value.id)] = value
++                context_values.append(value)
++                context_fields.append(SSARecordFieldDescriptor(
++                    member_name, SSARecordFieldStorage.SPAN if rank else SSARecordFieldStorage.SCALAR,
++                    storage_identity=_row_column_identity(declared_records, parameter_name, path),
++                    value_ids=(int(value.id),), dtype=member_dtype, writable=writable,
++                ))
++            context = (tuple(context_values[:-2]), context_values[-2], context_values[-1],
++                       tuple(context_fields))
++            pooled_table_contexts[key] = context
++            return context
++
+         def materialize_nested_record(
+             schema_name: str,
+             owner_ids: set[int],
+@@ -22792,69 +22858,8 @@
+                     if sequence_id is None and resident_views:
+                         sequence_id = next(iter(resident_views))
+                     if sequence_id is not None and columns:
+-                        column_arenas = []
+-                        for column in columns:
+-                            arena = SSAValue(
+-                                GLOBAL_MONOTONIC_IDS.mint(),
+-                                dtype=str(column["dtype"]),
+-                                accounting={
+-                                    "program_abi_record": schema_identity,
+-                                    "program_abi_parameter": str(
+-                                        parameter_name
+-                                    ),
+-                                    "program_abi_field": (
+-                                        f"{nested_path}.columns."
+-                                        f"{column['name']}"
+-                                    ),
+-                                    "program_abi_storage": "span",
+-                                    "program_abi_rank": 1,
+-                                    "program_abi_mutable": mutable,
+-                                    "program_abi_field_written": False,
+-                                    "program_abi_row_identity": (
+-                                        "deterministic_graph_node_id"
+-                                    ),
+-                                    "program_abi_token_vocabulary": tuple(
+-                                        map(str, column.get(
+-                                            "token_vocabulary"
+-                                        ) or ())
+-                                    ),
+-                                },
+-                            )
+-                            function.args.append(arena)
+-                            values[int(arena.id)] = arena
+-                            column_arenas.append(arena)
+-                        lengths = SSAValue(
+-                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+-                            accounting={
+-                                "program_abi_record": schema_identity,
+-                                "program_abi_parameter": str(parameter_name),
+-                                "program_abi_field": f"{nested_path}.lengths",
+-                                "program_abi_storage": "span",
+-                                "program_abi_rank": 1,
+-                                "program_abi_mutable": mutable,
+-                                "program_abi_field_written": False,
+-                                "program_abi_row_identity": (
+-                                    "deterministic_graph_node_id"
+-                                ),
+-                            },
+-                        )
+-                        stride = SSAValue(
+-                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+-                            accounting={
+-                                "program_abi_record": schema_identity,
+-                                "program_abi_parameter": str(parameter_name),
+-                                "program_abi_field": (
+-                                    f"{nested_path}.row_stride"
+-                                ),
+-                                "program_abi_storage": "scalar",
+-                                "program_abi_rank": 0,
+-                                "program_abi_mutable": False,
+-                                "program_abi_field_written": False,
+-                            },
+-                        )
+-                        function.args.extend((lengths, stride))
+-                        values[int(lengths.id)] = lengths
+-                        values[int(stride.id)] = stride
++                        column_arenas, lengths, stride, context_fields = materialize_row_table_context(
++                            schema_identity, parameter_name, nested_path, nested_field)
+                         row_handle = values[int(row_handle_id)]
+                         row_offset = SSAValue(
+                             GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+@@ -23055,6 +23060,9 @@
+                                 dtype="row",
+                                 writable=mutable,
+                             ))
++                            nested_fields.extend(replace(context_field,
++                                name=f"{nested_name}.{context_field.name}")
++                                for context_field in context_fields)
+                             continue
+                     # A declared table that cannot yet be correlated to the
+                     # authored iterable stays an explicit reference frontier;
+@@ -23524,6 +23532,7 @@
+             schema_identity = str(schema.get("identity") or schema_name)
+             row_fields: list[SSARecordFieldDescriptor] = []
+             deferred: list[tuple[str, str]] = []
++            table_decompositions = []
+             for leaf_name, leaf_field in dict(schema.get("fields") or {}).items():
+                 leaf_field = dict(leaf_field)
+                 leaf_storage = str(leaf_field.get("storage") or "")
+@@ -23547,6 +23556,19 @@
+                             ),
+                             writable=False,
+                         ))
++                    continue
++                if leaf_storage == "table":
++                    _arenas, _lengths, stride, context_fields = materialize_row_table_context(
++                        schema_identity, parameter_name, leaf_path, leaf_field)
++                    row_fields.extend(replace(context_field,
++                        name=f"{leaf_name}.{context_field.name}")
++                        for context_field in context_fields)
++                    # Only capacity is shared with a selected row descriptor:
++                    # its length ADDRESS and column pointers are row-local GEP
++                    # results, not the whole lengths/column pools. Publishing
++                    # those pools as selected-row members would misbind them.
++                    table_decompositions.append((f"{schema_identity}.{leaf_name}",
++                        ((("capacity_value_id",), int(stride.id)),)))
+                     continue
+                 leaf_shape = (
+                     None if leaf_field.get("shape") is None
+@@ -23644,6 +23666,15 @@
+             table.register(SSARecordDescriptor(
+                 int(row_record_id), schema_identity, tuple(row_fields),
+             ))
++            from .concordance_declarations import RECORD_DESCRIPTOR, RECORD_FIELD_DECOMPOSITION
++            from .identity_concordance import Mode
++            for storage_identity, roles in table_decompositions:
++                _frame_post(RECORD_FIELD_DECOMPOSITION,
++                    (table.owner, int(row_record_id), storage_identity), roles,
++                    stage=RECORD_ABI_MATERIALIZATION, mode=Mode.CONCORD,
++                    cells=_frame_cells(
++                        _frame_table_cell(table, row_record_id, RECORD_DESCRIPTOR),
++                        *(_frame_value_cell(function, value_id) for _role, value_id in roles)))
+             return int(row_record_id)
+ 
+         for parameter_name, record in declared_records.items():
+@@ -23759,10 +23790,18 @@
+                     incoming_slot = current_identity_book().page(
+                         "record_field_incoming_slot"
+                     ).latest((str(symbol), str(parameter_name), str(field_name)))
+-                    candidate_ids = (
+-                        (int(incoming_slot),) if incoming_slot is not None
+-                        else (GLOBAL_MONOTONIC_IDS.mint(),)
+-                    )
++                    # A forwarding-only keyed field already has its complete
++                    # physical length/keys/values decomposition below. There
++                    # is no authored read/write naming a logical mapping here.
++                    # root->relay->inspect formerly minted that absent mapping
++                    # as an extra input; relay's ghost input was then leased
++                    # despite root owning the field (duplicate-storage-across-
++                    # call). Do not invent a second input beside its residents.
++                    if storage != "keyed":
++                        candidate_ids = (
++                            (int(incoming_slot),) if incoming_slot is not None
++                            else (GLOBAL_MONOTONIC_IDS.mint(),)
++                        )
+                 if (
+                     "sequence" in access_receipts
+                     and storage not in {"keyed", "table", "record"}
+@@ -24035,6 +24074,14 @@
+                             for part_name in parts
+                         )
+                     ), None)
++                    if existing_parts is None:
++                        decomposition = dict(current_identity_book().page(
++                            "record_field_decomposition").latest((
++                                table.owner, int(record_id), storage_identity), ()) or ())
++                        roles = {"length": ("length_address_id",),
++                                 "keys": ("column", 0), "values": ("column", 1)}
++                        if all(decomposition.get(roles[part]) in values for part in parts):
++                            existing_parts = {part: int(decomposition[roles[part]]) for part in parts}
+                     if existing_parts is not None:
+                         # Reuse means reuse the complete ABI description, not
+                         # merely the allocations.  Omitting these descriptors
+diff --git a/tests/test_ssa_object_operations.py b/tests/test_ssa_object_operations.py
+--- a/tests/test_ssa_object_operations.py
++++ b/tests/test_ssa_object_operations.py
+@@ -156,14 +156,92 @@
+     assert 'record-sequence-unknown' in concordance_report(module)
+ 
+ 
+-def test_source_caller_nested_object_member_context_remains_an_explicit_gap():
+-    # Retain the actual failing source composition, rather than presenting
+-    # the SSA caller test as an automatic front-end binding success.
+-    source = ('def inspect(book,handle):\n    identity=id(handle)\n'
+-              '    return len(book.objects[identity].members)\n'
+-              'def root(book,handle):\n    return inspect(book,handle)\n')
+-    with pytest.raises(ValueError, match='metadata.Object.members.*has no such field'):
+-        lower_ast_source_to_ssa(source, 'root', name='object_context_gap',
++@pytest.mark.parametrize('operation', [ObjectOperation.KIND, ObjectOperation.LENGTH,
++                                       ObjectOperation.GET, ObjectOperation.SET])
++@pytest.mark.parametrize('depth', [1, 2])
++def test_source_calls_forward_complete_object_table_context(operation, depth, tmp_path):
++    # Actual authored call composition through the public compiler entry,
++    # not the manually assembled SSA caller used by the helper-API tests.
++    body = {
++        ObjectOperation.KIND: '    return item.kind\n',
++        ObjectOperation.LENGTH: '    return len(item.members)\n',
++        ObjectOperation.GET: '    return item.members[index][1]\n',
++        ObjectOperation.SET: '    item.members[index][1]=value\n    return True\n',
++    }[operation]
++    source = ('def inspect(book,handle,index,value):\n    identity=id(handle)\n'
++              '    item=book.objects[identity]\n' + body)
++    target = 'inspect'
++    if depth == 2:
++        source += 'def relay(book,handle,index,value):\n    return inspect(book,handle,index,value)\n'
++        target = 'relay'
++    source += f'def root(book,handle,index,value):\n    return {target}(book,handle,index,value)\n'
++    module, outputs, exports = lower_ast_source_to_ssa(source, 'root', name='object_context',
++        extraction_contract=policy(operation is ObjectOperation.SET), runtime_closure_only=True,
++        progress=lambda _: None, progress_bars=False)
++    root = module.functions[exports[0]]
++    fields = {v.accounting.get('program_abi_field'): v for v in root.args
++              if v.accounting.get('program_abi_field')}
++    context_paths = ('objects[].members.columns.key', 'objects[].members.columns.value',
++                     'objects[].members.lengths', 'objects[].members.row_stride')
++    for path in context_paths:
++        assert path in fields
++        assert sum(v.accounting.get('program_abi_field') == path for v in root.args) == 1
++        assert 'linked_call_frame_storage' not in fields[path].accounting
++        assert 'returned_record_storage' not in fields[path].accounting
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    artifact = emit_ssa_function_to_llvm(module, root.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'source_calls')
++    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
++    from src.compiler.ssa_fortran_backend import emit_module
++    c = emit_ssa_module_to_c(module, root.name)
++    assert c.complete, c.shortfalls
++    fortran = emit_module(module, outputs=outputs, progress=lambda _: None)
++    assert fortran.complete, fortran.shortfalls
++    facts = {
++        'objects.length': [3], 'objects.keys': [2**60+3, 17, 29], 'objects.values': [0, 1, 2],
++        'objects[].kind.column': [1, 2, 6], 'objects[].members.lengths': [2, 0, 1],
++        'objects[].members.row_stride': [2], 'objects[].members.columns.key': [7, 11, 0, 0, 13, 0],
++        'objects[].members.columns.value': [2**60+19, 23, 0, 0, 31, 0],
++    }
++    arrays = {path: np.array(data, dtype=np.int64) for path, data in facts.items()}
++    buffers = {v.id: arrays[v.accounting['program_abi_field']] for v in root.args
++               if v.accounting.get('program_abi_field') in arrays}
++    parameters = dict(root.metadata['parameter_names'])
++    output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    cases = [(2**60+3, 0, 1, 2, 2**60+19), (29, 0, 6, 1, 31)]
++    if operation in {ObjectOperation.KIND, ObjectOperation.LENGTH}:
++        cases.append((17, 0, 2, 0, None))
++    for handle, index, kind, length, member in cases:
++        replacement = 2**60+43
++        for name, value in [('handle', handle), ('index', index), ('value', replacement)]:
++            if parameters.get(name) in {v.id for v in root.args}:
++                buffers[parameters[name]] = np.array([value], dtype=np.int64)
++        execution = prepare_artifact_execution(native, buffers).run()
++        assert execution.buffers[output].item() == {
++            ObjectOperation.KIND: kind, ObjectOperation.LENGTH: length,
++            ObjectOperation.GET: member, ObjectOperation.SET: True}[operation]
++        if operation is ObjectOperation.SET:
++            row = 0 if handle == 2**60+3 else 2
++            assert arrays['objects[].members.columns.value'][row*2+index] == replacement
++        assert arrays['objects[].members.columns.key'].tolist() == facts['objects[].members.columns.key']
++        assert arrays['objects[].members.lengths'].tolist() == facts['objects[].members.lengths']
++
++
++def test_recursive_keyed_view_reports_unmaterialized_workspace():
++    # This remains an explicit refusal, NOT a successful recursive/native
++    # context proof. An authored keyed view still reaches recursive frame
++    # leasing before its physical decomposition has been linked.
++    source = ('def inspect(book,handle,index):\n    if index<=0:\n'
++              '        result=len(book.objects[id(handle)].members)\n'
++              '    else:\n        result=inspect(book,handle,index-1)\n'
++              '    return result\n'
++              'def root(book,handle,index):\n    return inspect(book,handle,index)\n')
++    from src.compiler.ssa_fortran_backend import FortranEmissionError
++    with pytest.raises(FortranEmissionError,
++            match="recursive invocation storage.*private_formal=6, dtype='unknown'.*declared_workspace=True"):
++        lower_ast_source_to_ssa(source, 'root', name='recursive_context',
+             extraction_contract=policy(), runtime_closure_only=True,
+             progress=lambda _: None, progress_bars=False)
+ 

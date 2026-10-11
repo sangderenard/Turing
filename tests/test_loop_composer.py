@@ -8,6 +8,20 @@ import textwrap
 from dataclasses import replace
 
 import numpy as np
+import pytest
+
+from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+
+@pytest.fixture(autouse=True)
+def _isolated_loop_fixture_book():
+    # Independent authored test programs cannot redeclare one project's
+    # qualified function addresses with another table's address ordering.
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
 
 from src.common.tensors.accelerator_backends.glsl_backend import (
     emit_native_for_loop,
@@ -1085,7 +1099,7 @@ def test_raise_guard_inside_retained_loop_becomes_lexical_validation():
     assert "Raise" not in reduction.blockers
     assert reduction.control_program is not None
     assert reduction.control_program.root.source_loop_node_id == (
-        plans[0].loop.node_id
+        plan.loop.node_id
     )
     root = reduction.control_program.root
     assert isinstance(root, LoopBlock)
@@ -1633,40 +1647,51 @@ def test_method_spelling_does_not_turn_unknown_receiver_into_sequence():
     assert effect.sequence_policy is None
 
 
-def test_bootstrap_collection_mutation_occurrence_ledger_is_not_collapsed():
+@pytest.mark.parametrize('target_name', ('_attach_external_methods', '_expand_unresolved_ast_parents', 'build_from_ast'))
+def test_bootstrap_collection_mutation_occurrence_ledger_is_not_collapsed(target_name):
+    from collections import Counter
+    # The actual bootstrap source now has extra annotation/dependency queues.
+    # Check authored receiver/operator occurrences, not a retired ordering of
+    # five operation names. Distinct call sites must remain distinct effects.
     expected = {
-        "_attach_external_methods": [("add", "unique")],
+        "_attach_external_methods": [("present", "add", "unique")],
         "_expand_unresolved_ast_parents": [
-            ("append", "duplicates"),
-            ("add", "unique"),
-            ("extend", "duplicates"),
-            ("append", "duplicates"),
-            ("append", "duplicates"),
+            ("static_table_lookups", "append", "duplicates"),
+            ("new_definitions", "append", "duplicates"),
+            ("parent_links", "append", "duplicates"),
+            ("unresolved_calls", "append", "duplicates"),
+            ("unavailable_identities", "add", "unique"),
+            ("definitions", "extend", "duplicates"),
         ],
         "build_from_ast": [
-            ("append", "duplicates"),
-            ("add", "unique"),
+            ("class_names", "append", "duplicates"),
+            ("seen_methods", "add", "unique"),
+            ("dependency_seed_definitions", "append", "duplicates"),
+            ("pending", "extend", "duplicates"),
+            ("pending", "pop", "duplicates"),
+            ("annotation_rows", "append", "duplicates"),
+            ("annotation_rows", "append", "duplicates"),
         ],
     }
-    targets = (
-        graph_express2._attach_external_methods,
-        graph_express2._expand_unresolved_ast_parents,
-        ProcessGraph.build_from_ast,
-    )
-    for target in targets:
-        source = textwrap.dedent(inspect.getsource(target))
-        graph = _function_graph(source, target.__name__)
-        plans = _glsl_composer().compose(graph)
-        actual = [
-            (effect.operator, effect.sequence_policy)
-            for plan in plans
-            for effect in plan.loop.state_effects
-            if effect.mode is LoopStateEffectMode.SEQUENCE_MUTATION
-        ]
-        # This is an authored-operation ledger, not a count of compiler
-        # worklist visits. Binding-revision requeues must never fabricate
-        # a second runtime mutation for the same source Call node.
-        assert actual == expected[target.__name__]
+    target = (ProcessGraph.build_from_ast if target_name == 'build_from_ast'
+              else getattr(graph_express2, target_name))
+    source = textwrap.dedent(inspect.getsource(target))
+    graph = _function_graph(source, target.__name__)
+    plans = _glsl_composer().compose(graph)
+    effects = [effect for plan in plans for effect in plan.loop.state_effects
+               if effect.mode is LoopStateEffectMode.SEQUENCE_MUTATION]
+    # This is an authored-operation ledger, not a count of compiler
+    # worklist visits. Binding-revision requeues must never fabricate
+    # a second runtime mutation for the same source Call node.
+    assert len(effects) == len({effect.effect_node_id for effect in effects})
+    actual = []
+    for effect in effects:
+        expression = graph.G.nodes[effect.effect_node_id]['expr_obj']
+        assert isinstance(expression, ast.Call)
+        assert isinstance(expression.func, ast.Attribute)
+        assert isinstance(expression.func.value, ast.Name)
+        actual.append((expression.func.value.id, effect.operator, effect.sequence_policy))
+    assert Counter(actual) == Counter(expected[target.__name__])
 
 
 def test_ifexp_list_merge_preserves_each_args_extend_and_append_occurrence():
@@ -1873,7 +1898,7 @@ def test_generator_extend_routes_yields_and_filter_into_destination_insert():
     )
     assert shortfalls == ()
     assert (
-        f"ssa_sequence_{mutation.sequence_value_id}_append"
+        f"planned_control__ssa_sequence_{mutation.sequence_value_id}_append"
         in module.functions
     )
     assert {

@@ -440,6 +440,25 @@ def test_integer_scalar_domain_is_not_widened_through_double(tmp_path):
         )
 
 
+def test_integer_floor_division_is_exact_for_representable_nonzero_divisors(tmp_path):
+    left, right, result = (SSAValue(i, "int64") for i in range(3))
+    function = Function("integer_floor", [left, right], {
+        "entry": BasicBlock("entry", [
+            Instr("FloorDiv", [left, right], result), Instr("Ret", [result], None),
+        ]),
+    })
+    artifact = emit_ssa_function_to_llvm(IRModule({function.name: function}), function.name)
+    assert artifact.complete, artifact.shortfalls
+    assert "fdiv" not in artifact.llvm_ir
+    native = compile_artifact(artifact, directory=tmp_path)
+    for numerator, denominator in (
+        (-1, 2), (1, -2), (-7, 3), (7, -3), (-6, -3), (0, 3),
+        (2**60 + 17, 7), (-2**60 - 17, 7),
+    ):
+        execution = prepare_artifact_execution(native, {left.id: numerator, right.id: denominator}).run()
+        assert int(execution.buffers[result.id]) == numerator // denominator
+
+
 def test_multiblock_span_constants_fill_and_mixed_scalars_convert(tmp_path):
     """Span fills and scalar broadcasts retain their physical dtypes."""
 
@@ -749,3 +768,40 @@ def test_real_program_regions_compile_to_native_artifacts(ssa_module, tmp_path):
         compiled = compile_artifact(artifact, directory=tmp_path / region)
         assert compiled.library_path is not None and compiled.library_path.is_file()
         assert compiled.entry() is not None
+def test_pointer_phi_refuses_incompatible_physical_element_types():
+    from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
+    from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
+    integer, floating, selected = SSAValue(0, "int64"), SSAValue(1, "float64"), SSAValue(2, "int64")
+    function = Function("mixed_phi", [integer, floating], {
+        "entry": BasicBlock("entry", [Instr("Br", [], None, attributes={"target": "merge"})], ["merge"]),
+        "other": BasicBlock("other", [Instr("Br", [], None, attributes={"target": "merge"})], ["merge"]),
+        "merge": BasicBlock("merge", [
+            Instr("Phi", [integer, floating], selected, attributes={"incoming_blocks": ("entry", "other")}),
+            Instr("Ret", [selected], None),
+        ]),
+    })
+    artifact = emit_ssa_function_to_llvm(IRModule({function.name: function}), function.name)
+    assert not artifact.complete
+    assert any(item.operation == "Phi" and "physical element" in item.reason for item in artifact.shortfalls)
+
+
+def test_scalar_phi_captures_a_value_before_its_selected_slot_is_reused(tmp_path):
+    import numpy as np
+    from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
+    from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution
+    slot, selected, replacement = SSAValue(0, "int64"), SSAValue(1, "int64"), SSAValue(2, "int64")
+    function = Function("phi_value", [slot], {
+        "entry": BasicBlock("entry", [Instr("Br", [], None, attributes={"target": "merge"})], ["merge"]),
+        "merge": BasicBlock("merge", [
+            Instr("Phi", [slot], selected, attributes={"incoming_blocks": ("entry",)}),
+            Instr("Const", [], replacement, attributes={"value": 31}),
+            Instr("Store", [replacement, slot], None), Instr("Ret", [selected], None),
+        ]),
+    })
+    artifact = emit_ssa_function_to_llvm(IRModule({function.name: function}), function.name)
+    assert artifact.complete, artifact.shortfalls
+    native = compile_artifact(artifact, directory=tmp_path)
+    input_slot = np.array(17, dtype=np.int64)
+    result = prepare_artifact_execution(native, {slot.id: input_slot}).run()
+    assert int(result.buffers[slot.id]) == 31
+    assert int(result.buffers[selected.id]) == 17

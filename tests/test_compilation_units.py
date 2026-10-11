@@ -3,6 +3,19 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import networkx as nx
+import pytest
+
+from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+
+@pytest.fixture(autouse=True)
+def _isolated_project_book():
+    # Each synthetic project owns its function-address declarations.
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
 
 from src.compiler.compilation_units import (
     plan_compilation_units,
@@ -66,10 +79,14 @@ def test_mutual_recursion_is_the_only_automatic_multi_call_unit():
 
 def test_plan_identity_uses_qualified_names_not_reference_order():
     first, _ = _table({"z": (), "a": ()})
-    second, _ = _table({"a": (), "z": ()})
-
     first_names = [unit.qualified_names for unit in plan_compilation_units(first).units]
-    second_names = [unit.qualified_names for unit in plan_compilation_units(second).units]
+    # This is a second project, not conflicting declarations in the first.
+    _book, token = begin_identity_book()
+    try:
+        second, _ = _table({"a": (), "z": ()})
+        second_names = [unit.qualified_names for unit in plan_compilation_units(second).units]
+    finally:
+        end_identity_book(token)
 
     assert first_names == second_names == [("project.a",), ("project.z",)]
 
@@ -105,3 +122,22 @@ def test_runtime_closure_excludes_unrelated_catalogue_entries():
         references["leaf"].address,
     )))
     assert references["unrelated"].address not in regions.retained
+
+
+def test_indivisible_edges_condense_the_convex_call_component_not_unrelated_work():
+    table, references = _table({
+        "island_root": ("island_left", "island_right", "island_free"),
+        "island_left": ("island_tail",), "island_right": ("island_tail",),
+        "island_tail": (), "island_free": (),
+    })
+    plan = plan_compilation_units(table, indivisible_edges=(
+        (references["island_root"].address, references["island_left"].address),
+        (references["island_left"].address, references["island_tail"].address),
+    ))
+    island = plan.unit_for_reference(references["island_root"].address)
+    # The alternate root->right->tail path must join the contracted component;
+    # otherwise its quotient has an island->right->island scheduling cycle.
+    assert island.qualified_names == ("project.island_left", "project.island_right",
+                                      "project.island_root", "project.island_tail")
+    assert not island.recursive
+    assert plan.unit_for_reference(references["island_free"].address).qualified_names == ("project.island_free",)

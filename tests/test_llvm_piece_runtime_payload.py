@@ -125,3 +125,87 @@ def test_runtime_only_piece_refuses_source_linking(compiled_piece):
             python_bindings={"law": runtime},
             extraction_contract=batch_contract("caller", ("x",), 3),
         )
+
+
+@pytest.mark.parametrize("retain_bodies", [False, True])
+def test_static_link_imports_piece_interface_not_helper_bodies(compiled_piece, tmp_path, retain_bodies):
+    import dataclasses
+    import subprocess
+    import sys
+    from pathlib import Path
+    from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm, compile_artifact
+    piece = compiled_piece
+    original = {name: function.blocks for name, function in piece.module.functions.items()}
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def caller(x):\n    result, constant = law(x)\n    return result + constant\n",
+        "caller", name="linked_header", python_bindings={"law": piece},
+        extraction_contract=batch_contract("caller", ("x",), 3),
+        **({"retain_linked_piece_bodies": False} if not retain_bodies else {}),
+        progress=lambda message: None,
+    )
+    assert piece.entry in module.functions
+    declaration = module.functions[piece.entry]
+    if not retain_bodies:
+        assert not declaration.blocks
+        assert declaration.metadata["linked_piece_interface"]
+        assert not (set(original) - {piece.entry}) & set(module.functions)
+    assert {name: fn.blocks for name, fn in piece.module.functions.items()} == original
+    report = concordance_report(module)
+    assert report.splitlines()[0].endswith(", 0 finding(s)"), report
+    if not retain_bodies:
+        from src.compiler.identity_concordance import CorrelationTable
+        declaration.metadata["linked_piece_interface"]["native_symbol"] = "wrong_symbol"
+        assert any(f.kind == "linked-piece-interface-disagreement"
+                   for f in CorrelationTable.build(module).findings(module))
+        declaration.metadata["linked_piece_interface"]["native_symbol"] = piece.artifact.name
+    root = module.functions[exports[0]]
+    artifact = emit_ssa_function_to_llvm(module, root.name)
+    assert artifact.complete, artifact.shortfalls
+    artifact = compile_artifact(artifact, directory=tmp_path / "native")
+    runtime = dataclasses.replace(artifact, emission=None, _entry=None, _library=None,
+                                  _validation_error_reset=None, _validation_error_take=None)
+    payload = tmp_path / "native-check.pkl"
+    with payload.open("wb") as stream:
+        pickle.dump((runtime, {}, ("program_outputs",), {
+            "inputs": {int(root.args[0].id): np.array([-2.0, 0.0, 3.5])},
+            "outputs": tuple(int(value.id) for value in outputs[root.name]),
+        }), stream)
+    child = subprocess.run([sys.executable, "-u", str(Path(__file__).resolve().parents[1] /
+                           "tools/compiler_probes/graph_kernel_native_worker.py"), str(payload)],
+                           capture_output=True, text=True, timeout=10)
+    assert child.returncode == 0, child.stdout + child.stderr
+    assert "GRAPH_PROGRAM_OUTPUTS=[[12.0, 8.0, 20.25]]" in child.stdout
+    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+    # Check C's linked buffer seam directly. Scalar authored addition of two
+    # unpacked tensor outputs has a separate publication failure at clean
+    # 54c67fbd as well; it is not a compact-interface regression.
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def caller(x):\n    result, constant = law(x)\n    return result\n",
+        "caller", name="linked_header", python_bindings={"law": piece},
+        extraction_contract=batch_contract("caller", ("x",), 3),
+        **({"retain_linked_piece_bodies": False} if not retain_bodies else {}),
+        progress=lambda message: None,
+    )
+    root = module.functions[exports[0]]
+    proxy = emit_ssa_module_to_c(module, root.name, entry_name="linked_header_c", batch=3)
+    assert proxy.complete, proxy.shortfalls
+    proxy.compile(tmp_path / "native-c")
+    child = subprocess.run([sys.executable, "-u", "-c", '''
+import ctypes, json, sys
+library = ctypes.CDLL(sys.argv[1])
+entry = library.linked_header_c
+entry.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_longlong)]
+x = (ctypes.c_double * 3)(-2.0, 0.0, 3.5)
+output = (ctypes.c_double * 3)()
+order = json.loads(sys.argv[2])
+spans = [(ctypes.c_double * 3)() for _ in order]
+spans[order.index(int(sys.argv[3]))] = x
+spans[order.index(int(sys.argv[4]))] = output
+pointers = (ctypes.c_void_p * len(order))(*(ctypes.addressof(span) for span in spans))
+entry(pointers, (ctypes.c_longlong * 1)(0))
+assert list(output) == [5.0, 1.0, 13.25], list(output)
+print('NATIVE_LINK_HEADER_C=exact')
+''', str(proxy.library_path), __import__('json').dumps(proxy.buffer_order),
+                           str(root.args[0].id), str(outputs[root.name][0].id)],
+                           capture_output=True, text=True, timeout=10)
+    assert child.returncode == 0, child.stdout + child.stderr

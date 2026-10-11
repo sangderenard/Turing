@@ -18,6 +18,7 @@ from src.compiler.project_compilation_product import (
     compile_project_call,
     compile_project_bootstrap_creep,
     compile_project_product,
+    compile_partitioned_source,
     compile_process_graph_creep,
     compile_process_graph_subdivision_integral,
     compile_process_graph_subdivision_plan,
@@ -181,6 +182,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--entry", action="append", default=[])
+    parser.add_argument("--partitioned-source", action="store_true",
+                        help="plan source once, archive bounded SCC inputs, then lower in isolated workers")
+    parser.add_argument("--interface-tiles", action="store_true",
+                        help="partitioned-source: compile native objects and import bodyless callee interfaces")
+    parser.add_argument("--max-tile-nodes", type=int, default=4096,
+                        help="source nodes per SCC/dependency cut in partitioned-source mode (default: 4096)")
     parser.add_argument(
         "--extraction-contract", type=Path,
         default=DEFAULT_PROJECT_EXTRACTION_CONTRACT,
@@ -347,6 +354,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             "stage": "compiler_bootstrap_activation",
             "products": [item.to_mapping() for item in activations],
         }, sort_keys=True), flush=True)
+
+    if arguments.interface_tiles and not arguments.partitioned_source:
+        parser.error("--interface-tiles requires --partitioned-source")
+    if arguments.partitioned_source:
+        if arguments.source is None or len(arguments.entry) > 1:
+            parser.error("--partitioned-source requires --source and at most one --entry")
+        if arguments.emit_native or arguments.seed_product or arguments.plan_only:
+            parser.error("partitioned-source publishes SSA units; native image/seed/plan-only modes are separate")
+        manifest = compile_partitioned_source(
+            arguments.source.read_text(encoding="utf-8"), arguments.output,
+            entrypoint=arguments.entry[0] if arguments.entry else None,
+            extraction_contract=arguments.extraction_contract,
+            jobs=arguments.jobs if arguments.jobs is not None else 2,
+            max_unit_source_nodes=arguments.max_tile_nodes,
+            interface_tiles=arguments.interface_tiles,
+            max_total_resident_bytes=(None if arguments.max_total_gb is None
+                                      else int(arguments.max_total_gb * 1024 ** 3)),
+            worker_resident_reservation_bytes=int(arguments.worker_reserve_gb * 1024 ** 3),
+            max_worker_memory_bytes=(None if arguments.max_worker_gb == 0
+                                     else int(arguments.max_worker_gb * 1024 ** 3)),
+            unit_timeout_seconds=(None if arguments.unit_timeout_seconds == 0
+                                  else arguments.unit_timeout_seconds),
+            progress=lambda event: print(json.dumps(event, sort_keys=True), flush=True),
+        )
+        print(json.dumps({"counts": manifest["counts"],
+                          "concurrent_workers_peak": manifest["concurrent_workers_peak"],
+                          "manifest": str(arguments.output.resolve() / "product/manifest.json")},
+                         sort_keys=True), flush=True)
+        return 1 if manifest["counts"]["failed"] or manifest["counts"]["partial"] else 0
 
     if arguments.creep_project:
         if arguments.source is None:

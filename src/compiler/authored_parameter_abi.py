@@ -112,6 +112,11 @@ def _authored_sequence_annotation_contract(
         "float": "float64",
         # Repository SSA represents authored text by its deterministic token.
         "str": "int64",
+        # An arbitrary object is carried by the incumbent reference ABI:
+        # one fixed-width identity handle, not its unknown physical payload.
+        # This proves a collection's SLOT layout without claiming the handle
+        # can be dereferenced or its runtime object type inspected.
+        "object": "opaque_ref",
     }
 
     def scalar_dtype(node: ast.AST) -> str | None:
@@ -156,6 +161,53 @@ def _authored_sequence_annotation_contract(
         container in {"List", "list", "Set", "set"},
         (dtype,),
     )
+
+
+def _authored_parameter_sequence_contracts(graph_obj: Any):
+    """Derive parameter row contracts from the existing boundary receipts.
+
+    A top-level ProgramABI keyed value previously received only scalar dtype
+    accounting: memo[key] emitted a flat GEP rather than keyed-table access.
+    The normalized boundary already states this row layout; consume it at
+    the same declaration site as authored collection annotations.
+    """
+    contracts = {}
+    for parameter, annotation in _current_authored_parameter_annotations(graph_obj).items():
+        contract = _authored_sequence_annotation_contract(annotation)
+        if contract is not None:
+            contracts[str(parameter)] = contract
+    receipts = dict(graph_obj.graph.get("parameter_value_abi") or {})
+    # The existing call-edge ABI fixed point also describes captured inputs.
+    # Consume that exact input identity, not a same-spelled parameter in a
+    # different function, and never derive a row layout from an opaque handle.
+    linked = graph_obj.graph.get("linked_value_abi") or {}
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if str(data.get("type") or data.get("op") or "").casefold() != "input":
+            continue
+        name = attributes.get("binding_name")
+        receipt = linked.get(int(data.get("value_id", node_id)))
+        if name is None or receipt is None or receipt.get("storage") != "keyed":
+            continue
+        incumbent = receipts.get(str(name))
+        if incumbent is not None and any(
+            incumbent.get(key) != receipt.get(key)
+            for key in ("storage", "dtype", "mutable", "key_encoding", "value_record")
+        ):
+            raise ValueError(f"parameter {name!r} declared and linked keyed contracts disagree")
+        receipts[str(name)] = receipt
+    for parameter, receipt in receipts.items():
+        if receipt.get("storage") != "keyed":
+            continue
+        if receipt.get("value_record") is not None:
+            raise ValueError("top-level keyed value_record requires its existing record-row binding; scalar row lowering cannot discard it")
+        contract = ("unique", 2, bool(receipt.get("mutable", False)),
+                    ("int64", str(receipt["dtype"])))
+        incumbent = contracts.get(str(parameter))
+        if incumbent is not None and (incumbent[0:2], incumbent[3]) != (contract[0:2], contract[3]):
+            raise ValueError(f"parameter {parameter!r} annotation and ProgramABI disagree about sequence row layout")
+        contracts[str(parameter)] = contract
+    return contracts
 
 
 def _authored_text_parameter_transforms(

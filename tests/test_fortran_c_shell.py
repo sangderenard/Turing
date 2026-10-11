@@ -2106,10 +2106,8 @@ def run(key, value):
 
 
 def test_whole_object_if_assignment_lowers_to_conditional_phi_merge():
-    from src.common.tensors.accelerator_backends.aot_compile import (
-        compile_ast_aot,
-    )
-    from src.compiler.fortran_c_shell import _class_surface_ssa_program
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     source = """
 def choose(flags, mask, add):
@@ -2117,19 +2115,15 @@ def choose(flags, mask, add):
         flags &= ~mask
     return flags | add
 """
-    compilation = compile_ast_aot(
-        source,
-        "choose",
-        {"flags": 7, "mask": 3, "add": 1},
-        precompile_only=True,
-        bake_mode="whole_program",
-        require_planned_shells=True,
-        project_captured_hierarchy=False,
-    )
-    module, _outputs, _exports = _class_surface_ssa_program(
-        compilation, "conditional_merge"
-    )
-    function = module.functions["conditional_merge__choose"]
+    policy = ExtractionContract(CONTRACT).with_program_abi({
+        'bindings': [], 'values': [{'function': 'choose', 'parameter': parameter,
+            'storage': 'scalar', 'dtype': 'int64', 'rank': 0, 'python_type': 'builtins.int'}
+            for parameter in ('flags', 'mask', 'add')]})
+    # The deprecated numerical precompile entry no longer owns complete
+    # source/control lowering. Exercise the sanctioned complete-program API.
+    module, _outputs, exports = lower_ast_source_to_ssa(source, 'choose',
+        name='conditional_merge', extraction_contract=policy, progress=lambda _: None)
+    function = module.functions[exports[0]]
     instructions = [
         instruction
         for block in function.blocks.values()
@@ -2144,11 +2138,14 @@ def choose(flags, mask, add):
         if instruction.op == "Phi"
         and instruction.attributes.get("binding") == "conditional_carried"
     )
-    assert [value.id for value in conditional.args] == [4]
-    assert [value.id for value in merged.args] == [6, 2]
-    assert merged.res.id == 3
+    assert len(conditional.args) == 1
+    # The authored bitwise expression stays int64; the backend tests nonzero.
+    assert conditional.args[0].dtype == 'int64'
+    parameters = dict(function.metadata['parameter_names'])
+    assert merged.args[1].id == parameters['flags']
+    assert merged.args[0].id != merged.args[1].id
     assert any(
-        instruction.op == "Call" and [value.id for value in instruction.args] == [3, 0]
+        instruction.op == "Call" and merged.res.id in [value.id for value in instruction.args]
         for instruction in instructions
     )
 

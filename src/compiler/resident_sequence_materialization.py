@@ -422,6 +422,15 @@ def _source_mapping_mutations(graph_obj: Any):
     from .control_source import ControlSequenceMutation
 
     aliases = _loop_carried_storage_aliases(graph_obj)
+    # The recursive metadata copier writes a caller-owned memo before its
+    # child calls. Requiring a dict materializer hoisted that IndexedStore
+    # into a numeric prelude before the branch's object constructor existed.
+    # The existing keyed Input ABI proves this is the same lexical mapping
+    # effect; its descriptor remains caller-owned, never a new local dict.
+    keyed_inputs = {int(node_id) for node_id, data in graph_obj.nodes(data=True)
+        if str(data.get('type') or data.get('op') or '').casefold() == 'input'
+        and (graph_obj.graph.get('linked_value_abi') or {}).get(
+            int(data.get('value_id', node_id)), {}).get('storage') == 'keyed'}
     materializers = {}
     for node_id, data in graph_obj.nodes(data=True):
         attrs = data.get("attributes") or {}
@@ -454,7 +463,7 @@ def _source_mapping_mutations(graph_obj: Any):
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
         base = roles.get("base")
         base = aliases.get(base, base)
-        if base not in materializers or "index" not in roles or "value" not in roles:
+        if base not in (materializers.keys() | keyed_inputs) or "index" not in roles or "value" not in roles:
             continue
         mutations.append(ControlSequenceMutation(
             int(graph_obj.nodes[base].get("value_id", base)), "update",
@@ -591,10 +600,158 @@ def _static_mapping_capacity_bounds(
             if node_id not in unknown}
 
 
+def _control_sequence_capacity_bounds(control: Any, sequence_ids: Iterable[int]) -> dict[int, int]:
+    """Interval transfer over the existing lexical control tree, not a replay.
+
+    In the controller-shaped repro, failures grows at most once in a while
+    whose every path breaks, and lines starts with one row then grows at most
+    len(failures). Treating every loop as unbounded discarded both proofs;
+    the native frame defaulted to one row and append silently hit capacity.
+    Branches join by max; bounded loops multiply growth. Unknown backedges or
+    a loop mutating its own extent invalidate the affected bound, not guess.
+    """
+    import re
+    from .control_source import (CallBlock, ConditionalBlock, LoopBlock,
+        LoopControlBlock, SequenceBlock, SequenceMutationBlock, WhileBlock)
+
+    initial = {int(value_id): 0 for value_id in sequence_ids}
+    peaks = dict(initial)
+
+    def join(left, right):
+        return {key: None if left[key] is None or right[key] is None
+                else max(left[key], right[key]) for key in initial}
+
+    def effects(block):
+        if block is None:
+            return ()
+        result = list(getattr(block, "sequence_mutations", ()))
+        if isinstance(block, SequenceMutationBlock):
+            result.append(block.mutation)
+        for child in getattr(block, "blocks", ()):
+            result.extend(effects(child))
+        for arm in ("condition", "body", "orelse", "callee"):
+            result.extend(effects(getattr(block, arm, None)))
+        return tuple(result)
+
+    def outcomes(block):
+        if isinstance(block, LoopControlBlock):
+            return ({block.action} if block.predicate_value_id is None
+                    and block.predicate_expression is None else {"normal", block.action})
+        if isinstance(block, SequenceBlock):
+            result = {"normal"}
+            for child in block.blocks:
+                if "normal" not in result:
+                    break
+                result = (result - {"normal"}) | outcomes(child)
+            return result
+        if isinstance(block, ConditionalBlock):
+            return outcomes(block.body) | outcomes(block.orelse)
+        return {"normal"}
+
+    def extent(text, state):
+        def expression(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, int):
+                return int(node.value)
+            if isinstance(node, ast.Name):
+                match = re.fullmatch(r"__iterable_extent_(\d+)__", node.id)
+                return state.get(int(match[1])) if match else None
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left, right = expression(node.left), expression(node.right)
+                return None if left is None or right is None else left + right
+            return None
+        try:
+            return expression(ast.parse(str(text), mode="eval").body)
+        except (SyntaxError, ValueError, TypeError):
+            return None
+
+    def mutate(mutation, state):
+        sequence_id = int(mutation.sequence_value_id)
+        if sequence_id not in state:
+            return state
+        state = dict(state)
+        current = state[sequence_id]
+        if mutation.operator == "clear" and mutation.predicate_expression is None:
+            state[sequence_id] = 0
+        elif mutation.operator == "append" and current is not None:
+            state[sequence_id] = current + 1
+        elif mutation.operator not in {"clear", "pop", "remove"}:
+            state[sequence_id] = None
+        peaks[sequence_id] = (None if peaks[sequence_id] is None or state[sequence_id] is None
+                              else max(peaks[sequence_id], state[sequence_id]))
+        return state
+
+    def visit(block, state):
+        if block is None:
+            return state
+        if isinstance(block, SequenceMutationBlock):
+            return mutate(block.mutation, state)
+        if isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                state = visit(child, state)
+                if outcomes(child) <= {"break", "return", "continue"}:
+                    break
+            return state
+        if isinstance(block, ConditionalBlock):
+            return join(visit(block.body, dict(state)), visit(block.orelse, dict(state)))
+        if isinstance(block, CallBlock):
+            return visit(block.callee, state)
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            writes = {int(m.sequence_value_id) for m in effects(block)} & set(initial)
+            count = None
+            if isinstance(block, WhileBlock):
+                body_outcomes = outcomes(SequenceBlock((block.body, *block.terminal_controls)))
+                if body_outcomes <= {"break", "return"}:
+                    count = 1
+            else:
+                start, stop, step = (extent(text, state) for text in (block.start, block.stop, block.step))
+                reads = {int(value_id) for value_id in re.findall(
+                    r"__iterable_extent_(\d+)__", str(block.stop))}
+                if (not reads & writes and start is not None and stop is not None
+                        and step is not None and step > 0):
+                    count = len(range(start, stop, step))
+            if count is None:
+                state = dict(state)
+                for key in writes:
+                    state[key] = peaks[key] = None
+                return state
+            if count == 0:
+                return state
+            before = dict(state)
+            state = visit(getattr(block, "condition", None), dict(state))
+            state = visit(block.body, state)
+            for mutation in block.sequence_mutations:
+                state = mutate(mutation, state)
+            if count > 1:
+                # Nested bounds must be invariant over the outer body. A
+                # written extent could grow each iteration; do not extrapolate
+                # the first iteration's work in that case.
+                def variable_extent(candidate):
+                    if isinstance(candidate, LoopBlock) and writes & {
+                        int(v) for v in re.findall(r"__iterable_extent_(\d+)__", str(candidate.stop))}:
+                        return True
+                    return any(variable_extent(child) for child in getattr(candidate, "blocks", ())) or any(
+                        variable_extent(getattr(candidate, arm)) for arm in ("body", "orelse", "callee")
+                        if getattr(candidate, arm, None) is not None)
+                unsafe = variable_extent(block.body)
+                for key in writes:
+                    if unsafe or before[key] is None or state[key] is None or peaks[key] is None:
+                        state[key] = peaks[key] = None
+                    else:
+                        growth = max(0, state[key] - before[key], peaks[key] - before[key])
+                        state[key] = before[key] + count * growth
+                        peaks[key] = max(peaks[key], state[key])
+            return join(before, state)
+        return state
+
+    visit(control.root, initial)
+    return {key: value for key, value in peaks.items() if value is not None}
+
+
 def _static_sequence_capacity_bounds(
     graph_obj: Any,
     *,
     nonmutating_call_ids: Iterable[int] = (),
+    control: Any = None,
 ) -> dict[int, int]:
     bounds = _static_mapping_capacity_bounds(
         graph_obj,
@@ -604,6 +761,7 @@ def _static_sequence_capacity_bounds(
                    for node_id, data in graph_obj.nodes(data=True)
                    if isinstance(data.get("expr_obj"), ast.List)}
     unknown = set()
+    escaped = set()
     loops = [data["expr_obj"] for _, data in graph_obj.nodes(data=True)
              if isinstance(data.get("expr_obj"), (ast.For, ast.While))]
     for mutation in _sequence_append_call_mutations(graph_obj):
@@ -622,12 +780,17 @@ def _static_sequence_capacity_bounds(
         if not isinstance(expression, ast.Call):
             continue
         identity = (data.get("attributes") or {}).get("extraction_identity")
-        if identity in {"builtins.tuple", "builtins.len", "builtins.bool"}:
+        if identity in {"builtins.tuple", "builtins.len", "builtins.bool", "builtins.enumerate"}:
             continue
         for parent, role in data.get("parents") or ():
             if str(role).startswith("arg:") and int(parent) in local_lists:
                 unknown.add(int(parent))
+                escaped.add(int(parent))
     bounds.update({key: count for key, count in local_lists.items() if key not in unknown})
+    if control is not None:
+        bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
+            control, local_lists,
+        ).items() if key not in escaped})
     for mutation in _source_sequence_snapshots(graph_obj):
         source = int(mutation.argument_value_ids[0])
         if source in bounds:
@@ -770,7 +933,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
             leaves = tuple(map(
                 int, attributes.get("aggregate_leaf_value_ids", ())
             ))
-            if attributes.get("aggregate_kind") == "tuple" and leaves:
+            abi = (graph_obj.graph.get('linked_value_abi') or {}).get(int(value_id), {})
+            if (attributes.get("aggregate_kind") == "tuple" and leaves
+                    and not (abi.get('storage') == 'reference' and abi.get('dtype') == 'opaque_ref')):
                 arguments.extend(leaves)
             else:
                 arguments.append(int(value_id))
@@ -885,6 +1050,61 @@ def _joined_byte_sequence_ids(
         if identities & seeds:
             joined.update(identities & declared)
     return tuple(sorted(joined))
+
+
+def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tuple[Any, ...]:
+    """Publish ordinary list rows at their exact authored construction site.
+
+    ``lines=[10.0]; lines.append(20.0)`` retained List->Constant edges but
+    received only the frame's zero-length initializer. A list birth is a
+    lexical clear followed by its ordered rows, just like a dict birth. The
+    accepted joined-byte and opaque-object representations retain their own
+    materializers; callers pass only ordinary declared sequence identities.
+    """
+    from .control_source import ControlExpression, ControlSequenceMutation
+    from .string_table import string_token
+
+    accepted = set(map(int, sequence_ids))
+    mutations = []
+    for node_id, data in graph_obj.nodes(data=True):
+        sequence_id = int(data.get("value_id", node_id))
+        expression = data.get("expr_obj")
+        attributes = data.get("attributes") or {}
+        if (sequence_id not in accepted or not isinstance(expression, ast.List)
+                or not expression.elts
+                or attributes.get("producer_kind") != "aggregate"
+                or attributes.get("materialization_kind") is not None):
+            continue
+        parents = tuple((int(parent), graph_obj.nodes[parent])
+                        for parent, role in data.get("parents", ())
+                        if str(role).startswith("elts") and parent in graph_obj)
+        rows = []
+        for element in expression.elts:
+            exact = tuple((parent, row) for parent, row in parents
+                          if row.get("expr_obj") is element)
+            if len(exact) != 1 or isinstance(element, ast.Starred):
+                raise ValueError(f"List {sequence_id} lacks one exact element producer")
+            parent, row = exact[0]
+            value_id = int(row.get("value_id", parent))
+            leaves = tuple(map(int, (row.get("attributes") or {}).get(
+                "aggregate_leaf_value_ids", ())))
+            arguments = (leaves if isinstance(element, ast.Tuple) and leaves else (value_id,))
+            expressions = ()
+            if isinstance(element, ast.Constant) and isinstance(element.value, (bool, int, float, str)):
+                literal = string_token(element.value) if isinstance(element.value, str) else element.value
+                expressions = (ControlExpression("const", literal=literal),)
+            rows.append(ControlSequenceMutation(
+                sequence_value_id=sequence_id, operator="append",
+                argument_value_ids=arguments, effect_node_id=parent,
+                policy="duplicates", argument_kind="row" if len(arguments) > 1 else "value",
+                argument_expressions=expressions,
+            ))
+        mutations.append(ControlSequenceMutation(
+            sequence_value_id=sequence_id, operator="clear", argument_value_ids=(),
+            effect_node_id=int(node_id), policy="duplicates",
+        ))
+        mutations.extend(rows)
+    return tuple(mutations)
 
 
 def _joined_list_literal_mutations(

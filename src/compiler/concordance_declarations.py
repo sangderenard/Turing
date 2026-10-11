@@ -158,6 +158,10 @@ NAME_BINDING = declare_page("name_binding", (
     RowField("read_scope", K.SCOPE), RowField("name", K.NAME),
     RowField("version", K.INDEX),
 ), BindingFact, rows_level=IdentityLogLevel.FULL)
+NAME_BINDING_CAPTURE = declare_page("name_binding_capture", (
+    RowField("read_scope", K.SCOPE), RowField("name", K.NAME),
+    RowField("version", K.INDEX),
+), tuple)  # (source binding, source version, owning loop or None); CONCORD
 CLASS_DECLARATION = declare_page("class_declaration", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
 ), ClassFact)
@@ -615,6 +619,24 @@ class MemoryRelease:
 MEMORY_RELEASE_RECEIPT = declare_page("memory_release_receipt", (
     RowField("compile_stage", K.NAME), RowField("ordinal", K.INDEX),
 ), MemoryRelease)
+
+
+@dataclass(frozen=True)
+class GraphWorkPublication:
+    """A sealed dependency snapshot accepted by the region's coordinator."""
+
+    snapshot_digest: str
+    schedule_preference: str
+    nodes: int
+    edges: int
+    provider: str
+    admission_limit: int
+    read_scope: tuple | None
+
+
+GRAPH_WORK_PUBLICATION = declare_page("graph_work_publication", (
+    RowField("planning_scope", K.SCOPE), RowField("region", K.INDEX),
+), GraphWorkPublication)
 
 
 @dataclass(frozen=True)
@@ -1555,6 +1577,7 @@ class CallBindingSource(Enum):
     IDENTITY_ALIAS = "identity_alias"
     DEFAULT_LITERAL = "default_literal"
     DISCOVERY = "discovery"
+    OBJECT_CONTEXT = "object_context"
 
 
 # -- pages: new --------------------------------------------------------------
@@ -2628,7 +2651,7 @@ BACKWARD_RULE_DEFINITION = declare_page("backward_rule_definition", (
 # ----------------------------------------------------------------------------
 
 SCALAR_DTYPE_SETTLEMENT = declare_stage("scalar_dtype_settlement")
-#: An integer whose width was inferred (a Cast target, a Load, integer
+#: An integer whose width was inferred (a Cast target, an abstract projection, integer
 #: arithmetic) widened to int64.  Operand: the value's ``ssa_value`` cell.
 INFERRED_INTEGER_WIDEN = declare_transform("inferred_integer_widen", 1)
 #: A Const declaring an integer width whose result has no ``ssa_value`` cell
@@ -2637,6 +2660,9 @@ INFERRED_INTEGER_WIDEN = declare_transform("inferred_integer_widen", 1)
 CONST_DECLARED_WIDTH_NOT_ON_BOOK = declare_reason(
     "const_declared_width_not_on_book"
 )
+#: A raw typed Load declares its physical memory width. It is not an
+#: inferred Python integer; the importer owes its missing value identity.
+LOAD_DECLARED_WIDTH_NOT_ON_BOOK = declare_reason("load_declared_width_not_on_book")
 #: A widened integer whose value has no ``ssa_value`` cell to transform.
 WIDENED_VALUE_NOT_ON_BOOK = declare_reason("widened_value_not_on_book")
 
@@ -2657,7 +2683,7 @@ class IntegerWidthFact:
 
 SCALAR_INTEGER_WIDTH = declare_page("scalar_integer_width", (
     RowField("function_scope", K.SCOPE), RowField("ssa_id", K.VALUE_ID),
-), IntegerWidthFact)                   # DERIVED(Const ssa_value) | NOVEL(INFERRED_INTEGER_WIDEN); CONCORD
+), IntegerWidthFact)                   # DERIVED(declared Const/Load ssa_value) | NOVEL(INFERRED_INTEGER_WIDEN); CONCORD
 
 LINKED_VALUE_ABI_SETTLEMENT = declare_stage("linked_value_abi_settlement")
 #: A copy's statement with no book cell to derive from (a ProgramABI contract
@@ -3103,6 +3129,15 @@ AGGREGATE_LEDGER = declare_page("aggregate_ledger", (
 AGGREGATE_LEDGER_CAUSE_NOT_ON_BOOK = declare_reason(
     "aggregate_ledger_cause_not_on_book"
 )
+
+# Native object admission owns representation, not source identity. Its facts
+# are DERIVED from the incumbent producer/operand/loop cells. Control and SSA
+# carry only this cell reference; they must read the book before allocating or
+# projecting, rather than trust an independently copied row receipt.
+NATIVE_OBJECT_SOURCE = declare_page("native_object_source", (
+    RowField("read_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+    RowField("role", K.LABEL),
+), tuple)
 
 #: ``_callsite_specialized_shell_type.record_and_return``: the return shape a
 #: callsite specialization published in one round, ``(caller, callee, call)``

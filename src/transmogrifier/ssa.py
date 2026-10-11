@@ -99,6 +99,25 @@ class Function:
 
 
 @dataclass(frozen=True)
+class SSAOpaqueObject:
+    """An object reference in an explicitly admitted storage domain.
+
+    This is a semantic view of an existing value, not another physical dtype
+    or object store. The owner implements inspection; the handle itself is
+    never an address. Context/owner operands travel on ordinary native calls.
+    """
+
+    reference: SSAValue
+    storage_identity: str
+
+    def __post_init__(self) -> None:
+        if self.reference.dtype != "opaque_ref" or self.reference.shape:
+            raise ValueError("opaque object requires a scalar opaque_ref")
+        if not isinstance(self.storage_identity, str) or not self.storage_identity:
+            raise ValueError("opaque object requires an admitted storage identity")
+
+
+@dataclass(frozen=True)
 class SSAClassMethod:
     """One method of a class as the SSA layer holds it: its dot-name, the
     function-table reference to its body, and -- once that body is lowered into
@@ -1572,6 +1591,10 @@ class SSASequenceDescriptor:
     capacity_policy: SSASequenceCapacityPolicy = SSASequenceCapacityPolicy.FIXED
     writable: bool = True
     child_table_pool: "SSAChildTablePoolDescriptor | None" = None
+    # Present only when columns are mutable native pointer cells holding
+    # runtime-sized arenas. Their owner is a separate pointer cell; opaque
+    # Python reference handles never imply this dereferenceable contract.
+    heap_owner_value_id: int | None = None
 
     def __post_init__(self) -> None:
         storage_ids = (
@@ -1584,6 +1607,27 @@ class SSASequenceDescriptor:
             raise ValueError("SSA sequence value ids must be non-negative")
         if not self.column_value_ids:
             raise ValueError("an SSA sequence requires at least one data column")
+        if self.heap_owner_value_id is not None:
+            physical_ids = (*storage_ids, self.status_address_id, self.live_flags_value_id)
+            if int(self.heap_owner_value_id) < 0 or int(self.heap_owner_value_id) in physical_ids:
+                raise ValueError("heap owner must be a distinct non-negative storage identity")
+            # Runtime arena replacement writes capacity while length remains
+            # live. Aliasing these cells (or a pointer column) destroys that
+            # contract; fixed borrowed keyed views may still alias them.
+            counters = (int(self.length_address_id), int(self.capacity_value_id))
+            if counters[0] == counters[1] or set(counters) & set(self.column_value_ids):
+                raise ValueError("heap sequence length/capacity must be distinct from each other and columns")
+            if len(self.column_dtypes) != len(self.column_value_ids):
+                raise ValueError("heap columns require explicit element layouts")
+            from .dtype_layout import layout_for
+            column_layouts = {}
+            for value_id, dtype in zip(self.column_value_ids, self.column_dtypes):
+                layout = layout_for(dtype)  # No guessed layout for unresolved elements.
+                if layout.llvm_type == "ptr" or layout.alignment > 8:
+                    raise ValueError("heap sequence requires fixed-width native element storage")
+                incumbent = column_layouts.setdefault(int(value_id), layout)
+                if incumbent != layout:
+                    raise ValueError("aliased heap columns disagree about element layout")
         if self.column_dtypes and len(self.column_dtypes) != len(
             self.column_value_ids
         ):
@@ -1647,12 +1691,83 @@ class SSASequenceDescriptor:
             "live_flags_value_id": self.live_flags_value_id,
             "capacity_policy": self.capacity_policy.value,
             "writable": bool(self.writable),
+            "heap_owner_value_id": self.heap_owner_value_id,
             "child_table_pool": (
                 None
                 if self.child_table_pool is None
                 else self.child_table_pool.to_mapping()
             ),
         }
+
+
+@dataclass(frozen=True)
+class SSAObjectContext:
+    """An explicit native object domain over existing sequence storage.
+
+    This is an ABI view, not a second registry or a Python object model.
+    ``objects`` holds (opaque handle, declared kind); ``members`` holds
+    (owner handle, key handle, value handle). Both use one caller-owned heap.
+    Member keys compare by HANDLE IDENTITY, not Python equality/hash semantics.
+    Zero is the invalid handle. The caller initializes next_handle to a positive
+    unused identity; construction advances it only after successful publication.
+    """
+
+    storage_identity: str
+    objects: SSASequenceDescriptor
+    members: SSASequenceDescriptor
+    next_handle_value_id: int
+    kind_vocabulary: tuple[str, ...]
+    # Optional introspection facet on the SAME object identity table. Bit i
+    # records the boundary's builtin isinstance evidence, not payload layout.
+    type_vocabulary: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.storage_identity or not isinstance(self.storage_identity, str):
+            raise ValueError("object context requires an explicit storage identity")
+        if (not self.kind_vocabulary or len(set(self.kind_vocabulary)) != len(self.kind_vocabulary)
+                or any(not isinstance(kind, str) or not kind for kind in self.kind_vocabulary)):
+            raise ValueError("object context requires a unique declared kind vocabulary")
+        if (len(set(self.type_vocabulary)) != len(self.type_vocabulary)
+                or len(self.type_vocabulary) > 63):
+            raise ValueError("object type evidence requires a unique bounded vocabulary")
+        supported = {'builtins.' + name for name in ('dict', 'list', 'tuple', 'set',
+            'frozenset', 'object', 'bool', 'int', 'float', 'str', 'bytes', 'NoneType')}
+        if any(token not in supported for token in self.type_vocabulary):
+            raise ValueError('object type evidence supports declared builtin guards only')
+        object_dtypes = ("opaque_ref", "int64", "int64") if self.type_vocabulary else ("opaque_ref", "int64")
+        expected = ((self.objects, object_dtypes, (0,)),
+                    (self.members, ("opaque_ref", "opaque_ref", "opaque_ref"), (0, 1)))
+        occupied = set()
+        owner = self.objects.heap_owner_value_id
+        for descriptor, dtypes, keys in expected:
+            if (descriptor.column_dtypes != dtypes or descriptor.key_columns != keys
+                    or any(descriptor.column_shapes) or not descriptor.writable
+                    or descriptor.capacity_policy is not SSASequenceCapacityPolicy.DYNAMIC
+                    or descriptor.heap_owner_value_id is None
+                    or descriptor.heap_owner_value_id != owner
+                    or descriptor.status_address_id is None
+                    or descriptor.live_flags_value_id is not None
+                    or descriptor.child_table_pool is not None):
+                raise ValueError("object context requires typed dynamic tables with one shared owner")
+            ids = {descriptor.sequence_id, *descriptor.column_value_ids,
+                   descriptor.length_address_id, descriptor.capacity_value_id,
+                   descriptor.status_address_id}
+            if occupied & ids:
+                raise ValueError("object context tables must have disjoint storage identities")
+            occupied.update(ids)
+        if owner in occupied or self.next_handle_value_id in occupied | {owner} or self.next_handle_value_id < 0:
+            raise ValueError("object context owner/counter must be distinct storage identities")
+
+    def to_mapping(self) -> Dict[str, Any]:
+        receipt = {"storage_identity": self.storage_identity,
+                "objects": self.objects.to_mapping(), "members": self.members.to_mapping(),
+                "next_handle_value_id": self.next_handle_value_id,
+                "kind_vocabulary": self.kind_vocabulary,
+                "invalid_handle": 0, "member_key_semantics": "reference-identity"}
+        if self.type_vocabulary:
+            receipt["type_vocabulary"] = self.type_vocabulary
+            receipt["type_evidence_column"] = 2
+        return receipt
 
 
 @dataclass(frozen=True)
@@ -1764,6 +1879,7 @@ def sequence_member_roles(
     for attribute in (
         "length_address_id", "capacity_value_id",
         "status_address_id", "live_flags_value_id",
+        "heap_owner_value_id",
     ):
         claim(getattr(descriptor, attribute, None), (attribute,))
     return claims

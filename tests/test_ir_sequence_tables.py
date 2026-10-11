@@ -431,7 +431,11 @@ def test_sequence_helper_fresh_ids_reserve_non_argument_descriptor_identities():
     assert helper_inputs
     assert helper_inputs.isdisjoint(reserved)
     assert helper_results.isdisjoint(reserved)
-    assert min(helper_inputs | helper_results) == max(reserved) + 1
+    # Fresh identities now come from the shared flagged namespace, not the
+    # old helper-local max(id)+1 counter. Noncollision is the contract.
+    from src.compiler.id_space import MINTED
+    assert all(value_id & MINTED for value_id in helper_inputs | helper_results)
+    assert min(helper_inputs | helper_results) > max(reserved)
 
 
 def test_set_descriptor_retains_linear_unique_key_and_live_row_policy():
@@ -762,7 +766,9 @@ def test_retained_loop_append_becomes_internal_sequence_ssa_call_and_table():
     )
 
     assert shortfalls == ()
-    assert "ssa_sequence_10_append" in module.functions
+    helper = next(function for function in module.functions.values()
+                  if function.metadata.get("ssa_sequence_operation") == "append"
+                  and function.metadata.get("sequence_id") == 10)
     assert module.sequence_tables["planned_control"].by_id(10).allows_duplicates
     control_calls = [
         instruction
@@ -785,7 +791,7 @@ def test_retained_loop_append_becomes_internal_sequence_ssa_call_and_table():
         for block in module.functions["planned_control"].blocks.values()
         for instruction in block.instrs
     )
-    helper_ops = set(_ops(module.functions["ssa_sequence_10_append"]))
+    helper_ops = set(_ops(helper))
     assert {"GetElementPtr", "Load", "Store", "Lt", "CondBr"} <= helper_ops
     emitted = emit_module(
         module,
@@ -905,7 +911,9 @@ def test_retained_loop_set_add_keeps_unique_scan_and_extend_inherits_it():
         identity_table={"seen": (20,), "value": (21,)},
     )
     assert add_shortfalls == ()
-    add_helper = add_module.functions["ssa_sequence_20_add"]
+    add_helper = next(function for function in add_module.functions.values()
+                      if function.metadata.get("ssa_sequence_operation") == "add"
+                      and function.metadata.get("sequence_id") == 20)
     assert "unique_scan_header" in add_helper.blocks
 
     extend_program = _loop_with_mutation(ControlSequenceMutation(
@@ -921,7 +929,9 @@ def test_retained_loop_set_add_keeps_unique_scan_and_extend_inherits_it():
         identity_table={"seen": (30,), "incoming": (31,)},
     )
     assert extend_shortfalls == ()
-    insert = extend_module.functions["ssa_sequence_30_insert"]
+    insert = next(function for function in extend_module.functions.values()
+                  if function.metadata.get("ssa_sequence_operation") == "insert"
+                  and function.metadata.get("sequence_id") == 30)
     assert "unique_scan_header" in insert.blocks
     assert extend_module.sequence_tables["planned_control"].by_id(30).key_columns == (0,)
 

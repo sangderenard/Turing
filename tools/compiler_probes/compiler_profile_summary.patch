@@ -1,0 +1,880 @@
+diff --git a/src/compiler/shell_telemetry.py b/src/compiler/shell_telemetry.py
+index cdc3970c..b4863ffc 100644
+--- a/src/compiler/shell_telemetry.py
++++ b/src/compiler/shell_telemetry.py
+@@ -93,6 +93,10 @@ class TelemetryChannel:
+         self._sequence = 0
+         self._started_ns = time.perf_counter_ns()
+         self._subscribers: list[Callable[[Record], None]] = []
++        # Aggregate timings, not the unbounded log or any compiler graph.
++        # A long compile can evict its first stage from records while that
++        # stage must still appear in the final table/DataFrame.
++        self._profiles: dict[tuple[str, str, str], dict[str, Any]] = {}
+         # Which kinds this channel actually carries. ``None`` keeps every kind,
+         # which is what an ordinary build wants; naming a subset makes the rest
+         # cost nothing at all -- a disabled kind is rejected before its record
+@@ -141,6 +145,21 @@ class TelemetryChannel:
+             detail=detail,
+         )
+         self.records.append(record)
++        if kind == PROFILE:
++            key = (record.path, str(detail.get("section", "")), record.message)
++            elapsed = int(detail.get("nanoseconds", 0))
++            row = self._profiles.setdefault(key, {
++                "path": key[0], "section": key[1], "label": key[2],
++                "calls": 0, "nanoseconds": 0, "max_ns": 0,
++                "failed_calls": 0, "rss_bytes": 0, "slowest_function": "",
++            })
++            row["calls"] += 1
++            row["nanoseconds"] += elapsed
++            row["failed_calls"] += int(bool(detail.get("failed")))
++            row["rss_bytes"] = max(row["rss_bytes"], int(detail.get("rss_bytes", 0)))
++            if elapsed >= row["max_ns"]:
++                row["max_ns"] = elapsed
++                row["slowest_function"] = str(detail.get("function", ""))
+         for subscriber in tuple(self._subscribers):
+             # A broken subscriber must not take the channel down with it --
+             # telemetry that can fail the thing it observes is worse than no
+@@ -293,6 +312,29 @@ class TelemetryChannel:
+     def to_json(self) -> str:
+         return json.dumps(self.to_mapping(), default=str)
+ 
++    def profile_summary(self) -> tuple[dict[str, Any], ...]:
++        """Inclusive wall timings by existing path/section/label.
++
++        Parent and child rows must NOT be added to estimate total wall time.
++        No per-function graph copies, stack tracing or DataFrames on dispatch.
++        """
++        return tuple({
++            **row, "seconds": row["nanoseconds"] / 1e9,
++            "mean_seconds": row["nanoseconds"] / row["calls"] / 1e9,
++            "max_seconds": row["max_ns"] / 1e9,
++        } for row in sorted(self._profiles.values(),
++                            key=lambda row: (-row["nanoseconds"], row["path"], row["label"])))
++
++    def profile_dataframe(self):
++        """Materialize pandas only when requested, after collecting records."""
++        import pandas as pd
++        result = pd.DataFrame.from_records(self.profile_summary(), columns=(
++            "path", "section", "label", "calls", "seconds", "mean_seconds",
++            "max_seconds", "failed_calls", "rss_bytes", "slowest_function",
++        ))
++        result.attrs["timing_semantics"] = "inclusive wall time; nested rows are not additive"
++        return result
++
+ 
+ # --- adapters over what already exists -------------------------------------
+ #
+@@ -335,11 +377,14 @@ def attach_profiler(profiler: Any, channel: TelemetryChannel) -> Callable[[], No
+ 
+     def record(*args: Any, **kwargs: Any):
+         result = original(*args, **kwargs)
++        if not getattr(profiler, "enabled", True):
++            return result
+         path = kwargs.get("path") or (args[0] if args else "")
+         nanoseconds = (
+             kwargs.get("elapsed_ns")
+             or kwargs.get("duration_ns")
+             or kwargs.get("nanoseconds")
++            or float(kwargs.get("cpu_ms", 0)) * 1e6
+             or 0
+         )
+         channel.emit(
+@@ -347,6 +392,8 @@ def attach_profiler(profiler: Any, channel: TelemetryChannel) -> Callable[[], No
+             str(kwargs.get("label") or kwargs.get("phase") or "record"),
+             path=str(path),
+             nanoseconds=int(nanoseconds or 0),
++            section=str(kwargs.get("section", "")),
++            gpu_ms=kwargs.get("gpu_ms"), dispatches=kwargs.get("dispatches", 0),
+         )
+         return result
+ 
+@@ -623,10 +670,12 @@ class _CompileBars:
+         self.bars: dict[str, Any] = {}
+         self.created: dict[str, float] = {}
+         self.details: dict[str, str] = {}
++        self.positions: dict[str, int] = {}
+         self.peak_rss = 0
+         self.last_rss = 0
+         self._last_rss_at = float("-inf")
+         self.failure: str | None = None
++        self.table: list[Any] = []
+ 
+     # -- helpers -------------------------------------------------------------
+ 
+@@ -677,17 +726,21 @@ class _CompileBars:
+         for key in tuple(self.bars):
+             if key not in keep:
+                 self.details.pop(key, None)
++                self.positions.pop(key, None)
+                 self.created.pop(key, None)
+                 self.bars.pop(key).close()
+ 
+     def heartbeat(self) -> None:
+         """Refresh the clocks and memory without any event arriving."""
+ 
+-        with self.lock:
++        # The event producer already holds owner._lock. Keep the same lock
++        # order for heartbeat -> table -> summary to avoid a render deadlock.
++        with self.owner._lock, self.lock:
+             if self.main is None or self.failure is not None:
+                 return
+             self.main.set_postfix_str(self._main_postfix(), refresh=False)
+             self.main.refresh()
++            self._refresh_table()
+             now = self.owner.clock()
+             for key, bar in self.bars.items():
+                 bar.set_postfix_str(self._nested_postfix(key), refresh=False)
+@@ -699,7 +752,7 @@ class _CompileBars:
+     # -- the subscriber ------------------------------------------------------
+ 
+     def __call__(self, record: Record) -> None:
+-        with self.lock:
++        with self.owner._lock, self.lock:
+             if self.failure is not None and record.kind != LOG:
+                 return
+             try:
+@@ -713,6 +766,9 @@ class _CompileBars:
+                     self._close_nested()
+                     if self.main is not None:
+                         self.main.close()
++                    for row in self.table:
++                        row.close()
++                    self.table.clear()
+                 except Exception:
+                     pass
+                 print(
+@@ -746,20 +802,40 @@ class _CompileBars:
+     def _start(self) -> None:
+         owner = self.owner
+         self.main = owner.tqdm_class(
+-            total=len(owner.stages),
++            # Stage order has no relationship to remaining work/time.
++            total=None,
+             desc=self._stage_desc(),
+             unit="stage",
+             file=owner.stream,
+             leave=True,
+             dynamic_ncols=True,
+             mininterval=0.25,
+-            bar_format=(
+-                "{desc} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+-                "[{elapsed}]{postfix}"
+-            ),
++            position=len(owner.stages) + 1 if owner.timing_table else 0,
++            bar_format="{desc} [{elapsed}]{postfix}",
+         )
++        if owner.timing_table:
++            self._rss()
++            for position in range(len(owner.stages) + 1):
++                self.table.append(owner.tqdm_class(
++                    total=None, desc="", file=owner.stream, leave=True,
++                    position=position, dynamic_ncols=True, bar_format="{desc}",
++                ))
++            self._refresh_table()
+         self.main.set_postfix_str(self._main_postfix(), refresh=True)
+ 
++    def _refresh_table(self) -> None:
++        if not self.table:
++            return
++        rows = self.owner.summary()["stages"]
++        self.table[0].set_description_str(
++            "Stage                              State       Wall(s)    RSS(GB)", refresh=False)
++        self.table[0].refresh()
++        for bar, row in zip(self.table[1:], rows, strict=True):
++            bar.set_description_str(
++                f"{row['label'][:34]:34} {row['state']:10} "
++                f"{row['seconds']:9.2f} {row['rss_bytes'] / _GIB:10.2f}", refresh=False)
++            bar.refresh()
++
+     def _stage(self, record: Record) -> None:
+         self._close_nested()
+         self.stage_index = int(record.detail["index"])
+@@ -769,12 +845,14 @@ class _CompileBars:
+         self.main.set_description_str(self._stage_desc(), refresh=False)
+         self.main.set_postfix_str(self._main_postfix(), refresh=False)
+         self.main.refresh()
++        self._refresh_table()
+ 
+     def _count(self, record: Record) -> None:
+         detail = record.detail
+         key = str(detail["key"])
+         if detail.get("close"):
+             self.details.pop(key, None)
++            self.positions.pop(key, None)
+             self.created.pop(key, None)
+             bar = self.bars.pop(key, None)
+             if bar is not None:
+@@ -784,6 +862,10 @@ class _CompileBars:
+         bar = self.bars.get(key)
+         if bar is None:
+             self.created[key] = self.owner.clock()
++            position = len(self.owner.stages) + 2 if self.owner.timing_table else 1
++            while position in self.positions.values():
++                position += 1
++            self.positions[key] = position
+             bar = self.bars[key] = self.owner.tqdm_class(
+                 total=total,
+                 desc=record.message,
+@@ -793,6 +875,11 @@ class _CompileBars:
+                 dynamic_ncols=True,
+                 mininterval=0.25,
+                 delay=self.owner.nested_delay,
++                position=position,
++                # A known total is a work-item fraction, not a time forecast.
++                bar_format=("{desc} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
++                            "[{elapsed}]{postfix}" if total is not None else
++                            "{desc} {n_fmt} completed [{elapsed}]{postfix}"),
+             )
+         else:
+             bar.set_description_str(record.message, refresh=False)
+@@ -817,14 +904,18 @@ class _CompileBars:
+                 refresh=False,
+             )
+         else:
+-            main.n = total
+-            main.set_description_str(f"compile {total}/{total} done", refresh=False)
++            main.n = len(self.owner._stage_profiles)
++            main.set_description_str(f"compile done ({main.n} timed stages)", refresh=False)
+         main.set_postfix_str(
+             f"peak {max(self.peak_rss, self._rss()) / _GIB:.2f}GB, "
+             f"stage {_format_duration(self.owner.clock() - self.stage_started)}",
+             refresh=False,
+         )
+         main.refresh()
++        self._refresh_table()
++        for row in self.table:
++            row.close()
++        self.table.clear()
+         main.close()
+         self.main = None
+ 
+@@ -837,8 +928,9 @@ _ACTIVE_COMPILE_PROGRESS: contextvars.ContextVar = contextvars.ContextVar(
+ class CompileProgress:
+     """The stage/loop progress layer for one compile.
+ 
+-    ``enabled=False`` builds nothing and changes nothing.  Enabled, it owns a
+-    ``TelemetryChannel`` (``log`` + ``progress`` records), subscribes the tqdm
++    ``enabled=False, collect_profile=False`` builds nothing. With
++    ``collect_profile=True`` it retains timings without a renderer/thread.
++    Enabled, it owns a ``TelemetryChannel`` (log/progress/profile records), subscribes the tqdm
+     renderer to it, and exposes the calls compile code makes:
+     ``stage``/``substage`` (the persistent bar), ``count``/``iterate`` (nested
+     bars, ``leave=False``, closed with their stage), and ``log``.
+@@ -861,6 +953,8 @@ class CompileProgress:
+         min_interval: float = 0.1,
+         nested_delay: float = 0.5,
+         prefix: str = COMPILE_LINE_PREFIX,
++        timing_table: bool = True,
++        collect_profile: bool = False,
+     ):
+         self.stages = tuple(stages)
+         self.enabled = bool(enabled) and bool(self.stages)
+@@ -877,6 +971,8 @@ class CompileProgress:
+         self.min_interval = float(min_interval)
+         self.nested_delay = float(nested_delay)
+         self.prefix = prefix
++        self.timing_table = bool(timing_table)
++        self.collect_profile = bool(collect_profile or enabled) and bool(self.stages)
+         self.channel: TelemetryChannel | None = None
+         self.bars: _CompileBars | None = None
+         self._depth = 0
+@@ -885,19 +981,23 @@ class CompileProgress:
+         self._counts: dict[str, dict[str, Any]] = {}
+         self._stage_index = 0
+         self._stage_started = clock()
++        self._stage_profiles: dict[str, Mapping[str, Any]] = {}
++        self._stage_seconds: dict[str, float] = {}
++        self._work: dict[str, dict[str, dict[str, Any]]] = {}
+         self._heartbeat_stop = threading.Event()
+         self._heartbeat_thread: threading.Thread | None = None
+-        if self.enabled:
++        if self.enabled or self.collect_profile:
+             self.channel = channel or TelemetryChannel(
+-                name="compile-progress", capacity=1024, kinds=(LOG, PROGRESS)
++                name="compile-progress", capacity=1024, kinds=(LOG, PROGRESS, PROFILE)
+             )
++        if self.enabled:
+             self.bars = _CompileBars(self)
+             self.channel.subscribe(self.bars)
+ 
+     # -- lifecycle -------------------------------------------------------------
+ 
+     def open(self) -> "CompileProgress":
+-        if not self.enabled:
++        if self.channel is None:
+             return self
+         with self._lock:
+             self._depth += 1
+@@ -905,11 +1005,15 @@ class CompileProgress:
+                 self._token = _ACTIVE_COMPILE_PROGRESS.set(self)
+                 self._stage_index = 0
+                 self._stage_started = self.clock()
++                self._stage_profiles.clear()
++                self._stage_seconds.clear()
++                self._work.clear()
+                 self.channel.progress(
+                     self.stages[0].label, done=0, total=len(self.stages),
+                     path="compile/start", scope="start",
++                    metric="stage-order", fraction_is_progress=False,
+                 )
+-                if self.heartbeat_interval:
++                if self.enabled and self.heartbeat_interval:
+                     self._heartbeat_stop.clear()
+                     self._heartbeat_thread = threading.Thread(
+                         target=self._heartbeat_loop,
+@@ -920,7 +1024,7 @@ class CompileProgress:
+         return self
+ 
+     def close(self, failed: bool = False) -> None:
+-        if not self.enabled:
++        if self.channel is None:
+             return
+         with self._lock:
+             if self._depth == 0:
+@@ -935,12 +1039,15 @@ class CompileProgress:
+         with self._lock:
+             stage = self.stages[self._stage_index]
+             self._log_stage_finished(stage, failed=failed)
++            for key in tuple(self._counts):
++                self.count_close(key)
+             self._counts.clear()
+             self.channel.progress(
+                 "compile failed" if failed else "compile done",
+-                done=len(self.stages) if not failed else self._stage_index,
++                done=len(self._stage_profiles),
+                 total=len(self.stages), path="compile/end",
+                 scope="end", failed=bool(failed),
++                metric="stage-order", fraction_is_progress=False,
+             )
+             _ACTIVE_COMPILE_PROGRESS.reset(self._token)
+             self._token = None
+@@ -998,18 +1105,61 @@ class CompileProgress:
+     # -- stages ---------------------------------------------------------------
+ 
+     def _log_stage_finished(self, stage: CompileStage, *, failed: bool) -> None:
+-        elapsed = _format_duration(self.clock() - self._stage_started)
+-        rss = self.bars._rss() / _GIB
+-        self.channel.log(
+-            f"stage {self._stage_index + 1}/{len(self.stages)} "
+-            f"{stage.label}: {'FAILED after' if failed else 'done in'} "
+-            f"{elapsed} (rss {rss:.2f}GB)"
++        seconds = max(0.0, self.clock() - self._stage_started)
++        try:
++            rss_bytes = self.bars._rss() if self.bars is not None else int(self.rss())
++        except Exception:
++            rss_bytes = 0
++        self._stage_profiles[stage.key] = {"failed": failed, "rss_bytes": rss_bytes}
++        self.channel.profile(
++            stage.label, path=f"compile/stage/{stage.key}", section="stage",
++            nanoseconds=round(seconds * 1e9), failed=failed, rss_bytes=rss_bytes,
+         )
++        self._stage_seconds[stage.key] = self._stage_seconds.get(stage.key, 0.0) + seconds
++        if self.enabled:
++            self.channel.log(
++                f"stage {self._stage_index + 1}/{len(self.stages)} "
++                f"{stage.label}: {'FAILED after' if failed else 'done in'} "
++                f"{_format_duration(seconds)} (rss {rss_bytes / _GIB:.2f}GB)"
++            )
++
++    def summary(self) -> dict[str, Any]:
++        """Small serializable summary, including the active stage and real work."""
++        with self._lock:
++            rows = []
++            for index, stage in enumerate(self.stages):
++                record = self._stage_profiles.get(stage.key)
++                detail = {} if record is None else record
++                running = self._depth > 0 and index == self._stage_index
++                rows.append({
++                    "key": stage.key, "label": stage.label,
++                    "state": "running" if running else "failed" if detail.get("failed")
++                             else "done" if record is not None else "pending",
++                    "seconds": self._stage_seconds.get(stage.key, 0.0) +
++                               (max(0.0, self.clock() - self._stage_started) if running else 0),
++                    "rss_bytes": (self.bars.last_rss if running and self.bars else
++                                  int(detail.get("rss_bytes", 0))),
++                })
++            work = {stage: {key: dict(value) for key, value in counters.items()}
++                    for stage, counters in self._work.items()}
++            active = work.setdefault(self.stages[self._stage_index].key, {}) if self.stages else {}
++            for key, value in self._counts.items():
++                prior = active.get(key, {"done": 0, "total": 0})
++                active[key] = {"done": prior["done"] + value["n"],
++                               "total": None if prior["total"] is None or value["total"] is None
++                                        else prior["total"] + value["total"],
++                               "label": value["label"]}
++            return {"stages": rows, "work": work,
++                    "profiles": () if self.channel is None else self.channel.profile_summary(),
++                    "timing_semantics": "inclusive wall time; stage order is not percent progress"}
++
++    def profile_dataframe(self):
++        return compile_profile_dataframe(self.summary())
+ 
+     def stage(self, key: str) -> None:
+         """Enter a declared stage; the previous stage's nested bars close."""
+ 
+-        if not self.enabled:
++        if self.channel is None:
+             return
+         with self._lock:
+             index = next(
+@@ -1026,6 +1176,8 @@ class CompileProgress:
+             self._log_stage_finished(
+                 self.stages[self._stage_index], failed=False
+             )
++            for count_key in tuple(self._counts):
++                self.count_close(count_key)
+             self._counts.clear()
+             self._stage_index = index
+             self._stage_started = self.clock()
+@@ -1033,6 +1185,7 @@ class CompileProgress:
+                 self.stages[index].label, done=index, total=len(self.stages),
+                 path="compile/stage", scope="stage", key=key, index=index,
+                 started=self._stage_started,
++                metric="stage-order", fraction_is_progress=False,
+             )
+ 
+     def substage(self, name: str, *, keep: Iterable[str] = ()) -> None:
+@@ -1041,16 +1194,17 @@ class CompileProgress:
+         Nested bars close with it, except those named in ``keep``.
+         """
+ 
+-        if not self.enabled:
++        if self.channel is None:
+             return
+         with self._lock:
+             keep = tuple(keep)
+             for key in tuple(self._counts):
+                 if key not in keep:
+-                    del self._counts[key]
++                    self.count_close(key)
+             self.channel.progress(
+                 str(name), done=self._stage_index, total=len(self.stages),
+                 path="compile/substage", scope="substage", keep=keep,
++                metric="stage-order", fraction_is_progress=False,
+             )
+ 
+     # -- nested bars ------------------------------------------------------------
+@@ -1070,7 +1224,7 @@ class CompileProgress:
+         or with the next stage.  ``total=None`` is an open-ended count.
+         """
+ 
+-        if not self.enabled:
++        if self.channel is None:
+             return
+         with self._lock:
+             state = self._counts.get(key)
+@@ -1111,11 +1265,18 @@ class CompileProgress:
+             self.count(key, state["n"], detail=detail)
+ 
+     def count_close(self, key: str) -> None:
+-        if not self.enabled:
++        if self.channel is None:
+             return
+         with self._lock:
+-            if self._counts.pop(key, None) is None:
++            state = self._counts.pop(key, None)
++            if state is None:
+                 return
++            stage = self.stages[self._stage_index].key
++            prior = self._work.setdefault(stage, {}).setdefault(
++                key, {"done": 0, "total": 0, "label": state["label"]})
++            prior["done"] += state["n"]
++            prior["total"] = (None if prior["total"] is None or state["total"] is None
++                              else prior["total"] + state["total"])
+             self.channel.progress(
+                 key, done=0, total=0, path=f"compile/count/{key}",
+                 scope="count", key=key, close=True,
+@@ -1139,8 +1300,11 @@ class CompileProgress:
+         self.count(key, 0, total=total, label=label)
+         try:
+             for item in iterable:
+-                self.count(key)
+                 yield item
++                # Resuming the iterator means the caller finished the item.
++                # Yielding it is not completion; an exception/break must not
++                # count an unfinished item as completed.
++                self.count(key)
+         finally:
+             self.count_close(key)
+ 
+@@ -1162,8 +1326,15 @@ class CompileProgress:
+         fold and region-reduction facts drive their own nested bars.
+         """
+ 
+-        if not self.enabled:
++        if self.channel is None:
+             return
++        if state in ("end", "failed") and "duration_seconds" in facts:
++            with self._lock:
++                self.channel.profile(
++                    stage, path=f"compile/planner/{stage}", section="planner",
++                    nanoseconds=round(float(facts["duration_seconds"]) * 1e9),
++                    failed=state == "failed", function=function,
++                )
+         inside_function_shells = "function-shells" in self._counts
+         if depth == 0:
+             if (
+@@ -1333,6 +1504,23 @@ def declare_progress_bars_policy(enabled: bool, book: Any = None) -> None:
+     )
+ 
+ 
++def compile_profile_dataframe(summary_or_module):
++    """View an accumulated lowering summary (or SSA module) without re-profiling.
++
++    Pandas is optional and imported only here; normal compilation needs none.
++    The module form reads ``module.metadata['compile_profile']``.
++    """
++    import pandas as pd
++    summary = (summary_or_module if isinstance(summary_or_module, Mapping)
++               else summary_or_module.metadata["compile_profile"])
++    result = pd.DataFrame.from_records(summary["stages"], columns=(
++        "key", "label", "state", "seconds", "rss_bytes"))
++    result.attrs["work"] = summary["work"]
++    result.attrs["profiles"] = summary["profiles"]
++    result.attrs["timing_semantics"] = "stage wall time; no remaining-time estimate"
++    return result
++
++
+ __all__ = [
+     "COMPILE_STAGES",
+     "CompileProgress",
+@@ -1352,6 +1540,7 @@ __all__ = [
+     "compile_count_close",
+     "compile_iter",
+     "compile_progress",
++    "compile_profile_dataframe",
+     "compile_selection_event",
+     "compile_stage",
+     "compile_substage",
+diff --git a/src/compiler/bounded_fixed_point.py b/src/compiler/bounded_fixed_point.py
+index b8fd5a29..df84172d 100644
+--- a/src/compiler/bounded_fixed_point.py
++++ b/src/compiler/bounded_fixed_point.py
+@@ -140,7 +140,9 @@ class BoundedFixedPoint:
+         )
+         # The round counter of every guarded loop is a nested progress bar.
+         compile_count(
+-            f"fixed-point:{self.name}", index, total=self.bound,
++            # This bound guarantees refusal, not the number of rounds until
++            # convergence. 2/50 must not be displayed as 4% compiled.
++            f"fixed-point:{self.name}", index,
+             label=f"{self.name} rounds (bound {self.bound})",
+             detail=f"changed={count}",
+         )
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+index 1a808878..ce27463f 100644
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -16328,7 +16328,10 @@ def _class_surface_ssa_program(
+             ("<sequence-schema-survey>", item)
+             for item in sequence_schema_shortfalls
+         )
+-    for shell_index, shell in enumerate(planned_shells, 1):
++    for shell_index, shell in compile_iter(
++        enumerate(planned_shells, 1), "functions", total=len(planned_shells),
++        label="SSA lowering: shells completed",
++    ):
+         graph = getattr(shell, "process_graph", None)
+         graph_obj = graph.G if graph is not None else None
+         function_name = (
+@@ -16337,8 +16340,8 @@ def _class_surface_ssa_program(
+         if function_name is None:
+             continue
+         compile_count(
+-            "functions", total=len(planned_shells),
+-            label="SSA lowering: functions", detail=str(function_name),
++            "functions", shell_index - 1, total=len(planned_shells),
++            label="SSA lowering: shells completed", detail=str(function_name),
+         )
+         report(
+             f"function {shell_index}/{len(planned_shells)} {function_name}: "
+@@ -45142,7 +45145,16 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
+     writes every ``progress`` line above them (``shell_telemetry``).  Off,
+     ``progress`` behaves as it always did.  The choice is a ``compile_policy``
+     row on the book.
++
++    ``compile_profile=True`` retains source-to-SSA stage wall times, existing
++    planner timings and completed work counts in ``module.metadata['compile_profile']``
++    even without bars. ``shell_telemetry.compile_profile_dataframe(module)``
++    makes a pandas view afterwards. Bars show logs above a persistent timing
++    table and actual work counters below it; stage order is not percent progress.
++    This summary excludes backend emission/build. Partitioned compilation uses
++    its existing per-unit manifest timings instead of this monolithic summary.
+     """
++    _collect_profile = kwargs.pop("compile_profile", True)
+     partitioned_directory = kwargs.pop("partitioned_directory", None)
+     partitioned_options = kwargs.pop("partitioned_options", {})
+     if partitioned_directory is not None:
+@@ -45188,7 +45200,7 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
+     # that deliberately wants silence can pass ``lambda _message: None``.
+     # Off, ``progress`` is the caller's callback or the plain ``[compiler]``
+     # line, exactly as before; on, it writes below-the-bars via tqdm.write.
+-    _bars = compile_progress(kwargs.pop("progress_bars", None))
++    _bars = compile_progress(kwargs.pop("progress_bars", None), collect_profile=_collect_profile)
+     kwargs["progress"] = _bars.progress_callback(kwargs.get("progress"))
+ 
+     from .graph_work import ensure_graph_foundation
+@@ -45279,6 +45291,8 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
+         return result
+     finally:
+         _bars.close(failed=not ok)
++        if module is not None and _bars.channel is not None:
++            module.metadata["compile_profile"] = _bars.summary()
+         book = end_identity_book(_token)
+         entrypoint = kwargs.get("entrypoint")
+         if entrypoint is None and len(args) > 1:
+diff --git a/src/compiler/glsl_deployment_strategy.py b/src/compiler/glsl_deployment_strategy.py
+index 4f3c3b5b..45fe08b7 100644
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -23807,7 +23807,7 @@ class ProcessGraphGLSLDeployment:
+                 callsite_planning_total += 1
+                 compile_count(
+                     "callsite-plan", callsite_planning_total,
+-                    label="callsite activations planned",
++                    label="callsite activations visited",
+                     detail=caller_identity,
+                 )
+                 if (
+diff --git a/src/compiler/deployment_profiler.py b/src/compiler/deployment_profiler.py
+index 7edf5ff8..0023c9ff 100644
+--- a/src/compiler/deployment_profiler.py
++++ b/src/compiler/deployment_profiler.py
+@@ -310,6 +310,18 @@ class DeploymentProfiler:
+             "device_events": tuple(self.device_trace_history),
+         }
+ 
++    def summary_dataframe(self, *, window: int = 60):
++        """A pandas view of the existing accumulated report, on request only."""
++        import pandas as pd
++        summary = self.summary(window=window)
++        result = pd.DataFrame.from_records(summary["rows"], columns=(
++            "path", "section", "label", "cpu_mean_ms", "cpu_p95_ms",
++            "gpu_mean_ms", "gpu_p95_ms", "calls_mean", "dispatches_mean"))
++        result.attrs.update({key: value for key, value in summary.items()
++                             if key != "rows"})
++        result.attrs["timing_semantics"] = "inclusive timings; nested rows are not additive"
++        return result
++
+     def summary(self, *, window: int = 60) -> dict[str, Any]:
+         reports = list(self.history)[-max(1, int(window)):]
+         if not reports:
+diff --git a/tests/test_compile_progress_bars.py b/tests/test_compile_progress_bars.py
+index df7f68d8..0e74c547 100644
+--- a/tests/test_compile_progress_bars.py
++++ b/tests/test_compile_progress_bars.py
+@@ -96,6 +96,8 @@ def make_layer(stages=FAKE_STAGES, **options):
+     options.setdefault("rss", lambda: int(1.5 * GIB))
+     options.setdefault("heartbeat", None)
+     options.setdefault("min_interval", 0.0)
++    # Isolate the existing nested-bar tests; table layout is checked below.
++    options.setdefault("timing_table", False)
+     layer = CompileProgress(
+         enabled=True, stages=stages, tqdm_class=tqdm_class,
+         stream=io.StringIO(), clock=clock, **options,
+@@ -116,7 +118,8 @@ def test_stage_bar_opens_first_advances_in_order_and_closes_last():
+     layer, events, bars, clock = make_layer()
+     with layer:
+         main = bars[0]
+-        assert main.total == 3 and main.leave is True
++        assert main.total is None and main.leave is True
++        assert "percentage" not in main.kwargs["bar_format"]
+         assert main.n == 0 and "first stage" in main.desc
+         clock.now += 5
+         compile_stage("beta")
+@@ -575,7 +578,7 @@ def test_every_guarded_fixed_point_loop_is_a_nested_round_bar():
+         guard.round(True, state="a")
+         guard.round(True, state="b")
+         nested = bars[1]
+-        assert nested.total == 50 and nested.n == 2 and not nested.closed
++        assert nested.total is None and nested.n == 2 and not nested.closed
+         assert "toy-fixed-point rounds (bound 50)" in nested.desc
+         guard.round(False, state="c")
+         assert nested.closed
+@@ -635,4 +638,118 @@ def test_with_real_tqdm_lines_scroll_above_the_bars(monkeypatch):
+     assert "compile 2/3 second stage" in text
+     assert "rss 1.00GB" in text
+     assert "[compiler] a compiler line" in written
+-    assert "compile 3/3 done" in text
++    assert "compile done (2 timed stages)" in text
++
++
++def test_timing_table_sits_above_measured_work_and_survives_logs():
++    layer, events, bars, clock = make_layer(timing_table=True)
++    with layer:
++        main = bars[0]
++        assert main.kwargs['position'] == len(FAKE_STAGES) + 1
++        table = layer.bars.table
++        assert [bar.kwargs['position'] for bar in table] == [0, 1, 2, 3]
++        assert 'Wall(s)' in table[0].desc and 'running' in table[1].desc
++        compile_count('items', 0, total=3)
++        nested = layer.bars.bars['items']
++        assert nested.kwargs['position'] > main.kwargs['position']
++        clock.now += 12
++        layer.log('scrolling message')
++        layer.stage('beta')
++        assert 'done' in table[1].desc and '12.00' in table[1].desc
++        assert 'running' in table[2].desc
++        assert not any(bar.closed for bar in table)
++    assert all(bar.closed for bar in bars)
++    assert any(e[0] == 'write' and 'scrolling message' in e[1] for e in events)
++
++
++def test_work_advances_after_processing_not_before_yield_and_retains_partial_failure():
++    layer, _events, _bars, _clock = make_layer()
++    with pytest.raises(RuntimeError):
++        with layer:
++            for item in layer.iterate([1, 2, 3], 'nodes'):
++                assert layer._counts['nodes']['n'] == item - 1
++                if item == 2:
++                    raise RuntimeError('second item failed')
++    assert layer.summary()['work']['alpha']['nodes'] == {
++        'done': 1, 'total': 3, 'label': 'nodes'}
++    assert layer.summary()['stages'][0]['state'] == 'failed'
++
++
++def test_interleaved_work_bars_never_reuse_an_occupied_row():
++    layer, _events, _bars, _clock = make_layer(timing_table=True)
++    with layer:
++        layer.count('first', 0, total=2)
++        layer.count('second', 0, total=2)
++        layer.count_close('first')
++        layer.count('third', 0, total=2)
++        assert layer.bars.positions['second'] != layer.bars.positions['third']
++
++
++def test_profile_collection_without_display_keeps_callbacks_and_counts():
++    clock = Clock()
++    layer = CompileProgress(enabled=False, collect_profile=True, stages=FAKE_STAGES,
++                            clock=clock, rss=lambda: GIB)
++    callback = lambda _: None
++    assert layer.progress_callback(callback) is callback
++    with layer:
++        clock.now += 2
++        list(layer.iterate([1, 2], 'nodes'))
++        layer.stage('beta')
++        clock.now += 5
++        layer.selection('fold', 'end', 0, 'root', {'duration_seconds': 0.125})
++    assert layer.bars is None
++    assert [row['seconds'] for row in layer.summary()['stages']] == [2, 5, 0]
++    assert [row['state'] for row in layer.summary()['stages']] == ['done', 'done', 'pending']
++    assert layer.summary()['work']['alpha']['nodes']['done'] == 2
++    assert all(record.detail.get('fraction_is_progress') is False
++               for record in layer.channel.of_kind('progress')
++               if record.detail.get('scope') in {'start', 'stage', 'substage', 'end'})
++    assert any(row['path'] == 'compile/planner/fold' and row['seconds'] == 0.125
++               for row in layer.channel.profile_summary())
++
++
++def test_timing_dataframe_uses_accumulated_stage_values():
++    pytest.importorskip('pandas')
++    layer, _events, _bars, clock = make_layer()
++    with layer:
++        clock.now += 2
++        layer.stage('beta')
++        clock.now += 3
++        layer.stage('alpha')
++        clock.now += 4
++    frame = layer.profile_dataframe().set_index('key')
++    assert frame.loc['alpha', 'seconds'] == 6
++    assert frame.loc['beta', 'seconds'] == 3
++    assert frame.loc['gamma', 'state'] == 'pending'
++
++
++def test_public_lowerer_retains_headless_profile_and_allows_explicit_opt_out():
++    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++    source = 'def root():\n    return 2 + 3\n'
++    options = {'extraction_contract': 'extraction_contracts/program_extraction.yaml',
++               'progress': lambda _: None, 'progress_bars': False}
++    module, _outputs, _exports = lower_ast_source_to_ssa(source, 'root', **options)
++    summary = module.metadata['compile_profile']
++    assert all(row['state'] == 'done' for row in summary['stages'])
++    assert any(row['section'] == 'planner' for row in summary['profiles'])
++    work = summary['work']['ssa-lowering']['functions']
++    assert work['done'] == work['total'] > 0
++    quiet, _, _ = lower_ast_source_to_ssa(source, 'root', compile_profile=False, **options)
++    assert 'compile_profile' not in quiet.metadata
++    pytest.importorskip('pandas')
++    frame = telemetry.compile_profile_dataframe(module)
++    assert frame['seconds'].sum() > 0
++    assert frame.attrs['work'] == summary['work']
++
++
++def test_filtered_channel_does_not_erase_failed_stage_summary():
++    clock = Clock()
++    layer = CompileProgress(enabled=False, collect_profile=True, stages=FAKE_STAGES,
++                            clock=clock, rss=lambda: GIB,
++                            channel=telemetry.TelemetryChannel(kinds=('progress',)))
++    with pytest.raises(RuntimeError):
++        with layer:
++            clock.now += 2
++            raise RuntimeError('failed')
++    row = layer.summary()['stages'][0]
++    assert row['state'] == 'failed' and row['seconds'] == 2 and row['rss_bytes'] == GIB
+diff --git a/tests/test_shell_telemetry.py b/tests/test_shell_telemetry.py
+index 84112e8a..6e5c6336 100644
+--- a/tests/test_shell_telemetry.py
++++ b/tests/test_shell_telemetry.py
+@@ -132,6 +132,37 @@ def test_attaching_a_profiler_mirrors_without_replacing():
+     detach()
+ 
+ 
++def test_profile_summary_survives_log_eviction_and_dataframe_is_a_late_view():
++    channel = TelemetryChannel(capacity=1)
++    channel.profile('fold', path='compiler/fold', nanoseconds=2_000_000, function='first')
++    channel.profile('fold', path='compiler/fold', nanoseconds=3_000_000,
++                    function='slow', failed=True)
++    channel.log('evicts every raw timing record')
++    assert channel.of_kind(PROFILE) == ()
++    row, = channel.profile_summary()
++    assert row['calls'] == 2 and row['seconds'] == 0.005
++    assert row['mean_seconds'] == 0.0025 and row['failed_calls'] == 1
++    assert row['slowest_function'] == 'slow'
++    import pytest
++    pytest.importorskip('pandas')
++    frame = channel.profile_dataframe()
++    assert frame.loc[0, 'seconds'] == 0.005
++    assert 'not additive' in frame.attrs['timing_semantics']
++
++
++def test_real_deployment_profiler_cpu_ms_reaches_telemetry_as_nanoseconds():
++    from src.compiler.deployment_profiler import DeploymentProfiler
++    profiler = DeploymentProfiler(enabled=True)
++    channel = TelemetryChannel()
++    detach = attach_profiler(profiler, channel)
++    profiler.record(path='root', section='planning', label='fold', cpu_ms=12.5)
++    assert channel.profile_summary()[0]['seconds'] == 0.0125
++    profiler.enabled = False
++    profiler.record(path='root', section='planning', label='fold', cpu_ms=99)
++    assert channel.profile_summary()[0]['calls'] == 1
++    detach()
++
++
+ def test_a_launch_profile_lands_on_the_same_timeline():
+     class Launch:
+         shell_ns, device_ns, host_ns, status, language = 500, 200, 300, 0, "wasm"
+@@ -142,6 +173,23 @@ def test_a_launch_profile_lands_on_the_same_timeline():
+     assert detail["nanoseconds"] == 500 and detail["device_ns"] == 200
+ 
+ 
++def test_deployment_dataframe_is_a_view_of_existing_window_not_another_profiler():
++    import pytest
++    pytest.importorskip('pandas')
++    from src.compiler.deployment_profiler import DeploymentProfiler
++    profiler = DeploymentProfiler(enabled=True)
++    empty = profiler.summary_dataframe()
++    assert 'cpu_mean_ms' in empty.columns and empty.attrs['frames'] == 0
++    profiler.history.append({'sequence': 1, 'total_ms': 7.0, 'rows': ({
++        'path': 'root', 'section': 'planning', 'label': 'fold',
++        'calls': 2, 'cpu_ms': 5.0, 'gpu_ms': 0.0, 'dispatches': 0},)})
++    frame = profiler.summary_dataframe(window=1)
++    assert frame.loc[0, 'cpu_mean_ms'] == 5.0
++    assert frame.loc[0, 'calls_mean'] == 2
++    assert frame.attrs['total_mean_ms'] == 7.0
++    assert profiler.summary(window=1)['rows'][0]['cpu_mean_ms'] == 5.0
++
++
+ def test_shortfalls_are_errors_not_a_separate_report():
+     class Shortfall:
+         def format(self):

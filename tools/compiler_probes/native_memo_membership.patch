@@ -1,0 +1,426 @@
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -15395,9 +15395,11 @@
+         ).items():
+             contract = {
+                 key: value_abi[key]
+-                for key in ("dtype", "rank", "shape", "storage")
++                for key in ("dtype", "rank", "shape", "storage", "mutable", "key_encoding", "value_record")
+                 if value_abi.get(key) is not None
+             }
++            if contract.get("storage") == "keyed":
++                contract["program_abi_parameter"] = str(parameter_name)
+             for value_id in identities.get(str(parameter_name), ()):
+                 value_contracts[int(value_id)] = dict(contract)
+                 note_shape(planned_graph, int(value_id), (
+@@ -18522,6 +18524,33 @@
+                     ),
+                 )
+                 formal.accounting = accounting
++            # A linked keyed input owns the complete descriptor, not only
++            # column zero. Captures must forward those same caller arenas;
++            # treating the remaining members as private scratch loses the
++            # memo at the native call boundary.
++            linked_sequences = lowered_control.metadata.get("sequence_table")
++            formals_by_id = {int(value.id): value for value in lowered_control.args}
++            for descriptor in getattr(linked_sequences, "sequences", {}).values():
++                contract = linked_contracts.get(int(descriptor.sequence_id), {})
++                owner = contract.get("program_abi_parameter")
++                if contract.get("storage") != "keyed" or owner is None:
++                    continue
++                member_ids = (
++                    *descriptor.column_value_ids, descriptor.length_address_id,
++                    descriptor.capacity_value_id, descriptor.status_address_id,
++                    descriptor.live_flags_value_id,
++                )
++                for member_id in member_ids:
++                    formal = formals_by_id.get(member_id)
++                    if formal is None:
++                        continue
++                    formal.accounting = {
++                        **dict(formal.accounting or {}),
++                        "program_abi_parameter": str(owner),
++                        "program_abi_storage": "scalar" if member_id == descriptor.capacity_value_id else "span",
++                        "program_abi_rank": 0 if member_id == descriptor.capacity_value_id else 1,
++                        "linked_parameter_provenance": "exact_call_argument_sequence_member",
++                    }
+             if phi_initial_identity_receipts:
+                 lowered_control.metadata[
+                     "phi_initial_identity_repairs"
+@@ -19522,7 +19551,7 @@
+             return current
+ 
+         def structural_membership_value(value_id: int, data, *, negate: bool):
+-            """Lower ``key in field`` / ``key not in field`` structurally.
++            """Lower membership against an exact declared keyed field or input.
+ 
+             A short-circuited boolop operand of this shape (see
+             ``ensure_structural_value``'s "call"-disguise case) names no
+@@ -19584,20 +19613,26 @@
+                 for parent, role in (field_data.get("parents") or ())
+                 if str(role) == "value"
+             ), None)
+-            if field_name is None or base_id is None or record_table is None:
++            sequence_table = all_sequence_tables.get(symbol)
++            direct_descriptor = (
++                sequence_table.sequences.get(int(field_id))
++                if sequence_table is not None else None
++            )
++            if direct_descriptor is None and (
++                field_name is None or base_id is None or record_table is None
++            ):
+                 structural_shortfalls.append((
+                     value_id, "call", "membership-field"
+                 ))
+                 return None
+-            sequence_table = all_sequence_tables.get(symbol)
+             if sequence_table is None:
+                 structural_shortfalls.append((
+                     value_id, "call", "membership-sequence-table"
+                 ))
+                 return None
+             sequence_id = None
+-            parts_descriptor = None
+-            base_record = record_table.records.get(base_id)
++            parts_descriptor = direct_descriptor
++            base_record = record_table.records.get(base_id) if record_table is not None else None
+             field_descriptor = next((
+                 field for field in (base_record.fields if base_record else ())
+                 if field.name == str(field_name)
+@@ -19609,7 +19644,7 @@
+                 # A record field lowered as one SEQUENCE descriptor names
+                 # its table directly.
+                 sequence_id = int(field_descriptor.sequence_id)
+-            else:
++            elif direct_descriptor is None:
+                 # A program-ABI ``keyed`` field is not one SEQUENCE field:
+                 # `materialize_parameter_record_abi` expands it into
+                 # `<field>.length` / `<field>.keys` / `<field>.values` part
+@@ -19748,12 +19783,16 @@
+                         value_id, "call", "membership-descriptor"
+                     ))
+                     return None
++            if len(descriptor.key_columns) != 1:
++                structural_shortfalls.append((value_id, "call", "membership-key-arity"))
++                return None
+             query_value = ensure_structural_value(query_id)
+             if query_value is None:
+                 structural_shortfalls.append((
+                     value_id, "call", f"membership-query:{query_id}"
+                 ))
+                 return None
++            mark_structural_parameter_use(query_id, query_value, value_id)
+             storage_ids = (
+                 *descriptor.column_value_ids,
+                 descriptor.length_address_id,
+@@ -19776,6 +19815,16 @@
+                         value_id, "call", f"membership-storage:{storage_id}"
+                     ))
+                     return None
++                if direct_descriptor is not None and storage_value not in function.args:
++                    # Control-region pruning precedes structural recovery.
++                    # Restore the exact declared parameter arena, never a
++                    # fresh anonymous formal or a frame-local replacement.
++                    if not (storage_value.accounting or {}).get("program_abi_parameter"):
++                        structural_shortfalls.append((
++                            value_id, "call", f"membership-parameter-storage:{storage_id}"
++                        ))
++                        return None
++                    function.args.append(storage_value)
+                 storage_args.append(storage_value)
+             from .ir_sequence_tables import lower_sequence_contains
+ 
+@@ -19798,6 +19847,11 @@
+                     "source_linked": True,
+                     "ssa_sequence_operation": "contains",
+                     "sequence_id": int(descriptor.sequence_id),
++                    **({"structural_membership_parameter": {
++                        "sequence_id": int(descriptor.sequence_id),
++                        "source_target_id": int(field_id),
++                        "source_query_id": int(query_id),
++                    }} if direct_descriptor is not None else {}),
+                     # A helper built over an anonymous table's arenas is
+                     # rebound to the owner's `<field>.keys/.values/.length`
+                     # part slots by the keyed-owner binder after call-frame
+@@ -19831,21 +19885,8 @@
+             values[int(value_id)] = negated
+             return negated
+ 
+-        def structural_reference_identity(value_id: int, data):
+-            """One producer for public results and private ``leaf(id(x))`` feeds.
+-
+-            ``return id(value)`` used to emit its Cast after the control builder
+-            closed parameter accounting; ``leaf(id(value))`` never emitted it.
+-            The producer owns the use, including promotion of the exact declared
+-            input in the same function_parameter/declared_parameter pages.
+-            """
+-            arguments = ordered_arguments(data.get("parents") or ())
+-            if len(arguments) != 1:
+-                return None
+-            source_id = int(arguments[0])
+-            source = ensure_structural_value(source_id)
+-            if source is None:
+-                return None
++        def mark_structural_parameter_use(source_id: int, source, value_id: int):
++            """Publish a late structural use through the incumbent parameter pages."""
+             source_attributes = graph.nodes.get(source_id, {}).get("attributes") or {}
+             if source in function.args and source_attributes.get("binding_kind") == "parameter":
+                 from .concordance_declarations import (
+@@ -19880,6 +19921,17 @@
+                     (str(row[1]), int(page.latest(row))) for row in page.scope_rows(scope)
+                     if page.latest(row) is not None
+                 )
++
++        def structural_reference_identity(value_id: int, data):
++            """One producer for public results and private ``leaf(id(x))`` feeds."""
++            arguments = ordered_arguments(data.get("parents") or ())
++            if len(arguments) != 1:
++                return None
++            source_id = int(arguments[0])
++            source = ensure_structural_value(source_id)
++            if source is None:
++                return None
++            mark_structural_parameter_use(source_id, source, value_id)
+             result = SSAValue(
+                 int(value_id), dtype="int64", accounting={"tensor_identity": "stable-handle"},
+             )
+--- a/src/compiler/authored_parameter_abi.py
++++ b/src/compiler/authored_parameter_abi.py
+@@ -176,7 +176,27 @@
+         contract = _authored_sequence_annotation_contract(annotation)
+         if contract is not None:
+             contracts[str(parameter)] = contract
+-    for parameter, receipt in dict(graph_obj.graph.get("parameter_value_abi") or {}).items():
++    receipts = dict(graph_obj.graph.get("parameter_value_abi") or {})
++    # The existing call-edge ABI fixed point also describes captured inputs.
++    # Consume that exact input identity, not a same-spelled parameter in a
++    # different function, and never derive a row layout from an opaque handle.
++    linked = graph_obj.graph.get("linked_value_abi") or {}
++    for node_id, data in graph_obj.nodes(data=True):
++        attributes = data.get("attributes") or {}
++        if str(data.get("type") or data.get("op") or "").casefold() != "input":
++            continue
++        name = attributes.get("binding_name")
++        receipt = linked.get(int(data.get("value_id", node_id)))
++        if name is None or receipt is None or receipt.get("storage") != "keyed":
++            continue
++        incumbent = receipts.get(str(name))
++        if incumbent is not None and any(
++            incumbent.get(key) != receipt.get(key)
++            for key in ("storage", "dtype", "mutable", "key_encoding", "value_record")
++        ):
++            raise ValueError(f"parameter {name!r} declared and linked keyed contracts disagree")
++        receipts[str(name)] = receipt
++    for parameter, receipt in receipts.items():
+         if receipt.get("storage") != "keyed":
+             continue
+         if receipt.get("value_record") is not None:
+--- a/src/compiler/ir_sequence_tables.py
++++ b/src/compiler/ir_sequence_tables.py
+@@ -1961,10 +1961,10 @@
+     found = builder.block("found")
+     absent = builder.block("absent")
+     result_block = builder.block("result")
+-    zero = builder.const(entry, 0)
+-    one = builder.const(entry, 1)
++    zero = builder.const(entry, 0, dtype="int64")
++    one = builder.const(entry, 1, dtype="int64")
+     length_slot = builder.fresh("ptr")
+-    length = builder.fresh("int")
++    length = builder.fresh("int64")
+     builder.emit(
+         entry,
+         "GetElementPtr",
+@@ -1973,8 +1973,8 @@
+     )
+     builder.emit(entry, "Load", [length_slot], length)
+     builder.branch(entry, header)
+-    index = builder.fresh("int")
+-    next_index = builder.fresh("int")
++    index = builder.fresh("int64")
++    next_index = builder.fresh("int64")
+     builder.emit(
+         header,
+         "Phi",
+@@ -2023,9 +2023,9 @@
+     builder.cond(body, matches, found, latch)
+     builder.emit(latch, "Add", [index, one], next_index)
+     builder.branch(latch, header)
+-    true_value = builder.const(found, 1)
++    true_value = builder.const(found, True, dtype="bool")
+     builder.branch(found, result_block)
+-    false_value = builder.const(absent, 0)
++    false_value = builder.const(absent, False, dtype="bool")
+     builder.branch(absent, result_block)
+     result = builder.fresh("bool")
+     builder.emit(
+--- a/src/compiler/identity_concordance.py
++++ b/src/compiler/identity_concordance.py
+@@ -2735,6 +2735,30 @@
+         for block_name, block in function.blocks.items():
+             for index, instruction in enumerate(block.instrs):
+                 attributes = instruction.attributes or {}
++                membership = attributes.get("structural_membership_parameter")
++                if membership is not None:
++                    sequence_table = module.sequence_tables.get(name)
++                    descriptor = getattr(sequence_table, "sequences", {}).get(
++                        int(membership["sequence_id"])
++                    )
++                    storage = () if descriptor is None else tuple(dict.fromkeys((
++                        *descriptor.column_value_ids, descriptor.length_address_id,
++                        descriptor.capacity_value_id,
++                        *((descriptor.live_flags_value_id,)
++                          if descriptor.live_flags_value_id is not None else ()),
++                    )))
++                    actual = tuple(int(value.id) for value in instruction.args)
++                    helper = module.functions.get(str(attributes.get("callee") or ""))
++                    if (descriptor is None or instruction.op != "Call"
++                            or attributes.get("ssa_sequence_operation") != "contains"
++                            or int(membership["source_target_id"]) != int(descriptor.sequence_id)
++                            or actual != (*storage, int(membership["source_query_id"]))
++                            or helper is None
++                            or helper.metadata.get("ssa_sequence_operation") != "contains"
++                            or len(helper.args) != len(actual)):
++                        found.append(Finding("membership-parameter-contract", name,
++                            None if instruction.res is None else int(instruction.res.id),
++                            f"{block_name}#{index}: membership operands disagree with exact parameter descriptor"))
+                 if (attributes.get("source_object_constructor") is not None
+                         or attributes.get("source_object_operation") is not None
+                         or attributes.get("native_collection_row") is not None):
+--- a/tools/compiler_probes/probe_native_metadata_copy.py
++++ b/tools/compiler_probes/probe_native_metadata_copy.py
+@@ -51,10 +51,17 @@
+             ('builtins.dict', 'builtins.list', 'builtins.tuple', 'builtins.set',
+              'builtins.frozenset', 'builtins.object'))
+ 
++    # Native id(value) is the admitted stable integer handle. Its memo uses
++    # the incumbent integer-key/opaque-value table ABI, not reference-equality
++    # object-member keys. This only declares the lowering probe's boundary;
++    # it does not import/export a Python memo or change the production copier.
+     contract = ExtractionContract(ROOT / "extraction_contracts/program_extraction.yaml")
+     contract = contract.with_program_abi({"records": {}, "bindings": [], "values": [
+         {"function": "metadata_copy_program", "parameter": name,
+-         "storage": "reference", "mutable": True,
++         "storage": "keyed" if name == "metadata_memo" and context_options else "reference",
++         "mutable": True,
++         **({"dtype": "opaque_ref", "key_encoding": "integer_identity"}
++            if name == "metadata_memo" and context_options else {}),
+          "python_type": "builtins.object" if name == "value" else "builtins.dict"}
+         for name in ("value", "metadata_memo")
+     ]}).with_execution_file(ROOT / "extraction_contracts/vehicle_full_native_execution.yaml")
+--- /dev/null
++++ b/tests/test_native_memo_membership.py
+@@ -0,0 +1,113 @@
++"""Keyed membership at the public source boundary, including captured memos."""
++from pathlib import Path
++
++import networkx as nx
++import numpy as np
++import pytest
++
++from src.compiler.authored_parameter_abi import _authored_parameter_sequence_contracts
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++from src.compiler.identity_concordance import concordance_report
++from src.compiler.ssa_llvm_backend import (
++    compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
++)
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def policy(identity=False):
++    return ExtractionContract(ROOT / 'extraction_contracts/program_extraction.yaml').with_program_abi({
++        'records': {}, 'bindings': [], 'values': [
++            {'function': 'root', 'parameter': 'memo', 'storage': 'keyed',
++             'dtype': 'opaque_ref', 'mutable': True, 'key_encoding': 'integer_identity',
++             'python_type': 'builtins.dict'},
++            {'function': 'root', 'parameter': 'value' if identity else 'key',
++             **({'storage': 'reference', 'python_type': 'builtins.object'} if identity else
++                {'storage': 'scalar', 'dtype': 'int64', 'python_type': 'builtins.int'})},
++        ],
++    }).with_execution_file(ROOT / 'extraction_contracts/vehicle_full_native_execution.yaml')
++
++
++@pytest.mark.parametrize('mode', ['direct', 'negated', 'conditional', 'captured', 'identity'])
++def test_native_membership_keeps_exact_parameter_arenas(tmp_path, mode):
++    if mode == 'captured':
++        source = ('def root(memo,key):\n'
++                  '    def visit(value):\n        return value in memo\n'
++                  '    return visit(key)\n')
++    elif mode == 'identity':
++        source = 'def root(memo,value):\n    identity=id(value)\n    return identity in memo\n'
++    elif mode == 'conditional':
++        source = ('def root(memo,key):\n    if key in memo:\n        result=1.0\n'
++                  '    else:\n        result=0.0\n    return result\n')
++    else:
++        source = f'def root(memo,key):\n    return key {"not in" if mode == "negated" else "in"} memo\n'
++    module, _, exports = lower_ast_source_to_ssa(source, 'root', name='memo_membership',
++        extraction_contract=policy(mode == 'identity'), runtime_closure_only=True,
++        progress=lambda _: None, progress_bars=False)
++    root = module.functions[exports[0]]
++    assert concordance_report(module).splitlines()[0].endswith('0 finding(s)')
++    artifact = emit_ssa_function_to_llvm(module, root.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / mode)
++    descriptor = next(iter(module.sequence_tables[root.name].sequences.values()))
++    assert descriptor.column_dtypes == ('int64', 'opaque_ref')
++    assert set(descriptor.column_value_ids) <= {v.id for v in root.args}
++    output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    parameters = dict(root.metadata['parameter_names'])
++    keys = np.array([0, -7, 2**60 + 3, 41], dtype=np.int64)
++    live = np.array([True, True, True, False], dtype=np.bool_)
++    buffers = {
++        descriptor.column_value_ids[0]: keys,
++        descriptor.column_value_ids[1]: np.zeros(4, dtype=np.int64),
++        descriptor.length_address_id: np.array([4], dtype=np.int64),
++        descriptor.capacity_value_id: np.array([4], dtype=np.int64),
++        descriptor.status_address_id: np.zeros(1, dtype=np.int32),
++        descriptor.live_flags_value_id: live,
++    }
++    for count in (0, 4):
++        buffers[descriptor.length_address_id][0] = count
++        for query in (0, -7, 2**60 + 3, 15, 41):
++            buffers[parameters['value' if mode == 'identity' else 'key']] = np.array([query], dtype=np.int64)
++            execution = prepare_artifact_execution(native, buffers).run()
++            expected = count != 0 and query in (0, -7, 2**60 + 3)
++            assert execution.buffers[output].item() == (not expected if mode == 'negated' else expected)
++
++
++def test_linked_capture_contract_uses_exact_input_identity():
++    graph = nx.DiGraph()
++    graph.add_node(7, type='Input', attributes={'binding_name': 'memo', 'binding_kind': 'external'})
++    graph.add_node(8, type='Call', attributes={'binding_name': 'unrelated'})
++    graph.graph['linked_value_abi'] = {
++        7: {'storage': 'keyed', 'dtype': 'opaque_ref', 'mutable': True},
++        8: {'storage': 'keyed', 'dtype': 'float64', 'mutable': False},
++    }
++    assert _authored_parameter_sequence_contracts(graph) == {
++        'memo': ('unique', 2, True, ('int64', 'opaque_ref')),
++    }
++
++
++def test_linked_capture_cannot_override_declared_row_layout():
++    graph = nx.DiGraph()
++    graph.add_node(7, type='Input', attributes={'binding_name': 'memo'})
++    graph.graph['parameter_value_abi'] = {'memo': {'storage': 'keyed', 'dtype': 'opaque_ref'}}
++    graph.graph['linked_value_abi'] = {7: {'storage': 'keyed', 'dtype': 'float64'}}
++    with pytest.raises(ValueError, match='declared and linked keyed contracts disagree'):
++        _authored_parameter_sequence_contracts(graph)
++
++
++@pytest.mark.parametrize('corruption', ['storage', 'query', 'target'])
++def test_membership_receipt_detects_stale_parameter_binding(corruption):
++    module, _, exports = lower_ast_source_to_ssa('def root(memo,key):\n    return key in memo\n',
++        'root', extraction_contract=policy(), runtime_closure_only=True,
++        progress=lambda _: None, progress_bars=False)
++    root = module.functions[exports[0]]
++    call = next(i for b in root.blocks.values() for i in b.instrs
++                if i.attributes.get('structural_membership_parameter'))
++    if corruption == 'storage':
++        call.args[0] = call.args[1]
++    elif corruption == 'query':
++        call.args[-1] = call.args[0]
++    else:
++        call.attributes['structural_membership_parameter']['source_target_id'] += 1
++    assert '[membership-parameter-contract]' in concordance_report(module)

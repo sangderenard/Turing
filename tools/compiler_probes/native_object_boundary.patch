@@ -1,0 +1,705 @@
+--- a/src/compiler/shell_external_references.py
++++ b/src/compiler/shell_external_references.py
+@@ -111,8 +111,11 @@
+     def __init__(self) -> None:
+         self._objects: dict[int, Any] = {}
+         self._next_handle = 1
++        self._native_object_boundary = None
+ 
+     def retain(self, value: Any) -> int:
++        if self._native_object_boundary is not None:
++            raise RuntimeError('native object domain is leased; finish its boundary before retaining')
+         handle = self._next_handle
+         self._next_handle += 1
+         self._objects[handle] = value
+@@ -125,8 +128,21 @@
+             raise ValueError(f"unknown external object handle {handle}") from error
+ 
+     def release(self, handle: int) -> None:
+-        if self._objects.pop(int(handle), None) is None:
++        if self._native_object_boundary is not None:
++            raise RuntimeError('native object domain is leased; finish its boundary before releasing')
++        if int(handle) not in self._objects:
+             raise ValueError(f"unknown external object handle {handle}")
++        del self._objects[int(handle)]
++
++    def bind_native_objects(self, context, roots: Sequence[Any]):
++        """Lease this codec's handle domain to the explicit native context.
++
++        Conversion runs once at entry/exit. Native operations use resident
++        table columns, not calls back to this codec. This does not authorize
++        Python equality/hash operations on reference-identity member tables.
++        """
++        from .native_object_boundary import NativeObjectBoundary
++        return NativeObjectBoundary(self, context, roots)
+ 
+     def encode(self, value: Any) -> bytes:
+         if value is None:
+--- a/src/compiler/ir_indexing.py
++++ b/src/compiler/ir_indexing.py
+@@ -179,7 +179,7 @@
+     }
+ 
+     from .concordance_declarations import (
+-        CONST_DECLARED_WIDTH_NOT_ON_BOOK, INFERRED_INTEGER_WIDEN,
++        CONST_DECLARED_WIDTH_NOT_ON_BOOK, LOAD_DECLARED_WIDTH_NOT_ON_BOOK, INFERRED_INTEGER_WIDEN,
+         IntegerWidthDecision, IntegerWidthFact, SCALAR_DTYPE_SETTLEMENT,
+         SCALAR_INTEGER_WIDTH, SSA_VALUE, WIDENED_VALUE_NOT_ON_BOOK,
+     )
+@@ -258,6 +258,23 @@
+             and isinstance(
+                 instruction.attributes.get("value"), (bool, int, float)
+             )
++        }
++        aggregate_result_ids = {
++            int(instruction.res.id) for instruction in instructions
++            if instruction.op == "Call" and instruction.res is not None
++            and instruction.attributes.get("result_convention") == "ssa.aggregate"
++        }
++        declared_load_ids = {
++            int(instruction.res.id) for instruction in instructions
++            if instruction.op == "Load" and instruction.res is not None
++            and instruction.attributes.get("lowered_from") not in _GATHER
++            # A planned Call -> GEP -> Load is an abstract return projection,
++            # not a physical memory-width declaration. The oscillator's
++            # source output69 retains an int placeholder with int64 on its
++            # identity book; its existing projection settlement still applies.
++            and (not instruction.args or address_base.get(int(instruction.args[0].id))
++                 not in aggregate_result_ids)
++            and str(instruction.res.dtype or "") in _DECLARED_LITERAL_DTYPES
+         }
+ 
+         def declared_float(instruction) -> str | None:
+@@ -382,10 +399,16 @@
+                 if inferred in narrow_integers:
+                     declared = str(instruction.res.dtype or "")
+                     if (
+-                        instruction.op == "Const"
++                        (instruction.op == "Const" or result_id in declared_load_ids)
+                         and declared in _DECLARED_LITERAL_DTYPES
+                         and inferred == declared
+                     ):
++                        # Source-linked native object SET reaches the dynamic
++                        # store's i32 status cell. Widening its raw typed Loads
++                        # alone changed both incoming statuses to i64 while
++                        # their explicit Phi stayed i32. Load is a memory read,
++                        # not an implicit conversion. Keep its declared width
++                        # at this writer, under the same identity check as Const.
+                         declared_cell, declared_fact = value_cell(result_id)
+                         if declared_cell is not None and str(
+                             getattr(declared_fact, "dtype", None)
+@@ -417,7 +440,8 @@
+             fact = IntegerWidthFact(decision, source_dtype, dtype)
+             if source_cell is None:
+                 provenance = Unsourced(
+-                    CONST_DECLARED_WIDTH_NOT_ON_BOOK
++                    (LOAD_DECLARED_WIDTH_NOT_ON_BOOK if result_id in declared_load_ids
++                     else CONST_DECLARED_WIDTH_NOT_ON_BOOK)
+                     if decision is IntegerWidthDecision.KEPT_DECLARED
+                     else WIDENED_VALUE_NOT_ON_BOOK
+                 )
+--- a/src/compiler/concordance_declarations.py
++++ b/src/compiler/concordance_declarations.py
+@@ -2650,7 +2650,7 @@
+ # ----------------------------------------------------------------------------
+ 
+ SCALAR_DTYPE_SETTLEMENT = declare_stage("scalar_dtype_settlement")
+-#: An integer whose width was inferred (a Cast target, a Load, integer
++#: An integer whose width was inferred (a Cast target, an abstract projection, integer
+ #: arithmetic) widened to int64.  Operand: the value's ``ssa_value`` cell.
+ INFERRED_INTEGER_WIDEN = declare_transform("inferred_integer_widen", 1)
+ #: A Const declaring an integer width whose result has no ``ssa_value`` cell
+@@ -2659,6 +2659,9 @@
+ CONST_DECLARED_WIDTH_NOT_ON_BOOK = declare_reason(
+     "const_declared_width_not_on_book"
+ )
++#: A raw typed Load declares its physical memory width. It is not an
++#: inferred Python integer; the importer owes its missing value identity.
++LOAD_DECLARED_WIDTH_NOT_ON_BOOK = declare_reason("load_declared_width_not_on_book")
+ #: A widened integer whose value has no ``ssa_value`` cell to transform.
+ WIDENED_VALUE_NOT_ON_BOOK = declare_reason("widened_value_not_on_book")
+ 
+@@ -2679,7 +2682,7 @@
+ 
+ SCALAR_INTEGER_WIDTH = declare_page("scalar_integer_width", (
+     RowField("function_scope", K.SCOPE), RowField("ssa_id", K.VALUE_ID),
+-), IntegerWidthFact)                   # DERIVED(Const ssa_value) | NOVEL(INFERRED_INTEGER_WIDEN); CONCORD
++), IntegerWidthFact)                   # DERIVED(declared Const/Load ssa_value) | NOVEL(INFERRED_INTEGER_WIDEN); CONCORD
+ 
+ LINKED_VALUE_ABI_SETTLEMENT = declare_stage("linked_value_abi_settlement")
+ #: A copy's statement with no book cell to derive from (a ProgramABI contract
+--- /dev/null
++++ b/src/compiler/native_object_boundary.py
+@@ -0,0 +1,272 @@
++"""Python entry/exit conversion for the existing SSAObjectContext ABI.
++
++This is boundary marshalling, not a Python container runtime. Native code sees
++the context's exact tables and operates without host callbacks. Dictionary
++members retain their actual key identities and insertion order; their native
++lookup contract remains reference identity, NOT Python equality/hash.
++"""
++from __future__ import annotations
++
++from collections import deque
++import ctypes
++
++import numpy as np
++
++from .ssa_object_context import context_values
++
++
++_CONTAINERS = {dict: 'builtins.dict', list: 'builtins.list', tuple: 'builtins.tuple',
++               set: 'builtins.set', frozenset: 'builtins.frozenset'}
++
++
++class NativeObjectBoundary:
++    """An exclusive handle-domain lease with caller-owned initial columns.
++
++    Exact builtin containers are converted. Other values (including subclasses)
++    remain retained opaque leaves; no instance layout is inferred. All roots
++    share one identity traversal. New native handles use the context counter,
++    and that counter is reconciled before the codec can retain another object.
++    The caller must execute the existing native context release before close
++    if native growth has allocated memory. No finalizer frees native memory.
++    Only trusted native context buffers may be read: this is an in-process ABI,
++    not a deserializer for arbitrary addresses supplied by an external party.
++    """
++
++    def __init__(self, codec, context, roots):
++        if codec._native_object_boundary is not None:
++            raise RuntimeError('native object domain is already leased')
++        self.codec, self.context = codec, context
++        self.receipt = context.to_mapping()
++        self.closed = False
++        kinds = {name: index + 1 for index, name in enumerate(context.kind_vocabulary)}
++        required = {*_CONTAINERS.values(), 'builtins.object'}
++        if not required.issubset(kinds):
++            raise ValueError('native Python object boundary requires all builtin container kinds and leaf kind')
++        roots = tuple(roots)
++        self.retained = []
++        self._leaf_handles = set()
++        objects, members, pending, identities = [], [], deque(), {}
++
++        def reference(value):
++            identity = id(value)
++            if identity in identities:
++                return identities[identity]
++            handle = codec.retain(value)
++            self.retained.append(handle)
++            identities[identity] = handle
++            label = _CONTAINERS.get(type(value), 'builtins.object')
++            objects.append((handle, kinds[label]))
++            if label == 'builtins.object':
++                self._leaf_handles.add(handle)
++            else:
++                pending.append((handle, value))
++            return handle
++
++        try:
++            self.roots = tuple(reference(value) for value in roots)
++            while pending:
++                owner, value = pending.popleft()
++                if type(value) is dict:
++                    for key, item in value.items():
++                        members.append((owner, reference(key), reference(item)))
++                elif type(value) in (list, tuple):
++                    for index, item in enumerate(value, 1):
++                        members.append((owner, index, reference(item)))
++                else:
++                    for item in value:
++                        handle = reference(item)
++                        members.append((owner, handle, handle))
++            self.buffers = {value.id: np.zeros(1, dtype=np.uint64 if value.dtype == 'ptr'
++                else np.int32 if value.dtype == 'int' else np.int64)
++                for value in context_values(context)}
++            self._initial_columns = {}
++            for descriptor, rows in ((context.objects, objects), (context.members, members)):
++                capacity = max(len(rows), 1)
++                for index, cell in enumerate(descriptor.column_value_ids):
++                    column = np.zeros(capacity, dtype=np.int64)
++                    column[:len(rows)] = [row[index] for row in rows]
++                    self._initial_columns[cell] = column
++                    self.buffers[cell][0] = column.ctypes.data
++                self.buffers[descriptor.length_address_id][0] = len(rows)
++                self.buffers[descriptor.capacity_value_id][0] = capacity
++            self.buffers[context.next_handle_value_id][0] = codec._next_handle
++            codec._native_object_boundary = self
++        except BaseException:
++            for handle in self.retained:
++                codec.release(handle)
++            raise
++
++    def _check_live(self):
++        if self.closed or self.codec._native_object_boundary is not self:
++            raise RuntimeError('native object boundary is closed')
++        if self.context.to_mapping() != self.receipt:
++            raise ValueError('native object boundary context contract changed')
++
++    def _rows(self, descriptor):
++        length = int(self.buffers[descriptor.length_address_id][0])
++        capacity = int(self.buffers[descriptor.capacity_value_id][0])
++        if not 0 <= length <= capacity <= (2**63 - 1) // 8:
++            raise ValueError('native object table has invalid extents')
++        columns = []
++        for cell in descriptor.column_value_ids:
++            address = int(self.buffers[cell][0])
++            if length and not address:
++                raise ValueError('native object table has a null live column')
++            initial = self._initial_columns[cell]
++            if address == initial.ctypes.data:
++                if capacity > len(initial):
++                    raise ValueError('native object table exceeds its borrowed column capacity')
++                columns.append(initial[:length])
++            elif length:
++                # A live explicit heap owner is the allocation contract, never
++                # a cast of an opaque reference. The pointer cell holds storage.
++                if not self.buffers[self.context.objects.heap_owner_value_id][0]:
++                    raise ValueError('native replacement column has no live heap owner')
++                pointer = ctypes.cast(address, ctypes.POINTER(ctypes.c_int64))
++                columns.append(np.ctypeslib.as_array(pointer, shape=(length,)))
++            else:
++                columns.append(())
++        return tuple(tuple(int(value) for value in row) for row in zip(*columns))
++
++    def export(self, roots=None):
++        """Reify native graph roots, preserving imported identities and aliases.
++
++        Imported mutable objects synchronize only after graph validation; new
++        native handles get fresh shells. Imported immutable handles must retain
++        their exact members (mutation requires a new handle). Immutable dependencies use a linear
++        topological worklist. An impossible immutable-only cycle refuses.
++        Host dictionaries/sets apply their real equality/hash semantics here.
++        Duplicate equal keys from invalid native construction refuse rather
++        than silently collapsing an edge or changing the graph's cardinality.
++        """
++        self._check_live()
++        objects = self._rows(self.context.objects)
++        members = self._rows(self.context.members)
++        labels, children, keys = {}, {}, {}
++        vocabulary = self.context.kind_vocabulary
++        for handle, kind in objects:
++            if handle <= 0 or handle in labels or not 1 <= kind <= len(vocabulary):
++                raise ValueError('invalid or duplicate native object identity/kind')
++            labels[handle] = vocabulary[kind - 1]
++            children[handle], keys[handle] = [], set()
++        counter = int(self.buffers[self.context.next_handle_value_id][0])
++        if not 0 < counter < 2**63 or any(handle >= counter for handle in labels):
++            raise ValueError('native object counter does not dominate live identities')
++        self.codec._next_handle = max(self.codec._next_handle, counter)
++        for owner, key, value in members:
++            if owner not in labels or key in keys[owner] or value not in labels:
++                raise ValueError('native member has missing identity or duplicate key')
++            label = labels[owner]
++            if label in ('builtins.dict', 'builtins.set', 'builtins.frozenset') and key not in labels:
++                raise ValueError('native member key has no object identity')
++            keys[owner].add(key)
++            children[owner].append((key, value))
++        retained = set(self.retained)
++        values, immutable = {}, set()
++        for handle, label in labels.items():
++            if handle not in retained and handle in self.codec._objects:
++                raise ValueError('native object identity collides with the host codec')
++            if handle in retained and label != _CONTAINERS.get(
++                    type(self.codec.object(handle)), 'builtins.object'):
++                raise ValueError('native kind disagrees with its retained Python identity')
++            if label == 'builtins.object':
++                if handle not in self._leaf_handles or children[handle]:
++                    raise ValueError('native leaf has no retained Python representation')
++                values[handle] = self.codec.object(handle)
++            elif label == 'builtins.dict':
++                values[handle] = self.codec.object(handle) if handle in retained else {}
++            elif label == 'builtins.list':
++                values[handle] = self.codec.object(handle) if handle in retained else []
++            elif label == 'builtins.set':
++                values[handle] = self.codec.object(handle) if handle in retained else set()
++            elif label in ('builtins.tuple', 'builtins.frozenset'):
++                immutable.add(handle)
++            else:
++                raise ValueError(f'unhandled native object kind {label}')
++            if label in ('builtins.list', 'builtins.tuple'):
++                rows = children[handle]
++                ordered = [None] * len(rows)
++                for key, value in rows:
++                    if not 1 <= key <= len(rows):
++                        raise ValueError('native positional members must be contiguous and one-based')
++                    ordered[key - 1] = (key, value)
++                children[handle] = ordered
++            if label in ('builtins.set', 'builtins.frozenset') and any(
++                    key != value for key, value in children[handle]):
++                raise ValueError('native set members must carry the same key and value identity')
++        waiting, dependents = {}, {}
++        for handle in immutable:
++            dependencies = {value for _, value in children[handle] if value in immutable}
++            waiting[handle] = len(dependencies)
++            for dependency in dependencies:
++                dependents.setdefault(dependency, []).append(handle)
++        ready = deque(handle for handle, count in waiting.items() if not count)
++        while ready:
++            handle = ready.popleft()
++            items = [values[value] for _, value in children[handle]]
++            if handle in retained:
++                original = self.codec.object(handle)
++                same = (all(left is right for left, right in zip(original, items))
++                        if labels[handle] == 'builtins.tuple' else
++                        {id(item) for item in original} == {id(item) for item in items})
++                if len(original) != len(items) or not same:
++                    raise ValueError('native mutation of an imported immutable object requires a new identity')
++                values[handle] = original
++            else:
++                values[handle] = tuple(items) if labels[handle] == 'builtins.tuple' else frozenset(items)
++            if len(values[handle]) != len(items):
++                raise ValueError('native immutable members collapse under Python equality')
++            for dependent in dependents.get(handle, ()):
++                waiting[dependent] -= 1
++                if not waiting[dependent]:
++                    ready.append(dependent)
++        if any(handle not in values for handle in immutable):
++            raise ValueError('native immutable-only cycle cannot be reified')
++        staged = {}
++        for handle, label in labels.items():
++            rows = children[handle]
++            if label == 'builtins.list':
++                staged[handle] = [values[value] for _, value in rows]
++            elif label == 'builtins.dict':
++                staged[handle] = {}
++                for key, value in rows:
++                    staged[handle][values[key]] = values[value]
++            elif label == 'builtins.set':
++                staged[handle] = {values[value] for _, value in rows}
++            if label in ('builtins.dict', 'builtins.set') and len(staged[handle]) != len(rows):
++                raise ValueError('native members collapse under Python equality')
++        roots = self.roots if roots is None else tuple(roots)
++        if any(handle not in values for handle in roots):
++            raise ValueError('native result has no object identity')
++        for handle, replacement in staged.items():
++            if labels[handle] == 'builtins.list':
++                values[handle][:] = replacement
++            else:
++                values[handle].clear()
++                values[handle].update(replacement)
++        # Publish native-created representations in the SAME incumbent handle
++        # owner. A second export of handle h must return the same object, not
++        # reconstruct another identity for h. The exclusive lease prevents
++        # concurrent host minting from occupying a native-issued handle.
++        for handle, value in values.items():
++            if handle not in retained:
++                self.codec._objects[handle] = value
++                self.retained.append(handle)
++        return tuple(values[handle] for handle in roots)
++
++    def close(self):
++        """End the lease after explicit native release; drop input retentions."""
++        self._check_live()
++        if self.buffers[self.context.objects.heap_owner_value_id][0]:
++            raise RuntimeError('release the native object context before closing its boundary')
++        counter = int(self.buffers[self.context.next_handle_value_id][0])
++        self.codec._next_handle = max(self.codec._next_handle, counter)
++        self.codec._native_object_boundary = None
++        for handle in self.retained:
++            self.codec.release(handle)
++        for buffer in self.buffers.values():
++            buffer.fill(0)
++        self.closed = True
++
++
++__all__ = ['NativeObjectBoundary']
+--- /dev/null
++++ b/tests/test_native_object_boundary.py
+@@ -0,0 +1,296 @@
++"""Boundary conversion tests; not proof of automatic copier-source lowering."""
++import numpy as np
++import pytest
++
++from src.compiler.monotonic_ids import GLOBAL_MONOTONIC_IDS
++from src.compiler.shell_external_references import ExternalReferenceValueCodec
++from src.transmogrifier.ssa import SSAObjectContext, SSASequenceDescriptor, SSASequenceCapacityPolicy
++
++
++def context():
++    mint = GLOBAL_MONOTONIC_IDS.mint
++    owner = mint()
++    def table(dtypes, keys):
++        columns = tuple(mint() for _ in dtypes)
++        return SSASequenceDescriptor(columns[0], columns, mint(), mint(),
++            status_address_id=mint(), column_dtypes=dtypes, key_columns=keys,
++            capacity_policy=SSASequenceCapacityPolicy.DYNAMIC, heap_owner_value_id=owner)
++    return SSAObjectContext('boundary.test', table(('opaque_ref', 'int64'), (0,)),
++        table(('opaque_ref', 'opaque_ref', 'opaque_ref'), (0, 1)), mint(),
++        ('builtins.dict', 'builtins.list', 'builtins.tuple', 'builtins.set',
++         'builtins.frozenset', 'builtins.object'))
++
++
++def test_conversion_preserves_graph_aliases_cycles_keys_and_leaf_identity():
++    codec = ExternalReferenceValueCodec()
++    leaf = object()
++    shared = [leaf]
++    ring = (shared,)
++    shared.extend((shared, ring))
++    key = ('key', 123)
++    source = {key: shared, 'ring': ring, 'set': {key}, 'frozen': frozenset((key,)),
++              'equal': {1: 'a', True: 'b'}, 'none': None}
++    boundary = codec.bind_native_objects(context(), (source, shared, leaf, source))
++    result, copied, returned_leaf, alias = boundary.export()
++    assert result is alias and result is source and copied is shared
++    assert returned_leaf is leaf and copied[0] is leaf
++    assert copied[1] is copied and copied[2][0] is copied
++    assert result[key] is copied and result['ring'] is copied[2]
++    assert next(iter(result)) is next(iter(result['set']))
++    assert next(iter(result['frozen'])) is next(iter(result))
++    assert result['equal'] == {1: 'b'} and result['none'] is None
++    boundary.close()
++    assert not codec._objects
++    with pytest.raises(RuntimeError, match='closed'):
++        boundary.export()
++
++
++def test_deep_conversion_is_iterative_and_domain_lease_is_exclusive():
++    source = object()
++    leaf = source
++    for _ in range(2500):
++        source = (source,)
++    codec = ExternalReferenceValueCodec()
++    boundary = codec.bind_native_objects(context(), (source,))
++    with pytest.raises(RuntimeError, match='leased'):
++        codec.retain(object())
++    with pytest.raises(RuntimeError, match='leased'):
++        codec.bind_native_objects(context(), ())
++    result, = boundary.export()
++    for _ in range(2500):
++        result, = result
++    assert result is leaf
++    boundary.close()
++    assert not codec._objects
++
++
++def test_subclasses_stay_opaque_and_none_retention_can_release():
++    class Custom(list):
++        def __iter__(self):
++            raise AssertionError('must not infer custom container semantics')
++    value = Custom()
++    codec = ExternalReferenceValueCodec()
++    boundary = codec.bind_native_objects(context(), (value, None))
++    exported = boundary.export()
++    assert exported[0] is value and exported[1] is None
++    boundary.close()
++
++
++def test_invalid_native_graph_refuses_without_collapsing_dictionary_semantics():
++    scope = context()
++    codec = ExternalReferenceValueCodec()
++    original = {1: 'first', 2: 'second'}
++    boundary = codec.bind_native_objects(scope, (original, True))
++    true_handle = boundary.roots[1]
++    key_column = boundary._initial_columns[scope.members.column_value_ids[1]]
++    key_column[1] = true_handle  # 1 and True distinct refs, Python-equal keys.
++    with pytest.raises(ValueError, match='collapse'):
++        boundary.export()
++    assert original == {1: 'first', 2: 'second'}
++    boundary.close()
++
++
++def test_immutable_mutation_and_impossible_immutable_cycle_refuse():
++    scope = context()
++    codec = ExternalReferenceValueCodec()
++    original = (object(),)
++    replacement = object()
++    boundary = codec.bind_native_objects(scope, (original, replacement))
++    column = boundary._initial_columns[scope.members.column_value_ids[2]]
++    column[0] = boundary.roots[1]
++    with pytest.raises(ValueError, match='immutable object'):
++        boundary.export()
++    column[0] = boundary.roots[0]
++    with pytest.raises(ValueError, match='immutable-only cycle'):
++        boundary.export()
++    boundary.close()
++    boundary = codec.bind_native_objects(scope, ([1],))
++    boundary._initial_columns[scope.members.column_value_ids[1]][0] = 7
++    with pytest.raises(ValueError, match='contiguous'):
++        boundary.export()
++    boundary.close()
++
++
++def test_invalid_extent_is_rejected_before_dereferencing_pointer():
++    scope = context()
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, ([],))
++    boundary.buffers[scope.objects.length_address_id][0] = 10
++    with pytest.raises(ValueError, match='extents'):
++        boundary.export()
++    boundary.buffers[scope.objects.length_address_id][0] = 1
++    boundary.close()
++
++
++@pytest.mark.parametrize('dtype', ['int8', 'int16', 'int32', 'int', 'int64'])
++def test_raw_memory_load_keeps_declared_integer_width(dtype):
++    from src.compiler.ir_indexing import lower_indexing_to_ssa_addressing
++    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
++    mint = GLOBAL_MONOTONIC_IDS.mint
++    storage = SSAValue(mint(), dtype, shape=(1,))
++    zero, address, loaded = SSAValue(mint(), 'int64'), SSAValue(mint(), 'ptr'), SSAValue(mint(), dtype)
++    block = BasicBlock('entry', [Instr('Const', [], zero, attributes={'value': 0}),
++        Instr('GetElementPtr', [storage, zero], address), Instr('Load', [address], loaded),
++        Instr('Ret', [loaded], None)])
++    function = Function('typed_memory_read', [storage], {'entry': block})
++    lower_indexing_to_ssa_addressing({function.name: function})
++    assert loaded.dtype == dtype
++
++
++def test_abstract_call_projection_is_not_a_raw_memory_width_declaration():
++    from src.compiler.ir_indexing import lower_indexing_to_ssa_addressing
++    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
++    mint = GLOBAL_MONOTONIC_IDS.mint
++    aggregate, zero, address, projected = (SSAValue(mint(), dtype)
++        for dtype in ('ssa.aggregate', 'int64', 'ptr', 'int'))
++    block = BasicBlock('entry', [
++        Instr('Call', [], aggregate, attributes={'callee': 'declared_region', 'result_convention': 'ssa.aggregate'}),
++        Instr('Const', [], zero, attributes={'value': 0}),
++        Instr('GetElementPtr', [aggregate, zero], address),
++        Instr('Load', [address], projected, attributes={'aggregate_index': 0, 'source_output_id': projected.id}),
++        Instr('Ret', [projected], None)])
++    function = Function('abstract_projection', [], {'entry': block})
++    lower_indexing_to_ssa_addressing({function.name: function})
++    assert projected.dtype == 'int64'  # Incumbent Python-integer projection rule.
++
++
++def test_native_growth_and_new_container_export_use_existing_context(tmp_path):
++    from src.compiler.identity_concordance import concordance_report
++    from src.compiler.ssa_object_context import lower_object_context
++    from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution
++    scope = context()
++    module = lower_object_context(scope, prefix='boundary_native')
++    assert concordance_report(module).splitlines()[0].endswith('0 finding(s)')
++    natives = {label: compile_artifact(emit_ssa_function_to_llvm(module, 'boundary_native_' + label),
++        directory=tmp_path / label) for label in ('construct', 'set', 'release')}
++    leaf = object()
++    source = [leaf]
++    codec = ExternalReferenceValueCodec()
++    boundary = codec.bind_native_objects(scope, (source, leaf))
++    original_arrays = {cell: array.copy() for cell, array in boundary._initial_columns.items()}
++
++    def run(label, *operands):
++        function = module.functions['boundary_native_' + label]
++        receipt = function.metadata.get('opaque_object_helper', {})
++        ids = (() if receipt.get('reference_formal_id') is None else (receipt['reference_formal_id'],))
++        ids += receipt.get('operand_formal_ids', ())
++        bound = {**boundary.buffers, **{key: np.array([value], dtype=np.int64)
++                 for key, value in zip(ids, operands, strict=True)}}
++        execution = prepare_artifact_execution(natives[label], bound)
++        for key in boundary.buffers:
++            if key in execution.buffers:
++                assert np.shares_memory(boundary.buffers[key], execution.buffers[key])
++        execution.run()
++        returned = function.metadata.get('return_value')
++        return None if returned is None else execution.buffers[returned.id].item()
++
++    try:
++        # SSA ABI integration, not compilation of a substitute metadata copier.
++        new = run('construct', scope.kind_vocabulary.index('builtins.dict') + 1)
++        assert new > max(boundary.retained)
++        assert run('set', new, boundary.roots[1], boundary.roots[0])
++        assert run('set', boundary.roots[0], 2, new)  # list -> new dict -> list cycle
++        assert run('set', boundary.roots[0], 3, boundary.roots[1])
++        assert source == [leaf]  # Host mutations publish at export, not per native op.
++        result, fresh = boundary.export((boundary.roots[0], new))
++        assert result[0] is leaf and result[2] is leaf
++        assert result[1] is fresh and fresh[leaf] is result
++        assert result is source
++        again, = boundary.export((new,))
++        assert again is fresh and source[1] is fresh
++        assert boundary.buffers[scope.objects.heap_owner_value_id][0]
++        with pytest.raises(RuntimeError, match='release'):
++            boundary.close()
++    finally:
++        run('release')
++        boundary.close()
++    # Growth writes replacement arenas; borrowed initial arrays remain intact.
++    for cell, original in original_arrays.items():
++        np.testing.assert_array_equal(boundary._initial_columns[cell], original)
++    handle = codec.retain(fresh)
++    assert codec.object(handle) is fresh
++    codec.release(handle)
++
++
++def test_public_source_loop_accepts_python_graph_and_exports_native_objects(tmp_path):
++    from pathlib import Path
++    from src.compiler.extraction_contract import ExtractionContract
++    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++    from src.compiler.identity_concordance import concordance_report
++    from src.compiler.ssa_object_context import context_values, lower_object_context
++    from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution
++    scope = context()
++    native_module = lower_object_context(scope, prefix='source_boundary')
++    cells = context_values(scope)
++    names = [f'cell_{value.id}' for value in cells]
++    signature = ','.join(names)
++    declared = {label: ','.join(name for name, _ in native_module.functions[
++        'source_boundary_' + label].metadata['parameter_names']) for label in ('construct', 'set')}
++    source = (f'def construct({declared["construct"]}):\n    return 0\n'
++              f'def store({declared["set"]}):\n    return 0\n'
++              f'def root({signature},root_ref,leaf_ref,requested_kind,count):\n'
++              f'    for index in range(count):\n'
++              f'        item=construct({signature},requested_kind)\n'
++              f'        store({signature},item,leaf_ref,root_ref)\n'
++              f'        store({signature},root_ref,index+2,item)\n'
++              f'    return root_ref\n')
++    values = []
++    for name, value in zip(names, cells, strict=True):
++        receipt = {'function': '*', 'parameter': name, 'dtype': value.dtype, 'mutable': True,
++                   'storage': 'span' if value.shape else 'scalar',
++                   'python_type': 'numpy.ndarray' if value.shape else 'builtins.int'}
++        if value.shape:
++            receipt.update(rank=1, shape=list(value.shape))
++        values.append(receipt)
++    for name in ('root_ref', 'leaf_ref'):
++        values.append({'function': '*', 'parameter': name, 'dtype': 'opaque_ref',
++            'storage': 'reference', 'python_type': 'builtins.object'})
++    for name in ('requested_kind', 'count'):
++        values.append({'function': '*', 'parameter': name, 'dtype': 'int64',
++            'storage': 'scalar', 'python_type': 'builtins.int'})
++    repository = Path(__file__).resolve().parents[1]
++    policy = ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_program_abi(
++        {'records': {}, 'bindings': [], 'values': values}).with_execution_file(
++        repository / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    links = {}
++    for declaration, label in (('construct', 'construct'), ('store', 'set')):
++        name = 'source_boundary_' + label
++        links[declaration] = (native_module, name, {name: (native_module.functions[name].metadata['return_value'],)})
++    module, _, exports = lower_ast_source_to_ssa(source, 'root', name='python_graph_boundary',
++        extraction_contract=policy, linked_repository_ssa=links, progress=lambda _: None, progress_bars=False)
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'source')
++    destructor = compile_artifact(emit_ssa_function_to_llvm(native_module, 'source_boundary_release'),
++        directory=tmp_path / 'release')
++    root = module.functions[exports[0]]
++    parameters = dict(root.metadata['parameter_names'])
++    output = next(instruction.args[0] for block in root.blocks.values()
++                  for instruction in block.instrs if instruction.op == 'Ret')
++    codec = ExternalReferenceValueCodec()
++    for count in (1, 17, 257):
++        leaf = object()
++        original = [leaf]
++        boundary = codec.bind_native_objects(scope, (original, leaf))
++        feeds = {parameters[name]: boundary.buffers[value.id] for name, value in zip(names, cells)
++                 if name in parameters}
++        for name, value in (('root_ref', boundary.roots[0]), ('leaf_ref', boundary.roots[1]),
++                            ('requested_kind', 1), ('count', count)):
++            feeds[parameters[name]] = np.array([value], dtype=np.int64)
++        try:
++            execution = prepare_artifact_execution(native, feeds)
++            for name, value in zip(names, cells):
++                if name in parameters:
++                    assert np.shares_memory(execution.buffers[parameters[name]], boundary.buffers[value.id])
++            execution.run()  # ONE invocation for the entire source loop.
++            assert original == [leaf]
++            result, = boundary.export((int(execution.buffers[output.id][0]),))
++            assert len(result) == count + 1 and result[0] is leaf
++            assert len({id(item) for item in result[1:]}) == count
++            assert all(item[leaf] is result for item in result[1:])
++            assert result is original
++        finally:
++            prepare_artifact_execution(destructor, boundary.buffers).run()
++            boundary.close()
++        assert not codec._objects
+

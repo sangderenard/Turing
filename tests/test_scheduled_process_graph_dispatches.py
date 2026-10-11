@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 
+import pytest
+
 from src.compiler.process_graph_fusion import (
     extract_clean_process_subgraph,
     reduce_scheduled_shader_regions,
@@ -9,6 +11,7 @@ from src.compiler.process_graph_fusion import (
 )
 from src.compiler.glsl_deployment_strategy import (
     _control_partition_keys,
+    _dispatch_graph_index,
     _dispatch_subgraph,
     _dispatch_metadata_node_classifier,
     _is_dispatch_metadata_node,
@@ -41,6 +44,110 @@ def _add(graph, node_id, op, parents=()):
     for parent, role in parent_items:
         graph.G.add_edge(parent, node_id, role=role)
         graph.G.nodes[parent]["children"].append((node_id, role))
+
+
+@pytest.fixture
+def graph_cut_book():
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    book, token = begin_identity_book()
+    try:
+        yield book
+    finally:
+        end_identity_book(token)
+
+
+def _scope_dispatch_fixture(graph, book):
+    """Enter synthetic nodes through the same identity API as scoped cuts."""
+    from src.compiler.concordance_declarations import (
+        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, SYNTHESIZED_NO_SOURCE,
+    )
+    from src.compiler.identity_concordance import Mode, Unsourced
+    scope = book.mint_scope('dispatch_fixture', READ_SCOPE_FORK)
+    graph.G.graph.update(ingestion_value_scope=scope, lexical_read_scope=scope,
+                         operand_position_scope=scope)
+    for node_id, data in graph.G.nodes(data=True):
+        book.post(INGESTION_VALUE, (scope, node_id),
+                  NodeFact(data.get('type'), data.get('op'), data.get('label')),
+                  stage=READ_SCOPE_FORK, provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
+                  mode=Mode.CONCORD)
+
+
+def test_dispatch_cuts_share_one_edge_index_without_rescanning_other_members(monkeypatch, graph_cut_book):
+    """Region count must not multiply whole-source adjacency traversals.
+
+    Node 3's operand-only edge to 4 is deliberately absent from networkx.
+    Its external consumer must still force publication from region (2, 3).
+    """
+    from src.compiler.concordance_declarations import (
+        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, SYNTHESIZED_NO_SOURCE,
+    )
+    from src.compiler.identity_concordance import Mode, Unsourced
+
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "Input")
+    _add(graph, 2, "Add", (1,))
+    _add(graph, 3, "Mul", (2,))
+    _add(graph, 4, "Add")
+    graph.G.nodes[4]["parents"] = [(3, "arg0")]
+    for node_id in range(5, 37):
+        _add(graph, node_id, "Add", (1,))
+    graph.levels = {node_id: node_id for node_id in graph.G}
+    scope = graph_cut_book.mint_scope("dispatch_cut", READ_SCOPE_FORK)
+    graph.G.graph.update(
+        ingestion_value_scope=scope,
+        lexical_read_scope=scope,
+        operand_position_scope=scope,
+    )
+    for node_id, data in graph.G.nodes(data=True):
+        graph_cut_book.post(
+            INGESTION_VALUE, (scope, node_id),
+            NodeFact(data["type"], data["op"], data["label"]),
+            stage=READ_SCOPE_FORK,
+            provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+        )
+    queries = []
+    original = graph.G.predecessors
+
+    def counted(node_id):
+        queries.append(node_id)
+        return original(node_id)
+
+    monkeypatch.setattr(graph.G, "predecessors", counted)
+    index = _dispatch_graph_index(graph)
+    assert len(queries) == len(graph.G)
+    assert index.parents[4] == frozenset({3})
+    assert index.children[3] == frozenset({4})
+    with pytest.raises(TypeError):
+        index.parents[4] = frozenset()
+
+    def refuse_scan(_node_id):
+        raise AssertionError("region carving rescanned the source adjacency")
+
+    monkeypatch.setattr(graph.G, "predecessors", refuse_scan)
+    monkeypatch.setattr(graph.G, "successors", refuse_scan)
+    region = _dispatch_subgraph(graph, (2, 3), _graph_index=index)
+    assert region.G.graph["deployment_inputs"] == (1,)
+    assert region.G.graph["deployment_outputs"] == (3,)
+    for node_id in range(4, 37):
+        region = _dispatch_subgraph(graph, (node_id,), _graph_index=index)
+        assert region.G.graph["deployment_outputs"] == (node_id,)
+        if node_id == 4:
+            assert region.G.graph["deployment_inputs"] == (3,)
+            assert region.G.has_edge(3, 4)
+    assert len(queries) == len(graph.G)
+    assert not graph.G.has_edge(3, 4)
+    assert graph.G.nodes[4]["parents"] == [(3, "arg0")]
+
+
+def test_dispatch_index_cannot_be_used_for_a_different_graph():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "Input")
+    index = _dispatch_graph_index(graph)
+    other = ProcessGraph(materialize_memory=False)
+    _add(other, 1, "Input")
+    with pytest.raises(ValueError, match="different source graph"):
+        _dispatch_subgraph(other, (1,), _graph_index=index)
 
 
 def test_recursion_control_projection_still_reduces_numeric_interior():
@@ -292,7 +399,7 @@ def test_old_serialized_dispatch_classification_is_recomputed():
     assert graph.G.graph["_dispatch_metadata_cache"] is not old_cache
 
 
-def test_tensor_accessor_and_its_scalar_comparison_stay_with_coordinator():
+def test_tensor_accessor_is_coordinator_but_scalar_comparison_has_a_producer():
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")
     _add(graph, 1, "ndims", (0,))
@@ -303,7 +410,9 @@ def test_tensor_accessor_and_its_scalar_comparison_stay_with_coordinator():
     graph.G.nodes[2]["constant"] = 1
 
     assert _is_dispatch_metadata_node(graph, 1)
-    assert _is_dispatch_metadata_node(graph, 3)
+    # Sept30's recorded decision removed scalar-expression deferral. The
+    # comparison is numerical work, computed once rather than per consumer.
+    assert not _is_dispatch_metadata_node(graph, 3)
 
 
 def test_clean_subgraph_drops_obligations_to_excluded_parents():
@@ -382,6 +491,33 @@ def test_compartment_carries_its_own_nodes_tokens_and_shares_read_only_tables():
     assert whole.G.graph["deployment_selection_trace"] is not trace
     assert whole.G.graph["ingestion_identity_table"] is not names
     assert whole.G.graph["ingestion_identity_table"]["x"][0] is not names["x"][0]
+
+
+def test_token_projection_reads_only_compartment_members():
+    class CountedTokens(dict):
+        scans = 0
+        lookups = 0
+
+        def items(self):
+            for item in super().items():
+                self.scans += 1
+                yield item
+
+        def __getitem__(self, key):
+            self.lookups += 1
+            return super().__getitem__(key)
+
+    graph = ProcessGraph(materialize_memory=False)
+    for node in range(128):
+        _add(graph, node, "Input")
+    tokens = CountedTokens({node: ("value", node) for node in graph.G})
+    graph.G.graph["ssa_identity_tokens"] = tokens
+    for node in range(128):
+        region = extract_clean_process_subgraph(graph, (node,))
+        assert region.G.graph["ssa_identity_tokens"] == {node: tokens[node]}
+        assert region.G.graph["ssa_identity_tokens"][node] is tokens[node]
+    assert tokens.scans == 0
+    assert tokens.lookups <= 4 * len(graph.G)
 
 
 def test_region_fork_of_read_scope_holds_its_own_nodes_rows_as_a_declared_projection():
@@ -685,7 +821,7 @@ def test_region_reduction_is_open_to_every_executable_tensor_operation():
     assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1, 2, 3)]
 
 
-def test_a_lookup_nobody_reads_is_not_a_region_boundary():
+def test_a_lookup_nobody_reads_is_not_a_region_boundary(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")
     _add(graph, 1, "Add", (0,))
@@ -693,6 +829,8 @@ def test_a_lookup_nobody_reads_is_not_a_region_boundary():
     _add(graph, 3, "Mul", (1,))
     graph.G.nodes[2]["expr_obj"] = ast.parse("value.sqrt").body[0].value
     graph.compute_levels(method="asap", order="dependency")
+
+    _scope_dispatch_fixture(graph, graph_cut_book)
 
     inert = _inert_routing_nodes(graph)
     assert inert == frozenset({2})
@@ -713,12 +851,14 @@ def test_an_attribute_assignment_is_never_treated_as_inert():
     assert _inert_routing_nodes(graph) == frozenset()
 
 
-def test_dispatch_exports_a_value_routed_by_identity():
+def test_dispatch_exports_a_value_routed_by_identity(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")
     _add(graph, 1, "Add", (0,))
     _add(graph, 2, "Mul", (1,))
     graph.compute_levels(method="asap", order="dependency")
+
+    _scope_dispatch_fixture(graph, graph_cut_book)
 
     dispatch = _dispatch_subgraph(
         graph,
@@ -729,13 +869,15 @@ def test_dispatch_exports_a_value_routed_by_identity():
     assert dispatch.G.graph["deployment_outputs"] == (1, 2)
 
 
-def test_dispatch_exports_an_internal_value_used_outside_the_region():
+def test_dispatch_exports_an_internal_value_used_outside_the_region(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")
     _add(graph, 1, "Add", (0,))
     _add(graph, 2, "Mul", (1,))
     _add(graph, 3, "external", (1,))
     graph.compute_levels(method="asap", order="dependency")
+
+    _scope_dispatch_fixture(graph, graph_cut_book)
 
     dispatch = _dispatch_subgraph(graph, (1, 2))
 

@@ -1947,6 +1947,23 @@ def source_walk(node: Any) -> tuple[Any, ...]:
     return tuple(collected)
 
 
+def _source_read_names(node: Any) -> set[str]:
+    """Lexical loads, including AugAssign's syntactic Store/read operand."""
+    # ``if add & mask: flags &= ~mask`` first reads flags at an AugAssign
+    # target, whose AST context is Store. The old Load-only entry scan minted
+    # flags inside the true arm; resetting that environment discarded the
+    # update and minted a second flags Input at the return. All control entry
+    # snapshots must include this read before either arm/iteration is reduced.
+    members = source_walk(node)
+    return {
+        member.id for member in members
+        if isinstance(member, ast.Name) and isinstance(member.ctx, ast.Load)
+    } | {
+        member.target.id for member in members
+        if isinstance(member, ast.AugAssign) and isinstance(member.target, ast.Name)
+    }
+
+
 def function_parameter_names(definition: Any) -> tuple[str, ...]:
     """A function definition's declared parameter names, in order.
 
@@ -3871,6 +3888,19 @@ def _normalize_lexical_values(
     static_environment: dict[str, _StaticPythonReference] = {}
     deleted_names: set[str] = set()
     identity_bindings: dict[str, list[int]] = {}
+    # Exact AST ownership of assignment sites, not a source-line containment
+    # guess. ``position = size`` executed inside a retained loop captures
+    # THIS iteration's size; the same assignment before it freezes its seed.
+    binding_loop_owners = {}
+    ownership_frontier = [(statement, None)]
+    while ownership_frontier:
+        member, owner = ownership_frontier.pop()
+        if isinstance(member, ast.Name) and isinstance(member.ctx, ast.Store):
+            binding_loop_owners[id(member)] = owner
+        if member is not statement and isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        child_owner = id(member) if isinstance(member, (ast.For, ast.While, ast.AsyncFor)) else owner
+        ownership_frontier.extend((child, child_owner) for child in ast.iter_child_nodes(member))
     ingestion_definitions: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     loop_target_bindings_by_ast: dict[int, int] = {}
     static_reference_nodes: dict[tuple[int, str], int] = {}
@@ -4974,6 +5004,11 @@ def _normalize_lexical_values(
     def resolve_expression(expression: ast.AST | None) -> int | None:
         if expression is None:
             return None
+        if isinstance(expression, ast.UnaryOp) and isinstance(expression.op, ast.UAdd):
+            # The operator pass has already retired +value as an identity
+            # projection. Its authored operand, not the missing wrapper node,
+            # is the value this later lexical/return reader must resolve.
+            return resolve_expression(expression.operand)
         if isinstance(expression, ast.Constant) and id(expression) not in graph.G:
             # Structural reduction can remove a keyword wrapper and its leaf
             # before lexical call binding. A live use still has the exact
@@ -5645,6 +5680,18 @@ def _normalize_lexical_values(
                     and current_state.kind is not _FieldStateKind.OBSERVED
                     else None
                 )
+                if isinstance(current_state, _Unresolved) and current_state.reason == _LOOP_EXIT_FIELD_STATE_UNMERGED:
+                    # An unknown final field VALUE does not make the known
+                    # loop-exit ordering unknown. The unresolved book fact
+                    # names the construct that has to finish before this
+                    # read; keep that causal edge without claiming a field
+                    # merge/value or running a zero-trip body's store.
+                    for cell in current_state.read:
+                        exit_id = _cell_node_id(cell)
+                        if exit_id in graph.G and isinstance(
+                            graph.G.nodes[exit_id].get('expr_obj'), (ast.For, ast.While)
+                        ):
+                            read_inputs.append((exit_id, 'after_write'))
                 # Order this read after the most recent recorded write to the
                 # same field -- a whole-attribute ``SetAttr`` or an
                 # element-wise ``obj.field[i, j] = ...`` ``IndexedStore`` --
@@ -6091,7 +6138,7 @@ def _normalize_lexical_values(
                 isinstance(callee, _StaticPythonReference)
                 and any(
                     callee.value is kind
-                    for kind in (tuple, list, set, dict, bytes, bytearray)
+                    for kind in (tuple, list, set, frozenset, dict, bytes, bytearray)
                 )
                 and node_id in graph.G
             ):
@@ -6109,13 +6156,13 @@ def _normalize_lexical_values(
                 constructor_attributes.update({
                     "aggregate_kind": aggregate_kind,
                     "sequence_key_columns": (
-                        (0,) if aggregate_kind in {"set", "dict"} else ()
+                        (0,) if aggregate_kind in {"set", "frozenset", "dict"} else ()
                     ),
                     "sequence_column_count": (
                         2 if aggregate_kind == "dict" else 1
                     ),
                     "sequence_writable": aggregate_kind not in {
-                        "tuple", "bytes"
+                        "tuple", "frozenset", "bytes"
                     },
                 })
                 constructor_attributes.setdefault(
@@ -6638,7 +6685,7 @@ def _normalize_lexical_values(
         if (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Name)
-            and expression.func.id in {"tuple", "list"}
+            and expression.func.id in {"tuple", "list", "frozenset"}
             and len(expression.args) == 1
             and node_id in graph.G
         ):
@@ -6725,6 +6772,7 @@ def _normalize_lexical_values(
     def bind_target(
         target: ast.AST,
         value: int | _StaticPythonReference | None,
+        *, value_occurrence: ast.AST | None = None,
     ) -> None:
         if value is None:
             return
@@ -6736,9 +6784,31 @@ def _normalize_lexical_values(
                 _remove_node(graph, id(target))
                 return
             static_environment.pop(target.id, None)
+            source_binding = None
+            source_version = None
+            if isinstance(value_occurrence, ast.Name):
+                source_binding = value_occurrence.id
+                source_version = next((
+                    version for version in range(len(identity_bindings.get(source_binding, ())) - 1, -1, -1)
+                    if identity_bindings[source_binding][version] == value
+                ), None)
             environment[target.id] = value
             identity_bindings.setdefault(target.id, []).append(value)
             record_ingestion_definition(target.id, value, target)
+            if source_version is not None:
+                from ...compiler.concordance_declarations import NAME_BINDING_CAPTURE
+                book = current_identity_book()
+                row = (ingestion_read_scope, target.id, len(identity_bindings[target.id]) - 1)
+                source_row = (ingestion_read_scope, source_binding, source_version)
+                read_row = (ingestion_read_scope, "occurrence", id(value_occurrence), 0)
+                owner = binding_loop_owners.get(id(target))
+                cells = tuple(cell for cell in (
+                    book.latest_ref(_NAME_BINDING, row), book.latest_ref(_NAME_BINDING, source_row),
+                    book.latest_ref(_LEXICAL_READ_BINDING, read_row),
+                    node_identity_cell(graph, owner) if owner is not None else None,
+                ) if cell is not None)
+                book.post(NAME_BINDING_CAPTURE, row, (source_binding, source_version, owner),
+                          stage=_REDUCTION, provenance=_Derived(cells), mode=_Mode.CONCORD)
             _remove_node(graph, id(target))
             return
         if isinstance(target, ast.Attribute):
@@ -6811,6 +6881,10 @@ def _normalize_lexical_values(
                 (
                     (receiver, "object"),
                     (value, "value"),
+                ),
+                fork_from=(
+                    {("value", 0): ("occurrence", id(value_occurrence), 0)}
+                    if isinstance(value_occurrence, ast.Name) else None
                 ),
             )
             if static_receiver is not None:
@@ -6962,6 +7036,12 @@ def _normalize_lexical_values(
             node_data.setdefault("attributes", {})[
                 "source_type"
             ] = "SubscriptStore"
+            # ``heap[size] = node`` in the compiler's integer graph kernel:
+            # resolving the RHS Name removes its occurrence and the Assign
+            # wrapper. The new store's value operand was an unattributed
+            # Append, so a loop-carried ``node`` sharing a zero seed refused
+            # control lowering. Fork this new operand from the existing RHS
+            # occurrence receipt; never infer a binding from the seed value.
             _replace_inputs(
                 graph,
                 node_id,
@@ -6969,6 +7049,10 @@ def _normalize_lexical_values(
                     (base, "base"),
                     *((index, "index") for index in indices),
                     (value, "value"),
+                ),
+                fork_from=(
+                    {("value", 0): ("occurrence", id(value_occurrence), 0)}
+                    if isinstance(value_occurrence, ast.Name) else None
                 ),
             )
             if isinstance(target.value, ast.Name):
@@ -7139,11 +7223,7 @@ def _normalize_lexical_values(
 
         # Parameters exist from function entry; mint every one this statement
         # reads before any arm does (the rule ``if`` and loops apply).
-        for read_name in {
-            member.id
-            for member in source_walk(dispatch)
-            if isinstance(member, ast.Name) and isinstance(member.ctx, ast.Load)
-        }:
+        for read_name in _source_read_names(dispatch):
             if (
                 read_name in parameter_names
                 and read_name not in environment
@@ -7215,7 +7295,7 @@ def _normalize_lexical_values(
                 else (body_statement.target,)
             )
             for target in targets:
-                bind_target(target, value)
+                bind_target(target, value, value_occurrence=body_statement.value)
             _remove_node(graph, id(body_statement))
             return value
         if isinstance(body_statement, ast.AugAssign):
@@ -7338,17 +7418,15 @@ def _normalize_lexical_values(
             # read before the slot expressions resolve, since resolving a
             # ``Name`` redirects and removes its occurrence node.
             return_site_cell = (
-                node_identity_cell(graph, id(returned))
-                if returned is not None and id(returned) in graph.G else None
+                _posted_node_identity_cell(graph, id(returned))
+                if returned is not None else None
             )
             return_construct_cell = (
-                node_identity_cell(graph, id(body_statement))
-                if id(body_statement) in graph.G else return_site_cell
+                _posted_node_identity_cell(graph, id(body_statement)) or return_site_cell
             )
             slot_expression_cells = tuple(
-                node_identity_cell(graph, id(expression))
-                if expression is not None and id(expression) in graph.G
-                else None
+                _posted_node_identity_cell(graph, id(expression))
+                if expression is not None else None
                 for expression in expressions
             )
             for index, expression in enumerate(expressions):
@@ -7560,12 +7638,7 @@ def _normalize_lexical_values(
             # in/out parameter whose storage the caller can no longer bind.
             # Mint every parameter this statement reads BEFORE the snapshot,
             # the rule loops already apply; ``input_value`` is idempotent.
-            for read_name in {
-                member.id
-                for member in source_walk(body_statement)
-                if isinstance(member, ast.Name)
-                and isinstance(member.ctx, ast.Load)
-            }:
+            for read_name in _source_read_names(body_statement):
                 if (
                     read_name in parameter_names
                     and read_name not in environment
@@ -8059,12 +8132,7 @@ def _normalize_lexical_values(
             # in/out parameter whose storage the caller can no longer bind.
             # Mint every parameter this statement reads BEFORE the snapshot,
             # the rule loops already apply; ``input_value`` is idempotent.
-            for read_name in {
-                member.id
-                for member in source_walk(body_statement)
-                if isinstance(member, ast.Name)
-                and isinstance(member.ctx, ast.Load)
-            }:
+            for read_name in _source_read_names(body_statement):
                 if (
                     read_name in parameter_names
                     and read_name not in environment
@@ -8217,12 +8285,7 @@ def _normalize_lexical_values(
             # every parameter the loop reads BEFORE the snapshot is strictly
             # more faithful, and ``input_value`` is idempotent, so this mints
             # exactly the Input node the body's own first read would have.
-            for read_name in {
-                member.id
-                for member in source_walk(body_statement)
-                if isinstance(member, ast.Name)
-                and isinstance(member.ctx, ast.Load)
-            }:
+            for read_name in _source_read_names(body_statement):
                 if (
                     read_name in parameter_names
                     and read_name not in environment
@@ -8309,6 +8372,26 @@ def _normalize_lexical_values(
                 entry_cell = before_loop_field_cells.get(field_key)
                 if entry_cell == exit_cell:
                     continue
+                # Normalizing ``field[i] = value`` retires the Assign
+                # wrapper that the original For body edge named. The field
+                # state still identifies the exact IndexedStore effect.
+                # Join that effect (or a nested loop's recorded exit) to
+                # this loop construct before publishing its unresolved
+                # final VALUE. Otherwise even an after-loop read barrier
+                # has no dependency path back to the writes it protects.
+                body_state = field_state_at(exit_cell)
+                body_effects = ()
+                if isinstance(body_state, _FieldState) and body_state.kind is not _FieldStateKind.OBSERVED:
+                    body_effects = (body_state.effect,)
+                elif isinstance(body_state, _Unresolved) and body_state.reason == _LOOP_EXIT_FIELD_STATE_UNMERGED:
+                    body_effects = tuple(cell for cell in body_state.read
+                        if (effect_id := _cell_node_id(cell)) in graph.G
+                        and isinstance(graph.G.nodes[effect_id].get('expr_obj'), (ast.For, ast.While)))
+                for effect_cell in body_effects:
+                    effect_id = _cell_node_id(effect_cell)
+                    if effect_id in graph.G and loop_id in graph.G and effect_id != loop_id:
+                        if (effect_id, 'body') not in (graph.G.nodes[loop_id].get('parents') or ()):
+                            _append_operand(graph, loop_id, effect_id, 'body')
                 read_cells = tuple(dict.fromkeys(
                     cell for cell in (entry_cell, exit_cell, loop_cell)
                     if cell is not None
@@ -8564,11 +8647,18 @@ def _normalize_lexical_values(
                             initial = input_value(name, binding_kind="parameter")
                         if (
                             initial is None
-                            or int(initial) == int(value)
+                            or (int(initial) == int(value) and name not in loop_carried_bindings)
                             or int(initial) not in graph.G
                             or int(value) not in graph.G
                         ):
                             continue
+                        # ``child += 1; if ...: break; position = child``:
+                        # child's updated value already dominates the break,
+                        # but position has not been assigned. Omitting its
+                        # unchanged site value let exit lowering take child's
+                        # value through position's future update identity.
+                        # Record every carried binding's exact site state,
+                        # including an unchanged header generation.
                         # The binding's key is its carried pair: two names
                         # seeded from one pre-loop value (``tried = dt``)
                         # share ``initial`` yet are distinct bindings with
@@ -9264,6 +9354,19 @@ def _normalize_lexical_values(
             provenance=_Derived((cell, canonical_cells[value_id])),
             mode=_Mode.CONCORD,
         )
+        from ...compiler.concordance_declarations import NAME_BINDING_CAPTURE
+        capture = book.page(NAME_BINDING_CAPTURE).latest(cell.row)
+        if capture is not None:
+            source_name, source_version, owner = capture
+            source_fact = binding_page.latest((ingestion_read_scope, source_name, source_version))
+            if source_fact is not None and int(source_fact.value_id) in mapping:
+                book.post(
+                    NAME_BINDING_CAPTURE, (read_scope, name, version),
+                    (source_name, source_version, None if owner is None else mapping.get(owner)),
+                    stage=_CANONICAL_RELABEL_STAGE,
+                    provenance=_Derived((book.latest_ref(NAME_BINDING_CAPTURE, cell.row), canonical_cells[value_id])),
+                    mode=_Mode.CONCORD,
+                )
     canonical_bindings: dict[str, list[tuple[int, Any]]] = {}
     for row in binding_page.scope_rows(read_scope):
         canonical_bindings.setdefault(str(row[1]), []).append(

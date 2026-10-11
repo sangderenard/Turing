@@ -598,6 +598,19 @@ def test_imported_llvm_scalar_literals_emit_fortran_constants():
 
     assert module.complete, [item.format() for item in module.shortfalls]
     assert "ieee_value(0.0_c_double, ieee_positive_inf)" in module.source
+    assert "ieee_arithmetic, only:" in module.source
+
+
+def test_plain_arithmetic_does_not_import_ieee_environment_runtime():
+    left, right, result = (SSAValue(i, 'float64') for i in range(3))
+    function = Function('plain_add', [left, right], {'entry': BasicBlock('entry', [
+        Instr('Add', [left, right], result), Instr('Ret', [result], None),
+    ])})
+    module = emit_module({function.name: function}, outputs={function.name: [result]})
+    assert module.complete, module.shortfalls
+    # GNU inserts ieee_procedure_entry/exit around every procedure that imports
+    # ieee_arithmetic, even when ordinary arithmetic uses no IEEE intrinsic.
+    assert 'ieee_arithmetic' not in module.source
 
 
 def test_fortran_module_omits_helpers_replaced_by_native_tensor_ops():

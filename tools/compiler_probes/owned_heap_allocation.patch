@@ -1,0 +1,885 @@
+diff --git a/src/compiler/ssa_llvm_backend.py b/src/compiler/ssa_llvm_backend.py
+index 498a754..0ba71f2 100644
+--- a/src/compiler/ssa_llvm_backend.py
++++ b/src/compiler/ssa_llvm_backend.py
+@@ -893,7 +893,27 @@ _LLVM_INTRINSIC_DECLARATIONS: dict[str, str] = {
+     ),
+     # Entry-frame storage past ``_FRAME_HEAP_BYTES`` lives on the heap.
+     "malloc": "declare ptr @malloc(i64)",
+-    "free": "declare void @free(ptr)",
++    "free": "declare void @free(ptr)",
++    "llvm.trap": "declare void @llvm.trap() cold noreturn nounwind",
++    # Returned heap arenas live through their caller's explicit owner, not
++    # the allocating helper's entry-frame cleanup. The owner cell is reset
++    # before releasing the chain, making empty/repeated release well-defined.
++    "turing_heap_release": """define internal void @turing_heap_release(ptr %owner) {
++entry:
++  %first = load ptr, ptr %owner, align 8
++  store ptr null, ptr %owner, align 8
++  br label %scan
++scan:
++  %block = phi ptr [ %first, %entry ], [ %next, %release ]
++  %done = icmp eq ptr %block, null
++  br i1 %done, label %exit, label %release
++release:
++  %next = load ptr, ptr %block, align 8
++  call void @free(ptr %block)
++  br label %scan
++exit:
++  ret void
++}""",
+     "turing_validation_error": (
+         "declare void @turing_validation_error(i32)"
+     ),
+@@ -1025,8 +1045,13 @@ def _release_frame_before_returns(lines: list[str], frees: list[str]) -> None:
+     lines[:] = released
+ 
+ 
+-def _value_llvm_type(value: _Any) -> str:
+-    accounting = getattr(value, "accounting", {}) or {}
++def _value_llvm_type(value: _Any) -> str:
++    accounting = getattr(value, "accounting", {}) or {}
++    if accounting.get("heap_owner") or accounting.get("heap_element_dtype") is not None:
++        # These are declared native pointer CELLS, not a typed address whose
++        # dtype names the pointee. Raw ptr spelling alone historically means
++        # the latter in SSA; the explicit heap ABI states the former.
++        return "ptr"
+     if tuple(
+         accounting.get(
+             "ssa_aggregate_outputs", ()
+@@ -1891,7 +1916,8 @@ def _emit_repository_call_module(
+         }
+         aggregate_members: dict[int, dict[int, str]] = {}
+         address_members: dict[int, str] = {}
+-        address_slots: dict[int, str] = {}
++        address_slots: dict[int, str] = {}
++        owned_heap_addresses: set[int] = set()
+         # Dynamic tensor metadata crosses planned-region calls as ordinary SSA
+         # formals.  A ``shape`` formal is an i32 span address, so a Load from
+         # it reads the first extent just as a GEP-derived span address does.
+@@ -2506,7 +2532,45 @@ def _emit_repository_call_module(
+                 ))
+                 continue
+ 
+-            if operation in {"Const", "StaticRef"} and result is not None:
++            if operation == "Alloca" and result is not None:
++                from .ssa_heap_allocation import validate_heap_allocation
++                try:
++                    count_value, owner, layout = validate_heap_allocation(instruction)
++                except (KeyError, ValueError) as error:
++                    shortfalls.append(LLVMEmissionShortfall(name, operation, str(error)))
++                    continue
++                count = load_as(count_value, "i64", f"heap.count.{tag}")
++                prefix = f"heap.{tag}"
++                # Check before multiplication. Negative and overflow counts
++                # fail rather than wrapping into a tiny successful allocation.
++                maximum = (2**63 - 1 - 8) // layout.byte_size
++                body.extend((
++                    f"  %{prefix}.valid = icmp ule i64 {count}, {maximum}",
++                    f"  br i1 %{prefix}.valid, label %{prefix}.allocate, label %{prefix}.failure",
++                    f"{prefix}.allocate:",
++                    f"  %{prefix}.bytes = mul i64 {count}, {layout.byte_size}",
++                    f"  %{prefix}.total = add i64 %{prefix}.bytes, 8",
++                    f"  %{prefix}.block = call ptr @malloc(i64 %{prefix}.total)",
++                    f"  %{prefix}.present = icmp ne ptr %{prefix}.block, null",
++                    f"  br i1 %{prefix}.present, label %{prefix}.ready, label %{prefix}.failure",
++                    f"{prefix}.failure:",
++                    "  call void @llvm.trap()",
++                    "  unreachable",
++                    f"{prefix}.ready:",
++                    f"  %{prefix}.previous = load ptr, ptr {pointer(owner)}, align 8",
++                    f"  store ptr %{prefix}.previous, ptr %{prefix}.block, align 8",
++                    f"  store ptr %{prefix}.block, ptr {pointer(owner)}, align 8",
++                    f"  %{prefix}.data = getelementptr i8, ptr %{prefix}.block, i64 8",
++                    f"  store ptr %{prefix}.data, ptr {pointer(result)}, align 8",
++                ))
++                if instruction.attributes.get("zero_initialize"):
++                    body.append("  call void @llvm.memset.p0.i64("
++                                f"ptr %{prefix}.data, i8 0, i64 %{prefix}.bytes, i1 false)")
++                block_exit_label[active_block] = f"{prefix}.ready"
++                register_cache.clear()
++                continue
++
++            if operation in {"Const", "StaticRef"} and result is not None:
+                 if operation == "StaticRef":
+                     payload = int(instruction.attributes["reference_handle"])
+                 else:
+@@ -3052,9 +3116,22 @@ def _emit_repository_call_module(
+                 if len(instruction.args) > 1 and (
+                     name in extent_users or len(instruction.args) == 2
+                 ):
+-                    base = instruction.args[0]
+-                    indices = [
+-                        load_as(argument, "i32", f"{tag}.{position}")
++                    base = instruction.args[0]
++                    # Generated sequence helpers recreate operand views, but
++                    # their formal with this EXACT identity owns the storage
++                    # contract. In particular a heap column formal is a
++                    # pointer cell, not a directly passed element arena.
++                    declared_base = values_by_function[name].get(int(base.id))
++                    if declared_base is not None and (declared_base.accounting or {}).get("heap_element_dtype") is not None:
++                        base = declared_base
++                    heap_element = (base.accounting or {}).get("heap_element_dtype")
++                    if heap_element is not None and len(instruction.args) != 2:
++                        shortfalls.append(LLVMEmissionShortfall(name, operation,
++                            "owned heap arenas require a single flat element index"))
++                        continue
++                    index_type = "i64" if heap_element is not None else "i32"
++                    indices = [
++                        load_as(argument, index_type, f"{tag}.{position}")
+                         for position, argument in enumerate(
+                             instruction.args[1:]
+                         )
+@@ -3112,20 +3189,28 @@ def _emit_repository_call_module(
+                                 f"  {summed} = add i32 {scaled}, {index}"
+                             )
+                             offset = summed
+-                        element_type = _value_llvm_type(base)
++                        element_type = _value_llvm_type(base)
++                        base_pointer = pointer(base)
++                        heap_element = (base.accounting or {}).get("heap_element_dtype")
++                        if heap_element is not None:
++                            from ..transmogrifier.dtype_layout import layout_for
++                            element_type = layout_for(heap_element).llvm_type
++                            base_pointer = load_as(base, "ptr", f"heap.base.{tag}")
+                         if element_type == "ptr":
+                             element_type = "i64"
+                         computed = f"%address.{tag}"
+                         body.append(
+                             f"  {computed} = getelementptr {element_type}, "
+-                            f"ptr {pointer(base)}, i32 {offset}"
++                            f"ptr {base_pointer}, {index_type} {offset}"
+                         )
+                         # The addressed element *is* the storage; a later Load
+                         # aliases it rather than copying, exactly as the
+                         # aggregate-member path already does.
+                         pointers[result_id] = computed
+                         span_addresses[result_id] = computed
+-                        span_address_types[result_id] = element_type
++                        span_address_types[result_id] = element_type
++                        if heap_element is not None:
++                            owned_heap_addresses.add(result_id)
+                         continue
+                     shortfalls.append(LLVMEmissionShortfall(
+                         name, operation,
+@@ -3151,9 +3236,14 @@ def _emit_repository_call_module(
+                     # preceding GEP would discard that proven address and
+                     # leave direct length/status loads unrenderable.
+                     addressed = pointer(address_argument)
+-                if addressed is not None:
+-                    loaded_type = _value_llvm_type(result)
+-                    if loaded_type in {"double", "i32", "i1"}:
++                if addressed is not None:
++                    loaded_type = _value_llvm_type(result)
++                    heap_address = int(address_argument.id) in owned_heap_addresses
++                    if heap_address and span_address_types.get(int(address_argument.id)) != loaded_type:
++                        shortfalls.append(LLVMEmissionShortfall(name, operation,
++                            "heap load result disagrees with its declared element layout; explicit conversion required"))
++                        continue
++                    if loaded_type in {"double", "i32", "i1"} or int(address_argument.id) in owned_heap_addresses:
+                         # Pin the loaded scalar to its own slot.
+                         #
+                         # Aliasing the result to the ADDRESS instead (what
+@@ -3176,7 +3266,7 @@ def _emit_repository_call_module(
+                         pinned = f"%pinned.load.{tag}"
+                         body.append(
+                             f"  {pinned} = load {loaded_type}, ptr "
+-                            f"{addressed}, align 8"
++                            f"{addressed}, align {_align(loaded_type) if heap_address else 8}"
+                         )
+                         body.append(
+                             f"  store {loaded_type} {pinned}, ptr "
+@@ -3239,9 +3329,9 @@ def _emit_repository_call_module(
+                 loaded_value = load_as(
+                     source, destination_type, f"store.{tag}",
+                 )
+-                body.append(
+-                    f"  store {destination_type} {loaded_value}, "
+-                    f"ptr {destination}, align 8"
++                body.append(
++                    f"  store {destination_type} {loaded_value}, "
++                    f"ptr {destination}, align {_align(destination_type) if int(address.id) in owned_heap_addresses else 8}"
+                 )
+                 register_cache.clear()
+                 continue
+@@ -3252,7 +3342,19 @@ def _emit_repository_call_module(
+                 # (aliased IO is a design feature); registers read before the
+                 # call must not serve reads after it.
+                 register_cache.clear()
+-                symbol = str(callee)
++                symbol = str(callee)
++                from .ssa_heap_allocation import HEAP_RELEASE_SYMBOL, require_heap_owner
++                if instruction.attributes.get("native_heap_abi") == "release_owner":
++                    try:
++                        if symbol != HEAP_RELEASE_SYMBOL or len(instruction.args) != 1 or result is not None:
++                            raise ValueError("heap release requires one owner and no result")
++                        require_heap_owner(instruction.args[0])
++                    except ValueError as error:
++                        shortfalls.append(LLVMEmissionShortfall(name, symbol, str(error)))
++                        continue
++                    body.append(f"  call void @{HEAP_RELEASE_SYMBOL}(ptr {pointer(instruction.args[0])})")
++                    register_cache.clear()
++                    continue
+                 if symbol == "turing_validation_error":
+                     error_code = int(instruction.attributes.get(
+                         "error_code", 0
+@@ -4496,10 +4598,13 @@ def _emit_repository_call_module(
+         symbol = pending_kernels.pop()
+         if symbol in definitions or symbol in declarations:
+             continue
+-        if symbol in _LLVM_INTRINSIC_DECLARATIONS:
+-            declarations[symbol] = _LLVM_INTRINSIC_DECLARATIONS[symbol]
+-            symbol_origins[symbol] = ("intrinsic",)
+-            continue
++        if symbol in _LLVM_INTRINSIC_DECLARATIONS:
++            declarations[symbol] = _LLVM_INTRINSIC_DECLARATIONS[symbol]
++            symbol_origins[symbol] = ("intrinsic",)
++            pending_kernels.update(set(_re.findall(
++                r"@([A-Za-z_$.-][\w$.-]*)\s*\(", declarations[symbol],
++            )) - set(declarations) - set(definitions))
++            continue
+         try:
+             definition = extract_llvm_function(symbol)
+         except KeyError:
+@@ -5656,7 +5761,9 @@ def emit_ssa_function_to_llvm(
+     if (
+         len(repository_closure) > 1
+         or len(module.functions[function_name].blocks) > 1
+-        or calls_piece
++        or calls_piece
++        or any(str(i.op) == "Alloca" or i.attributes.get("native_heap_abi")
++               for b in module.functions[function_name].blocks.values() for i in b.instrs)
+     ):
+         return _emit_repository_call_module(
+             module,
+
+diff --git a/src/compiler/ir_sequence_tables.py b/src/compiler/ir_sequence_tables.py
+index e60faaa..de87832 100644
+--- a/src/compiler/ir_sequence_tables.py
++++ b/src/compiler/ir_sequence_tables.py
+@@ -7,9 +7,9 @@ columns; a set is the same storage with a unique key; a dictionary is a
+ multi-column row with one or more unique key columns.
+ 
+ The first executable foundation deliberately supports fixed-capacity arenas.
+-Dynamic allocation and arena replacement require an allocation ABI which the
+-repository SSA does not yet state, so requesting dynamic growth produces a
+-typed shortfall instead of silently truncating or delegating to Python.
++Runtime-sized fixed-capacity columns can use the explicit owned-heap Alloca
++ABI. Dynamic growth still requires arena replacement, and produces a typed
++shortfall rather than silently truncating or delegating to Python.
+ """
+ from __future__ import annotations
+ 
+@@ -179,8 +179,8 @@ class _Builder:
+         block.instrs.append(instruction)
+         return instruction
+ 
+-    def const(self, block: BasicBlock, literal: int) -> SSAValue:
+-        result = self.fresh("int")
++    def const(self, block: BasicBlock, literal: int, *, dtype: str = "int") -> SSAValue:
++        result = self.fresh(dtype)
+         self.emit(block, "Const", [], result, attributes={"value": int(literal)})
+         return result
+ 
+@@ -244,7 +244,8 @@ def _sequence_descriptor_identity_ids(
+         descriptor.length_address_id,
+         descriptor.capacity_value_id,
+         *((descriptor.status_address_id,) if descriptor.status_address_id is not None else ()),
+-        *((descriptor.live_flags_value_id,) if descriptor.live_flags_value_id is not None else ()),
++        *((descriptor.live_flags_value_id,) if descriptor.live_flags_value_id is not None else ()),
++        *((descriptor.heap_owner_value_id,) if descriptor.heap_owner_value_id is not None else ()),
+         *_child_pool_identity_ids(descriptor.child_table_pool),
+     ))
+ 
+@@ -278,8 +279,11 @@ def _storage_values(
+ ) -> tuple[SSAValue, ...]:
+     values = [
+         *(SSAValue(
+-            value_id, dtype=dtype,
+-            accounting={"sequence_row_shape": tuple(shape)},
++            value_id, dtype="ptr" if descriptor.heap_owner_value_id is not None else dtype,
++            accounting={"sequence_row_shape": tuple(shape), **({
++                "heap_element_dtype": dtype,
++                "heap_owner_value_id": int(descriptor.heap_owner_value_id),
++            } if descriptor.heap_owner_value_id is not None else {})},
+         ) for value_id, dtype, shape in zip(
+             descriptor.column_value_ids,
+             descriptor.column_dtypes
+@@ -302,7 +306,49 @@ def _storage_values(
+     if descriptor.live_flags_value_id is not None:
+         values.append(SSAValue(descriptor.live_flags_value_id, dtype="bool"))
+     # Alias descriptors can intentionally name the same arena more than once.
+-    return tuple({value.id: value for value in values}.values())
++    return tuple({value.id: value for value in values}.values())
++
++
++def lower_sequence_allocate(
++    descriptor: SSASequenceDescriptor, *, function_name: str | None = None,
++) -> SSASequenceLowering:
++    """Allocate descriptor columns at its runtime capacity, then clear length.
++
++    This initializes EMPTY storage. It neither migrates existing rows nor
++    implements growth. Columns are caller-supplied native pointer cells and
++    remain valid until explicit owner release, including across helper returns.
++    """
++    from .ssa_heap_allocation import heap_allocate
++
++    if descriptor.heap_owner_value_id is None:
++        raise ValueError("sequence allocation requires an explicit heap owner")
++    if descriptor.capacity_policy is not SSASequenceCapacityPolicy.FIXED:
++        raise ValueError("sequence allocation does not implement arena replacement")
++    if not descriptor.writable or descriptor.live_flags_value_id is not None or descriptor.child_table_pool is not None:
++        raise ValueError("heap initialization currently requires writable columns without live flags or child pools")
++    if any(descriptor.column_shapes):
++        raise ValueError("heap initialization of shaped rows requires checked capacity multiplication")
++    storage = _storage_values(descriptor)
++    values = {int(value.id): value for value in storage}
++    owner = SSAValue(descriptor.heap_owner_value_id, "ptr", shape=(1,),
++                     accounting={"heap_owner": True})
++    builder = _Builder(_first_fresh_identity(descriptor, values=(*storage, owner)))
++    entry = builder.block("entry")
++    capacity = values[int(descriptor.capacity_value_id)]
++    for index, column_id in enumerate(descriptor.column_value_ids):
++        entry.instrs.append(heap_allocate(capacity, owner, values[int(column_id)],
++            element_dtype=descriptor.column_dtypes[index], zero_initialize=True))
++    zero = builder.const(entry, 0)
++    slot = builder.fresh("ptr")
++    builder.emit(entry, "GetElementPtr", [values[int(descriptor.length_address_id)], zero], slot)
++    builder.emit(entry, "Store", [zero, slot])
++    builder.emit(entry, "Ret", [])
++    function = Function(function_name or f"ssa_sequence_{descriptor.sequence_id}_allocate",
++                        [*storage, owner], builder.blocks, metadata={
++        "ssa_sequence_operation": "allocate", "sequence_id": descriptor.sequence_id,
++        "sequence_array_argument_ids": tuple(descriptor.column_value_ids) + (descriptor.length_address_id, owner.id),
++    })
++    return SSASequenceLowering((function,))
+ 
+ 
+ def _status_branch(
+@@ -379,7 +425,11 @@ def lower_sequence_insert(
+     columns = tuple(SSAValue(value_id, dtype=value.dtype) for value_id, value in zip(
+         descriptor.column_value_ids, row_values
+     ))
+-    length_address = SSAValue(descriptor.length_address_id, dtype="ptr")
++    # Untouched LLVM insert stored double 1.0 into this int64 length cell
++    # because the operand view called it merely "ptr". Derive the operand
++    # from the same storage declaration as the helper's formal, not a weaker
++    # pointer spelling which loses the cell's element type.
++    length_address = next(value for value in storage if value.id == descriptor.length_address_id)
+     capacity = SSAValue(descriptor.capacity_value_id, dtype="int64")
+     live_flags = (
+         None
+@@ -394,9 +444,9 @@ def lower_sequence_insert(
+     inserted = builder.block("inserted")
+     result_block = builder.block("result")
+     status_values: list[tuple[BasicBlock, SSAValue]] = []
+-    current_length = builder.fresh("int")
+-    zero = builder.const(entry, 0)
+-    one = builder.const(entry, 1)
++    current_length = builder.fresh("int64")
++    zero = builder.const(entry, 0, dtype="int64")
++    one = builder.const(entry, 1, dtype="int64")
+     length_slot = builder.fresh("ptr")
+     builder.emit(
+         entry, "GetElementPtr", [length_address, zero], length_slot
+@@ -409,8 +459,8 @@ def lower_sequence_insert(
+         scan_latch = builder.block("unique_scan_latch")
+         duplicate = builder.block("duplicate")
+         builder.branch(entry, scan_header)
+-        scan_index = builder.fresh("int")
+-        next_scan_index = builder.fresh("int")
++        scan_index = builder.fresh("int64")
++        next_scan_index = builder.fresh(scan_index.dtype)
+         builder.emit(
+             scan_header,
+             "Phi",
+@@ -503,7 +553,7 @@ def lower_sequence_insert(
+         live_address = builder.fresh("ptr")
+         builder.emit(write, "GetElementPtr", [live_flags, current_length], live_address)
+         builder.emit(write, "Store", [one, live_address])
+-    next_length = builder.fresh("int")
++    next_length = builder.fresh("int64")
+     builder.emit(write, "Add", [current_length, one], next_length)
+     builder.emit(write, "Store", [next_length, length_slot])
+     builder.branch(write, inserted)
+@@ -1683,7 +1733,7 @@ def lower_sequence_prepend_packed_bytes(
+     ),))
+ 
+ 
+-def lower_sequence_contains(
++def lower_sequence_contains(
+     descriptor: SSASequenceDescriptor,
+     *,
+     function_name: str | None = None,
+@@ -1707,11 +1757,11 @@ def lower_sequence_contains(
+     latch = builder.block("contains_latch")
+     found = builder.block("found")
+     absent = builder.block("absent")
+-    result_block = builder.block("result")
+-    zero = builder.const(entry, 0)
+-    one = builder.const(entry, 1)
+-    length_slot = builder.fresh("ptr")
+-    length = builder.fresh("int")
++    result_block = builder.block("result")
++    zero = builder.const(entry, 0)
++    one = builder.const(entry, 1)
++    length_slot = builder.fresh("ptr")
++    length = builder.fresh("int")
+     builder.emit(
+         entry,
+         "GetElementPtr",
+@@ -1720,8 +1770,8 @@ def lower_sequence_contains(
+     )
+     builder.emit(entry, "Load", [length_slot], length)
+     builder.branch(entry, header)
+-    index = builder.fresh("int")
+-    next_index = builder.fresh("int")
++    index = builder.fresh("int")
++    next_index = builder.fresh("int")
+     builder.emit(
+         header,
+         "Phi",
+@@ -1803,7 +1853,7 @@ def lower_sequence_contains(
+     return SSASequenceLowering((function,))
+ 
+ 
+-def lower_table_lookup(
++def lower_table_lookup(
+     descriptor: SSASequenceDescriptor,
+     *,
+     function_name: str | None = None,
+@@ -1843,19 +1893,19 @@ def lower_table_lookup(
+     found = builder.block("found")
+     absent = builder.block("absent")
+     result_block = builder.block("result")
+-    zero = builder.const(entry, 0)
+-    one = builder.const(entry, 1)
+-    length_slot = builder.fresh("ptr")
+-    length = builder.fresh("int")
+-    status_slot = builder.fresh("ptr")
++    zero = builder.const(entry, 0, dtype="int64")
++    one = builder.const(entry, 1, dtype="int64")
++    length_slot = builder.fresh("ptr")
++    length = builder.fresh("int64")
++    status_slot = builder.fresh("ptr")
+     builder.emit(entry, "GetElementPtr", [
+         SSAValue(descriptor.length_address_id, dtype="int64", shape=(1,)), zero
+     ], length_slot)
+     builder.emit(entry, "Load", [length_slot], length)
+     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
+     builder.branch(entry, header)
+-    index = builder.fresh("int")
+-    next_index = builder.fresh("int")
++    index = builder.fresh("int64")
++    next_index = builder.fresh("int64")
+     builder.emit(header, "Phi", [zero, next_index], index, attributes={
+         "incoming_blocks": (entry.name, latch.name)
+     })
+
+diff --git a/src/transmogrifier/ssa.py b/src/transmogrifier/ssa.py
+index 8bf89b7..46b3a5a 100644
+--- a/src/transmogrifier/ssa.py
++++ b/src/transmogrifier/ssa.py
+@@ -1571,7 +1571,11 @@ class SSASequenceDescriptor:
+     live_flags_value_id: int | None = None
+     capacity_policy: SSASequenceCapacityPolicy = SSASequenceCapacityPolicy.FIXED
+     writable: bool = True
+-    child_table_pool: "SSAChildTablePoolDescriptor | None" = None
++    child_table_pool: "SSAChildTablePoolDescriptor | None" = None
++    # Present only when columns are mutable native pointer cells holding
++    # runtime-sized arenas. Their owner is a separate pointer cell; opaque
++    # Python reference handles never imply this dereferenceable contract.
++    heap_owner_value_id: int | None = None
+ 
+     def __post_init__(self) -> None:
+         storage_ids = (
+@@ -1582,8 +1586,16 @@ class SSASequenceDescriptor:
+         )
+         if any(value_id < 0 for value_id in storage_ids):
+             raise ValueError("SSA sequence value ids must be non-negative")
+-        if not self.column_value_ids:
+-            raise ValueError("an SSA sequence requires at least one data column")
++        if not self.column_value_ids:
++            raise ValueError("an SSA sequence requires at least one data column")
++        if self.heap_owner_value_id is not None:
++            if int(self.heap_owner_value_id) < 0 or int(self.heap_owner_value_id) in storage_ids:
++                raise ValueError("heap owner must be a distinct non-negative storage identity")
++            if len(self.column_dtypes) != len(self.column_value_ids):
++                raise ValueError("heap columns require explicit element layouts")
++            from .dtype_layout import layout_for
++            for dtype in self.column_dtypes:
++                layout_for(dtype)  # No guessed layout for unresolved elements.
+         if self.column_dtypes and len(self.column_dtypes) != len(
+             self.column_value_ids
+         ):
+@@ -1646,7 +1658,8 @@ class SSASequenceDescriptor:
+             "key_columns": [int(item) for item in self.key_columns],
+             "live_flags_value_id": self.live_flags_value_id,
+             "capacity_policy": self.capacity_policy.value,
+-            "writable": bool(self.writable),
++            "writable": bool(self.writable),
++            "heap_owner_value_id": self.heap_owner_value_id,
+             "child_table_pool": (
+                 None
+                 if self.child_table_pool is None
+@@ -1763,7 +1776,8 @@ def sequence_member_roles(
+         claim(column, ("column", position))
+     for attribute in (
+         "length_address_id", "capacity_value_id",
+-        "status_address_id", "live_flags_value_id",
++        "status_address_id", "live_flags_value_id",
++        "heap_owner_value_id",
+     ):
+         claim(getattr(descriptor, attribute, None), (attribute,))
+     return claims
+
+diff --git a/src/compiler/identity_concordance.py b/src/compiler/identity_concordance.py
+index b4df7b1..aeae5b1 100644
+--- a/src/compiler/identity_concordance.py
++++ b/src/compiler/identity_concordance.py
+@@ -1044,10 +1044,12 @@ class CorrelationTable:
+                 ]
+                 if descriptor.status_address_id is not None:
+                     roles.append((int(descriptor.status_address_id), "status"))
+-                if descriptor.live_flags_value_id is not None:
+-                    roles.append(
+-                        (int(descriptor.live_flags_value_id), "live_flags")
+-                    )
++                if descriptor.live_flags_value_id is not None:
++                    roles.append(
++                        (int(descriptor.live_flags_value_id), "live_flags")
++                    )
++                if getattr(descriptor, "heap_owner_value_id", None) is not None:
++                    roles.append((int(descriptor.heap_owner_value_id), "heap_owner"))
+                 for value_id, role in roles:
+                     self.claim(
+                         name, value_id, "sequence-member",
+@@ -2687,7 +2689,7 @@ class CorrelationTable:
+             distinct = {(sequence_id, role.rstrip("0123456789"))
+                         for sequence_id, role in roles}
+             sequences = {sequence_id for sequence_id, _role in distinct}
+-            if len(sequences) > 1:
++            if len(sequences) > 1 and not all(role == "heap_owner" for _, role in roles):
+                 found.append(Finding(
+                     "descriptor-member-shared", name, value_id,
+                     f"roles={roles!r}",
+@@ -2703,8 +2705,18 @@ class CorrelationTable:
+         }
+         for block_name, block in function.blocks.items():
+             for index, instruction in enumerate(block.instrs):
+-                attributes = instruction.attributes or {}
+-                if attributes.get("keyed_lookup_owner") is None:
++                attributes = instruction.attributes or {}
++                if attributes.get("allocation_kind") == "owned_heap":
++                    from .ssa_heap_allocation import validate_heap_allocation
++                    try:
++                        validate_heap_allocation(instruction)
++                    except (KeyError, ValueError) as error:
++                        found.append(Finding(
++                            "heap-allocation-contract", name,
++                            None if instruction.res is None else int(instruction.res.id),
++                            f"{block_name}#{index}: {error}",
++                        ))
++                if attributes.get("keyed_lookup_owner") is None:
+                     continue
+                 for position, argument in enumerate(instruction.args[:4]):
+                     argument_id = int(argument.id)
+
+diff --git a/src/compiler/ssa_heap_allocation.py b/src/compiler/ssa_heap_allocation.py
+new file mode 100644
+--- /dev/null
++++ b/src/compiler/ssa_heap_allocation.py
+@@ -0,0 +1,81 @@
++"""Explicit owned heap storage using the existing Alloca/Call vocabulary.
++
++An owner is one caller-owned native pointer cell, initially null. Allocations
++link into that owner and survive the allocating function's return. Release is
++explicit; the owner must outlive every arena allocated through it. This states
++memory ownership, not a Python object representation or a callback ABI.
++"""
++from __future__ import annotations
++
++from ..transmogrifier.dtype_layout import layout_for
++from ..transmogrifier.ssa import Instr, SSAValue
++from ..transmogrifier.ssa_registry import Handler
++
++
++HEAP_RELEASE_SYMBOL = "turing_heap_release"
++
++
++def require_heap_owner(owner: SSAValue) -> None:
++    if (str(owner.dtype) != "ptr" or tuple(owner.shape or ()) != (1,)
++            or not (owner.accounting or {}).get("heap_owner")):
++        raise ValueError("heap owner must be a declared mutable ptr cell of shape (1,)")
++
++
++def validate_heap_allocation(instruction: Instr):
++    """Read the one allocation contract without editing it during emission."""
++    if instruction.attributes.get("allocation_kind") != "owned_heap" or len(instruction.args) != 2:
++        raise ValueError("Alloca requires an explicit owned-heap allocation contract")
++    count, owner = instruction.args
++    require_heap_owner(owner)
++    count_layout = layout_for(count.dtype)
++    if count_layout.kind not in {"int", "uint"} or tuple(count.shape or ()):
++        raise ValueError("heap count must be an integer scalar")
++    layout = layout_for(instruction.attributes["element_dtype"])
++    if layout.llvm_type == "ptr" or layout.alignment > 8:
++        raise ValueError("heap element layout must be fixed-width and aligned at most 8")
++    result = instruction.res
++    if result is None or str(result.dtype) != "ptr" or tuple(result.shape or ()):
++        raise ValueError("heap result must be a scalar native address, not an opaque handle")
++    if (result.accounting or {}).get("heap_element_dtype") != layout.name:
++        raise ValueError("Alloca result lacks its declared element-layout accounting")
++    if (result.accounting or {}).get("heap_owner_value_id") != int(owner.id):
++        raise ValueError("Alloca result and instruction disagree about allocation owner")
++    return count, owner, layout
++
++
++def heap_allocate(count: SSAValue, owner: SSAValue, result: SSAValue,
++                  *, element_dtype: str, zero_initialize: bool = False) -> Instr:
++    """Declare runtime-sized allocation with caller-controlled lifetime."""
++    layout = layout_for(element_dtype)  # Strict: unknown never defaults to double.
++    require_heap_owner(owner)
++    count_layout = layout_for(count.dtype)
++    if count_layout.kind not in {"int", "uint"} or tuple(count.shape or ()):
++        raise ValueError("heap count must be an integer scalar")
++    if layout.llvm_type == "ptr" or layout.alignment > 8:
++        raise ValueError("heap element layout must be fixed-width and aligned at most 8")
++    if str(result.dtype) != "ptr" or tuple(result.shape or ()):
++        raise ValueError("heap result must be a scalar native address, not an opaque handle")
++    incumbent = (result.accounting or {}).get("heap_element_dtype")
++    if incumbent is not None and layout_for(incumbent) != layout:
++        raise ValueError("heap result and allocation disagree about element layout")
++    incumbent_owner = (result.accounting or {}).get("heap_owner_value_id")
++    if incumbent_owner is not None and int(incumbent_owner) != int(owner.id):
++        raise ValueError("heap result and allocation disagree about allocation owner")
++    result.accounting = {
++        **dict(result.accounting or {}), "heap_element_dtype": layout.name,
++        "heap_owner_value_id": int(owner.id),
++    }
++    instruction = Instr(Handler.Alloca.value, [count, owner], result, attributes={
++        "allocation_kind": "owned_heap", "element_dtype": layout.name,
++        "zero_initialize": bool(zero_initialize),
++    })
++    validate_heap_allocation(instruction)
++    return instruction
++
++
++def heap_release(owner: SSAValue) -> Instr:
++    """Release every allocation of this owner and reset its cell to null."""
++    require_heap_owner(owner)
++    return Instr(Handler.Call.value, [owner], None, attributes={
++        "callee": HEAP_RELEASE_SYMBOL, "native_heap_abi": "release_owner",
++    })
+
+diff --git a/tests/test_ssa_owned_heap.py b/tests/test_ssa_owned_heap.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_ssa_owned_heap.py
+@@ -0,0 +1,204 @@
++"""Native allocation ABI unit tests; not claims of a compiled metadata copier."""
++import ctypes
++
++import numpy as np
++import pytest
++
++from src.compiler.ssa_heap_allocation import heap_allocate, heap_release
++from src.compiler.ssa_llvm_backend import (
++    compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
++)
++from src.transmogrifier.ssa import BasicBlock, Function, Instr, IRModule, SSAValue
++
++
++def owner(value_id):
++    return SSAValue(value_id, 'ptr', shape=(1,), accounting={'heap_owner': True})
++
++
++def make_allocation_module(dtype='int64'):
++    count, scope, arena = SSAValue(0, 'int64'), owner(1), SSAValue(2, 'ptr')
++    allocate = Function('allocate', [count, scope], {'entry': BasicBlock('entry', [
++        heap_allocate(count, scope, arena, element_dtype=dtype, zero_initialize=True),
++        Instr('Ret', [arena], None),
++    ])})
++    scope2 = owner(10)
++    release = Function('release', [scope2], {'entry': BasicBlock('entry', [
++        heap_release(scope2), Instr('Ret', [], None),
++    ])})
++    return IRModule(functions={'allocate': allocate, 'release': release})
++
++
++@pytest.mark.parametrize('dtype, ctype', [('int64', ctypes.c_int64),
++                                       ('int32', ctypes.c_int32),
++                                       ('float64', ctypes.c_double),
++                                       ('float32', ctypes.c_float),
++                                       ('opaque_ref', ctypes.c_uint64)])
++def test_runtime_sized_arena_survives_return_until_owner_release(dtype, ctype, tmp_path):
++    module = make_allocation_module(dtype)
++    allocated = emit_ssa_function_to_llvm(module, 'allocate')
++    released = emit_ssa_function_to_llvm(module, 'release')
++    assert allocated.complete, allocated.shortfalls
++    assert released.complete, released.shortfalls
++    native = compile_artifact(allocated, directory=tmp_path / 'allocate')
++    destructor = compile_artifact(released, directory=tmp_path / 'release')
++    scope = np.zeros(1, dtype=np.uint64)
++    kept = []
++    try:
++        for n in (0, 1, 7, 4097):
++            execution = prepare_artifact_execution(native, {
++                0: np.array([n], dtype=np.int64), 1: scope,
++            }).run()
++            address = int(execution.buffers[2].item())
++            assert address and scope[0]
++            # Read AFTER native helper returned. Prior allocations must also
++            # survive later invocations through the same owner.
++            values = (ctype * n).from_address(address)
++            assert list(values) == [0] * n
++            if n:
++                values[0], values[n - 1] = 17, 29
++                kept.append((values, n))
++            for old, size in kept:
++                assert old[size - 1] == 29
++                if size > 1:
++                    assert old[0] == 17
++    finally:
++        prepare_artifact_execution(destructor, {10: scope}).run()
++    assert scope[0] == 0
++    prepare_artifact_execution(destructor, {10: scope}).run()  # Empty release is safe.
++
++
++def test_native_caller_reads_returned_arena_without_host_materialization(tmp_path):
++    module = make_allocation_module()
++    count, scope = SSAValue(20, 'int64'), owner(21)
++    address = SSAValue(22, 'ptr', accounting={'heap_element_dtype': 'int64'})
++    zero, number = SSAValue(23, 'int64'), SSAValue(24, 'int64')
++    slot, loaded = SSAValue(25, 'ptr'), SSAValue(26, 'int64')
++    module.functions['root'] = Function('root', [count, scope], {'entry': BasicBlock('entry', [
++        Instr('Call', [count, scope], address, attributes={'callee': 'allocate'}),
++        Instr('Const', [], zero, attributes={'value': 0}),
++        Instr('Const', [], number, attributes={'value': 2**60 + 3}),
++        Instr('GetElementPtr', [address, zero], slot),
++        Instr('Store', [number, slot], None),
++        Instr('Load', [slot], loaded),
++        heap_release(scope), Instr('Ret', [loaded], None),
++    ])})
++    artifact = emit_ssa_function_to_llvm(module, 'root')
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'caller')
++    scope_buffer = np.zeros(1, dtype=np.uint64)
++    execution = prepare_artifact_execution(native, {
++        20: np.array([4097], dtype=np.int64), 21: scope_buffer,
++    }).run()
++    assert execution.buffers[26].item() == 2**60 + 3
++    assert scope_buffer[0] == 0
++
++
++def test_unknown_element_layout_is_not_guessed():
++    with pytest.raises(KeyError, match='no dtype layout'):
++        heap_allocate(SSAValue(0, 'int64'), owner(1), SSAValue(2, 'ptr'), element_dtype='unknown')
++
++
++def test_owner_disagreement_is_a_named_emission_shortfall():
++    module = make_allocation_module()
++    module.functions['allocate'].blocks['entry'].instrs[0].res.accounting['heap_owner_value_id'] = 99
++    artifact = emit_ssa_function_to_llvm(module, 'allocate')
++    assert not artifact.complete
++    assert any('disagree about allocation owner' in s.reason for s in artifact.shortfalls)
++
++
++def test_existing_sequence_helpers_use_runtime_heap_columns_in_native_caller(tmp_path):
++    from src.compiler.ir_sequence_tables import (
++        lower_sequence_allocate, lower_sequence_insert, lower_table_lookup,
++    )
++    from src.transmogrifier.ssa import SSASequenceDescriptor
++
++    descriptor = SSASequenceDescriptor(0, (10, 11), 2, 3, status_address_id=4,
++        column_dtypes=('int64', 'int64'), key_columns=(0,), heap_owner_value_id=6)
++    allocate = lower_sequence_allocate(descriptor).functions[0]
++    insert = lower_sequence_insert(descriptor).functions[0]
++    lookup = lower_table_lookup(descriptor).functions[0]
++    values = {value.id: value for value in allocate.args}
++    scope, capacity, length = values[6], values[3], values[2]
++    status = next(value for value in lookup.args if value.id == 4)
++    zero, one, last = SSAValue(50, 'int64'), SSAValue(51, 'int64'), SSAValue(52, 'int64')
++    length_slot = SSAValue(53, 'ptr')
++    key, value = insert.args[-2:]
++    lookup_result = next(i for b in lookup.blocks.values() for i in b.instrs if i.op == 'Ret').args[0]
++    answer = SSAValue(54, lookup_result.dtype)
++    root = Function('root', [capacity, scope, length, status], {'entry': BasicBlock('entry', [
++        Instr('Call', list(allocate.args), None, attributes={'callee': allocate.name}),
++        Instr('Const', [], zero, attributes={'value': 0}),
++        Instr('Const', [], one, attributes={'value': 1}),
++        Instr('Sub', [capacity, one], last),
++        Instr('GetElementPtr', [length, zero], length_slot),
++        # The initializer zeroes every row; write at the final runtime row
++        # to exercise addressing well beyond a scalar or small static frame.
++        Instr('Store', [last, length_slot], None),
++        Instr('Const', [], key, attributes={'value': 2**60 + 3}),
++        Instr('Const', [], value, attributes={'value': 2**60 + 17}),
++        Instr('Call', [values.get(v.id, v) for v in insert.args], None,
++              attributes={'callee': insert.name}),
++        Instr('Call', [key if v is lookup.args[-1] else values.get(v.id, v) for v in lookup.args],
++              answer, attributes={'callee': lookup.name}),
++        heap_release(scope), Instr('Ret', [answer], None),
++    ])})
++    module = IRModule(functions={f.name: f for f in (root, allocate, insert, lookup)})
++    artifact = emit_ssa_function_to_llvm(module, 'root')
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'table')
++    for n in (1, 7, 4097):
++        scope_buffer = np.zeros(1, dtype=np.uint64)
++        length_buffer = np.zeros(1, dtype=np.int64)
++        status_buffer = np.zeros(1, dtype=np.int32)
++        execution = prepare_artifact_execution(native, {
++            3: np.array([n], dtype=np.int64), 6: scope_buffer,
++            2: length_buffer, 4: status_buffer,
++        }).run()
++        assert execution.buffers[54].item() == 2**60 + 17
++        assert length_buffer[0] == n
++        assert status_buffer[0] == 1
++        assert scope_buffer[0] == 0
++
++
++def test_heap_owner_is_a_sequence_member_on_the_incumbent_book():
++    from src.transmogrifier.ssa import SSASequenceDescriptor, SSASequenceTable
++    descriptor = SSASequenceDescriptor(0, (10,), 2, 3,
++        column_dtypes=('int64',), heap_owner_value_id=6)
++    table = SSASequenceTable()
++    table.register(descriptor)
++    assert (0, ('heap_owner_value_id',)) in table.member_claims(6)
++    assert descriptor.to_mapping()['heap_owner_value_id'] == 6
++
++
++def test_heap_allocation_disagreement_is_visible_to_concordance():
++    from src.compiler.identity_concordance import concordance_report
++    module = make_allocation_module()
++    module.functions['allocate'].blocks['entry'].instrs[0].res.accounting['heap_owner_value_id'] = 99
++    assert 'heap-allocation-contract' in concordance_report(module)
++
++
++def test_invalid_allocation_does_not_rewrite_result_identity():
++    result = SSAValue(2, 'ptr', accounting={'heap_owner_value_id': 99})
++    with pytest.raises(ValueError, match='disagree about allocation owner'):
++        heap_allocate(SSAValue(0, 'int64'), owner(1), result, element_dtype='int64')
++    assert result.accounting == {'heap_owner_value_id': 99}
++
++
++def test_direct_column_insert_preserves_integer_length_cell(tmp_path):
++    from src.compiler.ir_sequence_tables import lower_sequence_insert
++    from src.transmogrifier.ssa import SSASequenceDescriptor
++    descriptor = SSASequenceDescriptor(0, (10, 11), 2, 3,
++        column_dtypes=('int64', 'int64'), key_columns=(0,))
++    function = lower_sequence_insert(descriptor).functions[0]
++    artifact = emit_ssa_function_to_llvm(IRModule(functions={function.name: function}), function.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'direct')
++    length = np.zeros(1, dtype=np.int64)
++    key_column, value_column = np.zeros(1, dtype=np.int64), np.zeros(1, dtype=np.int64)
++    prepare_artifact_execution(native, {
++        10: key_column, 11: value_column, 2: length, 3: np.array([1], dtype=np.int64),
++        function.args[-2].id: np.array([17], dtype=np.int64),
++        function.args[-1].id: np.array([29], dtype=np.int64),
++    }).run()
++    assert length[0] == 1
++    assert (key_column[0], value_column[0]) == (17, 29)
+
+

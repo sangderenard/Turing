@@ -759,6 +759,15 @@ def reconcile_conditional_phi_continuations(module):
                 for arm in operation.args:
                     if arm is operation.res:
                         continue
+                    # Lowering already proved this source belongs to another
+                    # lexical binding as well. In choose(n, status), n,
+                    # incumbent and proposed share value 0; only proposed is
+                    # merged to Phi18. The trapped writer here changed the
+                    # correct Store/compare feeds 0 -> 18, making both names
+                    # equal again. Dominance is availability, not rebinding.
+                    # Honor the existing name_binding receipt on this Phi.
+                    if int(arm.id) in attributes.get('preserved_name_binding_value_ids', ()):
+                        continue
                     candidates.setdefault(id(arm), []).append(candidate)
 
         def candidate_available(candidate, target_block, use_index, phi_edge):

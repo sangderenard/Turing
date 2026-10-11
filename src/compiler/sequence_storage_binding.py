@@ -24,6 +24,44 @@ def _authored_source_sequence_ids(
         for value_id in identity.get(str(parameter_name), ())
         if int(value_id) in declared
     }
+    # A writable member table selected from a caller-owned keyed record is
+    # still caller storage. ``book.objects[id(handle)].members`` previously
+    # missed the parameter-only test and emitted a local length reset before
+    # the selected-row pointer existed. Propagate ownership only along exact
+    # storage-selection edges, then verify the declared field on its exact
+    # receiver schema. This is a derived view, not another object registry.
+    from collections import deque
+    from .identity_concordance import publish_program_abi_graph_identities
+    publish_program_abi_graph_identities(graph_obj)
+    caller_values = {
+        int(history[0])
+        for parameter_name in graph_obj.graph.get("function_parameters") or ()
+        for history in (tuple(identity.get(str(parameter_name), ())),)
+        if history
+    }
+    caller_owned = {int(node_id) for node_id, data in graph_obj.nodes(data=True)
+                    if int(data.get("value_id", node_id)) in caller_values}
+    children = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("op") or data.get("type") or "").casefold() not in {
+            "getattr", "indexed", "load",
+        }:
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role) in {"value", "object", "base", "receiver"}:
+                children.setdefault(int(parent), []).append(int(node_id))
+    pending = deque(caller_owned)
+    while pending:
+        for child in children.get(pending.popleft(), ()):
+            if child not in caller_owned:
+                caller_owned.add(child)
+                pending.append(child)
+    schemas = {}
+    for record in ((graph_obj.graph.get("program_abi") or {}).get("records") or {}).values():
+        schemas.setdefault(str(record.get("identity") or ""), []).append(record)
+    for record in (graph_obj.graph.get("parameter_record_abi") or {}).values():
+        if str(record.get("identity") or "") not in schemas:
+            schemas[str(record.get("identity") or "")] = [record]
     self_fields = {
         str(field_name)
         for field_name, receipt in dict(
@@ -49,6 +87,17 @@ def _authored_source_sequence_ids(
             source_ids.add(value_id)
             continue
         operation = str(data.get("op") or data.get("type") or "").casefold()
+        if operation == "getattr" and int(node_id) in caller_owned:
+            receivers = [int(parent) for parent, role in data.get("parents") or ()
+                         if str(role) in {"value", "object", "base", "receiver"}
+                         and int(parent) in graph_obj and int(parent) in caller_owned]
+            if len(receivers) == 1:
+                receiver_attributes = graph_obj.nodes[receivers[0]].get("attributes") or {}
+                records = schemas.get(str(receiver_attributes.get("program_abi_record_identity") or ""), ())
+                if len(records) == 1:
+                    field = (records[0].get("fields") or {}).get(str(attributes.get("attribute") or "")) or {}
+                    if field.get("storage") in {"span", "table", "keyed"}:
+                        source_ids.add(value_id)
         if (
             operation == "getattr"
             and str(attributes.get("attribute") or "") in self_fields
@@ -146,8 +195,21 @@ def _bind_sequence_storage_members(
         or caller_sequence is None
         or len(callee_sequence.column_value_ids)
         != len(caller_sequence.column_value_ids)
+        or (getattr(callee_sequence, "heap_owner_value_id", None) is None)
+        != (getattr(caller_sequence, "heap_owner_value_id", None) is None)
     ):
         return False
+    if getattr(callee_sequence, "heap_owner_value_id", None) is not None:
+        # A ptr-cell ABI alone cannot prove its pointee layout. Otherwise an
+        # int64 arena binds to a float64 arena with every LLVM formal still
+        # spelling ptr, and the wrong contract escapes scalar type checking.
+        from ..transmogrifier.dtype_layout import layout_for
+        if tuple(map(layout_for, callee_sequence.column_dtypes)) != tuple(
+            map(layout_for, caller_sequence.column_dtypes)
+        ) or (callee_sequence.column_shapes or ((),) * len(callee_sequence.column_value_ids)) != (
+            caller_sequence.column_shapes or ((),) * len(caller_sequence.column_value_ids)
+        ):
+            return False
     provisional_targets = set(map(int, provisional_targets))
 
     def bind(callee_id: int, caller_id: int) -> None:
@@ -175,7 +237,7 @@ def _bind_sequence_storage_members(
         int(callee_sequence.capacity_value_id),
         int(caller_sequence.capacity_value_id),
     )
-    for attribute in ("status_address_id", "live_flags_value_id"):
+    for attribute in ("status_address_id", "live_flags_value_id", "heap_owner_value_id"):
         callee_member = getattr(callee_sequence, attribute, None)
         caller_member = getattr(caller_sequence, attribute, None)
         if callee_member is not None and caller_member is not None:
@@ -187,14 +249,19 @@ def _sequence_length_values(
     graph_obj: Any,
     sequence_declarations: Iterable[tuple[int, str, int, bool]],
     aliases: Mapping[int, int] | Iterable[tuple[int, int]] = (),
+    *, native_object_value_ids: Iterable[int] = (),
 ) -> dict[int, int]:
-    """Map authored ``len(sequence)`` results to resident descriptors."""
+    """Map authored length results to exact sequence or object identities."""
 
     declared = {
         int(sequence_id)
         for sequence_id, _policy, _columns, _writable
         in sequence_declarations
     }
+    # Native object handles have no private sequence declaration. Their length
+    # uses the shared context helper, but store-version aliases are identical
+    # to those already resolved here for resident sequence storage.
+    declared.update(map(int, native_object_value_ids))
     resident = {value_id: value_id for value_id in declared}
     resident.update({
         int(alias): int(source)

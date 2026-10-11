@@ -1,0 +1,804 @@
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+index 73015b7..dd96e8d 100644
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -1062,7 +1062,7 @@ def _drop_unused_private_sequences(function: Any, sequence_table: Any) -> int:
+     return len(removed_sequences)
+ 
+ 
+-def _drop_unused_root_private_formals(function: Any) -> int:
++def _drop_unused_root_private_formals(function: Any, sequence_table: Any = None) -> int:
+     """Erase late compiler frame formals that the root never references."""
+ 
+     if function.metadata.get("native_interface") or function.metadata.get("linked_piece_interface"):
+@@ -1078,6 +1078,11 @@ def _drop_unused_root_private_formals(function: Any) -> int:
+             *metadata.get("named_outputs", ()),
+         )
+     }
++    # ``parts=[0.0]; parts[0]=n; return parts[0]`` retains a live sequence
++    # descriptor. Its unused capacity/status cells are still descriptor
++    # members, not anonymous dead formals. Use the same exact member-liveness
++    # rule as callee pruning, rather than orphaning their concordance rows.
++    protected.update(_live_sequence_member_ids(function, sequence_table))
+     used = {
+         int(value.id)
+         for block in function.blocks.values()
+@@ -14702,6 +14707,78 @@ def _class_surface_ssa_program(
+     machine_indirect_links: list[Any] = []
+     pending_call_records: list[tuple[str, Any, Any, Any, Any]] = []
+ 
++    def recursive_frame_lease(caller_graph, callsite_id, source, callee):
++        """Select invocation storage from the admitted source call SCC.
++
++        The exact metadata copier's six recursive sites each leased the same
++        callee's scratch into caller.args. Later sites saw those leases as new
++        callee formals and leased them again (thousands of arguments). Neither
++        aliasing live invocations' arenas nor extending the signature is legal.
++        A typed, statically sized lease is a local SSA zero buffer, using the
++        backends' existing function-frame allocation. It is NOT a new formal.
++        An opaque/dynamic arena still requires a physical storage contract;
++        refuse that case before minting, rather than allocating one element
++        by default. Explicitly bound caller storage never takes this path.
++        """
++        from .identity_concordance import current_identity_book
++
++        owner = str(caller_graph.graph.get("qualified_name")
++                    or caller_graph.graph.get("function_name") or "<module>")
++        activation = current_identity_book().page(
++            "source_callsite_activation_concordance"
++        ).latest((owner, int(callsite_id)))
++        if activation is None or activation[1] != "recursive_scc_backedge":
++            return False
++        shape = tuple(source.shape or ())
++        accounting = dict(source.accounting or {})
++        table = all_sequence_tables.get(str(callee.name))
++        resident_members = {
++            int(member)
++            for descriptor in (() if table is None else table.sequences.values())
++            for member in (
++                *descriptor.column_value_ids, descriptor.length_address_id,
++                descriptor.capacity_value_id, descriptor.status_address_id,
++                descriptor.live_flags_value_id,
++            ) if member is not None
++        }
++        declared_workspace = int(source.id) in resident_members or any(
++            accounting.get(key) not in {None, ""} for key in (
++                "compiler_frame_storage", "linked_call_frame_storage",
++                "returned_record_storage",
++            )
++        )
++        if (
++            not declared_workspace
++            or str(source.dtype or "").casefold() in {"", "unknown", "none", "opaque_ref", "ptr", "ssa.aggregate"}
++            or any(not isinstance(extent, int) or extent < 0 for extent in shape)
++            or ((source.accounting or {}).get("sequence_arena") and not shape)
++        ):
++            raise FortranEmissionError(
++                "recursive invocation storage is not materialized: "
++                f"caller={owner!r}, callsite={int(callsite_id)}, "
++                f"callee_reference={int(activation[0])}, recursive_unit={activation[2]}, "
++                f"private_formal={int(source.id)}, dtype={source.dtype!r}, shape={shape!r}, "
++                f"declared_workspace={declared_workspace}; "
++                "requires per-invocation native storage with a known element "
++                "type and extent, not caller-signature propagation"
++            )
++        return True
++
++    def publish_invocation_storage(caller, value):
++        # A real existing SSA producer keeps the value in function_values and
++        # in the concordance's definition inventory. Merely deleting the
++        # formal and relying on a backend's implicit alloca loses that proof.
++        value.accounting = {
++            **dict(value.accounting or {}),
++            "compiler_frame_storage": str(caller.name),
++            "invocation_local_storage": True,
++        }
++        entry = next(iter(caller.blocks.values()))
++        entry.instrs.insert(0, Instr(
++            "zeros", [], value,
++            attributes={"binding": "recursive_invocation_storage"},
++        ))
++
+     def dependency_closure(graph: Any, seeds: Any) -> set[int]:
+         """Follow the ProcessGraph's already-authored value dependencies."""
+ 
+@@ -19488,6 +19565,74 @@ def _class_surface_ssa_program(
+             values[int(value_id)] = negated
+             return negated
+ 
++        def structural_reference_identity(value_id: int, data):
++            """One producer for public results and private ``leaf(id(x))`` feeds.
++
++            ``return id(value)`` used to emit its Cast after the control builder
++            closed parameter accounting; ``leaf(id(value))`` never emitted it.
++            The producer owns the use, including promotion of the exact declared
++            input in the same function_parameter/declared_parameter pages.
++            """
++            arguments = ordered_arguments(data.get("parents") or ())
++            if len(arguments) != 1:
++                return None
++            source_id = int(arguments[0])
++            source = ensure_structural_value(source_id)
++            if source is None:
++                return None
++            source_attributes = graph.nodes.get(source_id, {}).get("attributes") or {}
++            if source in function.args and source_attributes.get("binding_kind") == "parameter":
++                from .concordance_declarations import (
++                    CONTROL_SSA_FINISH, CONTROL_VALUE_BINDING, DECLARED_PARAMETER,
++                    FUNCTION_PARAMETER, SSA_VALUE, ParameterDeclaration,
++                )
++                from .identity_concordance import Derived, Mode
++
++                book = current_identity_book()
++                scope = function.metadata["tensor_shape_concordance_scope"]
++                name = str(source_attributes["binding_name"])
++                declaration = book.latest_ref(DECLARED_PARAMETER, (scope, source_id))
++                cells = _frame_cells(
++                    declaration,
++                    book.latest_ref(CONTROL_VALUE_BINDING, (scope, source_id)),
++                    book.latest_ref(SSA_VALUE, (scope, int(source.id))),
++                    _frame_graph_cell(graph, int(value_id)),
++                )
++                if declaration is None or not cells:
++                    raise ValueError(f"structural parameter use has no declaration: {scope!r}, {source_id}")
++                used = book.post(
++                    DECLARED_PARAMETER, (scope, source_id), ParameterDeclaration.USED,
++                    stage=CONTROL_SSA_FINISH, provenance=Derived(cells), mode=Mode.REVISE,
++                )
++                book.post(
++                    FUNCTION_PARAMETER, (scope, name), int(source.id),
++                    stage=CONTROL_SSA_FINISH,
++                    provenance=Derived(_frame_cells(used, *cells)), mode=Mode.CONCORD,
++                )
++                page = book.pages[FUNCTION_PARAMETER.name]
++                function.metadata["parameter_names"] = tuple(
++                    (str(row[1]), int(page.latest(row))) for row in page.scope_rows(scope)
++                    if page.latest(row) is not None
++                )
++            result = SSAValue(
++                int(value_id), dtype="int64", accounting={"tensor_identity": "stable-handle"},
++            )
++            from .concordance_declarations import CONTROL_SSA_FINISH, SSA_VALUE, SSAValueFact, SSAValueOrigin
++            from .identity_concordance import Mode
++            _frame_post(
++                SSA_VALUE, (_frame_book_scope(function), int(value_id)),
++                SSAValueFact("int64", (), SSAValueOrigin.ADOPTED_GRAPH_ID),
++                stage=CONTROL_SSA_FINISH, mode=Mode.REVISE,
++                cells=_frame_cells(_frame_graph_cell(graph, int(value_id)),
++                                   _frame_value_cell(function, int(source.id))),
++            )
++            insertions.append(Instr(
++                "Cast", [source], result,
++                attributes={"tensor_operation": "tensor_identity", "reference_cast": True},
++            ))
++            values[int(value_id)] = result
++            return result
++
+         def ensure_structural_value(value_id: int):
+             """Lower a missing direct expression from its exact graph edges."""
+ 
+@@ -19580,6 +19725,11 @@ def _class_surface_ssa_program(
+                         )
+                         if membership is not None:
+                             return membership
++            if (
++                operation == "call"
++                and attributes.get("static_python_reference") == "id"
++            ):
++                return structural_reference_identity(value_id, data)
+             if compare_op_canonical is None and operation in {"call", "plancall"}:
+                 structural_shortfalls.append((
+                     value_id, operation, "call-result-unavailable"
+@@ -20519,23 +20669,11 @@ def _class_surface_ssa_program(
+                 operation == "call"
+                 and attributes.get("static_python_reference") == "id"
+             ):
+-                # `id(x)` takes one argument: argument ZERO, not whichever
+-                # positional edge the parent set yields first.
+-                arguments = ordered_arguments(data.get("parents") or ())
+-                source_id = int(arguments[0]) if arguments else None
+-                if source_id is not None and source_id in values:
+-                    result = SSAValue(
+-                        output_id,
+-                        dtype="int64",
+-                        accounting={"tensor_identity": "stable-handle"},
+-                    )
+-                    instruction = Instr(
+-                        "Cast", [values[source_id]], result,
+-                        attributes={
+-                            "tensor_operation": "tensor_identity",
+-                            "reference_cast": True,
+-                        },
+-                    )
++                result = ensure_structural_value(output_id)
++                if result is not None:
++                    terminator.args.append(result)
++                    published.add(output_id)
++                continue
+             elif operation == "boolop":
+                 operands = [
+                     int(parent)
+@@ -28062,6 +28200,9 @@ def _class_surface_ssa_program(
+                 source = function_values(callee_function).get(
+                     old_id, SSAValue(old_id)
+                 )
++                invocation_local = recursive_frame_lease(
++                    caller_graph, planned_call.callsite_id, source, callee_function,
++                )
+                 # The storage is NOVEL(RESULT_STORAGE_LEASE, callee value
+                 # cell) on the caller's ``ssa_value`` page; the lease row
+                 # ``result_storage_binding`` derives from the callee value's
+@@ -28133,7 +28274,10 @@ def _class_surface_ssa_program(
+                                 next(iter(widths)),
+                             )),
+                         }
+-                all_functions[caller_symbol].args.append(value)
++                if invocation_local:
++                    publish_invocation_storage(all_functions[caller_symbol], value)
++                else:
++                    all_functions[caller_symbol].args.append(value)
+                 caller_values[new_id] = value
+                 result_storage_bindings.setdefault(old_id, new_id)
+                 return new_id
+@@ -31311,6 +31455,9 @@ def _class_surface_ssa_program(
+                                 # cell); the lease derives from the
+                                 # ``linked_caller_member`` row that found no
+                                 # member.
++                                invocation_local = recursive_frame_lease(
++                                    caller_graph, record.callsite_id, argument, callee,
++                                )
+                                 caller_storage = clone_value(
+                                     _lease_source(argument),
+                                     mint_compiler_value_id(
+@@ -31338,7 +31485,10 @@ def _class_surface_ssa_program(
+                                         record.callee_symbol, argument_id,
+                                     )),
+                                 )
+-                                caller.args.append(caller_storage)
++                                if invocation_local:
++                                    publish_invocation_storage(caller, caller_storage)
++                                else:
++                                    caller.args.append(caller_storage)
+                                 values[int(caller_storage.id)] = caller_storage
+                             refreshed_frame_bindings.append((
+                                 argument_id,
+@@ -39839,7 +39989,9 @@ def _class_surface_ssa_program(
+             _drop_unused_private_sequences(
+                 function, all_sequence_tables.get(str(function.name))
+             )
+-            _drop_unused_root_private_formals(function)
++            _drop_unused_root_private_formals(
++                function, all_sequence_tables.get(str(function.name)),
++            )
+ 
+     # Literal construction is pure. Source ingestion intentionally retains
+     # strings, empty tuples, debug labels, and optional markers long enough
+@@ -41423,7 +41575,9 @@ def lower_resolved_process_graph_unit_to_ssa(
+         # after the in-deployment prune. Use the canonical root-only prune at
+         # this completed-unit seam (_energy_time_limit presence input 80).
+         for export in exports:
+-            _drop_unused_root_private_formals(module.functions[export])
++            _drop_unused_root_private_formals(
++                module.functions[export], module.sequence_tables.get(export),
++            )
+     finally:
+         end_identity_book(token)
+     module.metadata["compilation_unit_plan"] = plan.to_mapping()
+diff --git a/src/compiler/glsl_deployment_strategy.py b/src/compiler/glsl_deployment_strategy.py
+index 78a0eec..e1e05fd 100644
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -1492,7 +1492,15 @@ def _build_shell_hierarchy_plan(
+                     pending.append(int(successor))
+         return found
+ 
+-    boundary_calls = set(shell.callsite_function_shells)
++    # ``visit(n - 1)`` is retained by plan_callsites as an SCC backedge, not
++    # a new specialized shell.  The old freeze required a child shell and
++    # silently omitted its PlanCall while a region still consumed its result.
++    # Read the admitted activation edge and use the existing catalogue shell
++    # only as a signature. Never recursively expand the SCC's body here.
++    from .planned_shell_tree import _recursive_callsite_targets
++    recursive_targets = _recursive_callsite_targets(shell)
++
++    boundary_calls = set(shell.callsite_function_shells) | set(recursive_targets)
+     for callsite_id, call_data in graph.G.nodes(data=True):
+         attributes = call_data.get("attributes") or {}
+         reference = attributes.get("callee_ref", attributes.get("method_ref"))
+@@ -1592,6 +1600,9 @@ def _build_shell_hierarchy_plan(
+ 
+     for node_id in walk_order:
+         child = shell.callsite_function_shells.get(node_id)
++        recursive_target = recursive_targets.get(int(node_id))
++        if child is None and recursive_target is not None:
++            child = recursive_target
+         attributes = graph.G.nodes[node_id].get("attributes") or {}
+         reference = attributes.get("callee_ref", attributes.get("method_ref"))
+         entry = None if reference is None else graph.function_table.entry(int(reference))
+@@ -1905,7 +1916,11 @@ def _build_shell_hierarchy_plan(
+             _concord_call_argument_operands(graph, int(node_id), operand_edges)
+             items.append(PlanCall(
+                 int(node_id),
+-                _build_shell_hierarchy_plan(child, memo),
++                (PlanClosure(
++                    name=str(child_graph.graph.get("function_name")),
++                    captures=tuple(dict.fromkeys(callee for _caller, callee in argument_bindings)),
++                    items=(),
++                ) if recursive_target is not None else _build_shell_hierarchy_plan(child, memo)),
+                 parents,
+                 tuple(caller for _callee, caller in result_bindings),
+                 tuple(argument_bindings),
+@@ -18289,6 +18304,13 @@ def _tensor_descriptor_rule(
+     tensor = dict(data.get("tensor") or {})
+     attributes = data.get("attributes") or {}
+     reference = attributes.get("callee_ref", attributes.get("method_ref"))
++    if (str(data.get("op") or data.get("type") or "").casefold() == "call"
++            and attributes.get("static_python_reference") == "id"):
++        # Identity is an integer handle even when its reference operand has
++        # no numeric descriptor. Publish the result at planning, not only at
++        # late Cast emission: leaf(id(value)) otherwise planned leaf's formal
++        # as double and rounded handles above 2**53 across the call boundary.
++        return {"shape": (), "dtype": "int64", "rank": 0}
+     if reference is not None:
+         entry = graph.function_table.entry(int(reference))
+         host = entry.metadata.get("host_ssa_module")
+@@ -19788,6 +19810,29 @@ def _fold_callsite_structural_values(
+             graph.G.graph.get("source_sequence_mutation_records") or {}
+         ).values()
+     }
++    # IndexedStore carries the updated state identity on its base edge. Its
++    # initializer must stay resident too: folding it to a literal made each
++    # region construct its own [0.0], so the write survived but the later read
++    # still observed a different, untouched arena. Follow only exact base
++    # edges through consecutive store versions, never a binding-name match.
++    for _node_id, store in graph.G.nodes(data=True):
++        if str(store.get("op") or store.get("type") or "").casefold() not in {
++            "indexedstore", "index_set", "setitem",
++        }:
++            continue
++        pending_bases = [int(parent) for parent, role in store.get("parents") or ()
++                         if str(role) == "base"]
++        while pending_bases:
++            base_id = pending_bases.pop()
++            if base_id in mutated_sequence_ids:
++                continue
++            mutated_sequence_ids.add(base_id)
++            base = graph.G.nodes.get(base_id, {})
++            if str(base.get("op") or base.get("type") or "").casefold() in {
++                "indexedstore", "index_set", "setitem",
++            }:
++                pending_bases.extend(int(parent) for parent, role in base.get("parents") or ()
++                                     if str(role) == "base")
+     loop_carried_initial_ids = {
+         int(initial)
+         for _loop_id, data in graph.G.nodes(data=True)
+@@ -20221,6 +20266,16 @@ def _fold_callsite_structural_values(
+         node_type = str(data.get("type") or "")
+         operation = str(data.get("op") or node_type).casefold()
+         expression = data.get("expr_obj")
++        # ``parts[0] = n`` owns an IndexedStore whose expression is an
++        # ast.Subscript(ctx=Store). The generic Subscript evaluator below
++        # read the INITIAL [0.0], replaced the effect with Const(0.0), and
++        # removed n from the program. A write is never a structural read.
++        # Retain the exact effect and its operand-position/state receipts.
++        if operation in {"indexedstore", "index_set", "setitem"} or (
++            isinstance(expression, ast.Subscript)
++            and isinstance(expression.ctx, ast.Store)
++        ):
++            return unresolved
+         if node_type in {"Constant", "Const", "const"}:
+             return constant(data)
+         if node_type in {"Input", "input"}:
+@@ -20797,15 +20852,32 @@ def _fold_callsite_structural_values(
+                     # lowers the accepted source types to positions in the
+                     # same vocabulary; the fact is not one particular member.
+                     return unresolved
+-                if (
+-                    values[0].storage == "reference"
+-                    or values[0].python_type in {"", "unknown"}
+-                ):
++                if values[0].python_type in {"", "unknown"}:
+                     return unresolved
+                 declared = values[0].python_type
+                 accepted_identities = type_identities(
+                     expression.args[1] if len(expression.args) > 1 else None
+                 )
++                if values[0].storage == "reference":
++                    # The declared source-language type is independent of
++                    # physical handle storage. A dict handle is still a dict:
++                    # its declared type proves this positive predicate without
++                    # dereferencing it. A failed match proves nothing about a
++                    # reference's dynamic subtype (especially builtins.object),
++                    # so leave that case for the runtime object contract.
++                    accepted_types = safe_types(
++                        expression.args[1] if len(expression.args) > 1 else None
++                    ) or ()
++                    proven_identities = {
++                        f"{type_.__module__}.{type_.__qualname__}"
++                        for type_ in accepted_types
++                    }
++                    if declared in proven_identities or any(
++                        identity in {"builtins.object", "object"}
++                        for identity in accepted_identities
++                    ):
++                        return True
++                    return unresolved
+                 return any(
+                     declared == identity
+                     or declared.endswith("." + identity)
+@@ -23551,8 +23623,12 @@ class ProcessGraphGLSLDeployment:
+                 return None
+             return int(owner_unit)
+ 
++        recursive_signature_owners: set[int] = set()
++        recursive_signature_pending: list[tuple[Any, tuple[int, ...]]] = []
++
+         def plan_callsites(owner, active_references=()):
+             nonlocal callsite_planning_total
++            recursive_signature_owners.add(id(owner))
+             owner.callsite_function_shells = {}
+             for node_id, data in owner.process_graph.G.nodes(data=True):
+                 attributes = data.get("attributes") or {}
+@@ -23694,6 +23770,14 @@ class ProcessGraphGLSLDeployment:
+                     # expanding it into another shell would enumerate every
+                     # simple path around the SCC instead of representing the
+                     # one authored backedge.
++                    # Its target remains an executable definition. Visit each
++                    # existing SCC owner once so right's own activation is not
++                    # lost in left()->right()->left(); do not clone a path.
++                    target = self.function_shells.get(reference)
++                    if target is None:
++                        raise ValueError(f"recursive SCC has no target shell: {reference}")
++                    if id(target) not in recursive_signature_owners:
++                        recursive_signature_pending.append((target, tuple(active_references)))
+                     continue
+                 shell_type = self.function_shell_types.get(reference)
+                 if shell_type is None and self._owns_function_shells:
+@@ -23780,6 +23864,18 @@ class ProcessGraphGLSLDeployment:
+             # shell instance; mutual recursion terminates on the first
+             # already-active function identity for the same reason.
+             plan_callsites(function_shell, (int(reference),))
++            # Iterative SCC closure: a long recursive component must not add
++            # one Python stack frame per member merely to freeze signatures.
++            recursive_activated = []
++            while recursive_signature_pending:
++                target, active = recursive_signature_pending.pop()
++                if id(target) not in recursive_signature_owners:
++                    plan_callsites(target, active)
++                    recursive_activated.append(target)
++            for target in recursive_activated:
++                target.hierarchy_plan, target.hierarchy_value_table = assign_hierarchy_ids(
++                    _build_shell_hierarchy_plan(target), shell=target,
++                )
+             (
+                 function_shell.hierarchy_plan,
+                 function_shell.hierarchy_value_table,
+@@ -23796,6 +23892,16 @@ class ProcessGraphGLSLDeployment:
+             self.callsite_function_shells = {}
+         else:
+             plan_callsites(self)
++            recursive_activated = []
++            while recursive_signature_pending:
++                target, active = recursive_signature_pending.pop()
++                if id(target) not in recursive_signature_owners:
++                    plan_callsites(target, active)
++                    recursive_activated.append(target)
++            for target in recursive_activated:
++                target.hierarchy_plan, target.hierarchy_value_table = assign_hierarchy_ids(
++                    _build_shell_hierarchy_plan(target), shell=target,
++                )
+         (
+             self.hierarchy_plan,
+             self.hierarchy_value_table,
+diff --git a/src/compiler/planned_shell_tree.py b/src/compiler/planned_shell_tree.py
+index 3ec1262..e29df45 100644
+--- a/src/compiler/planned_shell_tree.py
++++ b/src/compiler/planned_shell_tree.py
+@@ -5,6 +5,32 @@ from __future__ import annotations
+ from typing import Any
+ 
+ 
++def _recursive_callsite_targets(shell: Any) -> dict[int, Any]:
++    """Read admitted SCC activation edges, not the whole definition catalogue."""
++    from .identity_concordance import current_identity_book
++
++    graph = getattr(getattr(shell, "process_graph", None), "G", None)
++    if graph is None:
++        return {}
++    page = current_identity_book().page("source_callsite_activation_concordance")
++    owner = str(graph.graph.get("qualified_name") or graph.graph.get("function_name") or "<module>")
++    targets = {}
++    for row in page.scope_rows(owner):
++        fact = page.latest(row)
++        if fact is None or fact[1] != "recursive_scc_backedge" or int(row[1]) not in graph:
++            continue
++        node_id = int(row[1])
++        attributes = graph.nodes[node_id].get("attributes") or {}
++        reference = attributes.get("callee_ref", attributes.get("method_ref"))
++        if reference is None or int(reference) != int(fact[0]):
++            raise ValueError(f"recursive activation disagrees with call edge: {row!r}")
++        target = getattr(shell, "function_shells", {}).get(int(reference))
++        if target is None:
++            raise ValueError(f"recursive activation has no catalogue signature: {row!r}")
++        targets[node_id] = target
++    return targets
++
++
+ def _walk_planned_shells(
+     shell: Any,
+     *,
+@@ -50,6 +76,11 @@ def _walk_planned_shells(
+         pending.extend(
+             getattr(current, "callsite_function_shells", {}).values()
+         )
++        # A recursive call is an activation without a callsite clone.  Walking
++        # only the tree left right() absent from left()->right()->left(), so
++        # the linker dereferenced a missing callee. Admit just these exact
++        # dependency targets; seen bounds the SCC, without path expansion.
++        pending.extend(_recursive_callsite_targets(current).values())
+ 
+ 
+ def _deployment_program_table_lines(shell: Any) -> tuple[str, ...]:
+diff --git a/tests/test_native_structural_producers.py b/tests/test_native_structural_producers.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_native_structural_producers.py
+@@ -0,0 +1,258 @@
++"""Real public-entry regressions for structural uses and recursive edges."""
++from pathlib import Path
++
++import pytest
++
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++from src.compiler.ssa_llvm_backend import (
++    compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
++)
++
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def native_policy(values):
++    return ExtractionContract(ROOT / 'extraction_contracts/program_extraction.yaml').with_program_abi(
++        {'records': {}, 'bindings': [], 'values': values}
++    ).with_execution_file(ROOT / 'extraction_contracts/vehicle_full_native_execution.yaml')
++
++
++@pytest.mark.parametrize('private', [False, True])
++def test_native_reference_identity_keeps_its_authored_parameter(private, tmp_path):
++    source = ('def leaf(identity):\n    return identity\n'
++              'def root(value, unused):\n    return leaf(id(value))\n' if private else
++              'def root(value, unused):\n    return id(value)\n')
++    policy = native_policy([{'function': 'root', 'parameter': 'value',
++                            'storage': 'reference', 'python_type': 'builtins.object'}])
++    module, _, exports = lower_ast_source_to_ssa(
++        source, 'root', name='native_identity', extraction_contract=policy,
++        runtime_closure_only=True, progress=lambda _: None)
++    root = module.functions[exports[0]]
++    parameter_id = dict(root.metadata['parameter_names'])['value']
++    assert 'unused' not in dict(root.metadata['parameter_names'])
++    identity = [i for b in root.blocks.values() for i in b.instrs
++                if i.attributes.get('tensor_operation') == 'tensor_identity']
++    assert len(identity) == 1
++    assert identity[0].args[0].id == parameter_id
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    import numpy as np
++    native = compile_artifact(artifact, directory=tmp_path / 'identity_native')
++    output_id = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    # These are ABI stable handles, NOT claims of CPython object/address parity.
++    for handle in (1, 4660, 2**60 + 3):
++        execution = prepare_artifact_execution(native, {parameter_id: np.array([handle], dtype=np.uint64)}).run()
++        assert execution.buffers[output_id].item() == handle
++    from src.compiler.identity_concordance import CorrelationTable
++    assert not [f for f in CorrelationTable.build(module).findings(module)
++                if f.kind not in {'unsourced-fact', 'unsourced-identity'}]
++
++
++@pytest.mark.parametrize('nested', [False, True])
++def test_recursive_backedge_retains_its_source_call(nested, tmp_path):
++    source = '''
++def visit(n):
++    if n <= 0.0:
++        return 0.0
++    return visit(n - 1) + 1
++
++def root(n):
++    return visit(n)
++'''
++    if nested:
++        source = 'def root(n):\n' + ''.join('    ' + line + '\n' for line in source.splitlines()[:6]) + '    return visit(n)\n'
++    policy = native_policy([{'function': '*', 'parameter': 'n',
++                            'storage': 'scalar', 'dtype': 'float64', 'rank': 0,
++                            'python_type': 'builtins.float'}])
++    module, _, exports = lower_ast_source_to_ssa(
++        source, 'root', name='native_recursion', extraction_contract=policy,
++        runtime_closure_only=True, progress=lambda _: None)
++    recursive = [f for f in module.functions.values()
++                 if any(i.op == 'Call' and i.attributes.get('callee') == f.name
++                        for b in f.blocks.values() for i in b.instrs)]
++    assert recursive, 'the graph backedge must remain an executable recursive Call'
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    import numpy as np
++    native = compile_artifact(artifact, directory=tmp_path / 'recursive_native')
++    root = module.functions[exports[0]]
++    parameter_id = dict(root.metadata['parameter_names'])['n']
++    output_id = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    for n in (0, 1, 4, 12):
++        execution = prepare_artifact_execution(native, {parameter_id: np.array([n], dtype=np.float64)}).run()
++        assert execution.buffers[output_id].item() == n
++
++
++def test_mutually_recursive_component_keeps_both_call_edges(tmp_path):
++    source = '''
++def left(n):
++    if n <= 0.0:
++        return 0.0
++    return right(n - 1) + 1
++def right(n):
++    if n <= 0.0:
++        return 0.0
++    return left(n - 1) + 1
++def root(n):
++    return left(n)
++'''
++    policy = native_policy([{'function': '*', 'parameter': 'n', 'storage': 'scalar',
++                            'dtype': 'float64', 'rank': 0, 'python_type': 'builtins.float'}])
++    module, _, exports = lower_ast_source_to_ssa(source, 'root', name='native_mutual',
++                                               extraction_contract=policy,
++                                               runtime_closure_only=True, progress=lambda _: None)
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'mutual_native')
++    root = module.functions[exports[0]]
++    parameter_id = dict(root.metadata['parameter_names'])['n']
++    output_id = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    import numpy as np
++    for n in (0, 1, 4, 11):
++        execution = prepare_artifact_execution(native, {parameter_id: np.array([n], dtype=np.float64)}).run()
++        assert execution.buffers[output_id].item() == n
++
++
++@pytest.mark.parametrize('membership', [False, True])
++def test_opaque_reference_without_object_operations_is_not_accepted_as_native(membership):
++    from src.compiler.ssa_fortran_backend import FortranEmissionError
++    source = ('def root(value):\n    return 1 in value\n' if membership else
++              'def root(value):\n    return isinstance(value, dict)\n')
++    policy = native_policy([{'function': 'root', 'parameter': 'value',
++                            'storage': 'reference', 'python_type': 'builtins.object'}])
++    with pytest.raises(FortranEmissionError, match='structural_outputs='):
++        lower_ast_source_to_ssa(source, 'root', name='opaque_object_limit',
++                                extraction_contract=policy, progress=lambda _: None)
++
++
++@pytest.mark.parametrize('declared, accepted', [
++    ('dict', 'dict'), ('list', '(dict, list)'), ('object', 'object'),
++])
++def test_reference_type_contract_proves_positive_predicate(declared, accepted, tmp_path):
++    policy = native_policy([{'function': 'root', 'parameter': 'value',
++                            'storage': 'reference', 'python_type': 'builtins.' + declared}])
++    module, _, exports = lower_ast_source_to_ssa(
++        'def root(value):\n    return isinstance(value, ' + accepted + ')\n',
++        'root', name='proven_reference_type', extraction_contract=policy,
++        runtime_closure_only=True, progress=lambda _: None)
++    root = module.functions[exports[0]]
++    assert not root.args  # No handle dereference is required for this proof.
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'proven_type')
++    output_id = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    assert prepare_artifact_execution(native, {}).run().buffers[output_id].item() is True
++
++
++@pytest.mark.parametrize('declared, accepted', [('builtins.dict', 'list'), ('custom.dict', 'dict')])
++def test_unproved_reference_predicate_is_not_folded_false(declared, accepted):
++    from src.compiler.ssa_fortran_backend import FortranEmissionError
++    policy = native_policy([{'function': 'root', 'parameter': 'value',
++                            'storage': 'reference', 'python_type': declared}])
++    with pytest.raises(FortranEmissionError, match='structural_outputs='):
++        lower_ast_source_to_ssa('def root(value):\n    return isinstance(value, ' + accepted + ')\n',
++                                'root', name='unproved_reference_type', extraction_contract=policy,
++                                runtime_closure_only=True, progress=lambda _: None)
++
++
++def test_typed_recursive_workspace_is_not_propagated_into_its_signature(tmp_path):
++    source = '''
++def visit(n):
++    parts = [0.0]
++    if n <= 0.0:
++        return 0.0
++    child = visit(n - 1)
++    return len(parts) + child
++def root(n):
++    return visit(n)
++'''
++    policy = native_policy([{'function': '*', 'parameter': 'n', 'storage': 'scalar',
++                            'dtype': 'float64', 'rank': 0, 'python_type': 'builtins.float'}])
++    module, _, exports = lower_ast_source_to_ssa(
++        source, 'root', name='typed_recursive_workspace', extraction_contract=policy,
++        runtime_closure_only=True, progress=lambda _: None)
++    local = [(f, i) for f in module.functions.values() for b in f.blocks.values()
++             for i in b.instrs if i.attributes.get('binding') == 'recursive_invocation_storage']
++    assert local
++    for function, instruction in local:
++        assert instruction.op == 'zeros'
++        assert instruction.res not in function.args
++        assert instruction.res.accounting['compiler_frame_storage'] == function.name
++    from src.compiler.identity_concordance import CorrelationTable
++    assert not [f for f in CorrelationTable.build(module).findings(module)
++                if f.kind not in {'unsourced-fact', 'unsourced-identity'}]
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'typed_scratch')
++    root = module.functions[exports[0]]
++    parameter = dict(root.metadata['parameter_names'])['n']
++    output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    import numpy as np
++    for n in (0, 1, 4, 12, 1, 0):
++        execution = prepare_artifact_execution(native, {parameter: np.array([n], dtype=np.float64)}).run()
++        assert execution.buffers[output].item() == n
++
++
++def test_recursive_private_scratch_refuses_signature_feedback_before_leasing():
++    from src.compiler.ssa_fortran_backend import FortranEmissionError
++    source = '''
++def visit(n):
++    parts = []
++    if n <= 0.0:
++        return 0.0
++    parts.append(visit(n - 1))
++    return parts[0]
++def root(n):
++    return visit(n)
++'''
++    policy = native_policy([{'function': '*', 'parameter': 'n', 'storage': 'scalar',
++                            'dtype': 'float64', 'rank': 0, 'python_type': 'builtins.float'}])
++    with pytest.raises(FortranEmissionError, match='requires per-invocation native storage'):
++        lower_ast_source_to_ssa(source, 'root', name='recursive_scratch_limit',
++                                extraction_contract=policy, runtime_closure_only=True,
++                                progress=lambda _: None)
++
++
++@pytest.mark.parametrize('recursive', [False, True])
++def test_indexed_write_keeps_one_resident_across_regions_and_recursion(recursive, tmp_path):
++    source = '''
++def root(n):
++    parts = [0.0]
++    parts[0] = n
++    return parts[0]
++'''
++    if recursive:
++        source = '''
++def visit(n):
++    parts = [0.0]
++    if n <= 0.0:
++        return 0.0
++    parts[0] = n
++    child = visit(n - 1)
++    return parts[0] + child
++def root(n):
++    return visit(n)
++'''
++    policy = native_policy([{'function': '*', 'parameter': 'n', 'storage': 'scalar',
++                            'dtype': 'float64', 'rank': 0, 'python_type': 'builtins.float'}])
++    module, _, exports = lower_ast_source_to_ssa(
++        source, 'root', name='resident_mutation', extraction_contract=policy,
++        runtime_closure_only=True, progress=lambda _: None)
++    stores = [i for f in module.functions.values() for b in f.blocks.values()
++              for i in b.instrs if i.op == 'Store' and not i.attributes.get('binding')]
++    assert stores, 'the authored indexed effect must survive structural folding'
++    from src.compiler.identity_concordance import CorrelationTable
++    assert not [f for f in CorrelationTable.build(module).findings(module)
++                if f.kind not in {'unsourced-fact', 'unsourced-identity'}]
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'resident_mutation')
++    root = module.functions[exports[0]]
++    parameter = dict(root.metadata['parameter_names'])['n']
++    output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    import numpy as np
++    for n in (0, 1, 4, 12, 1, 0):
++        execution = prepare_artifact_execution(native, {parameter: np.array([n], dtype=np.float64)}).run()
++        assert execution.buffers[output].item() == (n * (n + 1) / 2 if recursive else n)

@@ -111,8 +111,11 @@ class ExternalReferenceValueCodec:
     def __init__(self) -> None:
         self._objects: dict[int, Any] = {}
         self._next_handle = 1
+        self._native_object_boundary = None
 
     def retain(self, value: Any) -> int:
+        if self._native_object_boundary is not None:
+            raise RuntimeError('native object domain is leased; finish its boundary before retaining')
         handle = self._next_handle
         self._next_handle += 1
         self._objects[handle] = value
@@ -125,8 +128,21 @@ class ExternalReferenceValueCodec:
             raise ValueError(f"unknown external object handle {handle}") from error
 
     def release(self, handle: int) -> None:
-        if self._objects.pop(int(handle), None) is None:
+        if self._native_object_boundary is not None:
+            raise RuntimeError('native object domain is leased; finish its boundary before releasing')
+        if int(handle) not in self._objects:
             raise ValueError(f"unknown external object handle {handle}")
+        del self._objects[int(handle)]
+
+    def bind_native_objects(self, context, roots: Sequence[Any]):
+        """Lease this codec's handle domain to the explicit native context.
+
+        Conversion runs once at entry/exit. Native operations use resident
+        table columns, not calls back to this codec. This does not authorize
+        Python equality/hash operations on reference-identity member tables.
+        """
+        from .native_object_boundary import NativeObjectBoundary
+        return NativeObjectBoundary(self, context, roots)
 
     def encode(self, value: Any) -> bytes:
         if value is None:

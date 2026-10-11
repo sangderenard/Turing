@@ -12,7 +12,16 @@ from src.compiler.glsl_deployment_strategy import (
     _walk_planned_shells,
     strategize_shell_deployment,
 )
-from src.compiler.identity_concordance import current_identity_book
+from src.compiler.identity_concordance import current_identity_book, begin_identity_book, end_identity_book
+
+
+@pytest.fixture(autouse=True)
+def _isolated_reference_fixture_book():
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
 from src.compiler.compilation_units import record_compilation_unit_plan
 from src.compiler.shell_reference_tables import (
     build_class_navigation_table,
@@ -482,13 +491,16 @@ def negate_tensor(value):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    class TensorValue:
-        shape = (2,)
-        dtype = "float64"
+    # Tensor inputs now enter via planner_tensor_descriptors, not arbitrary
+    # live objects in the structural-literal specialization map.
+    from src.common.tensors.abstraction import AbstractTensor
+    value = AbstractTensor.tensor([1.0, 2.0])
 
     graph.function_table.entry(
         "negate_tensor"
-    ).graph.G.graph["planner_specializations"] = {"value": TensorValue()}
+    ).graph.G.graph["planner_tensor_descriptors"] = {"value": {
+        "shape": tuple(value.shape), "dtype": str(value.dtype), "rank": len(value.shape),
+    }}
     deployment_type = strategize_shell_deployment(graph)
 
     split_graph = deployment_type.function_shell_types[

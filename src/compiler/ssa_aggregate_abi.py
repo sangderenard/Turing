@@ -70,6 +70,9 @@ def is_storage_view(value: SSAValue, storage: SSAValue) -> bool:
 
 def _function_values(function: Function) -> dict[int, SSAValue]:
     values = {int(value.id): value for value in function.args}
+    if function.metadata.get("native_interface") or function.metadata.get("linked_piece_interface"):
+        values.update((int(value.id), value) for value in
+                      function.metadata["declared_native_outputs"])
     for block in function.blocks.values():
         for instruction in block.instrs:
             if instruction.res is None:
@@ -120,7 +123,7 @@ def analyze_aggregate_abi(
             for block in module.functions[function_name].blocks.values()
             for instruction in block.instrs
             if instruction.op in {"Ret", "ret", "Return", "return"}
-        ), ())
+        ), tuple(module.functions[function_name].metadata.get("declared_native_outputs", ())))
         if len(returned) == 1:
             aggregate_ids = tuple(map(
                 int,

@@ -117,12 +117,16 @@ def tick(state, dt):
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         name="concordance_view", runtime_closure_only=True,
         extraction_contract=policy,
-        resolved_process_graph_sink=process_graph_sink,
+        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
     )
     return module
 
 
 def _lower_toplevel(*, process_graph_sink=None):
+    from src.common.tensors import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
     from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.vehicle_python_compilation import (
@@ -147,8 +151,15 @@ def _lower_toplevel(*, process_graph_sink=None):
         inspect.getsource(_scalar),
         inspect.getsource(_energy_time_limit),
         inspect.getsource(_propose_dt_pen),
-        "def root(metrics, targets, dx, distribution):\n"
-        "    return _propose_dt_pen(metrics, targets, dx, distribution)\n",
+        # A supplied distribution is an authored callable, not an untyped
+        # runtime Python object at a native boundary. Keep both actual DT
+        # paths reachable under a runtime flag and the current five-arg API.
+        "def distribution_override(metrics, targets, dx):\n"
+        "    return dx * 0.5\n",
+        "def root(metrics, targets, dx, dt_current, override):\n"
+        "    if override:\n"
+        "        return _propose_dt_pen(metrics, targets, dx, distribution_override, dt_current)\n"
+        "    return _propose_dt_pen(metrics, targets, dx, None, dt_current)\n",
     ))
     policy = ExtractionContract(
         CONTRACTS / "program_extraction.yaml"
@@ -161,11 +172,21 @@ def _lower_toplevel(*, process_graph_sink=None):
             {"function": "*", "parameter": "metrics", "record": "Metrics"},
             {"function": "*", "parameter": "targets", "record": "Targets"},
         ],
-        "values": [],
+        "values": [*base["values"], *[
+            {"function": "root", "parameter": parameter, "storage": "scalar",
+             "dtype": dtype, "rank": 0, "python_type": python_type}
+            for parameter, dtype, python_type in (
+                ("dx", "float64", "builtins.float"),
+                ("dt_current", "float64", "builtins.float"),
+                ("override", "bool", "builtins.bool"),
+            )
+        ]],
     })
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_toplevel", extraction_contract=policy,
-        resolved_process_graph_sink=process_graph_sink,
+        python_bindings={"AbstractTensor": AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
     )
     return module
 
@@ -198,14 +219,14 @@ def _lower_energy(*, process_graph_sink=None):
             {"function": "*", "parameter": "metrics", "record": "Metrics"},
             {"function": "*", "parameter": "targets", "record": "Targets"},
         ],
-        "values": [],
+        "values": list(base["values"]),
     })
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_energy",
         python_bindings={"AbstractTensor": AbstractTensor},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         extraction_contract=policy,
-        resolved_process_graph_sink=process_graph_sink,
+        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
     )
     return module
 
@@ -236,7 +257,11 @@ def _lower_controller(*, declare_root_types: bool = True, process_graph_sink=Non
         "bindings": [
             {"function": "*", "parameter": "ctrl", "record": "STController"},
         ],
-        "values": ([
+        # with_program_abi replaces the ABI; it does not append fields.
+        # Keep the incumbent helper contracts. Dropping _restore_type's
+        # AbstractTensor/float declarations left its isinstance predicate
+        # undefined and made this audit report an artificial compiler fault.
+        "values": [*base["values"], *([
             {
                 "function": "root", "parameter": name,
                 "storage": "scalar", "dtype": dtype, "rank": 0,
@@ -249,14 +274,14 @@ def _lower_controller(*, declare_root_types: bool = True, process_graph_sink=Non
                 ("dt_pen", "float64", "builtins.float"),
                 ("osc", "bool", "builtins.bool"),
             )
-        ] if declare_root_types else []),
+        ] if declare_root_types else [])],
     })
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_controller",
         python_bindings={"AbstractTensor": AbstractTensor},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         extraction_contract=policy,
-        resolved_process_graph_sink=process_graph_sink,
+        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
     )
     return module
 
@@ -278,7 +303,7 @@ def _lower_mapping(*, process_graph_sink=None):
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_mapping",
         extraction_contract=CONTRACTS / "program_extraction.yaml",
-        resolved_process_graph_sink=process_graph_sink,
+        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
     )
     return module
 
@@ -339,7 +364,7 @@ def _lower_oscillator(*, process_graph_sink=None):
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_oscillator",
         extraction_contract=CONTRACTS / "program_extraction.yaml",
-        resolved_process_graph_sink=process_graph_sink,
+        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
     )
     return module
 

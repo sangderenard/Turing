@@ -104,6 +104,9 @@ class MemoryRegulator:
     #: A compile resuming its caller's book does not know which stages the
     #: caller has finished with.
     owns_book: bool = True
+    # One shared dispatch cache across every specialization/shell of this
+    # compile; per-shell limits would multiply with the expanded call graph.
+    graph_pool: Any = None
     _report: bool = field(
         default_factory=lambda: bool(os.environ.get("TURING_COMPILE_RSS")),
     )
@@ -218,6 +221,21 @@ def stage_boundary(label: str) -> None:
         regulator.boundary(label)
 
 
+def region_topology_pool():
+    """The active compile's dispatch cache (legacy non-compile planners stay eager)."""
+    regulator = _ACTIVE.get()
+    if regulator is None:
+        return None
+    from .graph_work import RegionTopologyPool, graph_work_settings
+
+    _workers, limit, _admission = graph_work_settings()
+    if limit is None:
+        return None
+    if regulator.graph_pool is None:
+        regulator.graph_pool = RegionTopologyPool(regulator.book, limit)
+    return regulator.graph_pool
+
+
 def stage_end(label: str) -> None:
     """Mark the end of a stage whose working set is DEAD here (the stage's
     objects are unreachable by the next one): collect the cyclic garbage it
@@ -251,4 +269,8 @@ def end_regulation(
             gc.collect()
         regulator.boundary("compile: end")
     finally:
-        _ACTIVE.reset(token)
+        try:
+            if regulator.graph_pool is not None:
+                regulator.graph_pool.close()
+        finally:
+            _ACTIVE.reset(token)

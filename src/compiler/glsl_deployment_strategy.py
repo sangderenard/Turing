@@ -29,7 +29,7 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping, Sequence
-from types import ModuleType, SimpleNamespace
+from types import MappingProxyType, ModuleType, SimpleNamespace
 
 import networkx as nx
 import numpy as np
@@ -1334,6 +1334,59 @@ def _concord_call_argument_operands(
                 page.concord(argument_row, (role, ordinal))
 
 
+def _authored_output_paths(graph, outputs):
+    """Read return leaves by their authored aggregate edges, not flat ABI order."""
+    paths = {}
+
+    def expand(path, value_id):
+        leaves = _authored_aggregate_leaves(graph, int(value_id))
+        if not leaves:
+            paths[path] = int(value_id)
+            return
+        for index, leaf in enumerate(leaves):
+            expand((*path, index), int(leaf))
+
+    for index, value_id in enumerate(outputs):
+        expand((index,), int(value_id))
+    return paths
+
+
+def _call_result_bindings(graph, node_id, output_paths):
+    """One projection operator for authored bodies and accepted native headers."""
+    caller_paths = {}
+
+    def collect(path, value_id):
+        for successor in graph.G.successors(int(value_id)):
+            data = graph.G.nodes[int(successor)]
+            if str(data.get("op", "")).lower() != "indexed":
+                continue
+            indices = tuple(int(parent) for parent, role in data.get("parents") or ()
+                            if str(role) == "index")
+            if len(indices) != 1:
+                continue
+            index_data = graph.G.nodes[indices[0]]
+            index = index_data.get("constant")
+            if index is None:
+                index = (index_data.get("attributes") or {}).get("value")
+            if isinstance(index, bool) or not isinstance(index, int):
+                continue
+            projection_path = (*path, index)
+            caller_paths[projection_path] = int(successor)
+            collect(projection_path, int(successor))
+
+    collect((), int(node_id))
+    from .identity_concordance import current_identity_book
+    page = current_identity_book().page("call_result_projection_concordance")
+    for path, value_id in caller_paths.items():
+        page.concord((int(node_id), value_id), path)
+    if tuple(output_paths) == ((0,),) and not (
+        graph.G.nodes[int(node_id)].get("attributes") or {}
+    ).get("authored_return_container"):
+        return ((output_paths[(0,)], int(node_id)),)
+    return tuple((output_paths[path], caller_paths[path])
+                 for path in output_paths if path in caller_paths)
+
+
 def _build_shell_hierarchy_plan(
     shell: Any,
     _memo: dict[int, PlanClosure] | None = None,
@@ -1355,6 +1408,22 @@ def _build_shell_hierarchy_plan(
     # idempotent, and executes no numerical source code.
     if graph.G.graph.get("function_name"):
         _fold_callsite_structural_values(graph)
+    # After the fold, plan freezing reads this graph's source/ABI edges; it
+    # does not rewrite them.  Rechecking the publication receipt per value
+    # sums all adjacency lengths per query: V queries cost O(V*(V+E)).
+    # Publish at the first read exactly as before, then use a FRESH existing
+    # query for each value.  Only publication is batched: descriptor answers,
+    # path/cycle guards and all shape-provenance writes remain call-scoped.
+    abi_published = False
+
+    def planned_descriptor(value_id):
+        nonlocal abi_published
+        if not abi_published:
+            from .identity_concordance import publish_program_abi_graph_identities
+            publish_program_abi_graph_identities(graph.G)
+            abi_published = True
+        return _tensor_descriptor(graph, int(value_id), _DescriptorQuery())
+
     # An Indexed successor used to unpack a multi-result source call is a
     # call-boundary projection, not a numerical gather owned by a region.
     # Dispatch regions can be carved before callsite shells are attached, so
@@ -1419,13 +1488,37 @@ def _build_shell_hierarchy_plan(
                 # when ``r[1]`` is a tensor.  Walking through a tensor removed
                 # that read from every region, so nothing computed it and the
                 # caller kept a formal for it.
-                if _tensor_descriptor(graph, int(successor)) is None:
+                if planned_descriptor(int(successor)) is None:
                     pending.append(int(successor))
         return found
 
+    # ``visit(n - 1)`` is retained by plan_callsites as an SCC backedge, not
+    # a new specialized shell.  The old freeze required a child shell and
+    # silently omitted its PlanCall while a region still consumed its result.
+    # Read the admitted activation edge and use the existing catalogue shell
+    # only as a signature. Never recursively expand the SCC's body here.
+    from .planned_shell_tree import _recursive_callsite_targets
+    recursive_targets = _recursive_callsite_targets(shell)
+
+    boundary_calls = set(shell.callsite_function_shells) | set(recursive_targets)
+    for callsite_id, call_data in graph.G.nodes(data=True):
+        attributes = call_data.get("attributes") or {}
+        reference = attributes.get("callee_ref", attributes.get("method_ref"))
+        if reference is None:
+            continue
+        entry = graph.function_table.entry(int(reference))
+        host = entry.metadata.get("host_ssa_module")
+        root = entry.metadata.get("host_ssa_root")
+        declaration = None if host is None else host.functions.get(str(root))
+        if declaration is not None and declaration.metadata.get("native_interface"):
+            contract = declaration.metadata["native_interface"]
+            # leaf(x)[0] over one tensor result is a numerical element read,
+            # not tuple unpacking. Its region must still own that Indexed node.
+            if len(contract["output_ids"]) > 1 or contract.get("return_container_kind") in {"tuple", "list"}:
+                boundary_calls.add(int(callsite_id))
     call_result_projection_ids = {
         projection
-        for callsite_id in shell.callsite_function_shells
+        for callsite_id in boundary_calls
         if int(callsite_id) in graph.G
         for projection in call_result_projections(int(callsite_id))
     }
@@ -1507,6 +1600,92 @@ def _build_shell_hierarchy_plan(
 
     for node_id in walk_order:
         child = shell.callsite_function_shells.get(node_id)
+        recursive_target = recursive_targets.get(int(node_id))
+        if child is None and recursive_target is not None:
+            child = recursive_target
+        attributes = graph.G.nodes[node_id].get("attributes") or {}
+        reference = attributes.get("callee_ref", attributes.get("method_ref"))
+        entry = None if reference is None else graph.function_table.entry(int(reference))
+        host = None if entry is None else entry.metadata.get("host_ssa_module")
+        root = None if entry is None else entry.metadata.get("host_ssa_root")
+        declaration = None if host is None else host.functions.get(str(root))
+        if child is None and declaration is not None and declaration.metadata.get("native_interface"):
+            # root(x) = left(x) + right(x): omitting authored callee bodies
+            # used to omit BOTH PlanCalls. Derive call frames from accepted
+            # declarations and the same authoritative argument edges instead.
+            contract = declaration.metadata["native_interface"]
+            outputs = tuple(contract["output_ids"])
+            output_paths = dict(contract.get("output_paths", ()))
+            if not output_paths:
+                if len(outputs) != 1:
+                    raise ValueError("native interface has no accepted result projection layout")
+                output_paths = {(0,): int(outputs[0])}
+            by_name = dict(declaration.metadata.get("parameter_names", ()))
+            formals = tuple(contract["argument_ids"])
+            authored_parameters = tuple(declaration.metadata.get("authored_parameters", ()))
+            from types import SimpleNamespace
+            receiver, positional, _all_parameters = _method_parameter_layout(SimpleNamespace(
+                graph={"function_parameters": authored_parameters, **declaration.metadata}))
+            record_abi = declaration.metadata.get("parameter_record_abi", {})
+            # _propose_dt_pen's dx/distribution/dt_current are specialized
+            # before the unit cut. Its native declaration keeps authored
+            # parameter identities for diagnostics, not physical formals for
+            # those constants. Never bind an erased source operand to an
+            # unrelated field by its old positional index.
+            logical_formals = {parameter: value_id for parameter, value_id in by_name.items()
+                               if int(value_id) in formals or parameter in record_abi}
+            for parameter in authored_parameters:
+                if parameter not in record_abi:
+                    continue
+                owned = {int(value.id) for value in declaration.args
+                         if (value.accounting or {}).get("program_abi_parameter") == parameter}
+                if not owned:
+                    logical_formals.pop(parameter, None)
+                    continue
+                records = getattr(host.record_tables.get(str(root)), "records", {})
+                candidates = [int(record_id) for record_id, record in records.items()
+                              if record.identity == record_abi[parameter]["identity"]
+                              and {int(value_id) for field in record.fields for value_id in field.value_ids}
+                              and {int(value_id) for field in record.fields for value_id in field.value_ids}.issubset(owned)]
+                if len(candidates) != 1:
+                    raise ValueError(f"native interface has no exact record binding for {parameter}")
+                logical_formals[parameter] = candidates[0]
+            edges = _expanded_callsite_argument_edges(graph, node_id)
+            bindings = []
+            for parent, role in edges:
+                position = _positional_argument_index(role)
+                parameter = _callsite_parameter_name(role, receiver, positional)
+                if parameter in authored_parameters and parameter not in logical_formals:
+                    # This source operand is still evaluated by its own graph
+                    # owner; the accepted native object needs no record fields.
+                    continue
+                if parameter in logical_formals:
+                    formal = int(logical_formals[parameter])
+                elif position is not None and position < len(formals):
+                    formal = formals[position]
+                elif role.startswith("kw:") and role[3:] in by_name:
+                    formal = int(by_name[role[3:]])
+                else:
+                    raise ValueError(f"native interface argument role is not declared: {role}")
+                bindings.append((int(parent), int(formal)))
+            expected_formals = (tuple(logical_formals[parameter] for parameter in authored_parameters
+                                      if parameter in logical_formals)
+                                if record_abi else formals)
+            bound_formals = {formal for _parent, formal in bindings}
+            defaults = {int(by_name[parameter]) for parameter in declaration.metadata.get("parameter_defaults", {})
+                        if parameter in by_name}
+            if (len(bindings) != len(bound_formals) or not bound_formals.issubset(expected_formals)
+                    or set(expected_formals) - bound_formals - defaults):
+                raise ValueError("native interface call arguments do not match the accepted signature")
+            _concord_call_argument_operands(graph, int(node_id), dict(enumerate(edges)))
+            result_bindings = _call_result_bindings(graph, node_id, output_paths)
+            items.append(PlanCall(int(node_id), PlanClosure(str(root), expected_formals, ()),
+                tuple(parent for parent, _role in edges), tuple(caller for _callee, caller in result_bindings),
+                tuple(bindings), result_bindings,
+                tuple(int(plan.loop.node_id) for plan in sorted(
+                    (plan for plan in shell.loop_plans if int(node_id) in plan.loop.body_nodes),
+                    key=lambda plan: -len(plan.loop.body_nodes)))))
+            continue
         if child is not None:
             call_attributes = graph.G.nodes[node_id].get("attributes") or {}
             constructor_call = call_attributes.get("constructor_ref") is not None
@@ -1731,96 +1910,17 @@ def _build_shell_hierarchy_plan(
             # the projection path (1, 0).  Expanding the callee leaves and
             # zipping them against the caller's first-level projections
             # shifts every member after the aggregate onto the wrong result.
-            child_output_paths: dict[tuple[int, ...], int] = {}
-
-            def expand_child_output(
-                path: tuple[int, ...], value_id: int,
-            ) -> None:
-                leaves = _authored_aggregate_leaves(
-                    child.process_graph, int(value_id),
-                )
-                if not leaves:
-                    child_output_paths[path] = int(value_id)
-                    return
-                for index, leaf in enumerate(leaves):
-                    expand_child_output((*path, int(index)), int(leaf))
-
-            for position, child_output in enumerate(child_outputs):
-                expand_child_output((int(position),), int(child_output))
-
-            def literal_projection_index(successor: int) -> int | None:
-                successor_data = graph.G.nodes[int(successor)]
-                if str(successor_data.get("op", "")).lower() != "indexed":
-                    return None
-                index_parents = tuple(
-                    int(parent)
-                    for parent, role in (
-                        successor_data.get("parents") or ()
-                    )
-                    if str(role) == "index"
-                )
-                if len(index_parents) != 1:
-                    return None
-                index_data = graph.G.nodes[index_parents[0]]
-                index_value = index_data.get("constant")
-                if index_value is None:
-                    index_value = (
-                        index_data.get("attributes") or {}
-                    ).get("value")
-                if isinstance(index_value, bool) or not isinstance(
-                    index_value, int
-                ):
-                    return None
-                return int(index_value)
-
-            caller_projection_paths: dict[tuple[int, ...], int] = {}
-
-            def collect_caller_projections(
-                path: tuple[int, ...], value_id: int,
-            ) -> None:
-                for successor in graph.G.successors(int(value_id)):
-                    index = literal_projection_index(int(successor))
-                    if index is None:
-                        continue
-                    projection_path = (*path, index)
-                    caller_projection_paths[projection_path] = int(successor)
-                    collect_caller_projections(projection_path, int(successor))
-
-            collect_caller_projections((), int(node_id))
-            # This is the operation that owns the exact relation between a
-            # source call's authored result path and the caller projection
-            # value.  Publish it now.  Later SSA stages must not reconstruct
-            # that relation from target names or from dependency enumeration,
-            # either of which can change when a projection becomes loop state.
-            from .identity_concordance import current_identity_book
-
-            call_result_projection_page = current_identity_book().page(
-                "call_result_projection_concordance"
-            )
-            for projection_path, caller_projection_id in (
-                caller_projection_paths.items()
-            ):
-                call_result_projection_page.concord(
-                    (int(node_id), int(caller_projection_id)),
-                    tuple(map(int, projection_path)),
-                )
-            if tuple(child_output_paths) == ((0,),) and not (
-                graph.G.nodes[int(node_id)].get("attributes") or {}
-            ).get("authored_return_container"):
-                result_bindings = (
-                    (child_output_paths[(0,)], int(node_id)),
-                )
-            else:
-                result_bindings = tuple(
-                    (child_output_paths[path], caller_projection_paths[path])
-                    for path in child_output_paths
-                    if path in caller_projection_paths
-                )
+            child_output_paths = _authored_output_paths(child.process_graph, child_outputs)
+            result_bindings = _call_result_bindings(graph, node_id, child_output_paths)
             child_outputs = tuple(child_output_paths.values())
             _concord_call_argument_operands(graph, int(node_id), operand_edges)
             items.append(PlanCall(
                 int(node_id),
-                _build_shell_hierarchy_plan(child, memo),
+                (PlanClosure(
+                    name=str(child_graph.graph.get("function_name")),
+                    captures=tuple(dict.fromkeys(callee for _caller, callee in argument_bindings)),
+                    items=(),
+                ) if recursive_target is not None else _build_shell_hierarchy_plan(child, memo)),
                 parents,
                 tuple(caller for _callee, caller in result_bindings),
                 tuple(argument_bindings),
@@ -2395,7 +2495,12 @@ def _build_shell_hierarchy_plan(
                     and str(role).casefold() not in {
                         "callee", "func", "function", "definition",
                         "operator", "operator_reference",
+                        "control",
                     }
+                    and (
+                        operation != "phi"
+                        or str(role).casefold() in {"body", "orelse"}
+                    )
                 )
                 return node, tensor, attributes, logical, dtype, operation, parents
 
@@ -2443,6 +2548,29 @@ def _build_shell_hierarchy_plan(
                 ]
                 parent_shapes = [record[1] for record in parent_records]
                 parent_dtypes = [record[2] for record in parent_records]
+                if operation in {"loopresult", "loopstateport", "loopaggregateresult"}:
+                    # In the compiler heap, LoopResult(size) had an int64
+                    # descriptor, but this freeze used its empty tensor's
+                    # float64 default and followed its CONTROL edge as if it
+                    # were a numeric dependency. The region formal then
+                    # disagreed with the loop Phi's physical storage. Ports
+                    # continue values; consult the existing proven descriptor.
+                    posted = planned_descriptor(int(current))
+                    if posted is not None and posted.get("dtype"):
+                        dtype = str(posted["dtype"])
+                    elif len(parent_dtypes) == 1:
+                        dtype = parent_dtypes[0]
+                elif operation == "phi" and parent_dtypes:
+                    # The guard chooses an arm; it contributes no element
+                    # type. A merge's numeric arms use the substrate's
+                    # existing promotion rule, not DomainNode's default.
+                    promoted = _widest_element(*parent_dtypes)
+                    if promoted is not None:
+                        dtype = promoted
+                    elif all(value in {"int", "int64", "i64", "int32", "i32"} for value in parent_dtypes):
+                        dtype = "int64" if any(value in {"int64", "i64"} for value in parent_dtypes) else "int"
+                    elif all(value == "bool" for value in parent_dtypes):
+                        dtype = "bool"
                 if operation == "cast_like" and len(parents) >= 2:
                     # ``value.cast_like(reference)`` has the REFERENCE's
                     # element dtype (AbstractTensor.cast_like: the destination
@@ -2465,7 +2593,7 @@ def _build_shell_hierarchy_plan(
                     # no dtype posted on the node, the domain default
                     # (float64) is not a declaration: take the posted
                     # descriptor's dtype, else the operand's own record.
-                    posted = _tensor_descriptor(graph, int(current))
+                    posted = planned_descriptor(int(current))
                     value_parent = next((
                         int(parent)
                         for parent, role in (_node.get("parents") or ())
@@ -2570,7 +2698,7 @@ def _build_shell_hierarchy_plan(
                     # ``t26.sum(t3)`` became rank 0 while the descriptor said
                     # (4,), and ``t1.unsqueeze(t2)`` kept its source's (5,)
                     # while the descriptor said (5, 1).
-                    settled = _tensor_descriptor(graph, int(current))
+                    settled = planned_descriptor(int(current))
                     if settled is not None and descriptor_states_a_shape(settled):
                         logical = tuple(int(e) for e in (settled.get("shape") or ()))
                         _shape_dtype_cache[current] = (logical, dtype)
@@ -2626,7 +2754,7 @@ def _build_shell_hierarchy_plan(
                 )),
             )
             for value_id in (*region_nodes, *region_captures)
-            for descriptor in (_tensor_descriptor(graph, int(value_id)),)
+            for descriptor in (planned_descriptor(int(value_id)),)
             if descriptor is not None
         )
         # A capture produced by a shape-only operation outside the region is
@@ -2647,7 +2775,7 @@ def _build_shell_hierarchy_plan(
                     "operand", "value", "base", "input", "self", "receiver",
                 } and int(parent) in graph.G
             ), None)
-            descriptor = _tensor_descriptor(graph, int(value_id))
+            descriptor = planned_descriptor(int(value_id))
             if storage is None or descriptor is None or not descriptor_states_a_shape(descriptor):
                 continue
             value_views.append((
@@ -6461,6 +6589,10 @@ def _subgraph_reduction_digest(subgraph: Any) -> str:
     ).hexdigest()
 
 
+from .graph_work import region_write_lease
+
+
+@region_write_lease
 def _structural_region_program_from_subgraph(
     subgraph: Any,
 ) -> CapturedFusedProgram:
@@ -6612,6 +6744,79 @@ def _structural_region_program_from_subgraph(
     return CapturedFusedProgram(program, {})
 
 
+@dataclass(frozen=True)
+class _DispatchGraphIndex:
+    """Read-only edge projection for one dispatch-carving phase.
+
+    The ProcessGraph and the identity book remain authoritative. This index
+    joins graph edges and authored operand references once; regions consult
+    only their members and boundary neighbours. It is local to the carving
+    phase, never cached across graph rewrites or retained by a shell.
+    """
+
+    source: Any
+    parents: Mapping[int, frozenset[int]]
+    children: Mapping[int, frozenset[int]]
+    carried_initials: frozenset[int]
+    next_store_id: int
+    boundary_descriptor: Any
+
+
+def _dispatch_graph_index(graph: Any) -> _DispatchGraphIndex:
+    """Derive the shared adjacency view from the exact source identities."""
+
+    # Source topology is fixed for this index's carving phase.  Revalidating
+    # publication per boundary value cost 514 full scans on the 512-add
+    # source. Publish lazily at the SAME first descriptor read (after the
+    # region copy), then only that validation is shared by subsequent cuts.
+    # Each value still gets a fresh query and publishes its own shape facts.
+    abi_published = False
+
+    def boundary_descriptor(value_id):
+        nonlocal abi_published
+        if not abi_published:
+            from .identity_concordance import publish_program_abi_graph_identities
+            publish_program_abi_graph_identities(graph.G)
+            abi_published = True
+        return _tensor_descriptor(graph, int(value_id), _DescriptorQuery())
+
+    parents = {
+        node_id: frozenset({
+            *graph.G.predecessors(node_id),
+            *(
+                parent for parent, _role in data.get("parents", ())
+                if parent in graph.G
+            ),
+        })
+        for node_id, data in graph.G.nodes(data=True)
+    }
+    children = {node_id: set() for node_id in parents}
+    for child, dependencies in parents.items():
+        for parent in dependencies:
+            children[parent].add(child)
+    carried_initials = frozenset(
+        int(initial)
+        for _, data in graph.G.nodes(data=True)
+        for initial, _updated in (data.get("attributes") or {}).get(
+            "loop_carried_bindings", {}
+        ).values()
+    )
+    return _DispatchGraphIndex(
+        source=graph.G,
+        parents=MappingProxyType(parents),
+        children=MappingProxyType({
+            node_id: frozenset(consumers)
+            for node_id, consumers in children.items()
+        }),
+        carried_initials=carried_initials,
+        next_store_id=max(
+            (node_id for node_id in graph.G if isinstance(node_id, int)),
+            default=0,
+        ) + 1,
+        boundary_descriptor=boundary_descriptor,
+    )
+
+
 def _dispatch_subgraph(
     graph: Any,
     node_ids: tuple[int, ...],
@@ -6620,6 +6825,8 @@ def _dispatch_subgraph(
     inert_nodes: frozenset[int] = frozenset(),
     schedule_preference: str = "asap",
     region_index: int | None = None,
+    _graph_index: _DispatchGraphIndex | None = None,
+    _defer_schedule: bool = False,
 ) -> Any:
     """Return the planned dispatch as an independent ProcessGraph subgraph.
 
@@ -6641,26 +6848,17 @@ def _dispatch_subgraph(
     """
 
     selected = set(node_ids)
-    semantic_parents = {
-        node_id: {
-            *graph.G.predecessors(node_id),
-            *(
-                parent
-                for parent, _role in graph.G.nodes[node_id].get(
-                    "parents", ()
-                )
-                if parent in graph.G
-            ),
-        }
-        for node_id in graph.G
-    }
-    semantic_children = {
-        node_id: set(graph.G.successors(node_id))
-        for node_id in graph.G
-    }
-    for child, parents in semantic_parents.items():
-        for parent in parents:
-            semantic_children[parent].add(child)
+    # The four-call graph_frontier_proof builds six regions over 13 members.
+    # Rebuilding the entire adjacency per region made 164 source adjacency
+    # queries. A carving phase now derives one immutable view and each region
+    # reads its own cut, including operand-only edges and external consumers.
+    graph_index = (
+        _graph_index if _graph_index is not None
+        else _dispatch_graph_index(graph)
+    )
+    if graph_index.source is not graph.G:
+        raise ValueError("dispatch adjacency index belongs to a different source graph")
+    semantic_parents = graph_index.parents
     # Container literals are routing, not dispatches of their own.  When one
     # feeds a numerical region, inline the container and expose its leaves as
     # the region boundary so a captured tensor operation retains each feed's
@@ -6701,13 +6899,7 @@ def _dispatch_subgraph(
                     role=roles.get(parent, "dependency"),
                 )
 
-    carried_initials = {
-        int(initial)
-        for _, data in graph.G.nodes(data=True)
-        for initial, _updated in (data.get("attributes") or {}).get(
-            "loop_carried_bindings", {}
-        ).values()
-    }
+    carried_initials = graph_index.carried_initials
     for node_id in boundary:
         data = subgraph.G.nodes[node_id]
         # Ask the concordance while the source graph still owns this value's
@@ -6716,7 +6908,7 @@ def _dispatch_subgraph(
         # proven descriptor first, a chained layout operation (for example
         # ``literal.unsqueeze(1).unsqueeze(2)``) loses the first view's shape
         # exactly at the region seam.
-        descriptor = _tensor_descriptor(graph, int(node_id))
+        descriptor = graph_index.boundary_descriptor(int(node_id))
         if descriptor_states_a_shape(descriptor):
             tensor = dict(data.get("tensor") or {})
             tensor.update({
@@ -6741,8 +6933,8 @@ def _dispatch_subgraph(
             subgraph.G.remove_edge(parent, node_id)
 
     observed_children = {
-        node_id: children - inert_nodes
-        for node_id, children in semantic_children.items()
+        node_id: graph_index.children[node_id] - inert_nodes
+        for node_id in node_ids
     }
     subgraph.roots = [
         node_id
@@ -6757,10 +6949,7 @@ def _dispatch_subgraph(
         )
     ]
     deployment_outputs = tuple(subgraph.roots)
-    next_node_id = max(
-        (node_id for node_id in graph.G if isinstance(node_id, int)),
-        default=0,
-    ) + 1
+    next_node_id = graph_index.next_store_id
     store_nodes = []
     for output_id in deployment_outputs:
         while next_node_id in subgraph.G:
@@ -6809,12 +6998,19 @@ def _dispatch_subgraph(
         raise ValueError(
             "dispatch schedule preference must be 'asap' or 'alap'"
         )
-    computed_levels = subgraph.compute_levels(
-        method=schedule_preference,
-        order="dependency",
-    )
-    if computed_levels is not None:
-        subgraph.levels = computed_levels
+    if _defer_schedule:
+        if subgraph.materialize_memory:
+            raise ValueError("dependency-only worker scheduling requires a non-materialized ProcessGraph")
+        # Finalization may mint nodes/rows. Do it here, on the coordinator,
+        # before the sealed scheduler input crosses the worker boundary.
+        subgraph.finalize_graph_with_outputs()
+    else:
+        computed_levels = subgraph.compute_levels(
+            method=schedule_preference,
+            order="dependency",
+        )
+        if computed_levels is not None:
+            subgraph.levels = computed_levels
     subgraph.G.graph["compartment_schedule_preference"] = (
         schedule_preference
     )
@@ -6822,7 +7018,7 @@ def _dispatch_subgraph(
     # level. The order within a level is identical (it is the single sort's
     # order, filtered), so the schedule is unchanged; only the redundant
     # O(levels x sort) work is removed.
-    _compartment_order = nx.lexicographical_topological_sort(
+    _compartment_order = () if _defer_schedule else nx.lexicographical_topological_sort(
         subgraph.G, key=lambda value_id: int(value_id)
     )
     _nodes_by_level: dict[int, list[int]] = {}
@@ -7744,15 +7940,24 @@ def _ordinary_conditional_control_programs(
         # merge; consuming that record here (before the ``continue``) builds
         # the ConditionalBlock whose ``carried_field_cells`` the control
         # builder already reads, and the mutation pass then finds the arm.
-        field_state_merge = any(
+        # Scalar result merges are retention reasons too: a bare-formal
+        # predicate with two constant assignments has no predicate/arm region
+        # or call. The reducer's Phi4(test0, body2, orelse3) still requires
+        # this conditional. Retain its exact ownership, not a name history.
+        source_owned_merge = any(
             str(phi_data.get("type") or phi_data.get("op") or "")
             .casefold() == "phi"
             and int((phi_data.get("attributes") or {}).get(
                 "source_conditional_id", -1
             )) == int(control_id)
-            and isinstance(
-                (phi_data.get("attributes") or {}).get("field_state_arms"),
-                (tuple, list),
+            and (
+                isinstance(
+                    (phi_data.get("attributes") or {}).get("field_state_arms"),
+                    (tuple, list),
+                )
+                or {"body", "orelse"}.issubset({
+                    str(role) for _parent, role in phi_data.get("parents") or ()
+                })
             )
             for _phi_node_id, phi_data in graph.G.nodes(data=True)
         )
@@ -7765,7 +7970,7 @@ def _ordinary_conditional_control_programs(
             and not else_callsites
             and not result_aliases
             and not (predicate_regions and has_structural_branch_effect)
-            and not field_state_merge
+            and not source_owned_merge
         ):
             if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
                 print(
@@ -7815,24 +8020,24 @@ def _ordinary_conditional_control_programs(
             merged_id = int(phi_data.get("value_id", phi_node_id))
             binding_name = phi_attributes.get("binding_name")
             if (
-                binding_name is not None
-                and str(binding_name).startswith("__turing_single_exit_result")
+                phi_attributes.get("initial_value_id") is None
+                or (binding_name is not None
+                    and str(binding_name).startswith("__turing_single_exit_result"))
             ):
-                # Guard-return normalization creates a fresh result only in
-                # the two arms.  Its reducer Phi may name the first arm as an
-                # ``initial_value_id`` compatibility fallback, but there is
-                # no incumbent value before the branch.  Lower it through
-                # the exact conditional-result path so each arm resolves its
-                # own source identity instead of the missing arm falling
-                # back to the first arm's constant.
+                # A name first defined in both arms has no entered version.
+                # The recursive object-table probe's Phi18(body17, orelse9)
+                # was skipped here, so neither len-result17 nor its merge
+                # was requested and Ret read only the recursive arm9.
+                # Consume the reducer's exact arm edges as a result merge.
+                # Guard-return normalization has the same semantics, even
+                # when it publishes a compatibility initial-value fallback.
                 result_aliases = (*result_aliases, (
                     int(phi_parents["body"]),
                     int(phi_parents["orelse"]),
                     merged_id,
                 ))
-                direct_phi_bindings.add(str(binding_name))
-                continue
-            if phi_attributes.get("initial_value_id") is None:
+                if binding_name is not None:
+                    direct_phi_bindings.add(str(binding_name))
                 continue
             carried.append((
                 int(phi_parents["body"]),
@@ -8365,11 +8570,32 @@ def _source_control_nesting_hints(
         for parent_index, parent_expression in expressions.items():
             if parent_index == child_index:
                 continue
-            descendants = tuple(ast.walk(parent_expression))
+            # The metadata copier's `if all(new is old for ...)` evaluates
+            # its comprehension BEFORE entering the conditional. Walking the
+            # whole If assigned that predicate loop to the arm although its
+            # region marker is outside the arm, and overlay refused (4)/(0).
+            # Use the same authored arm-slot ownership as ordinary conditional
+            # nesting above; do not infer it from overlapping region sets.
+            if isinstance(parent_expression, (ast.If, ast.IfExp)):
+                statements = (
+                    (parent_expression.body, parent_expression.orelse)
+                    if isinstance(parent_expression, ast.IfExp)
+                    else (*parent_expression.body, *parent_expression.orelse)
+                )
+                descendants = tuple(member for statement in statements
+                                    for member in ast.walk(statement))
+            else:
+                descendants = tuple(ast.walk(parent_expression))
             child_signature = _ast_source_signature(child_expression)
+            # All comprehension clauses lack their own source coordinates.
+            # Their identical (type,None,None,...) signatures are NOT source
+            # identity: copier loops63/67/71 became a containment cycle and
+            # overlay silently lost their bodies. Exact AST identity remains
+            # authoritative; a signature fallback requires a located node.
+            located_child = getattr(child_expression, 'lineno', None) is not None
             if not any(
                 id(member) == id(child_expression)
-                or _ast_source_signature(member) == child_signature
+                or located_child and _ast_source_signature(member) == child_signature
                 for member in descendants
             ):
                 continue
@@ -8381,10 +8607,22 @@ def _source_control_nesting_hints(
         if candidates:
             _size, _span, parent_index = min(candidates)
             children.setdefault(int(parent_index), set()).add(int(child_index))
-    return {
-        parent: frozenset(sorted(nested))
-        for parent, nested in children.items() if nested
-    }
+    # These are authored ancestor relations, not yet direct ownership edges.
+    # In the controller's `while -> if -> enumerate(failures)` the loop was
+    # claimed by both the conditional and its ancestor; overlay instantiated
+    # the SAME source loop twice, once guarded and once after the guard.
+    # Keep the Hasse diagram of the existing relation, not a second parent
+    # chosen by region sizes or coordinates. Reachability is unchanged.
+    import networkx as nx
+    ownership = nx.DiGraph()
+    ownership.add_edges_from((parent, child)
+                             for parent, nested in children.items()
+                             for child in nested)
+    if not nx.is_directed_acyclic_graph(ownership):
+        raise ValueError('authored control ownership contains a cycle')
+    direct = nx.transitive_reduction(ownership)
+    return {parent: frozenset(direct.successors(parent)) for parent in direct
+            if direct.out_degree(parent)}
 
 
 def _overlay_control_or_require_subdivision(
@@ -8395,6 +8633,7 @@ def _overlay_control_or_require_subdivision(
     conditional_controls: Sequence[ControlProgram],
     nesting: Mapping[int, Iterable[int]],
     *, region_dependencies: Iterable[tuple[int, int]] = (),
+    dispatch_subgraphs: Iterable[Any] = (),
 ) -> ControlProgram:
     """Turn a named cross-scope overlay refusal into loop-owned frontier data."""
 
@@ -8466,6 +8705,11 @@ def _overlay_control_or_require_subdivision(
             runtime_regions,
             (*loop_controls, *conditional_controls),
             known_nesting=nesting,
+            source_graph=graph,
+            region_source_nodes={
+                index: tuple(subgraph.G.graph.get("deployment_nodes", ()))
+                for index, subgraph in enumerate(dispatch_subgraphs)
+            },
         )
         return order_control_region_dependencies(program, region_dependencies)
     except ValueError as error:
@@ -15078,7 +15322,14 @@ def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
         if attributes.get("structural_specialization") and tuple(
             attributes.get("aggregate_leaf_value_ids") or ()
         ):
-            return False
+            # Selecting an aggregate does not prove its payload static; nor
+            # does it prove the payload dynamic. The literal (1, 2, 3) in
+            # child(x, amounts) was being classified dynamic after folding,
+            # then demanded a runtime Input from its already-constant formal.
+            # Consult the exact retained member identities recursively. A
+            # selected snapshot/tensor aggregate still fails this proof.
+            return all(_source_static_value(graph, int(leaf), visiting)
+                for leaf in attributes["aggregate_leaf_value_ids"])
         return True
     if data.get("type") == "Input":
         name = (data.get("attributes") or {}).get("binding_name")
@@ -15542,44 +15793,45 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
 
 
 def _invalidate_tensor_descriptor_dependents(
-    graph: Any, source_ids: Any, reason: str,
+    graph: Any, source_ids: Any, reason: str, *, _dependents=None,
 ) -> None:
     """Invalidate every cached descriptor derived from changed exact values."""
 
     sources = {int(source_id) for source_id in source_ids}
     affected = set(sources)
-    changed = True
-    while changed:
-        changed = False
-        for node_id, data in graph.G.nodes(data=True):
-            node_id = int(node_id)
-            if node_id in affected:
-                continue
-            parents = tuple(
-                int(parent)
-                for parent, role in data.get("parents") or ()
-                if str(role) not in {"callee", "func", "definition"}
-            )
-            causes = tuple(parent for parent in parents if parent in affected)
-            if not causes:
-                continue
-            affected.add(node_id)
-            data.pop("tensor", None)
-            try:
-                from .identity_concordance import (
-                    invalidate_proven_shape,
-                    shape_scope_of,
-                )
+    from .dependency_cone import iter_dependency_cone, parent_record_dependents
 
-                invalidate_proven_shape(
-                    shape_scope_of(graph),
-                    int(data.get("value_id", node_id)),
-                    int(causes[0]),
-                    str(reason),
-                )
-            except Exception:
-                pass
-            changed = True
+    # The 64-node reverse descriptor chain read2016 parent edges. Index the
+    # exact operand records once, then visit only the cone. Retain incumbent
+    # sweep order and first affected operand: they determine book event/cause
+    # order. Shape withdrawal never changes this phase's operand relation.
+    dependents = (
+        _dependents if _dependents is not None else parent_record_dependents(
+            graph.G, excluded_roles={"callee", "func", "definition"},
+        )
+    )
+    for node_id in iter_dependency_cone(
+        sources, lambda node: dependents.get(node, ()),
+        include_roots=False, order=graph.G,
+    ):
+        node_id = int(node_id)
+        data = graph.G.nodes[node_id]
+        causes = tuple(
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role) not in {"callee", "func", "definition"}
+            and int(parent) in affected
+        )
+        affected.add(node_id)
+        data.pop("tensor", None)
+        try:
+            from .identity_concordance import invalidate_proven_shape, shape_scope_of
+
+            invalidate_proven_shape(
+                shape_scope_of(graph), int(data.get("value_id", node_id)),
+                int(causes[0]), str(reason),
+            )
+        except Exception:
+            pass
 
 
 def _publish_callsite_return_members(
@@ -16515,9 +16767,20 @@ def _propagate_callsite_tensor_specializations(
                         if dict(data.get("tensor") or {}) != replacement:
                             previous = copy.deepcopy(data.get("tensor"))
                             data["tensor"] = replacement
+                            from .dependency_cone import (
+                                iter_dependency_cone, parent_record_dependents,
+                            )
+
+                            # Share this boundary's exact read index across
+                            # withdrawal and FIFO re-settlement below. Neither
+                            # operation mutates operands; no index survives it.
+                            descriptor_dependents = parent_record_dependents(
+                                caller.G, excluded_roles={"callee", "func", "definition"},
+                            )
                             _invalidate_tensor_descriptor_dependents(
                                 caller, (int(_node_id),),
                                 "call-result-specialization-changed",
+                                _dependents=descriptor_dependents,
                             )
                             from .identity_concordance import (
                                 current_identity_book,
@@ -16624,37 +16887,12 @@ def _propagate_callsite_tensor_specializations(
                             # comprehension materializer reads the new row
                             # shape rather than immediately republishing the
                             # provisional scalar that was just retired.
-                            def descriptor_dependents(source_id: int):
-                                return tuple(
-                                    int(candidate_id)
-                                    for candidate_id, candidate
-                                    in caller.G.nodes(data=True)
-                                    if any(
-                                        int(parent) == int(source_id)
-                                        and str(role) not in {
-                                            "callee", "func", "definition",
-                                        }
-                                        for parent, role in candidate.get(
-                                            "parents", ()
-                                        )
-                                    )
-                                )
-
-                            pending_descriptor_nodes = list(
-                                descriptor_dependents(int(_node_id))
-                            )
-                            seen_descriptor_nodes = {int(_node_id)}
-                            while pending_descriptor_nodes:
-                                dependent_id = int(
-                                    pending_descriptor_nodes.pop(0)
-                                )
-                                if dependent_id in seen_descriptor_nodes:
-                                    continue
-                                seen_descriptor_nodes.add(dependent_id)
-                                _tensor_descriptor(caller, dependent_id)
-                                pending_descriptor_nodes.extend(
-                                    descriptor_dependents(dependent_id)
-                                )
+                            for dependent_id in iter_dependency_cone(
+                                (int(_node_id),),
+                                lambda source: descriptor_dependents.get(source, ()),
+                                include_roots=False,
+                            ):
+                                _tensor_descriptor(caller, int(dependent_id))
                             changed = True
                             mutation_counts["single_returns"] += 1
                     elif result_descriptors:
@@ -16782,13 +17020,24 @@ def _propagate_callsite_tensor_specializations(
 
         for caller in graphs:
             function_name = shape_scope_of(caller)
+            # Call-edge writes above have finished.  This dependency-ordered
+            # settlement reads graph topology/ABI and writes only shape book
+            # facts, so 1025 value queries need one publication validation,
+            # not 1025 full adjacency scans on the 512-add source.  Keep the
+            # first publication AFTER the original before-proof read: ABI
+            # publication can itself establish the proof being measured.
+            abi_published = False
             for value_id in _dependency_order(caller):
                 data = caller.G.nodes[int(value_id)]
                 semantic_id = int(data.get("value_id", value_id))
                 before = proven_shape_contract_of(
                     function_name, semantic_id,
                 )
-                _tensor_descriptor(caller, int(value_id))
+                if not abi_published:
+                    from .identity_concordance import publish_program_abi_graph_identities
+                    publish_program_abi_graph_identities(caller.G)
+                    abi_published = True
+                _tensor_descriptor(caller, int(value_id), _DescriptorQuery())
                 after = proven_shape_contract_of(
                     function_name, semantic_id,
                 )
@@ -17386,10 +17635,12 @@ def _structured_output_descriptor(graph: Any, value_id: int) -> Any:
     }
 
 
-def _operand_descriptor(graph: Any, value_id: int) -> dict[str, Any] | None:
+def _operand_descriptor(
+    graph: Any, value_id: int, _seen: set[int] | None = None,
+) -> dict[str, Any] | None:
     """A tensor descriptor, treating an authored scalar literal as rank 0."""
 
-    descriptor = _tensor_descriptor(graph, int(value_id))
+    descriptor = _tensor_descriptor(graph, int(value_id), _seen)
     if descriptor is not None:
         return descriptor
     node = graph.G.nodes.get(int(value_id), {})
@@ -17582,6 +17833,11 @@ def release_dispatch_region_copies(shells: Any) -> dict[str, int]:
             if held is None or isinstance(held, ReleasedDispatchRegions):
                 continue
             released[name] += len(held)
+            if name == "dispatch_subgraphs":
+                from .graph_work import retire_region
+
+                for subgraph in held:
+                    retire_region(subgraph)
             setattr(owner, name, sentinel)
     return released
 
@@ -18086,6 +18342,51 @@ def _tensor_descriptor_rule(
     seen.add(int(node_id))
     data = graph.G.nodes[int(node_id)]
     tensor = dict(data.get("tensor") or {})
+    attributes = data.get("attributes") or {}
+    reference = attributes.get("callee_ref", attributes.get("method_ref"))
+    if (str(data.get("op") or data.get("type") or "").casefold() == "call"
+            and attributes.get("static_python_reference") == "id"):
+        # Identity is an integer handle even when its reference operand has
+        # no numeric descriptor. Publish the result at planning, not only at
+        # late Cast emission: leaf(id(value)) otherwise planned leaf's formal
+        # as double and rounded handles above 2**53 across the call boundary.
+        return {"shape": (), "dtype": "int64", "rank": 0}
+    if reference is not None:
+        entry = graph.function_table.entry(int(reference))
+        host = entry.metadata.get("host_ssa_module")
+        root = entry.metadata.get("host_ssa_root")
+        declaration = None if host is None else host.functions.get(str(root))
+        if declaration is not None and declaration.metadata.get("native_interface"):
+            outputs = tuple(declaration.metadata["declared_native_outputs"])
+            contract = declaration.metadata["native_interface"]
+            if len(outputs) != 1 or contract.get("return_container_kind") in {"tuple", "list"}:
+                by_id = {int(value.id): value for value in outputs}
+                paths = dict(contract.get("output_paths", ()))
+                if set(paths.values()) != set(by_id):
+                    raise ValueError("native interface result needs explicit projection layout")
+                def descriptors(prefix=()):
+                    if prefix in paths:
+                        value = by_id[paths[prefix]]
+                        return {"shape": tuple(value.shape or ()), "dtype": str(value.dtype),
+                                "rank": len(value.shape or ())}
+                    indices = {path[len(prefix)] for path in paths
+                               if path[:len(prefix)] == prefix and len(path) > len(prefix)}
+                    if indices != set(range(len(indices))):
+                        raise ValueError("native result container has incomplete authored paths")
+                    return tuple(descriptors((*prefix, index)) for index in range(len(indices)))
+                attributes["tensor_output_descriptors"] = descriptors()
+                attributes["authored_return_container"] = contract.get("return_container_kind") or "tuple"
+                data["attributes"] = attributes
+                return None
+            # Observed: vector left/right returned (4,), but the caller Add
+            # defaulted to scalar because shape discovery required their
+            # absent graphs. The accepted result descriptor IS the call edge's
+            # source; read it before the provisional scalar graph domain.
+            value = outputs[0]
+            return {"shape": tuple(value.shape or ()), "dtype": str(value.dtype),
+                    "rank": int((value.accounting or {}).get("program_abi_rank", len(value.shape or ()))),
+                    "native_interface_source": (int(reference), int(value.id),
+                        declaration.metadata["native_interface"]["ssa_artifact_sha256"])}
 
     def authored_rectangular_shape(expression: ast.AST) -> tuple[int, ...] | None:
         """Return extents proved solely by nested aggregate syntax.
@@ -18841,28 +19142,13 @@ def _tensor_descriptor_rule(
                 ):
                     left_shape = tuple(sides[0].get("shape") or ())
                     right_shape = tuple(sides[1].get("shape") or ())
-                    rank = max(len(left_shape), len(right_shape))
-                    left_aligned = (1,) * (rank - len(left_shape)) + left_shape
-                    right_aligned = (
-                        (1,) * (rank - len(right_shape)) + right_shape
-                    )
-                    broadcast: list[int] = []
-                    compatible = True
-                    for left_extent, right_extent in zip(
-                        left_aligned, right_aligned
-                    ):
-                        if left_extent == right_extent:
-                            broadcast.append(int(left_extent))
-                        elif left_extent == 1:
-                            broadcast.append(int(right_extent))
-                        elif right_extent == 1:
-                            broadcast.append(int(left_extent))
-                        else:
-                            # Not broadcastable: say nothing rather than
-                            # invent an extent neither operand has.
-                            compatible = False
-                            break
-                    if compatible:
+                    # Only the existing admitted integer law crosses the
+                    # accelerator boundary. Unknown/scalar/callsite guards
+                    # above, precision promotion below and book publication
+                    # in _tensor_descriptor remain owned by this pass.
+                    from .native_compiler_accelerators import broadcast_shape
+                    broadcast = broadcast_shape(left_shape, right_shape)
+                    if broadcast is not None:
                         dtype = (
                             "bool"
                             if operation in {
@@ -19433,7 +19719,7 @@ def _remove_dead_metadata_nodes(
     node each step, which is exactly what the restarted scan found.
     """
 
-    def is_dead(node_id: int, data: Mapping[str, Any]) -> bool:
+    def is_candidate(node_id: int, data: Mapping[str, Any]) -> bool:
         attributes = data.get("attributes") or {}
         dead_pure_tensor_call = bool(
             attributes.get("tensor_candidate") is not None
@@ -19453,7 +19739,6 @@ def _remove_dead_metadata_nodes(
         # backend drops.
         return (
             node_id not in protected_values
-            and graph.G.out_degree(node_id) == 0
             and not (
                 str(data.get("type")) in {"Constant", "Const", "const"}
                 and attributes.get("structural_specialization")
@@ -19467,6 +19752,25 @@ def _remove_dead_metadata_nodes(
                 or dead_pure_tensor_call
             )
         )
+
+    def is_dead(node_id: int, data: Mapping[str, Any]) -> bool:
+        return graph.G.out_degree(node_id) == 0 and is_candidate(node_id, data)
+
+    from .native_compiler_accelerators import DEAD_METADATA_ORDER, compiler_accelerators
+    provider = compiler_accelerators.resolve(DEAD_METADATA_ORDER)
+    if provider.tier == "native":
+        # One whole-graph decision program, including the transitive min-heap
+        # worklist. Preserve the ORIGINAL remove_node publisher and its exact
+        # node order: it owns operand retirement and identity-book writes.
+        eligible = frozenset(
+            node_id for node_id, data in graph.G.nodes(data=True)
+            if is_candidate(int(node_id), data)
+        )
+        for node_id in provider.run(graph.G, eligible=eligible):
+            if node_id not in graph.G or not is_dead(int(node_id), graph.G.nodes[node_id]):
+                raise RuntimeError("native dead-metadata proposal contradicts the live graph")
+            remove_node(int(node_id))
+        return
 
     import heapq
 
@@ -19519,6 +19823,24 @@ def _fold_callsite_structural_values(
     # Resolve capability before getattr(..., default) can select its default.
     _resolve_grounded_method_references(graph)
 
+    # Descriptor queries read ABI identities but repeatedly validating their
+    # receipt walks ALL adjacency lengths.  In the real 48-add program this
+    # was 388 whole-graph validations between ZERO operand writes.  Publish
+    # once between mutations, not per value.  Queries themselves remain
+    # fresh: no descriptor, book state or cycle-cut answer survives a call.
+    abi_published = False
+
+    def fold_descriptor(value_id, *, operand=False):
+        nonlocal abi_published
+        if not abi_published:
+            from .identity_concordance import publish_program_abi_graph_identities
+            publish_program_abi_graph_identities(graph.G)
+            abi_published = True
+        query = _DescriptorQuery()
+        if operand:
+            return _operand_descriptor(graph, int(value_id), query)
+        return _tensor_descriptor(graph, int(value_id), query)
+
     unresolved = _UNRESOLVED_STRUCTURAL_VALUE
     known: dict[int, Any] = {}
     topology_changed = False
@@ -19528,6 +19850,29 @@ def _fold_callsite_structural_values(
             graph.G.graph.get("source_sequence_mutation_records") or {}
         ).values()
     }
+    # IndexedStore carries the updated state identity on its base edge. Its
+    # initializer must stay resident too: folding it to a literal made each
+    # region construct its own [0.0], so the write survived but the later read
+    # still observed a different, untouched arena. Follow only exact base
+    # edges through consecutive store versions, never a binding-name match.
+    for _node_id, store in graph.G.nodes(data=True):
+        if str(store.get("op") or store.get("type") or "").casefold() not in {
+            "indexedstore", "index_set", "setitem",
+        }:
+            continue
+        pending_bases = [int(parent) for parent, role in store.get("parents") or ()
+                         if str(role) == "base"]
+        while pending_bases:
+            base_id = pending_bases.pop()
+            if base_id in mutated_sequence_ids:
+                continue
+            mutated_sequence_ids.add(base_id)
+            base = graph.G.nodes.get(base_id, {})
+            if str(base.get("op") or base.get("type") or "").casefold() in {
+                "indexedstore", "index_set", "setitem",
+            }:
+                pending_bases.extend(int(parent) for parent, role in base.get("parents") or ()
+                                     if str(role) == "base")
     loop_carried_initial_ids = {
         int(initial)
         for _loop_id, data in graph.G.nodes(data=True)
@@ -19741,7 +20086,7 @@ def _fold_callsite_structural_values(
         }
 
     def descriptor_attribute(parent: int, attribute: str) -> Any:
-        descriptor = _tensor_descriptor(graph, parent)
+        descriptor = fold_descriptor(parent)
         if descriptor is None:
             descriptor = _record_field_descriptor(parent)
         if attribute in {"shape", "ndim", "ndims"}:
@@ -19755,7 +20100,7 @@ def _fold_callsite_structural_values(
                 source = graph.G.nodes[current]
                 operation = str(source.get("op") or source.get("type") or "").casefold()
                 if operation == "input":
-                    if _tensor_descriptor(graph, current) is None:
+                    if fold_descriptor(current) is None:
                         return unresolved
                     continue
                 # A declared record span supplies its own shape boundary;
@@ -19837,7 +20182,7 @@ def _fold_callsite_structural_values(
                 "bool": (bool,), "int": (int,), "float": (float,),
                 "str": (str,), "bytes": (bytes,), "tuple": (tuple,),
                 "list": (list,), "dict": (dict,), "set": (set,),
-                "range": (range,),
+                "range": (range,), "object": (object,), "frozenset": (frozenset,),
             }.get(expression.id)
         if isinstance(expression, ast.Tuple):
             result = tuple(
@@ -19961,6 +20306,16 @@ def _fold_callsite_structural_values(
         node_type = str(data.get("type") or "")
         operation = str(data.get("op") or node_type).casefold()
         expression = data.get("expr_obj")
+        # ``parts[0] = n`` owns an IndexedStore whose expression is an
+        # ast.Subscript(ctx=Store). The generic Subscript evaluator below
+        # read the INITIAL [0.0], replaced the effect with Const(0.0), and
+        # removed n from the program. A write is never a structural read.
+        # Retain the exact effect and its operand-position/state receipts.
+        if operation in {"indexedstore", "index_set", "setitem"} or (
+            isinstance(expression, ast.Subscript)
+            and isinstance(expression.ctx, ast.Store)
+        ):
+            return unresolved
         if node_type in {"Constant", "Const", "const"}:
             return constant(data)
         if node_type in {"Input", "input"}:
@@ -20031,7 +20386,24 @@ def _fold_callsite_structural_values(
                 return _ProgramABIValueFact(
                     str(record_abi["identity"]), "record", None
                 )
-            descriptor = _tensor_descriptor(graph, int(node_id))
+            linked_abi = (graph.G.graph.get("linked_value_abi") or {}).get(
+                int(data.get("value_id", node_id))
+            )
+            if linked_abi is not None and linked_abi.get("storage") == "reference":
+                # root(value,memo)->visit(item): tuple(visit(child) for child
+                # in item) already declares item as a reference handle. The
+                # tensor fallback rebuilt that as scalar/opaque_ref and proved
+                # isinstance(item,tuple) False, deleting the collection's
+                # value/control edges. Preserve the SAME ABI fact: a physical
+                # scalar handle does not prove its object's dynamic kind.
+                shape = linked_abi.get("shape")
+                return _ProgramABIValueFact(
+                    str(linked_abi.get("python_type") or "unknown"),
+                    "reference", linked_abi.get("dtype"),
+                    shape=None if shape is None else tuple(map(int, shape)),
+                    rank=linked_abi.get("rank"),
+                )
+            descriptor = fold_descriptor(int(node_id))
             if descriptor is not None:
                 dtype = str(descriptor.get("dtype") or "unknown")
                 # A descriptor that carries the declared Python type (a
@@ -20204,8 +20576,7 @@ def _fold_callsite_structural_values(
                 for parent, role in (data.get("parents") or ())
                 if str(role) in {"operand", "value", "base", "object"}
             ), None)
-            descriptor = None if parent is None else _tensor_descriptor(
-                graph, parent
+            descriptor = None if parent is None else fold_descriptor(parent
             )
             if descriptor is not None:
                 # Read the descriptor for what it states.  ``LU.get_shape()``
@@ -20479,7 +20850,7 @@ def _fold_callsite_structural_values(
             attribute = values[1]
             if isinstance(attribute, str) and not attribute.startswith("_"):
                 owner_id = int(arguments[0])
-                descriptor = _tensor_descriptor(graph, owner_id)
+                descriptor = fold_descriptor(owner_id)
                 if descriptor is not None and attribute in {
                     "item", "shape", "dtype", "ndim", "ndims", "numel",
                 }:
@@ -20532,21 +20903,53 @@ def _fold_callsite_structural_values(
             if len(values) >= 3 and values[2] is not unresolved:
                 return values[2]
         if name == "isinstance" and values:
+            if values[0] is unresolved and arguments:
+                # ``value={}; isinstance(value,dict)`` retained Dict0, but
+                # Dict has no foldable payload in this evaluator: Call2 saw
+                # an unresolved value and lost the constructor's known type.
+                # Ask the exact argument producer, not its binding name.
+                # Type inspection never freezes a mutable container's data.
+                producer = graph.G.nodes.get(int(arguments[0]), {})
+                producer_attributes = producer.get("attributes") or {}
+                literal_types = {"Dict": dict, "List": list, "Tuple": tuple, "Set": set}
+                object_type = literal_types.get(str(producer.get("type")))
+                accepted = safe_types(expression.args[1] if len(expression.args) > 1 else None)
+                if (object_type is not None and accepted is not None
+                        and producer_attributes.get("producer_kind") == "aggregate"
+                        and producer_attributes.get("aggregate_kind") == object_type.__name__):
+                    return issubclass(object_type, accepted)
             if isinstance(values[0], _ProgramABIValueFact):
                 if values[0].token_vocabulary:
                     # This is a runtime vocabulary token.  The SSA ABI pass
                     # lowers the accepted source types to positions in the
                     # same vocabulary; the fact is not one particular member.
                     return unresolved
-                if (
-                    values[0].storage == "reference"
-                    or values[0].python_type in {"", "unknown"}
-                ):
+                if values[0].python_type in {"", "unknown"}:
                     return unresolved
                 declared = values[0].python_type
                 accepted_identities = type_identities(
                     expression.args[1] if len(expression.args) > 1 else None
                 )
+                if values[0].storage == "reference":
+                    # The declared source-language type is independent of
+                    # physical handle storage. A dict handle is still a dict:
+                    # its declared type proves this positive predicate without
+                    # dereferencing it. A failed match proves nothing about a
+                    # reference's dynamic subtype (especially builtins.object),
+                    # so leave that case for the runtime object contract.
+                    accepted_types = safe_types(
+                        expression.args[1] if len(expression.args) > 1 else None
+                    ) or ()
+                    proven_identities = {
+                        f"{type_.__module__}.{type_.__qualname__}"
+                        for type_ in accepted_types
+                    }
+                    if declared in proven_identities or any(
+                        identity in {"builtins.object", "object"}
+                        for identity in accepted_identities
+                    ):
+                        return True
+                    return unresolved
                 return any(
                     declared == identity
                     or declared.endswith("." + identity)
@@ -20564,6 +20967,24 @@ def _fold_callsite_structural_values(
             if name in {"bool", "int", "float"}:
                 return {"bool": bool, "int": int, "float": float}[name](*values)
             if name in {"tuple", "list", "set"}:
+                if (data.get("attributes") or {}).get(
+                    "materialization_kind"
+                ) == "unrolled_loop":
+                    # Loop evaporation replaces the generator argument with
+                    # its ordered element producers. They are elements, not
+                    # positional constructor arguments (tuple(1, 2)).
+                    # The empty case can retain an empty-sequence seed as an
+                    # argument; only the published element identities count.
+                    elements = tuple(
+                        known.get(int(value_id), unresolved)
+                        for value_id in (data.get("attributes") or {}).get(
+                            "materialized_value_ids", ()
+                        )
+                    )
+                    if any(element is unresolved or isinstance(element, _ProgramABIValueFact)
+                           for element in elements):
+                        return unresolved
+                    return {"tuple": tuple, "list": list, "set": set}[name](elements)
                 return {"tuple": tuple, "list": list, "set": set}[name](*values)
             if name == "len":
                 return len(*values)
@@ -20590,7 +21011,8 @@ def _fold_callsite_structural_values(
         return unresolved
 
     def replace(node_id: int, value: Any) -> None:
-        nonlocal topology_changed
+        nonlocal topology_changed, abi_published
+        abi_published = False
         data = graph.G.nodes[int(node_id)]
         topology_changed |= bool(data.get("parents"))
         source_attributes = data.get("attributes") or {}
@@ -20736,6 +21158,8 @@ def _fold_callsite_structural_values(
             }
 
     def replace_alias(node_id: int, source_id: int) -> None:
+        nonlocal abi_published
+        abi_published = False
         node_id = int(node_id)
         source_id = int(source_id)
         if node_id == source_id or source_id not in graph.G:
@@ -20759,10 +21183,14 @@ def _fold_callsite_structural_values(
         # source's identity (plan 80, A2.7); return slots naming it follow.
         _post_identity_table_mutation(graph, aliases={node_id: source_id})
         graph.G.graph["identity_table"] = {
-            str(name): tuple(dict.fromkeys(
+            # A binding history is ordered versions, not a set of values.
+            # Folding a final Phi back to an earlier arm must leave that
+            # arm at the final version, even if it appeared before another
+            # arm. Deduplication would silently select the other return.
+            str(name): tuple(
                 source_id if int(value_id) == node_id else int(value_id)
                 for value_id in history
-            ))
+            )
             for name, history in identities.items()
         }
         graph.roots = [
@@ -20819,7 +21247,7 @@ def _fold_callsite_structural_values(
                 else (int(parent),)
             )
             for candidate_id in candidate_ids:
-                descriptor = _tensor_descriptor(graph, candidate_id)
+                descriptor = fold_descriptor(candidate_id)
                 if descriptor is None:
                     candidate = graph.G.nodes.get(candidate_id, {})
                     literal = candidate.get("constant")
@@ -20922,6 +21350,8 @@ def _fold_callsite_structural_values(
     round_cells: list = []
     changed = True
     while changed:
+        # A projection alias can rewrite topology and restart this sweep.
+        abi_published = False
         fixed_point_iteration += 1
         round_cells = []
         iteration_mutations: list[Any] = []
@@ -20992,7 +21422,7 @@ def _fold_callsite_structural_values(
                 or operation
             ).casefold()
             existing_tensor = data.get("tensor") or {}
-            inherited_descriptor = _tensor_descriptor(graph, node_id)
+            inherited_descriptor = fold_descriptor(node_id)
             if (
                 inherited_descriptor is not None
                 and (
@@ -21104,7 +21534,7 @@ def _fold_callsite_structural_values(
                     descriptor
                     for parent in numerical_parents
                     if (
-                        descriptor := _operand_descriptor(graph, parent)
+                        descriptor := fold_descriptor(parent, operand=True)
                     ) is not None
                 )
                 if len(parent_descriptors) != len(numerical_parents):
@@ -21138,8 +21568,7 @@ def _fold_callsite_structural_values(
                 index_values: list[Any] = []
                 for parent, role in data.get("parents") or ():
                     if str(role) == "base":
-                        source_descriptor = _tensor_descriptor(
-                            graph, int(parent)
+                        source_descriptor = fold_descriptor(int(parent)
                         )
                     elif str(role) == "index":
                         index_values.append(
@@ -21202,7 +21631,7 @@ def _fold_callsite_structural_values(
                 ), None)
                 source_descriptor = (
                     None if base is None
-                    else _tensor_descriptor(graph, base)
+                    else fold_descriptor(base)
                 )
                 if (
                     source_descriptor is not None
@@ -21308,12 +21737,12 @@ def _fold_callsite_structural_values(
                 "zeros_like", "empty_like", "ones_like", "full_like",
             }:
                 source_descriptor = next((
-                    _tensor_descriptor(graph, int(parent))
+                    fold_descriptor(int(parent))
                     for parent, role in (data.get("parents") or ())
                     if str(role) not in {
                         "callee", "func", "function", "definition",
                     }
-                    and _tensor_descriptor(graph, int(parent)) is not None
+                    and fold_descriptor(int(parent)) is not None
                 ), None)
                 if source_descriptor is not None:
                     data["tensor"] = copy.deepcopy(source_descriptor)
@@ -21414,16 +21843,16 @@ def _fold_callsite_structural_values(
                         }
             if tensor_candidate in {"gather", "index_select"}:
                 source_descriptor = next((
-                    _tensor_descriptor(graph, int(parent))
+                    fold_descriptor(int(parent))
                     for parent, role in (data.get("parents") or ())
                     if str(role) in {"operand", "value", "base"}
-                    and _tensor_descriptor(graph, int(parent)) is not None
+                    and fold_descriptor(int(parent)) is not None
                 ), None)
                 index_descriptor = next((
-                    _tensor_descriptor(graph, int(parent))
+                    fold_descriptor(int(parent))
                     for parent, role in (data.get("parents") or ())
                     if str(role) in {"indices", "index", "arg:0", "arg:1"}
-                    and _tensor_descriptor(graph, int(parent)) is not None
+                    and fold_descriptor(int(parent)) is not None
                 ), None)
                 axis = structural_call_argument(
                     data,
@@ -21451,10 +21880,10 @@ def _fold_callsite_structural_values(
                     "transpose", "swapaxes", "transpose_last2", "t"
                 }:
                 source_descriptor = next((
-                    _tensor_descriptor(graph, int(parent))
+                    fold_descriptor(int(parent))
                     for parent, role in (data.get("parents") or ())
                     if str(role) in {"operand", "arg:0", "value"}
-                    and _tensor_descriptor(graph, int(parent)) is not None
+                    and fold_descriptor(int(parent)) is not None
                 ), None)
                 if source_descriptor is not None:
                     source_shape = tuple(source_descriptor["shape"])
@@ -21472,7 +21901,7 @@ def _fold_callsite_structural_values(
                     for parent, role in (data.get("parents") or ())
                     if str(role) not in {"callee", "func", "definition"}
                     and (
-                        descriptor := _tensor_descriptor(graph, int(parent))
+                        descriptor := fold_descriptor(int(parent))
                     ) is not None
                 )
                 if len(operand_descriptors) >= 2:
@@ -21503,10 +21932,10 @@ def _fold_callsite_structural_values(
                         }
             if tensor_candidate in {"reshape", "view"}:
                 source_descriptor = next((
-                    _tensor_descriptor(graph, int(parent))
+                    fold_descriptor(int(parent))
                     for parent, role in (data.get("parents") or ())
                     if str(role) in {"operand", "value"}
-                    and _tensor_descriptor(graph, int(parent)) is not None
+                    and fold_descriptor(int(parent)) is not None
                 ), None)
                 shape_arguments = sorted(
                     (
@@ -21577,13 +22006,13 @@ def _fold_callsite_structural_values(
                     for _parent, role in (data.get("parents") or ())
                 )
                 source_descriptor = next((
-                    _tensor_descriptor(graph, int(parent))
+                    fold_descriptor(int(parent))
                     for parent, role in (data.get("parents") or ())
                     if str(role) in (
                         {"operand", "value", "self", "receiver"}
                         if method_style else {"arg:0"}
                     )
-                    and _tensor_descriptor(graph, int(parent)) is not None
+                    and fold_descriptor(int(parent)) is not None
                 ), None)
                 axis = structural_call_argument(
                     data,
@@ -23180,6 +23609,7 @@ class ProcessGraphGLSLDeployment:
         legacy_fused_network=False,
         shell_language="glsl",
         _defer_callsite_planning=False,
+        _function_catalogue=None,
         **tuning,
     ):
         tuning = dict(tuning)
@@ -23235,7 +23665,7 @@ class ProcessGraphGLSLDeployment:
         # children re-entered this constructor before the chain could be
         # passed down, making recursive call topologies expand forever.
         self.function_shells = (
-            {}
+            (_function_catalogue if _function_catalogue is not None else {})
             if self._callsite_planning_deferred
             else {
                 reference: shell_type(
@@ -23245,7 +23675,7 @@ class ProcessGraphGLSLDeployment:
                 for reference, shell_type in self.function_shell_types.items()
             }
         )
-        self._owns_function_shells = bool(self.function_shells)
+        self._owns_function_shells = bool(self.function_shells) and not self._callsite_planning_deferred
         for function_shell in self.function_shells.values():
             function_shell.function_shells = self.function_shells
             function_shell._owns_function_shells = False
@@ -23288,8 +23718,12 @@ class ProcessGraphGLSLDeployment:
                 return None
             return int(owner_unit)
 
+        recursive_signature_owners: set[int] = set()
+        recursive_signature_pending: list[tuple[Any, tuple[int, ...]]] = []
+
         def plan_callsites(owner, active_references=()):
             nonlocal callsite_planning_total
+            recursive_signature_owners.add(id(owner))
             owner.callsite_function_shells = {}
             for node_id, data in owner.process_graph.G.nodes(data=True):
                 attributes = data.get("attributes") or {}
@@ -23373,7 +23807,7 @@ class ProcessGraphGLSLDeployment:
                 callsite_planning_total += 1
                 compile_count(
                     "callsite-plan", callsite_planning_total,
-                    label="callsite activations planned",
+                    label="callsite activations visited",
                     detail=caller_identity,
                 )
                 if (
@@ -23431,6 +23865,14 @@ class ProcessGraphGLSLDeployment:
                     # expanding it into another shell would enumerate every
                     # simple path around the SCC instead of representing the
                     # one authored backedge.
+                    # Its target remains an executable definition. Visit each
+                    # existing SCC owner once so right's own activation is not
+                    # lost in left()->right()->left(); do not clone a path.
+                    target = self.function_shells.get(reference)
+                    if target is None:
+                        raise ValueError(f"recursive SCC has no target shell: {reference}")
+                    if id(target) not in recursive_signature_owners:
+                        recursive_signature_pending.append((target, tuple(active_references)))
                     continue
                 shell_type = self.function_shell_types.get(reference)
                 if shell_type is None and self._owns_function_shells:
@@ -23454,6 +23896,7 @@ class ProcessGraphGLSLDeployment:
                         shared = shell_type(
                             **tuning,
                             _defer_callsite_planning=True,
+                            _function_catalogue=self.function_shells,
                         )
                         shared.function_shells = self.function_shells
                         shared._owns_function_shells = False
@@ -23490,6 +23933,11 @@ class ProcessGraphGLSLDeployment:
                 planned = shell_type(
                     **tuning,
                     _defer_callsite_planning=True,
+                    # The constructor builds hierarchy signatures before
+                    # returning. countdown's backedge must read the shared
+                    # catalogue here, not an empty child table that is only
+                    # attached on the next line after construction.
+                    _function_catalogue=self.function_shells,
                 )
                 planned.function_shells = self.function_shells
                 planned._owns_function_shells = False
@@ -23504,6 +23952,7 @@ class ProcessGraphGLSLDeployment:
                     (*active_references, reference),
                 )
         activation_roots = (
+            () if self._callsite_planning_deferred else
             tuple(self.activation_root_references)
             if self.runtime_closure_only
             else tuple(self.function_shells)
@@ -23517,6 +23966,18 @@ class ProcessGraphGLSLDeployment:
             # shell instance; mutual recursion terminates on the first
             # already-active function identity for the same reason.
             plan_callsites(function_shell, (int(reference),))
+            # Iterative SCC closure: a long recursive component must not add
+            # one Python stack frame per member merely to freeze signatures.
+            recursive_activated = []
+            while recursive_signature_pending:
+                target, active = recursive_signature_pending.pop()
+                if id(target) not in recursive_signature_owners:
+                    plan_callsites(target, active)
+                    recursive_activated.append(target)
+            for target in recursive_activated:
+                target.hierarchy_plan, target.hierarchy_value_table = assign_hierarchy_ids(
+                    _build_shell_hierarchy_plan(target), shell=target,
+                )
             (
                 function_shell.hierarchy_plan,
                 function_shell.hierarchy_value_table,
@@ -23533,6 +23994,16 @@ class ProcessGraphGLSLDeployment:
             self.callsite_function_shells = {}
         else:
             plan_callsites(self)
+            recursive_activated = []
+            while recursive_signature_pending:
+                target, active = recursive_signature_pending.pop()
+                if id(target) not in recursive_signature_owners:
+                    plan_callsites(target, active)
+                    recursive_activated.append(target)
+            for target in recursive_activated:
+                target.hierarchy_plan, target.hierarchy_value_table = assign_hierarchy_ids(
+                    _build_shell_hierarchy_plan(target), shell=target,
+                )
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
@@ -24196,6 +24667,7 @@ class ProcessGraphGLSLDeployment:
                 conditional_controls,
                 nesting,
                 region_dependencies=region_dependencies,
+                dispatch_subgraphs=target.dispatch_subgraphs,
             )
             shell_control = _place_validation_blocks(
                 shell_control,
@@ -26025,6 +26497,7 @@ class ProcessGraphGLSLDeployment:
                 conditional_controls,
                 nesting,
                 region_dependencies=region_dependencies,
+                dispatch_subgraphs=self.dispatch_subgraphs,
             )
             shell_control = replace(
                 shell_control,
@@ -26770,13 +27243,10 @@ class ProcessGraphGLSLDeployment:
 def strategize_shell_deployment(
     graph: Any,
     *,
-    # Was 256, which was a GLSL dispatch-sizing constraint: a shader had to
-    # be split into chunks a driver would accept. That is no longer what the
-    # number means now that emission goes SPIR-V -> GLSL, and for a target
-    # that wants one flat program it was actively harmful -- a program past
-    # the bound was split into regions, so a caller asking for a flat
-    # unrolled loop silently got a retained one instead.
-    max_nodes_per_dispatch: int = 65536,
+    # One size authority for native and shader planning. Explicit callers can
+    # still request a flat/unrolled representation with their own bound;
+    # otherwise the work contract drives the existing graph partitioner.
+    max_nodes_per_dispatch: int | None = None,
     backend: str | None = None,
     remove_loops: bool | None = None,
     unroll_limit: int | None = None,
@@ -26812,6 +27282,10 @@ def strategize_shell_deployment(
     """
 
     from .identity_concordance import shape_scope_is_variant
+
+    if max_nodes_per_dispatch is None:
+        from .work_contract import active_contract
+        max_nodes_per_dispatch = active_contract().graph_region_node_limit
 
     if _selection_trace is None:
         _selection_trace = {
@@ -27296,35 +27770,84 @@ def strategize_shell_deployment(
                         f"preferences: region={region_index}, "
                         f"preferences={(previous, deployment.schedule_preference)!r}"
                     )
-    dispatch_subgraphs = selection_phase(
-        "extract-dispatch-subgraphs",
-        lambda: tuple(
-            _dispatch_subgraph(
-                graph,
-                node_ids,
-                required_outputs=frozenset((*closure_outputs, *return_outputs)),
-                inert_nodes=inert_nodes,
-                schedule_preference=deployment_region_preferences.get(
-                    region_index, "asap"
-                ),
-            )
-            for region_index, node_ids in compile_iter(
+
+    def extract_dispatch_subgraphs():
+        # The source topology is fixed throughout this phase. Release the
+        # shared index with the phase; a later specialization derives its own
+        # view after its rewrites rather than trusting an earlier snapshot.
+        if not any(executable_dispatch_nodes):
+            return ()
+        graph_index = _dispatch_graph_index(graph)
+        selection_event(
+            "dispatch-cut-index", "ready",
+            indexed_nodes=len(graph_index.parents),
+            dependency_edges=sum(map(len, graph_index.parents.values())),
+            planned_regions=sum(bool(nodes) for nodes in executable_dispatch_nodes),
+            region_members=sum(map(len, executable_dispatch_nodes)),
+        )
+        from .graph_work import (
+            bounded_schedule_regions, dependency_snapshot, graph_work_settings,
+            post_graph_work_publication,
+        )
+        from .memory_regulation import region_topology_pool
+
+        workers, _resident_limit, admission = graph_work_settings()
+        pool = region_topology_pool()
+        collected = []
+        region_count = sum(bool(nodes) for nodes in executable_dispatch_nodes)
+
+        def pending_regions():
+            ordinal = 0
+            for plan_index, node_ids in compile_iter(
                 enumerate(executable_dispatch_nodes), "regions",
-                label="extract dispatch subgraphs",
-                total=len(executable_dispatch_nodes),
+                label="extract dispatch subgraphs", total=len(executable_dispatch_nodes),
+            ):
+                if not node_ids:
+                    continue
+                preference = deployment_region_preferences.get(plan_index, "asap")
+                if pool is not None:
+                    pool.reserve()
+                try:
+                    subgraph = _dispatch_subgraph(
+                        graph, node_ids,
+                        required_outputs=frozenset((*closure_outputs, *return_outputs)),
+                        inert_nodes=inert_nodes, schedule_preference=preference,
+                        _graph_index=graph_index, _defer_schedule=True,
+                    )
+                except BaseException:
+                    if pool is not None:
+                        pool.abandon_reservation()
+                    raise
+                subgraph.G.graph["rewrite_history"] = dispatch_plan.dispatches[plan_index].rewrite_history
+                yield ordinal, subgraph, dependency_snapshot(subgraph, preference)
+                ordinal += 1
+
+        def finish(ordinal, subgraph, snapshot, proposal):
+            # Region identity, scheduling receipt, and backing-store admission
+            # happen in one ordered coordinator publication, never a worker.
+            _post_deployment_region(graph, subgraph, ordinal)
+            post_graph_work_publication(graph, subgraph, ordinal, snapshot, proposal, admission)
+            collected.append(pool.add(subgraph, reserved=True) if pool is not None else subgraph)
+            selection_event(
+                "graph-work", "published", region=ordinal,
+                completed=len(collected), total=region_count,
+                admission_limit=admission,
+                resident_regions=0 if pool is None else len(pool.resident),
+                resident_limit=_resident_limit,
             )
-            if node_ids
-        ),
+
+        bounded_schedule_regions(pending_regions(), workers=workers,
+                                 admission_limit=admission, finish=finish,
+                                 stats=None if pool is None else pool.stats,
+                                 executor=None if pool is None else pool.worker_executor(workers))
+        return tuple(collected)
+
+    dispatch_subgraphs = selection_phase(
+        "extract-dispatch-subgraphs", extract_dispatch_subgraphs,
     )
-    # The region ordinal every later reader uses is the subgraph's position
-    # in this tuple; post the rows under that ordinal (plan 80, A2.4).
-    for region_index, subgraph in enumerate(dispatch_subgraphs):
-        _post_deployment_region(graph, subgraph, int(region_index))
-    for subgraph, dispatch in zip(
-        dispatch_subgraphs,
-        dispatch_plan.dispatches,
-    ):
-        subgraph.G.graph["rewrite_history"] = dispatch.rewrite_history
+    # Extraction has published each tuple ordinal before admitting its topology
+    # to the compile-wide backing store. These are shared lightweight headers:
+    # the compiler and ephemeral collections do not retain additional payloads.
     loop_region_indices = {
         plan.loop.node_id: tuple(
             region_index
@@ -27343,24 +27866,23 @@ def strategize_shell_deployment(
             executable_dispatch_nodes,
         ),
     )
-    deep_compilers = tuple(
-        GraphDeepCompiler(
-            subgraph,
+    from .graph_work import RegionProjectionSequence
+
+    deep_compilers = RegionProjectionSequence(
+        len(dispatch_subgraphs),
+        lambda index: GraphDeepCompiler(
+            dispatch_subgraphs[index],
             dict(abstract_tensor_funcs),
             abstract_tensor_sigs,
             node_observer=_observe_process_graph_node,
         )
-        for subgraph in dispatch_subgraphs
     )
-    ephemeral_callables = tuple(
-        EphemeralProcessGraphCallable(
-            subgraph,
-            compiler=compiler,
+    ephemeral_callables = RegionProjectionSequence(
+        len(dispatch_subgraphs),
+        lambda index: EphemeralProcessGraphCallable(
+            dispatch_subgraphs[index],
+            compiler=deep_compilers[index],
             eager=False,
-        )
-        for subgraph, compiler in zip(
-            dispatch_subgraphs,
-            deep_compilers,
         )
     )
 

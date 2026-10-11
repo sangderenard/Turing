@@ -1,0 +1,955 @@
+--- a/src/compiler/ssa_object_context.py
++++ b/src/compiler/ssa_object_context.py
+@@ -14,6 +14,86 @@
+ )
+ from .ssa_heap_allocation import heap_release
+ from .ssa_object_operations import ObjectOperation, declare_object_helper
++
++
++def source_constructor_mutations(graph, context):
++    """Read native object births from exact authored literal nodes.
++
++    The explicit context admits a representation, not a schema for future
++    contents. Empty dict/list literals have known kind and zero initial extent.
++    Their source identities become handles; they are not private column arenas.
++    Other construction forms are not inferred from a callable's spelling.
++    """
++    import ast
++    from .control_source import ControlSequenceMutation
++    mutations = []
++    for node_id, data in graph.nodes(data=True):
++        expression = data.get('expr_obj')
++        kind = ('builtins.dict' if isinstance(expression, ast.Dict) and not expression.keys
++                else 'builtins.list' if isinstance(expression, ast.List) and not expression.elts
++                else None)
++        if kind is None:
++            attributes = data.get('attributes') or {}
++            literal = attributes.get('value', data.get('constant'))
++            # Structural reduction of [] retains its exact aggregate birth
++            # receipt but removes the AST object. Read that incumbent record,
++            # not an inferred variable name or source-coordinate match.
++            if (attributes.get('producer_kind') == 'aggregate'
++                    and attributes.get('aggregate_kind') in {'dict', 'list'}
++                    and not attributes.get('aggregate_leaf_value_ids')
++                    and type(literal) in {dict, list} and not literal
++                    and type(literal).__name__ == attributes['aggregate_kind']):
++                kind = 'builtins.' + attributes['aggregate_kind']
++        if kind is None:
++            continue
++        if kind not in context.kind_vocabulary:
++            raise ValueError(f'native object context has no admitted constructor kind {kind}')
++        mutations.append(ControlSequenceMutation(int(data.get('value_id', node_id)),
++            'object_construct', (), int(node_id), argument_kind=kind))
++    return tuple(mutations)
++
++
++def source_object_value_ids(graph, births):
++    """Propagate admitted handles through exact control-owned graph edges.
++
++    A Phi of handles is a handle, not a new container arena. LoopResult also
++    requires its initial value: its update alone says nothing about zero trips.
++    Each rule is visited only as its incoming admitted identities arrive.
++    """
++    admitted = set(map(int, births))
++    if not admitted:
++        return frozenset()
++    rules, dependents = {}, {}
++    for node_id, data in graph.nodes(data=True):
++        parents = dict((str(role), int(parent)) for parent, role in data.get('parents') or ())
++        kind = str(data.get('type') or data.get('op') or '').casefold()
++        dependencies = None
++        if kind == 'phi' and 'body' in parents and 'orelse' in parents:
++            dependencies = (parents['body'], parents['orelse'])
++        elif kind == 'loopresult' and 'control' in parents and 'value' in parents:
++            control = graph.nodes[parents['control']]
++            attributes = control.get('attributes') or {}
++            pairs = [tuple(map(int, pair)) for pair in
++                     (attributes.get('loop_carried_bindings') or {}).values()
++                     if len(pair) == 2 and int(pair[1]) == parents['value']]
++            if len(pairs) == 1 and not attributes.get('loop_break_bindings'):
++                dependencies = pairs[0]
++        if dependencies is None:
++            continue
++        result = int(data.get('value_id', node_id))
++        needed = {int(graph.nodes[p].get('value_id', p)) for p in dependencies}
++        rules[result] = needed
++        for dependency in needed:
++            dependents.setdefault(dependency, []).append(result)
++    pending = list(admitted)
++    while pending:
++        value_id = pending.pop()
++        for result in dependents.get(value_id, ()):
++            rules[result].discard(value_id)
++            if not rules[result] and result not in admitted:
++                admitted.add(result)
++                pending.append(result)
++    return frozenset(admitted)
+ 
+ 
+ def context_values(context: SSAObjectContext) -> tuple[SSAValue, ...]:
+@@ -35,6 +115,13 @@
+     """A context receipt must still agree with its actual tables and ABI."""
+     function = module.functions[function_name]
+     receipt = function.metadata.get('object_context')
++    source_context = function.metadata.get('native_object_context')
++    if source_context is not None:
++        if receipt is not None and receipt != source_context:
++            raise ValueError('source and helper object contexts disagree')
++        receipt = source_context
++        if module.metadata.get('native_object_context') != receipt:
++            raise ValueError('source object context differs from accepted module context')
+     if receipt is None:
+         return
+     table = module.sequence_tables.get(function_name)
+@@ -56,6 +143,59 @@
+         for key in ('heap_owner', 'heap_owner_value_id', 'heap_element_dtype'):
+             if (actual.accounting or {}).get(key) != (value.accounting or {}).get(key):
+                 raise ValueError(f'object context has incompatible ownership formal {value.id}')
++        if source_context is not None and (
++                actual.accounting.get('native_object_context_value_id') != value.id
++                or actual.accounting.get('native_object_context_storage_identity') != context.storage_identity):
++            raise ValueError(f'source object context has stale role formal {value.id}')
++
++
++def source_object_definitions(function):
++    definitions = {}
++    for block in function.blocks.values():
++        for instruction in block.instrs:
++            if instruction.res is not None:
++                definitions.setdefault(instruction.res.id, []).append(instruction)
++    return definitions
++
++
++def validate_source_object_instruction(module, function_name, instruction, *, _definitions=None, _helpers=None):
++    """Check authored object receipts against the live helper and context."""
++    birth = instruction.attributes.get('source_object_constructor')
++    operation = instruction.attributes.get('source_object_operation')
++    if birth is None and operation is None:
++        return
++    function = module.functions[function_name]
++    context = function.metadata.get('native_object_context')
++    interface = instruction.attributes.get('opaque_object_operation')
++    if context is None or interface is None:
++        raise ValueError('source object operation has no accepted context/helper')
++    from .ssa_object_operations import validate_object_call
++    validate_object_call(module, instruction, _helpers=_helpers)
++    if interface['storage_identity'] != context['storage_identity']:
++        raise ValueError('source object operation uses a different storage domain')
++    bindings = dict(instruction.attributes['opaque_object_bindings'])
++    actuals = {value.id: value for value in instruction.args}
++    for role in interface['context_formal_ids']:
++        actual = actuals[bindings[role]]
++        if (actual.accounting.get('native_object_context_value_id') != role
++                or actual.accounting.get('native_object_context_storage_identity') != context['storage_identity']):
++            raise ValueError('source object operation has stale context bindings')
++    if birth is not None:
++        if (operation is not None or interface['operation'] != 'construct'
++                or birth['context'] != context or birth['initial_extent'] != 0
++                or birth['kind'] not in context['kind_vocabulary']):
++            raise ValueError('source constructor has stale kind/storage receipt')
++        operands = interface['operand_formal_ids']
++        if len(operands) != 1:
++            raise ValueError('source constructor requires its one declared kind token')
++        token_id = bindings[operands[0]]
++        definitions = source_object_definitions(function) if _definitions is None else _definitions
++        tokens = definitions.get(token_id, ())
++        if (len(tokens) != 1 or tokens[0].op != 'Const'
++                or tokens[0].attributes.get('value') != tuple(context['kind_vocabulary']).index(birth['kind']) + 1):
++            raise ValueError('source constructor kind token differs from its live producer')
++    elif operation[0] != interface['operation']:
++        raise ValueError('source object operation disagrees with its live helper')
+ 
+ 
+ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_object') -> IRModule:
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -1427,6 +1427,9 @@
+         table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
+         table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+         resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
++        native_object_context: Any = None,
++        native_object_module: Any = None,
++        native_object_value_ids: Iterable[int] = (),
+     ):
+         from .evolution_metagraph import (
+             active_evolution_metagraph,
+@@ -1671,6 +1674,15 @@
+         self.sequence_storage_values: dict[int, tuple[SSAValue, ...]] = {}
+         self.sequence_status_values: dict[int, SSAValue] = {}
+         self.sequence_helper_functions: dict[str, Function] = {}
++        self.native_object_context = native_object_context
++        self.native_object_module = native_object_module
++        self.native_object_constructor_receipts = []
++        self.native_object_context_used = False
++        self.native_object_source_ids = set()
++        if native_object_context is not None:
++            from .ssa_object_context import context_values
++            for cell in context_values(native_object_context):
++                self.region_value_meta[cell.id] = Meta(tuple(cell.shape), cell.dtype)
+         # A locally authored ``list[bytes]`` has two physical views: the
+         # logical outer row count and the flattened byte stream consumed by
+         # ``b"".join``. This is the same composite ABI already used for a
+@@ -1983,6 +1995,9 @@
+             return tuple(found)
+ 
+         control_mutations = authored_sequence_mutations(program.root)
++        self.native_object_source_ids = set(map(int, native_object_value_ids)) | {
++            int(mutation.sequence_value_id) for mutation in control_mutations
++            if mutation.operator == 'object_construct'}
+ 
+         static_sequence_capacities: dict[int, int] = {}
+ 
+@@ -2488,6 +2503,12 @@
+         self, result_id: int, query_id: int | tuple[int, ...], sequence_id: int,
+         *, ownership: str = "scheduled", owner_ids: tuple[int, ...] = (),
+     ) -> None:
++        if int(sequence_id) in self.native_object_source_ids:
++            keys = query_id if isinstance(query_id, tuple) else (query_id,)
++            if len(keys) != 1:
++                raise ValueError('native object member lookup requires one reference key')
++            self._emit_native_object_operation('get', int(sequence_id), tuple(keys), int(result_id))
++            return
+         descriptor = self.sequence_descriptors.get(int(sequence_id))
+         if descriptor is None:
+             self.shortfalls.append(SSALoweringShortfall(
+@@ -2740,6 +2761,12 @@
+         self, _effect_id: int, key_id: int | tuple[int, ...],
+         value_id: int, sequence_id: int
+     ) -> None:
++        if int(sequence_id) in self.native_object_source_ids:
++            keys = key_id if isinstance(key_id, tuple) else (key_id,)
++            if len(keys) != 1:
++                raise ValueError('native object member store requires one reference key')
++            self._emit_native_object_operation('set', int(sequence_id), (*keys, value_id), None)
++            return
+         descriptor = self.sequence_descriptors.get(int(sequence_id))
+         if descriptor is None:
+             self.shortfalls.append(SSALoweringShortfall(
+@@ -3524,6 +3551,8 @@
+                 )
+         sequence_id = self.sequence_length_values.get(value_id)
+         if sequence_id is not None and value_id not in self.external_values:
++            if int(sequence_id) in self.native_object_source_ids:
++                self._emit_native_object_operation('length', int(sequence_id), (), value_id)
+             descriptor = self.sequence_descriptors.get(int(sequence_id))
+             if descriptor is not None:
+                 length_cell = self.sequence_storage_values[int(sequence_id)][
+@@ -7488,6 +7517,9 @@
+         """Lower a lexical query against the sequence's length-cell ABI."""
+ 
+         location = f"{path}.sequence_query[{query.source_call_node_id}]"
++        if int(query.sequence_value_id) in self.native_object_source_ids and query.operation == 'length':
++            self._emit_native_object_operation('length', int(query.sequence_value_id), (), int(query.result_value_id))
++            return
+         if query.operation == "lookup":
+             self._emit_table_lookup(
+                 int(query.result_value_id),
+@@ -7800,6 +7832,70 @@
+             return
+         self.emit_plan_callsite(int(callsite_id), location=location)
+ 
++    def _native_object_bindings(self):
++        from .ssa_object_context import context_values
++        context = self.native_object_context
++        if context is None or self.native_object_module is None:
++            raise ValueError('source object operation has no admitted context')
++        bindings = {}
++        for cell in context_values(context):
++            actual = self.external_value(cell.id, dtype=cell.dtype)
++            actual.accounting = {**dict(actual.accounting or {}), **dict(cell.accounting or {}),
++                'native_object_context_storage_identity': context.storage_identity,
++                'native_object_context_value_id': cell.id}
++            bindings[cell.id] = actual
++        self.native_object_context_used = True
++        return bindings
++
++    def _emit_native_object_operation(self, operation, reference_id, operands, result_id):
++        from .ssa_object_operations import object_call
++        from ..transmogrifier.ssa import SSAOpaqueObject
++        bindings = self._native_object_bindings()
++        helper = next(function for function in self.native_object_module.functions.values()
++            if function.metadata.get('opaque_object_helper', {}).get('operation') == operation)
++        receipt = helper.metadata['opaque_object_helper']
++        operand_values = tuple(self.external_value(int(value_id)) for value_id in operands)
++        result_dtype = receipt['result_layout'][0]
++        result = (self.fresh_value(dtype=result_dtype, transform=CONTROL_EXPRESSION,
++                                  operands=(int(reference_id), *operand_values)) if result_id is None
++                  else self.produced_value(int(result_id), dtype=result_dtype,
++                    claim_provisional_definition=True, cause=(int(reference_id), *operand_values)))
++        reference = SSAOpaqueObject(self.external_value(reference_id), self.native_object_context.storage_identity)
++        instruction = object_call(self.native_object_module, helper.name, reference,
++            context=bindings, operands=dict(zip(receipt['operand_formal_ids'], operand_values, strict=True)), result=result)
++        instruction.attributes['source_object_operation'] = (operation, reference_id, tuple(operands), result_id)
++        self.emit(Handler.Call, instruction.args, instruction.res, attributes=instruction.attributes)
++        return result
++
++    def _emit_native_object_constructor(self, mutation, *, location):
++        from .ssa_object_operations import object_call
++        context = self.native_object_context
++        module = self.native_object_module
++        bindings = self._native_object_bindings()
++        kind = str(mutation.argument_kind)
++        if kind not in context.kind_vocabulary or mutation.argument_value_ids:
++            raise ValueError(f'{location}: source object constructor contract disagrees')
++        helper = next(function for function in module.functions.values()
++            if function.metadata.get('opaque_object_helper', {}).get('operation') == 'construct')
++        token = self.fresh_value(dtype='int64', transform=CONTROL_CONST,
++                                 operands=(int(mutation.sequence_value_id),))
++        self.emit(Handler.Const, [], token,
++                  attributes={'value': context.kind_vocabulary.index(kind) + 1})
++        result = self.produced_value(int(mutation.sequence_value_id), dtype='opaque_ref',
++            claim_provisional_definition=True, cause=(token,))
++        result.accounting.update(native_object_storage_identity=context.storage_identity,
++                                 native_object_source_kind=kind)
++        operand_id, = helper.metadata['opaque_object_helper']['operand_formal_ids']
++        instruction = object_call(module, helper.name, None, context=bindings,
++            operands={operand_id: token}, result=result)
++        instruction.attributes.update(source_object_constructor={
++            'source_value_id': int(mutation.sequence_value_id),
++            'source_node_id': int(mutation.effect_node_id),
++            'kind': kind, 'initial_extent': 0,
++            'context': context.to_mapping()})
++        self.emit(Handler.Call, instruction.args, instruction.res, attributes=instruction.attributes)
++        self.native_object_constructor_receipts.append(instruction.attributes['source_object_constructor'])
++
+     def _lower_sequence_mutation_body(
+         self,
+         mutation: ControlSequenceMutation,
+@@ -7808,6 +7904,15 @@
+     ) -> None:
+         operation = str(mutation.operator)
+         location = f"{path}.sequence_mutation[{mutation.effect_node_id}]"
++        if operation == 'object_construct':
++            self._emit_native_object_constructor(mutation, location=location)
++            return
++        if int(mutation.sequence_value_id) in self.native_object_source_ids:
++            if operation == 'update' and mutation.argument_kind == 'mapping_items' and len(mutation.argument_value_ids) == 2:
++                self._emit_table_store(mutation.effect_node_id, mutation.argument_value_ids[0],
++                                      mutation.argument_value_ids[1], mutation.sequence_value_id)
++                return
++            raise ValueError(f'{location}: native object operation {operation!r}/{mutation.argument_kind!r} is not bound')
+         if mutation.policy is None:
+             self.shortfalls.append(SSALoweringShortfall(
+                 "ssa-sequence",
+@@ -11727,7 +11832,8 @@
+             # already bound to a resident descriptor by sequence_length_values.
+             # Materialize that declared length, not a provisional ABI formal.
+             if (value is None and value_id in self.sequence_length_values
+-                    and self.sequence_length_values[value_id] in self.sequence_descriptors):
++                    and (self.sequence_length_values[value_id] in self.sequence_descriptors
++                         or self.sequence_length_values[value_id] in self.native_object_source_ids)):
+                 value = self.external_value(value_id)
+             if value is not None:
+                 value = carried_port_values.get(int(value.id), value)
+@@ -12082,6 +12188,17 @@
+         if self.evolution is not None and self.ssa_evolution is not None:
+             self.evolution.bind_artifact(function, self.ssa_evolution)
+             self.evolution.close_graph(self.ssa_evolution)
++        if self.native_object_context_used:
++            context = self.native_object_context
++            function.metadata['native_object_context'] = context.to_mapping()
++            function.metadata['source_object_constructors'] = tuple(self.native_object_constructor_receipts)
++            function.metadata['sequence_table'].register(context.objects)
++            function.metadata['sequence_table'].register(context.members)
++            from .ssa_object_context import context_values
++            function.metadata['sequence_array_argument_ids'] = tuple(dict.fromkeys((
++                *function.metadata['sequence_array_argument_ids'],
++                *(cell.id for cell in context_values(context) if cell.shape),
++            )))
+         return function, tuple(self.shortfalls)
+ 
+ 
+@@ -12494,6 +12611,9 @@
+     table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
+     table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+     resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
++    native_object_context: Any = None,
++    native_object_module: Any = None,
++    native_object_value_ids: Iterable[int] = (),
+ ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
+     builder = _ControlSSABuilder(
+         program,
+@@ -12542,6 +12662,9 @@
+         table_region_post_operations=table_region_post_operations,
+         table_epilogue_operations=table_epilogue_operations,
+         resolved_sequence_schemas=resolved_sequence_schemas,
++        native_object_context=native_object_context,
++        native_object_module=native_object_module,
++        native_object_value_ids=native_object_value_ids,
+     )
+     builder.lower(program.root)
+     for kind, arguments in builder.table_epilogue_operations:
+@@ -15038,6 +15161,9 @@
+     progress: Callable[[str], None] | None = None,
+     parameter_value_abi: Mapping[str, Any] | None = None,
+     parameter_record_abi: Mapping[str, Any] | None = None,
++    native_object_context: Any = None,
++    native_object_module: Any = None,
++    native_object_value_ids: Iterable[int] = (),
+ ) -> tuple[
+     IRModule,
+     tuple[SSALoweringShortfall, ...],
+@@ -17583,6 +17709,9 @@
+             for region, operations in table_region_post_operations.items()
+         },
+         table_epilogue_operations=tuple(table_epilogue_operations),
++        native_object_context=native_object_context,
++        native_object_module=native_object_module,
++        native_object_value_ids=native_object_value_ids,
+     )
+     report(
+         f"control lowering complete; blocks={len(control_function.blocks)} "
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -7387,6 +7387,7 @@
+     retained_storage_identities: frozenset[str] = frozenset(),
+     keyed_table_fields: frozenset[str] = frozenset(),
+     keyed_writable_fields: frozenset[str] = frozenset(),
++    native_object_value_ids: frozenset[int] = frozenset(),
+ ):
+     """Recover a method's instance-field accesses as slot loads and stores.
+ 
+@@ -7904,6 +7905,10 @@
+         leaf_ids = tuple(map(int, attributes.get(
+             "aggregate_leaf_value_ids", ()
+         )))
++        if sequence_id in native_object_value_ids:
++            # The accepted object context owns this constructor's payload.
++            # Its authored identity is a scalar handle, not a local arena.
++            continue
+         if (
+             len(leaf_ids) == 1 and sequence_id == leaf_ids[0]
+             or sequence_id in singleton_structural_scalar_ids
+@@ -8010,6 +8015,14 @@
+         if base_id not in graph_obj:
+             return None, None
+         base_data = graph_obj.nodes[base_id]
++        value_id = int(base_data.get("value_id", base_id))
++        if value_id in native_object_value_ids:
++            # The source {} constructor already owns this exact handle.
++            # Omitting it here left item[key]=value as a raw IndexedStore in
++            # a numerical region, which treated opaque_ref as an address.
++            # Keep the incumbent lexical table-operation route, but let its
++            # control emitter bind the accepted native object context.
++            return value_id, f"native-object:{value_id}"
+         inferred_sequence_id = inferred_nested_table_bases.get(
+             int(base_data.get("value_id", base_id))
+         )
+@@ -14949,6 +14962,54 @@
+         if deployment_graph is None
+         else dict(deployment_graph.graph.get("program_abi") or {})
+     )
++    native_object_context = (None if deployment_graph is None else
++                             deployment_graph.graph.get('native_object_context'))
++    native_object_module = None
++    if native_object_context is not None:
++        from .ssa_object_context import lower_object_context
++        native_object_module = lower_object_context(native_object_context,
++            prefix=_identifier(artifact_name) + '__object')
++        all_functions.update(native_object_module.functions)
++        all_sequence_tables.update(native_object_module.sequence_tables)
++        module_metadata['native_object_context'] = native_object_context.to_mapping()
++
++    def native_context_member(caller, formal):
++        """Bind an admitted context cell, never lease it as private scratch.
++
++        Source constructors declare exact context IDs. A forwarding caller
++        receives the same caller-owned cell through this accepted ABI edge;
++        recursion shares the domain but each constructor mints a distinct
++        object handle. Neither dtype nor equal numeric IDs establish the edge.
++        """
++        role = (formal.accounting or {}).get('native_object_context_value_id')
++        if role is None:
++            return None
++        if native_object_context is None:
++            raise ValueError('source call requires an undeclared native object context')
++        from .ssa_object_context import context_values
++        declared = {cell.id: cell for cell in context_values(native_object_context)}
++        expected = declared.get(int(role))
++        if (expected is None or int(formal.id) != int(role)
++                or (formal.dtype, tuple(formal.shape)) != (expected.dtype, tuple(expected.shape))
++                or formal.accounting.get('native_object_context_storage_identity') != native_object_context.storage_identity):
++            raise ValueError('source call native object context formal disagrees with the accepted ABI')
++        for key in ('heap_owner', 'heap_owner_value_id', 'heap_element_dtype'):
++            if formal.accounting.get(key) != expected.accounting.get(key):
++                raise ValueError(f'source call native object context has conflicting {key}')
++        present = function_values(caller)
++        actual = present.get(int(role))
++        if actual is None:
++            actual = clone_value(formal, int(role))
++            caller.args.append(actual)
++        elif (actual.dtype, tuple(actual.shape)) != (expected.dtype, tuple(expected.shape)):
++            raise ValueError('source caller context cell has conflicting physical storage')
++        caller.metadata['native_object_context'] = native_object_context.to_mapping()
++        caller.metadata['sequence_array_argument_ids'] = tuple(dict.fromkeys((
++            *caller.metadata.get('sequence_array_argument_ids', ()), int(role))))
++        table = all_sequence_tables.setdefault(caller.name, SSASequenceTable(owner=caller.name))
++        table.register(native_object_context.objects)
++        table.register(native_object_context.members)
++        return int(role)
+     function_symbols: dict[int, str] = {}
+     shell_symbols: dict[int, str] = {}
+     section_outputs: dict[str, tuple[Any, ...]] = {}
+@@ -16702,11 +16763,20 @@
+             getattr(shell, "dispatch_subgraphs", ()),
+         )
+         from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
++        native_constructor_mutations = ()
++        if native_object_context is not None:
++            from .ssa_object_context import source_constructor_mutations
++            native_constructor_mutations = source_constructor_mutations(graph_obj, native_object_context)
++        native_constructor_ids = {mutation.sequence_value_id for mutation in native_constructor_mutations}
++        from .ssa_object_context import source_object_value_ids
++        native_handle_ids = source_object_value_ids(graph_obj, native_constructor_ids)
+         control, lexical_sequence_shortfalls = _install_lexical_sequence_mutations(
+             control,
+             graph,
+             getattr(shell, "dispatch_subgraphs", ()),
+-            extra_mutations=_dict_literal_mutations(graph_obj),
++            extra_mutations=(*native_constructor_mutations, *(mutation
++                for mutation in _dict_literal_mutations(graph_obj)
++                if mutation.sequence_value_id not in native_constructor_ids)),
+         )
+         control, lexical_query_shortfalls = _install_lexical_sequence_queries(
+             control,
+@@ -16850,6 +16920,7 @@
+         self_id, field_ops, const_sources, field_count, field_names, record_identity, sequence_initializations, field_aliases, sequence_declarations, sequence_memberships, table_lookups, table_lookup_defaults, table_stores, table_deletions, retained_sequence_ids, nested_sequence_ids, nested_tensor_sequence_ids, nested_record_fields, _tombstone_sequence_ids = _field_slot_ops(
+             graph_obj,
+             contract_scope=symbol,
++            native_object_value_ids=native_handle_ids,
+             retained_storage_identities=frozenset(retained_storage_identities),
+             # A contract-declared keyed field is a lookup table, but it is a
+             # program-ABI record field, NOT a class-field aggregate: seeding
+@@ -17259,7 +17330,8 @@
+                     found.update(_generated_sequence_ids(block.condition))
+                 found.update(_generated_sequence_ids(block.body))
+             elif isinstance(block, _ControlSequenceQueryBlock):
+-                found.add(int(block.sequence_value_id))
++                if int(block.sequence_value_id) not in native_handle_ids:
++                    found.add(int(block.sequence_value_id))
+             elif isinstance(block, _ControlSequenceBlock):
+                 for child in block.blocks:
+                     found.update(_generated_sequence_ids(child))
+@@ -17271,6 +17343,11 @@
+                 found.update(_generated_sequence_ids(block.callee))
+             for mutation in mutations:
+                 sequence_id = int(mutation.sequence_value_id)
++                if mutation.operator == 'object_construct':
++                    # This effect publishes a scalar object handle. Its
++                    # payload belongs to the admitted context, not another
++                    # private sequence descriptor for the literal identity.
++                    continue
+                 sequence_data = graph_obj.nodes.get(sequence_id, {})
+                 sequence_attributes = sequence_data.get("attributes") or {}
+                 if (
+@@ -17430,7 +17507,7 @@
+             **dict(graph_obj.graph.get("parameter_defaults") or {}),
+             **dict(graph_obj.graph.get("planner_specializations") or {}),
+         }
+-        parameter_value_dtypes = {}
++        parameter_value_dtypes = {value_id: 'opaque_ref' for value_id in native_handle_ids}
+         parameter_value_shapes = {}
+         # Control-owned tuple members have authored scalar/span contracts.
+         # Numerical helpers may publish a padded one-element view for a
+@@ -18155,6 +18232,8 @@
+             if source_id is not None and int(source_id) in graph_obj
+         )
+         from .identity_concordance import shape_scope_of
++        for value_id in native_constructor_ids:
++            constant_values.pop(int(value_id), None)
+ 
+         module_ir, shortfalls, shell_section_outputs = (
+             lower_control_sections_to_ssa(
+@@ -18162,6 +18241,9 @@
+                 hierarchy_plan=getattr(shell, "hierarchy_plan", None),
+                 value_concordance=planning_concordance,
+                 control_name=symbol,
++                native_object_context=native_object_context,
++                native_object_module=native_object_module,
++                native_object_value_ids=native_handle_ids,
+                 identity_table=dict(graph_obj.graph.get("identity_table") or {}),
+                 function_outputs=tuple(
+                     graph_obj.graph.get("function_outputs") or ()
+@@ -18282,6 +18364,7 @@
+                         },
+                         **dict(sequence_concat_aliases),
+                     },
++                    native_object_value_ids=native_handle_ids,
+                 ),
+                 string_table=string_table,
+                 tensor_ssa_reference=tensor_ssa_reference,
+@@ -29688,6 +29771,14 @@
+             if callee_symbol is None:
+                 return None
+             caller_function = all_functions[caller_symbol]
++            context_member = native_context_member(caller_function, callee_formal)
++            if context_member is not None:
++                binding_cells[int(callee_formal.id)] = _frame_cells(_frame_post(
++                    CALL_BINDING_INPUT, (str(caller_symbol), int(planned_call.callsite_id),
++                        int(callee_formal.id), CallBindingSource.OBJECT_CONTEXT),
++                    int(context_member), stage=FRAME_BINDING, mode=Mode.REVISE,
++                    cells=(_frame_value_cell(callee_function, callee_formal.id),)))
++                return int(context_member)
+             sequence_members: set[int] = set()
+ 
+             member = _linked_caller_member(
+@@ -32020,15 +32111,17 @@
+                             # mint; follow only recorded ids to the caller
+                             # member (never a parameter spelling or a
+                             # dtype/shape key over the caller's formals).
+-                            linked_member = _linked_caller_member(
+-                                str(caller_symbol), record, argument_id,
+-                                all_record_tables.get(str(record.callee_symbol)),
+-                                all_record_tables.get(str(caller_symbol)),
+-                                all_sequence_tables.get(str(record.callee_symbol)),
+-                                all_sequence_tables.get(str(caller_symbol)),
+-                                {int(value.id) for value in caller.args},
+-                                linked_sequence_members,
+-                            )
++                            linked_member = native_context_member(caller, argument)
++                            if linked_member is None:
++                                linked_member = _linked_caller_member(
++                                    str(caller_symbol), record, argument_id,
++                                    all_record_tables.get(str(record.callee_symbol)),
++                                    all_record_tables.get(str(caller_symbol)),
++                                    all_sequence_tables.get(str(record.callee_symbol)),
++                                    all_sequence_tables.get(str(caller_symbol)),
++                                    {int(value.id) for value in caller.args},
++                                    linked_sequence_members,
++                                )
+                             if linked_member is not None:
+                                 caller_storage = values.get(int(linked_member))
+                                 if (
+@@ -40390,6 +40483,7 @@
+                         "program_abi_parameter",
+                         "linked_call_frame_storage",
+                         "returned_record_storage",
++                        "native_object_context_storage_identity",
+                     )):
+                         argument.accounting = {
+                             **accounting,
+@@ -40404,6 +40498,7 @@
+                 accounting.get("linked_call_frame_storage")
+                 or accounting.get("returned_record_storage")
+                 or accounting.get("compiler_frame_storage")
++                or accounting.get("native_object_context_storage_identity")
+             )
+             if not owner:
+                 continue
+@@ -41971,6 +42066,7 @@
+     resolved_process_graph_sink: Callable[[Any], None] | None = None,
+     stop_after_compilation_unit_plan: bool = False,
+     retain_linked_piece_bodies: bool = True,
++    native_object_context: Any = None,
+ ):
+     """Ingest one complete authored program and lower it directly to SSA.
+ 
+@@ -43243,6 +43339,11 @@
+         source_language=source_language,
+     )
+     graph.G.graph["assignment_normalization_receipts"] = assignment_receipts
++    if native_object_context is not None:
++        from ..transmogrifier.ssa import SSAObjectContext
++        if not isinstance(native_object_context, SSAObjectContext):
++            raise TypeError('native_object_context must be an admitted SSAObjectContext')
++        graph.G.graph['native_object_context'] = native_object_context
+     linked_process_graphs = {
+         str(function_name): function_graph
+         for function_name, function_graph in dict(
+--- a/src/compiler/concordance_declarations.py
++++ b/src/compiler/concordance_declarations.py
+@@ -1577,6 +1577,7 @@
+     IDENTITY_ALIAS = "identity_alias"
+     DEFAULT_LITERAL = "default_literal"
+     DISCOVERY = "discovery"
++    OBJECT_CONTEXT = "object_context"
+ 
+ 
+ # -- pages: new --------------------------------------------------------------
+--- a/src/compiler/identity_concordance.py
++++ b/src/compiler/identity_concordance.py
+@@ -2706,7 +2706,8 @@
+                     "descriptor-member-shared", name, value_id,
+                     f"roles={roles!r}",
+                 ))
+-        if function.metadata.get("object_context") is not None:
++        if (function.metadata.get("object_context") is not None
++                or function.metadata.get("native_object_context") is not None):
+             from .ssa_object_context import validate_context_function
+             try:
+                 validate_context_function(module, name)
+@@ -2727,13 +2728,26 @@
+             value_id for value_id, row in rows.items()
+             if any(c.kind == "keyed-part" for c in row.claims)
+         }
++        from .ssa_object_context import source_object_definitions
++        source_definitions = (source_object_definitions(function)
++            if function.metadata.get("native_object_context") is not None else {})
++        object_helpers = {}
+         for block_name, block in function.blocks.items():
+             for index, instruction in enumerate(block.instrs):
+                 attributes = instruction.attributes or {}
++                if (attributes.get("source_object_constructor") is not None
++                        or attributes.get("source_object_operation") is not None):
++                    from .ssa_object_context import validate_source_object_instruction
++                    try:
++                        validate_source_object_instruction(module, name, instruction,
++                            _definitions=source_definitions, _helpers=object_helpers)
++                    except (KeyError, ValueError, TypeError) as error:
++                        found.append(Finding("source-object-contract", name,
++                            None if instruction.res is None else int(instruction.res.id), str(error)))
+                 if attributes.get("opaque_object_operation") is not None:
+                     from .ssa_object_operations import validate_object_call
+                     try:
+-                        validate_object_call(module, instruction)
++                        validate_object_call(module, instruction, _helpers=object_helpers)
+                     except (KeyError, ValueError) as error:
+                         found.append(Finding(
+                             "opaque-object-contract", name,
+--- a/src/compiler/ssa_object_operations.py
++++ b/src/compiler/ssa_object_operations.py
+@@ -203,14 +203,19 @@
+             continue
+         visited.add(name)
+         function = module.functions[name]
+-        from .ssa_object_context import validate_context_function
++        from .ssa_object_context import (validate_context_function,
++            validate_source_object_instruction, source_object_definitions)
+         validate_context_function(module, name)
++        source_definitions = (source_object_definitions(function)
++            if function.metadata.get('native_object_context') is not None else {})
+         from .ssa_heap_allocation import validate_heap_context_projection
+         for formal in function.args:
+             validate_heap_context_projection(module, name, formal)
+         for block in function.blocks.values():
+             for instruction in block.instrs:
+                 validate_object_call(module, instruction, _helpers=helpers)
++                validate_source_object_instruction(module, name, instruction,
++                    _definitions=source_definitions, _helpers=helpers)
+                 callee = instruction.attributes.get("callee") if instruction.op == "Call" else None
+                 if callee in module.functions and callee not in visited:
+                     pending.append(callee)
+--- a/src/compiler/sequence_storage_binding.py
++++ b/src/compiler/sequence_storage_binding.py
+@@ -249,14 +249,19 @@
+     graph_obj: Any,
+     sequence_declarations: Iterable[tuple[int, str, int, bool]],
+     aliases: Mapping[int, int] | Iterable[tuple[int, int]] = (),
++    *, native_object_value_ids: Iterable[int] = (),
+ ) -> dict[int, int]:
+-    """Map authored ``len(sequence)`` results to resident descriptors."""
++    """Map authored length results to exact sequence or object identities."""
+ 
+     declared = {
+         int(sequence_id)
+         for sequence_id, _policy, _columns, _writable
+         in sequence_declarations
+     }
++    # Native object handles have no private sequence declaration. Their length
++    # uses the shared context helper, but store-version aliases are identical
++    # to those already resolved here for resident sequence storage.
++    declared.update(map(int, native_object_value_ids))
+     resident = {value_id: value_id for value_id in declared}
+     resident.update({
+         int(alias): int(source)
+--- a/tools/compiler_probes/probe_native_metadata_copy.py
++++ b/tools/compiler_probes/probe_native_metadata_copy.py
+@@ -31,6 +31,26 @@
+     from src.compiler.extraction_contract import ExtractionContract
+     from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
+ 
++    # Opt-in physical ABI for the unchanged production source. The context
++    # schema is the incumbent SSA descriptor, not a replacement copier.
++    context_options = {}
++    if '--object-context' in sys.argv[1:]:
++        from src.compiler.monotonic_ids import GLOBAL_MONOTONIC_IDS
++        from src.transmogrifier.ssa import (SSAObjectContext,
++            SSASequenceDescriptor, SSASequenceCapacityPolicy)
++        mint = GLOBAL_MONOTONIC_IDS.mint
++        owner = mint()
++        def table(dtypes, keys):
++            columns = tuple(mint() for _ in dtypes)
++            return SSASequenceDescriptor(columns[0], columns, mint(), mint(),
++                status_address_id=mint(), column_dtypes=dtypes, key_columns=keys,
++                capacity_policy=SSASequenceCapacityPolicy.DYNAMIC, heap_owner_value_id=owner)
++        context_options['native_object_context'] = SSAObjectContext('compiler.metadata.context',
++            table(('opaque_ref', 'int64'), (0,)),
++            table(('opaque_ref', 'opaque_ref', 'opaque_ref'), (0, 1)), mint(),
++            ('builtins.dict', 'builtins.list', 'builtins.tuple', 'builtins.set',
++             'builtins.frozenset', 'builtins.object'))
++
+     contract = ExtractionContract(ROOT / "extraction_contracts/program_extraction.yaml")
+     contract = contract.with_program_abi({"records": {}, "bindings": [], "values": [
+         {"function": "metadata_copy_program", "parameter": name,
+@@ -48,6 +68,7 @@
+             python_bindings={}, extraction_contract=contract, runtime_closure_only=True,
+             progress=lambda message: print(str(message), flush=True)
+             if str(message).startswith("ssa-source:") else None, progress_bars=False,
++            **context_options,
+         )
+         artifact = emit_ssa_function_to_llvm(module, exports[0])
+         print("LLVM_COMPLETE: " + repr((artifact.complete, artifact.shortfalls)), flush=True)
+--- /dev/null
++++ b/tests/test_source_object_context.py
+@@ -0,0 +1,160 @@
++"""Ordinary authored object births through the public source compiler."""
++from pathlib import Path
++import numpy as np
++import pytest
++
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++from src.compiler.identity_concordance import concordance_report
++from src.compiler.monotonic_ids import GLOBAL_MONOTONIC_IDS
++from src.compiler.shell_external_references import ExternalReferenceValueCodec
++from src.compiler.ssa_object_context import lower_object_context
++from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution
++from src.transmogrifier.ssa import SSAObjectContext, SSASequenceDescriptor, SSASequenceCapacityPolicy
++
++
++def context():
++    mint = GLOBAL_MONOTONIC_IDS.mint
++    owner = mint()
++    def table(dtypes, keys):
++        columns = tuple(mint() for _ in dtypes)
++        return SSASequenceDescriptor(columns[0], columns, mint(), mint(),
++            status_address_id=mint(), column_dtypes=dtypes, key_columns=keys,
++            capacity_policy=SSASequenceCapacityPolicy.DYNAMIC, heap_owner_value_id=owner)
++    return SSAObjectContext('source.context', table(('opaque_ref', 'int64'), (0,)),
++        table(('opaque_ref', 'opaque_ref', 'opaque_ref'), (0, 1)), mint(),
++        ('builtins.dict', 'builtins.list', 'builtins.tuple', 'builtins.set',
++         'builtins.frozenset', 'builtins.object'))
++
++
++@pytest.mark.parametrize('literal, expected', [('{}', dict), ('[]', list)])
++@pytest.mark.parametrize('mode', ['direct', 'forwarded', 'recursive', 'loop', 'conditional'])
++def test_source_constructor_has_handle_not_private_recursive_columns(tmp_path, literal, expected, mode):
++    if mode == 'direct':
++        source = f'def root(n):\n    item={literal}\n    return item\n'
++    elif mode == 'forwarded':
++        source = (f'def make(n):\n    item={literal}\n    return item\n'
++                  'def relay(n):\n    return make(n)\ndef root(n):\n    return relay(n)\n')
++    elif mode == 'recursive':
++        source = (f'def visit(n):\n    item={literal}\n'
++                  '    if n>0.0:\n        result=visit(n-1.0)\n'
++                  '    else:\n        result=item\n    return result\n'
++                  'def root(n):\n    return visit(n)\n')
++    elif mode == 'loop':
++        source = (f'def root(n):\n    item={literal}\n'
++                  f'    while n>0.0:\n        item={literal}\n        n=n-1.0\n'
++                  '    return item\n')
++    else:
++        source = (f'def root(n):\n    if n>0.0:\n        item={literal}\n'
++                  f'    else:\n        item={literal}\n    return item\n')
++    repository = Path(__file__).resolve().parents[1]
++    policy = ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_program_abi(
++        {'records': {}, 'bindings': [], 'values': [{'function': '*', 'parameter': 'n',
++         'storage': 'scalar', 'dtype': 'float64', 'python_type': 'builtins.float'}]}).with_execution_file(
++        repository / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    scope = context()
++    module, _, exports = lower_ast_source_to_ssa(source, 'root', name='authored_birth',
++        extraction_contract=policy, native_object_context=scope, progress=lambda _: None, progress_bars=False)
++    constructors = [instruction for function in module.functions.values()
++                    for block in function.blocks.values() for instruction in block.instrs
++                    if instruction.attributes.get('source_object_constructor')]
++    assert len(constructors) == (2 if mode in {'loop', 'conditional'} else 1)
++    assert constructors[0].res.dtype == 'opaque_ref' and constructors[0].res.shape == ()
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'source')
++    release_module = lower_object_context(scope, prefix='release_source')
++    release = compile_artifact(emit_ssa_function_to_llvm(release_module, 'release_source_release'),
++                               directory=tmp_path / 'release')
++    root = module.functions[exports[0]]
++    outputs = [instruction.args[0] for block in root.blocks.values()
++               for instruction in block.instrs if instruction.op == 'Ret' and instruction.args]
++    for depth in ((0, 1, 7, 32) if mode in {'recursive', 'loop', 'conditional'} else (0,)):
++        boundary = ExternalReferenceValueCodec().bind_native_objects(scope, ())
++        feeds = {}
++        for value in root.args:
++            role = value.accounting.get('native_object_context_value_id')
++            if role is not None:
++                feeds[value.id] = boundary.buffers[role]
++        parameters = dict(root.metadata['parameter_names'])
++        if 'n' in parameters:
++            feeds[parameters['n']] = np.array([depth], dtype=np.float64)
++        try:
++            execution = prepare_artifact_execution(native, feeds)
++            execution.run()
++            handle = int(execution.buffers[outputs[0].id].item())
++            result, = boundary.export((handle,))
++            assert type(result) is expected and len(result) == 0
++            assert boundary.buffers[scope.objects.length_address_id][0] == (depth + 1 if mode in {'recursive', 'loop'} else 1)
++        finally:
++            prepare_artifact_execution(release, boundary.buffers).run()
++            boundary.close()
++
++
++@pytest.mark.parametrize('expression', ['item', 'item[key]', 'len(item)'])
++def test_source_dictionary_reference_store_lookup_and_length(tmp_path, expression):
++    repository = Path(__file__).resolve().parents[1]
++    policy = ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_program_abi(
++        {'records': {}, 'bindings': [], 'values': [{'function': 'root', 'parameter': name,
++         'storage': 'reference', 'python_type': 'builtins.object'} for name in ('key', 'value')]}).with_execution_file(
++        repository / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    scope = context()
++    source = 'def root(key,value):\n    item={}\n    item[key]=value\n    return ' + expression + '\n'
++    module, _, exports = lower_ast_source_to_ssa(source, 'root', name='authored_member',
++        extraction_contract=policy, native_object_context=scope, progress=lambda _: None, progress_bars=False)
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    artifact = emit_ssa_function_to_llvm(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'source')
++    release_module = lower_object_context(scope, prefix='release_member')
++    release = compile_artifact(emit_ssa_function_to_llvm(release_module, 'release_member_release'),
++                               directory=tmp_path / 'release')
++    root = module.functions[exports[0]]
++    parameters = dict(root.metadata['parameter_names'])
++    key, value = object(), object()
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (key, value))
++    feeds = {argument.id: boundary.buffers[argument.accounting['native_object_context_value_id']]
++             for argument in root.args if 'native_object_context_value_id' in argument.accounting}
++    for name, handle in zip(('key', 'value'), boundary.roots):
++        if name in parameters:
++            feeds[parameters[name]] = np.array([handle], dtype=np.int64)
++    try:
++        execution = prepare_artifact_execution(native, feeds).run()
++        output = next(instruction.args[0] for block in root.blocks.values()
++                      for instruction in block.instrs if instruction.op == 'Ret')
++        returned = int(execution.buffers[output.id].item())
++        if expression == 'len(item)':
++            assert returned == 1
++        else:
++            result, = boundary.export((returned,))
++            assert result is value if expression == 'item[key]' else result == {key: value}
++    finally:
++        prepare_artifact_execution(release, boundary.buffers).run()
++        boundary.close()
++
++
++@pytest.mark.parametrize('corruption', ['role', 'token', 'context'])
++def test_source_context_audit_and_emission_refuse_stale_receipts(corruption):
++    from src.compiler.ssa_object_operations import validate_object_operations
++    repository = Path(__file__).resolve().parents[1]
++    scope = context()
++    policy = ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_execution_file(
++        repository / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    module, _, exports = lower_ast_source_to_ssa('def root():\n    item={}\n    return item\n',
++        'root', name='stale_birth', extraction_contract=policy, native_object_context=scope,
++        progress=lambda _: None, progress_bars=False)
++    root = module.functions[exports[0]]
++    if corruption == 'role':
++        formal = next(value for value in root.args if value.id == scope.next_handle_value_id)
++        formal.accounting['native_object_context_value_id'] = -1
++    elif corruption == 'token':
++        token = next(i for b in root.blocks.values() for i in b.instrs if i.op == 'Const')
++        token.attributes['value'] = 2
++    else:
++        module.metadata['native_object_context'] = dict(scope.to_mapping(), storage_identity='other')
++    assert 'object-context-contract' in concordance_report(module) or 'source-object-contract' in concordance_report(module)
++    with pytest.raises(ValueError):
++        validate_object_operations(module, exports[0])
+

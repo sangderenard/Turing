@@ -1,0 +1,135 @@
+diff --git a/src/compiler/glsl_deployment_strategy.py b/src/compiler/glsl_deployment_strategy.py
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -8513,7 +8546,22 @@ def _source_control_nesting_hints(
+         for parent_index, parent_expression in expressions.items():
+             if parent_index == child_index:
+                 continue
+-            descendants = tuple(ast.walk(parent_expression))
++            # The metadata copier's `if all(new is old for ...)` evaluates
++            # its comprehension BEFORE entering the conditional. Walking the
++            # whole If assigned that predicate loop to the arm although its
++            # region marker is outside the arm, and overlay refused (4)/(0).
++            # Use the same authored arm-slot ownership as ordinary conditional
++            # nesting above; do not infer it from overlapping region sets.
++            if isinstance(parent_expression, (ast.If, ast.IfExp)):
++                statements = (
++                    (parent_expression.body, parent_expression.orelse)
++                    if isinstance(parent_expression, ast.IfExp)
++                    else (*parent_expression.body, *parent_expression.orelse)
++                )
++                descendants = tuple(member for statement in statements
++                                    for member in ast.walk(statement))
++            else:
++                descendants = tuple(ast.walk(parent_expression))
+             child_signature = _ast_source_signature(child_expression)
+             if not any(
+                 id(member) == id(child_expression)
+diff --git a/tests/test_metadata_copy_control_ownership.py b/tests/test_metadata_copy_control_ownership.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_metadata_copy_control_ownership.py
+@@ -0,0 +1,33 @@
++"""Predicate computation precedes an If; it is not that If's arm body."""
++import ast
++from types import SimpleNamespace
++
++import networkx as nx
++import pytest
++
++from src.compiler.control_source import ConditionalBlock, ControlProgram, StatementBlock
++from src.compiler.glsl_deployment_strategy import _source_control_nesting_hints
++
++
++@pytest.mark.parametrize("in_predicate", [True, False])
++def test_comprehension_ownership_uses_conditional_arm_slots(in_predicate):
++    source = (
++        "if all(item is not None for item in values):\n    result = 1\n"
++        if in_predicate else
++        "if enabled:\n    result = all(item is not None for item in values)\n"
++    )
++    conditional = ast.parse(source).body[0]
++    clause = next(node for node in ast.walk(conditional) if isinstance(node, ast.comprehension))
++    G = nx.DiGraph()
++    G.add_node(1, expr_obj=conditional)
++    G.add_node(2, expr_obj=clause)
++    graph = SimpleNamespace(G=G)
++    reduction = SimpleNamespace(loop_node_id=2, control_program=None, region_indices=(0,))
++    control = ControlProgram(
++        ConditionalBlock(10, StatementBlock(("__scheduled_region_4__",)), source_node_id=1),
++        region_indices=(4,),
++    )
++
++    hints = _source_control_nesting_hints((reduction,), (control,), (), graph)
++
++    assert hints == ({} if in_predicate else {1: frozenset({0})})
+diff --git a/tools/compiler_probes/probe_native_metadata_copy.py b/tools/compiler_probes/probe_native_metadata_copy.py
+new file mode 100644
+--- /dev/null
++++ b/tools/compiler_probes/probe_native_metadata_copy.py
+@@ -0,0 +1,65 @@
++"""Compile the ENTIRE incumbent metadata copier, without a Python callback.
++
++The source is taken from the production extractor, not reimplemented. Its
++memo is an explicit boundary input because one extraction shares it across
++graph metadata and every node. No deadline and no production route mutation.
++"""
++import ast
++from pathlib import Path
++import sys
++import time
++import traceback
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT))
++
++
++def authored_program():
++    tree = ast.parse((ROOT / "src/compiler/process_graph_fusion.py").read_text())
++    extractor = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
++                     and node.name == "extract_clean_process_subgraph")
++    copier = next(node for node in extractor.body if isinstance(node, ast.FunctionDef)
++                  and node.name == "isolate_metadata")
++    root = ast.parse("def metadata_copy_program(value, metadata_memo):\n"
++                     "    return isolate_metadata(value)\n").body[0]
++    root.body.insert(0, copier)
++    return ast.unparse(ast.fix_missing_locations(ast.Module(body=[root], type_ignores=[])))
++
++
++def main():
++    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++    from src.compiler.extraction_contract import ExtractionContract
++    from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
++
++    contract = ExtractionContract(ROOT / "extraction_contracts/program_extraction.yaml")
++    contract = contract.with_program_abi({"records": {}, "bindings": [], "values": [
++        {"function": "metadata_copy_program", "parameter": name,
++         "storage": "reference", "mutable": True,
++         "python_type": "builtins.object" if name == "value" else "builtins.dict"}
++        for name in ("value", "metadata_memo")
++    ]}).with_execution_file(ROOT / "extraction_contracts/vehicle_full_native_execution.yaml")
++    source = authored_program()
++    print("EXACT_METADATA_COPIER_SUBMISSION: " + str(len(source.splitlines()))
++          + " authored lines; full-native, no Python callbacks", flush=True)
++    started = time.perf_counter()
++    try:
++        module, _outputs, exports = lower_ast_source_to_ssa(
++            source, "metadata_copy_program", name="compiler_metadata_copy",
++            python_bindings={}, extraction_contract=contract, runtime_closure_only=True,
++            progress=lambda message: print(str(message), flush=True)
++            if str(message).startswith("ssa-source:") else None, progress_bars=False,
++        )
++        artifact = emit_ssa_function_to_llvm(module, exports[0])
++        print("LLVM_COMPLETE: " + repr((artifact.complete, artifact.shortfalls)), flush=True)
++        return 0 if artifact.complete else 2
++    except Exception as error:
++        print("EXACT_METADATA_COPIER_BLOCKER: " + type(error).__name__ + ": " + str(error),
++              flush=True)
++        traceback.print_exc(file=sys.stdout)
++        return 2
++    finally:
++        print("ELAPSED: " + str(time.perf_counter() - started), flush=True)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

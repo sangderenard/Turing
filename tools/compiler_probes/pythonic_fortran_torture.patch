@@ -1,0 +1,1154 @@
+diff --git a/src/compiler/compiled_program_api.py b/src/compiler/compiled_program_api.py
+--- a/src/compiler/compiled_program_api.py
++++ b/src/compiler/compiled_program_api.py
+@@ -163,6 +163,8 @@ def describe_fortran_function(
+     dynamic_array_dimensions: Mapping[int, Sequence[str]] | None = None,
+     array_argument_ids: Iterable[int] = (),
+     reference_argument_ids: Iterable[int] = (),
++    value_dtypes: Mapping[int, str] | None = None,
++    value_shapes: Mapping[int, Sequence[int]] | None = None,
+ ) -> EntryPoint:
+     """Describe one emitted Fortran subroutine's calling contract.
+ 
+@@ -172,6 +174,14 @@ def describe_fortran_function(
+     """
+ 
+     parameters: list[Parameter] = []
++    # The emitter's resolved declaration is the ABI authority. Raw SSA
++    # occurrences may be rankless placeholders for compiler-owned arrays.
++    from dataclasses import replace
++    def declared(value):
++        return replace(value,
++            dtype=(value_dtypes or {}).get(int(value.id), value.dtype),
++            shape=tuple((value_shapes or {}).get(int(value.id), value.shape)))
++    outputs = tuple(declared(value) for value in outputs)
+     source_names = dict(source_names or {})
+     source_transforms = dict(source_transforms or {})
+     dynamic_array_extents = {
+@@ -198,7 +208,8 @@ def describe_fortran_function(
+             )
+         )
+     output_ids = {value.id for value in outputs}
+-    for value in function.args:
++    for occurrence in function.args:
++        value = declared(occurrence)
+         c_type, ctypes_name = _c_type_for(value.dtype)
+         dynamic_extent = dynamic_array_extents.get(int(value.id))
+         array = (
+@@ -221,7 +232,8 @@ def describe_fortran_function(
+                 or accounting.get("compiler_frame_storage") is not None
+             )
+         )
+-        dimensions = dynamic_array_dimensions.get(int(value.id), ())
++        dimensions = dynamic_array_dimensions.get(int(value.id), ()) or tuple(
++            f"extent_{int(size)}" for size in value.shape)
+         parameters.append(
+             Parameter(
+                 name=f"t{value.id}",
+@@ -267,7 +279,8 @@ def describe_fortran_function(
+         if value.id in {argument.id for argument in function.args}:
+             continue
+         c_type, ctypes_name = _c_type_for(value.dtype)
+-        dimensions = dynamic_array_dimensions.get(int(value.id), ())
++        dimensions = dynamic_array_dimensions.get(int(value.id), ()) or tuple(
++            f"extent_{int(size)}" for size in value.shape)
+         parameters.append(
+             Parameter(
+                 name=f"t{value.id}",
+@@ -282,7 +295,8 @@ def describe_fortran_function(
+                     if len(dimensions) == 1
+                     else (
+                         str(extent_names[-1])
+-                        if extent_names and not dimensions
++                        if (value.shape or int(value.id) in array_argument_ids)
++                        and extent_names and not dimensions
+                         else None
+                     )
+                 ),
+diff --git a/src/compiler/control_source.py b/src/compiler/control_source.py
+--- a/src/compiler/control_source.py
++++ b/src/compiler/control_source.py
+@@ -63,7 +63,7 @@ class ControlExpression:
+     op: str
+     operands: tuple["ControlExpression", ...] = ()
+     value_id: int | None = None
+-    literal: bool | int | float | None = None
++    literal: bool | int | float | tuple | list | None = None
+     # Where a ``value`` leaf was read: ``(consumer node, operand role,
+     # ordinal)``, the key of its ``lexical_read_binding`` row.  Structure
+     # only -- the binding it read is the book's fact, looked up by the
+@@ -170,7 +170,7 @@ class LoopBlock:
+     #: ``(initial id, literal)`` for carried seeds that folded to constants;
+     #: the SSA lowering materializes these as Const instead of inventing a
+     #: producerless argument for an evaporated node.
+-    carried_seeds: tuple[tuple[int, float], ...] = ()
++    carried_seeds: tuple[tuple[int, bool | int | float], ...] = ()
+     # The planner has proved that iterations communicate only through
+     # induction-indexed publications.  A parallel backend may map one
+     # iteration to one workgroup; ordinary renderers retain a serial loop.
+@@ -229,7 +229,7 @@ class WhileBlock:
+     body: "ControlBlock"
+     carried_aliases: tuple[tuple[int, int], ...] = ()
+     result_ports: tuple[tuple[int, int, int], ...] = ()
+-    carried_seeds: tuple[tuple[int, float], ...] = ()
++    carried_seeds: tuple[tuple[int, bool | int | float], ...] = ()
+     recursion_region_id: int | None = None
+     predicate_expression: ControlExpression | None = None
+     sequence_mutations: tuple[ControlSequenceMutation, ...] = ()
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -54,6 +54,7 @@ from .shell_telemetry import (
+ from .fortran_toolchain import (
+     aggressive_c_flags,
+     aggressive_fortran_flags,
++    gnu_lto_flag,
+     standalone_fortran_link_flags,
+     standalone_runtime_shim_sources,
+ )
+@@ -7285,7 +7286,7 @@ def compile_fortran_module_c_shell(
+         try:
+             link_flags = (
+                 standalone_fortran_link_flags(compiler)
+-                if standalone else ("-flto",)
++                if standalone else (gnu_lto_flag(),)
+             )
+         except ValueError as error:
+             raise FortranEmissionError(str(error)) from error
+diff --git a/src/compiler/fortran_toolchain.py b/src/compiler/fortran_toolchain.py
+--- a/src/compiler/fortran_toolchain.py
++++ b/src/compiler/fortran_toolchain.py
+@@ -11,6 +11,15 @@ def is_gnu_fortran(compiler: str) -> bool:
+     return "gfortran" in Path(compiler).name.casefold()
+ 
+ 
++def gnu_lto_flag() -> str:
++    """Use the available hardware threads for GCC's partitioned LTO work.
++
++    This controls build-time jobs, not program-loop concurrency. Bare -flto
++    does not request a job count when the build has no make jobserver.
++    """
++    return f"-flto={max(1, os.cpu_count() or 1)}"
++
++
+ def aggressive_fortran_flags(
+     compiler: str, *, precision_sections: bool = False,
+ ) -> tuple[str, ...]:
+@@ -33,7 +42,7 @@ def aggressive_fortran_flags(
+     contract = ("-ffp-contract=off",) if precision_sections else ()
+     if "gfortran" in name:
+         return (
+-            "-O3", "-march=native", "-flto", "-funroll-loops",
++            "-O3", "-march=native", gnu_lto_flag(), "-funroll-loops",
+             "-fomit-frame-pointer", "-ffree-line-length-none", *contract,
+         )
+     if name.startswith(("ifx", "ifort")):
+@@ -53,7 +62,7 @@ def aggressive_c_flags(fortran_compiler: str) -> tuple[str, ...]:
+ 
+     if is_gnu_fortran(fortran_compiler):
+         return (
+-            "-O3", "-march=native", "-flto", "-funroll-loops",
++            "-O3", "-march=native", gnu_lto_flag(), "-funroll-loops",
+             "-fomit-frame-pointer",
+         )
+     return ("-O3",)
+@@ -67,7 +76,7 @@ def standalone_fortran_link_flags(compiler: str) -> tuple[str, ...]:
+             "standalone runtime linkage is currently defined only for GNU "
+             "Fortran; set standalone=False or add a verified compiler policy"
+         )
+-    flags = ["-flto", "-static-libgfortran", "-static-libgcc"]
++    flags = [gnu_lto_flag(), "-static-libgfortran", "-static-libgcc"]
+     if os.name == "nt":
+         # This also selects archive forms of libquadmath and transitive GNU
+         # support libraries. Windows system DLLs remain normal OS ABI imports.
+diff --git a/src/compiler/ir_indexing.py b/src/compiler/ir_indexing.py
+--- a/src/compiler/ir_indexing.py
++++ b/src/compiler/ir_indexing.py
+@@ -181,7 +181,7 @@ def _propagate_scalar_dtypes(functions) -> None:
+     from .concordance_declarations import (
+         CONST_DECLARED_WIDTH_NOT_ON_BOOK, LOAD_DECLARED_WIDTH_NOT_ON_BOOK, INFERRED_INTEGER_WIDEN,
+         IntegerWidthDecision, IntegerWidthFact, SCALAR_DTYPE_SETTLEMENT,
+-        SCALAR_INTEGER_WIDTH, SSA_VALUE, WIDENED_VALUE_NOT_ON_BOOK,
++        SCALAR_INTEGER_WIDTH, SSA_VALUE, WIDENED_VALUE_NOT_ON_BOOK, SSAValueFact,
+     )
+     from .identity_concordance import (
+         Derived, Mode, Novel, Unsourced, current_identity_book,
+@@ -224,6 +224,8 @@ def _propagate_scalar_dtypes(functions) -> None:
+                 instructions.append(instruction)
+                 for value in (
+                     *instruction.args,
++                    *(value for _, value in (instruction.attributes.get("incoming") or ())
++                      if instruction.op in {"Phi", "phi"}),
+                     *((instruction.res,) if instruction.res is not None else ()),
+                 ):
+                     values.setdefault(int(value.id), []).append(value)
+@@ -327,6 +329,19 @@ def _propagate_scalar_dtypes(functions) -> None:
+                     )
+                 elif instruction.op == "Cast":
+                     inferred = instruction.attributes.get("target_dtype")
++                elif instruction.op in {"Phi", "phi"}:
++                    # A merge is storage selection, not numeric promotion.
++                    # Metrics.hard_failure's incoming bool slots settle after
++                    # call linking, but its provisional merge stayed double.
++                    # Follow the exact incoming identities to a fixed point;
++                    # mixed representations still require explicit edge Casts
++                    # and are deliberately left for the backend to reject.
++                    incoming = instruction.attributes.get("incoming")
++                    incoming_values = (tuple(value for _, value in incoming)
++                                       if incoming else tuple(instruction.args))
++                    incoming_types = {dtype_of.get(int(value.id)) for value in incoming_values}
++                    if len(incoming_types) == 1 and None not in incoming_types:
++                        inferred = next(iter(incoming_types))
+                 elif instruction.op == "Load" and instruction.args:
+                     declared = str(instruction.res.dtype or "")
+                     base_id = address_base.get(int(instruction.args[0].id))
+@@ -396,7 +411,7 @@ def _propagate_scalar_dtypes(functions) -> None:
+                 # WIDENED is NOVEL(INFERRED_INTEGER_WIDEN) from the value's
+                 # own ``ssa_value`` cell.  The book and the instruction
+                 # disagreeing about a declared width is a missing edge: raise.
+-                if inferred in narrow_integers:
++                if inferred in narrow_integers and instruction.op not in {"Phi", "phi"}:
+                     declared = str(instruction.res.dtype or "")
+                     if (
+                         (instruction.op == "Const" or result_id in declared_load_ids)
+@@ -458,3 +473,19 @@ def _propagate_scalar_dtypes(functions) -> None:
+         for value_id, dtype in dtype_of.items():
+             for value in values.get(value_id, ()):
+                 value.dtype = dtype
++        # The Phi's SSA record is the same identity, revised from its exact
++        # incoming records. Keep this settlement visible to the concordance.
++        for instruction in instructions:
++            if instruction.op not in {"Phi", "phi"} or instruction.res is None:
++                continue
++            previous, fact = value_cell(int(instruction.res.id))
++            if previous is None or fact.dtype == instruction.res.dtype:
++                continue
++            incoming = instruction.attributes.get("incoming")
++            incoming_values = tuple(v for _, v in incoming) if incoming else instruction.args
++            sources = tuple(cell for value in incoming_values
++                            for cell in (value_cell(int(value.id))[0],) if cell is not None)
++            book.post(SSA_VALUE, (scope, int(instruction.res.id)),
++                      SSAValueFact(instruction.res.dtype, fact.shape, fact.origin),
++                      stage=SCALAR_DTYPE_SETTLEMENT,
++                      provenance=Derived((previous, *sources)), mode=Mode.REVISE)
+diff --git a/src/compiler/ir_sequence_tables.py b/src/compiler/ir_sequence_tables.py
+--- a/src/compiler/ir_sequence_tables.py
++++ b/src/compiler/ir_sequence_tables.py
+@@ -741,7 +741,10 @@ def lower_sequence_insert(
+                 [column, destination_index], destination_address,
+             )
+             stored = value
+-            if row_width != 1:
++            # A singleton shaped row is still an array. Store its element,
++            # not its address/array value (append((..., (3.0,)))): Fortran
++            # rejected the rank mismatch, while scalar-only tests missed it.
++            if row_shape:
+                 source_address = builder.fresh("ptr")
+                 stored = builder.fresh(value.dtype)
+                 builder.emit(
+diff --git a/src/compiler/kernel_bank.py b/src/compiler/kernel_bank.py
+--- a/src/compiler/kernel_bank.py
++++ b/src/compiler/kernel_bank.py
+@@ -620,7 +620,7 @@ class KernelBank:
+                 entry for entry in fortran_module.api.entry_points
+                 if str(entry.name) == entrypoint
+             )
+-            return FortranCoreNative(built.executable_path, record)
++            return FortranCoreNative(built.executable_path, record, fortran_module.api)
+         if name == "glsl":
+             from src.compiler.ssa_glsl_compute_backend import (
+                 emit_ssa_module_to_glsl_compute,
+diff --git a/src/compiler/loop_composer.py b/src/compiler/loop_composer.py
+--- a/src/compiler/loop_composer.py
++++ b/src/compiler/loop_composer.py
+@@ -4260,6 +4260,7 @@ def analyze_shader_loop_reductions(
+         node_id: int,
+         visiting: frozenset[int] = frozenset(),
+         read: tuple | None = None,
++        *, aggregate_truth: bool = True,
+     ) -> ControlExpression | None:
+         # ``read`` is the operand position this node is read at, so a
+         # ``value`` leaf carries the key of its ``lexical_read_binding`` row
+@@ -4308,6 +4309,11 @@ def analyze_shader_loop_reductions(
+         if value_id in carried_initial_value_ids:
+             return ControlExpression("value", value_id=value_id, read=read)
+         known, literal = _constant(graph, int(resolved_node_id))
++        # append((1.0, 2.0, (3.0,))) carries the nested row's data,
++        # not bool((3.0,)). The graph already retained the exact constant.
++        # Predicates still query aggregate length; data operands retain it.
++        if not aggregate_truth and known and isinstance(literal, (tuple, list)):
++            return ControlExpression("const", value_id=value_id, literal=literal)
+         if known and isinstance(literal, (bool, int, float)):
+             return ControlExpression(
+                 "const", value_id=value_id, literal=literal
+@@ -5266,7 +5272,7 @@ def analyze_shader_loop_reductions(
+                     int(effect.effect_node_id)
+                 ),
+                 argument_expressions=tuple(
+-                    structured_control_expression(int(value_id))
++                    structured_control_expression(int(value_id), aggregate_truth=False)
+                     for value_id in mutation_arguments
+                 ),
+                 extraction_identity=(
+@@ -5316,7 +5322,7 @@ def analyze_shader_loop_reductions(
+                 argument_kind="mapping_items" if kind == "dict" else "value",
+                 predicate_expression=output_predicate,
+                 argument_expressions=tuple(
+-                    structured_control_expression(int(value_id))
++                    structured_control_expression(int(value_id), aggregate_truth=False)
+                     for value_id in arguments
+                 ),
+                 object_contract_cell=cell,
+@@ -5770,10 +5776,11 @@ def analyze_shader_loop_reductions(
+                 literal = seed_data.get("constant")
+                 if literal is None:
+                     literal = (seed_data.get("attributes") or {}).get("value")
+-                if isinstance(literal, (int, float)) and not isinstance(
+-                    literal, bool
+-                ):
+-                    carried_seeds.append((initial, float(literal)))
++                # run_superstep's integer iters=0 was converted to 0.0 here;
++                # its Add backedge remains int64. Keep the source literal's
++                # representation for the control-owned seed, including bool.
++                if isinstance(literal, (bool, int, float)):
++                    carried_seeds.append((initial, literal))
+             carried_seeds = tuple(carried_seeds)
+             if loop.source_type == "While":
+                 return WhileBlock(
+diff --git a/src/compiler/precompile_to_ssa.py b/src/compiler/precompile_to_ssa.py
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -6281,6 +6281,20 @@ class _ControlSSABuilder:
+             }
+             return value
+         if expression.op == "const":
++            if isinstance(expression.literal, (tuple, list)):
++                # Data-context aggregate constants use ordinary typed SSA
++                # Const storage. Never reduce a row payload to truthiness.
++                import numpy as np
++                literal = np.asarray(expression.literal)
++                if literal.dtype.kind not in "bifu":
++                    raise ValueError("control row constant needs a rectangular numeric layout")
++                result = result_override or self.fresh_value(
++                    dtype=str(literal.dtype), shape=tuple(literal.shape),
++                    transform=CONTROL_CONST, operands=(expression.value_id,),
++                )
++                self.emit(Handler.Const, [], result,
++                    attributes={"values": literal.tolist()})
++                return result
+             result = result_override or self.fresh_value(
+                 dtype="bool" if isinstance(expression.literal, bool) else None,
+                 transform=CONTROL_CONST, operands=(expression.value_id,),
+@@ -10148,9 +10162,12 @@ class _ControlSSABuilder:
+         # an invalid Phi even for a two-member native table iteration.
+         # Derive the counter from the actual range operands and widen the
+         # preheader seeds explicitly; never repair the Phi at emission.
+-        induction_dtype = "int64" if any(
+-            value.dtype == "int64" for value in (start, stop, step)
+-        ) else "int"
++        # The shared scalar settlement widens inferred integer Add to int64,
++        # including this counter's latch. A constant-bounded range(32) used
++        # to mint an int32 header/seed and acquire an int64 latch afterwards.
++        # State the same integer-arithmetic width at the counter's producer;
++        # explicitly convert range operands, without relabelling their cells.
++        induction_dtype = "int64"
+         if induction_dtype == "int64":
+             def range_operand(value):
+                 if value.dtype == induction_dtype:
+@@ -10170,12 +10187,14 @@ class _ControlSSABuilder:
+             if seed_id in self.external_values:
+                 continue
+             seed_value = self.fresh_value(
+-                dtype="float64", transform=CONTROL_CONST,
++                dtype=("bool" if isinstance(seed_literal, bool) else
++                       "int64" if isinstance(seed_literal, int) else "float64"),
++                transform=CONTROL_CONST,
+                 operands=(seed_id, loop.source_loop_node_id),
+             )
+             self.emit(
+                 Handler.Const, [], seed_value,
+-                attributes={"value": float(seed_literal)},
++                attributes={"value": seed_literal},
+             )
+             # LOOP_SEED: the folded seed's own identity cell is the cause.
+             self._bind(
+@@ -11144,12 +11163,14 @@ class _ControlSSABuilder:
+             if seed_id in self.external_values:
+                 continue
+             seed_value = self.fresh_value(
+-                dtype="float64", transform=CONTROL_CONST,
++                dtype=("bool" if isinstance(seed_literal, bool) else
++                       "int64" if isinstance(seed_literal, int) else "float64"),
++                transform=CONTROL_CONST,
+                 operands=(seed_id, loop.source_loop_node_id),
+             )
+             self.emit(
+                 Handler.Const, [], seed_value,
+-                attributes={"value": float(seed_literal)},
++                attributes={"value": seed_literal},
+             )
+             # LOOP_SEED: the folded seed's own identity cell is the cause.
+             self._bind(
+diff --git a/src/compiler/ssa_c_backend.py b/src/compiler/ssa_c_backend.py
+--- a/src/compiler/ssa_c_backend.py
++++ b/src/compiler/ssa_c_backend.py
+@@ -106,7 +106,7 @@ class CFunctionArtifact:
+         return not self.shortfalls
+ 
+     def compile(
+-        self, directory: str | Path, *, optimization: str = "O2",
++        self, directory: str | Path, *, optimization: str = "O3",
+     ) -> "CFunctionArtifact":
+         if not self.complete:
+             raise ValueError("C artifact has emission shortfalls")
+@@ -1034,7 +1034,7 @@ class CModuleArtifact:
+         return inputs, libraries
+ 
+     def compile(
+-        self, directory: str | Path, *, optimization: str = "O2",
++        self, directory: str | Path, *, optimization: str = "O3",
+         link: str = "static",
+     ) -> "CModuleArtifact":
+         if link not in {"static", "dynamic"}:
+diff --git a/src/compiler/ssa_fortran_backend.py b/src/compiler/ssa_fortran_backend.py
+--- a/src/compiler/ssa_fortran_backend.py
++++ b/src/compiler/ssa_fortran_backend.py
+@@ -437,6 +437,8 @@ class FortranSubroutine:
+     # caller's projection cell must match these at the call, bridging any
+     # difference with an explicit conversion after the call returns.
+     output_dtypes: tuple[str, ...] = ()
++    argument_shapes: tuple[tuple[int, ...], ...] = ()
++    output_shapes: tuple[tuple[int, ...], ...] = ()
+ 
+     @property
+     def complete(self) -> bool:
+@@ -4123,10 +4125,19 @@ class _FunctionEmitter:
+ 
+         name = self.function.name
+         native_name = self.native_symbol
++        # Unconditional IEEE_ARITHMETIC import made GNU Fortran wrap every
++        # scalar numeric/append helper in _gfortran_ieee_procedure_entry/exit.
++        # In the 256-row mixed probe these environment saves ran inside each
++        # iteration. Import only the actual intrinsic tokens emitted here,
++        # and never host-associate the IEEE module into unrelated procedures.
++        ieee_symbols = sorted(set(re.findall(
++            r"\b(ieee_(?:fma|is_nan|is_finite|value|quiet_nan|positive_inf|negative_inf))\b",
++            "\n".join((*declarations, *body)))))
+         lines = [
+             f"  subroutine {native_name}({', '.join(arguments)}) bind(C, name=\"{name}\")",
+             "    use, intrinsic :: iso_c_binding",
+-            "    use, intrinsic :: ieee_arithmetic",
++            *(("    use, intrinsic :: ieee_arithmetic, only: " + ", ".join(ieee_symbols),)
++              if ieee_symbols else ()),
+             "    implicit none",
+             *declarations,
+             "",
+@@ -4152,6 +4163,10 @@ class _FunctionEmitter:
+                 str(self._typed(value).dtype or self.dtype)
+                 for value in self.outputs
+             ),
++            argument_shapes=tuple(tuple(self._typed(value).shape)
++                for value in self.function.args),
++            output_shapes=tuple(tuple(self._typed(value).shape)
++                for value in self.outputs),
+         )
+ 
+ 
+@@ -5709,7 +5724,6 @@ def emit_module(
+     lines = [
+         f"module {name}",
+         "  use, intrinsic :: iso_c_binding",
+-        "  use, intrinsic :: ieee_arithmetic",
+         "  implicit none",
+         "contains",
+         "",
+@@ -5746,6 +5760,7 @@ def emit_module(
+         return "numerical"
+ 
+     entry_points = []
++    subroutine_by_name = {item.name: item for item in subroutines}
+     for function_name, function in functions.items():
+         kind = _kind(function_name)
+         note = None
+@@ -5847,6 +5862,16 @@ def emit_module(
+                 reference_argument_ids=emitted_reference_arguments.get(
+                     function_name, ()
+                 ),
++                value_dtypes={int(value.id): resolved
++                    for values, resolved_types in (
++                        (function.args, subroutine_by_name[function_name].argument_dtypes),
++                        (named_outputs.get(function_name, ()), subroutine_by_name[function_name].output_dtypes))
++                    for value, resolved in zip(values, resolved_types, strict=True)},
++                value_shapes={int(value.id): shape
++                    for values, resolved_shapes in (
++                        (function.args, subroutine_by_name[function_name].argument_shapes),
++                        (named_outputs.get(function_name, ()), subroutine_by_name[function_name].output_shapes))
++                    for value, shape in zip(values, resolved_shapes, strict=True)},
+             )
+         )
+     control_entries = [e.name for e in entry_points if e.kind == "control"]
+@@ -6277,8 +6302,8 @@ def compile_module(
+         # GCC's LTO plugin publishes the shim's weak PE symbol as a different
+         # symbol type from the archive reference.  Compile this small static
+         # runtime link without LTO; ordinary optimized modules keep LTO.
+-        compile_flags = tuple(flag for flag in compile_flags if flag != "-flto")
+-        link_flags = tuple(flag for flag in link_flags if flag != "-flto")
++        compile_flags = tuple(flag for flag in compile_flags if not flag.startswith("-flto"))
++        link_flags = tuple(flag for flag in link_flags if not flag.startswith("-flto"))
+     command = [
+         compiler,
+         "-shared",
+@@ -6339,16 +6364,30 @@ __all__ = [
+ # ---------------------------------------------------------------------------
+ 
+ import numpy as np
++from ..transmogrifier.dtype_layout import c_abi_type_table, shell_numpy_dtype
++
++# Reuse the common dtype authority, once. np.dtype(ctypes.c_double) runs
++# NumPy's ctypes introspection on EVERY preparation slot; the mixed probe
++# measured roughly 200us to stamp nine parameters that need only typed cells.
++_FORTRAN_ABI_NUMPY_DTYPES = {
++    ctypes_name: np.dtype(numpy_name)
++    for name, (_c_type, ctypes_name) in c_abi_type_table().items()
++    for numpy_name in (shell_numpy_dtype(name),)
++    if numpy_name is not None
++}
+ 
+ 
+ class FortranCoreExecution:
+     """Allocated buffers and a bound packed entry, mirroring the LLVM face."""
+ 
+-    def __init__(self, buffers, entry, pointers, count):
++    def __init__(self, buffers, entry, pointers, count, slots=()):
+         self.buffers = buffers
+         self._entry = entry
+         self._pointers = pointers
+         self._count = count
++        # Pointer-table entries do not own their NumPy allocations. Extent
++        # cells also need to live through every repeated native invocation.
++        self._slots = tuple(slots)
+ 
+     def run(self) -> "FortranCoreExecution":
+         if not self._entry(self._pointers, self._count):
+@@ -6378,10 +6417,11 @@ class FortranCoreNative:
+     #: happening too.
+     _LIBRARIES: dict = {}
+ 
+-    def __init__(self, library_path: Path, entry_record):
++    def __init__(self, library_path: Path, entry_record, api=None):
+         import ctypes
+ 
+         self._entry_record = entry_record
++        self._api = api
+         symbol = f"{entry_record.symbol}__packed"
+         resolved = str(Path(library_path).resolve())
+         library = FortranCoreNative._LIBRARIES.get(resolved)
+@@ -6396,35 +6436,75 @@ class FortranCoreNative:
+         ]
+         self._packed = function
+ 
+-    def prepare_execution(self, feeds) -> FortranCoreExecution:
++    def prepare_execution(self, feeds, *, extent_overrides=None) -> FortranCoreExecution:
+         import ctypes
+         import re
+ 
+         parameters = tuple(self._entry_record.parameters)
++        from .native_shell_abi import _element_count, _extent_values
++        overrides = dict(extent_overrides or {})
++        for parameter in parameters:
++            if parameter.role != "extent" or parameter.name in overrides:
++                continue
++            matched = re.search(r"_(\d+)_(\d+)$", str(parameter.name))
++            if matched and int(matched.group(1)) in feeds:
++                measured = np.atleast_1d(np.asarray(feeds[int(matched.group(1))]))
++                axis = int(matched.group(2)) - 1
++                if axis >= measured.ndim:
++                    raise ValueError(f"feed rank cannot resolve {parameter.name}")
++                overrides[parameter.name] = int(measured.shape[axis])
++        extents = _extent_values(self._entry_record, overrides)
+         slots = []
+         buffers: dict[int, Any] = {}
+         for parameter in parameters:
+-            dtype = "int32" if str(parameter.c_type) == "int32_t" else "float64"
++            # The published type is authoritative: int64 lengths and bool
++            # controls must not be stamped into an eight-byte float cell.
++            try:
++                dtype = _FORTRAN_ABI_NUMPY_DTYPES[str(parameter.ctypes_name)]
++            except KeyError as error:
++                raise ValueError(f"unsupported Fortran native type {parameter.ctypes_name!r}") from error
+             if str(getattr(parameter, "role", "")) == "extent":
+-                # extent_dynamic_<hash>_<value_id>_<axis>: the runtime
+-                # length of the array that value id was fed with.
+-                matched = re.search(r"_(\d+)_(\d+)$", str(parameter.name))
+-                measured = np.asarray(feeds[int(matched.group(1))])
+-                held = np.asarray([measured.size], dtype=dtype)
++                held = np.asarray([extents[parameter.name]], dtype=dtype)
+             else:
+                 value_id = int(str(parameter.name).lstrip("t"))
+                 fed = feeds.get(value_id)
+-                held = np.ascontiguousarray(
+-                    np.atleast_1d(np.asarray(
+-                        0 if fed is None else fed
+-                    )), dtype=dtype,
+-                )
++                count = _element_count(parameter, extents)
++                if fed is None:
++                    if parameter.role in {"input", "inout"}:
++                        raise ValueError(f"missing Fortran feed {value_id}")
++                    held = np.zeros(count, dtype=dtype)
++                else:
++                    held = np.ascontiguousarray(np.atleast_1d(np.asarray(fed)), dtype=dtype)
++                    if held.size != count:
++                        raise ValueError(f"Fortran feed {value_id} has {held.size} elements; ABI needs {count}")
+                 buffers[value_id] = held
+             slots.append(held)
++        # Local sequence workspaces are caller-owned in Fortran. Publish the
++        # capacity of the actual allocations through the EXISTING descriptor,
++        # just as C/LLVM publish their privately owned root allocations.
++        metadata = {} if self._api is None else dict(self._api.metadata)
++        descriptors = {int(item["sequence_id"]): item for item in
++            (metadata.get("sequence_tables") or {}).get(self._entry_record.name, ())}
++        for binding in (metadata.get("sequence_runtime_bindings") or {}).get(self._entry_record.name, ()):
++            descriptor = descriptors[int(binding["sequence_id"])]
++            rows = []
++            row_shapes = dict(zip(descriptor["column_value_ids"], descriptor["column_shapes"], strict=True))
++            for column in binding["column_parameters"]:
++                column_id = int(column.lstrip("t"))
++                width = int(np.prod(row_shapes[column_id])) if row_shapes[column_id] else 1
++                rows.append(buffers[column_id].size // width)
++            if not rows:
++                continue
++            capacity_id = int(binding["capacity_parameter"].lstrip("t"))
++            allocated_rows = min(rows)
++            if capacity_id not in feeds:
++                buffers[capacity_id][0] = allocated_rows
++            elif not 0 <= int(buffers[capacity_id][0]) <= allocated_rows:
++                raise ValueError("Fortran sequence capacity exceeds its resident columns")
+         pointers = (ctypes.c_void_p * len(slots))(*(
+             ctypes.c_void_p(int(held.ctypes.data)) for held in slots
+         ))
+         return FortranCoreExecution(
+-            buffers, self._packed, pointers, len(slots),
++            buffers, self._packed, pointers, len(slots), slots,
+         )
+ 
+diff --git a/src/compiler/ssa_llvm_backend.py b/src/compiler/ssa_llvm_backend.py
+--- a/src/compiler/ssa_llvm_backend.py
++++ b/src/compiler/ssa_llvm_backend.py
+@@ -6934,7 +6934,7 @@ def emit_ssa_function_to_llvm(
+ 
+ def compile_artifact(
+     artifact: LLVMFunctionArtifact, *, directory: _Path | None = None,
+-    optimization: str = "O2",
++    optimization: str = "O3",
+     _object_only: bool = False,
+ ) -> LLVMFunctionArtifact:
+     """Build the emitted module with the LLVM compiler, ahead of time."""
+diff --git a/src/compiler/work_contract.py b/src/compiler/work_contract.py
+--- a/src/compiler/work_contract.py
++++ b/src/compiler/work_contract.py
+@@ -310,6 +310,9 @@ PRESETS: dict[str, WorkContract] = {
+     "develop": WorkContract(
+         "develop", register_reuse=True, inexact_identities=False,
+         contract_multiply_add=False,
++        # Native products target this host under the ordinary exact preset
++        # too. CPU tuning is not permission for fast-math or inexact laws.
++        compiler_flags=("-march=native",),
+     ),
+     "deploy": WorkContract(
+         "deploy", register_reuse=True, inexact_identities=True,
+diff --git a/tests/test_fortran_native_execution_contract.py b/tests/test_fortran_native_execution_contract.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_fortran_native_execution_contract.py
+@@ -0,0 +1,67 @@
++"""The existing packed Fortran caller must obey emitted storage records."""
++import numpy as np
++import pytest
++from src.compiler.compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
++from src.compiler.ssa_fortran_backend import FortranCoreNative
++
++
++def _unbound_core(parameters, metadata=None):
++    # Allocation tests must not load/execute a library. Use the actual caller's
++    # preparation method, inspecting the exact slots it would pass to native.
++    core = FortranCoreNative.__new__(FortranCoreNative)
++    core._entry_record = EntryPoint("root", "root", "control", tuple(parameters))
++    core._api = CompiledProgramAPI("probe", "fortran", "root", (core._entry_record,), metadata or {})
++    core._packed = None
++    return core
++
++
++@pytest.mark.parametrize("dtype,c_type,ctype,value", (
++    ("bool", "bool", "c_bool", True),
++    ("int64", "int64_t", "c_int64", 2**40 + 7),
++    ("float32", "float", "c_float", 1.25),
++    ("uint8", "uint8_t", "c_uint8", 251),
++))
++def test_fortran_slots_use_declared_native_type(dtype, c_type, ctype, value):
++    core = _unbound_core([Parameter("t3", "input", dtype, c_type, ctype, "value")])
++    execution = core.prepare_execution({3: value})
++    assert execution.buffers[3].dtype == np.dtype(dtype)
++    assert execution.buffers[3].item() == value
++    assert execution._slots[0] is execution.buffers[3]
++
++
++def test_fortran_fixed_shape_and_extent_cells_are_retained():
++    core = _unbound_core([
++        Parameter("extent_2", "extent", "int32", "int32_t", "c_int32", "value"),
++        Parameter("extent_3", "extent", "int32", "int32_t", "c_int32", "value"),
++        Parameter("t5", "workspace", "int64", "int64_t", "c_int64", "reference",
++                  shape=(2, 3), extents=("extent_2", "extent_3")),
++    ])
++    execution = core.prepare_execution({})
++    assert execution.buffers[5].size == 6
++    assert [slot.item() for slot in execution._slots[:2]] == [2, 3]
++    assert all(int(slot.ctypes.data) == execution._pointers[index]
++               for index, slot in enumerate(execution._slots))
++
++
++def test_fortran_missing_and_wrong_sized_feeds_refuse_before_native():
++    core = _unbound_core([Parameter("t3", "input", "float64", "double", "c_double",
++                                  "reference", shape=(2,))])
++    with pytest.raises(ValueError, match="missing Fortran feed"):
++        core.prepare_execution({})
++    with pytest.raises(ValueError, match="ABI needs 2"):
++        core.prepare_execution({3: [1.0]})
++
++
++def test_fortran_capacity_is_the_minimum_actual_column_row_count():
++    core = _unbound_core([
++        Parameter("t1", "workspace", "float64", "double", "c_double", "reference", shape=(4,)),
++        Parameter("t2", "workspace", "float64", "double", "c_double", "reference", shape=(6,)),
++        Parameter("t3", "workspace", "int64", "int64_t", "c_int64", "value"),
++    ], {"sequence_tables": {"root": [{"sequence_id": 7, "column_value_ids": [1, 2],
++                                      "column_shapes": [[], [2]]}]},
++        "sequence_runtime_bindings": {"root": [{"sequence_id": 7,
++            "column_parameters": ["t1", "t2"], "capacity_parameter": "t3"}]}})
++    execution = core.prepare_execution({})
++    assert execution.buffers[3].item() == 3
++    with pytest.raises(ValueError, match="capacity exceeds"):
++        core.prepare_execution({3: 4})
+diff --git a/tests/test_fortran_toolchain.py b/tests/test_fortran_toolchain.py
+--- a/tests/test_fortran_toolchain.py
++++ b/tests/test_fortran_toolchain.py
+@@ -19,9 +19,10 @@ def test_gnu_policy_is_lto_native_and_standalone_without_fast_math():
+     c = aggressive_c_flags(compiler)
+     link = standalone_fortran_link_flags(compiler)
+ 
+-    assert {"-O3", "-march=native", "-flto", "-funroll-loops"} <= set(fortran)
+-    assert {"-O3", "-march=native", "-flto", "-funroll-loops"} <= set(c)
+-    assert {"-flto", "-static-libgfortran", "-static-libgcc"} <= set(link)
++    lto = f"-flto={max(1, os.cpu_count() or 1)}"
++    assert {"-O3", "-march=native", lto, "-funroll-loops"} <= set(fortran)
++    assert {"-O3", "-march=native", lto, "-funroll-loops"} <= set(c)
++    assert {lto, "-static-libgfortran", "-static-libgcc"} <= set(link)
+     assert "-ffast-math" not in fortran
+     # Ordinary modules keep contraction; a module carrying a precision
+     # section withdraws it, which is what lets the fortran lane declare
+diff --git a/tests/test_ir_sequence_tables.py b/tests/test_ir_sequence_tables.py
+--- a/tests/test_ir_sequence_tables.py
++++ b/tests/test_ir_sequence_tables.py
+@@ -431,7 +431,11 @@ def test_sequence_helper_fresh_ids_reserve_non_argument_descriptor_identities():
+     assert helper_inputs
+     assert helper_inputs.isdisjoint(reserved)
+     assert helper_results.isdisjoint(reserved)
+-    assert min(helper_inputs | helper_results) == max(reserved) + 1
++    # Fresh identities now come from the shared flagged namespace, not the
++    # old helper-local max(id)+1 counter. Noncollision is the contract.
++    from src.compiler.id_space import MINTED
++    assert all(value_id & MINTED for value_id in helper_inputs | helper_results)
++    assert min(helper_inputs | helper_results) > max(reserved)
+ 
+ 
+ def test_set_descriptor_retains_linear_unique_key_and_live_row_policy():
+@@ -762,7 +766,9 @@ def test_retained_loop_append_becomes_internal_sequence_ssa_call_and_table():
+     )
+ 
+     assert shortfalls == ()
+-    assert "ssa_sequence_10_append" in module.functions
++    helper = next(function for function in module.functions.values()
++                  if function.metadata.get("ssa_sequence_operation") == "append"
++                  and function.metadata.get("sequence_id") == 10)
+     assert module.sequence_tables["planned_control"].by_id(10).allows_duplicates
+     control_calls = [
+         instruction
+@@ -785,7 +791,7 @@ def test_retained_loop_append_becomes_internal_sequence_ssa_call_and_table():
+         for block in module.functions["planned_control"].blocks.values()
+         for instruction in block.instrs
+     )
+-    helper_ops = set(_ops(module.functions["ssa_sequence_10_append"]))
++    helper_ops = set(_ops(helper))
+     assert {"GetElementPtr", "Load", "Store", "Lt", "CondBr"} <= helper_ops
+     emitted = emit_module(
+         module,
+@@ -905,7 +911,9 @@ def test_retained_loop_set_add_keeps_unique_scan_and_extend_inherits_it():
+         identity_table={"seen": (20,), "value": (21,)},
+     )
+     assert add_shortfalls == ()
+-    add_helper = add_module.functions["ssa_sequence_20_add"]
++    add_helper = next(function for function in add_module.functions.values()
++                      if function.metadata.get("ssa_sequence_operation") == "add"
++                      and function.metadata.get("sequence_id") == 20)
+     assert "unique_scan_header" in add_helper.blocks
+ 
+     extend_program = _loop_with_mutation(ControlSequenceMutation(
+@@ -921,7 +929,9 @@ def test_retained_loop_set_add_keeps_unique_scan_and_extend_inherits_it():
+         identity_table={"seen": (30,), "incoming": (31,)},
+     )
+     assert extend_shortfalls == ()
+-    insert = extend_module.functions["ssa_sequence_30_insert"]
++    insert = next(function for function in extend_module.functions.values()
++                  if function.metadata.get("ssa_sequence_operation") == "insert"
++                  and function.metadata.get("sequence_id") == 30)
+     assert "unique_scan_header" in insert.blocks
+     assert extend_module.sequence_tables["planned_control"].by_id(30).key_columns == (0,)
+ 
+diff --git a/tests/test_pythonic_control_torture.py b/tests/test_pythonic_control_torture.py
+--- a/tests/test_pythonic_control_torture.py
++++ b/tests/test_pythonic_control_torture.py
+@@ -63,17 +63,45 @@ CASES["guarded_splice"] = (_source.replace("enumerate(failures, 1)",
+     "enumerate((*failures, (4.0, 5.0, (6.0,))), 1)"),
+     tuple((inputs, 1 + int(inputs["guard"]) * (1 + int(inputs["populated"]))) for inputs, _ in _trials))
+ 
++CASES["mixed_numeric_rows"] = ("""
++def root(seed, guard):
++    values = []
++    total = seed
++    for i in range(32):
++        total = total + i * 0.125
++        if guard:
++            values.append(total)
++    for value in values:
++        total = total + value * 0.5
++    return total
++""", tuple((dict(seed=0.125, guard=guard),
++            0.125 + 0.125 * 32 * 31 / 2 +
++            (0.5 * (32 * 0.125 + 0.125 * 32 * 31 * 33 / 6) if guard else 0))
++           for guard in (False, True, False, True)))
++
++CASES["integer_while_counter"] = ("""
++def root(limit):
++    iters = 0
++    while iters < limit:
++        iters += 1
++    return iters
++""", tuple((dict(limit=limit), limit) for limit in (0, 1, 7, 0)))
++_counter_source, _counter_trials = CASES['integer_while_counter']
++CASES['folded_integer_seed'] = (_counter_source.replace('while iters < limit:', 'while limit > 0:')
++    .replace('        iters += 1', '        limit -= 1\n        iters += 1'), _counter_trials)
++
+ 
+ @pytest.mark.parametrize("case", CASES)
+-@pytest.mark.parametrize("backend", ("c", "llvm"))
++@pytest.mark.parametrize("backend", ("c", "llvm", "fortran"))
+ def test_pythonic_control_native_effects(tmp_path, case, backend):
+     source, trials = CASES[case]
+     policy = ExtractionContract("extraction_contracts/program_extraction.yaml").with_execution_file(
+         "extraction_contracts/vehicle_full_native_execution.yaml").with_program_abi({
+         "bindings": [], "values": [
+-            {"function": "root", "parameter": name, "storage": "scalar", "dtype": "bool",
+-             "rank": 0, "python_type": "builtins.bool"}
+-            for name in trials[0][0]
++            {"function": "root", "parameter": name, "storage": "scalar",
++             "dtype": "bool" if isinstance(value, bool) else "int64" if isinstance(value, int) else "float64",
++             "rank": 0, "python_type": "builtins.bool" if isinstance(value, bool) else "builtins.int" if isinstance(value, int) else "builtins.float"}
++            for name, value in trials[0][0].items()
+         ]})
+     module, outputs, exports = lower_ast_source_to_ssa(source, "root", name="pythonic_" + case,
+         extraction_contract=policy, progress=lambda _: None)
+@@ -85,11 +113,19 @@ def test_pythonic_control_native_effects(tmp_path, case, backend):
+         artifact = emit_ssa_module_to_c(module, function.name)
+         assert artifact.complete, artifact.shortfalls
+         artifact.compile(tmp_path / "native")
+-    else:
++    elif backend == "llvm":
+         from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
+         emitted = emit_ssa_function_to_llvm(module, function.name)
+         assert emitted.complete, emitted.shortfalls
+         artifact = compile_artifact(emitted, directory=tmp_path / "native")
++    else:
++        from src.compiler.ssa_fortran_backend import emit_module
++        from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
++        emitted = emit_module(module, name="pythonic_" + case, outputs=outputs)
++        assert emitted.complete, emitted.shortfalls
++        built = compile_fortran_module_c_shell(emitted, {}, tmp_path / "native",
++            entrypoint=function.name, library=True)
++        artifact = (built.executable_path, emitted.api.entry_point(function.name), emitted.api)
+     proof = tmp_path / "proof.pkl"
+     proof.write_bytes(pickle.dumps((artifact, dict(function.metadata["parameter_names"]),
+                                   outputs[function.name][0].id, trials, backend)))
+@@ -99,12 +135,16 @@ def test_pythonic_control_native_effects(tmp_path, case, backend):
+ import pickle, sys
+ import numpy as np
+ artifact, parameters, result, trials, backend = pickle.load(open(sys.argv[1], 'rb'))
+-feeds = {parameters[name]: np.array([value], dtype=np.bool_) for name, value in trials[0][0].items()}
++feeds = {parameters[name]: np.array([value], dtype=np.bool_ if isinstance(value, bool) else np.int64 if isinstance(value, int) else np.float64)
++         for name, value in trials[0][0].items()}
+ if backend == 'c':
+     execution = artifact.prepare_execution(feeds)
+-else:
++elif backend == 'llvm':
+     from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+     execution = prepare_artifact_execution(artifact, feeds)
++else:
++    from src.compiler.ssa_fortran_backend import FortranCoreNative
++    execution = FortranCoreNative(*artifact).prepare_execution(feeds)
+ failures = []
+ for inputs, expected in trials:
+     for name, value in inputs.items():
+@@ -114,6 +154,18 @@ for inputs, expected in trials:
+     print('PYTHONIC_NATIVE', backend, inputs, 'actual', actual, 'expected', expected, flush=True)
+     if actual != expected:
+         failures.append((inputs, actual, expected))
++    if backend == 'fortran' and inputs.get('populated'):
++        # Cardinality alone used to hide bool((3.0,)) replacing nested data.
++        # Read the authored failures arena through its published identity.
++        api = artifact[2]
++        for descriptor in api.metadata['sequence_tables'][artifact[1].name]:
++            if 'failures' not in descriptor['source_names']:
++                continue
++            length = int(execution.buffers[descriptor['length_address_id']][0])
++            assert length > 0
++            for column, expected_element in zip(descriptor['column_value_ids'], (1.0, 2.0, 3.0), strict=True):
++                np.testing.assert_array_equal(execution.buffers[column][:length], np.full(length, expected_element))
++        print('PYTHONIC_NATIVE nested row payload preserved', flush=True)
+ assert not failures, failures
+ """, str(proof)], capture_output=True, text=True)
+     print(invocation.stdout, end="")
+diff --git a/tests/test_scalar_merge_dtypes.py b/tests/test_scalar_merge_dtypes.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_scalar_merge_dtypes.py
+@@ -0,0 +1,63 @@
++"""A Phi selects a representation; it does not reinterpret its operands."""
++from src.compiler.ir_indexing import _propagate_scalar_dtypes
++from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
++import pytest
++
++
++def test_boolean_merge_chain_uses_exact_incoming_storage_types():
++    left = SSAValue(1, 'bool')
++    right = SSAValue(2, 'bool')
++    inner = SSAValue(3, 'float64')
++    outer = SSAValue(4, 'float64')
++    function = Function('boolean_chain', [left, right], {'entry': BasicBlock('entry', [
++        Instr('Phi', [inner, right], outer),
++        Instr('Phi', [left, right], inner),
++        Instr('Ret', [outer], None),
++    ])})
++    _propagate_scalar_dtypes({function.name: function})
++    assert inner.dtype == outer.dtype == 'bool'
++
++
++def test_integer_merge_tracks_settled_backedge_and_attribute_occurrences():
++    seed = SSAValue(1, 'int64')
++    backedge = SSAValue(2, 'int64')
++    merged = SSAValue(3, 'int')
++    attribute_seed = SSAValue(1, 'int64')
++    attribute_backedge = SSAValue(2, 'int64')
++    function = Function('integer_merge', [seed, backedge], {'entry': BasicBlock('entry', [
++        Instr('Phi', [], merged, attributes={'incoming': (('start', attribute_seed), ('latch', attribute_backedge))}),
++        Instr('Ret', [merged], None),
++    ])})
++    _propagate_scalar_dtypes({function.name: function})
++    assert merged.dtype == 'int64'
++
++
++def test_mixed_representation_phi_is_not_implicitly_reinterpreted():
++    seed = SSAValue(1, 'float64')
++    backedge = SSAValue(2, 'int64')
++    merged = SSAValue(3, 'float64')
++    function = Function('bad_merge', [seed, backedge], {'entry': BasicBlock('entry', [
++        Instr('Phi', [seed, backedge], merged), Instr('Ret', [merged], None),
++    ])})
++    _propagate_scalar_dtypes({function.name: function})
++    assert merged.dtype == 'float64'
++    assert backedge.dtype == 'int64'
++
++
++@pytest.mark.parametrize('literal,dtype', [(0, 'int64'), (False, 'bool'), (0.0, 'float64')])
++def test_folded_while_seed_retains_authored_literal_representation(literal, dtype):
++    from src.compiler.control_source import ControlProgram, ControlExpression, SequenceBlock, WhileBlock
++    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
++    control = ControlProgram(WhileBlock(
++        predicate_value_id=10, condition=SequenceBlock(()), body=SequenceBlock(()),
++        predicate_expression=ControlExpression('const', literal=False),
++        carried_aliases=((21, 20),), carried_seeds=((20, literal),), source_loop_node_id=30))
++    function, shortfalls = lower_control_program_to_ssa(control)
++    assert not shortfalls
++    carried = next(i for b in function.blocks.values() for i in b.instrs
++                   if i.op == 'Phi' and i.attributes.get('binding') == 'loop_carried')
++    seed = next(i for b in function.blocks.values() for i in b.instrs
++                if i.op == 'Const' and i.res.id == carried.args[0].id)
++    assert seed.res.dtype == dtype
++    assert type(seed.attributes['value']) is type(literal)
++    assert seed.attributes['value'] == literal
+diff --git a/tests/test_ssa_fortran_and_optimizing_llvm.py b/tests/test_ssa_fortran_and_optimizing_llvm.py
+--- a/tests/test_ssa_fortran_and_optimizing_llvm.py
++++ b/tests/test_ssa_fortran_and_optimizing_llvm.py
+@@ -598,6 +598,19 @@ def test_imported_llvm_scalar_literals_emit_fortran_constants():
+ 
+     assert module.complete, [item.format() for item in module.shortfalls]
+     assert "ieee_value(0.0_c_double, ieee_positive_inf)" in module.source
++    assert "ieee_arithmetic, only:" in module.source
++
++
++def test_plain_arithmetic_does_not_import_ieee_environment_runtime():
++    left, right, result = (SSAValue(i, 'float64') for i in range(3))
++    function = Function('plain_add', [left, right], {'entry': BasicBlock('entry', [
++        Instr('Add', [left, right], result), Instr('Ret', [result], None),
++    ])})
++    module = emit_module({function.name: function}, outputs={function.name: [result]})
++    assert module.complete, module.shortfalls
++    # GNU inserts ieee_procedure_entry/exit around every procedure that imports
++    # ieee_arithmetic, even when ordinary arithmetic uses no IEEE intrinsic.
++    assert 'ieee_arithmetic' not in module.source
+ 
+ 
+ def test_fortran_module_omits_helpers_replaced_by_native_tensor_ops():
+diff --git a/tools/compiler_probes/benchmark_pythonic_numerics.py b/tools/compiler_probes/benchmark_pythonic_numerics.py
+new file mode 100644
+--- /dev/null
++++ b/tools/compiler_probes/benchmark_pythonic_numerics.py
+@@ -0,0 +1,140 @@
++"""Phase and steady-call timing through OUR public compiler, no deadlines."""
++import argparse
++from dataclasses import replace
++import json
++from pathlib import Path
++import statistics
++import subprocess
++import sys
++import tempfile
++import time
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++import numpy as np
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa, compile_fortran_module_c_shell
++from src.compiler.ssa_c_backend import emit_ssa_module_to_c
++from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm, compile_artifact, prepare_artifact_execution
++from src.compiler.ssa_fortran_backend import emit_module, FortranCoreNative
++from src.compiler.work_contract import PRESETS, set_active_contract
++
++
++def median_call(call, repeats):
++    for _ in range(30):
++        call()
++    values = []
++    for _ in range(7):
++        start = time.perf_counter()
++        for _ in range(repeats):
++            call()
++        values.append((time.perf_counter() - start) / repeats)
++    return statistics.median(values)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--sizes", nargs="+", type=int, default=[32, 256])
++    parser.add_argument("--backends", nargs="+", choices=("c", "llvm", "fortran"), default=["c", "llvm", "fortran"])
++    parser.add_argument("--repeats", type=int, default=2000)
++    parser.add_argument("--flags", action="append", default=[])
++    args = parser.parse_args()
++    if args.repeats < 1 or any(size < 1 for size in args.sizes):
++        parser.error("sizes and repeats must be positive")
++    set_active_contract(replace(PRESETS["develop"], compiler_flags=(*PRESETS["develop"].compiler_flags, *args.flags)))
++    directory = Path(tempfile.mkdtemp(prefix="turing_pythonic_numeric_"))
++    for size in args.sizes:
++        source = f"""
++def root(seed, guard):
++    values = []
++    total = seed
++    for i in range({size}):
++        total = total + i * 0.125
++        if guard:
++            values.append(total)
++    for value in values:
++        total = total + value * 0.5
++    return total
++"""
++        eager_namespace = {}
++        exec(compile(source, "authored_timing_reference", "exec"), eager_namespace)
++        eager = eager_namespace["root"]
++        policy = ExtractionContract("extraction_contracts/program_extraction.yaml").with_execution_file(
++            "extraction_contracts/vehicle_full_native_execution.yaml").with_program_abi({"bindings": [], "values": [
++            {"function": "root", "parameter": "seed", "storage": "scalar", "dtype": "float64", "rank": 0, "python_type": "builtins.float"},
++            {"function": "root", "parameter": "guard", "storage": "scalar", "dtype": "bool", "rank": 0, "python_type": "builtins.bool"}]})
++        # Lower the identical authored source separately for every backend:
++        # emitters may publish derived type views. No lane inherits another's.
++        for backend in args.backends:
++            timings = {}
++            start = time.perf_counter()
++            module, outputs, exports = lower_ast_source_to_ssa(source, "root",
++                name=f"mixed_{size}_{backend}", extraction_contract=policy,
++                progress=lambda _: None, progress_bars=False)
++            timings["lower_s"] = time.perf_counter() - start
++            name = exports[0]
++            parameters = dict(module.functions[name].metadata["parameter_names"])
++            feeds = {parameters["seed"]: np.asarray([0.125]), parameters["guard"]: np.asarray([True])}
++            start = time.perf_counter()
++            if backend == "c":
++                artifact = emit_ssa_module_to_c(module, name)
++            elif backend == "llvm":
++                artifact = emit_ssa_function_to_llvm(module, name)
++            else:
++                artifact = emit_module(module, name=f"mixed_{size}", outputs=outputs, progress=lambda _: None)
++            if not artifact.complete:
++                raise AssertionError(artifact.shortfalls)
++            timings["emit_s"] = time.perf_counter() - start
++            start = time.perf_counter()
++            build_dir = directory / str(size) / backend
++            ordinary_run = subprocess.run
++            def observe_build(command, *positional, **keywords):
++                print("BUILD_COMMAND", backend, command, flush=True)
++                return ordinary_run(command, *positional, **keywords)
++            subprocess.run = observe_build
++            try:
++                if backend == "c":
++                    artifact.compile(build_dir, optimization="O3")
++                elif backend == "llvm":
++                    compile_artifact(artifact, directory=build_dir, optimization="O3")
++                else:
++                    built = compile_fortran_module_c_shell(artifact, {}, build_dir, entrypoint=name, library=True)
++            finally:
++                subprocess.run = ordinary_run
++            timings["build_s"] = time.perf_counter() - start
++            start = time.perf_counter()
++            if backend == "c":
++                execution = artifact.prepare_execution(feeds)
++            elif backend == "llvm":
++                execution = prepare_artifact_execution(artifact, feeds)
++            else:
++                native_core = FortranCoreNative(built.executable_path, artifact.api.entry_point(name), artifact.api)
++                execution = native_core.prepare_execution(feeds)
++            timings["prepare_s"] = time.perf_counter() - start
++            result = outputs[name][0].id
++            for guard in (False, True):
++                feeds[parameters["guard"]][0] = guard
++                execution.buffers[parameters["guard"]][0] = guard
++                execution.run()
++                expected = 0.125 + 0.125 * size * (size - 1) / 2
++                if guard:
++                    expected += 0.5 * (size * 0.125 + 0.125 * size * (size - 1) * (size + 1) / 6)
++                actual = execution.buffers[result].item()
++                assert actual == expected, (backend, size, guard, actual, expected)
++                assert eager(0.125, guard) == expected
++                timings[f"native_{guard}_us"] = 1e6 * median_call(execution.run, args.repeats)
++                timings[f"python_{guard}_us"] = 1e6 * median_call(lambda: eager(0.125, guard), args.repeats)
++                def boundary():
++                    if backend == "c":
++                        prepared = artifact.prepare_execution(feeds)
++                    elif backend == "llvm":
++                        prepared = prepare_artifact_execution(artifact, feeds)
++                    else:
++                        prepared = native_core.prepare_execution(feeds)
++                    prepared.run()
++                timings[f"prepare_and_run_{guard}_us"] = 1e6 * median_call(boundary, min(args.repeats, 200))
++            print("MIXED_TIMING", json.dumps({"backend": backend, "rows": size, **timings}), flush=True)
++    print("BUILD_DIRECTORY", directory, flush=True)
++
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,1469 @@
+diff --git a/src/compiler/precompile_to_ssa.py b/src/compiler/precompile_to_ssa.py
+index ef7c854..3842178 100644
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -1612,7 +1612,10 @@ class _ControlSSABuilder:
+             elif isinstance(block, ResourceScopeBlock):
+                 children = (block.body, *block.cleanup)
+             elif isinstance(block, ParallelDeployment):
+-                children = tuple(lane.body for lane in block.lanes)
++                # ParallelDeployment.lanes are ControlBlocks, not deployment
++                # descriptors with a body. The former access crashed even a
++                # StatementBlock lane before any lowering could begin.
++                children = tuple(block.lanes)
+             elif isinstance(block, StateMachineTick):
+                 children = tuple(body for _case, body in block.cases)
+                 if block.default is not None:
+@@ -10202,6 +10205,7 @@ class _ControlSSABuilder:
+                 self._construct_cell(loop.source_loop_node_id),
+             )
+         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
++        own_result_ports = {int(port_id) for port_id, *_ in loop.result_ports}
+         for updated_id, initial_id in loop.carried_aliases:
+             updated_id = int(updated_id)
+             initial_id = int(initial_id)
+@@ -10218,6 +10222,10 @@ class _ControlSSABuilder:
+                 follow_aliases=(
+                     int(initial_id) not in self.external_values
+                     and int(initial_id) in self.value_aliases
++                    # A physical alias to THIS loop's exit is not the
++                    # preheader version. The observed 10->30 alias formerly
++                    # selected unproduced result-port 30 instead of seed 10.
++                    and self._concorded_resident(initial_id) not in own_result_ports
+                 ),
+             )
+             updated_value = self.external_values.get(updated_id)
+@@ -11178,6 +11186,7 @@ class _ControlSSABuilder:
+                 self._construct_cell(loop.source_loop_node_id),
+             )
+         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
++        own_result_ports = {int(port_id) for port_id, *_ in loop.result_ports}
+         for updated_id, initial_id in loop.carried_aliases:
+             updated_id = int(updated_id)
+             initial_id = int(initial_id)
+@@ -11192,6 +11201,7 @@ class _ControlSSABuilder:
+                 follow_aliases=(
+                     int(initial_id) not in self.external_values
+                     and int(initial_id) in self.value_aliases
++                    and self._concorded_resident(initial_id) not in own_result_ports
+                 ),
+             )
+             updated_value = self.external_values.get(updated_id)
+diff --git a/src/common/tensors/topological_reducer.py b/src/common/tensors/topological_reducer.py
+index 8c66265..4632519 100644
+--- a/src/common/tensors/topological_reducer.py
++++ b/src/common/tensors/topological_reducer.py
+@@ -1947,6 +1947,23 @@ def source_walk(node: Any) -> tuple[Any, ...]:
+     return tuple(collected)
+ 
+ 
++def _source_read_names(node: Any) -> set[str]:
++    """Lexical loads, including AugAssign's syntactic Store/read operand."""
++    # ``if add & mask: flags &= ~mask`` first reads flags at an AugAssign
++    # target, whose AST context is Store. The old Load-only entry scan minted
++    # flags inside the true arm; resetting that environment discarded the
++    # update and minted a second flags Input at the return. All control entry
++    # snapshots must include this read before either arm/iteration is reduced.
++    members = source_walk(node)
++    return {
++        member.id for member in members
++        if isinstance(member, ast.Name) and isinstance(member.ctx, ast.Load)
++    } | {
++        member.target.id for member in members
++        if isinstance(member, ast.AugAssign) and isinstance(member.target, ast.Name)
++    }
++
++
+ def function_parameter_names(definition: Any) -> tuple[str, ...]:
+     """A function definition's declared parameter names, in order.
+ 
+@@ -4987,6 +5004,11 @@ def _normalize_lexical_values(
+     def resolve_expression(expression: ast.AST | None) -> int | None:
+         if expression is None:
+             return None
++        if isinstance(expression, ast.UnaryOp) and isinstance(expression.op, ast.UAdd):
++            # The operator pass has already retired +value as an identity
++            # projection. Its authored operand, not the missing wrapper node,
++            # is the value this later lexical/return reader must resolve.
++            return resolve_expression(expression.operand)
+         if isinstance(expression, ast.Constant) and id(expression) not in graph.G:
+             # Structural reduction can remove a keyword wrapper and its leaf
+             # before lexical call binding. A live use still has the exact
+@@ -5658,6 +5680,18 @@ def _normalize_lexical_values(
+                     and current_state.kind is not _FieldStateKind.OBSERVED
+                     else None
+                 )
++                if isinstance(current_state, _Unresolved) and current_state.reason == _LOOP_EXIT_FIELD_STATE_UNMERGED:
++                    # An unknown final field VALUE does not make the known
++                    # loop-exit ordering unknown. The unresolved book fact
++                    # names the construct that has to finish before this
++                    # read; keep that causal edge without claiming a field
++                    # merge/value or running a zero-trip body's store.
++                    for cell in current_state.read:
++                        exit_id = _cell_node_id(cell)
++                        if exit_id in graph.G and isinstance(
++                            graph.G.nodes[exit_id].get('expr_obj'), (ast.For, ast.While)
++                        ):
++                            read_inputs.append((exit_id, 'after_write'))
+                 # Order this read after the most recent recorded write to the
+                 # same field -- a whole-attribute ``SetAttr`` or an
+                 # element-wise ``obj.field[i, j] = ...`` ``IndexedStore`` --
+@@ -7189,11 +7223,7 @@ def _normalize_lexical_values(
+ 
+         # Parameters exist from function entry; mint every one this statement
+         # reads before any arm does (the rule ``if`` and loops apply).
+-        for read_name in {
+-            member.id
+-            for member in source_walk(dispatch)
+-            if isinstance(member, ast.Name) and isinstance(member.ctx, ast.Load)
+-        }:
++        for read_name in _source_read_names(dispatch):
+             if (
+                 read_name in parameter_names
+                 and read_name not in environment
+@@ -7388,17 +7418,15 @@ def _normalize_lexical_values(
+             # read before the slot expressions resolve, since resolving a
+             # ``Name`` redirects and removes its occurrence node.
+             return_site_cell = (
+-                node_identity_cell(graph, id(returned))
+-                if returned is not None and id(returned) in graph.G else None
++                _posted_node_identity_cell(graph, id(returned))
++                if returned is not None else None
+             )
+             return_construct_cell = (
+-                node_identity_cell(graph, id(body_statement))
+-                if id(body_statement) in graph.G else return_site_cell
++                _posted_node_identity_cell(graph, id(body_statement)) or return_site_cell
+             )
+             slot_expression_cells = tuple(
+-                node_identity_cell(graph, id(expression))
+-                if expression is not None and id(expression) in graph.G
+-                else None
++                _posted_node_identity_cell(graph, id(expression))
++                if expression is not None else None
+                 for expression in expressions
+             )
+             for index, expression in enumerate(expressions):
+@@ -7610,12 +7638,7 @@ def _normalize_lexical_values(
+             # in/out parameter whose storage the caller can no longer bind.
+             # Mint every parameter this statement reads BEFORE the snapshot,
+             # the rule loops already apply; ``input_value`` is idempotent.
+-            for read_name in {
+-                member.id
+-                for member in source_walk(body_statement)
+-                if isinstance(member, ast.Name)
+-                and isinstance(member.ctx, ast.Load)
+-            }:
++            for read_name in _source_read_names(body_statement):
+                 if (
+                     read_name in parameter_names
+                     and read_name not in environment
+@@ -8109,12 +8132,7 @@ def _normalize_lexical_values(
+             # in/out parameter whose storage the caller can no longer bind.
+             # Mint every parameter this statement reads BEFORE the snapshot,
+             # the rule loops already apply; ``input_value`` is idempotent.
+-            for read_name in {
+-                member.id
+-                for member in source_walk(body_statement)
+-                if isinstance(member, ast.Name)
+-                and isinstance(member.ctx, ast.Load)
+-            }:
++            for read_name in _source_read_names(body_statement):
+                 if (
+                     read_name in parameter_names
+                     and read_name not in environment
+@@ -8267,12 +8285,7 @@ def _normalize_lexical_values(
+             # every parameter the loop reads BEFORE the snapshot is strictly
+             # more faithful, and ``input_value`` is idempotent, so this mints
+             # exactly the Input node the body's own first read would have.
+-            for read_name in {
+-                member.id
+-                for member in source_walk(body_statement)
+-                if isinstance(member, ast.Name)
+-                and isinstance(member.ctx, ast.Load)
+-            }:
++            for read_name in _source_read_names(body_statement):
+                 if (
+                     read_name in parameter_names
+                     and read_name not in environment
+@@ -8359,6 +8372,26 @@ def _normalize_lexical_values(
+                 entry_cell = before_loop_field_cells.get(field_key)
+                 if entry_cell == exit_cell:
+                     continue
++                # Normalizing ``field[i] = value`` retires the Assign
++                # wrapper that the original For body edge named. The field
++                # state still identifies the exact IndexedStore effect.
++                # Join that effect (or a nested loop's recorded exit) to
++                # this loop construct before publishing its unresolved
++                # final VALUE. Otherwise even an after-loop read barrier
++                # has no dependency path back to the writes it protects.
++                body_state = field_state_at(exit_cell)
++                body_effects = ()
++                if isinstance(body_state, _FieldState) and body_state.kind is not _FieldStateKind.OBSERVED:
++                    body_effects = (body_state.effect,)
++                elif isinstance(body_state, _Unresolved) and body_state.reason == _LOOP_EXIT_FIELD_STATE_UNMERGED:
++                    body_effects = tuple(cell for cell in body_state.read
++                        if (effect_id := _cell_node_id(cell)) in graph.G
++                        and isinstance(graph.G.nodes[effect_id].get('expr_obj'), (ast.For, ast.While)))
++                for effect_cell in body_effects:
++                    effect_id = _cell_node_id(effect_cell)
++                    if effect_id in graph.G and loop_id in graph.G and effect_id != loop_id:
++                        if (effect_id, 'body') not in (graph.G.nodes[loop_id].get('parents') or ()):
++                            _append_operand(graph, loop_id, effect_id, 'body')
+                 read_cells = tuple(dict.fromkeys(
+                     cell for cell in (entry_cell, exit_cell, loop_cell)
+                     if cell is not None
+diff --git a/src/compiler/ir_indexing.py b/src/compiler/ir_indexing.py
+index 04b2490..30e83c4 100644
+--- a/src/compiler/ir_indexing.py
++++ b/src/compiler/ir_indexing.py
+@@ -16,7 +16,6 @@ from __future__ import annotations
+ 
+ import dataclasses
+ 
+-from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+ from ..transmogrifier.ssa import Instr, SSAValue
+ 
+ _GATHER = ("Indexed", "gather")
+@@ -31,8 +30,8 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
+     ``functions`` is a mapping of name -> repository SSA ``Function``.
+     """
+ 
+-    def fresh() -> SSAValue:
+-        return SSAValue(GLOBAL_MONOTONIC_IDS.mint())
++    from .concordance_declarations import ADDRESS, CONTROL_SSA_FINISH
++    from .ssa_record_return_state import mint_ssa_value
+ 
+     for function in functions.values():
+ 
+@@ -86,7 +85,13 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
+                     rewritten.append(instruction)
+                 elif canonical_op in _GATHER and len(instruction.args) >= 2:
+                     base, *indices = instruction.args
+-                    address = fresh()
++                    # The energy audit's four raw GEP ids had no mint edge.
++                    # This address is made from the exact indexing operands,
++                    # not an unrelated global-counter identity.
++                    address = SSAValue(mint_ssa_value(
++                        function, ADDRESS, (base, *indices, instruction.res),
++                        stage=CONTROL_SSA_FINISH,
++                    ))
+                     lowered_attributes = {
+                         **dict(instruction.attributes or {}),
+                         "lowered_from": str(canonical_op),
+@@ -105,7 +110,10 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
+                     base = instruction.args[0]
+                     value = instruction.args[-1]
+                     indices = instruction.args[1:-1]
+-                    address = fresh()
++                    address = SSAValue(mint_ssa_value(
++                        function, ADDRESS, (base, *indices, instruction.res),
++                        stage=CONTROL_SSA_FINISH,
++                    ))
+                     rewritten.append(
+                         Instr("GetElementPtr", [base, *indices], address)
+                     )
+@@ -171,7 +179,7 @@ def _propagate_scalar_dtypes(functions) -> None:
+     floats = {"float", "float16", "float32", "float64", "double", "f32", "f64"}
+     preserving = {
+         "Add", "Sub", "Mul", "FloorDiv", "Mod", "Pow", "Min", "Max",
+-        "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Abs",
++        "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Abs", "Invert",
+     }
+     predicates = {
+         "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "ULt", "ULe",
+diff --git a/src/compiler/ssa_llvm_backend.py b/src/compiler/ssa_llvm_backend.py
+index 854e76a..5d9c580 100644
+--- a/src/compiler/ssa_llvm_backend.py
++++ b/src/compiler/ssa_llvm_backend.py
+@@ -808,6 +808,12 @@ def integer_scalar_lines(
+     if operation == "Neg" and len(operands) == 1:
+         return ([f"{register} = sub {operand_type} 0, {operands[0]}"],
+                 operand_type)
++    if operation == "Invert" and len(operands) == 1:
++        # The canonical authored ``~mask`` opcode preserves its integer
++        # domain. The old double fallback rejected it, despite an i64
++        # likeness entry, then left the consuming branch Phi mismatched.
++        return ([f"{register} = xor {operand_type} {operands[0]}, -1"],
++                operand_type)
+     if operation in {"Not", "LNot"} and len(operands) == 1:
+         return ([f"{register} = xor {operand_type} {operands[0]}, 1"],
+                 operand_type)
+diff --git a/src/compiler/ssa_fortran_backend.py b/src/compiler/ssa_fortran_backend.py
+index 13348bf..b2ef96b 100644
+--- a/src/compiler/ssa_fortran_backend.py
++++ b/src/compiler/ssa_fortran_backend.py
+@@ -3304,7 +3304,9 @@ class _FunctionEmitter:
+                 return f"int({expression}, {kind})"
+             return f"real({expression}, c_double)"
+ 
+-        if op == "invert" and len(args) == 1:
++        # Public source lowering uses the canonical Invert opcode. Both
++        # spellings name the same existing integer/logical complement rule.
++        if op in {"invert", "Invert"} and len(args) == 1:
+             source_dtype = str(self._typed(instr.args[0]).dtype).casefold()
+             if source_dtype in _LOGICAL_DTYPES:
+                 return f"(.not. {args[0]})"
+diff --git a/src/compiler/ssa_call_input_adapters.py b/src/compiler/ssa_call_input_adapters.py
+index 90803a5..0931b8a 100644
+--- a/src/compiler/ssa_call_input_adapters.py
++++ b/src/compiler/ssa_call_input_adapters.py
+@@ -5,8 +5,12 @@ from itertools import chain
+ from math import prod
+ import time
+ 
+-from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+-from .identity_concordance import current_identity_book
++from .identity_concordance import current_identity_book, Derived, Mode
++from .concordance_declarations import (
++    CONTROL_CAST, PHYSICAL_CALL_INPUT_ADAPTATION, CALL_INPUT_CONVERSION,
++    KERNEL_INPUT_CONVERSION,
++)
++from .ssa_record_return_state import mint_ssa_value, ssa_value_identity_cell, identity_cells
+ from ..transmogrifier.ssa import Instr, SSAValue
+ 
+ 
+@@ -624,7 +628,8 @@ def _adapt_physical_call_inputs_round(
+                         # settlement; passing its pointer directly is byte
+                         # reinterpretation (integer 1 becomes 5e-324).
+                         converted = SSAValue(
+-                            GLOBAL_MONOTONIC_IDS.mint(),
++                            mint_ssa_value(caller, CONTROL_CAST, (source,),
++                                dtype='float64', stage=PHYSICAL_CALL_INPUT_ADAPTATION),
+                             dtype='float64', shape=(), device=source.device,
+                             accounting={
+                                 'physical_dtype': 'float64',
+@@ -669,13 +674,13 @@ def _adapt_physical_call_inputs_round(
+                             str(caller.name), str(block_name),
+                             conversion['consumer_id'], 0,
+                         )
+-                        history = page.history(row)
+-                        column = history[-1][0] + 1 if history else 0
+-                        page.set(row, column, (
++                        current_identity_book().post(KERNEL_INPUT_CONVERSION, row, (
+                             int(source.id), int(converted.id),
+                             str(source_dtype), 'float64',
+                             'broadcast_double',
+-                        ))
++                        ), stage=PHYSICAL_CALL_INPUT_ADAPTATION,
++                            provenance=Derived(identity_cells(caller, source, converted)),
++                            mode=Mode.REVISE)
+                         count += 1
+                 if (instruction.op in {'Call', 'call'} and callee is not None
+                         and len(instruction.args) == len(callee.args)):
+@@ -746,7 +751,13 @@ def _adapt_physical_call_inputs_round(
+                         if source_dtype not in numeric or target_dtype not in numeric:
+                             continue
+                         # Shape is retained; a span conversion is elementwise.
+-                        converted = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=target_dtype, shape=actual.shape, device=actual.device,
++                        # These six energy-helper conversions used to mint
++                        # outside the book. The source value and the exact
++                        # callee formal are the causes of this ABI conversion.
++                        converted = SSAValue(mint_ssa_value(caller, CONTROL_CAST,
++                            (actual, ssa_value_identity_cell(callee, formal.id)),
++                            dtype=target_dtype, shape=actual.shape,
++                            stage=PHYSICAL_CALL_INPUT_ADAPTATION), dtype=target_dtype, shape=actual.shape, device=actual.device,
+                             accounting={'physical_dtype': target_dtype,
+                                 'call_input_conversion': (caller.name, int(actual.id), callee.name, int(formal.id)),
+                                 'call_input_conversion_kind': (
+@@ -793,12 +804,13 @@ def _adapt_physical_call_inputs_round(
+                             str(caller.name), int(actual.id),
+                             str(callee.name), int(formal.id),
+                         )
+-                        history = page.history(row)
+-                        column = history[-1][0] + 1 if history else 0
+-                        page.set(row, column, (
++                        current_identity_book().post(CALL_INPUT_CONVERSION, row, (
+                             int(converted.id), str(source_dtype),
+                             str(target_dtype), conversion['kind'],
+-                        ))
++                        ), stage=PHYSICAL_CALL_INPUT_ADAPTATION,
++                            provenance=Derived(identity_cells(caller, actual, converted,
++                                ssa_value_identity_cell(callee, formal.id))),
++                            mode=Mode.REVISE)
+                         count += 1
+                 publication = None
+                 output_position = instruction.attributes.get('ssa_output_argument')
+@@ -815,7 +827,10 @@ def _adapt_physical_call_inputs_round(
+                             and int(instruction.res.id) == int(original.id)
+                             and not (not original.shape and (original.accounting or {}).get('program_abi_storage') == 'span')
+                             and int(original.id) not in {int(value.id) for value in caller.args}):
+-                        temporary = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=backend_dtype, shape=original.shape, device=original.device,
++                        temporary = SSAValue(mint_ssa_value(caller, CONTROL_CAST,
++                            (original, ssa_value_identity_cell(callee, formal.id)),
++                            dtype=backend_dtype, shape=original.shape,
++                            stage=PHYSICAL_CALL_INPUT_ADAPTATION), dtype=backend_dtype, shape=original.shape, device=original.device,
+                             accounting={'physical_dtype': backend_dtype,
+                                 'call_output_conversion': (callee.name, int(formal.id), caller.name, int(original.id))})
+                         instruction.args[position] = temporary
+diff --git a/tests/test_precompile_to_ssa.py b/tests/test_precompile_to_ssa.py
+index 89c2c7f..46fb09c 100644
+--- a/tests/test_precompile_to_ssa.py
++++ b/tests/test_precompile_to_ssa.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import pytest
++
+ from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
+ from src.compiler.control_source import (
+     ControlDeploymentLane,
+@@ -56,6 +58,18 @@ from src.compiler.shell_reference_tables import (
+     ClassNavigationTable,
+ )
+ from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
++
++
++@pytest.fixture(autouse=True)
++def _isolated_control_fixture_book():
++    # Independent synthetic programs reuse planned_control and graph IDs.
++    # They are not revisions of one compile: each needs its own book, while
++    # repeated lowerings inside a test still share and test concordance.
++    _book, token = begin_identity_book()
++    try:
++        yield
++    finally:
++        end_identity_book(token)
+ from src.transmogrifier.function_table import ParameterContract
+ 
+ 
+@@ -94,18 +108,21 @@ def test_field_receiver_uses_typed_columns_only_for_heterogeneous_slots():
+         field_dtypes={0: "bool", 1: "int64"},
+     )
+ 
+-    assert locations == {0: (10, 0, "bool"), 1: (11, 0, "int64")}
++    from src.compiler.id_space import MINTED, has_flag
++    integer_column = locations[1][0]
++    assert has_flag(integer_column, MINTED)
++    assert locations == {0: (10, 0, "bool"), 1: (integer_column, 0, "int64")}
+     assert [(value.id, value.dtype, value.shape) for value in lowered.args] == [
+-        (10, "bool", (1,)), (11, "int64", (1,)), (7, "int64", ()),
++        (10, "bool", (1,)), (integer_column, "int64", (1,)), (7, "int64", ()),
+     ]
+     assert lowered.metadata["receiver_field_locations"] == (
+-        (0, 10, 0, "bool"), (1, 11, 0, "int64"),
++        (0, 10, 0, "bool"), (1, integer_column, 0, "int64"),
+     )
+     geps = [
+         instruction for instruction in lowered.blocks["entry"].instrs
+         if instruction.op == "GetElementPtr"
+     ]
+-    assert [instruction.args[0].id for instruction in geps] == [10, 11]
++    assert [instruction.args[0].id for instruction in geps] == [10, integer_column]
+ 
+ 
+ def test_field_write_versions_result_colliding_with_receiver_storage():
+@@ -463,11 +480,12 @@ def test_native_fortran_ops_keep_mean_and_span_fill_in_ssa():
+     instructions = function.blocks["entry"].instrs
+     assert [instruction.op for instruction in instructions] == [
+         "Call",
+-        "Fill",
++        "Call",
+         "Call",
+         "Ret",
+     ]
+     assert instructions[0].attributes["tensor_operation"] == "mean"
++    assert instructions[1].attributes['tensor_operation'] == 'zeros_like'
+ 
+ 
+ def test_class_navigation_has_general_ssa_semantic_procedures():
+@@ -769,8 +787,9 @@ def test_record_field_getattr_becomes_a_loaded_region_capture():
+         "output_value_ids": (8,),
+     }
+     assert [instruction.op for instruction in region_function.blocks["entry"].instrs] == [
+-        "Add"
++        "Add", "Ret"
+     ]
++    assert [v.id for v in region_function.blocks['entry'].instrs[-1].args] == [8]
+     control_operations = [
+         instruction.op
+         for block in module.functions["planned_control"].blocks.values()
+@@ -1443,7 +1462,9 @@ def test_in_place_store_chain_output_publishes_its_root_arena():
+         if instruction.op == "Ret"
+     )
+     assert [value.id for value in ret.args] == [13, 14]
+-    assert control_function.metadata["value_aliases"] == {12: 11, 13: 12}
++    # Canonical aliases now point directly to the storage root, not through
++    # incidental versions. Both authored store generations remain published.
++    assert control_function.metadata["value_aliases"] == {12: 11, 13: 11}
+ def test_in_place_store_chain_on_a_parameter_publishes_nothing():
+     """A store chain whose root is a CAPTURE is visible through that capture.
+ 
+@@ -2290,7 +2311,9 @@ def test_nested_iterable_row_is_handle_stride_and_child_address():
+         for instruction in block.instrs
+         if instruction.attributes.get("binding") == "nested_row_base"
+     )
+-    assert call.args == [row_address]
++    # Call operands are derived typed/accounted views of the same identity.
++    assert [(v.id, v.dtype, v.shape) for v in call.args] == [(row_address.id, row_address.dtype, row_address.shape)]
++    assert call.args[0].accounting['ssa_storage_alias'] == row_address.id
+ 
+ 
+ def test_explicit_iterable_binding_precedes_duplicate_closure_fallback():
+@@ -2568,7 +2591,8 @@ def test_nested_loop_inner_result_port_rebinds_to_enclosing_exit():
+         if instruction.attributes.get("region_index") == 4
+     )
+     assert outer_result.id == 40
+-    assert post_loop_call.args == [outer_result]
++    assert [(v.id, v.dtype, v.shape) for v in post_loop_call.args] == [(outer_result.id, outer_result.dtype, outer_result.shape)]
++    assert post_loop_call.args[0].accounting['ssa_storage_alias'] == outer_result.id
+     assert function.metadata["carried_port_values"][30] is outer_result
+ 
+ 
+@@ -3501,7 +3525,34 @@ def test_scalar_field_write_effect_versions_feed_conditional_merge():
+     assert check_definition_dominance(IRModule({function.name: function})) == []
+ 
+ 
+-def test_inplace_scalar_field_effect_uses_resident_incumbent_on_false_arm():
++@pytest.fixture
++def scalar_field_version_fixture():
++    """Exact field-state revisions, rather than ambiguous reused effect IDs."""
++    from src.compiler.concordance_declarations import (
++        CANONICAL_VALUE, INGESTION, INGEST_SOURCE, READ_SCOPE_FORK,
++        REDUCER_FIELD_STATE, FieldState, FieldStateKind,
++    )
++    from src.compiler.identity_concordance import Derived, Mode, Novel
++    book, token = begin_identity_book()
++    try:
++        scope = book.mint_scope('scalar_field_fixture', READ_SCOPE_FORK)
++        nodes = {value_id: book.post(CANONICAL_VALUE, (scope, value_id), (),
++                    stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD)
++                 for value_id in (12, 30, 40, 42, 50)}
++        def state(kind, value, effect):
++            return book.post(REDUCER_FIELD_STATE, (scope, 1, 'field'),
++                FieldState(kind, nodes[value], nodes[effect]), stage=INGESTION,
++                provenance=Derived((nodes[value], nodes[effect])), mode=Mode.REVISE)
++        observed = state(FieldStateKind.OBSERVED, 30, 30)
++        written = state(FieldStateKind.WRITTEN, 12, 40)
++        merged = state(FieldStateKind.MERGED, 42, 50)
++        yield scope, observed, written, merged
++    finally:
++        end_identity_book(token)
++
++
++def test_inplace_scalar_field_effect_uses_resident_incumbent_on_false_arm(scalar_field_version_fixture):
++    scope, observed, written, merged = scalar_field_version_fixture
+     control = ControlProgram(ConditionalBlock(
+         predicate_value_id=10,
+         body=SequenceBlock((ScalarFieldWriteBlock(
+@@ -3509,15 +3560,18 @@ def test_inplace_scalar_field_effect_uses_resident_incumbent_on_false_arm():
+             value_expression=ControlExpression("value", value_id=12),
+             dtype="int64",
+             effect_node_id=40,
++            field_state_cell=written,
+         ),)),
+         orelse=SequenceBlock(()),
+         predicate_expression=ControlExpression("value", value_id=10),
+         carried_aliases=((40, 40, 40, 42),),
++        carried_field_cells=((written, observed, merged),),
+         source_node_id=50,
+     ))
+ 
+     function, shortfalls = lower_control_program_to_ssa(
+         control,
++        lexical_read_scope=scope,
+         region_value_meta={
+             10: Meta((), "bool"),
+             12: Meta((), "int64"),
+@@ -3635,7 +3689,11 @@ def test_conditional_versions_join_when_graph_reuses_arm_identity():
+         and instruction.res.accounting.get("ssa_conditional_write_version")
+     )
+     assert [value.id for value in carried.args] == [40, 30]
+-    assert carried.res.id == 100
++    # first_value_id is no longer a private mint namespace. The shared book
++    # mints globally, retaining graph 40 only as the source-version identity.
++    from src.compiler.id_space import MINTED, has_flag
++    assert has_flag(carried.res.id, MINTED)
++    assert carried.res.id not in {10, 11, 12, 30, 40, 41}
+     assert carried.res.accounting == {
+         "source_value_id": 40,
+         "ssa_conditional_write_version": True,
+diff --git a/tests/test_scheduled_process_graph_dispatches.py b/tests/test_scheduled_process_graph_dispatches.py
+index 73aa9f7..91edca2 100644
+--- a/tests/test_scheduled_process_graph_dispatches.py
++++ b/tests/test_scheduled_process_graph_dispatches.py
+@@ -57,6 +57,22 @@ def graph_cut_book():
+         end_identity_book(token)
+ 
+ 
++def _scope_dispatch_fixture(graph, book):
++    """Enter synthetic nodes through the same identity API as scoped cuts."""
++    from src.compiler.concordance_declarations import (
++        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, SYNTHESIZED_NO_SOURCE,
++    )
++    from src.compiler.identity_concordance import Mode, Unsourced
++    scope = book.mint_scope('dispatch_fixture', READ_SCOPE_FORK)
++    graph.G.graph.update(ingestion_value_scope=scope, lexical_read_scope=scope,
++                         operand_position_scope=scope)
++    for node_id, data in graph.G.nodes(data=True):
++        book.post(INGESTION_VALUE, (scope, node_id),
++                  NodeFact(data.get('type'), data.get('op'), data.get('label')),
++                  stage=READ_SCOPE_FORK, provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
++                  mode=Mode.CONCORD)
++
++
+ def test_dispatch_cuts_share_one_edge_index_without_rescanning_other_members(monkeypatch, graph_cut_book):
+     """Region count must not multiply whole-source adjacency traversals.
+ 
+@@ -383,7 +399,7 @@ def test_old_serialized_dispatch_classification_is_recomputed():
+     assert graph.G.graph["_dispatch_metadata_cache"] is not old_cache
+ 
+ 
+-def test_tensor_accessor_and_its_scalar_comparison_stay_with_coordinator():
++def test_tensor_accessor_is_coordinator_but_scalar_comparison_has_a_producer():
+     graph = ProcessGraph(materialize_memory=False)
+     _add(graph, 0, "Input")
+     _add(graph, 1, "ndims", (0,))
+@@ -394,7 +410,9 @@ def test_tensor_accessor_and_its_scalar_comparison_stay_with_coordinator():
+     graph.G.nodes[2]["constant"] = 1
+ 
+     assert _is_dispatch_metadata_node(graph, 1)
+-    assert _is_dispatch_metadata_node(graph, 3)
++    # Sept30's recorded decision removed scalar-expression deferral. The
++    # comparison is numerical work, computed once rather than per consumer.
++    assert not _is_dispatch_metadata_node(graph, 3)
+ 
+ 
+ def test_clean_subgraph_drops_obligations_to_excluded_parents():
+@@ -803,7 +821,7 @@ def test_region_reduction_is_open_to_every_executable_tensor_operation():
+     assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1, 2, 3)]
+ 
+ 
+-def test_a_lookup_nobody_reads_is_not_a_region_boundary():
++def test_a_lookup_nobody_reads_is_not_a_region_boundary(graph_cut_book):
+     graph = ProcessGraph(materialize_memory=False)
+     _add(graph, 0, "Input")
+     _add(graph, 1, "Add", (0,))
+@@ -812,6 +830,8 @@ def test_a_lookup_nobody_reads_is_not_a_region_boundary():
+     graph.G.nodes[2]["expr_obj"] = ast.parse("value.sqrt").body[0].value
+     graph.compute_levels(method="asap", order="dependency")
+ 
++    _scope_dispatch_fixture(graph, graph_cut_book)
++
+     inert = _inert_routing_nodes(graph)
+     assert inert == frozenset({2})
+ 
+@@ -831,13 +851,15 @@ def test_an_attribute_assignment_is_never_treated_as_inert():
+     assert _inert_routing_nodes(graph) == frozenset()
+ 
+ 
+-def test_dispatch_exports_a_value_routed_by_identity():
++def test_dispatch_exports_a_value_routed_by_identity(graph_cut_book):
+     graph = ProcessGraph(materialize_memory=False)
+     _add(graph, 0, "Input")
+     _add(graph, 1, "Add", (0,))
+     _add(graph, 2, "Mul", (1,))
+     graph.compute_levels(method="asap", order="dependency")
+ 
++    _scope_dispatch_fixture(graph, graph_cut_book)
++
+     dispatch = _dispatch_subgraph(
+         graph,
+         (1, 2),
+@@ -847,7 +869,7 @@ def test_dispatch_exports_a_value_routed_by_identity():
+     assert dispatch.G.graph["deployment_outputs"] == (1, 2)
+ 
+ 
+-def test_dispatch_exports_an_internal_value_used_outside_the_region():
++def test_dispatch_exports_an_internal_value_used_outside_the_region(graph_cut_book):
+     graph = ProcessGraph(materialize_memory=False)
+     _add(graph, 0, "Input")
+     _add(graph, 1, "Add", (0,))
+@@ -855,6 +877,8 @@ def test_dispatch_exports_an_internal_value_used_outside_the_region():
+     _add(graph, 3, "external", (1,))
+     graph.compute_levels(method="asap", order="dependency")
+ 
++    _scope_dispatch_fixture(graph, graph_cut_book)
++
+     dispatch = _dispatch_subgraph(graph, (1, 2))
+ 
+     assert dispatch.G.graph["deployment_outputs"] == (1, 2)
+diff --git a/tests/test_fortran_c_shell.py b/tests/test_fortran_c_shell.py
+index 464f81b..54d0fe6 100644
+--- a/tests/test_fortran_c_shell.py
++++ b/tests/test_fortran_c_shell.py
+@@ -2106,10 +2106,8 @@ def run(key, value):
+ 
+ 
+ def test_whole_object_if_assignment_lowers_to_conditional_phi_merge():
+-    from src.common.tensors.accelerator_backends.aot_compile import (
+-        compile_ast_aot,
+-    )
+-    from src.compiler.fortran_c_shell import _class_surface_ssa_program
++    from src.compiler.extraction_contract import ExtractionContract
++    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+ 
+     source = """
+ def choose(flags, mask, add):
+@@ -2117,19 +2115,15 @@ def choose(flags, mask, add):
+         flags &= ~mask
+     return flags | add
+ """
+-    compilation = compile_ast_aot(
+-        source,
+-        "choose",
+-        {"flags": 7, "mask": 3, "add": 1},
+-        precompile_only=True,
+-        bake_mode="whole_program",
+-        require_planned_shells=True,
+-        project_captured_hierarchy=False,
+-    )
+-    module, _outputs, _exports = _class_surface_ssa_program(
+-        compilation, "conditional_merge"
+-    )
+-    function = module.functions["conditional_merge__choose"]
++    policy = ExtractionContract(CONTRACT).with_program_abi({
++        'bindings': [], 'values': [{'function': 'choose', 'parameter': parameter,
++            'storage': 'scalar', 'dtype': 'int64', 'rank': 0, 'python_type': 'builtins.int'}
++            for parameter in ('flags', 'mask', 'add')]})
++    # The deprecated numerical precompile entry no longer owns complete
++    # source/control lowering. Exercise the sanctioned complete-program API.
++    module, _outputs, exports = lower_ast_source_to_ssa(source, 'choose',
++        name='conditional_merge', extraction_contract=policy, progress=lambda _: None)
++    function = module.functions[exports[0]]
+     instructions = [
+         instruction
+         for block in function.blocks.values()
+@@ -2144,11 +2138,14 @@ def choose(flags, mask, add):
+         if instruction.op == "Phi"
+         and instruction.attributes.get("binding") == "conditional_carried"
+     )
+-    assert [value.id for value in conditional.args] == [4]
+-    assert [value.id for value in merged.args] == [6, 2]
+-    assert merged.res.id == 3
++    assert len(conditional.args) == 1
++    # The authored bitwise expression stays int64; the backend tests nonzero.
++    assert conditional.args[0].dtype == 'int64'
++    parameters = dict(function.metadata['parameter_names'])
++    assert merged.args[1].id == parameters['flags']
++    assert merged.args[0].id != merged.args[1].id
+     assert any(
+-        instruction.op == "Call" and [value.id for value in instruction.args] == [3, 0]
++        instruction.op == "Call" and merged.res.id in [value.id for value in instruction.args]
+         for instruction in instructions
+     )
+ 
+diff --git a/tests/test_callsite_formal_shape_concordance.py b/tests/test_callsite_formal_shape_concordance.py
+index 46c682e..11a3297 100644
+--- a/tests/test_callsite_formal_shape_concordance.py
++++ b/tests/test_callsite_formal_shape_concordance.py
+@@ -207,13 +207,13 @@ def test_existing_call_projection_is_enriched_by_later_exact_descriptor():
+             graph.G.nodes[27]["attributes"]["aggregate_leaf_value_ids"]
+         ) == leaves
+         assert graph.G.nodes[permutation]["tensor"] == exact[2]
+-        page = current_identity_book().page(
+-            "callsite_projection_specialization"
+-        )
+-        history = page.history(("solve", 27, 2, permutation))
++        # Descriptor revisions now live on the shared declared member page,
++        # keyed by caller-copy scope, not the retired action-log name page.
++        page = current_identity_book().page("callsite_return_member")
++        history = page.history((("function", "solve"), 27, 2, permutation))
+         assert history == (
+-            (0, ("materialized", None)),
+-            (1, ("enriched", ((2, 2), "float64"))),
++            (0, None),
++            (1, ((2, 2), "float64")),
+         )
+     finally:
+         end_identity_book(token)
+diff --git a/tests/test_compilation_units.py b/tests/test_compilation_units.py
+index b302c6b..800a058 100644
+--- a/tests/test_compilation_units.py
++++ b/tests/test_compilation_units.py
+@@ -3,6 +3,19 @@ from __future__ import annotations
+ from types import SimpleNamespace
+ 
+ import networkx as nx
++import pytest
++
++from src.compiler.identity_concordance import begin_identity_book, end_identity_book
++
++
++@pytest.fixture(autouse=True)
++def _isolated_project_book():
++    # Each synthetic project owns its function-address declarations.
++    _book, token = begin_identity_book()
++    try:
++        yield
++    finally:
++        end_identity_book(token)
+ 
+ from src.compiler.compilation_units import (
+     plan_compilation_units,
+@@ -66,10 +79,14 @@ def test_mutual_recursion_is_the_only_automatic_multi_call_unit():
+ 
+ def test_plan_identity_uses_qualified_names_not_reference_order():
+     first, _ = _table({"z": (), "a": ()})
+-    second, _ = _table({"a": (), "z": ()})
+-
+     first_names = [unit.qualified_names for unit in plan_compilation_units(first).units]
+-    second_names = [unit.qualified_names for unit in plan_compilation_units(second).units]
++    # This is a second project, not conflicting declarations in the first.
++    _book, token = begin_identity_book()
++    try:
++        second, _ = _table({"a": (), "z": ()})
++        second_names = [unit.qualified_names for unit in plan_compilation_units(second).units]
++    finally:
++        end_identity_book(token)
+ 
+     assert first_names == second_names == [("project.a",), ("project.z",)]
+ 
+diff --git a/tests/test_pythonic_control_torture.py b/tests/test_pythonic_control_torture.py
+index e98fd2c..5512950 100644
+--- a/tests/test_pythonic_control_torture.py
++++ b/tests/test_pythonic_control_torture.py
+@@ -90,6 +90,43 @@ _counter_source, _counter_trials = CASES['integer_while_counter']
+ CASES['folded_integer_seed'] = (_counter_source.replace('while iters < limit:', 'while limit > 0:')
+     .replace('        iters += 1', '        limit -= 1\n        iters += 1'), _counter_trials)
+ 
++CASES['first_read_augmented_branch'] = ('''
++def root(flags, mask, add):
++    if add & mask:
++        flags &= ~mask
++    return flags | add
++''', tuple((dict(flags=flags, mask=mask, add=add), expected)
++          for flags, mask, add, expected in ((15, 6, 2, 11), (15, 6, 1, 15),
++                                            (8, 6, 2, 10), (15, 6, 2, 11))))
++CASES['first_read_augmented_loop'] = ('''
++def root(value, count):
++    for index in range(count):
++        value += 2
++    return value
++''', tuple((dict(value=value, count=count), value + 2 * count)
++          for value, count in ((5, 0), (5, 1), (5, 7), (5, 0))))
++
++CASES['unary_plus_return'] = ('''
++def root(value):
++    return +value
++''', tuple((dict(value=value), value) for value in (0.125, -3.0, 0.0, 0.125)))
++
++for _index, (_xs, _ys, _flag) in enumerate((((), (), True), ((1, 2), (), True),
++                                          ((), (3, 4), True), ((1, 2), (3, 4), False))):
++    CASES[f'generator_target_scope_{_index}'] = (f'''
++def root():
++    xs = {_xs!r}
++    ys = {_ys!r}
++    flag = {_flag!r}
++    tagged = tuple(int(address) for address in xs)
++    total = 0
++    for address in ys:
++        total = total + address
++    if flag:
++        return total + len(tagged)
++    return total
++''', (({}, sum(_ys) + (len(_xs) if _flag else 0)),) * 2)
++
+ 
+ @pytest.mark.parametrize("case", CASES)
+ @pytest.mark.parametrize("backend", ("c", "llvm", "fortran"))
+diff --git a/tools/audit_identity_concordance.py b/tools/audit_identity_concordance.py
+index 285debf..936bd6d 100644
+--- a/tools/audit_identity_concordance.py
++++ b/tools/audit_identity_concordance.py
+@@ -117,12 +117,16 @@ def tick(state, dt):
+         tensor_ssa_reference=c_backend_repository_ssa_reference(),
+         name="concordance_view", runtime_closure_only=True,
+         extraction_contract=policy,
+-        resolved_process_graph_sink=process_graph_sink,
++        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
+     )
+     return module
+ 
+ 
+ def _lower_toplevel(*, process_graph_sink=None):
++    from src.common.tensors import AbstractTensor
++    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
++        c_backend_repository_ssa_reference,
++    )
+     from src.compiler.extraction_contract import ExtractionContract
+     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+     from src.compiler.vehicle_python_compilation import (
+@@ -147,8 +151,15 @@ def _lower_toplevel(*, process_graph_sink=None):
+         inspect.getsource(_scalar),
+         inspect.getsource(_energy_time_limit),
+         inspect.getsource(_propose_dt_pen),
+-        "def root(metrics, targets, dx, distribution):\n"
+-        "    return _propose_dt_pen(metrics, targets, dx, distribution)\n",
++        # A supplied distribution is an authored callable, not an untyped
++        # runtime Python object at a native boundary. Keep both actual DT
++        # paths reachable under a runtime flag and the current five-arg API.
++        "def distribution_override(metrics, targets, dx):\n"
++        "    return dx * 0.5\n",
++        "def root(metrics, targets, dx, dt_current, override):\n"
++        "    if override:\n"
++        "        return _propose_dt_pen(metrics, targets, dx, distribution_override, dt_current)\n"
++        "    return _propose_dt_pen(metrics, targets, dx, None, dt_current)\n",
+     ))
+     policy = ExtractionContract(
+         CONTRACTS / "program_extraction.yaml"
+@@ -161,11 +172,21 @@ def _lower_toplevel(*, process_graph_sink=None):
+             {"function": "*", "parameter": "metrics", "record": "Metrics"},
+             {"function": "*", "parameter": "targets", "record": "Targets"},
+         ],
+-        "values": [],
++        "values": [*base["values"], *[
++            {"function": "root", "parameter": parameter, "storage": "scalar",
++             "dtype": dtype, "rank": 0, "python_type": python_type}
++            for parameter, dtype, python_type in (
++                ("dx", "float64", "builtins.float"),
++                ("dt_current", "float64", "builtins.float"),
++                ("override", "bool", "builtins.bool"),
++            )
++        ]],
+     })
+     module, _outputs, _exports = lower_ast_source_to_ssa(
+         source, "root", name="concordance_toplevel", extraction_contract=policy,
+-        resolved_process_graph_sink=process_graph_sink,
++        python_bindings={"AbstractTensor": AbstractTensor},
++        tensor_ssa_reference=c_backend_repository_ssa_reference(),
++        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
+     )
+     return module
+ 
+@@ -198,14 +219,14 @@ def _lower_energy(*, process_graph_sink=None):
+             {"function": "*", "parameter": "metrics", "record": "Metrics"},
+             {"function": "*", "parameter": "targets", "record": "Targets"},
+         ],
+-        "values": [],
++        "values": list(base["values"]),
+     })
+     module, _outputs, _exports = lower_ast_source_to_ssa(
+         source, "root", name="concordance_energy",
+         python_bindings={"AbstractTensor": AbstractTensor},
+         tensor_ssa_reference=c_backend_repository_ssa_reference(),
+         extraction_contract=policy,
+-        resolved_process_graph_sink=process_graph_sink,
++        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
+     )
+     return module
+ 
+@@ -236,7 +257,11 @@ def _lower_controller(*, declare_root_types: bool = True, process_graph_sink=Non
+         "bindings": [
+             {"function": "*", "parameter": "ctrl", "record": "STController"},
+         ],
+-        "values": ([
++        # with_program_abi replaces the ABI; it does not append fields.
++        # Keep the incumbent helper contracts. Dropping _restore_type's
++        # AbstractTensor/float declarations left its isinstance predicate
++        # undefined and made this audit report an artificial compiler fault.
++        "values": [*base["values"], *([
+             {
+                 "function": "root", "parameter": name,
+                 "storage": "scalar", "dtype": dtype, "rank": 0,
+@@ -249,14 +274,14 @@ def _lower_controller(*, declare_root_types: bool = True, process_graph_sink=Non
+                 ("dt_pen", "float64", "builtins.float"),
+                 ("osc", "bool", "builtins.bool"),
+             )
+-        ] if declare_root_types else []),
++        ] if declare_root_types else [])],
+     })
+     module, _outputs, _exports = lower_ast_source_to_ssa(
+         source, "root", name="concordance_controller",
+         python_bindings={"AbstractTensor": AbstractTensor},
+         tensor_ssa_reference=c_backend_repository_ssa_reference(),
+         extraction_contract=policy,
+-        resolved_process_graph_sink=process_graph_sink,
++        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
+     )
+     return module
+ 
+@@ -278,7 +303,7 @@ def _lower_mapping(*, process_graph_sink=None):
+     module, _outputs, _exports = lower_ast_source_to_ssa(
+         source, "root", name="concordance_mapping",
+         extraction_contract=CONTRACTS / "program_extraction.yaml",
+-        resolved_process_graph_sink=process_graph_sink,
++        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
+     )
+     return module
+ 
+@@ -339,7 +364,7 @@ def _lower_oscillator(*, process_graph_sink=None):
+     module, _outputs, _exports = lower_ast_source_to_ssa(
+         source, "root", name="concordance_oscillator",
+         extraction_contract=CONTRACTS / "program_extraction.yaml",
+-        resolved_process_graph_sink=process_graph_sink,
++        resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
+     )
+     return module
+ 
+diff --git a/tests/test_concordance_audit_contracts.py b/tests/test_concordance_audit_contracts.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_concordance_audit_contracts.py
+@@ -0,0 +1,33 @@
++"""Audit overlays preserve the program's already-declared helper ABI."""
++from pathlib import Path
++import runpy
++import pytest
++from src.compiler.identity_concordance import concordance_report
++from src.compiler.identity_concordance import CorrelationTable
++
++
++@pytest.mark.parametrize('declare_root_types', [False, True])
++def test_controller_audit_preserves_existing_restore_type_contract(declare_root_types):
++    namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/audit_identity_concordance.py'))
++    module = namespace['_lower_controller'](declare_root_types=declare_root_types)
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    # The whole actual controller was still included, not replaced by a stub.
++    assert any('pi_update' in name for name in module.functions)
++    assert any('update_dt_max' in name for name in module.functions)
++
++
++@pytest.mark.parametrize('case', ['energy', 'toplevel'])
++def test_audit_has_no_undefined_values_or_unposted_minted_ids(case):
++    namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/audit_identity_concordance.py'))
++    module = namespace['_lower_' + case]()
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    _, identities = CorrelationTable.build(module)._unsourced_worklist(module)
++    assert identities == [], report
++    if case == 'toplevel':
++        assert any('distribution_override' in name for name in module.functions)
++        assert any('_energy_time_limit' in name for name in module.functions)
++        root = next(function for name, function in module.functions.items() if name.endswith('__root'))
++        assert any(instruction.op == 'CondBr' for block in root.blocks.values()
++                   for instruction in block.instrs)
+diff --git a/src/compiler/glsl_deployment_strategy.py b/src/compiler/glsl_deployment_strategy.py
+index b72db03..4f3c3b5 100644
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -15322,7 +15322,14 @@ def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
+         if attributes.get("structural_specialization") and tuple(
+             attributes.get("aggregate_leaf_value_ids") or ()
+         ):
+-            return False
++            # Selecting an aggregate does not prove its payload static; nor
++            # does it prove the payload dynamic. The literal (1, 2, 3) in
++            # child(x, amounts) was being classified dynamic after folding,
++            # then demanded a runtime Input from its already-constant formal.
++            # Consult the exact retained member identities recursively. A
++            # selected snapshot/tensor aggregate still fails this proof.
++            return all(_source_static_value(graph, int(leaf), visiting)
++                for leaf in attributes["aggregate_leaf_value_ids"])
+         return True
+     if data.get("type") == "Input":
+         name = (data.get("attributes") or {}).get("binding_name")
+@@ -20960,6 +20967,24 @@ def _fold_callsite_structural_values(
+             if name in {"bool", "int", "float"}:
+                 return {"bool": bool, "int": int, "float": float}[name](*values)
+             if name in {"tuple", "list", "set"}:
++                if (data.get("attributes") or {}).get(
++                    "materialization_kind"
++                ) == "unrolled_loop":
++                    # Loop evaporation replaces the generator argument with
++                    # its ordered element producers. They are elements, not
++                    # positional constructor arguments (tuple(1, 2)).
++                    # The empty case can retain an empty-sequence seed as an
++                    # argument; only the published element identities count.
++                    elements = tuple(
++                        known.get(int(value_id), unresolved)
++                        for value_id in (data.get("attributes") or {}).get(
++                            "materialized_value_ids", ()
++                        )
++                    )
++                    if any(element is unresolved or isinstance(element, _ProgramABIValueFact)
++                           for element in elements):
++                        return unresolved
++                    return {"tuple": tuple, "list": list, "set": set}[name](elements)
+                 return {"tuple": tuple, "list": list, "set": set}[name](*values)
+             if name == "len":
+                 return len(*values)
+@@ -21158,10 +21183,14 @@ def _fold_callsite_structural_values(
+         # source's identity (plan 80, A2.7); return slots naming it follow.
+         _post_identity_table_mutation(graph, aliases={node_id: source_id})
+         graph.G.graph["identity_table"] = {
+-            str(name): tuple(dict.fromkeys(
++            # A binding history is ordered versions, not a set of values.
++            # Folding a final Phi back to an earlier arm must leave that
++            # arm at the final version, even if it appeared before another
++            # arm. Deduplication would silently select the other return.
++            str(name): tuple(
+                 source_id if int(value_id) == node_id else int(value_id)
+                 for value_id in history
+-            ))
++            )
+             for name, history in identities.items()
+         }
+         graph.roots = [
+@@ -23580,6 +23609,7 @@ class ProcessGraphGLSLDeployment:
+         legacy_fused_network=False,
+         shell_language="glsl",
+         _defer_callsite_planning=False,
++        _function_catalogue=None,
+         **tuning,
+     ):
+         tuning = dict(tuning)
+@@ -23635,7 +23665,7 @@ class ProcessGraphGLSLDeployment:
+         # children re-entered this constructor before the chain could be
+         # passed down, making recursive call topologies expand forever.
+         self.function_shells = (
+-            {}
++            (_function_catalogue if _function_catalogue is not None else {})
+             if self._callsite_planning_deferred
+             else {
+                 reference: shell_type(
+@@ -23645,7 +23675,7 @@ class ProcessGraphGLSLDeployment:
+                 for reference, shell_type in self.function_shell_types.items()
+             }
+         )
+-        self._owns_function_shells = bool(self.function_shells)
++        self._owns_function_shells = bool(self.function_shells) and not self._callsite_planning_deferred
+         for function_shell in self.function_shells.values():
+             function_shell.function_shells = self.function_shells
+             function_shell._owns_function_shells = False
+@@ -23866,6 +23896,7 @@ class ProcessGraphGLSLDeployment:
+                         shared = shell_type(
+                             **tuning,
+                             _defer_callsite_planning=True,
++                            _function_catalogue=self.function_shells,
+                         )
+                         shared.function_shells = self.function_shells
+                         shared._owns_function_shells = False
+@@ -23902,6 +23933,11 @@ class ProcessGraphGLSLDeployment:
+                 planned = shell_type(
+                     **tuning,
+                     _defer_callsite_planning=True,
++                    # The constructor builds hierarchy signatures before
++                    # returning. countdown's backedge must read the shared
++                    # catalogue here, not an empty child table that is only
++                    # attached on the next line after construction.
++                    _function_catalogue=self.function_shells,
+                 )
+                 planned.function_shells = self.function_shells
+                 planned._owns_function_shells = False
+@@ -23916,6 +23952,7 @@ class ProcessGraphGLSLDeployment:
+                     (*active_references, reference),
+                 )
+         activation_roots = (
++            () if self._callsite_planning_deferred else
+             tuple(self.activation_root_references)
+             if self.runtime_closure_only
+             else tuple(self.function_shells)
+diff --git a/src/compiler/loop_composer.py b/src/compiler/loop_composer.py
+index 01c4292..ede27ad 100644
+--- a/src/compiler/loop_composer.py
++++ b/src/compiler/loop_composer.py
+@@ -2515,7 +2515,9 @@ def materialize_retained_loop_ports(
+         ))
+ 
+     graph.G.graph["identity_table"] = {
+-        name: tuple(dict.fromkeys(map(int, value_ids)))
++        # Preserve binding versions, including a final merge aliased back to
++        # an earlier value. Deduplicating it can make another arm current.
++        name: tuple(map(int, value_ids))
+         for name, value_ids in identities.items()
+     }
+     _rebuild_graph_edges(graph)
+@@ -4470,7 +4472,18 @@ def analyze_shader_loop_reductions(
+                 or effect.sequence_policy is None
+             ):
+                 continue
+-            materializer_id = int(effect.argument_value_ids[0])
++            argument_id = int(effect.argument_value_ids[0])
++            # materialize_retained_loop_ports replaces the GeneratorExp
++            # argument by its LoopResult (11). That result already records
++            # its exact materializer (8) in LoopIterationOutput. Reading the
++            # LoopResult's missing AST lost the route and emitted both a
++            # generator append and the enclosing extend for one source call.
++            materializers = {int(output.materializer_node_id)
++                for producer in plans for output in producer.loop.iteration_outputs
++                if int(output.result_value_id) == argument_id}
++            if len(materializers) > 1:
++                raise ValueError('one generator result has conflicting materializers')
++            materializer_id = next(iter(materializers), argument_id)
+             if materializer_id not in graph.G:
+                 continue
+             materializer = graph.G.nodes[materializer_id]
+diff --git a/src/transmogrifier/graph/graph_express2.py b/src/transmogrifier/graph/graph_express2.py
+index e3df268..0c01715 100644
+--- a/src/transmogrifier/graph/graph_express2.py
++++ b/src/transmogrifier/graph/graph_express2.py
+@@ -1230,7 +1230,10 @@ def _class_schema_from_ast(definition):
+     class_identity = (
+         ".".join(part for part in source_identity if part)
+         if source_identity is not None
+-        else definition.name
++        # Owner ingestion has already recorded lexical qualification. Two
++        # Visitor classes in lexical_calls/lexical_return_calls are distinct
++        # declarations, not two records for the bare spelling "Visitor".
++        else getattr(definition, "_turing_source_qualname", definition.name)
+     )
+     schema = {
+         "class_name": definition.name,
+diff --git a/tests/test_loop_composer.py b/tests/test_loop_composer.py
+index 8d8fe31..8afbd36 100644
+--- a/tests/test_loop_composer.py
++++ b/tests/test_loop_composer.py
+@@ -8,6 +8,20 @@ import textwrap
+ from dataclasses import replace
+ 
+ import numpy as np
++import pytest
++
++from src.compiler.identity_concordance import begin_identity_book, end_identity_book
++
++
++@pytest.fixture(autouse=True)
++def _isolated_loop_fixture_book():
++    # Independent authored test programs cannot redeclare one project's
++    # qualified function addresses with another table's address ordering.
++    _book, token = begin_identity_book()
++    try:
++        yield
++    finally:
++        end_identity_book(token)
+ 
+ from src.common.tensors.accelerator_backends.glsl_backend import (
+     emit_native_for_loop,
+@@ -1085,7 +1099,7 @@ def test_raise_guard_inside_retained_loop_becomes_lexical_validation():
+     assert "Raise" not in reduction.blockers
+     assert reduction.control_program is not None
+     assert reduction.control_program.root.source_loop_node_id == (
+-        plans[0].loop.node_id
++        plan.loop.node_id
+     )
+     root = reduction.control_program.root
+     assert isinstance(root, LoopBlock)
+@@ -1633,40 +1647,51 @@ def test_method_spelling_does_not_turn_unknown_receiver_into_sequence():
+     assert effect.sequence_policy is None
+ 
+ 
+-def test_bootstrap_collection_mutation_occurrence_ledger_is_not_collapsed():
++@pytest.mark.parametrize('target_name', ('_attach_external_methods', '_expand_unresolved_ast_parents', 'build_from_ast'))
++def test_bootstrap_collection_mutation_occurrence_ledger_is_not_collapsed(target_name):
++    from collections import Counter
++    # The actual bootstrap source now has extra annotation/dependency queues.
++    # Check authored receiver/operator occurrences, not a retired ordering of
++    # five operation names. Distinct call sites must remain distinct effects.
+     expected = {
+-        "_attach_external_methods": [("add", "unique")],
++        "_attach_external_methods": [("present", "add", "unique")],
+         "_expand_unresolved_ast_parents": [
+-            ("append", "duplicates"),
+-            ("add", "unique"),
+-            ("extend", "duplicates"),
+-            ("append", "duplicates"),
+-            ("append", "duplicates"),
++            ("static_table_lookups", "append", "duplicates"),
++            ("new_definitions", "append", "duplicates"),
++            ("parent_links", "append", "duplicates"),
++            ("unresolved_calls", "append", "duplicates"),
++            ("unavailable_identities", "add", "unique"),
++            ("definitions", "extend", "duplicates"),
+         ],
+         "build_from_ast": [
+-            ("append", "duplicates"),
+-            ("add", "unique"),
++            ("class_names", "append", "duplicates"),
++            ("seen_methods", "add", "unique"),
++            ("dependency_seed_definitions", "append", "duplicates"),
++            ("pending", "extend", "duplicates"),
++            ("pending", "pop", "duplicates"),
++            ("annotation_rows", "append", "duplicates"),
++            ("annotation_rows", "append", "duplicates"),
+         ],
+     }
+-    targets = (
+-        graph_express2._attach_external_methods,
+-        graph_express2._expand_unresolved_ast_parents,
+-        ProcessGraph.build_from_ast,
+-    )
+-    for target in targets:
+-        source = textwrap.dedent(inspect.getsource(target))
+-        graph = _function_graph(source, target.__name__)
+-        plans = _glsl_composer().compose(graph)
+-        actual = [
+-            (effect.operator, effect.sequence_policy)
+-            for plan in plans
+-            for effect in plan.loop.state_effects
+-            if effect.mode is LoopStateEffectMode.SEQUENCE_MUTATION
+-        ]
+-        # This is an authored-operation ledger, not a count of compiler
+-        # worklist visits. Binding-revision requeues must never fabricate
+-        # a second runtime mutation for the same source Call node.
+-        assert actual == expected[target.__name__]
++    target = (ProcessGraph.build_from_ast if target_name == 'build_from_ast'
++              else getattr(graph_express2, target_name))
++    source = textwrap.dedent(inspect.getsource(target))
++    graph = _function_graph(source, target.__name__)
++    plans = _glsl_composer().compose(graph)
++    effects = [effect for plan in plans for effect in plan.loop.state_effects
++               if effect.mode is LoopStateEffectMode.SEQUENCE_MUTATION]
++    # This is an authored-operation ledger, not a count of compiler
++    # worklist visits. Binding-revision requeues must never fabricate
++    # a second runtime mutation for the same source Call node.
++    assert len(effects) == len({effect.effect_node_id for effect in effects})
++    actual = []
++    for effect in effects:
++        expression = graph.G.nodes[effect.effect_node_id]['expr_obj']
++        assert isinstance(expression, ast.Call)
++        assert isinstance(expression.func, ast.Attribute)
++        assert isinstance(expression.func.value, ast.Name)
++        actual.append((expression.func.value.id, effect.operator, effect.sequence_policy))
++    assert Counter(actual) == Counter(expected[target.__name__])
+ 
+ 
+ def test_ifexp_list_merge_preserves_each_args_extend_and_append_occurrence():
+@@ -1873,7 +1898,7 @@ def test_generator_extend_routes_yields_and_filter_into_destination_insert():
+     )
+     assert shortfalls == ()
+     assert (
+-        f"ssa_sequence_{mutation.sequence_value_id}_append"
++        f"planned_control__ssa_sequence_{mutation.sequence_value_id}_append"
+         in module.functions
+     )
+     assert {
+diff --git a/tests/test_shell_reference_tables.py b/tests/test_shell_reference_tables.py
+index dfd3bff..931b685 100644
+--- a/tests/test_shell_reference_tables.py
++++ b/tests/test_shell_reference_tables.py
+@@ -12,7 +12,16 @@ from src.compiler.glsl_deployment_strategy import (
+     _walk_planned_shells,
+     strategize_shell_deployment,
+ )
+-from src.compiler.identity_concordance import current_identity_book
++from src.compiler.identity_concordance import current_identity_book, begin_identity_book, end_identity_book
++
++
++@pytest.fixture(autouse=True)
++def _isolated_reference_fixture_book():
++    _book, token = begin_identity_book()
++    try:
++        yield
++    finally:
++        end_identity_book(token)
+ from src.compiler.compilation_units import record_compilation_unit_plan
+ from src.compiler.shell_reference_tables import (
+     build_class_navigation_table,
+@@ -482,13 +491,16 @@ def negate_tensor(value):
+         graph.build_from_ast(module)
+     reduce_abstract_tensor_topology(graph)
+ 
+-    class TensorValue:
+-        shape = (2,)
+-        dtype = "float64"
++    # Tensor inputs now enter via planner_tensor_descriptors, not arbitrary
++    # live objects in the structural-literal specialization map.
++    from src.common.tensors.abstraction import AbstractTensor
++    value = AbstractTensor.tensor([1.0, 2.0])
+ 
+     graph.function_table.entry(
+         "negate_tensor"
+-    ).graph.G.graph["planner_specializations"] = {"value": TensorValue()}
++    ).graph.G.graph["planner_tensor_descriptors"] = {"value": {
++        "shape": tuple(value.shape), "dtype": str(value.dtype), "rank": len(value.shape),
++    }}
+     deployment_type = strategize_shell_deployment(graph)
+ 
+     split_graph = deployment_type.function_shell_types[
+diff --git a/tests/test_abstract_tensor_topological_reducer.py b/tests/test_abstract_tensor_topological_reducer.py
+index 7d9efed..96fcf27 100644
+--- a/tests/test_abstract_tensor_topological_reducer.py
++++ b/tests/test_abstract_tensor_topological_reducer.py
+@@ -8,6 +8,7 @@ import subprocess
+ import sys
+ 
+ import networkx as nx
++import pytest
+ 
+ from src.common.tensors.topological_reducer import (
+     _concorded_static_parameter_bindings,
+@@ -30,6 +31,15 @@ from src.compiler.identity_concordance import (
+ )
+ 
+ 
++@pytest.fixture(autouse=True)
++def _isolated_reducer_fixture_book():
++    _book, token = begin_identity_book()
++    try:
++        yield
++    finally:
++        end_identity_book(token)
++
++
+ class _StaticClassMethodFactory:
+     def __init__(self, value):
+         self.value = value
+@@ -1303,7 +1313,8 @@ class Builder:
+ 
+     contract = _field_slot_ops(executable)
+     table_deletions = contract[13]
+-    tombstone_sequence_ids = contract[17]
++    # Nested record fields now occupy slot 17; tombstones are the final slot.
++    tombstone_sequence_ids = contract[-1]
+ 
+     assert table_deletions == ()
+     assert tombstone_sequence_ids == (external_values,)
+@@ -2452,15 +2463,16 @@ def repro(xs, ys):
+     assert "address" not in attributes.get("loop_target_initials", {})
+ 
+ 
+-def test_generator_target_leak_no_longer_crashes_the_real_aot_pipeline():
++@pytest.mark.parametrize('xs,ys,flag', [((), (), True), ((1, 2), (), True),
++                                     ((), (3, 4), True), ((1, 2), (3, 4), False)])
++def test_generator_target_leak_no_longer_crashes_the_public_pipeline(xs, ys, flag):
+     # End-to-end regression for the bug these two tests isolate: compiling
+     # the exact repro shape through the real compiler entrypoint (not just
+     # the reducer) used to fail with a bare `KeyError` from deep inside
+     # capture, referencing a node number with no readable connection to a
+     # comprehension five lines above the code that actually failed.
+-    from src.common.tensors.accelerator_backends.aot_compile import (
+-        compile_ast_aot,
+-    )
++    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++    from src.compiler.identity_concordance import concordance_report
+ 
+     source = """
+ def repro(xs, ys, flag):
+@@ -2472,16 +2484,17 @@ def repro(xs, ys, flag):
+         return total + len(tagged)
+     return total
+ """
+-    for xs, ys, flag in [
+-        ((), (), True),
+-        ((1, 2), (), True),
+-        ((), (3, 4), True),
+-        ((1, 2), (3, 4), False),
+-    ]:
+-        compile_ast_aot(
+-            source, "repro", {"xs": xs, "ys": ys, "flag": flag},
+-            precompile_only=True,
+-        )
++    # The old precompile-only projection accepts Python argument values; the
++    # public complete-program entry accepts authored source and an ABI. Keep
++    # these four source specializations as literal bindings in the program.
++    source = source.replace('def repro(xs, ys, flag):',
++        f'def repro():\n    xs = {xs!r}\n    ys = {ys!r}\n    flag = {flag!r}')
++    module, outputs, exports = lower_ast_source_to_ssa(source, 'repro',
++        extraction_contract='extraction_contracts/program_extraction.yaml',
++        progress=lambda _: None)
++    assert exports and outputs[exports[0]]
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
+ 
+ 
+ def test_subscript_write_to_attribute_field_orders_before_later_bare_read():
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+index a6c2423..1a80887 100644
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -19567,8 +19567,16 @@ def _class_surface_ssa_program(
+             output_index = len(declared)
+             declared.append(desired_id)
+             call.attributes["output_ids"] = tuple(declared)
+-            index_value = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="int")
+-            address = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr")
++            from .concordance_declarations import ADDRESS, CONTROL_CONST, CONTROL_SSA_FINISH
++            from .ssa_record_return_state import mint_ssa_value
++            index_value = SSAValue(mint_ssa_value(
++                caller, CONTROL_CONST, (call.res,), dtype="int",
++                stage=CONTROL_SSA_FINISH,
++            ), dtype="int")
++            address = SSAValue(mint_ssa_value(
++                caller, ADDRESS, (call.res, index_value), dtype="ptr",
++                stage=CONTROL_SSA_FINISH,
++            ), dtype="ptr")
+             result = SSAValue(
+                 desired_id,
+                 dtype=produced_value.dtype,

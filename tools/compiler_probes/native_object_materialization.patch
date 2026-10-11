@@ -1,0 +1,782 @@
+--- a/src/compiler/ssa_object_context.py
++++ b/src/compiler/ssa_object_context.py
+@@ -11,6 +11,7 @@
+ from .ir_sequence_tables import (
+     _Builder, _storage_values, lower_sequence_allocate, lower_sequence_insert,
+     lower_table_lookup, lower_table_store,
++    lower_sequence_reserve,
+ )
+ from .ssa_heap_allocation import heap_release
+ from .ssa_object_operations import ObjectOperation, declare_object_helper
+@@ -50,7 +51,38 @@
+             raise ValueError(f'native object context has no admitted constructor kind {kind}')
+         mutations.append(ControlSequenceMutation(int(data.get('value_id', node_id)),
+             'object_construct', (), int(node_id), argument_kind=kind))
++    reference_inputs = {int(value_id) for value_id, abi in
++        (graph.graph.get('linked_value_abi') or {}).items()
++        if abi.get('storage') == 'reference' and abi.get('dtype') == 'opaque_ref'}
++    admitted = source_object_value_ids(graph, reference_inputs | {
++        mutation.sequence_value_id for mutation in mutations})
++    for node_id, data in graph.nodes(data=True):
++        attributes = data.get('attributes') or {}
++        source = native_materialization_source(graph, data)
++        if source is None or source not in admitted:
++            continue
++        kind = 'builtins.' + attributes['aggregate_kind']
++        if kind not in context.kind_vocabulary:
++            raise ValueError(f'native object context has no admitted materialization kind {kind}')
++        mutations.append(ControlSequenceMutation(int(data.get('value_id', node_id)),
++            'object_materialize', (source,), int(node_id), argument_kind=kind))
+     return tuple(mutations)
++
++
++def native_materialization_source(graph, data):
++    """Use the admitted builtin identity and exact argument/producer ledger."""
++    attributes = data.get('attributes') or {}
++    kind = attributes.get('aggregate_kind')
++    if (kind not in {'list', 'tuple'}
++            or attributes.get('producer_kind') != 'aggregate_materialization'
++            or attributes.get('extraction_identity') != 'builtins.' + kind):
++        return None
++    sources = tuple(int(graph.nodes[parent].get('value_id', parent))
++        for parent, role in data.get('parents') or ()
++        if str(role).startswith('arg:') and parent in graph)
++    if len(sources) != 1 or sources != tuple(attributes.get('materialized_source_value_ids', ())):
++        return None
++    return sources[0]
+ 
+ 
+ def source_object_value_ids(graph, births):
+@@ -68,6 +100,13 @@
+         parents = dict((str(role), int(parent)) for parent, role in data.get('parents') or ())
+         kind = str(data.get('type') or data.get('op') or '').casefold()
+         dependencies = None
++        materialized_source = native_materialization_source(graph, data)
++        if materialized_source is not None:
++            # This source is already a VALUE identity, unlike parent node keys.
++            result = int(data.get('value_id', node_id))
++            rules[result] = {materialized_source}
++            dependents.setdefault(materialized_source, []).append(result)
++            continue
+         if kind == 'phi' and 'body' in parents and 'orelse' in parents:
+             dependencies = (parents['body'], parents['orelse'])
+         elif kind == 'loopresult' and 'control' in parents and 'value' in parents:
+@@ -196,6 +235,18 @@
+             raise ValueError('source constructor kind token differs from its live producer')
+     elif operation[0] != interface['operation']:
+         raise ValueError('source object operation disagrees with its live helper')
++    materialization = instruction.attributes.get('source_object_materialization')
++    if materialization is not None:
++        if (interface['operation'] != 'materialize' or materialization['context'] != context
++                or materialization['kind'] not in {'builtins.list', 'builtins.tuple'}
++                or instruction.res.accounting.get('native_object_source_kind') != materialization['kind']):
++            raise ValueError('source materialization has stale kind/storage receipt')
++        operand, = interface['operand_formal_ids']
++        definitions = source_object_definitions(function) if _definitions is None else _definitions
++        tokens = definitions.get(bindings[operand], ())
++        if (len(tokens) != 1 or tokens[0].op != 'Const'
++                or tokens[0].attributes.get('value') != tuple(context['kind_vocabulary']).index(materialization['kind']) + 1):
++            raise ValueError('source materialization kind token differs from its live producer')
+ 
+ 
+ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_object') -> IRModule:
+@@ -399,6 +450,160 @@
+     builder.emit(complete, 'Ret', [count])
+     finish('length', builder, (handle,), reference=handle, operation=ObjectOperation.LENGTH)
+ 
++    # tuple(value)/list(value) stamp a whole shallow container in ONE native
++    # invocation. Do not dispatch get/set/construct through Python per item,
++    # or run the unique member-table scan for every copied edge. Reserve once,
++    # then write the new owner's disjoint rows directly. Stable handles, not
++    # payload addresses, retain aliases/backedges through reserve relocation.
++    materialize_kinds = {'builtins.list', 'builtins.tuple'} & set(context.kind_vocabulary)
++    if materialize_kinds:
++        reserve = add(lower_sequence_reserve(context.members,
++            function_name=f'{prefix}_materialize_reserve'))
++        builder = _Builder(0)
++        source, requested = builder.fresh('opaque_ref'), builder.fresh('int64')
++        blocks = {label: builder.block(label) for label in (
++            'entry', 'accepted', 'same', 'count_entry', 'count_header', 'count_body',
++            'count_latch', 'reserve', 'construct', 'copy_entry', 'copy_header',
++            'copy_body', 'copy_write', 'copy_latch', 'publish', 'reject', 'complete')}
++        blocks['copy_stamp'] = builder.block('copy_stamp')
++        entry, reject = blocks['entry'], blocks['reject']
++        zero, one = builder.const(entry, 0, dtype='int64'), builder.const(entry, 1, dtype='int64')
++        kind = builder.fresh('int64')
++        call(builder, entry, module.functions[f'{prefix}_kind'],
++            {module.functions[f'{prefix}_kind'].metadata['opaque_object_helper']['reference_formal_id']: source}, kind)
++        def kind_is(block, value, labels):
++            predicates = []
++            for label in labels:
++                if label in context.kind_vocabulary:
++                    predicate = builder.fresh('bool')
++                    builder.emit(block, 'Eq', [value, builder.const(block,
++                        context.kind_vocabulary.index(label) + 1, dtype='int64')], predicate)
++                    predicates.append(predicate)
++            if not predicates:
++                return builder.const(block, 0, dtype='bool')
++            combined = predicates[0]
++            for predicate in predicates[1:]:
++                merged = builder.fresh('bool')
++                builder.emit(block, 'LOr', [combined, predicate], merged)
++                combined = merged
++            return combined
++        source_valid = kind_is(entry, kind, ('builtins.dict', 'builtins.list',
++            'builtins.tuple', 'builtins.set', 'builtins.frozenset'))
++        target_valid = kind_is(entry, requested, sorted(materialize_kinds))
++        valid = builder.fresh('bool')
++        builder.emit(entry, 'LAnd', [source_valid, target_valid], valid)
++        positional = kind_is(entry, kind, ('builtins.list', 'builtins.tuple'))
++        dictionary = kind_is(entry, kind, ('builtins.dict',))
++        builder.cond(entry, valid, blocks['accepted'], reject)
++        source_tuple = kind_is(blocks['accepted'], kind, ('builtins.tuple',))
++        target_tuple = kind_is(blocks['accepted'], requested, ('builtins.tuple',))
++        same = builder.fresh('bool')
++        builder.emit(blocks['accepted'], 'LAnd', [source_tuple, target_tuple], same)
++        builder.cond(blocks['accepted'], same, blocks['same'], blocks['count_entry'])
++        builder.branch(blocks['same'], blocks['complete'])
++        start = blocks['count_entry']
++        length_slot, original_length = load_cell(builder, start, by_id[context.members.length_address_id])
++        nonnegative, fits, bounded, extent_valid, all_valid = (builder.fresh('bool') for _ in range(5))
++        builder.emit(start, 'Ge', [original_length, zero], nonnegative)
++        builder.emit(start, 'Le', [original_length, by_id[context.members.capacity_value_id]], fits)
++        builder.emit(start, 'Le', [by_id[context.members.capacity_value_id],
++            builder.const(start, (2**63 - 1 - 8) // 8, dtype='int64')], bounded)
++        builder.emit(start, 'LAnd', [nonnegative, fits], extent_valid)
++        builder.emit(start, 'LAnd', [extent_valid, bounded], all_valid)
++        builder.cond(start, all_valid, blocks['count_header'], reject)
++        index, count, next_index, next_count = (builder.fresh('int64') for _ in range(4))
++        header, body, latch = blocks['count_header'], blocks['count_body'], blocks['count_latch']
++        for value, update in ((index, next_index), (count, next_count)):
++            builder.emit(header, 'Phi', [zero, update], value,
++                attributes={'incoming_blocks': (start.name, latch.name)})
++        more = builder.fresh('bool')
++        builder.emit(header, 'Lt', [index, original_length], more)
++        builder.cond(header, more, body, blocks['reserve'])
++        def row_value(block, column, row, dtype='opaque_ref'):
++            address, value = builder.fresh('ptr'), builder.fresh(dtype)
++            builder.emit(block, 'GetElementPtr', [by_id[column], row], address)
++            builder.emit(block, 'Load', [address], value)
++            return value
++        owner = row_value(body, context.members.column_value_ids[0], index)
++        matches, increment = builder.fresh('bool'), builder.fresh('int64')
++        builder.emit(body, 'Eq', [owner, source], matches)
++        builder.emit(body, 'Cast', [matches], increment)
++        builder.emit(body, 'Add', [count, increment], next_count)
++        builder.branch(body, latch)
++        builder.emit(latch, 'Add', [index, one], next_index)
++        builder.branch(latch, header)
++        required, reserved = builder.fresh('int64'), builder.fresh('int')
++        builder.emit(blocks['reserve'], 'Add', [original_length, count], required)
++        call(builder, blocks['reserve'], reserve,
++            {reserve.metadata['required_capacity_value_id']: required}, reserved)
++        allocated = builder.fresh('bool')
++        builder.emit(blocks['reserve'], 'Lt', [reserved,
++            builder.const(blocks['reserve'], 2, dtype='int')], allocated)
++        builder.cond(blocks['reserve'], allocated, blocks['construct'], reject)
++        constructor = module.functions[f'{prefix}_construct']
++        destination = builder.fresh('opaque_ref')
++        call(builder, blocks['construct'], constructor,
++            {constructor.metadata['opaque_object_helper']['operand_formal_ids'][0]: requested}, destination)
++        live = builder.fresh('bool')
++        builder.emit(blocks['construct'], 'Gt', [destination,
++            builder.const(blocks['construct'], 0, dtype='opaque_ref')], live)
++        builder.cond(blocks['construct'], live, blocks['copy_entry'], reject)
++        start, header, body, write, latch = (blocks[label] for label in
++            ('copy_entry', 'copy_header', 'copy_body', 'copy_write', 'copy_latch'))
++        builder.branch(start, header)
++        index, copied, next_index, next_copied = (builder.fresh('int64') for _ in range(4))
++        for value, update in ((index, next_index), (copied, next_copied)):
++            builder.emit(header, 'Phi', [zero, update], value,
++                attributes={'incoming_blocks': (start.name, latch.name)})
++        more = builder.fresh('bool')
++        builder.emit(header, 'Lt', [index, original_length], more)
++        builder.cond(header, more, body, blocks['publish'])
++        owner = row_value(body, context.members.column_value_ids[0], index)
++        matches = builder.fresh('bool')
++        builder.emit(body, 'Eq', [owner, source], matches)
++        builder.cond(body, matches, write, latch)
++        key = row_value(write, context.members.column_value_ids[1], index)
++        item = row_value(write, context.members.column_value_ids[2], index)
++        payload = builder.fresh('opaque_ref')
++        builder.emit(write, 'Select', [dictionary, key, item], payload)
++        numbered, source_position, position = (builder.fresh('int64') for _ in range(3))
++        builder.emit(write, 'Add', [copied, one], numbered)
++        builder.emit(write, 'Cast', [key], source_position,
++            attributes={'binding': 'object_context_position'})
++        builder.emit(write, 'Select', [positional, source_position, numbered], position)
++        lower, upper, position_valid = (builder.fresh('bool') for _ in range(3))
++        builder.emit(write, 'Ge', [position, one], lower)
++        builder.emit(write, 'Le', [position, count], upper)
++        builder.emit(write, 'LAnd', [lower, upper], position_valid)
++        stamp = blocks['copy_stamp']
++        builder.cond(write, position_valid, stamp, reject)
++        offset, destination_row, position_handle = (builder.fresh(dtype)
++            for dtype in ('int64', 'int64', 'opaque_ref'))
++        builder.emit(stamp, 'Sub', [position, one], offset)
++        builder.emit(stamp, 'Add', [original_length, offset], destination_row)
++        builder.emit(stamp, 'Cast', [position], position_handle,
++            attributes={'binding': 'object_context_position'})
++        for column, value in zip(context.members.column_value_ids,
++                (destination, position_handle, payload), strict=True):
++            address = builder.fresh('ptr')
++            builder.emit(stamp, 'GetElementPtr', [by_id[column], destination_row], address)
++            builder.emit(stamp, 'Store', [value, address])
++        builder.branch(stamp, latch)
++        builder.emit(latch, 'Phi', [copied, numbered], next_copied,
++            attributes={'incoming_blocks': (body.name, stamp.name)})
++        builder.emit(latch, 'Add', [index, one], next_index)
++        builder.branch(latch, header)
++        builder.emit(blocks['publish'], 'Store', [required, length_slot])
++        builder.branch(blocks['publish'], blocks['complete'])
++        failed = builder.const(reject, 0, dtype='opaque_ref')
++        builder.branch(reject, blocks['complete'])
++        result = builder.fresh('opaque_ref')
++        builder.emit(blocks['complete'], 'Phi', [source, destination, failed], result,
++            attributes={'incoming_blocks': (blocks['same'].name, blocks['publish'].name, reject.name)})
++        builder.emit(blocks['complete'], 'Ret', [result])
++        finish('materialize', builder, (source, requested), reference=source,
++            operation=ObjectOperation.MATERIALIZE)
++
+     builder = _Builder(0)
+     entry = builder.block('entry')
+     entry.instrs.append(heap_release(by_id[context.objects.heap_owner_value_id]))
+--- a/src/compiler/ssa_object_operations.py
++++ b/src/compiler/ssa_object_operations.py
+@@ -20,6 +20,7 @@
+     GET = "get"
+     SET = "set"
+     CONSTRUCT = "construct"
++    MATERIALIZE = "materialize"
+     RELEASE = "release"
+ 
+ 
+@@ -27,6 +28,7 @@
+     ObjectOperation.KIND: "int64", ObjectOperation.LENGTH: "int64",
+     ObjectOperation.GET: "opaque_ref", ObjectOperation.SET: "bool",
+     ObjectOperation.CONSTRUCT: "opaque_ref", ObjectOperation.RELEASE: None,
++    ObjectOperation.MATERIALIZE: "opaque_ref",
+ }
+ 
+ 
+--- a/src/compiler/native_object_boundary.py
++++ b/src/compiler/native_object_boundary.py
+@@ -101,6 +101,42 @@
+             raise RuntimeError('native object boundary is closed')
+         if self.context.to_mapping() != self.receipt:
+             raise ValueError('native object boundary context contract changed')
++
++    def bind_execution(self, artifact, function, feeds=None):
++        """Prepare the incumbent ctypes ABI ONCE for an entire native pocket.
++
++        Feeds hold handles and real storage cells, never PyObject pointers.
++        No eager rehydration occurs between native invocations; export is an
++        explicit outer-boundary operation. Reusing the prepared execution avoids
++        rebuilding NumPy buffers/pointer arrays on every dispatch.
++        """
++        self._check_live()
++        receipt = function.metadata.get('native_object_context', function.metadata.get('object_context'))
++        if receipt != self.receipt or artifact.name != function.name:
++            raise ValueError('native invocation does not implement the accepted object context/function')
++        from .ssa_object_context import context_values
++        from .ssa_llvm_backend import prepare_artifact_execution
++        cells = {value.id for value in context_values(self.context)}
++        declared = {value.id for value in function.args}
++        if not cells.issubset(declared):
++            raise ValueError('native invocation is missing accepted object context cells')
++        feeds = dict(feeds or {})
++        if set(feeds) & cells:
++            raise ValueError('native invocation may not replace leased context cells')
++        missing = declared - cells - set(feeds)
++        if missing:
++            raise ValueError(f'native invocation has unbound input identities {sorted(missing)}')
++        if set(feeds) - declared:
++            raise ValueError('native invocation feeds must name exact function inputs')
++        execution = prepare_artifact_execution(artifact, {**feeds, **self.buffers})
++        for value_id in cells:
++            bound = execution.buffers.get(value_id)
++            original = self.buffers[value_id]
++            if (bound is None or bound.ctypes.data != original.ctypes.data
++                    or bound.nbytes != original.nbytes):
++                raise ValueError('native invocation copied or omitted a shared context cell')
++        artifact.entry()  # Resolve/cache the existing ctypes entry at bind time.
++        return NativeObjectInvocation(self, execution)
+ 
+     def _rows(self, descriptor):
+         length = int(self.buffers[descriptor.length_address_id][0])
+@@ -269,4 +305,26 @@
+         self.closed = True
+ 
+ 
+-__all__ = ['NativeObjectBoundary']
++class NativeObjectInvocation:
++    """Lease-checked reuse of LLVMExecution, not another runtime or registry."""
++    def __init__(self, boundary, execution):
++        self.boundary, self.execution = boundary, execution
++        self.native_invocations = 0
++
++    @property
++    def buffers(self):
++        return self.execution.buffers
++
++    def run(self):
++        # Immutable context/layout acceptance was checked at binding. The hot
++        # boundary needs only the live exclusive lease, not another graph walk
++        # or freshly constructed descriptor mapping.
++        boundary = self.boundary
++        if boundary.closed or boundary.codec._native_object_boundary is not boundary:
++            raise RuntimeError('native object invocation lease is closed')
++        self.execution.run()
++        self.native_invocations += 1
++        return self
++
++
++__all__ = ['NativeObjectBoundary', 'NativeObjectInvocation']
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -1997,7 +1997,7 @@
+         control_mutations = authored_sequence_mutations(program.root)
+         self.native_object_source_ids = set(map(int, native_object_value_ids)) | {
+             int(mutation.sequence_value_id) for mutation in control_mutations
+-            if mutation.operator == 'object_construct'}
++            if mutation.operator in {'object_construct', 'object_materialize'}}
+ 
+         static_sequence_capacities: dict[int, int] = {}
+ 
+@@ -7854,7 +7854,11 @@
+         helper = next(function for function in self.native_object_module.functions.values()
+             if function.metadata.get('opaque_object_helper', {}).get('operation') == operation)
+         receipt = helper.metadata['opaque_object_helper']
+-        operand_values = tuple(self.external_value(int(value_id)) for value_id in operands)
++        # A compiler-minted Const already is the exact SSA occurrence. Sending
++        # its id through source alias resolution made the materialize kind
++        # token a producerless formal, despite its preceding real Const.
++        operand_values = tuple(value_id if isinstance(value_id, SSAValue)
++            else self.external_value(int(value_id)) for value_id in operands)
+         result_dtype = receipt['result_layout'][0]
+         result = (self.fresh_value(dtype=result_dtype, transform=CONTROL_EXPRESSION,
+                                   operands=(int(reference_id), *operand_values)) if result_id is None
+@@ -7863,7 +7867,8 @@
+         reference = SSAOpaqueObject(self.external_value(reference_id), self.native_object_context.storage_identity)
+         instruction = object_call(self.native_object_module, helper.name, reference,
+             context=bindings, operands=dict(zip(receipt['operand_formal_ids'], operand_values, strict=True)), result=result)
+-        instruction.attributes['source_object_operation'] = (operation, reference_id, tuple(operands), result_id)
++        instruction.attributes['source_object_operation'] = (operation, reference_id,
++            tuple(value.id for value in operand_values), result_id)
+         self.emit(Handler.Call, instruction.args, instruction.res, attributes=instruction.attributes)
+         return result
+ 
+@@ -7896,6 +7901,25 @@
+         self.emit(Handler.Call, instruction.args, instruction.res, attributes=instruction.attributes)
+         self.native_object_constructor_receipts.append(instruction.attributes['source_object_constructor'])
+ 
++    def _emit_native_object_materialization(self, mutation, *, location):
++        context = self.native_object_context
++        kind = str(mutation.argument_kind)
++        if context is None or kind not in context.kind_vocabulary or len(mutation.argument_value_ids) != 1:
++            raise ValueError(f'{location}: source materialization has no admitted kind/source')
++        token = self.fresh_value(dtype='int64', transform=CONTROL_CONST,
++            operands=(int(mutation.sequence_value_id),))
++        self.emit(Handler.Const, [], token,
++            attributes={'value': context.kind_vocabulary.index(kind) + 1})
++        source, = mutation.argument_value_ids
++        result = self._emit_native_object_operation('materialize', int(source),
++            (token,), int(mutation.sequence_value_id))
++        result.accounting.update(native_object_storage_identity=context.storage_identity,
++                                 native_object_source_kind=kind)
++        self.current.instrs[-1].attributes['source_object_materialization'] = {
++            'source_value_id': int(mutation.sequence_value_id),
++            'source_node_id': int(mutation.effect_node_id),
++            'input_value_id': int(source), 'kind': kind, 'context': context.to_mapping()}
++
+     def _lower_sequence_mutation_body(
+         self,
+         mutation: ControlSequenceMutation,
+@@ -7906,6 +7930,9 @@
+         location = f"{path}.sequence_mutation[{mutation.effect_node_id}]"
+         if operation == 'object_construct':
+             self._emit_native_object_constructor(mutation, location=location)
++            return
++        if operation == 'object_materialize':
++            self._emit_native_object_materialization(mutation, location=location)
+             return
+         if int(mutation.sequence_value_id) in self.native_object_source_ids:
+             if operation == 'update' and mutation.argument_kind == 'mapping_items' and len(mutation.argument_value_ids) == 2:
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -10316,9 +10316,13 @@
+         _source_control_records,
+     )
+ 
++    extra_mutations = tuple(extra_mutations)
++    native_effects = {int(mutation.effect_node_id) for mutation in extra_mutations
++        if mutation.operator in {'object_construct', 'object_materialize'}}
+     mutations = tuple((
+-        *_sequence_append_call_mutations(graph.G),
+-        *tuple(extra_mutations),
++        *(mutation for mutation in _sequence_append_call_mutations(graph.G)
++          if int(mutation.effect_node_id) not in native_effects),
++        *extra_mutations,
+         *tuple(scalar_writes),
+     ))
+     if not mutations:
+@@ -17343,7 +17347,7 @@
+                 found.update(_generated_sequence_ids(block.callee))
+             for mutation in mutations:
+                 sequence_id = int(mutation.sequence_value_id)
+-                if mutation.operator == 'object_construct':
++                if mutation.operator in {'object_construct', 'object_materialize'}:
+                     # This effect publishes a scalar object handle. Its
+                     # payload belongs to the admitted context, not another
+                     # private sequence descriptor for the literal identity.
+--- a/src/compiler/ssa_llvm_backend.py
++++ b/src/compiler/ssa_llvm_backend.py
+@@ -4838,6 +4838,9 @@
+     _library: _Any = _field(default=None, repr=False)
+     _validation_error_reset: _Any = _field(default=None, repr=False)
+     _validation_error_take: _Any = _field(default=None, repr=False)
++    _validation_source: _Any = _field(default=None, init=False, repr=False, compare=False)
++    _validation_flag: _Any = _field(default=None, init=False, repr=False, compare=False)
++    _validation_required: bool = _field(default=False, init=False, repr=False, compare=False)
+     #: ``emission_concordance.ArtifactEmission``: the book and the
+     #: MODULE_TEXT / BUFFER_ORDER cells ``compile_artifact`` derives its
+     #: file, command and library rows from (plan 100, 4.2).  None when the
+@@ -4864,8 +4867,22 @@
+             self._entry = function
+         return self._entry
+ 
++    def _uses_validation_runtime(self) -> bool:
++        # The prepared object pocket was still scanning its 71,996-byte IR
++        # TWICE per native invocation (20 observed searches for 10 calls).
++        # This capability is an artifact fact, not runtime object work. Cache
++        # against the exact text object AND declared flag; a changed text,
++        # flag or dataclasses.replace artifact recomputes the original rule.
++        if (self._validation_source is not self.llvm_ir
++                or self._validation_flag != self.needs_validation_runtime):
++            self._validation_required = bool(self.needs_validation_runtime
++                or "@turing_validation_error(" in self.llvm_ir)
++            self._validation_source = self.llvm_ir
++            self._validation_flag = self.needs_validation_runtime
++        return self._validation_required
++
+     def reset_validation_error(self) -> None:
+-        if not self.needs_validation_runtime and "@turing_validation_error(" not in self.llvm_ir:
++        if not self._uses_validation_runtime():
+             return
+         self.entry()
+         if self._validation_error_reset is None:
+@@ -4876,7 +4893,7 @@
+         self._validation_error_reset()
+ 
+     def take_validation_error(self) -> int:
+-        if not self.needs_validation_runtime and "@turing_validation_error(" not in self.llvm_ir:
++        if not self._uses_validation_runtime():
+             return 0
+         self.entry()
+         if self._validation_error_take is None:
+--- /dev/null
++++ b/tests/test_native_object_materialize.py
+@@ -0,0 +1,200 @@
++"""Bulk shallow object stamping: one native call, no per-member dispatch."""
++import numpy as np
++import pytest
++
++from tests.test_source_object_context import context
++from src.compiler.identity_concordance import concordance_report
++from src.compiler.shell_external_references import ExternalReferenceValueCodec
++from src.compiler.ssa_object_context import lower_object_context
++from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution
++from pathlib import Path
++from src.compiler.extraction_contract import ExtractionContract
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++
++
++@pytest.fixture
++def compiled(tmp_path):
++    scope = context()
++    module = lower_object_context(scope, prefix='bulk')
++    assert concordance_report(module).splitlines()[0].endswith('0 finding(s)')
++    artifacts = {label: compile_artifact(emit_ssa_function_to_llvm(module, 'bulk_' + label),
++        directory=tmp_path / label) for label in ('materialize', 'release')}
++    return scope, module, artifacts
++
++
++@pytest.mark.parametrize('target', [list, tuple])
++def test_single_native_materialization_preserves_order_and_shallow_identity(compiled, target):
++    scope, module, artifacts = compiled
++    leaf, shared = object(), []
++    sources = ([leaf, shared, shared], (leaf, shared, shared),
++               {'second': shared, 'first': leaf}, {1, 3, 2}, frozenset({2, 4}), [])
++    for source in sources:
++        boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (source,))
++        function = module.functions['bulk_materialize']
++        receipt = function.metadata['opaque_object_helper']
++        feeds = {**boundary.buffers,
++            receipt['reference_formal_id']: np.array([boundary.roots[0]], dtype=np.int64),
++            receipt['operand_formal_ids'][0]: np.array([scope.kind_vocabulary.index('builtins.' + target.__name__) + 1], dtype=np.int64)}
++        try:
++            execution = prepare_artifact_execution(artifacts['materialize'], feeds).run()
++            handle = int(execution.buffers[function.metadata['return_value'].id].item())
++            result, = boundary.export((handle,))
++            expected = target(source)
++            assert type(result) is target and len(result) == len(expected)
++            assert all(a is b for a, b in zip(result, expected))
++            if target is tuple and type(source) is tuple:
++                assert result is source
++            else:
++                assert result is not source
++        finally:
++            prepare_artifact_execution(artifacts['release'], boundary.buffers).run()
++            boundary.close()
++
++
++def test_large_materialization_does_not_call_member_lookup_or_store(compiled):
++    scope, module, artifacts = compiled
++    function = module.functions['bulk_materialize']
++    callees = {i.attributes['callee'] for b in function.blocks.values() for i in b.instrs if i.op == 'Call'}
++    assert callees == {'bulk_kind', 'bulk_materialize_reserve', 'bulk_construct'}
++    leaf = object()
++    source = [leaf] * 4097
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (source,))
++    receipt = function.metadata['opaque_object_helper']
++    feeds = {**boundary.buffers, receipt['reference_formal_id']: np.array([boundary.roots[0]], dtype=np.int64),
++        receipt['operand_formal_ids'][0]: np.array([scope.kind_vocabulary.index('builtins.tuple') + 1], dtype=np.int64)}
++    try:
++        execution = prepare_artifact_execution(artifacts['materialize'], feeds).run()
++        result, = boundary.export((int(execution.buffers[function.metadata['return_value'].id].item()),))
++        assert len(result) == 4097 and all(item is leaf for item in result)
++    finally:
++        prepare_artifact_execution(artifacts['release'], boundary.buffers).run()
++        boundary.close()
++
++
++def test_bulk_refusal_and_prepared_boundary_contract(compiled):
++    scope, module, artifacts = compiled
++    function = module.functions['bulk_materialize']
++    receipt = function.metadata['opaque_object_helper']
++    source = np.array([0], dtype=np.int64)
++    kind = np.array([scope.kind_vocabulary.index('builtins.tuple') + 1], dtype=np.int64)
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (object(),))
++    feeds = {receipt['reference_formal_id']: source, receipt['operand_formal_ids'][0]: kind}
++    try:
++        with pytest.raises(ValueError, match='unbound input'):
++            boundary.bind_execution(artifacts['materialize'], function, {})
++        with pytest.raises(ValueError, match='replace leased'):
++            boundary.bind_execution(artifacts['materialize'], function,
++                {**feeds, scope.next_handle_value_id: np.array([1], dtype=np.int64)})
++        invocation = boundary.bind_execution(artifacts['materialize'], function, feeds)
++        counter = boundary.buffers[scope.next_handle_value_id].item()
++        for handle, token in ((0, kind[0]), (9999, kind[0]), (boundary.roots[0], kind[0]),
++                              (boundary.roots[0], 0)):
++            source[0], kind[0] = handle, token
++            invocation.run()
++            assert invocation.buffers[function.metadata['return_value'].id].item() == 0
++            assert boundary.buffers[scope.next_handle_value_id].item() == counter
++    finally:
++        prepare_artifact_execution(artifacts['release'], boundary.buffers).run()
++        boundary.close()
++
++
++def test_dispatch_validation_capability_does_not_scan_ir_per_call(compiled):
++    from dataclasses import replace
++    _scope, _module, artifacts = compiled
++    artifact = artifacts['materialize']
++    class CountedText(str):
++        searches = 0
++        def __contains__(self, item):
++            self.searches += 1
++            return super().__contains__(item)
++    artifact.llvm_ir = CountedText(artifact.llvm_ir)
++    for _ in range(100):
++        artifact.reset_validation_error()
++        assert artifact.take_validation_error() == 0
++    assert artifact.llvm_ir.searches == 1
++    changed = replace(artifact, llvm_ir=CountedText('declare void @turing_validation_error(i32)'))
++    assert changed._uses_validation_runtime()
++    assert changed.llvm_ir.searches == 1
++    changed.llvm_ir = CountedText('')
++    assert not changed._uses_validation_runtime()
++    changed.needs_validation_runtime = True
++    assert changed._uses_validation_runtime()
++
++
++def test_cached_dispatch_still_reports_real_native_validation_errors(tmp_path):
++    from src.transmogrifier.ssa import Function, BasicBlock, Instr, IRModule
++    function = Function('dispatch_validation', [], {
++        'entry': BasicBlock('entry', [Instr('Br', [], None, attributes={'target': 'guard'})]),
++        'guard': BasicBlock('guard', [
++        Instr('Call', [], None, attributes={'callee': 'turing_validation_error', 'error_code': 7}),
++        Instr('Ret', [], None)])}, metadata={'control_ir': True})
++    artifact = emit_ssa_function_to_llvm(IRModule({function.name: function}), function.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path)
++    execution = prepare_artifact_execution(native, {})
++    for _ in range(2):
++        with pytest.raises(RuntimeError, match='code 7'):
++            execution.run()
++
++
++@pytest.mark.parametrize('corruption', ['position', 'extent'])
++def test_bad_positional_edge_refuses_before_invalid_address(compiled, corruption):
++    scope, module, artifacts = compiled
++    function = module.functions['bulk_materialize']
++    receipt = function.metadata['opaque_object_helper']
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, ([object()],))
++    if corruption == 'position':
++        boundary._initial_columns[scope.members.column_value_ids[1]][0] = -1
++    else:
++        boundary.buffers[scope.members.length_address_id][0] = 2
++    feeds = {receipt['reference_formal_id']: np.array([boundary.roots[0]], dtype=np.int64),
++        receipt['operand_formal_ids'][0]: np.array([scope.kind_vocabulary.index('builtins.tuple') + 1], dtype=np.int64)}
++    try:
++        invocation = boundary.bind_execution(artifacts['materialize'], function, feeds).run()
++        assert invocation.buffers[function.metadata['return_value'].id].item() == 0
++        assert boundary.buffers[scope.members.length_address_id].item() == (1 if corruption == 'position' else 2)
++    finally:
++        prepare_artifact_execution(artifacts['release'], boundary.buffers).run()
++        boundary.close()
++
++
++@pytest.mark.parametrize('expression', ['tuple(value)', 'list(value)', 'tuple(list(value))'])
++def test_ordinary_source_materialization_has_real_input_and_one_native_invocation(tmp_path, expression):
++    scope = context()
++    repository = Path(__file__).resolve().parents[1]
++    policy = ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_program_abi(
++        {'records': {}, 'bindings': [], 'values': [{'function': 'root', 'parameter': 'value',
++         'storage': 'reference', 'python_type': 'builtins.object'}]}).with_execution_file(
++        repository / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    module, _, exports = lower_ast_source_to_ssa('def root(value):\n    return ' + expression + '\n',
++        'root', name='authored_materialize', extraction_contract=policy, native_object_context=scope,
++        progress=lambda _: None, progress_bars=False)
++    assert concordance_report(module).splitlines()[0].endswith('0 finding(s)')
++    root = module.functions[exports[0]]
++    native = compile_artifact(emit_ssa_function_to_llvm(module, exports[0]), directory=tmp_path / 'source')
++    release_module = lower_object_context(scope, prefix='release_bulk')
++    release = compile_artifact(emit_ssa_function_to_llvm(release_module, 'release_bulk_release'),
++        directory=tmp_path / 'release')
++    leaf, shared = object(), []
++    original = [leaf, shared, shared]
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++    input_id = dict(root.metadata['parameter_names'])['value']
++    feeds = {input_id: np.array([boundary.roots[0]], dtype=np.int64)}
++    try:
++        invocation = boundary.bind_execution(native, root, feeds)
++        execution = invocation.run()
++        output = next(i.args[0] for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++        result, = boundary.export((int(execution.buffers[output.id].item()),))
++        assert type(result) is (list if expression == 'list(value)' else tuple)
++        assert len(result) == 3 and all(a is b for a, b in zip(result, original))
++        pointers = invocation.execution.pointers
++        invocation.run()
++        assert invocation.native_invocations == 2
++        assert invocation.execution.pointers is pointers
++        repeated, = boundary.export((int(execution.buffers[output.id].item()),))
++        assert all(a is b for a, b in zip(repeated, original))
++    finally:
++        prepare_artifact_execution(release, boundary.buffers).run()
++        boundary.close()
++    with pytest.raises(RuntimeError, match='lease is closed'):
++        invocation.run()
+--- /dev/null
++++ b/tools/compiler_probes/probe_native_object_dispatch.py
+@@ -0,0 +1,99 @@
++"""Small public-source object/ctypes probe; no timeout or production install."""
++from pathlib import Path
++import sys
++import tempfile
++import time
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT))
++
++
++def main():
++    import numpy as np
++    from src.compiler.extraction_contract import ExtractionContract
++    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++    from src.compiler.monotonic_ids import GLOBAL_MONOTONIC_IDS
++    from src.compiler.shell_external_references import ExternalReferenceValueCodec
++    from src.compiler.ssa_object_context import lower_object_context
++    from src.compiler.ssa_llvm_backend import (compile_artifact,
++        emit_ssa_function_to_llvm, prepare_artifact_execution)
++    from src.transmogrifier.ssa import SSAObjectContext, SSASequenceDescriptor, SSASequenceCapacityPolicy
++    mint = GLOBAL_MONOTONIC_IDS.mint
++    owner = mint()
++    def table(dtypes, keys):
++        columns = tuple(mint() for _ in dtypes)
++        return SSASequenceDescriptor(columns[0], columns, mint(), mint(),
++            status_address_id=mint(), column_dtypes=dtypes, key_columns=keys,
++            capacity_policy=SSASequenceCapacityPolicy.DYNAMIC, heap_owner_value_id=owner)
++    scope = SSAObjectContext('probe.dispatch.context', table(('opaque_ref', 'int64'), (0,)),
++        table(('opaque_ref', 'opaque_ref', 'opaque_ref'), (0, 1)), mint(),
++        ('builtins.dict', 'builtins.list', 'builtins.tuple', 'builtins.set',
++         'builtins.frozenset', 'builtins.object'))
++    contract = ExtractionContract(ROOT / 'extraction_contracts/program_extraction.yaml').with_program_abi(
++        {'records': {}, 'bindings': [], 'values': [{'function': 'root', 'parameter': 'value',
++         'storage': 'reference', 'python_type': 'builtins.object'}]}).with_execution_file(
++        ROOT / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    started = time.perf_counter()
++    module, _, exports = lower_ast_source_to_ssa('def root(value):\n    return tuple(value)\n',
++        'root', name='object_dispatch_probe', extraction_contract=contract,
++        native_object_context=scope, progress=lambda _: None, progress_bars=False)
++    directory = Path(tempfile.mkdtemp(prefix='turing-object-dispatch-'))
++    native = compile_artifact(emit_ssa_function_to_llvm(module, exports[0]), directory=directory / 'source')
++    release_module = lower_object_context(scope, prefix='dispatch_release')
++    release = compile_artifact(emit_ssa_function_to_llvm(release_module, 'dispatch_release_release'),
++        directory=directory / 'release')
++    root = module.functions[exports[0]]
++    input_id = dict(root.metadata['parameter_names'])['value']
++    output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    print(f'BUILD_SECONDS {time.perf_counter() - started:.6f}', flush=True)
++    leaf = object()
++    for size in (0, 17, 257, 4097):
++        start = time.perf_counter()
++        original = [leaf] * size
++        boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++        imported = time.perf_counter() - start
++        try:
++            feeds = {input_id: np.array([boundary.roots[0]], dtype=np.int64)}
++            start = time.perf_counter()
++            invocation = boundary.bind_execution(native, root, feeds)
++            prepared = time.perf_counter() - start
++            start = time.perf_counter()
++            invocation.run()
++            stamped = time.perf_counter() - start
++            start = time.perf_counter()
++            result, = boundary.export((int(invocation.buffers[output].item()),))
++            exported = time.perf_counter() - start
++            assert len(result) == size and all(item is leaf for item in result)
++            print(f'STAMP n={size} calls={invocation.native_invocations} import_ms={imported*1000:.6f} '
++                  f'bind_ms={prepared*1000:.6f} native_ms={stamped*1000:.6f} export_ms={exported*1000:.6f}', flush=True)
++        finally:
++            prepare_artifact_execution(release, boundary.buffers).run()
++            boundary.close()
++    # Same tuple -> same tuple is a no-allocation control, isolating dispatch
++    # setup from row copying/growth. Both lanes call the SAME compiled source.
++    boundary = ExternalReferenceValueCodec().bind_native_objects(scope, ((leaf,),))
++    try:
++        feeds = {input_id: np.array([boundary.roots[0]], dtype=np.int64)}
++        invocation = boundary.bind_execution(native, root, feeds)
++        invocation.run()
++        samples = 1000
++        start = time.perf_counter()
++        for _ in range(samples):
++            prepare_artifact_execution(native, {**feeds, **boundary.buffers}).run()
++        fresh = time.perf_counter() - start
++        start = time.perf_counter()
++        for _ in range(samples):
++            invocation.run()
++        reused = time.perf_counter() - start
++        assert int(invocation.buffers[output].item()) == boundary.roots[0]
++        print(f'DISPATCH samples={samples} prepare_each_us={fresh*1e6/samples:.6f} '
++              f'reuse_us={reused*1e6/samples:.6f} ratio={fresh/reused:.3f}', flush=True)
++    finally:
++        prepare_artifact_execution(release, boundary.buffers).run()
++        boundary.close()
++    print(f'ARTIFACT_DIRECTORY {directory}', flush=True)
++    return 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+

@@ -1,0 +1,110 @@
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+index 759097c5..73015b70 100644
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -43199,9 +43225,12 @@ def _lower_ast_source_to_ssa_impl(
+         for entry in graph.function_table:
+             function_graph = getattr(getattr(entry, "graph", None), "G", None)
+             if function_graph is not None:
+-                function_graph.graph["program_abi"] = copy.deepcopy(
+-                    program_abi_receipt
+-                )
++                # This is the compilation's declarative schema receipt, not
++                # mutable per-function specialization. All writers install a
++                # whole receipt; readers derive their own parameter views.
++                # Copying every schema for every catalogue function made the
++                # ownership step O(functions * schema size), twice per lower.
++                function_graph.graph["program_abi"] = program_abi_receipt
+     graph.G.graph["compile_targets"] = tuple(dict.fromkeys(compile_targets))
+     for intrinsic_graph in (
+         graph,
+@@ -43238,9 +43267,11 @@ def _lower_ast_source_to_ssa_impl(
+             function_graph = getattr(getattr(entry, "graph", None), "G", None)
+             if function_graph is None:
+                 continue
+-            function_graph.graph["program_abi"] = copy.deepcopy(
+-                program_abi_receipt
+-            )
++            # Reattach the same compilation-owned declaration after reduction.
++            # parameter_record_abi below remains the function's mutable view;
++            # extract_clean_process_subgraph still isolates whole-callsite
++            # specialization copies. No schema or identity is reconstructed.
++            function_graph.graph["program_abi"] = program_abi_receipt
+             function_name = str(
+                 function_graph.graph.get("function_name") or entry.name
+             )
+diff --git a/src/compiler/process_graph_fusion.py b/src/compiler/process_graph_fusion.py
+index 48469013..ab98e48c 100644
+--- a/src/compiler/process_graph_fusion.py
++++ b/src/compiler/process_graph_fusion.py
+@@ -126,9 +126,18 @@ class ScheduledProcessGraphDispatchPlan:
+ #:     the function's name -> binding-history view (a view of the
+ #:     ``name_binding`` rows), written once at the canonical relabel; its
+ #:     only reader (``training_data_store``) reads the whole function's graph.
++#:
++#: ``program_abi``
++#:     the complete compilation-owned declarative receipt, installed by whole
++#:     assignment in the public source lowerer before planning. Readers select
++#:     record schemas and build their own mutable parameter_record_abi views;
++#:     none mutates the receipt in place. A proper region retains this authority,
++#:     not another full schema copy. Whole callsite-specialization copies still
++#:     isolate all containers below, including this receipt.
+ _COMPARTMENT_SHARED_METADATA = (
+     "deployment_selection_trace",
+     "ingestion_identity_table",
++    "program_abi",
+ )
+ 
+ #: Node-keyed views of book rows.  A compartment's view is the projection of
+diff --git a/tests/test_shared_program_abi_receipt.py b/tests/test_shared_program_abi_receipt.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_shared_program_abi_receipt.py
+@@ -0,0 +1,47 @@
++from pathlib import Path
++
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++
++
++def test_public_lowering_catalogue_shares_declarative_program_abi():
++    resolved = []
++    result = lower_ast_source_to_ssa(
++        "def helper(x):\n    return x + 1.0\ndef root(x):\n    return helper(x)\n",
++        "root", name="shared_abi_catalogue", progress=lambda message: None,
++        extraction_contract=Path(__file__).resolve().parents[1] / "extraction_contracts/program_extraction.yaml",
++        resolved_process_graph_sink=resolved.append,
++        stop_after_compilation_unit_plan=True,
++    )
++    assert result == (None, {}, ())
++    graph = resolved[0]
++    receipt = graph.G.graph["program_abi"]
++    functions = [entry.graph for entry in graph.function_table if entry.graph is not None]
++    assert len(functions) >= 2
++    assert all(function.G.graph["program_abi"] is receipt for function in functions)
++
++
++def test_region_shares_abi_without_walking_schema_but_specialization_isolates_it():
++    from src.compiler.process_graph_fusion import extract_clean_process_subgraph
++    from src.transmogrifier.graph.graph_express2 import ProcessGraph
++
++    class CountedABI(dict):
++        scans = 0
++
++        def items(self):
++            self.scans += 1
++            return super().items()
++
++    graph = ProcessGraph(materialize_memory=False)
++    graph.G.add_nodes_from((node, {"parents": [], "children": []}) for node in range(32))
++    graph.levels = {node: 0 for node in graph.G}
++    receipt = CountedABI(records={str(field): {"shape": [88]} for field in range(128)})
++    graph.G.graph["program_abi"] = receipt
++    for node in graph.G:
++        region = extract_clean_process_subgraph(graph, (node,))
++        assert region.G.graph["program_abi"] is receipt
++    assert receipt.scans == 0
++    specialization = extract_clean_process_subgraph(graph, graph.G)
++    isolated = specialization.G.graph["program_abi"]
++    assert isolated is not receipt and isolated == receipt
++    isolated["records"]["0"]["shape"].append(2)
++    assert receipt["records"]["0"]["shape"] == [88]

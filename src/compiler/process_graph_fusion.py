@@ -126,9 +126,18 @@ class ScheduledProcessGraphDispatchPlan:
 #:     the function's name -> binding-history view (a view of the
 #:     ``name_binding`` rows), written once at the canonical relabel; its
 #:     only reader (``training_data_store``) reads the whole function's graph.
+#:
+#: ``program_abi``
+#:     the complete compilation-owned declarative receipt, installed by whole
+#:     assignment in the public source lowerer before planning. Readers select
+#:     record schemas and build their own mutable parameter_record_abi views;
+#:     none mutates the receipt in place. A proper region retains this authority,
+#:     not another full schema copy. Whole callsite-specialization copies still
+#:     isolate all containers below, including this receipt.
 _COMPARTMENT_SHARED_METADATA = (
     "deployment_selection_trace",
     "ingestion_identity_table",
+    "program_abi",
 )
 
 #: Node-keyed views of book rows.  A compartment's view is the projection of
@@ -241,12 +250,29 @@ def extract_clean_process_subgraph(
         for key in _COMPARTMENT_NODE_KEYED_METADATA:
             table = metadata.get(key)
             if isinstance(table, Mapping):
+                # The region already names its exact member identities.  A
+                # scan of all function tokens per region made N singleton
+                # regions visit N*N rows.  This is the same keyed projection,
+                # proportional to the region rather than the whole function.
+                # Its sole reader asks explicit feed/output IDs, not map order.
                 metadata[key] = {
-                    node_id: fact
-                    for node_id, fact in table.items()
-                    if node_id in included
+                    node_id: table[node_id]
+                    for node_id in included
+                    if node_id in table
                 }
-    extracted.G.graph = isolate_metadata(metadata)
+    from .native_compiler_accelerators import METADATA_COPY, compiler_accelerators
+    provider = compiler_accelerators.resolve(METADATA_COPY)
+    copied_node_values = None
+    if provider.tier == 'native':
+        # One admitted batch and one memo across graph AND node metadata.
+        # Do not cross the Python/native boundary once per attribute.
+        node_slots = tuple((node_id, key, value) for node_id in extracted.G
+                           for key, value in extracted.G.nodes[node_id].items() if key != 'expr_obj')
+        copied = provider.run((metadata, *(value for _, _, value in node_slots)), copier=isolate_metadata)
+        extracted.G.graph = copied[0]
+        copied_node_values = tuple(zip(node_slots, copied[1:], strict=True))
+    else:
+        extracted.G.graph = isolate_metadata(metadata)
     extracted.G.graph.update(shared_metadata)
     # The copy owns its read facts from here on; its operand rewrites are
     # recorded in its own scope, never in its source's.
@@ -256,10 +282,13 @@ def extract_clean_process_subgraph(
             graph if included and len(included) < len(graph.G) else None
         ),
     )
+    if copied_node_values is not None:
+        for (node_id, key, _source), value in copied_node_values:
+            extracted.G.nodes[node_id][key] = value
     for node_id in extracted.G:
         data = extracted.G.nodes[node_id]
         for key, value in tuple(data.items()):
-            if key != "expr_obj":
+            if key != "expr_obj" and copied_node_values is None:
                 data[key] = isolate_metadata(value)
         _set_operands(extracted, node_id, [
             (parent, role)

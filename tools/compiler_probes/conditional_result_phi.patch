@@ -1,0 +1,201 @@
+diff --git a/src/compiler/glsl_deployment_strategy.py b/src/compiler/glsl_deployment_strategy.py
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -7940,15 +7940,24 @@
+         # merge; consuming that record here (before the ``continue``) builds
+         # the ConditionalBlock whose ``carried_field_cells`` the control
+         # builder already reads, and the mutation pass then finds the arm.
+-        field_state_merge = any(
++        # Scalar result merges are retention reasons too: a bare-formal
++        # predicate with two constant assignments has no predicate/arm region
++        # or call. The reducer's Phi4(test0, body2, orelse3) still requires
++        # this conditional. Retain its exact ownership, not a name history.
++        source_owned_merge = any(
+             str(phi_data.get("type") or phi_data.get("op") or "")
+             .casefold() == "phi"
+             and int((phi_data.get("attributes") or {}).get(
+                 "source_conditional_id", -1
+             )) == int(control_id)
+-            and isinstance(
+-                (phi_data.get("attributes") or {}).get("field_state_arms"),
+-                (tuple, list),
++            and (
++                isinstance(
++                    (phi_data.get("attributes") or {}).get("field_state_arms"),
++                    (tuple, list),
++                )
++                or {"body", "orelse"}.issubset({
++                    str(role) for _parent, role in phi_data.get("parents") or ()
++                })
+             )
+             for _phi_node_id, phi_data in graph.G.nodes(data=True)
+         )
+@@ -7961,7 +7970,7 @@
+             and not else_callsites
+             and not result_aliases
+             and not (predicate_regions and has_structural_branch_effect)
+-            and not field_state_merge
++            and not source_owned_merge
+         ):
+             if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
+                 print(
+@@ -8009,27 +8018,27 @@
+             if not {"body", "orelse"}.issubset(phi_parents):
+                 continue
+             merged_id = int(phi_data.get("value_id", phi_node_id))
+-            binding_name = phi_attributes.get("binding_name")
+-            if (
+-                binding_name is not None
+-                and str(binding_name).startswith("__turing_single_exit_result")
+-            ):
+-                # Guard-return normalization creates a fresh result only in
+-                # the two arms.  Its reducer Phi may name the first arm as an
+-                # ``initial_value_id`` compatibility fallback, but there is
+-                # no incumbent value before the branch.  Lower it through
+-                # the exact conditional-result path so each arm resolves its
+-                # own source identity instead of the missing arm falling
+-                # back to the first arm's constant.
++            binding_name = phi_attributes.get("binding_name")
++            if (
++                phi_attributes.get("initial_value_id") is None
++                or (binding_name is not None
++                    and str(binding_name).startswith("__turing_single_exit_result"))
++            ):
++                # A name first defined in both arms has no entered version.
++                # The recursive object-table probe's Phi18(body17, orelse9)
++                # was skipped here, so neither len-result17 nor its merge
++                # was requested and Ret read only the recursive arm9.
++                # Consume the reducer's exact arm edges as a result merge.
++                # Guard-return normalization has the same semantics, even
++                # when it publishes a compatibility initial-value fallback.
+                 result_aliases = (*result_aliases, (
+                     int(phi_parents["body"]),
+                     int(phi_parents["orelse"]),
+                     merged_id,
+                 ))
+-                direct_phi_bindings.add(str(binding_name))
+-                continue
+-            if phi_attributes.get("initial_value_id") is None:
+-                continue
++                if binding_name is not None:
++                    direct_phi_bindings.add(str(binding_name))
++                continue
+             carried.append((
+                 int(phi_parents["body"]),
+                 int(phi_parents["orelse"]),
+diff --git a/tests/test_ssa_object_operations.py b/tests/test_ssa_object_operations.py
+--- a/tests/test_ssa_object_operations.py
++++ b/tests/test_ssa_object_operations.py
+@@ -229,29 +229,48 @@
+         assert arrays['objects[].members.lengths'].tolist() == facts['objects[].members.lengths']
+ 
+ 
+-def test_recursive_keyed_view_binds_storage_before_control_result_refusal():
+-    # Borrowed storage must be settled before recursive leasing, without
+-    # suppressing the separate, still-missing authored branch-result Phi.
++@pytest.mark.parametrize('body, cases', [
++    ('    if index:\n        result=23\n    else:\n        result=41\n',
++     [(0, 41), (1, 23)]),
++    ('    if index<=0:\n        result=23\n    else:\n        result=41\n',
++     [(0, 23), (1, 41)]),
++    ('    if index<=0:\n        result=23\n    else:\n'
++     '        if index<2:\n            result=41\n        else:\n            result=59\n',
++     [(0, 23), (1, 41), (2, 59)]),
++    ('    result=5\n    if index<=0:\n        result=23\n    else:\n        result=41\n',
++     [(0, 23), (1, 41)]),
++])
++def test_authored_assignment_merges_preserve_each_arm(body, cases, tmp_path):
++    # New names use result merges, nested merges retain their arm ownership,
++    # and an existing name still uses the incumbent carried-value path.
++    module, _, exports = lower_ast_source_to_ssa('def root(index):\n' + body + '    return result\n',
++        'root', name='assignment_merge', extraction_contract=policy(),
++        runtime_closure_only=True, progress=lambda _: None, progress_bars=False)
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    root = module.functions[exports[0]]
++    artifact = emit_ssa_function_to_llvm(module, root.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'assignment_merge')
++    parameter = dict(root.metadata['parameter_names'])['index']
++    output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    for index, expected in cases:
++        assert prepare_artifact_execution(native, {
++            parameter: np.array([index], dtype=np.int64),
++        }).run().buffers[output].item() == expected
++
++
++def test_recursive_keyed_view_shares_storage_and_returns_base_case(tmp_path):
++    # Both arms first define result: there is no pre-branch version. Preserve
++    # the reducer's exact result Phi AND settle storage before recursive lease.
+     source = ('def inspect(book,handle,index):\n    if index<=0:\n'
+               '        result=len(book.objects[id(handle)].members)\n'
+               '    else:\n        result=inspect(book,handle,index-1)\n'
+               '    return result\n'
+               'def root(book,handle,index):\n    return inspect(book,handle,index)\n')
+-    from src.compiler.ssa_fortran_backend import FortranEmissionError
+-    with pytest.raises(FortranEmissionError, match='structural_outputs=.*phi') as failure:
+-        lower_ast_source_to_ssa(source, 'root', name='recursive_context',
+-            extraction_contract=policy(), runtime_closure_only=True,
+-            progress=lambda _: None, progress_bars=False)
+-    # The rejected module is a diagnostic witness only; do not emit/execute
+-    # malformed control SSA or weaken the full-native gate to obtain it.
+-    traceback = failure.value.__traceback__
+-    module = None
+-    while traceback is not None:
+-        candidate = traceback.tb_frame.f_locals.get('module')
+-        if isinstance(candidate, IRModule):
+-            module = candidate
+-        traceback = traceback.tb_next
+-    assert module is not None
++    module, outputs, exports = lower_ast_source_to_ssa(source, 'root', name='recursive_context',
++        extraction_contract=policy(), runtime_closure_only=True,
++        progress=lambda _: None, progress_bars=False)
+     recursive_calls = []
+     for function in module.functions.values():
+         for block in function.blocks.values():
+@@ -280,6 +299,44 @@
+         assert len(local_storage) == 1
+         assert local_storage[0].res.dtype == 'int'
+         assert not local_storage[0].res.accounting.get('sequence_arena')
++        merges = [i for b in function.blocks.values() for i in b.instrs
++                  if i.op == 'Phi' and i.attributes.get('binding') == 'conditional_result']
++        assert len(merges) == 1
++        assert merges[0].res.dtype == 'int64'
++        assert all(v.dtype == 'int64' for v in merges[0].args)
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    root = module.functions[exports[0]]
++    artifact = emit_ssa_function_to_llvm(module, root.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'recursive_context')
++    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
++    from src.compiler.ssa_fortran_backend import emit_module
++    c = emit_ssa_module_to_c(module, root.name)
++    # The C module lane still lacks the incumbent invocation-local zeros
++    # spelling. Do not confuse that backend limitation with LLVM execution.
++    assert not c.complete
++    assert {finding.operation for finding in c.shortfalls} == {'zeros'}
++    fortran = emit_module(module, outputs=outputs, progress=lambda _: None)
++    assert fortran.complete, fortran.shortfalls
++    facts = {'objects.length': [3], 'objects.keys': [2**60+3, 17, 29],
++             'objects.values': [0, 1, 2], 'objects[].kind.column': [1, 2, 6],
++             'objects[].members.lengths': [2, 0, 1], 'objects[].members.row_stride': [2],
++             'objects[].members.columns.key': [7, 11, 0, 0, 13, 0],
++             'objects[].members.columns.value': [2**60+19, 23, 0, 0, 31, 0]}
++    buffers = {v.id: np.array(facts[v.accounting['program_abi_field']], dtype=np.int64)
++               for v in root.args if v.accounting.get('program_abi_field') in facts}
++    parameters = dict(root.metadata['parameter_names'])
++    output = next(i.args[0].id for b in root.blocks.values() for i in b.instrs if i.op == 'Ret')
++    for handle, length in [(2**60+3, 2), (17, 0), (29, 1)]:
++        for depth in (0, 1, 7, 32):
++            buffers[parameters['handle']] = np.array([handle], dtype=np.int64)
++            buffers[parameters['index']] = np.array([depth], dtype=np.int64)
++            assert prepare_artifact_execution(native, buffers).run().buffers[output].item() == length
++    for value in root.args:
++        path = value.accounting.get('program_abi_field')
++        if path in facts:
++            assert buffers[value.id].tolist() == facts[path]
+ 
+ 
+ @pytest.mark.parametrize('operation', [ObjectOperation.KIND, ObjectOperation.LENGTH,
+

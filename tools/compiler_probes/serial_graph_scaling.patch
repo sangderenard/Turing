@@ -1,0 +1,1468 @@
+diff --git a/src/compiler/identity_concordance.py b/src/compiler/identity_concordance.py
+index 00e2bc20..72430f00 100644
+--- a/src/compiler/identity_concordance.py
++++ b/src/compiler/identity_concordance.py
+@@ -191,10 +191,28 @@ def publish_program_abi_graph_identities(
+         ),
+         scope=(str(graph_obj.graph.get("function_name") or ""),),
+     )
++    # Reverse insertion order used to propagate one identity per WHOLE-GRAPH
++    # scan: N linked record fields cost N * N node evaluations.  These are
++    # the same transfer rules in the same insertion order and round order;
++    # only values whose inputs changed need another evaluation.  Parent
++    # records, not a possibly unreconstructed NetworkX adjacency, are the
++    # dependency authority.  Loop target writes invalidate that target's
++    # consumers too.  All rules read only the three propagated identity
++    # attributes and immutable source/schema facts during this publication.
++    node_order = tuple(graph_obj)
++    order_index = {node: index for index, node in enumerate(node_order)}
++    consumers = {node: set() for node in node_order}
++    for node, node_data in graph_obj.nodes(data=True):
++        for parent, _role in node_data.get("parents") or ():
++            if parent in consumers:
++                consumers[parent].add(node)
++    pending = set(node_order)
+     changed = True
+     while changed:
+         changed = False
+-        for node_id, data in graph_obj.nodes(data=True):
++        changed_nodes = set()
++        for node_id in sorted(pending, key=order_index.__getitem__):
++            data = graph_obj.nodes[node_id]
+             attributes = data.setdefault("attributes", {})
+             operation = str(
+                 data.get("op") or data.get("type") or ""
+@@ -236,6 +254,7 @@ def publish_program_abi_graph_identities(
+                             attributes[
+                                 "program_abi_sequence_row_identity"
+                             ] = row_identity
++                            changed_nodes.add(node_id)
+                             changed = True
+                 if (
+                     isinstance(expression.func, ast.Name)
+@@ -259,6 +278,7 @@ def publish_program_abi_graph_identities(
+                             attributes[
+                                 "program_abi_sequence_row_identity"
+                             ] = row_identity
++                            changed_nodes.add(node_id)
+                             changed = True
+             if operation == "getattr":
+                 owner = next((
+@@ -334,6 +354,7 @@ def publish_program_abi_graph_identities(
+                         )
+                         if attributes.get(key) != identity:
+                             attributes[key] = identity
++                            changed_nodes.add(node_id)
+                             changed = True
+                 # ``mapping.values()`` is an identity-preserving view over
+                 # the declared value side of that exact keyed field.  Keep
+@@ -356,6 +377,7 @@ def publish_program_abi_graph_identities(
+                         attributes[
+                             "program_abi_sequence_row_identity"
+                         ] = row_identity
++                        changed_nodes.add(node_id)
+                         changed = True
+             elif operation in {"indexed", "load"}:
+                 base = next((
+@@ -377,6 +399,7 @@ def publish_program_abi_graph_identities(
+                     "program_abi_record_identity"
+                 ) != row_identity:
+                     attributes["program_abi_record_identity"] = row_identity
++                    changed_nodes.add(node_id)
+                     changed = True
+             elif operation in {"for", "comprehension"}:
+                 iterable = next((
+@@ -406,6 +429,7 @@ def publish_program_abi_graph_identities(
+                             target_attributes[
+                                 "program_abi_record_identity"
+                             ] = row_identity
++                            changed_nodes.add(target_node)
+                             changed = True
+             elif isinstance(data.get("expr_obj"), (
+                 ast.GeneratorExp, ast.ListComp, ast.SetComp,
+@@ -430,6 +454,7 @@ def publish_program_abi_graph_identities(
+                     attributes[
+                         "program_abi_sequence_row_identity"
+                     ] = row_identity
++                    changed_nodes.add(node_id)
+                     changed = True
+             elif (
+                 operation == "loopresult"
+@@ -457,6 +482,7 @@ def publish_program_abi_graph_identities(
+                         attributes[
+                             "program_abi_sequence_row_identity"
+                         ] = row_identity
++                        changed_nodes.add(node_id)
+                         changed = True
+             elif operation in {"phi", "boolop"}:
+                 for key in (
+@@ -477,7 +503,13 @@ def publish_program_abi_graph_identities(
+                         identity = next(iter(incoming))
+                         if attributes.get(key) != identity:
+                             attributes[key] = identity
++                            changed_nodes.add(node_id)
+                             changed = True
++        pending = changed_nodes | {
++            consumer
++            for node in changed_nodes
++            for consumer in consumers[node]
++        }
+         guard.round(changed)
+ 
+     graph_obj.graph[
+diff --git a/src/compiler/process_graph_fusion.py b/src/compiler/process_graph_fusion.py
+index 48469013..67ce9304 100644
+--- a/src/compiler/process_graph_fusion.py
++++ b/src/compiler/process_graph_fusion.py
+@@ -241,10 +241,15 @@ def extract_clean_process_subgraph(
+         for key in _COMPARTMENT_NODE_KEYED_METADATA:
+             table = metadata.get(key)
+             if isinstance(table, Mapping):
++                # The region already names its exact member identities.  A
++                # scan of all function tokens per region made N singleton
++                # regions visit N*N rows.  This is the same keyed projection,
++                # proportional to the region rather than the whole function.
++                # Its sole reader asks explicit feed/output IDs, not map order.
+                 metadata[key] = {
+-                    node_id: fact
+-                    for node_id, fact in table.items()
+-                    if node_id in included
++                    node_id: table[node_id]
++                    for node_id in included
++                    if node_id in table
+                 }
+     extracted.G.graph = isolate_metadata(metadata)
+     extracted.G.graph.update(shared_metadata)
+diff --git a/src/compiler/glsl_deployment_strategy.py b/src/compiler/glsl_deployment_strategy.py
+index 7be093b5..d55cf3da 100644
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -1408,6 +1408,22 @@ def _build_shell_hierarchy_plan(
+     # idempotent, and executes no numerical source code.
+     if graph.G.graph.get("function_name"):
+         _fold_callsite_structural_values(graph)
++    # After the fold, plan freezing reads this graph's source/ABI edges; it
++    # does not rewrite them.  Rechecking the publication receipt per value
++    # sums all adjacency lengths per query: V queries cost O(V*(V+E)).
++    # Publish at the first read exactly as before, then use a FRESH existing
++    # query for each value.  Only publication is batched: descriptor answers,
++    # path/cycle guards and all shape-provenance writes remain call-scoped.
++    abi_published = False
++
++    def planned_descriptor(value_id):
++        nonlocal abi_published
++        if not abi_published:
++            from .identity_concordance import publish_program_abi_graph_identities
++            publish_program_abi_graph_identities(graph.G)
++            abi_published = True
++        return _tensor_descriptor(graph, int(value_id), _DescriptorQuery())
++
+     # An Indexed successor used to unpack a multi-result source call is a
+     # call-boundary projection, not a numerical gather owned by a region.
+     # Dispatch regions can be carved before callsite shells are attached, so
+@@ -1472,7 +1488,7 @@ def _build_shell_hierarchy_plan(
+                 # when ``r[1]`` is a tensor.  Walking through a tensor removed
+                 # that read from every region, so nothing computed it and the
+                 # caller kept a formal for it.
+-                if _tensor_descriptor(graph, int(successor)) is None:
++                if planned_descriptor(int(successor)) is None:
+                     pending.append(int(successor))
+         return found
+ 
+@@ -2524,7 +2540,7 @@ def _build_shell_hierarchy_plan(
+                     # were a numeric dependency. The region formal then
+                     # disagreed with the loop Phi's physical storage. Ports
+                     # continue values; consult the existing proven descriptor.
+-                    posted = _tensor_descriptor(graph, int(current))
++                    posted = planned_descriptor(int(current))
+                     if posted is not None and posted.get("dtype"):
+                         dtype = str(posted["dtype"])
+                     elif len(parent_dtypes) == 1:
+@@ -2562,7 +2578,7 @@ def _build_shell_hierarchy_plan(
+                     # no dtype posted on the node, the domain default
+                     # (float64) is not a declaration: take the posted
+                     # descriptor's dtype, else the operand's own record.
+-                    posted = _tensor_descriptor(graph, int(current))
++                    posted = planned_descriptor(int(current))
+                     value_parent = next((
+                         int(parent)
+                         for parent, role in (_node.get("parents") or ())
+@@ -2667,7 +2683,7 @@ def _build_shell_hierarchy_plan(
+                     # ``t26.sum(t3)`` became rank 0 while the descriptor said
+                     # (4,), and ``t1.unsqueeze(t2)`` kept its source's (5,)
+                     # while the descriptor said (5, 1).
+-                    settled = _tensor_descriptor(graph, int(current))
++                    settled = planned_descriptor(int(current))
+                     if settled is not None and descriptor_states_a_shape(settled):
+                         logical = tuple(int(e) for e in (settled.get("shape") or ()))
+                         _shape_dtype_cache[current] = (logical, dtype)
+@@ -2723,7 +2739,7 @@ def _build_shell_hierarchy_plan(
+                 )),
+             )
+             for value_id in (*region_nodes, *region_captures)
+-            for descriptor in (_tensor_descriptor(graph, int(value_id)),)
++            for descriptor in (planned_descriptor(int(value_id)),)
+             if descriptor is not None
+         )
+         # A capture produced by a shape-only operation outside the region is
+@@ -2744,7 +2760,7 @@ def _build_shell_hierarchy_plan(
+                     "operand", "value", "base", "input", "self", "receiver",
+                 } and int(parent) in graph.G
+             ), None)
+-            descriptor = _tensor_descriptor(graph, int(value_id))
++            descriptor = planned_descriptor(int(value_id))
+             if storage is None or descriptor is None or not descriptor_states_a_shape(descriptor):
+                 continue
+             value_views.append((
+@@ -6728,11 +6744,27 @@ class _DispatchGraphIndex:
+     children: Mapping[int, frozenset[int]]
+     carried_initials: frozenset[int]
+     next_store_id: int
++    boundary_descriptor: Any
+ 
+ 
+ def _dispatch_graph_index(graph: Any) -> _DispatchGraphIndex:
+     """Derive the shared adjacency view from the exact source identities."""
+ 
++    # Source topology is fixed for this index's carving phase.  Revalidating
++    # publication per boundary value cost 514 full scans on the 512-add
++    # source. Publish lazily at the SAME first descriptor read (after the
++    # region copy), then only that validation is shared by subsequent cuts.
++    # Each value still gets a fresh query and publishes its own shape facts.
++    abi_published = False
++
++    def boundary_descriptor(value_id):
++        nonlocal abi_published
++        if not abi_published:
++            from .identity_concordance import publish_program_abi_graph_identities
++            publish_program_abi_graph_identities(graph.G)
++            abi_published = True
++        return _tensor_descriptor(graph, int(value_id), _DescriptorQuery())
++
+     parents = {
+         node_id: frozenset({
+             *graph.G.predecessors(node_id),
+@@ -6766,6 +6798,7 @@ def _dispatch_graph_index(graph: Any) -> _DispatchGraphIndex:
+             (node_id for node_id in graph.G if isinstance(node_id, int)),
+             default=0,
+         ) + 1,
++        boundary_descriptor=boundary_descriptor,
+     )
+ 
+ 
+@@ -6860,7 +6893,7 @@ def _dispatch_subgraph(
+         # proven descriptor first, a chained layout operation (for example
+         # ``literal.unsqueeze(1).unsqueeze(2)``) loses the first view's shape
+         # exactly at the region seam.
+-        descriptor = _tensor_descriptor(graph, int(node_id))
++        descriptor = graph_index.boundary_descriptor(int(node_id))
+         if descriptor_states_a_shape(descriptor):
+             tensor = dict(data.get("tensor") or {})
+             tensor.update({
+@@ -16930,13 +16963,24 @@ def _propagate_callsite_tensor_specializations(
+ 
+         for caller in graphs:
+             function_name = shape_scope_of(caller)
++            # Call-edge writes above have finished.  This dependency-ordered
++            # settlement reads graph topology/ABI and writes only shape book
++            # facts, so 1025 value queries need one publication validation,
++            # not 1025 full adjacency scans on the 512-add source.  Keep the
++            # first publication AFTER the original before-proof read: ABI
++            # publication can itself establish the proof being measured.
++            abi_published = False
+             for value_id in _dependency_order(caller):
+                 data = caller.G.nodes[int(value_id)]
+                 semantic_id = int(data.get("value_id", value_id))
+                 before = proven_shape_contract_of(
+                     function_name, semantic_id,
+                 )
+-                _tensor_descriptor(caller, int(value_id))
++                if not abi_published:
++                    from .identity_concordance import publish_program_abi_graph_identities
++                    publish_program_abi_graph_identities(caller.G)
++                    abi_published = True
++                _tensor_descriptor(caller, int(value_id), _DescriptorQuery())
+                 after = proven_shape_contract_of(
+                     function_name, semantic_id,
+                 )
+@@ -17534,10 +17578,12 @@ def _structured_output_descriptor(graph: Any, value_id: int) -> Any:
+     }
+ 
+ 
+-def _operand_descriptor(graph: Any, value_id: int) -> dict[str, Any] | None:
++def _operand_descriptor(
++    graph: Any, value_id: int, _seen: set[int] | None = None,
++) -> dict[str, Any] | None:
+     """A tensor descriptor, treating an authored scalar literal as rank 0."""
+ 
+-    descriptor = _tensor_descriptor(graph, int(value_id))
++    descriptor = _tensor_descriptor(graph, int(value_id), _seen)
+     if descriptor is not None:
+         return descriptor
+     node = graph.G.nodes.get(int(value_id), {})
+@@ -19713,6 +19759,24 @@ def _fold_callsite_structural_values(
+     # Resolve capability before getattr(..., default) can select its default.
+     _resolve_grounded_method_references(graph)
+ 
++    # Descriptor queries read ABI identities but repeatedly validating their
++    # receipt walks ALL adjacency lengths.  In the real 48-add program this
++    # was 388 whole-graph validations between ZERO operand writes.  Publish
++    # once between mutations, not per value.  Queries themselves remain
++    # fresh: no descriptor, book state or cycle-cut answer survives a call.
++    abi_published = False
++
++    def fold_descriptor(value_id, *, operand=False):
++        nonlocal abi_published
++        if not abi_published:
++            from .identity_concordance import publish_program_abi_graph_identities
++            publish_program_abi_graph_identities(graph.G)
++            abi_published = True
++        query = _DescriptorQuery()
++        if operand:
++            return _operand_descriptor(graph, int(value_id), query)
++        return _tensor_descriptor(graph, int(value_id), query)
++
+     unresolved = _UNRESOLVED_STRUCTURAL_VALUE
+     known: dict[int, Any] = {}
+     topology_changed = False
+@@ -19935,7 +19999,7 @@ def _fold_callsite_structural_values(
+         }
+ 
+     def descriptor_attribute(parent: int, attribute: str) -> Any:
+-        descriptor = _tensor_descriptor(graph, parent)
++        descriptor = fold_descriptor(parent)
+         if descriptor is None:
+             descriptor = _record_field_descriptor(parent)
+         if attribute in {"shape", "ndim", "ndims"}:
+@@ -19949,7 +20013,7 @@ def _fold_callsite_structural_values(
+                 source = graph.G.nodes[current]
+                 operation = str(source.get("op") or source.get("type") or "").casefold()
+                 if operation == "input":
+-                    if _tensor_descriptor(graph, current) is None:
++                    if fold_descriptor(current) is None:
+                         return unresolved
+                     continue
+                 # A declared record span supplies its own shape boundary;
+@@ -20225,7 +20289,7 @@ def _fold_callsite_structural_values(
+                 return _ProgramABIValueFact(
+                     str(record_abi["identity"]), "record", None
+                 )
+-            descriptor = _tensor_descriptor(graph, int(node_id))
++            descriptor = fold_descriptor(int(node_id))
+             if descriptor is not None:
+                 dtype = str(descriptor.get("dtype") or "unknown")
+                 # A descriptor that carries the declared Python type (a
+@@ -20398,8 +20462,7 @@ def _fold_callsite_structural_values(
+                 for parent, role in (data.get("parents") or ())
+                 if str(role) in {"operand", "value", "base", "object"}
+             ), None)
+-            descriptor = None if parent is None else _tensor_descriptor(
+-                graph, parent
++            descriptor = None if parent is None else fold_descriptor(parent
+             )
+             if descriptor is not None:
+                 # Read the descriptor for what it states.  ``LU.get_shape()``
+@@ -20673,7 +20736,7 @@ def _fold_callsite_structural_values(
+             attribute = values[1]
+             if isinstance(attribute, str) and not attribute.startswith("_"):
+                 owner_id = int(arguments[0])
+-                descriptor = _tensor_descriptor(graph, owner_id)
++                descriptor = fold_descriptor(owner_id)
+                 if descriptor is not None and attribute in {
+                     "item", "shape", "dtype", "ndim", "ndims", "numel",
+                 }:
+@@ -20784,7 +20847,8 @@ def _fold_callsite_structural_values(
+         return unresolved
+ 
+     def replace(node_id: int, value: Any) -> None:
+-        nonlocal topology_changed
++        nonlocal topology_changed, abi_published
++        abi_published = False
+         data = graph.G.nodes[int(node_id)]
+         topology_changed |= bool(data.get("parents"))
+         source_attributes = data.get("attributes") or {}
+@@ -20930,6 +20994,8 @@ def _fold_callsite_structural_values(
+             }
+ 
+     def replace_alias(node_id: int, source_id: int) -> None:
++        nonlocal abi_published
++        abi_published = False
+         node_id = int(node_id)
+         source_id = int(source_id)
+         if node_id == source_id or source_id not in graph.G:
+@@ -21013,7 +21079,7 @@ def _fold_callsite_structural_values(
+                 else (int(parent),)
+             )
+             for candidate_id in candidate_ids:
+-                descriptor = _tensor_descriptor(graph, candidate_id)
++                descriptor = fold_descriptor(candidate_id)
+                 if descriptor is None:
+                     candidate = graph.G.nodes.get(candidate_id, {})
+                     literal = candidate.get("constant")
+@@ -21116,6 +21182,8 @@ def _fold_callsite_structural_values(
+     round_cells: list = []
+     changed = True
+     while changed:
++        # A projection alias can rewrite topology and restart this sweep.
++        abi_published = False
+         fixed_point_iteration += 1
+         round_cells = []
+         iteration_mutations: list[Any] = []
+@@ -21186,7 +21254,7 @@ def _fold_callsite_structural_values(
+                 or operation
+             ).casefold()
+             existing_tensor = data.get("tensor") or {}
+-            inherited_descriptor = _tensor_descriptor(graph, node_id)
++            inherited_descriptor = fold_descriptor(node_id)
+             if (
+                 inherited_descriptor is not None
+                 and (
+@@ -21298,7 +21366,7 @@ def _fold_callsite_structural_values(
+                     descriptor
+                     for parent in numerical_parents
+                     if (
+-                        descriptor := _operand_descriptor(graph, parent)
++                        descriptor := fold_descriptor(parent, operand=True)
+                     ) is not None
+                 )
+                 if len(parent_descriptors) != len(numerical_parents):
+@@ -21332,8 +21400,7 @@ def _fold_callsite_structural_values(
+                 index_values: list[Any] = []
+                 for parent, role in data.get("parents") or ():
+                     if str(role) == "base":
+-                        source_descriptor = _tensor_descriptor(
+-                            graph, int(parent)
++                        source_descriptor = fold_descriptor(int(parent)
+                         )
+                     elif str(role) == "index":
+                         index_values.append(
+@@ -21396,7 +21463,7 @@ def _fold_callsite_structural_values(
+                 ), None)
+                 source_descriptor = (
+                     None if base is None
+-                    else _tensor_descriptor(graph, base)
++                    else fold_descriptor(base)
+                 )
+                 if (
+                     source_descriptor is not None
+@@ -21502,12 +21569,12 @@ def _fold_callsite_structural_values(
+                 "zeros_like", "empty_like", "ones_like", "full_like",
+             }:
+                 source_descriptor = next((
+-                    _tensor_descriptor(graph, int(parent))
++                    fold_descriptor(int(parent))
+                     for parent, role in (data.get("parents") or ())
+                     if str(role) not in {
+                         "callee", "func", "function", "definition",
+                     }
+-                    and _tensor_descriptor(graph, int(parent)) is not None
++                    and fold_descriptor(int(parent)) is not None
+                 ), None)
+                 if source_descriptor is not None:
+                     data["tensor"] = copy.deepcopy(source_descriptor)
+@@ -21608,16 +21675,16 @@ def _fold_callsite_structural_values(
+                         }
+             if tensor_candidate in {"gather", "index_select"}:
+                 source_descriptor = next((
+-                    _tensor_descriptor(graph, int(parent))
++                    fold_descriptor(int(parent))
+                     for parent, role in (data.get("parents") or ())
+                     if str(role) in {"operand", "value", "base"}
+-                    and _tensor_descriptor(graph, int(parent)) is not None
++                    and fold_descriptor(int(parent)) is not None
+                 ), None)
+                 index_descriptor = next((
+-                    _tensor_descriptor(graph, int(parent))
++                    fold_descriptor(int(parent))
+                     for parent, role in (data.get("parents") or ())
+                     if str(role) in {"indices", "index", "arg:0", "arg:1"}
+-                    and _tensor_descriptor(graph, int(parent)) is not None
++                    and fold_descriptor(int(parent)) is not None
+                 ), None)
+                 axis = structural_call_argument(
+                     data,
+@@ -21645,10 +21712,10 @@ def _fold_callsite_structural_values(
+                     "transpose", "swapaxes", "transpose_last2", "t"
+                 }:
+                 source_descriptor = next((
+-                    _tensor_descriptor(graph, int(parent))
++                    fold_descriptor(int(parent))
+                     for parent, role in (data.get("parents") or ())
+                     if str(role) in {"operand", "arg:0", "value"}
+-                    and _tensor_descriptor(graph, int(parent)) is not None
++                    and fold_descriptor(int(parent)) is not None
+                 ), None)
+                 if source_descriptor is not None:
+                     source_shape = tuple(source_descriptor["shape"])
+@@ -21666,7 +21733,7 @@ def _fold_callsite_structural_values(
+                     for parent, role in (data.get("parents") or ())
+                     if str(role) not in {"callee", "func", "definition"}
+                     and (
+-                        descriptor := _tensor_descriptor(graph, int(parent))
++                        descriptor := fold_descriptor(int(parent))
+                     ) is not None
+                 )
+                 if len(operand_descriptors) >= 2:
+@@ -21697,10 +21764,10 @@ def _fold_callsite_structural_values(
+                         }
+             if tensor_candidate in {"reshape", "view"}:
+                 source_descriptor = next((
+-                    _tensor_descriptor(graph, int(parent))
++                    fold_descriptor(int(parent))
+                     for parent, role in (data.get("parents") or ())
+                     if str(role) in {"operand", "value"}
+-                    and _tensor_descriptor(graph, int(parent)) is not None
++                    and fold_descriptor(int(parent)) is not None
+                 ), None)
+                 shape_arguments = sorted(
+                     (
+@@ -21771,13 +21838,13 @@ def _fold_callsite_structural_values(
+                     for _parent, role in (data.get("parents") or ())
+                 )
+                 source_descriptor = next((
+-                    _tensor_descriptor(graph, int(parent))
++                    fold_descriptor(int(parent))
+                     for parent, role in (data.get("parents") or ())
+                     if str(role) in (
+                         {"operand", "value", "self", "receiver"}
+                         if method_style else {"arg:0"}
+                     )
+-                    and _tensor_descriptor(graph, int(parent)) is not None
++                    and fold_descriptor(int(parent)) is not None
+                 ), None)
+                 axis = structural_call_argument(
+                     data,
+diff --git a/tests/test_scheduled_process_graph_dispatches.py b/tests/test_scheduled_process_graph_dispatches.py
+index 316dffb8..73aa9f7e 100644
+--- a/tests/test_scheduled_process_graph_dispatches.py
++++ b/tests/test_scheduled_process_graph_dispatches.py
+@@ -475,6 +475,33 @@ def test_compartment_carries_its_own_nodes_tokens_and_shares_read_only_tables():
+     assert whole.G.graph["ingestion_identity_table"]["x"][0] is not names["x"][0]
+ 
+ 
++def test_token_projection_reads_only_compartment_members():
++    class CountedTokens(dict):
++        scans = 0
++        lookups = 0
++
++        def items(self):
++            for item in super().items():
++                self.scans += 1
++                yield item
++
++        def __getitem__(self, key):
++            self.lookups += 1
++            return super().__getitem__(key)
++
++    graph = ProcessGraph(materialize_memory=False)
++    for node in range(128):
++        _add(graph, node, "Input")
++    tokens = CountedTokens({node: ("value", node) for node in graph.G})
++    graph.G.graph["ssa_identity_tokens"] = tokens
++    for node in range(128):
++        region = extract_clean_process_subgraph(graph, (node,))
++        assert region.G.graph["ssa_identity_tokens"] == {node: tokens[node]}
++        assert region.G.graph["ssa_identity_tokens"][node] is tokens[node]
++    assert tokens.scans == 0
++    assert tokens.lookups <= 4 * len(graph.G)
++
++
+ def test_region_fork_of_read_scope_holds_its_own_nodes_rows_as_a_declared_projection():
+     import pytest
+ 
+diff --git a/tools/compiler_probes/probe_four_rule_timing.py b/tools/compiler_probes/probe_four_rule_timing.py
+index 96c7cbd2..5b16e9ef 100644
+--- a/tools/compiler_probes/probe_four_rule_timing.py
++++ b/tools/compiler_probes/probe_four_rule_timing.py
+@@ -12,9 +12,11 @@ of the native graph-foundation bootstrap. Report this changed configuration.
+ from pathlib import Path
+ import subprocess
+ import sys
++import os
+ 
+ ROOT = Path(__file__).resolve().parents[2]
+-for entry in (ROOT.parent / "engine_toy", ROOT / "examples", ROOT):
++EXTERNAL_ROOT = Path(os.environ.get("TURING_PROBE_EXTERNAL_ROOT", str(ROOT)))
++for entry in (EXTERNAL_ROOT.parent / "engine_toy", EXTERNAL_ROOT / "examples", ROOT):
+     sys.path.insert(0, str(entry))
+ 
+ 
+@@ -48,6 +50,7 @@ def main():
+     # Preserve their lowering; stream real stage progress without per-AST-node
+     # prints (no output redirection, log file, tracing or hidden compiler).
+     from src.compiler import fortran_c_shell
++    print("N4_COMPILER_SOURCE=" + fortran_c_shell.__file__, flush=True)
+     public_lowerer = fortran_c_shell.lower_ast_source_to_ssa
+     last_default_progress = [0.0]
+ 
+diff --git a/tests/abi_publication_full_scan.py b/tests/abi_publication_full_scan.py
+new file mode 100644
+--- /dev/null
++++ b/tests/abi_publication_full_scan.py
+@@ -0,0 +1,367 @@
++"""Frozen pre-worklist publication, used only as the parity oracle."""
++from __future__ import annotations
++
++def publish_program_abi_graph_identities(
++    graph_obj: Any, *, force: bool = False,
++) -> None:
++    """Publish exact record/table identities along source graph edges.
++
++    ProgramABI names the root record.  GetAttr, table indexing, and loop
++    target bindings are the authoritative transformation spine from that
++    root to nested records.  Publishing the result on the graph value lets
++    every later consumer ask the same concordance instead of reconstructing
++    a field identity from a name or a local cache.
++    """
++
++    program_abi_source = graph_obj.graph.get("program_abi")
++    parameter_records_source = graph_obj.graph.get("parameter_record_abi")
++    identities_source = graph_obj.graph.get("identity_table")
++    program_abi = program_abi_source or {}
++    parameter_records = parameter_records_source or {}
++    identities = identities_source or {}
++    receipt = (
++        len(graph_obj),
++        _edge_count(graph_obj),
++        id(program_abi_source),
++        id(parameter_records_source),
++        id(identities_source),
++    )
++    if not force and graph_obj.graph.get(
++        "program_abi_identity_publication_receipt"
++    ) == receipt:
++        return
++
++    repository_records = dict(program_abi.get("records") or {})
++
++    def schema_named(identity: object):
++        matches = tuple(
++            (str(name), record)
++            for name, record in repository_records.items()
++            if str(name) == str(identity)
++            or str(record.get("identity") or "") == str(identity)
++        )
++        return matches[0] if len(matches) == 1 else None
++
++    # One pass indexes the nodes by value id; the old form rescanned every
++    # node for each (record, value id) pair -- records x ids x nodes, which
++    # dominated a 838-column dt system.
++    nodes_by_value: dict[int, list] = {}
++    if parameter_records:
++        for node_id, data in graph_obj.nodes(data=True):
++            nodes_by_value.setdefault(
++                int(data.get("value_id", node_id)), [],
++            ).append(data)
++    for parameter_name, record in dict(
++        parameter_records
++    ).items():
++        record_identity = str(record.get("identity") or "")
++        for value_id in identities.get(str(parameter_name), ()):
++            for data in nodes_by_value.get(int(value_id), ()):
++                data.setdefault("attributes", {})[
++                    "program_abi_record_identity"
++                ] = record_identity
++
++    from .bounded_fixed_point import BoundedFixedPoint, bound_for
++
++    # Identities only propagate along existing edges: a changing round moves
++    # at least one identity one edge further, so nodes + edges bound it.
++    guard = BoundedFixedPoint(
++        "program-abi-identity-publication",
++        bound_for(
++            "identity-publication", nodes=len(graph_obj),
++            callsites=int(graph_obj.number_of_edges()),
++        ),
++        scope=(str(graph_obj.graph.get("function_name") or ""),),
++    )
++    changed = True
++    while changed:
++        changed = False
++        for node_id, data in graph_obj.nodes(data=True):
++            attributes = data.setdefault("attributes", {})
++            operation = str(
++                data.get("op") or data.get("type") or ""
++            ).casefold()
++            parents = tuple(
++                (parent, str(role))
++                for parent, role in data.get("parents") or ()
++                if parent in graph_obj
++            )
++            expression = data.get("expr_obj")
++            if isinstance(expression, ast.Call):
++                # Resolved calls are respelled to their semantic operation
++                # (``values``, ``tuple``, ...), so their graph operation is
++                # intentionally not the frontend word ``Call``.  Preserve
++                # identities using the exact authored call and parent edges.
++                if (
++                    isinstance(expression.func, ast.Attribute)
++                    and expression.func.attr == "values"
++                ):
++                    incoming = {
++                        identity
++                        for parent, role in parents
++                        if role in {
++                            "operand", "value", "receiver", "callee",
++                            "func", "function", "callable",
++                        }
++                        for identity in ((
++                            graph_obj.nodes[parent].get("attributes") or {}
++                        ).get("program_abi_sequence_row_identity"), (
++                            graph_obj.nodes[parent].get("attributes") or {}
++                        ).get("program_abi_indexed_value_identity"))
++                        if identity is not None
++                    }
++                    if len(incoming) == 1:
++                        row_identity = next(iter(incoming))
++                        if attributes.get(
++                            "program_abi_sequence_row_identity"
++                        ) != row_identity:
++                            attributes[
++                                "program_abi_sequence_row_identity"
++                            ] = row_identity
++                            changed = True
++                if (
++                    isinstance(expression.func, ast.Name)
++                    and expression.func.id in {"list", "tuple", "set"}
++                ):
++                    incoming = {
++                        (graph_obj.nodes[parent].get("attributes") or {}).get(
++                            "program_abi_sequence_row_identity"
++                        )
++                        for parent, role in parents
++                        if str(role).startswith("arg:")
++                        and (graph_obj.nodes[parent].get("attributes") or {}).get(
++                            "program_abi_sequence_row_identity"
++                        ) is not None
++                    }
++                    if len(incoming) == 1:
++                        row_identity = next(iter(incoming))
++                        if attributes.get(
++                            "program_abi_sequence_row_identity"
++                        ) != row_identity:
++                            attributes[
++                                "program_abi_sequence_row_identity"
++                            ] = row_identity
++                            changed = True
++            if operation == "getattr":
++                owner = next((
++                    graph_obj.nodes[parent]
++                    for parent, role in parents
++                    if role in {"value", "object", "base", "receiver"}
++                ), None)
++                owner_identity = (
++                    None if owner is None else
++                    (owner.get("attributes") or {}).get(
++                        "program_abi_record_identity"
++                    )
++                )
++                schema_match = (
++                    None if owner_identity is None
++                    else schema_named(owner_identity)
++                )
++                field_name = str(attributes.get("attribute") or "")
++                field = (
++                    None if schema_match is None else
++                    dict(schema_match[1].get("fields") or {}).get(field_name)
++                )
++                if isinstance(field, Mapping):
++                    storage = str(field.get("storage") or "")
++                    declared_shape = field.get("shape")
++                    if (
++                        declared_shape is None
++                        and storage == "span"
++                        and field.get("fixed_length") is not None
++                    ):
++                        declared_shape = (int(field["fixed_length"]),)
++                    if storage == "span" and declared_shape is not None:
++                        declared_shape = tuple(map(int, declared_shape))
++                        declared_state = {
++                            "shape": declared_shape,
++                            "dtype": str(field.get("dtype") or "float64"),
++                            "rank": int(field.get(
++                                "rank", len(declared_shape),
++                            )),
++                            "metadata_state": "static",
++                        }
++                        record_shape_transformation(
++                            f"ProgramABI:{owner_identity}",
++                            (str(owner_identity), field_name),
++                            shape_scope_of(graph_obj),
++                            int(data.get("value_id", node_id)),
++                            stage="program_abi_graph_publication",
++                            operation="getattr",
++                            source_state=declared_state,
++                            target_state=declared_state,
++                            role=field_name,
++                        )
++                    target_name = (
++                        field.get("record") if storage == "record"
++                        else field.get("row_record") if storage == "table"
++                        else field.get("value_record") if storage == "keyed"
++                        else None
++                    )
++                    target = (
++                        None if target_name is None
++                        else schema_named(target_name)
++                    )
++                    key = (
++                        "program_abi_sequence_row_identity"
++                        if storage == "table"
++                        else "program_abi_indexed_value_identity"
++                        if storage == "keyed"
++                        else "program_abi_record_identity"
++                    )
++                    if target is not None:
++                        identity = str(
++                            target[1].get("identity") or target[0]
++                        )
++                        if attributes.get(key) != identity:
++                            attributes[key] = identity
++                            changed = True
++                # ``mapping.values()`` is an identity-preserving view over
++                # the declared value side of that exact keyed field.  Keep
++                # the row identity on the accessor edge so the subsequent
++                # Call and retained comprehension loop do not have to
++                # rediscover it from a binding name or a Python container.
++                if (
++                    field_name == "values"
++                    and owner is not None
++                    and (
++                        owner.get("attributes") or {}
++                    ).get("program_abi_indexed_value_identity") is not None
++                ):
++                    row_identity = (owner.get("attributes") or {})[
++                        "program_abi_indexed_value_identity"
++                    ]
++                    if attributes.get(
++                        "program_abi_sequence_row_identity"
++                    ) != row_identity:
++                        attributes[
++                            "program_abi_sequence_row_identity"
++                        ] = row_identity
++                        changed = True
++            elif operation in {"indexed", "load"}:
++                base = next((
++                    graph_obj.nodes[parent]
++                    for parent, role in parents if role == "base"
++                ), None)
++                row_identity = (
++                    None if base is None else
++                    (
++                        (base.get("attributes") or {}).get(
++                            "program_abi_sequence_row_identity"
++                        )
++                        or (base.get("attributes") or {}).get(
++                            "program_abi_indexed_value_identity"
++                        )
++                    )
++                )
++                if row_identity is not None and attributes.get(
++                    "program_abi_record_identity"
++                ) != row_identity:
++                    attributes["program_abi_record_identity"] = row_identity
++                    changed = True
++            elif operation in {"for", "comprehension"}:
++                iterable = next((
++                    graph_obj.nodes[parent]
++                    for parent, role in parents if role in {"iterable", "iter"}
++                ), None)
++                row_identity = (
++                    None if iterable is None else
++                    (iterable.get("attributes") or {}).get(
++                        "program_abi_sequence_row_identity"
++                    )
++                )
++                if row_identity is not None:
++                    target_ids = set(map(int, dict(attributes.get(
++                        "loop_target_bindings", {}
++                    )).values()))
++                    for target_node in target_ids:
++                        if target_node not in graph_obj:
++                            continue
++                        target_data = graph_obj.nodes[target_node]
++                        target_attributes = target_data.setdefault(
++                            "attributes", {}
++                        )
++                        if target_attributes.get(
++                            "program_abi_record_identity"
++                        ) != row_identity:
++                            target_attributes[
++                                "program_abi_record_identity"
++                            ] = row_identity
++                            changed = True
++            elif isinstance(data.get("expr_obj"), (
++                ast.GeneratorExp, ast.ListComp, ast.SetComp,
++            )):
++                # The comprehension materializer is the same resident
++                # sequence whose row is its exact ``elt`` edge.  Publishing
++                # that edge preserves a record row as a columnar record ABI;
++                # it does not create a Python generator or a parallel object.
++                element = next((
++                    graph_obj.nodes[parent]
++                    for parent, role in parents if role == "elt"
++                ), None)
++                row_identity = (
++                    None if element is None else
++                    (element.get("attributes") or {}).get(
++                        "program_abi_record_identity"
++                    )
++                )
++                if row_identity is not None and attributes.get(
++                    "program_abi_sequence_row_identity"
++                ) != row_identity:
++                    attributes[
++                        "program_abi_sequence_row_identity"
++                    ] = row_identity
++                    changed = True
++            elif (
++                operation == "loopresult"
++                and attributes.get("result_kind") == "collection"
++            ):
++                # Loop composition replaces the comprehension materializer
++                # with this collection port.  Its ``value`` edge is the exact
++                # element that is appended once per iteration, so a record
++                # identity becomes the resident sequence's row identity.
++                incoming = {
++                    (graph_obj.nodes[parent].get("attributes") or {}).get(
++                        "program_abi_record_identity"
++                    )
++                    for parent, role in parents
++                    if role == "value"
++                    and (graph_obj.nodes[parent].get("attributes") or {}).get(
++                        "program_abi_record_identity"
++                    ) is not None
++                }
++                if len(incoming) == 1:
++                    row_identity = next(iter(incoming))
++                    if attributes.get(
++                        "program_abi_sequence_row_identity"
++                    ) != row_identity:
++                        attributes[
++                            "program_abi_sequence_row_identity"
++                        ] = row_identity
++                        changed = True
++            elif operation in {"phi", "boolop"}:
++                for key in (
++                    "program_abi_record_identity",
++                    "program_abi_sequence_row_identity",
++                    "program_abi_indexed_value_identity",
++                ):
++                    incoming = {
++                        (graph_obj.nodes[parent].get("attributes") or {}).get(
++                            key
++                        )
++                        for parent, _role in parents
++                        if (graph_obj.nodes[parent].get("attributes") or {}).get(
++                            key
++                        ) is not None
++                    }
++                    if len(incoming) == 1:
++                        identity = next(iter(incoming))
++                        if attributes.get(key) != identity:
++                            attributes[key] = identity
++                            changed = True
++        guard.round(changed)
++
++    graph_obj.graph[
++        "program_abi_identity_publication_receipt"
++    ] = receipt
+diff --git a/tests/test_abi_identity_worklist.py b/tests/test_abi_identity_worklist.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_abi_identity_worklist.py
+@@ -0,0 +1,161 @@
++"""Exact parent-edge propagation must not scan the graph per chain link."""
++import copy
++import types
++import random
++import ast
++import sys
++from pathlib import Path
++
++import networkx as nx
++import pytest
++
++from src.compiler import identity_concordance as concordance
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from abi_publication_full_scan import publish_program_abi_graph_identities as full_scan
++
++
++class CountedNodes:
++    def __init__(self, nodes):
++        self.nodes = nodes
++        self.visits = 0
++
++    def __call__(self, *args, **kwargs):
++        for item in self.nodes(*args, **kwargs):
++            self.visits += 1
++            yield item
++
++    def __getitem__(self, key):
++        self.visits += 1
++        return self.nodes[key]
++
++    def __iter__(self):
++        return iter(self.nodes)
++
++    def __len__(self):
++        return len(self.nodes)
++
++
++def chain(size, reverse=True):
++    graph = nx.DiGraph()
++    graph.graph.update(
++        function_name="abi_chain",
++        parameter_record_abi={"root": {"identity": "Node"}},
++        identity_table={"root": (0,)},
++        program_abi={"records": {"Node": {"identity": "Node", "fields": {
++            "next": {"storage": "record", "record": "Node"},
++        }}}},
++    )
++    for node in (reversed(range(size)) if reverse else range(size)):
++        graph.add_node(node, value_id=node,
++                       type="Input" if node == 0 else "GetAttr",
++                       parents=[] if node == 0 else [(node - 1, "value")],
++                       attributes={} if node == 0 else {"attribute": "next"})
++    # Publication's authoritative dependencies are the actual parent records,
++    # not a guessed NetworkX adjacency (which can precede edge rebuilding).
++    return graph
++
++
++def run(function, graph):
++    graph = copy.deepcopy(graph)
++    counted = CountedNodes(graph.nodes)
++    graph.nodes = counted
++    book, token = concordance.begin_identity_book()
++    try:
++        function(graph, force=False)
++        rounds = [page for name, page in book.pages.items()
++                  if name == "fixed_point_round"]
++        facts = {node: {key: ast.dump(value, include_attributes=True)
++                       if isinstance(value, ast.AST) else value
++                       for key, value in data.items()}
++                 for node, data in graph.nodes.nodes(data=True)}
++        shapes = book.page("shape_transformation_state")
++        shape_facts = {row: shapes.latest(row) for row in shapes.rows()}
++        return facts, counted.visits, shape_facts
++    finally:
++        concordance.end_identity_book(token)
++
++
++ORIGINAL = types.FunctionType(full_scan.__code__, concordance.__dict__)
++ORIGINAL.__kwdefaults__ = full_scan.__kwdefaults__
++
++
++@pytest.mark.parametrize("size", [8, 32, 128])
++@pytest.mark.parametrize("reverse", [False, True])
++def test_worklist_preserves_exact_final_identities(size, reverse):
++    graph = chain(size, reverse)
++    old, old_visits, _ = run(ORIGINAL, graph)
++    new, visits, _ = run(concordance.publish_program_abi_graph_identities, graph)
++    assert new == old
++    assert all(data["attributes"]["program_abi_record_identity"] == "Node"
++               for data in new.values())
++    assert visits <= 20 * size, (visits, old_visits)
++
++
++def test_loop_target_writes_invalidate_actual_consumers():
++    graph = chain(4)
++    graph.graph["parameter_record_abi"] = {}
++    graph.nodes[0]["attributes"] = {"program_abi_sequence_row_identity": "Node"}
++    graph.nodes[2].update(type="For", parents=[(0, "iterable")],
++                          attributes={"loop_target_bindings": {"item": 1}})
++    graph.nodes[1].update(type="Input", parents=[], attributes={})
++    graph.nodes[3]["parents"] = [(1, "value")]
++    old, _, _ = run(ORIGINAL, graph)
++    new, _, _ = run(concordance.publish_program_abi_graph_identities, graph)
++    assert new == old
++    assert new[3]["attributes"]["program_abi_record_identity"] == "Node"
++
++
++def test_span_shape_publication_is_the_same_book_fact():
++    graph = chain(32)
++    graph.graph["shape_scope"] = ("abi_worklist", "span")
++    graph.graph["program_abi"]["records"]["Node"]["fields"]["column"] = {
++        "storage": "span", "shape": (8,), "dtype": "float64", "rank": 1,
++    }
++    graph.nodes[31]["attributes"]["attribute"] = "column"
++    old, _, old_shapes = run(ORIGINAL, graph)
++    new, _, new_shapes = run(concordance.publish_program_abi_graph_identities, graph)
++    assert new == old
++    assert new_shapes == old_shapes
++    assert old_shapes, "the original pass must publish the span's shape"
++
++
++@pytest.mark.parametrize("seed", range(40))
++def test_mixed_identity_rules_match_original_round_order(seed):
++    rng = random.Random(seed)
++    graph = chain(45)
++    order = list(graph)
++    rng.shuffle(order)
++    graph = nx.DiGraph(graph.subgraph(order))
++    # Explicitly randomize insertion order, preserving metadata/parent facts.
++    data = dict(graph.nodes(data=True))
++    graph.clear()
++    graph.graph.update(chain(1).graph)
++    for node in order:
++        graph.add_node(node, **data[node])
++    for node in range(1, 45):
++        kind = rng.choice(("GetAttr", "Indexed", "Phi", "BoolOp", "Call",
++                           "For", "LoopResult", "Comprehension"))
++        parents = rng.sample(range(node), min(node, rng.randint(1, 3)))
++        role = {"GetAttr": "value", "Indexed": "base", "Call": "arg:0",
++                "For": "iterable", "LoopResult": "value",
++                "Comprehension": "elt"}.get(kind, "value")
++        attributes = {"attribute": "next"}
++        expression = None
++        if kind == "Call":
++            expression = ast.parse("list(value)", mode="eval").body
++        if kind == "For":
++            attributes["loop_target_bindings"] = {"target": rng.randrange(45)}
++        if kind == "LoopResult":
++            attributes["result_kind"] = "collection"
++        if kind == "Comprehension":
++            expression = ast.parse("[value for value in rows]", mode="eval").body
++        graph.nodes[node].update(type=kind, attributes=attributes,
++                                 expr_obj=expression,
++                                 parents=[(parent, role) for parent in parents])
++        if rng.random() < .2:
++            graph.nodes[node]["attributes"][rng.choice((
++                "program_abi_record_identity", "program_abi_sequence_row_identity",
++                "program_abi_indexed_value_identity"))] = rng.choice(("Node", "Other"))
++    old, _, _ = run(ORIGINAL, graph)
++    new, _, _ = run(concordance.publish_program_abi_graph_identities, graph)
++    assert new == old
+diff --git a/tests/test_plan_descriptor_publication.py b/tests/test_plan_descriptor_publication.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_plan_descriptor_publication.py
+@@ -0,0 +1,141 @@
++"""Read-only plan freezing must not revalidate all edges for every value."""
++import inspect
++from pathlib import Path
++import sys
++import pytest
++
++from src.compiler import identity_concordance as concordance
++from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++from src.compiler import glsl_deployment_strategy as strategy
++
++
++def test_frozen_plan_publishes_abi_once_not_once_per_descriptor(monkeypatch):
++    original = concordance.publish_program_abi_graph_identities
++    calls = {}
++
++    def observed(graph, **kwargs):
++        frame = inspect.currentframe().f_back
++        while frame is not None:
++            if frame.f_code.co_name == "_fold_callsite_structural_values":
++                break  # mutable fold, not this read-only planning boundary
++            if frame.f_code.co_name == "_build_shell_hierarchy_plan":
++                calls[frame] = calls.get(frame, 0) + 1
++                break
++            frame = frame.f_back
++        return original(graph, **kwargs)
++
++    monkeypatch.setattr(concordance, "publish_program_abi_graph_identities", observed)
++    source = "def root(x):\n" + "".join(
++        f"    y{n} = {'x' if n == 0 else 'y' + str(n - 1)} + {n + 1}.0\n"
++        for n in range(48)
++    ) + "    return y47\n"
++    module, outputs, _ = lower_ast_source_to_ssa(
++        source, "root", name="plan_publication_scaling", progress=lambda message: None,
++        extraction_contract=Path(__file__).resolve().parents[1] / "extraction_contracts/program_extraction.yaml",
++    )
++    assert module.functions and outputs
++    assert calls, "the real public lowering must reach plan freezing"
++    assert max(calls.values()) == 1, list(calls.values())
++
++
++def test_mutable_fold_batches_reads_between_actual_operand_writes(monkeypatch):
++    original = concordance.publish_program_abi_graph_identities
++    operands = strategy._set_operands
++    calls, writes, stacks = {}, {}, {}
++
++    def fold_frame():
++        frame = inspect.currentframe().f_back
++        while frame is not None:
++            if frame.f_code.co_name == "_fold_callsite_structural_values":
++                return frame
++            frame = frame.f_back
++
++    def observed(graph, **kwargs):
++        frame = fold_frame()
++        if frame is not None:
++            calls[frame] = calls.get(frame, 0) + 1
++            caller = inspect.currentframe().f_back
++            path = []
++            while caller is not None and caller is not frame:
++                path.append(caller.f_code.co_name)
++                caller = caller.f_back
++            stacks[tuple(path)] = stacks.get(tuple(path), 0) + 1
++        return original(graph, **kwargs)
++
++    def written(*args, **kwargs):
++        frame = fold_frame()
++        if frame is not None:
++            writes[frame] = writes.get(frame, 0) + 1
++        return operands(*args, **kwargs)
++
++    monkeypatch.setattr(concordance, "publish_program_abi_graph_identities", observed)
++    monkeypatch.setattr(strategy, "_set_operands", written)
++    source = "def root(x):\n" + "".join(
++        f"    y{n} = {'x' if n == 0 else 'y' + str(n - 1)} + {n + 1}.0\n"
++        for n in range(48)
++    ) + "    return y47\n"
++    lower_ast_source_to_ssa(source, "root", name="fold_publication_scaling",
++        progress=lambda message: None,
++        extraction_contract=Path(__file__).resolve().parents[1] / "extraction_contracts/program_extraction.yaml")
++    assert calls
++    assert all(count <= writes.get(frame, 0) + 4 for frame, count in calls.items()), stacks
++
++
++def test_settlement_and_carving_validate_once_per_frozen_graph(monkeypatch):
++    original = concordance.publish_program_abi_graph_identities
++    settlements, carvings, held_indexes = {}, {}, {}
++
++    def observed(graph, **kwargs):
++        frame = inspect.currentframe().f_back
++        while frame is not None:
++            name = frame.f_code.co_name
++            if name == "_fold_callsite_structural_values":
++                break
++            if name == "_propagate_callsite_tensor_specializations":
++                settlements[frame] = settlements.get(frame, 0) + 1
++                break
++            if name == "_dispatch_subgraph":
++                index = frame.f_locals["graph_index"]
++                held_indexes[id(index)] = index
++                carvings[id(index)] = carvings.get(id(index), 0) + 1
++                break
++            frame = frame.f_back
++        return original(graph, **kwargs)
++
++    monkeypatch.setattr(concordance, "publish_program_abi_graph_identities", observed)
++    source = "def root(x):\n" + "".join(
++        f"    y{n} = {'x' if n == 0 else 'y' + str(n - 1)} + {n + 1}.0\n"
++        for n in range(48)
++    ) + "    return y47\n"
++    lower_ast_source_to_ssa(source, "root", name="settlement_carving_scaling",
++        progress=lambda message: None,
++        extraction_contract=Path(__file__).resolve().parents[1] / "extraction_contracts/program_extraction.yaml")
++    assert settlements and carvings
++    budgets = [(count, len(frame.f_locals["graphs"]) * frame.f_locals["round_index"])
++               for frame, count in settlements.items()]
++    assert all(count <= budget for count, budget in budgets), (budgets, list(carvings.values()))
++    assert max(carvings.values()) == 1, list(carvings.values())
++
++
++@pytest.mark.parametrize("case", ["view", "toplevel", "energy", "controller",
++                                 "controller_untyped", "mapping", "oscillator"])
++def test_frozen_reads_equal_original_fresh_publication(case, monkeypatch):
++    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
++    import audit_identity_concordance as audit
++    original = strategy._tensor_descriptor
++    compared = []
++
++    def checked(graph, node, seen=None):
++        answer = original(graph, node, seen)
++        caller = inspect.currentframe().f_back
++        if caller.f_code.co_name == "_operand_descriptor":
++            caller = caller.f_back
++        if caller.f_code.co_name == "planned_descriptor":
++            fresh = original(graph, node)
++            assert answer == fresh, (node, answer, fresh)
++            compared.append(node)
++        return answer
++
++    monkeypatch.setattr(strategy, "_tensor_descriptor", checked)
++    audit.CASES[case]()
++    assert compared, "audit source must exercise the real frozen plan's reads"
+diff --git a/tools/compiler_probes/probe_serial_graph_scaling.py b/tools/compiler_probes/probe_serial_graph_scaling.py
+new file mode 100644
+--- /dev/null
++++ b/tools/compiler_probes/probe_serial_graph_scaling.py
+@@ -0,0 +1,182 @@
++"""Small public-entry lowering and chain-work counts; no trace or deadline.
++
++--original-passes selects the frozen pre-worklist publication test oracle
++and restores per-query publication at the read-only plan boundary.  The latter
++retains one extra no-op first-read receipt check from the current boundary;
++it is not a byte-for-byte historical whole-compiler performance baseline.
++Stops after real SSA lowering, before LLVM emission or target execution.
++"""
++from pathlib import Path
++import statistics
++import sys
++import time
++import inspect
++import os
++import hashlib
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT))
++sys.path.insert(0, str(ROOT / "tests"))
++sys.path.insert(0, os.environ.get("TURING_PROBE_EXAMPLES", str(ROOT / "examples")))
++from test_abi_identity_worklist import ORIGINAL, chain, run
++from src.compiler import identity_concordance as concordance
++from src.compiler import glsl_deployment_strategy as strategy
++from src.compiler import fortran_c_shell as compiler
++from tools.compiler_probes.probe_dt_unit_interfaces import main
++
++if "--original-cone" in sys.argv:
++    from descriptor_invalidation_full_scan import original_invalidation
++    strategy._invalidate_tensor_descriptor_dependents = original_invalidation
++
++original_mode = "--original-passes" in sys.argv
++if original_mode:
++    concordance.publish_program_abi_graph_identities = ORIGINAL
++    descriptor = strategy._tensor_descriptor
++
++    def fresh_publication(graph, node, seen=None):
++        caller = inspect.currentframe().f_back
++        if caller.f_code.co_name == "_operand_descriptor":
++            caller = caller.f_back
++        if caller.f_code.co_name in {"planned_descriptor", "fold_descriptor",
++                                    "boundary_descriptor", "_propagate_callsite_tensor_specializations"}:
++            seen = None
++        return descriptor(graph, node, seen)
++
++    strategy._tensor_descriptor = fresh_publication
++
++publication = concordance.publish_program_abi_graph_identities
++publication_calls = []
++publication_callers = {}
++metadata_work = {}
++if "--metadata-work" in sys.argv:
++    from src.compiler import process_graph_fusion as fusion
++    extract = fusion.extract_clean_process_subgraph
++
++    def observed_extract(graph, node_ids):
++        nodes = tuple(node_ids)
++        proper = bool(nodes) and len(set(nodes)) < len(graph.G)
++        memo = set()
++
++        def count(value):
++            identity = id(value)
++            if identity in memo:
++                return 1
++            if isinstance(value, (dict, list, tuple, set, frozenset)):
++                memo.add(identity)
++                if isinstance(value, dict):
++                    return 1 + sum(count(key) + count(item) for key, item in value.items())
++                return 1 + sum(count(item) for item in value)
++            return 1
++
++        for key, value in graph.G.graph.items():
++            if proper and key in fusion._COMPARTMENT_SHARED_METADATA:
++                continue
++            if proper and key in fusion._COMPARTMENT_NODE_KEYED_METADATA:
++                value = {node: value[node] for node in nodes if node in value}
++            row = metadata_work.setdefault(("region" if proper else "whole", key), [0, 0])
++            row[0] += 1
++            row[1] += count(value)
++        return extract(graph, nodes)
++
++    fusion.extract_clean_process_subgraph = observed_extract
++    strategy.extract_clean_process_subgraph = observed_extract
++
++
++def measured_publication(graph, **kwargs):
++    started = time.perf_counter()
++    result = publication(graph, **kwargs)
++    publication_calls.append((len(graph), time.perf_counter() - started))
++    if "--caller-work" in sys.argv:
++        caller = inspect.currentframe().f_back
++        path = []
++        for _ in range(4):
++            if caller is None:
++                break
++            path.append((caller.f_code.co_name, caller.f_lineno))
++            caller = caller.f_back
++        row = publication_callers.setdefault(tuple(path), [0, 0])
++        row[0] += 1
++        row[1] += len(graph)
++    return result
++
++
++concordance.publish_program_abi_graph_identities = measured_publication
++entry = compiler.lower_ast_source_to_ssa
++
++
++class LoweringComplete(Exception):
++    pass
++
++
++def lower_only(*args, **kwargs):
++    kwargs["progress"] = lambda _message: None
++    publication_calls.clear()
++    publication_callers.clear()
++    metadata_work.clear()
++    started = time.perf_counter()
++    if "--profile-phases" in sys.argv:
++        import cProfile
++        import pstats
++        profile = cProfile.Profile()
++        result = profile.runcall(entry, *args, **kwargs)
++        print("SMALL_LOWERING_PROFILE_CUMULATIVE", flush=True)
++        pstats.Stats(profile).strip_dirs().sort_stats("cumulative").print_stats(25)
++        print("SMALL_LOWERING_PROFILE_EXCLUSIVE", flush=True)
++        pstats.Stats(profile).strip_dirs().sort_stats("tottime").print_stats(25)
++        pstats.Stats(profile).strip_dirs().print_callers("io.open")
++        pstats.Stats(profile).strip_dirs().print_callers("lzma.py:49")
++    else:
++        result = entry(*args, **kwargs)
++    elapsed = time.perf_counter() - started
++    proof = None
++    if "--llvm-proof" in sys.argv:
++        from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
++        artifact = emit_ssa_function_to_llvm(result[0], result[2][0], entry_name="graph_scaling_proof")
++        if not artifact.complete:
++            raise RuntimeError(artifact.shortfalls)
++        proof = hashlib.sha256(artifact.llvm_ir.encode("utf-8")).hexdigest()
++    print({"mode": "original-passes" if original_mode else "worklists",
++           "program": kwargs.get("name", "dt-proposal"),
++           "lowering_seconds": elapsed,
++           "abi_publication_calls": len(publication_calls),
++           "abi_publication_seconds": sum(seconds for _, seconds in publication_calls),
++           "abi_receipt_node_work": sum(nodes for nodes, _ in publication_calls),
++           "functions": len(result[0].functions),
++           "llvm_sha256": proof,
++           "concordance": concordance.concordance_report(result[0]).splitlines()[0]}, flush=True)
++    if publication_callers:
++        print("PUBLICATION_CALLER_WORK", sorted(publication_callers.items(),
++              key=lambda item: -item[1][1])[:15], flush=True)
++    if metadata_work:
++        print("METADATA_COPY_WORK", sorted(metadata_work.items(),
++              key=lambda item: -item[1][1])[:25], flush=True)
++    raise LoweringComplete()
++
++
++compiler.lower_ast_source_to_ssa = lower_only
++if "--arithmetic-scaling" in sys.argv:
++    for size in (128, 256, 512):
++        source = "def root(x):\n" + "".join(
++            f"    y{n} = {'x' if n == 0 else 'y' + str(n - 1)} + {n + 1}.0\n"
++            for n in range(size)
++        ) + f"    return y{size - 1}\n"
++        try:
++            compiler.lower_ast_source_to_ssa(source, "root", name=f"arithmetic_{size}",
++                extraction_contract=ROOT / "extraction_contracts/program_extraction.yaml")
++        except LoweringComplete:
++            pass
++else:
++    for _ in range(1 if "--one" in sys.argv else 3):
++        try:
++            main(ROOT / "build/serial-graph-scaling", proposal=True, serial=True)
++        except LoweringComplete:
++            pass
++
++for size in (256, 512, 1024):
++    samples = []
++    for _ in range(3):
++        started = time.perf_counter()
++        _, visits, _ = run(publication, chain(size))
++        samples.append(time.perf_counter() - started)
++    print({"chain_nodes": size, "node_visits": visits,
++           "median_seconds": statistics.median(samples)}, flush=True)

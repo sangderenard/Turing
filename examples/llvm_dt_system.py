@@ -1454,12 +1454,19 @@ def dt_system_contract(entry, columns, batch, participants=1, *, channel_names=D
 
 def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimization="O2",
                    link="static", piece_mode="link", progress=None,
-                   trace=False, trace_full_values=False, channel_names=DT_CHANNEL_NAMES):
+                   trace=False, trace_full_values=False, channel_names=DT_CHANNEL_NAMES,
+                   source_compilation="units"):
     """Lower ``dt_system_over`` to ``backend`` and return the compiled artifact.
 
     The pieces are bound by name (``step_i``) and called by name in the
     generated ``advance_pieces``, so the lowering notices each call as an
     LLVM piece and the backend calls the piece's entry and links its module.
+
+    For linked C/LLVM programs, ``source_compilation="serial"`` retains the
+    ordinary whole-program source lowering; ``"units"`` uses the bounded
+    source-unit workers. Both use the same public compiler. The previously
+    enabled unit default is retained; selecting serial does not delete or
+    modify any unit products. Other backends/inline programs stay whole-program.
 
     ``piece_mode`` chooses what the laws are to this program:
 
@@ -1494,12 +1501,26 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
             f"[llvm_dt_system] {message}", file=sys.stderr, flush=True,
         )
 
+    if piece_mode not in {"link", "inline"}:
+        raise ValueError(f"piece_mode={piece_mode!r}: 'link' or 'inline'")
+    if source_compilation not in {"serial", "units"}:
+        raise ValueError(f"source_compilation={source_compilation!r}: 'serial' or 'units'")
     progress(f"loading {len(piece_files)} compiled law piece(s)")
     pieces = [LLVMPiece.load(path) for path in piece_files]
     channel_names = tuple(channel_names)
     bindings = bind_pieces(pieces, channel_names=channel_names)
     batch = pieces[0].batch
     entry = "dt_system_over"
+    build = Path(directory) if directory is not None else Path.cwd() / "build" / "llvm_dt_system"
+    from src.compiler.work_contract import active_contract
+    unit_options = {}
+    if source_compilation == "units" and piece_mode == "link" and backend in {C_BACKEND, LLVM_BACKEND}:
+        # Normal linked-program compilation uses the existing source-unit
+        # scheduler. Inline mode deliberately retains whole-program SSA bodies.
+        import tempfile
+        build.mkdir(parents=True, exist_ok=True)
+        unit_options = {"partitioned_directory": Path(tempfile.mkdtemp(prefix="source-units_", dir=build)),
+                        "partitioned_options": {"jobs": max(2, active_contract().graph_workers)}}
     source = inspect.getsource(sys.modules[__name__]) + "\n\n" + generated_source(pieces, channel_names=channel_names)
     module, _outputs, exports = lower_ast_source_to_ssa(
         source, entry,
@@ -1509,9 +1530,9 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
         extraction_contract=dt_system_contract(entry, column_names_of(pieces), batch, len(pieces),
                                               channel_names=channel_names),
         progress=progress,
+        retain_linked_piece_bodies=(piece_mode == "inline"),
+        **unit_options,
     )
-    if piece_mode not in {"link", "inline"}:
-        raise ValueError(f"piece_mode={piece_mode!r}: 'link' or 'inline'")
     if piece_mode == "inline":
         # The law's body is already here: `linked_repository_ssa` merged the SSA
         # that its authored AbstractTensor source lowered to.  The receipt on

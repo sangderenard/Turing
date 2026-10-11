@@ -1,0 +1,361 @@
+--- a/src/compiler/control_source.py
++++ b/src/compiler/control_source.py
+@@ -3462,6 +3462,8 @@
+     *,
+     known_nesting: "Mapping[int, Iterable[int]] | None" = None,
+     lexical_encloses: "Callable[[int, int], bool] | None" = None,
++    source_graph: Any = None,
++    region_source_nodes: Mapping[int, Iterable[int]] | None = None,
+ ) -> ControlProgram:
+     """Overlay planned control blocks on the flat scheduled region order.
+ 
+@@ -3484,6 +3486,12 @@
+     they are wrongly treated as independent siblings both claiming the
+     same regions, which is exactly the "maximal control blocks overlap
+     without containment" failure this parameter exists to prevent.
++
++    For a declared nested loop with no regions, ``source_graph`` supplies
++    the exact authored arm/statement identity. ``region_source_nodes`` is
++    the incumbent dispatch region's deployment-node view, used only to
++    place that loop among the arm's existing statements. Missing evidence
++    refuses instead of running guarded work at the schedule root.
+     """
+ 
+     order = tuple(int(index) for index in region_indices)
+@@ -3765,6 +3773,101 @@
+ 
+     nested_roots: dict[int, ControlBlock] = {}
+ 
++    def place_regionless_loop(root, child_root):
++        """Consume the declared nesting edge in its exact authored arm.
++
++        In root(value,memo)->visit(item), conditional 11 owns comprehension
++        13, but 13 has no numerical regions. The old overlay ignored that
++        edge and emitted 13 beside 11, making recursive child 0 a formal.
++        Source AST objects select the arm and statement slot; region nodes
++        only locate the existing scheduled statements. Neither coordinates
++        nor a scalar dtype is evidence of ownership.
++        """
++        import ast
++        from .glsl_deployment_strategy import _source_control_expression
++
++        graph = getattr(source_graph, "G", source_graph)
++        if graph is None:
++            raise ValueError("region-less nested loop lacks its source graph")
++
++        def expression(node_id):
++            if node_id is None:
++                return None
++            data = graph.nodes.get(int(node_id), {})
++            return data.get("authored_expr_obj") or data.get("expr_obj") or (
++                _source_control_expression(graph, int(node_id))
++            )
++
++        child_expression = expression(child_root.source_loop_node_id)
++
++        def source_ids(block):
++            if isinstance(block, StatementBlock):
++                marker = _region_marker(block)
++                if marker is not None:
++                    return tuple((region_source_nodes or {}).get(marker, ()))
++                callsite = _callsite_marker(block)
++                return () if callsite is None else (callsite,)
++            node_id = getattr(block, "source_node_id", None)
++            if node_id is None:
++                node_id = getattr(block, "source_loop_node_id", None)
++            if node_id is None:
++                node_id = getattr(block, "site_node_id", None)
++            return () if node_id is None else (node_id,)
++
++        def insert(block):
++            if isinstance(block, SequenceBlock):
++                found = False
++                children = []
++                for member in block.blocks:
++                    projected, owned = insert(member)
++                    if owned and found:
++                        raise ValueError("nested loop has multiple authored owners")
++                    found |= owned
++                    children.append(projected)
++                return replace(block, blocks=tuple(children)), found
++            parent_id = getattr(block, "source_node_id", None)
++            if parent_id is None:
++                parent_id = getattr(block, "source_loop_node_id", None)
++            parent_expression = expression(parent_id)
++            slots = []
++            for arm in ("body", "orelse"):
++                if not hasattr(block, arm):
++                    continue
++                statements = getattr(parent_expression, arm, ())
++                if isinstance(statements, ast.AST):
++                    statements = (statements,)
++                members = tuple(frozenset(map(id, ast.walk(statement)))
++                                for statement in statements)
++                matches = [i for i, nodes in enumerate(members)
++                           if id(child_expression) in nodes]
++                if matches:
++                    slots.append((arm, matches, members))
++            if not slots:
++                return block, False
++            if len(slots) != 1 or len(slots[0][1]) != 1:
++                raise ValueError("nested loop has ambiguous authored arm")
++            arm, (ordinal,), members = slots[0]
++            siblings = _flatten_control_sequence(getattr(block, arm))
++            offset = len(siblings)
++            for i, sibling in enumerate(siblings):
++                positions = {j for node in source_ids(sibling)
++                             for j, nodes in enumerate(members)
++                             if id(expression(node)) in nodes}
++                if not positions:
++                    raise ValueError("nested loop sibling lacks source identity")
++                if min(positions) < ordinal <= max(positions):
++                    raise ValueError("scheduled region crosses a nested loop slot")
++                if min(positions) >= ordinal:
++                    offset = i
++                    break
++            body = SequenceBlock((*siblings[:offset], child_root, *siblings[offset:]))
++            return replace(block, **{arm: body}), True
++
++        projected, found = insert(root)
++        if not found:
++            raise ValueError("declared nested loop has no exact authored arm")
++        return projected
++
+     def nested_root(index: int, visiting=frozenset()) -> ControlBlock:
+         if index in nested_roots:
+             return nested_roots[index]
+@@ -3783,6 +3886,12 @@
+         # sibling's test reads -- was nested into that arm.
+         for child in sorted(direct_children.get(index, ())):
+             control = controls[child]
++            if (not control.region_indices
++                    and isinstance(control.root, (LoopBlock, WhileBlock))):
++                root = place_regionless_loop(
++                    root, nested_root(child, visiting | {index}),
++                )
++                continue
+             if not _anchored_control(control):
+                 continue
+             child_root = nested_root(child, visiting | {index})
+@@ -3932,9 +4041,10 @@
+         if str(projection) == "induction"
+     }
+     blocks = [
+-        control.root
+-        for control in controls
++        nested_root(index)
++        for index, control in enumerate(controls)
+         if not control.region_indices
++        and index not in nested_children_overall
+         and (
+             isinstance(control.root, LoopBlock)
+             and (
+@@ -3957,7 +4067,7 @@
+             continue
+         anchored_top_level.setdefault(
+             control.anchor_region, []
+-        ).append(control.root)
++        ).append(nested_root(index))
+     for region_index in order:
+         for anchored in anchored_top_level.pop(region_index, ()):
+             blocks.append(anchored)
+--- a/src/compiler/glsl_deployment_strategy.py
++++ b/src/compiler/glsl_deployment_strategy.py
+@@ -8615,6 +8615,7 @@
+     conditional_controls: Sequence[ControlProgram],
+     nesting: Mapping[int, Iterable[int]],
+     *, region_dependencies: Iterable[tuple[int, int]] = (),
++    dispatch_subgraphs: Iterable[Any] = (),
+ ) -> ControlProgram:
+     """Turn a named cross-scope overlay refusal into loop-owned frontier data."""
+ 
+@@ -8686,6 +8687,11 @@
+             runtime_regions,
+             (*loop_controls, *conditional_controls),
+             known_nesting=nesting,
++            source_graph=graph,
++            region_source_nodes={
++                index: tuple(subgraph.G.graph.get("deployment_nodes", ()))
++                for index, subgraph in enumerate(dispatch_subgraphs)
++            },
+         )
+         return order_control_region_dependencies(program, region_dependencies)
+     except ValueError as error:
+@@ -24606,6 +24612,7 @@
+                 conditional_controls,
+                 nesting,
+                 region_dependencies=region_dependencies,
++                dispatch_subgraphs=target.dispatch_subgraphs,
+             )
+             shell_control = _place_validation_blocks(
+                 shell_control,
+@@ -26435,6 +26442,7 @@
+                 conditional_controls,
+                 nesting,
+                 region_dependencies=region_dependencies,
++                dispatch_subgraphs=self.dispatch_subgraphs,
+             )
+             shell_control = replace(
+                 shell_control,
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -16714,6 +16714,11 @@
+                     for parent, children in direct_children.items()
+                 },
+                 lexical_encloses=lexical_encloses,
++                source_graph=graph,
++                region_source_nodes={
++                    index: tuple(subgraph.G.graph.get("deployment_nodes", ()))
++                    for index, subgraph in enumerate(getattr(shell, "dispatch_subgraphs", ()))
++                },
+             )
+             from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
+             def marker_counts(block, counts):
+--- a/tests/test_linked_reference_kind_folding.py
++++ b/tests/test_linked_reference_kind_folding.py
+@@ -132,8 +132,10 @@
+             progress=lambda _: None, progress_bars=False)
+     except FortranEmissionError as error:
+         # This test proves graph preservation, NOT recursive native execution.
+-        # The separate current control-placement gap must remain a loud refusal.
+-        assert 'recursive invocation storage is not materialized' in str(error)
++        # Exact control ownership now materializes the recursive child. The
++        # unresolved runtime kind predicate must remain a loud refusal.
++        assert 'recursive invocation storage' not in str(error)
++        assert "(10, 'call', 'call-result-unavailable')" in str(error)
+     receipts, parents = observations[-1]
+     assert len(receipts) == 1
+     for node in receipts:
+--- /dev/null
++++ b/tests/test_regionless_loop_ownership.py
+@@ -0,0 +1,130 @@
++"""A call-only loop consumes its exact declared source-control edge."""
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++
++import networkx as nx
++import numpy as np
++import pytest
++
++from src.compiler.control_source import (
++    ConditionalBlock, ControlProgram, LoopBlock, SequenceBlock, StatementBlock,
++    overlay_scheduled_control,
++)
++
++
++@pytest.mark.parametrize('arm', ['body', 'orelse'])
++@pytest.mark.parametrize('has_region', [False, True])
++def test_nested_regionless_loop_consumes_authored_arm(arm, has_region):
++    source = ast.parse('if flag:\n    before=1\n    result=tuple(x for x in value)\n    after=2\nelse:\n    pass\n').body[0]
++    if arm == 'orelse':
++        source.body, source.orelse = source.orelse, source.body
++    statements = getattr(source, arm)
++    loop_expression = statements[1].value.args[0].generators[0]
++    graph = nx.DiGraph()
++    graph.add_node(11, expr_obj=source)
++    graph.add_node(13, expr_obj=loop_expression)
++    graph.add_node(20, expr_obj=statements[0].value)
++    graph.add_node(21, expr_obj=statements[2].value)
++    loop = LoopBlock('iteration_13', '0', 'n', '1', SequenceBlock(()), source_loop_node_id=13)
++    markers = SequenceBlock((StatementBlock(('__scheduled_region_0__',)),
++                             StatementBlock(('__scheduled_region_1__',)))) if has_region else SequenceBlock(())
++    parent = ConditionalBlock(10, markers if arm == 'body' else SequenceBlock(()),
++                              markers if arm == 'orelse' else None, source_node_id=11)
++    order = (0, 1) if has_region else ()
++    program = overlay_scheduled_control(order,
++        (ControlProgram(loop), ControlProgram(SequenceBlock((parent,)), order)),
++        known_nesting={1: (0,)}, source_graph=SimpleNamespace(G=graph),
++        region_source_nodes={0: (20,), 1: (21,)})
++    assert len(program.root.blocks) == 1
++    projected = program.root.blocks[0]
++    assert isinstance(projected, ConditionalBlock)
++    members = getattr(projected, arm).blocks
++    expected = (markers.blocks[0], loop, markers.blocks[1]) if has_region else (loop,)
++    assert members == expected
++
++
++def test_nested_regionless_loop_refuses_missing_source_instead_of_hoisting():
++    loop = LoopBlock('iteration', '0', 'n', '1', SequenceBlock(()), source_loop_node_id=13)
++    parent = ConditionalBlock(10, SequenceBlock(()), source_node_id=11)
++    with pytest.raises(ValueError, match='lacks its source graph'):
++        overlay_scheduled_control((), (ControlProgram(loop), ControlProgram(parent)), known_nesting={1: (0,)})
++
++
++@pytest.mark.parametrize('fault', ['cloned_identity', 'cross_scope_region'])
++def test_nested_regionless_loop_refuses_unproven_placement(fault):
++    source = ast.parse('if flag:\n    before=1\n    result=tuple(x for x in value)\n    after=2\n').body[0]
++    loop_expression = source.body[1].value.args[0].generators[0]
++    if fault == 'cloned_identity':
++        import copy
++        loop_expression = copy.deepcopy(loop_expression)
++    graph = nx.DiGraph()
++    graph.add_node(11, expr_obj=source)
++    graph.add_node(13, expr_obj=loop_expression)
++    graph.add_node(20, expr_obj=source.body[0].value)
++    graph.add_node(21, expr_obj=source.body[2].value)
++    loop = LoopBlock('iteration', '0', 'n', '1', SequenceBlock(()), source_loop_node_id=13)
++    parent = ConditionalBlock(10, StatementBlock(('__scheduled_region_0__',)), source_node_id=11)
++    message = 'no exact authored arm' if fault == 'cloned_identity' else 'crosses a nested loop slot'
++    with pytest.raises(ValueError, match=message):
++        overlay_scheduled_control((0,), (ControlProgram(loop), ControlProgram(parent, (0,))),
++            known_nesting={1: (0,)}, source_graph=SimpleNamespace(G=graph),
++            region_source_nodes={0: (20, 21)})
++
++
++@pytest.mark.parametrize('arm', ['body', 'orelse'])
++def test_conditional_generator_runs_native_loop_only_in_selected_arm(tmp_path, arm):
++    from tests.test_source_object_context import context
++    from src.compiler.extraction_contract import ExtractionContract
++    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
++    from src.compiler.identity_concordance import concordance_report
++    from src.compiler.shell_external_references import ExternalReferenceValueCodec
++    from src.compiler.ssa_object_context import lower_object_context
++    from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution
++
++    repository = Path(__file__).resolve().parents[1]
++    policy = ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_program_abi({
++        'records': {}, 'bindings': [], 'values': [
++            {'function': 'root', 'parameter': 'value', 'storage': 'reference', 'python_type': 'builtins.object'},
++            {'function': 'root', 'parameter': 'flag', 'storage': 'scalar', 'dtype': 'float64', 'python_type': 'builtins.float'},
++        ],
++    }).with_execution_file(repository / 'extraction_contracts/vehicle_full_native_execution.yaml')
++    expression = 'tuple(identity(item) for item in value)'
++    true_value, false_value = (expression, 'value') if arm == 'body' else ('value', expression)
++    source = ('def identity(item):\n    return item\n'
++              'def root(value,flag):\n    if flag>0.0:\n'
++              f'        result={true_value}\n    else:\n        result={false_value}\n    return result\n')
++    scope = context()
++    module, _, exports = lower_ast_source_to_ssa(source, 'root', extraction_contract=policy,
++        native_object_context=scope, progress=lambda _: None, progress_bars=False)
++    report = concordance_report(module)
++    assert report.splitlines()[0].endswith('0 finding(s)'), report
++    function = module.functions[exports[0]]
++    native = compile_artifact(emit_ssa_function_to_llvm(module, function.name), directory=tmp_path / 'source')
++    release_module = lower_object_context(scope, prefix='release_owned_loop')
++    release = compile_artifact(emit_ssa_function_to_llvm(release_module, 'release_owned_loop_release'), directory=tmp_path / 'release')
++    parameters = dict(function.metadata['parameter_names'])
++    output = next(i.args[0] for b in function.blocks.values() for i in b.instrs if i.op == 'Ret' and i.args)
++    leaf = object()
++    for size in (0, 1, 17, 257):
++        for flag in (0, 1):
++            original = (leaf,) * size
++            boundary = ExternalReferenceValueCodec().bind_native_objects(scope, (original,))
++            count = int(boundary.buffers[scope.objects.length_address_id][0])
++            try:
++                invocation = boundary.bind_execution(native, function, {
++                    parameters['value']: np.array([boundary.roots[0]], dtype=np.int64),
++                    parameters['flag']: np.array([flag], dtype=np.float64),
++                })
++                invocation.run()
++                assert invocation.native_invocations == 1
++                result, = boundary.export((int(invocation.buffers[output.id].item()),))
++                assert type(result) is tuple and len(result) == size
++                assert all(item is leaf for item in result)
++                selected = bool(flag) == (arm == 'body')
++                assert int(boundary.buffers[scope.objects.length_address_id][0]) == count + int(selected)
++                if not selected:
++                    assert result is original
++            finally:
++                prepare_artifact_execution(release, boundary.buffers).run()
++                boundary.close()

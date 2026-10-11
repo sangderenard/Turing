@@ -87,16 +87,16 @@ def main() -> int:
         if changed:
             stale.append((name, path, changed))
     if missing or stale:
-        for name, path in missing:
-            print(f"MISSING  {name}: {path}", flush=True)
-        for name, path, changed in stale:
-            print(f"STALE    {name}: {path}\n         changed: {list(changed)}",
-                  flush=True)
-        print("STOP: not rebuilding.", flush=True)
-        return 2
-    stamp("all pieces cached and current")
-
+        # Stale pieces are expected after a compiler change: the normal path
+        # (equation_piece, called by craft_machine_dt_pieces as the game does)
+        # rebuilds them, one at a time, in order.
+        print(f"{len(missing)} missing, {len(stale)} stale: rebuilding through "
+              "craft_machine_dt_pieces (sequential; progress below)", flush=True)
+    stamp("craft_machine_dt_pieces: start (builds stale/missing pieces)")
     pieces, labels = craft_machine_dt_pieces(craft, 1, green_coast=True)
+    stamp("pieces ready")
+    still = [n for n, p in wanted if piece_staleness(LLVMPiece.load(p))]
+    print("stale after build:", still, flush=True)
     paths = [path for _name, path in wanted]
     for label, path in zip(labels, paths):
         print(f"  {label}: {path}", flush=True)

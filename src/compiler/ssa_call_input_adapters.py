@@ -5,8 +5,12 @@ from itertools import chain
 from math import prod
 import time
 
-from .monotonic_ids import GLOBAL_MONOTONIC_IDS
-from .identity_concordance import current_identity_book
+from .identity_concordance import current_identity_book, Derived, Mode
+from .concordance_declarations import (
+    CONTROL_CAST, PHYSICAL_CALL_INPUT_ADAPTATION, CALL_INPUT_CONVERSION,
+    KERNEL_INPUT_CONVERSION,
+)
+from .ssa_record_return_state import mint_ssa_value, ssa_value_identity_cell, identity_cells
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -37,6 +41,18 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
     page = book.page('exact_region_feed_dtype')
     changed = 0
     for caller in functions.values():
+        # A call occurrence is not the storage authority. In the compiler's
+        # Kahn-frontier micro-test, a loop-result Phi produced int64, while
+        # the earlier region cut expected float64. Retyping the same-ID call
+        # occurrence made the native store read integer bytes as a double.
+        # Resolve the exact producer/formal before creating any typed view;
+        # a representation mismatch must reach the existing Cast adapter.
+        residents = {int(value.id): value for value in caller.args}
+        residents.update(
+            (int(item.res.id), item.res)
+            for owner_block in caller.blocks.values()
+            for item in owner_block.instrs if item.res is not None
+        )
         for block in caller.blocks.values():
             for instruction in block.instrs:
                 if instruction.op not in {'Call', 'call'}:
@@ -103,6 +119,15 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                     actual_accounting = dict(actual.accounting or {})
                     formal_accounting = dict(formal.accounting or {})
                     actual_physical = actual_accounting.get('physical_dtype')
+                    resident = residents.get(int(actual.id))
+                    if resident is not None:
+                        resident_type = (resident.accounting or {}).get('physical_dtype') or resident.dtype
+                        if resident_type in _NUMERIC_DTYPES:
+                            actual_physical = resident_type
+                            if resident_type != exact_dtype:
+                                instruction.args[position] = resident
+                                actual = resident
+                                actual_accounting = dict(resident.accounting or {})
                     formal_physical = formal_accounting.get('physical_dtype')
 
                     # A different explicit representation needs an
@@ -274,8 +299,18 @@ def _intern_unshadowed_formal_uses(functions):
     return count
 
 
-def _infer_pointer_storage(functions):
+def _infer_pointer_storage(functions, native_storage=None):
     """Recover typed LLVM load/store contracts without changing pointer types."""
+    if native_storage is not None:
+        for function in functions.values():
+            for formal in function.args:
+                if formal.dtype != 'ptr' or (formal.accounting or {}).get('physical_dtype'):
+                    continue
+                dtype = native_storage.get((function.name, int(formal.id)))
+                if dtype is not None:
+                    formal.accounting = {**dict(formal.accounting or {}),
+                        'physical_dtype': dtype, 'physical_dtype_provenance': 'typed_memory_operations'}
+        return
     canonical = {'double': 'float64', 'float': 'float32', 'i64': 'int64', 'i32': 'int32', 'i1': 'bool'}
     for function in functions.values():
         instructions = [instruction for block in function.blocks.values() for instruction in block.instrs]
@@ -343,9 +378,83 @@ def physical_call_input_conflicts(functions):
     return tuple(conflicts)
 
 
+def _read_only_module_inputs(functions):
+    """Encode existing SSA identities/operand occurrences, never infer effects.
+
+    Opcode/base/Store roles and accepted physical call contracts are the SAME
+    ones read by _read_only_feed. The native program owns all transitive alias
+    closure, recursive-call closure and final effect-table writes.
+    """
+    identities = {}
+    for function in functions.values():
+        for value in chain(function.args, (value for block in function.blocks.values()
+                for instruction in block.instrs for value in (*instruction.args, instruction.res)
+                if value is not None)):
+            identities.setdefault((function.name, int(value.id)), len(identities))
+    blocked = [0] * len(identities)
+    kinds, results, offsets, operands, formals, writes = [], [], [0], [], [], []
+    active, memory_addresses, memory_dtypes = [], [], []
+    canonical = {'double': 'float64', 'float': 'float32', 'i64': 'int64', 'i32': 'int32', 'i1': 'bool'}
+    dtype_ids = {'ptr': 1}
+    for function in functions.values():
+        interface = function.metadata.get('native_interface') or function.metadata.get('linked_piece_interface')
+        if interface:
+            for (owner, value_id), position in identities.items():
+                if owner == function.name:
+                    blocked[position] = int(not interface['read_only_arguments'].get(value_id, False))
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                # View belongs to read-only address closure, NOT the narrower
+                # existing pointer-storage closure. Keep these laws distinct.
+                kinds.append(2 if instruction.op == 'View' else int(
+                    instruction.op in {'GEP', 'GetElementPtr', 'getelementptr', 'PtrCast'}))
+                active.append(int(not interface))
+                results.append(-1 if instruction.res is None else identities[(function.name, int(instruction.res.id))])
+                memory_address, memory_dtype = -1, None
+                if instruction.op == 'Load' and instruction.args and instruction.res is not None:
+                    memory_address = identities[(function.name, int(instruction.args[0].id))]
+                    memory_dtype = instruction.res.dtype
+                elif instruction.op == 'Store' and len(instruction.args) >= 2:
+                    memory_address = identities[(function.name, int(instruction.args[1].id))]
+                    memory_dtype = instruction.args[0].dtype
+                memory_addresses.append(memory_address)
+                if memory_dtype is None:
+                    memory_dtypes.append(0)
+                else:
+                    dtype = canonical.get(memory_dtype, memory_dtype)
+                    memory_dtypes.append(dtype_ids.setdefault(dtype, len(dtype_ids) + 1))
+                callee = functions.get(str(instruction.attributes.get('callee', '')))
+                matched = callee is not None and len(instruction.args) == len(callee.args)
+                for index, argument in enumerate(instruction.args):
+                    operands.append(identities[(function.name, int(argument.id))])
+                    formal, write = -1, False
+                    if instruction.op in {'Store', 'store'}:
+                        write = index != 0
+                    elif instruction.op in {'Call', 'call'}:
+                        write = _call_writes_argument(instruction, index)
+                        if not write and matched:
+                            formal = identities[(callee.name, int(callee.args[index].id))]
+                        elif not write:
+                            output = instruction.attributes.get('ssa_output_argument')
+                            write = output is None or int(output) == index
+                    formals.append(formal if not interface else -1)
+                    writes.append(int(write and not interface))
+                offsets.append(len(operands))
+    return tuple(identities), dict(n=len(identities), instruction_count=len(kinds), use_count=len(operands),
+        blocked=blocked, kinds=kinds, results=results, argument_offsets=offsets, operands=operands,
+        call_formals=formals, writes=writes, active=active,
+        memory_addresses=memory_addresses, memory_dtypes=memory_dtypes,
+        _dtype_names={code: dtype for dtype, code in dtype_ids.items()})
+
+
 def _read_only_feed(
     function, value_id, functions=None, active=frozenset(), diagnostics=None,
 ):
+    interface = function.metadata.get('native_interface') or function.metadata.get('linked_piece_interface')
+    if interface:
+        # Empty declaration blocks do not prove purity. Use the accepted
+        # callee's exact per-formal effect summary, not a body walk.
+        return interface['read_only_arguments'].get(int(value_id), False)
     if diagnostics is not None:
         diagnostics['queries'] += 1
         diagnostics['max_depth'] = max(
@@ -379,8 +488,13 @@ def _read_only_feed(
         changed = False
         for instruction in instructions:
             if (instruction.op in {'GEP', 'GetElementPtr', 'getelementptr', 'PtrCast', 'View'} and instruction.res is not None
-                    and any(int(value.id) in aliases for value in instruction.args)
+                    and instruction.args and int(instruction.args[0].id) in aliases
                     and int(instruction.res.id) not in aliases):
+                # ``heap[position] = target`` writes heap, not position.
+                # Treating the GEP's index as an address alias marked this
+                # scalar feed writable, blocked its numeric Cast, and made
+                # the float-view region read int64 position 1 as ~5e-324.
+                # The address/view aliases only its base (operand zero).
                 aliases.add(int(instruction.res.id))
                 changed = True
     for instruction in instructions:
@@ -390,7 +504,15 @@ def _read_only_feed(
         if not uses:
             continue
         if instruction.op in {'Store', 'store'}:
-            return False
+            # Store reads operand zero and writes through operand one.
+            # ``status[0] = size`` in the compiler's graph-frontier kernel
+            # needs an integer->float region-feed Cast for ``size``. Marking
+            # its VALUE operand writable refused that conversion and left
+            # the callee interpreting integer bytes as double. Only a path
+            # into the destination is a write to this formal's storage.
+            if any(position != 0 for position in uses):
+                return False
+            continue
         if instruction.op in {'Call', 'call'}:
             if any(
                 _call_writes_argument(instruction, index)
@@ -442,7 +564,15 @@ def _adapt_physical_call_inputs_round(
         f'settled; changes={count}; changed_rows={region_changes[:8]!r}; '
         f'elapsed={time.monotonic() - started:.1f}s'
     )
-    _infer_pointer_storage(functions)
+    from .native_compiler_accelerators import READ_ONLY_MODULE, compiler_accelerators, load_storage_effects_accelerator
+    effect_provider = compiler_accelerators.resolve(READ_ONLY_MODULE)
+    if effect_provider.tier != 'native':
+        installed = load_storage_effects_accelerator()
+        if installed is not None:
+            effect_provider = installed
+    native_effects, native_storage = (effect_provider.run(functions, include_storage_types=True)
+        if effect_provider.tier == 'native' else (None, None))
+    _infer_pointer_storage(functions, native_storage)
     report(
         f'physical-call adaptation round {round_index}: pointer storage '
         f'inferred; elapsed={time.monotonic() - started:.1f}s'
@@ -458,6 +588,15 @@ def _adapt_physical_call_inputs_round(
         'max_depth': 0,
         'call_operands': 0,
     }
+    if native_effects is not None:
+        report(f'physical-call adaptation round {round_index}: native whole-module effects; '
+               f'values={len(native_effects)}; provider={effect_provider.name}')
+
+    def read_only(function, value_id):
+        if native_effects is not None:
+            return native_effects[(function.name, int(value_id))]
+        return _read_only_feed(function, value_id, functions, diagnostics=diagnostics)
+
     for caller in functions.values():
         caller_formals = {int(value.id): value for value in caller.args}
         for block_name, block in caller.blocks.items():
@@ -489,7 +628,8 @@ def _adapt_physical_call_inputs_round(
                         # settlement; passing its pointer directly is byte
                         # reinterpretation (integer 1 becomes 5e-324).
                         converted = SSAValue(
-                            GLOBAL_MONOTONIC_IDS.mint(),
+                            mint_ssa_value(caller, CONTROL_CAST, (source,),
+                                dtype='float64', stage=PHYSICAL_CALL_INPUT_ADAPTATION),
                             dtype='float64', shape=(), device=source.device,
                             accounting={
                                 'physical_dtype': 'float64',
@@ -534,13 +674,13 @@ def _adapt_physical_call_inputs_round(
                             str(caller.name), str(block_name),
                             conversion['consumer_id'], 0,
                         )
-                        history = page.history(row)
-                        column = history[-1][0] + 1 if history else 0
-                        page.set(row, column, (
+                        current_identity_book().post(KERNEL_INPUT_CONVERSION, row, (
                             int(source.id), int(converted.id),
                             str(source_dtype), 'float64',
                             'broadcast_double',
-                        ))
+                        ), stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                            provenance=Derived(identity_cells(caller, source, converted)),
+                            mode=Mode.REVISE)
                         count += 1
                 if (instruction.op in {'Call', 'call'} and callee is not None
                         and len(instruction.args) == len(callee.args)):
@@ -581,10 +721,7 @@ def _adapt_physical_call_inputs_round(
                             and formal.dtype in numeric
                             and source_dtype != formal.dtype
                             and not _call_writes_argument(instruction, index)
-                            and _read_only_feed(
-                                callee, formal.id, functions,
-                                diagnostics=diagnostics,
-                            )
+                            and read_only(callee, formal.id)
                         )
                         # A float32 SPAN is stored as float32 (its own storage
                         # class), so an actual of that kind has physical storage
@@ -602,10 +739,7 @@ def _adapt_physical_call_inputs_round(
                             or (not actual.shape and (accounting.get('program_abi_storage') == 'span'
                                 or int(accounting.get('program_abi_rank') or 0) > 0))
                             or _call_writes_argument(instruction, index)
-                            or not _read_only_feed(
-                                callee, formal.id, functions,
-                                diagnostics=diagnostics,
-                            )
+                            or not read_only(callee, formal.id)
                         )
                         if not logical_scalar_conversion and not physical_conversion:
                             continue
@@ -617,7 +751,13 @@ def _adapt_physical_call_inputs_round(
                         if source_dtype not in numeric or target_dtype not in numeric:
                             continue
                         # Shape is retained; a span conversion is elementwise.
-                        converted = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=target_dtype, shape=actual.shape, device=actual.device,
+                        # These six energy-helper conversions used to mint
+                        # outside the book. The source value and the exact
+                        # callee formal are the causes of this ABI conversion.
+                        converted = SSAValue(mint_ssa_value(caller, CONTROL_CAST,
+                            (actual, ssa_value_identity_cell(callee, formal.id)),
+                            dtype=target_dtype, shape=actual.shape,
+                            stage=PHYSICAL_CALL_INPUT_ADAPTATION), dtype=target_dtype, shape=actual.shape, device=actual.device,
                             accounting={'physical_dtype': target_dtype,
                                 'call_input_conversion': (caller.name, int(actual.id), callee.name, int(formal.id)),
                                 'call_input_conversion_kind': (
@@ -664,12 +804,13 @@ def _adapt_physical_call_inputs_round(
                             str(caller.name), int(actual.id),
                             str(callee.name), int(formal.id),
                         )
-                        history = page.history(row)
-                        column = history[-1][0] + 1 if history else 0
-                        page.set(row, column, (
+                        current_identity_book().post(CALL_INPUT_CONVERSION, row, (
                             int(converted.id), str(source_dtype),
                             str(target_dtype), conversion['kind'],
-                        ))
+                        ), stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                            provenance=Derived(identity_cells(caller, actual, converted,
+                                ssa_value_identity_cell(callee, formal.id))),
+                            mode=Mode.REVISE)
                         count += 1
                 publication = None
                 output_position = instruction.attributes.get('ssa_output_argument')
@@ -686,7 +827,10 @@ def _adapt_physical_call_inputs_round(
                             and int(instruction.res.id) == int(original.id)
                             and not (not original.shape and (original.accounting or {}).get('program_abi_storage') == 'span')
                             and int(original.id) not in {int(value.id) for value in caller.args}):
-                        temporary = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype=backend_dtype, shape=original.shape, device=original.device,
+                        temporary = SSAValue(mint_ssa_value(caller, CONTROL_CAST,
+                            (original, ssa_value_identity_cell(callee, formal.id)),
+                            dtype=backend_dtype, shape=original.shape,
+                            stage=PHYSICAL_CALL_INPUT_ADAPTATION), dtype=backend_dtype, shape=original.shape, device=original.device,
                             accounting={'physical_dtype': backend_dtype,
                                 'call_output_conversion': (callee.name, int(formal.id), caller.name, int(original.id))})
                         instruction.args[position] = temporary

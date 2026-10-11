@@ -191,10 +191,28 @@ def publish_program_abi_graph_identities(
         ),
         scope=(str(graph_obj.graph.get("function_name") or ""),),
     )
+    # Reverse insertion order used to propagate one identity per WHOLE-GRAPH
+    # scan: N linked record fields cost N * N node evaluations.  These are
+    # the same transfer rules in the same insertion order and round order;
+    # only values whose inputs changed need another evaluation.  Parent
+    # records, not a possibly unreconstructed NetworkX adjacency, are the
+    # dependency authority.  Loop target writes invalidate that target's
+    # consumers too.  All rules read only the three propagated identity
+    # attributes and immutable source/schema facts during this publication.
+    node_order = tuple(graph_obj)
+    order_index = {node: index for index, node in enumerate(node_order)}
+    consumers = {node: set() for node in node_order}
+    for node, node_data in graph_obj.nodes(data=True):
+        for parent, _role in node_data.get("parents") or ():
+            if parent in consumers:
+                consumers[parent].add(node)
+    pending = set(node_order)
     changed = True
     while changed:
         changed = False
-        for node_id, data in graph_obj.nodes(data=True):
+        changed_nodes = set()
+        for node_id in sorted(pending, key=order_index.__getitem__):
+            data = graph_obj.nodes[node_id]
             attributes = data.setdefault("attributes", {})
             operation = str(
                 data.get("op") or data.get("type") or ""
@@ -236,6 +254,7 @@ def publish_program_abi_graph_identities(
                             attributes[
                                 "program_abi_sequence_row_identity"
                             ] = row_identity
+                            changed_nodes.add(node_id)
                             changed = True
                 if (
                     isinstance(expression.func, ast.Name)
@@ -259,6 +278,7 @@ def publish_program_abi_graph_identities(
                             attributes[
                                 "program_abi_sequence_row_identity"
                             ] = row_identity
+                            changed_nodes.add(node_id)
                             changed = True
             if operation == "getattr":
                 owner = next((
@@ -334,6 +354,7 @@ def publish_program_abi_graph_identities(
                         )
                         if attributes.get(key) != identity:
                             attributes[key] = identity
+                            changed_nodes.add(node_id)
                             changed = True
                 # ``mapping.values()`` is an identity-preserving view over
                 # the declared value side of that exact keyed field.  Keep
@@ -356,6 +377,7 @@ def publish_program_abi_graph_identities(
                         attributes[
                             "program_abi_sequence_row_identity"
                         ] = row_identity
+                        changed_nodes.add(node_id)
                         changed = True
             elif operation in {"indexed", "load"}:
                 base = next((
@@ -377,6 +399,7 @@ def publish_program_abi_graph_identities(
                     "program_abi_record_identity"
                 ) != row_identity:
                     attributes["program_abi_record_identity"] = row_identity
+                    changed_nodes.add(node_id)
                     changed = True
             elif operation in {"for", "comprehension"}:
                 iterable = next((
@@ -406,6 +429,7 @@ def publish_program_abi_graph_identities(
                             target_attributes[
                                 "program_abi_record_identity"
                             ] = row_identity
+                            changed_nodes.add(target_node)
                             changed = True
             elif isinstance(data.get("expr_obj"), (
                 ast.GeneratorExp, ast.ListComp, ast.SetComp,
@@ -430,6 +454,7 @@ def publish_program_abi_graph_identities(
                     attributes[
                         "program_abi_sequence_row_identity"
                     ] = row_identity
+                    changed_nodes.add(node_id)
                     changed = True
             elif (
                 operation == "loopresult"
@@ -457,6 +482,7 @@ def publish_program_abi_graph_identities(
                         attributes[
                             "program_abi_sequence_row_identity"
                         ] = row_identity
+                        changed_nodes.add(node_id)
                         changed = True
             elif operation in {"phi", "boolop"}:
                 for key in (
@@ -477,7 +503,13 @@ def publish_program_abi_graph_identities(
                         identity = next(iter(incoming))
                         if attributes.get(key) != identity:
                             attributes[key] = identity
+                            changed_nodes.add(node_id)
                             changed = True
+        pending = changed_nodes | {
+            consumer
+            for node in changed_nodes
+            for consumer in consumers[node]
+        }
         guard.round(changed)
 
     graph_obj.graph[
@@ -1016,6 +1048,8 @@ class CorrelationTable:
                     roles.append(
                         (int(descriptor.live_flags_value_id), "live_flags")
                     )
+                if getattr(descriptor, "heap_owner_value_id", None) is not None:
+                    roles.append((int(descriptor.heap_owner_value_id), "heap_owner"))
                 for value_id, role in roles:
                     self.claim(
                         name, value_id, "sequence-member",
@@ -1040,6 +1074,16 @@ class CorrelationTable:
     # --------------------------------------------------------------- findings
     def findings(self, module: Any) -> list[Finding]:
         found: list[Finding] = []
+        for name, table in (getattr(module, "record_tables", {}) or {}).items():
+            sequences = (getattr(module, "sequence_tables", {}) or {}).get(name)
+            for record in table.records.values():
+                for record_field in record.fields:
+                    if record_field.sequence_id is not None and (
+                            sequences is None or sequences.by_id(record_field.sequence_id) is None):
+                        found.append(Finding("record-sequence-unknown", str(name), int(record.record_id),
+                            f"field {record_field.storage_identity!r} names absent sequence {record_field.sequence_id}"))
+        found.extend(self._native_interface_findings(module))
+        found.extend(self._region_instruction_residency_findings(module))
         for name, function in module.functions.items():
             found.extend(self._function_findings(module, str(name), function))
             found.extend(
@@ -1057,6 +1101,9 @@ class CorrelationTable:
         found.extend(self._return_site_edge_findings(module))
         found.extend(self._sequence_descriptor_findings(module))
         found.extend(self._binding_kind_findings(module))
+        found.extend(self._name_binding_capture_findings(module))
+        found.extend(self._conditional_binding_preservation_findings(module))
+        found.extend(self._graph_work_publication_findings(module))
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._source_numeric_component_findings(module))
@@ -1080,6 +1127,202 @@ class CorrelationTable:
         # per-page kinds first; ``concordance_report`` counts these two kinds
         # on their own line.
         found.extend(self._unsourced_findings(module))
+        return found
+
+    @staticmethod
+    def _graph_work_publication_findings(module: Any) -> list[Finding]:
+        """Accepted worker facts must name the same region, policy and copy."""
+        from .concordance_declarations import (
+            GraphWorkPublication, GRAPH_WORK_PUBLICATION, DEPLOYMENT_REGION,
+            COMPILE_POLICY, SCOPE_REGISTRY,
+        )
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or "graph_work_publication" not in book.pages:
+            return []
+        found = []
+        with book.borrowed("graph_work_publication") as work, book.borrowed("deployment_region") as regions, \
+                book.borrowed("compile_policy") as policies, book.borrowed("scope_registry") as scopes:
+            for row in work.rows():
+                fact = work.latest(row)
+                region = regions.latest(row)
+                detail = None
+                if not isinstance(fact, GraphWorkPublication):
+                    detail = f"invalid graph work fact {fact!r}"
+                elif (fact.schedule_preference not in {"asap", "alap"}
+                      or not isinstance(fact.snapshot_digest, str)
+                      or len(fact.snapshot_digest) != 64
+                      or any(char not in "0123456789abcdef" for char in fact.snapshot_digest)
+                      or type(fact.nodes) is not int or fact.nodes < 1
+                      or type(fact.edges) is not int or fact.edges < 0
+                      or type(fact.admission_limit) is not int or fact.admission_limit < 1
+                      or not fact.provider):
+                    detail = f"invalid sealed snapshot/policy {fact!r}"
+                elif region is None or region.schedule_preference != fact.schedule_preference:
+                    detail = f"worker preference {fact.schedule_preference!r} disagrees with region {region!r}"
+                elif policies.latest(("graph_admission_limit",)) != str(fact.admission_limit):
+                    detail = "worker admission disagrees with the compile policy"
+                elif fact.read_scope is not None and scopes.latest(fact.read_scope) is not True:
+                    detail = f"worker names an unregistered read scope {fact.read_scope!r}"
+                else:
+                    ref = book.latest_ref(GRAPH_WORK_PUBLICATION, row)
+                    sources = {source.key for source, _stage in book.edges_into(ref)}
+                    required = [book.latest_ref(DEPLOYMENT_REGION, row),
+                                book.latest_ref(COMPILE_POLICY, ("graph_admission_limit",))]
+                    if fact.read_scope is not None:
+                        required.append(book.latest_ref(SCOPE_REGISTRY, fact.read_scope))
+                    if any(cell is None or cell.key not in sources for cell in required):
+                        detail = "worker publication lacks its exact region/policy/copy provenance"
+                if detail is not None:
+                    found.append(Finding("graph-work-publication-disagreement", str(row[0]), None, detail))
+        return found
+
+    @staticmethod
+    def _region_instruction_residency_findings(module: Any) -> list[Finding]:
+        found = []
+        book = identity_book(module)
+        for name, function in module.functions.items():
+            record = function.metadata.get("region_instruction_residency")
+            if record is None:
+                continue
+            counters = ("limit", "resident_peak", "resident_instructions_peak", "snapshots", "spills", "reloads")
+            if (record.get("schema") != "turing.region-instruction-residency.v1"
+                    or any(type(record.get(key)) is not int or record[key] < 0 for key in counters)
+                    or record["limit"] < 1 or record["resident_peak"] > record["limit"]
+                    or record["resident_peak"] > record["snapshots"]
+                    or book.page("compile_policy").latest(("ssa_resident_regions",)) != str(record["limit"])):
+                found.append(Finding("region-instruction-residency-disagreement", str(name), None,
+                                     "instruction cache receipt disagrees with its admission policy"))
+        return found
+
+    @staticmethod
+    def _native_interface_findings(module: Any) -> list[Finding]:
+        """A bodyless declaration is an accepted ABI view, never an empty body."""
+        found = []
+        for name, function in module.functions.items():
+            linked = function.metadata.get("linked_piece_interface")
+            if linked:
+                import hashlib
+                outputs = tuple(function.metadata.get("declared_native_outputs", ()))
+                piece = function.metadata.get("llvm_piece") or {}
+                values = (*function.args, *outputs)
+                arguments = tuple(int(value.id) for value in function.args)
+                if (linked.get("schema") != "turing.linked-piece-interface.v1"
+                        or function.blocks
+                        or tuple(linked.get("argument_ids", ())) != arguments
+                        or tuple(linked.get("output_ids", ())) != tuple(int(v.id) for v in outputs)
+                        or tuple(linked.get("boundary_values", ())) != tuple(
+                            (int(v.id), str(v.dtype), tuple(v.shape or ())) for v in values)
+                        or set(linked.get("read_only_arguments", {})) != set(arguments)
+                        or not all(isinstance(v, bool) for v in linked.get("read_only_arguments", {}).values())
+                        or any(tuple(linked.get(key, ())) != tuple(piece.get(key, ()))
+                               for key in ("buffer_order", "extent_order"))
+                        or not set(piece.get("buffer_order", ())).issubset({int(v.id) for v in values})
+                        or linked.get("native_symbol") != piece.get("symbol")
+                        or linked.get("llvm_ir_sha256") != hashlib.sha256(
+                            str(piece.get("llvm_ir", "")).encode()).hexdigest()):
+                    found.append(Finding("linked-piece-interface-disagreement", str(name), None,
+                                         "declaration, effect summary and retained native ABI disagree"))
+            contract = function.metadata.get("native_interface")
+            if not contract:
+                continue
+            outputs = tuple(function.metadata.get("declared_native_outputs", ()))
+            piece = function.metadata.get("llvm_piece") or {}
+            values = (*function.args, *outputs)
+            expected = tuple((int(v.id), str(v.dtype), tuple(v.shape or ())) for v in values)
+            ids = {int(v.id) for v in values}
+            arguments = tuple(int(v.id) for v in function.args)
+            paths = tuple(contract.get("output_paths", ()))
+            if paths and (len(dict(paths)) != len(paths)
+                    or any(not isinstance(path, tuple) or not path
+                           or any(not isinstance(index, int) or index < 0 for index in path)
+                           for path, _value in paths)
+                    or {value for _path, value in paths} != {int(v.id) for v in outputs}):
+                found.append(Finding("native-result-projection-disagreement", str(name), None,
+                                     "authored result paths and accepted output identities disagree"))
+            if (contract.get("schema") != "turing.native-unit-interface.v1"
+                    or function.blocks
+                    or tuple(contract.get("argument_ids", ())) != arguments
+                    or tuple(contract.get("output_ids", ())) != tuple(int(v.id) for v in outputs)
+                    or tuple(contract.get("boundary_values", ())) != expected
+                    or set(contract.get("read_only_arguments", {})) != set(arguments)
+                    or not all(isinstance(v, bool) for v in contract.get("read_only_arguments", {}).values())
+                    or not set(piece.get("buffer_order", ())).issubset(ids)
+                    or any(tuple(contract.get(key, ())) != tuple(piece.get(key, ()))
+                           for key in ("buffer_order", "extent_order", "buffer_shapes", "buffer_dtypes", "linked_objects"))
+                    or contract.get("native_symbol") != piece.get("symbol")
+                    or not piece.get("linked_objects")
+                    or not contract.get("ssa_artifact_sha256")):
+                found.append(Finding("native-interface-disagreement", str(name), None,
+                                     "declaration, effect summary and accepted native ABI disagree"))
+        return found
+
+    @staticmethod
+    def _conditional_binding_preservation_findings(module: Any) -> list[Finding]:
+        """A preserved conditional source must belong to another exact binding."""
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        owners = {}
+        scopes = {
+            tuple(operation.attributes['preserved_name_binding_scope'])
+            for function in module.functions.values() for block in function.blocks.values()
+            for operation in block.instrs
+            if (operation.attributes or {}).get('preserved_name_binding_value_ids')
+            and (operation.attributes or {}).get('preserved_name_binding_scope') is not None
+        }
+        if book is not None and "name_binding" in book.pages:
+            with book.borrowed("name_binding") as names:
+                # The exact declared read scope may be copy-on-read: rows()
+                # lists resident rows only, whereas scope_rows resolves its
+                # existing scope_origin projection without inventing aliases.
+                for scope in scopes:
+                    for row in names.scope_rows(scope):
+                        fact = names.latest(row)
+                        value_id = getattr(fact, 'value_id', None)
+                        if value_id is not None:
+                            owners.setdefault((row[0], int(value_id)), set()).add(row[1])
+        found = []
+        for symbol, function in module.functions.items():
+            for block in function.blocks.values():
+                for operation in block.instrs:
+                    attrs = operation.attributes or {}
+                    preserved = attrs.get('preserved_name_binding_value_ids', ())
+                    if not preserved:
+                        continue
+                    scope = attrs.get('preserved_name_binding_scope')
+                    scope = tuple(scope) if scope is not None else None
+                    merged = attrs.get('preserved_name_binding_merge_id')
+                    merged_names = owners.get((scope, merged), set())
+                    for source in preserved:
+                        if (operation.op == 'Phi' and merged_names
+                                and owners.get((scope, source), set()) - merged_names):
+                            continue
+                        found.append(Finding('conditional-binding-preservation-disagreement',
+                            str(symbol), int(source),
+                            f'preserved source {source} has no other binding than merge {merged} in {scope!r}'))
+        return found
+
+    @staticmethod
+    def _name_binding_capture_findings(module: Any) -> list[Finding]:
+        """A capture connects two exact binding versions of one value."""
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or "name_binding_capture" not in book.pages:
+            return []
+        found = []
+        with book.borrowed("name_binding_capture") as captures, book.borrowed("name_binding") as names:
+            for row in captures.rows():
+                capture = captures.latest(row)
+                if (not isinstance(capture, tuple) or len(capture) != 3
+                        or not isinstance(capture[0], str)
+                        or not isinstance(capture[1], int) or capture[1] < 0
+                        or capture[2] is not None and not isinstance(capture[2], int)):
+                    detail = f"capture {row!r} has invalid source/owner {capture!r}"
+                else:
+                    target = names.latest(row)
+                    source = names.latest((row[0], capture[0], capture[1]))
+                    if target is not None and source is not None and target.value_id == source.value_id:
+                        continue
+                    detail = f"capture {row!r} connects target {target!r} to source {source!r}"
+                found.append(Finding("name-binding-capture-disagreement", str(row[0]), None, detail))
         return found
 
     def _unsourced_worklist(
@@ -2335,10 +2578,10 @@ class CorrelationTable:
         never matches its own lookup.  The entry goes missing rather than
         failing loudly, which is the worst available outcome.
         """
-        integral = {
-            "int", "int8", "int16", "int32", "int64",
-            "uint8", "uint16", "uint32", "uint64", "bool",
-        }
+        # The shared layout table spells opaque_ref as exact i64 storage.
+        # Native identity-keyed tables legitimately compare these handles;
+        # a second spelling inventory incorrectly called them float keys.
+        from ..transmogrifier.dtype_layout import layout_for
         found: list[Finding] = []
         for function_name, table in (
             getattr(module, "sequence_tables", {}) or {}
@@ -2351,7 +2594,11 @@ class CorrelationTable:
                     if int(column) >= len(dtypes):
                         continue
                     dtype = str(dtypes[int(column)])
-                    if dtype in integral:
+                    try:
+                        integral = layout_for(dtype).kind in {"int", "uint", "bool"}
+                    except KeyError:
+                        integral = False
+                    if integral:
                         continue
                     found.append(Finding(
                         "key-column-not-integral",
@@ -2454,11 +2701,25 @@ class CorrelationTable:
             distinct = {(sequence_id, role.rstrip("0123456789"))
                         for sequence_id, role in roles}
             sequences = {sequence_id for sequence_id, _role in distinct}
-            if len(sequences) > 1:
+            if len(sequences) > 1 and not all(role == "heap_owner" for _, role in roles):
                 found.append(Finding(
                     "descriptor-member-shared", name, value_id,
                     f"roles={roles!r}",
                 ))
+        if (function.metadata.get("object_context") is not None
+                or function.metadata.get("native_object_context") is not None):
+            from .ssa_object_context import validate_context_function, validate_native_object_requirements
+            try:
+                validate_context_function(module, name)
+                validate_native_object_requirements(module, name)
+            except (KeyError, ValueError, TypeError) as error:
+                found.append(Finding("object-context-contract", name, None, str(error)))
+        from .ssa_heap_allocation import validate_heap_context_projection
+        for formal in function.args:
+            try:
+                validate_heap_context_projection(module, name, formal)
+            except (KeyError, ValueError, TypeError) as error:
+                found.append(Finding("heap-context-projection", name, formal.id, str(error)))
         # keyed helper operands
         described = {
             value_id for (function_name, value_id) in self.sequence_roles
@@ -2468,9 +2729,77 @@ class CorrelationTable:
             value_id for value_id, row in rows.items()
             if any(c.kind == "keyed-part" for c in row.claims)
         }
+        from .ssa_object_context import source_object_definitions
+        source_definitions = (source_object_definitions(function)
+            if function.metadata.get("native_object_context") is not None else {})
+        object_helpers = {}
         for block_name, block in function.blocks.items():
             for index, instruction in enumerate(block.instrs):
                 attributes = instruction.attributes or {}
+                membership = attributes.get("structural_membership_parameter")
+                if membership is not None:
+                    sequence_table = module.sequence_tables.get(name)
+                    descriptor = getattr(sequence_table, "sequences", {}).get(
+                        int(membership["sequence_id"])
+                    )
+                    storage = () if descriptor is None else tuple(dict.fromkeys((
+                        *descriptor.column_value_ids, descriptor.length_address_id,
+                        descriptor.capacity_value_id,
+                        *((descriptor.live_flags_value_id,)
+                          if descriptor.live_flags_value_id is not None else ()),
+                    )))
+                    actual = tuple(int(value.id) for value in instruction.args)
+                    helper = module.functions.get(str(attributes.get("callee") or ""))
+                    if (descriptor is None or instruction.op != "Call"
+                            or attributes.get("ssa_sequence_operation") != "contains"
+                            or int(membership["source_target_id"]) != int(descriptor.sequence_id)
+                            or actual != (*storage, int(membership["source_query_id"]))
+                            or helper is None
+                            or helper.metadata.get("ssa_sequence_operation") != "contains"
+                            or len(helper.args) != len(actual)):
+                        found.append(Finding("membership-parameter-contract", name,
+                            None if instruction.res is None else int(instruction.res.id),
+                            f"{block_name}#{index}: membership operands disagree with exact parameter descriptor"))
+                if (attributes.get("source_object_constructor") is not None
+                        or attributes.get("source_object_operation") is not None
+                        or attributes.get("source_object_type_test") is not None
+                        or attributes.get("native_collection_row") is not None):
+                    from .ssa_object_context import validate_source_object_instruction
+                    try:
+                        validate_source_object_instruction(module, name, instruction,
+                            _definitions=source_definitions, _helpers=object_helpers)
+                    except (KeyError, ValueError, TypeError) as error:
+                        found.append(Finding("source-object-contract", name,
+                            None if instruction.res is None else int(instruction.res.id), str(error)))
+                if attributes.get("opaque_object_operation") is not None:
+                    from .ssa_object_operations import validate_object_call
+                    try:
+                        validate_object_call(module, instruction, _helpers=object_helpers)
+                    except (KeyError, ValueError) as error:
+                        found.append(Finding(
+                            "opaque-object-contract", name,
+                            None if instruction.res is None else int(instruction.res.id),
+                            f"{block_name}#{index}: {error}",
+                        ))
+                if attributes.get("allocation_kind") == "owned_heap":
+                    from .ssa_heap_allocation import validate_heap_allocation
+                    try:
+                        validate_heap_allocation(instruction)
+                    except (KeyError, ValueError) as error:
+                        found.append(Finding(
+                            "heap-allocation-contract", name,
+                            None if instruction.res is None else int(instruction.res.id),
+                            f"{block_name}#{index}: {error}",
+                        ))
+                if attributes.get("native_heap_abi") == "copy_elements":
+                    from .ssa_heap_allocation import validate_heap_copy
+                    try:
+                        validate_heap_copy(instruction)
+                    except (KeyError, ValueError) as error:
+                        found.append(Finding(
+                            "heap-copy-contract", name, None,
+                            f"{block_name}#{index}: {error}",
+                        ))
                 if attributes.get("keyed_lookup_owner") is None:
                     continue
                 for position, argument in enumerate(instruction.args[:4]):
@@ -4673,6 +5002,65 @@ class IdentityBook:
             if fact is not None:
                 return fact
         return None
+
+    def project_cells(self, roots: Iterable[Ref]) -> "IdentityBook":
+        """Transport the exact predecessor closure of acceptance cells.
+
+        A persisted compiler unit carried ReturnBlock.source_cell but not
+        that ingestion cell, so post_control_program refused the first
+        Derived post. This is a subgraph of this book, with unchanged keys,
+        facts, stamps, mint and edge rows; it is not a reconstructed history.
+        The complete diagnostic book remains its separately stowed owner.
+        """
+        projected = IdentityBook(registry=self.registry)
+        selected: dict[str, dict[tuple, Any]] = {}
+        stamps: dict[str, dict[tuple, int]] = {}
+        pending = list(roots)
+        visited = set()
+
+        def copy_cell(name, row, column):
+            page = self.pages[name]
+            key = (row, column)
+            selected.setdefault(name, {})[key] = page.cells[key]
+            stamps.setdefault(name, {})[key] = page.stamps[key]
+
+        while pending:
+            ref = pending.pop()
+            if ref.key in visited:
+                continue
+            visited.add(ref.key)
+            self._source_stamp(ref)  # materialise a virtual referenced cell
+            copy_cell(ref.page.name, ref.row, ref.column)
+            for source, stage in self.edges_into(ref):
+                edge_row = (ref.key, source.key, stage.name)
+                copy_cell(EDGE_PAGE.name, edge_row, 0)
+                copy_cell(DEPENDENTS_PAGE.name, (source.key, edge_row), 0)
+                pending.append(source)
+            mint_page = dict.get(self.pages, MINT_PAGE.name)
+            if mint_page is not None:
+                self._ensure_parts(ref.page.name, (MINT_PAGE.name,), "unit_cell_projection")
+                for row in mint_page.scope_rows(ref.key):
+                    for column, fact in mint_page.history(row):
+                        copy_cell(MINT_PAGE.name, row, column)
+                        pending.extend(fact[1])
+            unsourced_page = dict.get(self.pages, UNSOURCED_PAGE.name)
+            if unsourced_page is not None:
+                self._ensure_parts(ref.page.name, (UNSOURCED_PAGE.name,), "unit_cell_projection")
+                for row in unsourced_page.scope_rows(ref.page.name):
+                    if row[1] == ref.row:
+                        for column, _fact in unsourced_page.history(row):
+                            copy_cell(UNSOURCED_PAGE.name, row, column)
+        projected.clock[0] = self.clock[0]
+        for name, cells in selected.items():
+            rows = {row for row, _column in cells}
+            columns = {column for _row, column in cells}
+            scopes = {scope: dict.fromkeys(row for row in self.pages[name].scope_rows(scope)
+                                          if row in rows)
+                      for scope in {row[0] for row in rows}}
+            projected.pages[name] = IdentityPage(name, cells=cells, stamps=stamps[name],
+                columns=[column for column in self.pages[name].columns if column in columns],
+                scopes=scopes, clock=projected.clock, book=projected)
+        return projected
 
     def unsourced_rows(self) -> tuple[tuple[Any, Any, Reason, Stage], ...]:
         """Every unsourced statement as (page, row, reason, stage); ``page``

@@ -1,0 +1,9 @@
+diff --git a/tools/compiler_probes/probe_four_rule_timing.py b/tools/compiler_probes/probe_four_rule_timing.py
+--- a/tools/compiler_probes/probe_four_rule_timing.py
++++ b/tools/compiler_probes/probe_four_rule_timing.py
+@@ -45 +45 @@
+-        "concurrent_full_main_job": True, "target_execution": False,
++        "concurrent_full_main_job": None, "target_execution": False,
+@@ -169 +169 @@
+-        "concurrent_full_main_job": True,
++        "concurrent_full_main_job": None,

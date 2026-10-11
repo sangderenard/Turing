@@ -385,9 +385,12 @@ def declare_external(name: str, signature: ExternalSignature, *,
     from .extraction_contract import llvm_piece_of
 
     piece = llvm_piece_of(implementation)
-    if piece is not None and piece is implementation and not isinstance(
-            implementation, ExternalFunction):
-        artifact = implementation.artifact
+    # The installed eager callable may be an authored-fallback wrapper. Its
+    # resolved piece, not the wrapper, owns the accepted ABI and SSA identities.
+    # Keep the wrapper only as the eager implementation; slot binding resolves
+    # the same native piece and never constructs a Python callback for it.
+    if piece is not None and not isinstance(piece, ExternalFunction):
+        artifact = piece.artifact
         abi = ExternalSlotABI(
             name=f"turing_external_{name}",
             buffer_order=tuple(int(v) for v in artifact.buffer_order),
@@ -397,16 +400,16 @@ def declare_external(name: str, signature: ExternalSignature, *,
         )
         return ExternalFunction(
             name=name, signature=signature, artifact=abi,
-            argument_names=tuple(implementation.argument_names),
-            argument_ids=tuple(int(v) for v in implementation.argument_ids),
-            output_names=tuple(implementation.output_names),
-            output_ids={str(k): int(v) for k, v in implementation.output_ids.items()},
+            argument_names=tuple(piece.argument_names),
+            argument_ids=tuple(int(v) for v in piece.argument_ids),
+            output_names=tuple(piece.output_names),
+            output_ids={str(k): int(v) for k, v in piece.output_ids.items()},
             # The leaf is tagged runtime-slot on its own copy: the host
             # piece's module stays the static piece it is.
-            module=copy.deepcopy(implementation.module), entry=str(implementation.entry),
-            outputs=implementation.outputs, source=implementation.source,
+            module=copy.deepcopy(piece.module), entry=str(piece.entry),
+            outputs=piece.outputs, source=piece.source,
             implementation=implementation, derivative=derivative,
-            identity=identity, batch=int(getattr(implementation, "batch", 1)),
+            identity=identity, batch=int(getattr(piece, "batch", 1)),
             external=external or name,
         )
     if any(tuple(shape) != tuple(signature.result_shape)

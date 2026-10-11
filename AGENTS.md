@@ -1,5 +1,14 @@
 # Zero-Ambiguity Action Plan
 
+## Current compiler integration (2026-10-11)
+
+Canonical source is C:/dev/Powershell/turing, its own main repository. Compiler
+repairs and profiling are installed in that repo and the native-fallback-link
+copied child plus build/n4-repair/turing. Read the CURRENT opening receipt in
+TEST_BASELINE_AND_HAZARDS.md; older unapplied/live-untouched claims are historical.
+Do not merge the parent coordination repo expecting it to carry ignored Turing
+sources. New Turing worktrees must come from Turing's own integrated history.
+
 (Everything below is mandatory. Any omission, digital shortcut, or silent deviation is "total failure." Agent = the person or program that will edit the existing repo.)
 
 ---

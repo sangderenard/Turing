@@ -1,0 +1,89 @@
+warning: in the working copy of 'C:/dev/Powershell/turing/tools/compiler_probes/probe_four_rule_timing.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/alber/.codex/worktrees/native-fallback-link/Powershell/turing/tools/compiler_probes/probe_four_rule_timing.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/tools/compiler_probes/probe_four_rule_timing.py b/tools/compiler_probes/probe_four_rule_timing.py
+index 5b16e9e..2b7fcbc 100644
+--- a/tools/compiler_probes/probe_four_rule_timing.py
++++ b/tools/compiler_probes/probe_four_rule_timing.py
+@@ -8,6 +8,11 @@ confound, never terminate it to make this benchmark look isolated.
+ 
+ --graph-workers 1 explicitly tests the preserved serial graph lane instead
+ of the native graph-foundation bootstrap. Report this changed configuration.
++
++--native-copier requires the installed whole original copier and counts native
++batches separately from pre-execution subclass fallbacks. No build on this run.
++--fresh-pieces gives this process its own empty law-cache root, so a concurrent
++comparison cannot reuse or overwrite pieces being built by the other run.
+ """
+ from pathlib import Path
+ import subprocess
+@@ -38,6 +43,8 @@ def main():
+         "source_compilation": "serial", "graph_workers": workers,
+         "resident_regions": 8, "directory": str(directory),
+         "concurrent_full_main_job": True, "target_execution": False,
++        "copier": "native" if '--native-copier' in sys.argv else "original_python",
++        "fresh_pieces": '--fresh-pieces' in sys.argv,
+     }), flush=True)
+ 
+     from src.compiler.native_compiler_accelerators import load_storage_effects_accelerator
+@@ -81,8 +88,46 @@ def main():
+         return result
+ 
+     provider.run = counted
++    copier_stats = None
++    if '--native-copier' in sys.argv:
++        from src.compiler.native_compiler_accelerators import load_metadata_copy_accelerator
++        copier_provider = load_metadata_copy_accelerator()
++        if copier_provider is None:
++            raise RuntimeError('no matching installed whole metadata copier; refusing silent serial benchmark')
++        print('N4_COPIER_ASSET=' + str(copier_provider.library_path), flush=True)
++        copier_run = copier_provider.run
++        copier_stats = {'batches': 0, 'native_batches': 0, 'fallback_batches': 0,
++                        'fallback_roots': 0, 'roots': 0, 'largest_batch_roots': 0,
++                        'seconds_including_boundaries': 0.0}
++        def counted_copier(values, *, copier):
++            before = time.perf_counter()
++            values = tuple(values)
++            previous_fallbacks = copier_stats['fallback_roots']
++            def observed_fallback(value):
++                copier_stats['fallback_roots'] += 1
++                return copier(value)
++            result = copier_run(values, copier=observed_fallback)
++            copier_stats['seconds_including_boundaries'] += time.perf_counter() - before
++            copier_stats['batches'] += 1
++            copier_stats['roots'] += len(values)
++            copier_stats['largest_batch_roots'] = max(copier_stats['largest_batch_roots'], len(values))
++            copier_stats['fallback_batches' if copier_stats['fallback_roots'] != previous_fallbacks
++                         else 'native_batches'] += 1
++            if copier_stats['batches'] == 1:
++                print('N4_COPIER_FIRST_BATCH=' + json.dumps(copier_stats), file=sys.__stdout__, flush=True)
++            return result
++        copier_provider.run = counted_copier
++    else:
++        from src.compiler.native_compiler_accelerators import METADATA_COPY, compiler_accelerators
++        if compiler_accelerators.resolve(METADATA_COPY).tier != 'python':
++            raise RuntimeError('original-copier benchmark unexpectedly has a native provider')
++        print('N4_COPIER_MODE=original_python; current compiler fixes retained', flush=True)
+     import llvm_dt_system as system
+     from tools.compiler_probes import profile_memory_n2 as probe
++    if '--fresh-pieces' in sys.argv:
++        import honorary_engine_equation_catalogue as honorary
++        honorary._LLVM_LAW_CACHE_DIR = directory / 'law_cache'
++        print('N4_ISOLATED_LAW_CACHE=' + str(honorary._LLVM_LAW_CACHE_DIR), flush=True)
+     original_lowered_system = system.lowered_system
+     phases = {}
+ 
+@@ -115,12 +160,12 @@ def main():
+     except BaseException as error:
+         print("N4_FAILED=" + json.dumps({
+             "seconds": time.perf_counter() - started, "type": type(error).__name__,
+-            "message": str(error), "native_analysis": native, "phases": phases,
++            "message": str(error), "native_analysis": native, "native_copier": copier_stats, "phases": phases,
+         }), flush=True)
+         raise
+     print("N4_TIMING=" + json.dumps({
+         "seconds": time.perf_counter() - started, "exit_code": result,
+-        "native_analysis": native, "phases": phases, "directory": str(directory),
++        "native_analysis": native, "native_copier": copier_stats, "phases": phases, "directory": str(directory),
+         "concurrent_full_main_job": True,
+     }), flush=True)
+     return result

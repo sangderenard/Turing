@@ -1,0 +1,837 @@
+diff --git a/src/compiler/ir_sequence_tables.py b/src/compiler/ir_sequence_tables.py
+--- a/src/compiler/ir_sequence_tables.py
++++ b/src/compiler/ir_sequence_tables.py
+@@ -6,14 +6,14 @@
+ columns; a set is the same storage with a unique key; a dictionary is a
+ multi-column row with one or more unique key columns.
+ 
+-The first executable foundation deliberately supports fixed-capacity arenas.
+-Runtime-sized fixed-capacity columns can use the explicit owned-heap Alloca
+-ABI. Dynamic growth still requires arena replacement, and produces a typed
+-shortfall rather than silently truncating or delegating to Python.
++Fixed arenas retain their existing capacity/status semantics. Typed scalar
++native pointer-cell arenas with an explicit heap owner also support checked
++geometric reserve, insert, table store and extend. Other dynamic contracts
++produce a typed shortfall rather than truncating or delegating to Python.
+ """
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from enum import Enum
+ from math import prod
+ 
+@@ -322,8 +322,6 @@
+ 
+     if descriptor.heap_owner_value_id is None:
+         raise ValueError("sequence allocation requires an explicit heap owner")
+-    if descriptor.capacity_policy is not SSASequenceCapacityPolicy.FIXED:
+-        raise ValueError("sequence allocation does not implement arena replacement")
+     if not descriptor.writable or descriptor.live_flags_value_id is not None or descriptor.child_table_pool is not None:
+         raise ValueError("heap initialization currently requires writable columns without live flags or child pools")
+     if any(descriptor.column_shapes):
+@@ -363,7 +361,7 @@
+ 
+ 
+ def _unsupported_destination(
+-    descriptor: SSASequenceDescriptor, operation: str
++    descriptor: SSASequenceDescriptor, operation: str, *, allow_dynamic: bool = False,
+ ) -> SSASequenceLowering | None:
+     if not descriptor.writable:
+         return SSASequenceLowering(shortfalls=(SSASequenceLoweringShortfall(
+@@ -372,14 +370,210 @@
+             operation,
+             "sequence insertion requires writable destination storage",
+         ),))
+-    if descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
++    if descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC and (
++        not allow_dynamic or descriptor.heap_owner_value_id is None
++        or descriptor.live_flags_value_id is not None
++        or descriptor.child_table_pool is not None or any(descriptor.column_shapes)
++    ):
+         return SSASequenceLowering(shortfalls=(SSASequenceLoweringShortfall(
+             SSASequenceShortfallCode.DYNAMIC_GROWTH_UNAVAILABLE,
+             descriptor.sequence_id,
+             operation,
+-            "dynamic sequence growth requires an explicit allocation and arena-replacement ABI",
++            "dynamic sequence growth requires typed scalar native pointer cells, "
++            "an explicit heap owner, and no live flags or child pools; "
++            "this operation must support arena replacement",
+         ),))
+     return None
++
++
++def lower_sequence_reserve(
++    descriptor: SSASequenceDescriptor, *, function_name: str | None = None,
++) -> SSASequenceLowering:
++    """Grow existing typed arenas and publish their pointer cells last.
++
++    The exact owner retains retired arenas until explicit release. Storage
++    CELL aliases remain stable; interior addresses are views of one arena
++    version and must be reacquired after reserve, never silently rebound.
++    Status 0 means unchanged, 1 grown, 2 invalid extent/storage contract.
++    Length and existing rows are preserved, new rows are zero-initialized.
++    """
++    from .ssa_heap_allocation import heap_allocate, heap_copy
++    from ..transmogrifier.dtype_layout import layout_for
++
++    unsupported = _unsupported_destination(descriptor, "reserve", allow_dynamic=True)
++    if unsupported is not None:
++        return unsupported
++    if descriptor.capacity_policy is not SSASequenceCapacityPolicy.DYNAMIC:
++        raise ValueError("reserve requires a dynamic sequence capacity contract")
++    storage = _storage_values(descriptor)
++    values = {int(value.id): value for value in storage}
++    owner = SSAValue(descriptor.heap_owner_value_id, "ptr", shape=(1,),
++                     accounting={"heap_owner": True})
++    builder = _Builder(_first_fresh_identity(descriptor, values=(*storage, owner)))
++    required = builder.fresh("int64")
++    capacity = values[int(descriptor.capacity_value_id)]
++    entry = builder.block("entry")
++    check = builder.block("capacity_check")
++    grow = builder.block("growth_check")
++    double = builder.block("double_capacity")
++    capped = builder.block("maximum_capacity")
++    candidate_block = builder.block("candidate_capacity")
++    exact = builder.block("exact_capacity")
++    geometric = builder.block("geometric_capacity")
++    allocate = builder.block("allocate")
++    unchanged = builder.block("unchanged")
++    invalid = builder.block("invalid_extent")
++    complete = builder.block("complete")
++    result = builder.block("result")
++    zero = builder.const(entry, 0, dtype="int64")
++    length_slot, length = builder.fresh("ptr"), builder.fresh("int64")
++    builder.emit(entry, "GetElementPtr", [values[descriptor.length_address_id], zero], length_slot)
++    builder.emit(entry, "Load", [length_slot], length)
++    maximum = min((2**63 - 1 - 8) // layout_for(dtype).byte_size
++                  for dtype in descriptor.column_dtypes)
++    maximum_value = builder.const(entry, maximum, dtype="int64")
++    predicates = []
++    for op, left, right in (("Ge", required, zero), ("Ge", length, zero),
++                            ("Le", length, capacity), ("Le", capacity, maximum_value),
++                            ("Le", required, maximum_value)):
++        predicate = builder.fresh("bool")
++        builder.emit(entry, op, [left, right], predicate)
++        predicates.append(predicate)
++    valid = predicates[0]
++    for predicate in predicates[1:]:
++        both = builder.fresh("bool")
++        builder.emit(entry, "LAnd", [valid, predicate], both)
++        valid = both
++    builder.cond(entry, valid, check, invalid)
++    fits = builder.fresh("bool")
++    builder.emit(check, "Le", [required, capacity], fits)
++    builder.cond(check, fits, unchanged, grow)
++    can_double = builder.fresh("bool")
++    builder.emit(grow, "Le", [capacity, builder.const(grow, maximum // 2, dtype="int64")], can_double)
++    builder.cond(grow, can_double, double, capped)
++    doubled = builder.fresh("int64")
++    builder.emit(double, "Mul", [capacity, builder.const(double, 2, dtype="int64")], doubled)
++    builder.branch(double, candidate_block)
++    builder.branch(capped, candidate_block)
++    candidate = builder.fresh("int64")
++    builder.emit(candidate_block, "Phi", [doubled, maximum_value], candidate,
++                 attributes={"incoming_blocks": (double.name, capped.name)})
++    needs_exact = builder.fresh("bool")
++    builder.emit(candidate_block, "Gt", [required, candidate], needs_exact)
++    builder.cond(candidate_block, needs_exact, exact, geometric)
++    builder.branch(exact, allocate)
++    builder.branch(geometric, allocate)
++    new_capacity = builder.fresh("int64")
++    builder.emit(allocate, "Phi", [required, candidate], new_capacity,
++                 attributes={"incoming_blocks": (exact.name, geometric.name)})
++    new_columns = {}
++    for column_id, dtype in zip(descriptor.column_value_ids, descriptor.column_dtypes, strict=True):
++        if column_id in new_columns:
++            continue  # Exact same pointer cell, already allocated/copied.
++        column = builder.fresh("ptr")
++        allocate.instrs.append(heap_allocate(new_capacity, owner, column,
++            element_dtype=dtype, zero_initialize=True))
++        new_columns[column_id] = column
++    for column_id, column in new_columns.items():
++        allocate.instrs.append(heap_copy(length, values[column_id], column))
++    # Only publish after every column has allocated and copied successfully.
++    for column_id, column in new_columns.items():
++        builder.emit(allocate, "Store", [column, values[column_id]])
++    builder.emit(allocate, "Store", [new_capacity, capacity])
++    builder.branch(allocate, complete)
++    outcomes = [(block, _status_branch(builder, block, status, result))
++                for block, status in ((unchanged, 0), (complete, 1), (invalid, 2))]
++    status = builder.fresh("int")
++    builder.emit(result, "Phi", [value for _, value in outcomes], status,
++                 attributes={"incoming_blocks": tuple(block.name for block, _ in outcomes)})
++    builder.emit(result, "Ret", [status])
++    function = Function(function_name or f"ssa_sequence_{descriptor.sequence_id}_reserve",
++                        [*storage, owner, required], builder.blocks, metadata={
++        "ssa_sequence_operation": "reserve", "sequence_id": descriptor.sequence_id,
++        "required_capacity_value_id": required.id,
++        "heap_owner_value_id": owner.id,
++        "sequence_array_argument_ids": (*descriptor.column_value_ids, descriptor.length_address_id, owner.id),
++        "status_values": {"unchanged": 0, "grown": 1, "invalid_extent": 2},
++        "growth_policy": "checked_geometric", "retired_arena_lifetime": "owner_release",
++        "named_outputs": (("status", status.id),),
++    })
++    return SSASequenceLowering((function,))
++
++
++def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, first_value_id):
++    """Use incumbent insertion/store, reserving only when it reports full."""
++    is_store = operation == "table_store"
++    name = function_name or f"ssa_sequence_{descriptor.sequence_id}_{'store' if is_store else 'insert'}"
++    fixed_descriptor = replace(descriptor, capacity_policy=SSASequenceCapacityPolicy.FIXED)
++    fixed = (lower_table_store(fixed_descriptor, function_name=name + "__fixed", first_value_id=first_value_id)
++             if is_store else lower_sequence_insert(fixed_descriptor,
++                 function_name=name + "__fixed", operation=operation, first_value_id=first_value_id))
++    if not fixed.complete:
++        return fixed
++    insert = fixed.functions[0]
++    reserve = lower_sequence_reserve(descriptor, function_name=name + "__reserve").functions[0]
++    values = {value.id: value for value in insert.args}
++    owner = next(value for value in reserve.args if value.id == descriptor.heap_owner_value_id)
++    builder = _Builder(_first_fresh_identity(descriptor, values=tuple(values.values())))
++    entry, insert_entry, grow, retry, result = (builder.block(block_name)
++        for block_name in ("entry", "insert", "grow", "retry", "result"))
++    # Reject inconsistent caller extents before the unique scan can read a
++    # row. Required zero validates without allocation or arena replacement.
++    validation_zero = builder.const(entry, 0, dtype="int64")
++    validation_values = {**values, owner.id: owner,
++                         reserve.metadata["required_capacity_value_id"]: validation_zero}
++    validation_status = builder.fresh("int")
++    builder.emit(entry, "Call", [validation_values[value.id] for value in reserve.args], validation_status,
++                 attributes={"callee": reserve.name})
++    valid = builder.fresh("bool")
++    builder.emit(entry, "Lt", [validation_status, builder.const(entry, 2)], valid)
++    builder.cond(entry, valid, insert_entry, result)
++
++    def call_mutation(block, status):
++        builder.emit(block, "Call", list(insert.args), None if is_store else status,
++                     attributes={"callee": insert.name})
++        if is_store:
++            slot = builder.fresh("ptr")
++            builder.emit(block, "GetElementPtr", [values[descriptor.status_address_id],
++                builder.const(block, 0, dtype="int64")], slot)
++            builder.emit(block, "Load", [slot], status)
++
++    first_status = builder.fresh("int")
++    call_mutation(insert_entry, first_status)
++    full = builder.fresh("bool")
++    builder.emit(insert_entry, "Eq", [first_status, builder.const(insert_entry, 2)], full)
++    builder.cond(insert_entry, full, grow, result)
++    zero = builder.const(grow, 0, dtype="int64")
++    length_slot, length, required = (builder.fresh(dtype) for dtype in ("ptr", "int64", "int64"))
++    builder.emit(grow, "GetElementPtr", [values[descriptor.length_address_id], zero], length_slot)
++    builder.emit(grow, "Load", [length_slot], length)
++    builder.emit(grow, "Add", [length, builder.const(grow, 1, dtype="int64")], required)
++    reserve_values = {**values, owner.id: owner,
++                      reserve.metadata["required_capacity_value_id"]: required}
++    reserve_status = builder.fresh("int")
++    builder.emit(grow, "Call", [reserve_values[value.id] for value in reserve.args], reserve_status,
++                 attributes={"callee": reserve.name})
++    succeeded = builder.fresh("bool")
++    builder.emit(grow, "Lt", [reserve_status, builder.const(grow, 2)], succeeded)
++    builder.cond(grow, succeeded, retry, result)
++    retry_status = builder.fresh("int")
++    call_mutation(retry, retry_status)
++    builder.branch(retry, result)
++    status = builder.fresh("int")
++    builder.emit(result, "Phi", [validation_status, first_status, reserve_status, retry_status], status,
++                 attributes={"incoming_blocks": (entry.name, insert_entry.name, grow.name, retry.name)})
++    if is_store:
++        slot = builder.fresh("ptr")
++        builder.emit(result, "GetElementPtr", [values[descriptor.status_address_id],
++            builder.const(result, 0, dtype="int64")], slot)
++        builder.emit(result, "Store", [status, slot])
++    builder.emit(result, "Ret", [] if is_store else [status])
++    function = Function(name, [*insert.args, owner], builder.blocks, metadata={
++        **insert.metadata, "fixed_capacity": False, "heap_owner_value_id": owner.id,
++        "sequence_array_argument_ids": (*insert.metadata["sequence_array_argument_ids"], owner.id),
++        "named_outputs": () if is_store else (("status", status.id),),
++    })
++    return SSASequenceLowering((function, insert, reserve))
+ 
+ 
+ def lower_sequence_insert(
+@@ -395,9 +589,12 @@
+     when a row is written, and 2 when fixed capacity is exhausted.
+     """
+ 
+-    unsupported = _unsupported_destination(descriptor, operation)
++    unsupported = _unsupported_destination(descriptor, operation, allow_dynamic=True)
+     if unsupported is not None:
+         return unsupported
++    if descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
++        return _lower_dynamic_sequence_mutation(descriptor, function_name=function_name,
++            operation=operation, first_value_id=first_value_id)
+     column_shapes = descriptor.column_shapes or tuple(
+         () for _column in descriptor.column_value_ids
+     )
+@@ -587,6 +784,7 @@
+             "sequence_id": descriptor.sequence_id,
+             "key_columns": descriptor.key_columns,
+             "allows_duplicates": descriptor.allows_duplicates,
++            "sequence_row_argument_ids": tuple(value.id for value in row_values),
+             "fixed_capacity": True,
+             "status_values": {"duplicate": 0, "inserted": 1, "capacity_exhausted": 2},
+             "sequence_array_argument_ids": tuple((
+@@ -2000,9 +2198,12 @@
+ ) -> SSASequenceLowering:
+     """Build update-existing-or-insert for a two-column fixed table."""
+ 
+-    unsupported = _unsupported_destination(descriptor, "table_store")
++    unsupported = _unsupported_destination(descriptor, "table_store", allow_dynamic=True)
+     if unsupported is not None:
+         return unsupported
++    if descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
++        return _lower_dynamic_sequence_mutation(descriptor, function_name=function_name,
++            operation="table_store", first_value_id=first_value_id)
+     value_columns = tuple(
+         column for column in range(len(descriptor.column_value_ids))
+         if column not in descriptor.key_columns
+@@ -2547,11 +2748,17 @@
+ ) -> SSASequenceLowering:
+     """Lower extend to source iteration plus the destination's insert policy."""
+ 
+-    unsupported = _unsupported_destination(destination, "extend")
++    unsupported = _unsupported_destination(destination, "extend", allow_dynamic=True)
+     if unsupported is not None:
+         return unsupported
+     if len(destination.column_value_ids) != len(source.column_value_ids):
+         raise ValueError("sequence extend requires matching row widths")
++    if destination.heap_owner_value_id is not None or source.heap_owner_value_id is not None:
++        from ..transmogrifier.dtype_layout import layout_for
++        if tuple(map(layout_for, destination.column_dtypes)) != tuple(map(layout_for, source.column_dtypes)):
++            raise ValueError("heap sequence extend requires matching element layouts")
++        if any(destination.column_shapes) or any(source.column_shapes):
++            raise ValueError("heap sequence extend requires scalar row columns")
+ 
+     insert_name = f"ssa_sequence_{destination.sequence_id}_insert"
+     insert_lowering = lower_sequence_insert(
+@@ -2567,6 +2774,10 @@
+     all_storage = tuple({value.id: value for value in (
+         *destination_storage, *source_storage
+     )}.values())
++    insert_function = insert_lowering.functions[0]
++    if destination.heap_owner_value_id is not None:
++        owner = next(value for value in insert_function.args if value.id == destination.heap_owner_value_id)
++        all_storage = (*all_storage, owner)
+     insert_ids = {
+         value.id
+         for function in insert_lowering.functions
+@@ -2650,10 +2861,12 @@
+         builder.branch(body, call_insert)
+ 
+     insert_status = builder.fresh("int")
++    insert_values = {value.id: value for value in all_storage}
++    insert_values.update(zip(insert_function.metadata["sequence_row_argument_ids"], row_values))
+     builder.emit(
+         call_insert,
+         "Call",
+-        [*destination_storage, *row_values],
++        [insert_values[value.id] for value in insert_function.args],
+         insert_status,
+         attributes={"callee": insert_name, "source_linked": True},
+     )
+@@ -2706,7 +2919,7 @@
+             "named_outputs": (("status", int(status_result.id)),),
+         },
+     )
+-    return SSASequenceLowering((insert_lowering.functions[0], function))
++    return SSASequenceLowering((*insert_lowering.functions, function))
+ 
+ 
+ def lower_sequence_aggregate_constants(
+diff --git a/tests/test_ssa_owned_heap.py b/tests/test_ssa_owned_heap.py
+--- a/tests/test_ssa_owned_heap.py
++++ b/tests/test_ssa_owned_heap.py
+@@ -98,6 +98,288 @@
+         heap_allocate(SSAValue(0, 'int64'), owner(1), SSAValue(2, 'ptr'), element_dtype='unknown')
+ 
+ 
++@pytest.mark.parametrize('dtype, width', [('int64', 8), ('opaque_ref', 8),
++                                        ('float64', 8), ('float32', 4), ('bool', 1)])
++def test_dynamic_sequence_reserve_preserves_bytes_and_owner(dtype, width, tmp_path):
++    # SSA allocation-contract proof, not automatic Python object construction.
++    from src.compiler.ir_sequence_tables import lower_sequence_allocate, lower_sequence_reserve
++    from src.transmogrifier.ssa import SSASequenceDescriptor, SSASequenceCapacityPolicy
++    descriptor = SSASequenceDescriptor(0, (10, 11), 2, 3,
++        column_dtypes=(dtype, dtype), key_columns=(0,), heap_owner_value_id=6,
++        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC)
++    initialize = lower_sequence_allocate(descriptor).functions[0]
++    reserve = lower_sequence_reserve(descriptor).functions[0]
++    release = Function('release', [owner(6)], {'entry': BasicBlock('entry', [
++        heap_release(owner(6)), Instr('Ret', [], None)])})
++    module = IRModule(functions={f.name: f for f in (initialize, reserve, release)})
++    artifacts = {f.name: emit_ssa_function_to_llvm(module, f.name) for f in (initialize, reserve, release)}
++    for artifact in artifacts.values():
++        assert artifact.complete, artifact.shortfalls
++    natives = {name: compile_artifact(artifact, directory=tmp_path / name)
++               for name, artifact in artifacts.items()}
++    buffers = {10: np.zeros(1, dtype=np.uint64), 11: np.zeros(1, dtype=np.uint64),
++               2: np.zeros(1, dtype=np.int64), 3: np.zeros(1, dtype=np.int64),
++               6: np.zeros(1, dtype=np.uint64)}
++    required_id = reserve.metadata['required_capacity_value_id']
++    status_id = dict(reserve.metadata['named_outputs'])['status']
++    expected = {10: b'', 11: b''}
++    try:
++        prepare_artifact_execution(natives[initialize.name], buffers).run()
++        for required in (1, 2, 7, 4097):
++            old_length = int(buffers[2][0])
++            old_addresses = {column: int(buffers[column][0]) for column in (10, 11)}
++            buffers[required_id] = np.array([required], dtype=np.int64)
++            execution = prepare_artifact_execution(natives[reserve.name], buffers).run()
++            assert execution.buffers[status_id].item() == 1
++            capacity = int(buffers[3][0])
++            assert capacity >= required and buffers[2][0] == old_length
++            for column in (10, 11):
++                data = (ctypes.c_ubyte * (capacity * width)).from_address(int(buffers[column][0]))
++                assert bytes(data[:old_length*width]) == expected[column]
++                assert not any(data[old_length*width:])
++                # Retired arenas remain valid for their owner's lifetime.
++                retired = (ctypes.c_ubyte * (old_length * width)).from_address(old_addresses[column])
++                assert bytes(retired) == expected[column]
++                payload = bytes((position*17+column) % 256 for position in range(required*width))
++                data[:required*width] = payload
++                expected[column] = payload
++            buffers[2][0] = required
++            before = {key: value.copy() for key, value in buffers.items() if key != required_id}
++            assert prepare_artifact_execution(natives[reserve.name], buffers).run().buffers[status_id].item() == 0
++            for key, value in before.items():
++                assert np.array_equal(buffers[key], value)
++        for invalid in (-1, 2**63-1):
++            buffers[required_id] = np.array([invalid], dtype=np.int64)
++            before = {key: value.copy() for key, value in buffers.items() if key != required_id}
++            assert prepare_artifact_execution(natives[reserve.name], buffers).run().buffers[status_id].item() == 2
++            for key, value in before.items():
++                assert np.array_equal(buffers[key], value)
++    finally:
++        prepare_artifact_execution(natives['release'], {6: buffers[6]}).run()
++    assert buffers[6][0] == 0
++
++
++def test_heap_copy_layout_disagreement_is_audited():
++    from src.compiler.ssa_heap_allocation import heap_copy
++    from src.compiler.identity_concordance import concordance_report
++    source = SSAValue(1, 'ptr', accounting={'heap_element_dtype': 'int64', 'heap_owner_value_id': 7})
++    destination = SSAValue(2, 'ptr', accounting={'heap_element_dtype': 'int64', 'heap_owner_value_id': 7})
++    count = SSAValue(3, 'int64')
++    copy = heap_copy(count, source, destination)
++    destination.accounting['heap_element_dtype'] = 'float64'
++    function = Function('copy', [source, destination, count],
++        {'entry': BasicBlock('entry', [copy, Instr('Ret', [], None)])})
++    module = IRModule(functions={'copy': function})
++    artifact = emit_ssa_function_to_llvm(module, 'copy')
++    assert not artifact.complete
++    assert any('element layouts disagree' in finding.reason for finding in artifact.shortfalls)
++    assert 'heap-copy-contract' in concordance_report(module)
++
++
++def test_owned_sequence_contract_rejects_aliased_counters_and_pointee_mismatch():
++    from src.compiler.sequence_storage_binding import _bind_sequence_storage_members
++    from src.transmogrifier.ssa import SSASequenceDescriptor
++    with pytest.raises(ValueError, match='length/capacity must be distinct'):
++        SSASequenceDescriptor(0, (10,), 2, 2, column_dtypes=('int64',), heap_owner_value_id=6)
++    with pytest.raises(ValueError, match='aliased heap columns disagree'):
++        SSASequenceDescriptor(0, (10, 10), 2, 3,
++            column_dtypes=('int64', 'float64'), heap_owner_value_id=6)
++    with pytest.raises(ValueError, match='heap owner must be a distinct'):
++        SSASequenceDescriptor(0, (10,), 2, 3, status_address_id=6,
++            column_dtypes=('int64',), heap_owner_value_id=6)
++    source = SSASequenceDescriptor(0, (10,), 2, 3,
++        column_dtypes=('int64',), heap_owner_value_id=6)
++    target = SSASequenceDescriptor(20, (30,), 22, 23,
++        column_dtypes=('float64',), heap_owner_value_id=26)
++    bindings = {}
++    assert not _bind_sequence_storage_members(bindings, source, target)
++    assert bindings == {}
++    from dataclasses import replace
++    matching = replace(target, column_dtypes=('int64',), column_shapes=((),))
++    assert _bind_sequence_storage_members(bindings, source, matching)
++    assert bindings == {0: 20, 10: 30, 2: 22, 3: 23, 6: 26}
++
++
++def test_heap_copy_does_not_accept_an_opaque_handle_as_an_address():
++    from src.compiler.ssa_heap_allocation import heap_copy
++    source = SSAValue(1, 'opaque_ref')
++    destination = SSAValue(2, 'ptr', accounting={'heap_element_dtype': 'int64', 'heap_owner_value_id': 7})
++    with pytest.raises(ValueError, match='not opaque handles'):
++        heap_copy(SSAValue(3, 'int64'), source, destination)
++
++
++def test_heap_copy_has_defined_overlap_semantics(tmp_path):
++    from src.compiler.ssa_heap_allocation import heap_copy
++    source = SSAValue(1, 'ptr', accounting={'heap_element_dtype': 'int64', 'heap_owner_value_id': 7})
++    destination = SSAValue(2, 'ptr', accounting={'heap_element_dtype': 'int64', 'heap_owner_value_id': 7})
++    count = SSAValue(3, 'int64')
++    function = Function('copy', [source, destination, count],
++        {'entry': BasicBlock('entry', [heap_copy(count, source, destination), Instr('Ret', [], None)])})
++    native = compile_artifact(emit_ssa_function_to_llvm(IRModule(functions={'copy': function}), 'copy'),
++                              directory=tmp_path / 'overlap')
++    module = make_allocation_module()
++    allocator = compile_artifact(emit_ssa_function_to_llvm(module, 'allocate'), directory=tmp_path / 'allocate')
++    destructor = compile_artifact(emit_ssa_function_to_llvm(module, 'release'), directory=tmp_path / 'release')
++    scope = np.zeros(1, dtype=np.uint64)
++    try:
++        execution = prepare_artifact_execution(allocator, {0: np.array([4], dtype=np.int64), 1: scope}).run()
++        address = int(execution.buffers[2].item())
++        rows = (ctypes.c_int64 * 4).from_address(address)
++        rows[:] = [1, 2, 3, 4]
++        prepare_artifact_execution(native, {1: np.array([address], dtype=np.uint64),
++            2: np.array([address+8], dtype=np.uint64), 3: np.array([3], dtype=np.int64)}).run()
++        assert list(rows) == [1, 1, 2, 3]
++    finally:
++        prepare_artifact_execution(destructor, {10: scope}).run()
++    assert scope[0] == 0
++
++
++def test_dynamic_insert_rejects_invalid_extents_before_touching_null_columns(tmp_path):
++    from src.compiler.ir_sequence_tables import lower_sequence_insert
++    from src.transmogrifier.ssa import SSASequenceDescriptor, SSASequenceCapacityPolicy
++    descriptor = SSASequenceDescriptor(0, (10, 11), 2, 3,
++        column_dtypes=('opaque_ref', 'opaque_ref'), key_columns=(0,), heap_owner_value_id=6,
++        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC)
++    lowering = lower_sequence_insert(descriptor)
++    function = lowering.functions[0]
++    module = IRModule(functions={f.name: f for f in lowering.functions})
++    artifact = emit_ssa_function_to_llvm(module, function.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'invalid_extents')
++    status_id = dict(function.metadata['named_outputs'])['status']
++    physical_ids = {0, 10, 11, 2, 3, 6}
++    rows = {value.id: np.array([17], dtype=np.int64) for value in function.args
++            if value.id not in physical_ids}
++    for length, capacity in ((-1, 0), (1, 0), (0, -1), (2**63-1, 2**63-1)):
++        buffers = {**rows, 10: np.zeros(1, dtype=np.uint64), 11: np.zeros(1, dtype=np.uint64),
++                   2: np.array([length], dtype=np.int64), 3: np.array([capacity], dtype=np.int64),
++                   6: np.zeros(1, dtype=np.uint64)}
++        before = {key: value.copy() for key, value in buffers.items()}
++        assert prepare_artifact_execution(native, buffers).run().buffers[status_id].item() == 2
++        for key, value in before.items():
++            assert np.array_equal(buffers[key], value)
++
++
++@pytest.mark.parametrize('dtype', ['int64', 'opaque_ref'])
++@pytest.mark.parametrize('operation', ['insert', 'store'])
++def test_native_insert_loop_grows_keyed_columns_without_python_dispatch(dtype, operation, tmp_path):
++    from src.compiler.ir_sequence_tables import lower_sequence_insert, lower_table_lookup, lower_table_store
++    from src.transmogrifier.ssa import SSASequenceDescriptor, SSASequenceCapacityPolicy
++    descriptor = SSASequenceDescriptor(0, (10, 11), 2, 3, status_address_id=4,
++        column_dtypes=(dtype, dtype), key_columns=(0,), heap_owner_value_id=6,
++        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC)
++    lowering = (lower_table_store(descriptor) if operation == 'store'
++                else lower_sequence_insert(descriptor))
++    assert lowering.complete, lowering.shortfalls
++    insert = lowering.functions[0]
++    lookup = lower_table_lookup(descriptor).functions[0]
++    physical_ids = {0, 10, 11, 2, 3, 4, 6}
++    key_formal, value_formal = [v for v in insert.args if v.id not in physical_ids]
++    query_formal = next(v for v in lookup.args if v.id not in physical_ids)
++    storage = {v.id: v for v in (*insert.args, *lookup.args) if v.id in physical_ids}
++    count, zero, one = SSAValue(20, 'int64'), SSAValue(21, 'int64'), SSAValue(22, 'int64')
++    index, following = SSAValue(23, 'int64'), SSAValue(24, 'int64')
++    predicate, base, offset = SSAValue(25, 'bool'), SSAValue(26, 'int64'), SSAValue(27, 'int64')
++    number, key, value = SSAValue(28, 'int64'), SSAValue(29, dtype), SSAValue(30, dtype)
++    insert_status = SSAValue(31, 'int')
++    last, query, answer = SSAValue(32, 'int64'), SSAValue(33, dtype), SSAValue(34, dtype)
++    bindings = {**storage, key_formal.id: key, value_formal.id: value}
++    root = Function('root', [*storage.values(), count], {
++        'entry': BasicBlock('entry', [
++            Instr('Const', [], zero, attributes={'value': 0}),
++            Instr('Const', [], one, attributes={'value': 1}),
++            Instr('Const', [], base, attributes={'value': 2**60+3}),
++            Instr('Const', [], offset, attributes={'value': 1000000}),
++            Instr('Br', [], None, attributes={'target': 'header'})], successors=['header']),
++        'header': BasicBlock('header', [
++            Instr('Phi', [zero, following], index, attributes={'incoming_blocks': ('entry', 'body')}),
++            Instr('Lt', [index, count], predicate),
++            Instr('CondBr', [predicate], None, attributes={'true_target': 'body', 'false_target': 'exit'})],
++            successors=['body', 'exit']),
++        'body': BasicBlock('body', [
++            Instr('Add', [base, index], number), Instr('Cast', [number], key),
++            Instr('Add', [key, offset], value),
++            Instr('Call', [bindings[v.id] for v in insert.args], None if operation == 'store' else insert_status,
++                  attributes={'callee': insert.name}),
++            Instr('Add', [index, one], following),
++            Instr('Br', [], None, attributes={'target': 'header'})], successors=['header']),
++        'exit': BasicBlock('exit', [
++            Instr('Sub', [count, one], last), Instr('Add', [base, last], query),
++            Instr('Call', [query if v.id == query_formal.id else storage[v.id] for v in lookup.args],
++                  answer, attributes={'callee': lookup.name}), Instr('Ret', [answer], None)]),
++    })
++    release = Function('release', [owner(6)], {'entry': BasicBlock('entry', [
++        heap_release(owner(6)), Instr('Ret', [], None)])})
++    module = IRModule(functions={f.name: f for f in (*lowering.functions, lookup, root, release)})
++    artifact = emit_ssa_function_to_llvm(module, 'root')
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'loop')
++    destructor = compile_artifact(emit_ssa_function_to_llvm(module, 'release'), directory=tmp_path / 'release')
++    for size in (1, 257, 4097):
++        buffers = {10: np.zeros(1, dtype=np.uint64), 11: np.zeros(1, dtype=np.uint64),
++                   2: np.zeros(1, dtype=np.int64), 3: np.zeros(1, dtype=np.int64),
++                   4: np.zeros(1, dtype=np.int32), 6: np.zeros(1, dtype=np.uint64),
++                   20: np.array([size], dtype=np.int64)}
++        try:
++            execution = prepare_artifact_execution(native, buffers).run()
++            assert execution.buffers[answer.id].item() == 2**60+3+size-1+1000000
++            assert buffers[2][0] == size
++            assert size <= buffers[3][0] < 2*size
++            for column, delta in ((10, 0), (11, 1000000)):
++                rows = (ctypes.c_uint64 * size).from_address(int(buffers[column][0]))
++                assert list(rows) == [2**60+3+i+delta for i in range(size)]
++            # Re-inserting all keys must neither grow nor change the columns.
++            saved = {key: value.copy() for key, value in buffers.items()}
++            assert prepare_artifact_execution(native, buffers).run().buffers[answer.id].item() == execution.buffers[answer.id].item()
++            for key in (10, 11, 2, 3, 6):
++                assert np.array_equal(buffers[key], saved[key])
++        finally:
++            prepare_artifact_execution(destructor, {6: buffers[6]}).run()
++        assert buffers[6][0] == 0
++
++
++def test_native_extend_keeps_full_dynamic_helper_closure_and_owner(tmp_path):
++    from src.compiler.ir_sequence_tables import lower_sequence_extend
++    from src.transmogrifier.ssa import SSASequenceDescriptor, SSASequenceCapacityPolicy
++    destination = SSASequenceDescriptor(0, (10, 11), 2, 3,
++        column_dtypes=('opaque_ref', 'opaque_ref'), key_columns=(0,), heap_owner_value_id=6,
++        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC)
++    source = SSASequenceDescriptor(100, (110, 111), 102, 103,
++        column_dtypes=('opaque_ref', 'opaque_ref'), key_columns=(0,))
++    lowering = lower_sequence_extend(destination, source)
++    assert lowering.complete, lowering.shortfalls
++    function = lowering.functions[-1]
++    assert any(v.id == 6 and v.accounting.get('heap_owner') for v in function.args)
++    module = IRModule(functions={f.name: f for f in lowering.functions})
++    artifact = emit_ssa_function_to_llvm(module, function.name)
++    assert artifact.complete, artifact.shortfalls
++    native = compile_artifact(artifact, directory=tmp_path / 'extend')
++    release = Function('release', [owner(6)], {'entry': BasicBlock('entry', [
++        heap_release(owner(6)), Instr('Ret', [], None)])})
++    destructor = compile_artifact(emit_ssa_function_to_llvm(
++        IRModule(functions={'release': release}), 'release'), directory=tmp_path / 'release')
++    size = 257
++    buffers = {10: np.zeros(1, dtype=np.uint64), 11: np.zeros(1, dtype=np.uint64),
++               2: np.zeros(1, dtype=np.int64), 3: np.zeros(1, dtype=np.int64),
++               6: np.zeros(1, dtype=np.uint64), 102: np.array([size], dtype=np.int64),
++               103: np.array([size], dtype=np.int64),
++               110: np.arange(size, dtype=np.int64)+(2**60+3),
++               111: np.arange(size, dtype=np.int64)+(2**60+43)}
++    status = dict(function.metadata['named_outputs'])['status']
++    original = {column: buffers[column].copy() for column in (110, 111)}
++    try:
++        for _ in range(2):
++            assert prepare_artifact_execution(native, buffers).run().buffers[status].item() == 1
++            assert buffers[2][0] == size
++            for destination_id, source_id in ((10, 110), (11, 111)):
++                rows = (ctypes.c_int64 * size).from_address(int(buffers[destination_id][0]))
++                assert list(rows) == original[source_id].tolist()
++                assert np.array_equal(buffers[source_id], original[source_id])
++    finally:
++        prepare_artifact_execution(destructor, {6: buffers[6]}).run()
++    assert buffers[6][0] == 0
++
++
+ def test_owner_disagreement_is_a_named_emission_shortfall():
+     module = make_allocation_module()
+     module.functions['allocate'].blocks['entry'].instrs[0].res.accounting['heap_owner_value_id'] = 99
+diff --git a/src/transmogrifier/ssa.py b/src/transmogrifier/ssa.py
+--- a/src/transmogrifier/ssa.py
++++ b/src/transmogrifier/ssa.py
+@@ -1608,13 +1608,26 @@
+         if not self.column_value_ids:
+             raise ValueError("an SSA sequence requires at least one data column")
+         if self.heap_owner_value_id is not None:
+-            if int(self.heap_owner_value_id) < 0 or int(self.heap_owner_value_id) in storage_ids:
++            physical_ids = (*storage_ids, self.status_address_id, self.live_flags_value_id)
++            if int(self.heap_owner_value_id) < 0 or int(self.heap_owner_value_id) in physical_ids:
+                 raise ValueError("heap owner must be a distinct non-negative storage identity")
++            # Runtime arena replacement writes capacity while length remains
++            # live. Aliasing these cells (or a pointer column) destroys that
++            # contract; fixed borrowed keyed views may still alias them.
++            counters = (int(self.length_address_id), int(self.capacity_value_id))
++            if counters[0] == counters[1] or set(counters) & set(self.column_value_ids):
++                raise ValueError("heap sequence length/capacity must be distinct from each other and columns")
+             if len(self.column_dtypes) != len(self.column_value_ids):
+                 raise ValueError("heap columns require explicit element layouts")
+             from .dtype_layout import layout_for
+-            for dtype in self.column_dtypes:
+-                layout_for(dtype)  # No guessed layout for unresolved elements.
++            column_layouts = {}
++            for value_id, dtype in zip(self.column_value_ids, self.column_dtypes):
++                layout = layout_for(dtype)  # No guessed layout for unresolved elements.
++                if layout.llvm_type == "ptr" or layout.alignment > 8:
++                    raise ValueError("heap sequence requires fixed-width native element storage")
++                incumbent = column_layouts.setdefault(int(value_id), layout)
++                if incumbent != layout:
++                    raise ValueError("aliased heap columns disagree about element layout")
+         if self.column_dtypes and len(self.column_dtypes) != len(
+             self.column_value_ids
+         ):
+diff --git a/src/compiler/sequence_storage_binding.py b/src/compiler/sequence_storage_binding.py
+--- a/src/compiler/sequence_storage_binding.py
++++ b/src/compiler/sequence_storage_binding.py
+@@ -199,6 +199,17 @@
+         != (getattr(caller_sequence, "heap_owner_value_id", None) is None)
+     ):
+         return False
++    if getattr(callee_sequence, "heap_owner_value_id", None) is not None:
++        # A ptr-cell ABI alone cannot prove its pointee layout. Otherwise an
++        # int64 arena binds to a float64 arena with every LLVM formal still
++        # spelling ptr, and the wrong contract escapes scalar type checking.
++        from ..transmogrifier.dtype_layout import layout_for
++        if tuple(map(layout_for, callee_sequence.column_dtypes)) != tuple(
++            map(layout_for, caller_sequence.column_dtypes)
++        ) or (callee_sequence.column_shapes or ((),) * len(callee_sequence.column_value_ids)) != (
++            caller_sequence.column_shapes or ((),) * len(caller_sequence.column_value_ids)
++        ):
++            return False
+     provisional_targets = set(map(int, provisional_targets))
+ 
+     def bind(callee_id: int, caller_id: int) -> None:
+diff --git a/src/compiler/ssa_heap_allocation.py b/src/compiler/ssa_heap_allocation.py
+--- a/src/compiler/ssa_heap_allocation.py
++++ b/src/compiler/ssa_heap_allocation.py
+@@ -13,6 +13,7 @@
+ 
+ 
+ HEAP_RELEASE_SYMBOL = "turing_heap_release"
++HEAP_COPY_SYMBOL = "llvm.memmove.p0.p0.i64"
+ 
+ 
+ def require_heap_owner(owner: SSAValue) -> None:
+@@ -23,12 +24,14 @@
+ 
+ def validate_heap_allocation(instruction: Instr):
+     """Read the one allocation contract without editing it during emission."""
+-    if instruction.attributes.get("allocation_kind") != "owned_heap" or len(instruction.args) != 2:
++    if (instruction.op != Handler.Alloca.value
++            or instruction.attributes.get("allocation_kind") != "owned_heap"
++            or len(instruction.args) != 2):
+         raise ValueError("Alloca requires an explicit owned-heap allocation contract")
+     count, owner = instruction.args
+     require_heap_owner(owner)
+     count_layout = layout_for(count.dtype)
+-    if count_layout.kind not in {"int", "uint"} or tuple(count.shape or ()):
++    if count_layout.kind not in {"int", "uint"} or count_layout.byte_size > 8 or tuple(count.shape or ()):
+         raise ValueError("heap count must be an integer scalar")
+     layout = layout_for(instruction.attributes["element_dtype"])
+     if layout.llvm_type == "ptr" or layout.alignment > 8:
+@@ -49,7 +52,7 @@
+     layout = layout_for(element_dtype)  # Strict: unknown never defaults to double.
+     require_heap_owner(owner)
+     count_layout = layout_for(count.dtype)
+-    if count_layout.kind not in {"int", "uint"} or tuple(count.shape or ()):
++    if count_layout.kind not in {"int", "uint"} or count_layout.byte_size > 8 or tuple(count.shape or ()):
+         raise ValueError("heap count must be an integer scalar")
+     if layout.llvm_type == "ptr" or layout.alignment > 8:
+         raise ValueError("heap element layout must be fixed-width and aligned at most 8")
+@@ -79,3 +82,44 @@
+     return Instr(Handler.Call.value, [owner], None, attributes={
+         "callee": HEAP_RELEASE_SYMBOL, "native_heap_abi": "release_owner",
+     })
++
++
++def validate_heap_copy(instruction: Instr):
++    """Read a typed element transfer between existing native arena cells."""
++    if (instruction.op != Handler.Call.value or instruction.res is not None
++            or instruction.attributes.get("callee") != HEAP_COPY_SYMBOL
++            or instruction.attributes.get("native_heap_abi") != "copy_elements"
++            or len(instruction.args) != 3):
++        raise ValueError("heap copy requires destination, source, count and no result")
++    destination, source, count = instruction.args
++    count_layout = layout_for(count.dtype)
++    if count_layout.kind not in {"int", "uint"} or count_layout.byte_size > 8 or tuple(count.shape or ()):
++        raise ValueError("heap copy count must be an integer scalar")
++    layouts = []
++    for value in (destination, source):
++        accounting = value.accounting or {}
++        if str(value.dtype) != "ptr" or tuple(value.shape or ()):
++            raise ValueError("heap copy requires native arena pointer cells, not opaque handles")
++        owner_id = accounting.get("heap_owner_value_id")
++        if not isinstance(owner_id, int) or isinstance(owner_id, bool) or owner_id < 0:
++            raise ValueError("heap copy arena lacks its allocation owner identity")
++        layout = layout_for(accounting.get("heap_element_dtype"))
++        if layout.llvm_type == "ptr" or layout.alignment > 8:
++            raise ValueError("heap copy requires fixed-width element storage")
++        layouts.append(layout)
++    if layouts[0] != layouts[1]:
++        raise ValueError("heap copy source and destination element layouts disagree")
++    return destination, source, count, layouts[0]
++
++
++def heap_copy(count: SSAValue, source: SSAValue, destination: SSAValue) -> Instr:
++    """Copy elements byte-exactly; the caller proves both live extents.
++
++    Counts are elements, never guessed bytes. This is the existing native
++    memory-transfer ABI, not object graph copying or handle dereferencing.
++    Memmove also keeps an explicitly aliased transfer well-defined.
++    """
++    instruction = Instr(Handler.Call.value, [destination, source, count], None,
++        attributes={"callee": HEAP_COPY_SYMBOL, "native_heap_abi": "copy_elements"})
++    validate_heap_copy(instruction)
++    return instruction
+diff --git a/src/compiler/ssa_llvm_backend.py b/src/compiler/ssa_llvm_backend.py
+--- a/src/compiler/ssa_llvm_backend.py
++++ b/src/compiler/ssa_llvm_backend.py
+@@ -884,6 +884,9 @@
+     **_intrinsic_declarations_from_templates(_BINARY, _UNARY),
+     "llvm.memcpy.p0.p0.i64": (
+         "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)"
++    ),
++    "llvm.memmove.p0.p0.i64": (
++        "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1 immarg)"
+     ),
+     # Zero fills reach this from the BACKWARD side: the derivative of any
+     # step-like operation is zero almost everywhere, and the authored rule
+@@ -3343,6 +3346,32 @@
+                 # call must not serve reads after it.
+                 register_cache.clear()
+                 symbol = str(callee)
++                if instruction.attributes.get("native_heap_abi") == "copy_elements":
++                    from .ssa_heap_allocation import validate_heap_copy, HEAP_COPY_SYMBOL
++                    try:
++                        destination, source, count_value, layout = validate_heap_copy(instruction)
++                    except (KeyError, ValueError) as error:
++                        shortfalls.append(LLVMEmissionShortfall(name, symbol, str(error)))
++                        continue
++                    count = load_as(count_value, "i64", f"heap.copy.count.{tag}")
++                    prefix = f"heap.copy.{tag}"
++                    maximum = (2**63 - 1 - 8) // layout.byte_size
++                    source_address = load_as(source, "ptr", f"heap.copy.source.{tag}")
++                    destination_address = load_as(destination, "ptr", f"heap.copy.destination.{tag}")
++                    body.extend((
++                        f"  %{prefix}.valid = icmp ule i64 {count}, {maximum}",
++                        f"  br i1 %{prefix}.valid, label %{prefix}.ready, label %{prefix}.failure",
++                        f"{prefix}.failure:",
++                        "  call void @llvm.trap()",
++                        "  unreachable",
++                        f"{prefix}.ready:",
++                        f"  %{prefix}.bytes = mul i64 {count}, {layout.byte_size}",
++                        f"  call void @{HEAP_COPY_SYMBOL}(ptr {destination_address}, ptr {source_address}, "
++                        f"i64 %{prefix}.bytes, i1 false)",
++                    ))
++                    block_exit_label[active_block] = f"{prefix}.ready"
++                    register_cache.clear()
++                    continue
+                 from .ssa_heap_allocation import HEAP_RELEASE_SYMBOL, require_heap_owner
+                 if instruction.attributes.get("native_heap_abi") == "release_owner":
+                     try:
+diff --git a/src/compiler/identity_concordance.py b/src/compiler/identity_concordance.py
+--- a/src/compiler/identity_concordance.py
++++ b/src/compiler/identity_concordance.py
+@@ -2734,6 +2734,15 @@
+                             None if instruction.res is None else int(instruction.res.id),
+                             f"{block_name}#{index}: {error}",
+                         ))
++                if attributes.get("native_heap_abi") == "copy_elements":
++                    from .ssa_heap_allocation import validate_heap_copy
++                    try:
++                        validate_heap_copy(instruction)
++                    except (KeyError, ValueError) as error:
++                        found.append(Finding(
++                            "heap-copy-contract", name, None,
++                            f"{block_name}#{index}: {error}",
++                        ))
+                 if attributes.get("keyed_lookup_owner") is None:
+                     continue
+                 for position, argument in enumerate(instruction.args[:4]):
+

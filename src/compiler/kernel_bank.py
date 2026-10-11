@@ -620,7 +620,7 @@ class KernelBank:
                 entry for entry in fortran_module.api.entry_points
                 if str(entry.name) == entrypoint
             )
-            return FortranCoreNative(built.executable_path, record)
+            return FortranCoreNative(built.executable_path, record, fortran_module.api)
         if name == "glsl":
             from src.compiler.ssa_glsl_compute_backend import (
                 emit_ssa_module_to_glsl_compute,

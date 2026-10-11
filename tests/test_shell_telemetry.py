@@ -132,6 +132,37 @@ def test_attaching_a_profiler_mirrors_without_replacing():
     detach()
 
 
+def test_profile_summary_survives_log_eviction_and_dataframe_is_a_late_view():
+    channel = TelemetryChannel(capacity=1)
+    channel.profile('fold', path='compiler/fold', nanoseconds=2_000_000, function='first')
+    channel.profile('fold', path='compiler/fold', nanoseconds=3_000_000,
+                    function='slow', failed=True)
+    channel.log('evicts every raw timing record')
+    assert channel.of_kind(PROFILE) == ()
+    row, = channel.profile_summary()
+    assert row['calls'] == 2 and row['seconds'] == 0.005
+    assert row['mean_seconds'] == 0.0025 and row['failed_calls'] == 1
+    assert row['slowest_function'] == 'slow'
+    import pytest
+    pytest.importorskip('pandas')
+    frame = channel.profile_dataframe()
+    assert frame.loc[0, 'seconds'] == 0.005
+    assert 'not additive' in frame.attrs['timing_semantics']
+
+
+def test_real_deployment_profiler_cpu_ms_reaches_telemetry_as_nanoseconds():
+    from src.compiler.deployment_profiler import DeploymentProfiler
+    profiler = DeploymentProfiler(enabled=True)
+    channel = TelemetryChannel()
+    detach = attach_profiler(profiler, channel)
+    profiler.record(path='root', section='planning', label='fold', cpu_ms=12.5)
+    assert channel.profile_summary()[0]['seconds'] == 0.0125
+    profiler.enabled = False
+    profiler.record(path='root', section='planning', label='fold', cpu_ms=99)
+    assert channel.profile_summary()[0]['calls'] == 1
+    detach()
+
+
 def test_a_launch_profile_lands_on_the_same_timeline():
     class Launch:
         shell_ns, device_ns, host_ns, status, language = 500, 200, 300, 0, "wasm"
@@ -140,6 +171,23 @@ def test_a_launch_profile_lands_on_the_same_timeline():
     record_launch_profile(channel, Launch(), path="root")
     detail = channel.of_kind(PROFILE)[0].detail
     assert detail["nanoseconds"] == 500 and detail["device_ns"] == 200
+
+
+def test_deployment_dataframe_is_a_view_of_existing_window_not_another_profiler():
+    import pytest
+    pytest.importorskip('pandas')
+    from src.compiler.deployment_profiler import DeploymentProfiler
+    profiler = DeploymentProfiler(enabled=True)
+    empty = profiler.summary_dataframe()
+    assert 'cpu_mean_ms' in empty.columns and empty.attrs['frames'] == 0
+    profiler.history.append({'sequence': 1, 'total_ms': 7.0, 'rows': ({
+        'path': 'root', 'section': 'planning', 'label': 'fold',
+        'calls': 2, 'cpu_ms': 5.0, 'gpu_ms': 0.0, 'dispatches': 0},)})
+    frame = profiler.summary_dataframe(window=1)
+    assert frame.loc[0, 'cpu_mean_ms'] == 5.0
+    assert frame.loc[0, 'calls_mean'] == 2
+    assert frame.attrs['total_mean_ms'] == 7.0
+    assert profiler.summary(window=1)['rows'][0]['cpu_mean_ms'] == 5.0
 
 
 def test_shortfalls_are_errors_not_a_separate_report():

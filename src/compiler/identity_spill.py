@@ -75,6 +75,7 @@ import sys
 import tempfile
 import weakref
 from array import array
+from contextvars import ContextVar
 from dataclasses import dataclass
 from itertools import chain
 from operator import itemgetter
@@ -139,11 +140,15 @@ class Segment:
 
 
 # ------------------------------------------------------------------ pickling
-_LOAD_REGISTRY: Any = None
+# Each read resolves leaves against its own book. A process-global pointer
+# exchanged registries when two workers reloaded different books together;
+# the forced-interleaving spill micro-test could even restore None halfway
+# through another unpickle. This also preserves nested reads' outer registry.
+_LOAD_REGISTRY: ContextVar[Any] = ContextVar("identity_spill_load_registry", default=None)
 
 
 def _registry_object(kind: str, name: str) -> Any:
-    registry = _LOAD_REGISTRY
+    registry = _LOAD_REGISTRY.get()
     table = {
         "page": registry.pages, "stage": registry.stages,
         "transform": registry.transforms, "reason": registry.reasons,
@@ -263,16 +268,15 @@ class BookSpill:
         return segment
 
     def read(self, segment: Segment) -> Any:
-        global _LOAD_REGISTRY
         with open(self.path, "rb") as handle:
             handle.seek(segment.offset)
             data = handle.read(segment.stored)
-        previous, _LOAD_REGISTRY = _LOAD_REGISTRY, self.registry
+        token = _LOAD_REGISTRY.set(self.registry)
         try:
             with lzma.LZMAFile(io.BytesIO(data)) as stream:
                 return pickle.Unpickler(stream).load()
         finally:
-            _LOAD_REGISTRY = previous
+            _LOAD_REGISTRY.reset(token)
 
 
 def _remove_files(*paths: str) -> None:

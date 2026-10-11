@@ -11,6 +11,15 @@ def is_gnu_fortran(compiler: str) -> bool:
     return "gfortran" in Path(compiler).name.casefold()
 
 
+def gnu_lto_flag() -> str:
+    """Use the available hardware threads for GCC's partitioned LTO work.
+
+    This controls build-time jobs, not program-loop concurrency. Bare -flto
+    does not request a job count when the build has no make jobserver.
+    """
+    return f"-flto={max(1, os.cpu_count() or 1)}"
+
+
 def aggressive_fortran_flags(
     compiler: str, *, precision_sections: bool = False,
 ) -> tuple[str, ...]:
@@ -33,7 +42,7 @@ def aggressive_fortran_flags(
     contract = ("-ffp-contract=off",) if precision_sections else ()
     if "gfortran" in name:
         return (
-            "-O3", "-march=native", "-flto", "-funroll-loops",
+            "-O3", "-march=native", gnu_lto_flag(), "-funroll-loops",
             "-fomit-frame-pointer", "-ffree-line-length-none", *contract,
         )
     if name.startswith(("ifx", "ifort")):
@@ -53,7 +62,7 @@ def aggressive_c_flags(fortran_compiler: str) -> tuple[str, ...]:
 
     if is_gnu_fortran(fortran_compiler):
         return (
-            "-O3", "-march=native", "-flto", "-funroll-loops",
+            "-O3", "-march=native", gnu_lto_flag(), "-funroll-loops",
             "-fomit-frame-pointer",
         )
     return ("-O3",)
@@ -67,7 +76,7 @@ def standalone_fortran_link_flags(compiler: str) -> tuple[str, ...]:
             "standalone runtime linkage is currently defined only for GNU "
             "Fortran; set standalone=False or add a verified compiler policy"
         )
-    flags = ["-flto", "-static-libgfortran", "-static-libgcc"]
+    flags = [gnu_lto_flag(), "-static-libgfortran", "-static-libgcc"]
     if os.name == "nt":
         # This also selects archive forms of libquadmath and transitive GNU
         # support libraries. Windows system DLLs remain normal OS ABI imports.
