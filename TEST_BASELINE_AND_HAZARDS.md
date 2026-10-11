@@ -1,5 +1,29 @@
 # Test baseline and hazards — read before running any test
 
+2026-10-11 FRESH N4 SOURCE COMPILE VERIFIED:
+User requested: "Nothing is useful to us if you fix it in ir, that is never okay, so please verify the source compile works"
+Ran canonical source38c2da32 through unchanged public source compiler:
+python -u tools/compiler_probes/profile_memory_n2.py 4 --backend llvm --save-ssa
+TraceFalse, serial source lane, O3; no timeout, job termination, saved-IR
+input, diagnostic transplantation, or post-lowering repair. All four stale
+law pieces rebuilt against these compiler sources. Process34060 exited0.
+PROBE_ELAPSED458.310s (7m38.3s including imports/profiling/stale leaf builds).
+Combined source stage times total260.172s (4m20.2s); compile boundaries
+178.7->443.5s (264.8s). Peak progress-sampled6143MiB; observed OS peak6.67GiB.
+Source-generated output:
+C:/dev/Powershell/turing/build/profile_rules_4_llvm_d96c6ueg
+repository-ssa.pkl190157673 bytes; emitted LLVM4152280 bytes,
+native step_3__dt_system_over.dll282624 bytes (plus import lib/debug symbols).
+LLVM sha2560dcc132c36881f6e9d53bb927c82d462abb8fc6c29efbb085afbf529e72b3e5e;
+996 functions. The native build refused no shortfalls.
+Read-only audit of this FRESH public-lowerer result:14725 rows/996 functions/
+0 structural findings,11.719s;60383 unsourced facts/468 unposted identities
+still OPEN. No compiler editing or IR changes were used for this audit.
+This supersedes the earlier "fresh N4 remains unverified" receipt below.
+Four SOURCE-TO-NATIVE BUILD now passes. Numerical dt execution/parity was
+not run; eight/all35 have not been tested on this source state.
+Source-and-SSA paging and ordinary-main worker parallelism remain unfinished.
+
 2026-10-11 N4 COMPLETE ERROR CENSUS / SOURCE FIXES (patch35):
 Authorized N4 run at aa18da80 still failed:496.725s including four stale
 leaf rebuilds; source-to-SSA completed. Saved190,213,415-byte repository-ssa.pkl
