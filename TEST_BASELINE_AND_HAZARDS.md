@@ -1,5 +1,14 @@
 # Test baseline and hazards — read before running any test
 
+LOCAL GIT INTEGRATION COMPLETE: Turing main compiler commit a4548f89 contains
+the preserved compiler foundations,32 repair/probe patches, tests and profiling.
+Root coordination map committed9fc96c9; shared guestbook/todo initial receipt
+committed9f424ba. No remote push. Unrelated pre-existing edits/artifacts remain
+unstaged. New Turing worktrees must use its own main, not the parent's branch.
+Matching native storage-effects assets also refreshed/load-only verified in
+benchmark2bffc361c6871181b735265c159e5a7e and repair9df7d0019cc11278dabb98ecc246b46e;
+all three have the same1690/188 audit and1116 unsourced facts OPEN.
+
 FINAL VERIFICATION (2026-10-11): combined affected+telemetry gate653 passed
 361.18s, zero failures/skips/exclusions; final profiling-only gate60 passed
 3.77s (includes two tests added after combined collection). Third-party cffi
