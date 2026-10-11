@@ -45153,8 +45153,12 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     table and actual work counters below it; stage order is not percent progress.
     This summary excludes backend emission/build. Partitioned compilation uses
     its existing per-unit manifest timings instead of this monolithic summary.
+    ``progress_renderer=`` (auto/rich/tqdm, or TURING_COMPILE_RENDERER) chooses
+    the terminal renderer. Auto prefers an installed Rich Live compositor;
+    headless runs do not import it. The measured telemetry is unchanged.
     """
     _collect_profile = kwargs.pop("compile_profile", True)
+    _progress_renderer = kwargs.pop("progress_renderer", None)
     partitioned_directory = kwargs.pop("partitioned_directory", None)
     partitioned_options = kwargs.pop("partitioned_options", {})
     if partitioned_directory is not None:
@@ -45200,7 +45204,8 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     # that deliberately wants silence can pass ``lambda _message: None``.
     # Off, ``progress`` is the caller's callback or the plain ``[compiler]``
     # line, exactly as before; on, it writes below-the-bars via tqdm.write.
-    _bars = compile_progress(kwargs.pop("progress_bars", None), collect_profile=_collect_profile)
+    _bars = compile_progress(kwargs.pop("progress_bars", None), collect_profile=_collect_profile,
+                             renderer=_progress_renderer)
     kwargs["progress"] = _bars.progress_callback(kwargs.get("progress"))
 
     from .graph_work import ensure_graph_foundation

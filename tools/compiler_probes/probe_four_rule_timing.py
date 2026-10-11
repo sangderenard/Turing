@@ -145,7 +145,13 @@ def main():
             if "complete; functions=" in str(message):
                 phases["combined_ssa_seconds"] = now - before
             if now - last_print[0] >= 20 or str(message).startswith("ssa-source:"):
-                print(f"[N4 +{now - started:.1f}s] {message}", file=sys.__stdout__, flush=True)
+                from src.compiler.shell_telemetry import active_compile_progress
+                display = active_compile_progress()
+                line = f"[N4 +{now - started:.1f}s] {message}"
+                if display is not None and display.enabled:
+                    display.log(line)
+                else:
+                    print(line, file=sys.__stdout__, flush=True)
                 last_print[0] = now
 
         kwargs["progress"] = progress

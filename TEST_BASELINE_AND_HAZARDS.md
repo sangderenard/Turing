@@ -1,5 +1,29 @@
 # Test baseline and hazards — read before running any test
 
+2026-10-11 ONE-OWNER TERMINAL DISPLAY (patch33 compiler_live_display.patch):
+Auto uses installed Rich14.3.3 Live; optional progress_renderer=auto/rich/tqdm
+or TURING_COMPILE_RENDERER. No dependency installed; no Rich import headless.
+One redraw owner composes timing table, stage status and measured work bars;
+logs/stdout/stderr scroll above it. Existing heartbeat, no second refresh
+thread. Resize collapses rows/compact view; active stage survives20x6. All
+timings/counters remain in the existing summary even when rows are hidden.
+Ctrl+C and drawing faults restore streams; failures degrade to plain logs.
+N4 probe heartbeat now uses the active renderer instead of bypassing through
+sys.__stdout__. Installed in canonical live and both existing copied compilers.
+Baseline60 passed2.88s; final UI/telemetry/fixed-point gate73 passed3.67s;
+broader UI+pythonic-control+scalar gate127 passed254.44s. Cffi warning retained.
+VT hide/clear/restore and resize tested explicitly (command harness TERM=dumb
+otherwise disables cursor control). No interactive Windows screen capture.
+Matching storage-effects assets refreshed/load-only verified: live066b79899d6a71495dd9a34c5f59669a,
+benchmark0930a4b9fc7e9cf642990f12012aefb1, repair2e13a919a0842dbc23b89e3fdda6c667.
+Each audit1690 rows/188 functions/0 structural findings;1116 unsourced facts OPEN.
+User N4 failure subsequently received: combined source lowering350.81s, full
+probe658.981s, peak6.11GB; emission refuses four sequence-replace Phi widths
+and a span Cast without extents. Error prints FIRST FIVE shortfalls only;
+not proof there are only five. No saved SSA in the named build directory.
+That native failure is separate from successful display/telemetry verification.
+
+
 LOCAL GIT INTEGRATION COMPLETE: Turing main compiler commit a4548f89 contains
 the preserved compiler foundations,32 repair/probe patches, tests and profiling.
 Root coordination map committed9fc96c9; shared guestbook/todo initial receipt

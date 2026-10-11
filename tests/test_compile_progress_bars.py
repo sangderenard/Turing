@@ -625,6 +625,7 @@ def test_with_real_tqdm_lines_scroll_above_the_bars(monkeypatch):
     stream = io.StringIO()
     layer = CompileProgress(
         enabled=True, stages=FAKE_STAGES, stream=stream, heartbeat=None,
+        renderer="tqdm",
         rss=lambda: GIB, nested_delay=0.0, min_interval=0.0,
     )
     with layer:

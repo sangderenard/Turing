@@ -920,6 +920,200 @@ class _CompileBars:
         self.main = None
 
 
+class _CompileLive(_CompileBars):
+    """One Rich Live owns cursor movement for timing rows and work bars.
+
+    Reuses the channel dispatcher and RSS sampler; never starts Progress's
+    own Live or another refresh thread. Logs (including ordinary print)
+    scroll above the complete frame, not between independently placed bars.
+    """
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        from rich.console import Console, Group
+        from rich.live import Live
+        from rich.progress import BarColumn, Progress, ProgressColumn, TextColumn
+        from rich.table import Column, Table
+        from rich.text import Text
+
+        class MeasuredBar(ProgressColumn):
+            def render(self, task):
+                return Text("") if task.total is None else BarColumn(bar_width=None).render(task)
+
+        self.console = Console(file=owner.stream, markup=False, highlight=False)
+        self.Group, self.Table, self.Text, self.Live = Group, Table, Text, Live
+        self.progress = Progress(
+            TextColumn("{task.description}", markup=False,
+                       table_column=Column(ratio=2, overflow="ellipsis", no_wrap=True)),
+            MeasuredBar(),
+            TextColumn("{task.fields[count]}", markup=False),
+            console=self.console, auto_refresh=False, expand=True,
+            get_time=owner.clock,
+        )
+        self.tasks: dict[str, Any] = {}
+        self.live = None
+        self.finished = False
+        self.failed = False
+        self._last_render_at = float("-inf")
+
+    def _frame(self):
+        self._rss()
+        summary = self.owner.summary()
+        status = (f"compile FAILED in {self.owner.stages[self.stage_index].label}" if self.failed
+                  else f"compile done ({len(self.owner._stage_profiles)} timed stages)" if self.finished
+                  else self._stage_desc())
+        status += ": " + self._main_postfix()
+        if self.finished:
+            status += f", peak {self.peak_rss / _GIB:.2f}GB"
+        available = max(2, self.console.height - 4)  # reserve room for scrolling logs
+        tasks = list(self.tasks.values())
+        if self.console.width < 55 or available < 6:
+            active = summary["stages"][self.stage_index]
+            compact_status = ("FAILED " if self.failed else "done " if self.finished else "")
+            compact_status += active["label"]
+            # At 20 columns the stage-order prefix used to hide the actual
+            # active stage. Give the operation's name first claim on width.
+            lines = [self.Text(compact_status, overflow="ellipsis", no_wrap=True),
+                     self.Text(f"{active['state']} | wall {active['seconds']:.2f}s | "
+                               f"rss {active['rss_bytes'] / _GIB:.2f}GB", no_wrap=True)]
+            if tasks and available > 2:
+                task = self.progress.tasks[-1]
+                lines.append(self.Text(f"{task.description}: {task.fields['count']}",
+                                       overflow="ellipsis", no_wrap=True))
+            return self.Group(*lines)
+
+        work_budget = min(len(tasks), max(1, available // 4))
+        visible_tasks = set(tasks[-work_budget:]) if work_budget else set()
+        for task in self.progress.tasks:
+            task.visible = task.id in visible_tasks
+        hidden_work = len(tasks) - work_budget
+        rows = summary["stages"]
+        budget = max(1, available - work_budget - 4 - int(bool(hidden_work)))
+        if self.finished:
+            budget = len(rows)  # final frame is ordinary scrollback, not a redraw region
+        priority = [self.stage_index] + [i for i in reversed(range(len(rows)))
+                                        if rows[i]["state"] in {"done", "failed"}]
+        priority += list(range(len(rows)))
+        selected = set(list(dict.fromkeys(priority))[:budget])
+        table = self.Table(title="Compiler timings (wall time)", box=None,
+                           expand=True, pad_edge=False)
+        table.add_column("Stage", ratio=3, overflow="ellipsis", no_wrap=True)
+        table.add_column("State", no_wrap=True)
+        table.add_column("Wall(s)", justify="right", no_wrap=True)
+        table.add_column("RSS(GB)", justify="right", no_wrap=True)
+        for index, row in enumerate(rows):
+            if index in selected:
+                table.add_row(self.Text(row["label"]), row["state"],
+                              f"{row['seconds']:.2f}", f"{row['rss_bytes'] / _GIB:.2f}")
+        if len(selected) < len(rows):
+            table.caption = f"{len(rows) - len(selected)} stages hidden; full summary retained"
+        parts = [table, self.Text(status, overflow="ellipsis", no_wrap=True)]
+        if tasks:
+            parts.append(self.progress)
+        if hidden_work:
+            parts.append(self.Text(f"+{hidden_work} other active counters; summary retains all"))
+        return self.Group(*parts)
+
+    def _start(self):
+        self.finished = self.failed = False
+        self.stage_index = 0
+        self.stage_started = self.owner._stage_started
+        self.live = self.Live(self._frame(), console=self.console,
+                              auto_refresh=False, redirect_stdout=True,
+                              redirect_stderr=True, vertical_overflow="crop")
+        self.live.start(refresh=True)
+        self._last_render_at = self.owner.clock()
+
+    def _write(self, text):
+        if self.failure is None:
+            self.console.print(self.Text(f"{self.owner.prefix}{text}"))
+        else:
+            print(f"{self.owner.prefix}{text}", file=self.owner.stream, flush=True)
+
+    def _close_nested(self, keep=()):
+        for key in tuple(self.tasks):
+            if key not in keep:
+                self.progress.remove_task(self.tasks.pop(key))
+
+    def _stage(self, record):
+        self._close_nested()
+        self.stage_index = int(record.detail["index"])
+        self.stage_started = float(record.detail["started"])
+        self.substage = ""
+        self.heartbeat(force=True)
+
+    def _count(self, record):
+        detail = record.detail
+        key = str(detail["key"])
+        if detail.get("close"):
+            if key in self.tasks:
+                self.progress.remove_task(self.tasks.pop(key))
+        else:
+            total, done = detail.get("bar_total"), int(detail["done"])
+            count = (f"{done}/{total} ({done / total:.0%})" if total else
+                     f"{done} completed" if total is None else f"{done}/0")
+            label = record.message + (f" — {detail['detail']}" if detail.get("detail") else "")
+            if key not in self.tasks:
+                self.tasks[key] = self.progress.add_task(label, total=total, completed=done, count=count)
+            else:
+                self.progress.update(self.tasks[key], description=label,
+                                     total=total, completed=done, count=count)
+        self.heartbeat()
+
+    def heartbeat(self, *, force=False):
+        # Same owner -> renderer lock order as event handling; Rich has no
+        # refresh thread holding a Console lock while requesting owner data.
+        with self.owner._lock, self.lock:
+            if self.live is None or self.failure is not None:
+                return
+            now = self.owner.clock()
+            if force or now - self._last_render_at >= 0.1:
+                try:
+                    self.live.update(self._frame(), refresh=True)
+                    self._last_render_at = now
+                except Exception as error:
+                    self._disable(error)
+
+    def _disable(self, error):
+        self.failure = f"{type(error).__name__}: {error}"
+        try:
+            if self.live is not None:
+                self.live.stop()
+        except Exception:
+            pass
+        finally:
+            self.live = None
+        print(f"{self.owner.prefix}live display disabled: {self.failure}",
+              file=self.owner.stream, flush=True)
+
+    def _end(self, record):
+        self._close_nested()
+        self.finished = True
+        self.failed = bool(record.detail.get("failed"))
+        if self.live is not None:
+            try:
+                self.heartbeat(force=True)
+            finally:
+                if self.live is not None:
+                    try:
+                        self.live.stop()
+                    finally:
+                        self.live = None
+
+    def __call__(self, record):
+        with self.owner._lock, self.lock:
+            if self.failure is not None:
+                if record.kind == LOG:
+                    self._write(record.message)
+                return
+            try:
+                self._dispatch(record)
+            except Exception as error:
+                self._disable(error)
+                if record.kind == LOG:
+                    self._write(record.message)
+
+
 _ACTIVE_COMPILE_PROGRESS: contextvars.ContextVar = contextvars.ContextVar(
     "turing_compile_progress", default=None
 )
@@ -955,10 +1149,23 @@ class CompileProgress:
         prefix: str = COMPILE_LINE_PREFIX,
         timing_table: bool = True,
         collect_profile: bool = False,
+        renderer: str | None = None,
     ):
         self.stages = tuple(stages)
         self.enabled = bool(enabled) and bool(self.stages)
-        if self.enabled and tqdm_class is None:
+        import os
+        requested_renderer = renderer or os.environ.get("TURING_COMPILE_RENDERER", "auto")
+        if requested_renderer not in {"auto", "rich", "tqdm"}:
+            raise ValueError("compile renderer must be auto, rich or tqdm")
+        self.renderer = "tqdm"
+        if self.enabled and (requested_renderer == "rich" or
+                             (requested_renderer == "auto" and tqdm_class is None)):
+            try:
+                from rich.live import Live
+                self.renderer = "rich"
+            except ImportError:
+                pass
+        if self.enabled and self.renderer == "tqdm" and tqdm_class is None:
             try:
                 from tqdm import tqdm as tqdm_class
             except ImportError:
@@ -991,7 +1198,7 @@ class CompileProgress:
                 name="compile-progress", capacity=1024, kinds=(LOG, PROGRESS, PROFILE)
             )
         if self.enabled:
-            self.bars = _CompileBars(self)
+            self.bars = _CompileLive(self) if self.renderer == "rich" else _CompileBars(self)
             self.channel.subscribe(self.bars)
 
     # -- lifecycle -------------------------------------------------------------
@@ -1089,6 +1296,9 @@ class CompileProgress:
             return inner if inner is not None else _plain_compiler_line
         if inner is None:
             return self.log
+        if self.renderer == "rich":
+            # Live owns stdout/stderr redirection for the whole compile.
+            return inner
 
         def routed(message: str) -> None:
             sink = _TqdmLineFile(self.tqdm_class, self.stream)
@@ -1150,6 +1360,7 @@ class CompileProgress:
                                         else prior["total"] + value["total"],
                                "label": value["label"]}
             return {"stages": rows, "work": work,
+                    "renderer": self.renderer if self.enabled else "none",
                     "profiles": () if self.channel is None else self.channel.profile_summary(),
                     "timing_semantics": "inclusive wall time; stage order is not percent progress"}
 
