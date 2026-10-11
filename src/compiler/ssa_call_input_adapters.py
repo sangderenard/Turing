@@ -17,6 +17,29 @@ from ..transmogrifier.ssa import Instr, SSAValue
 _NUMERIC_DTYPES = {'bool', 'int32', 'int64', 'float32', 'float64'}
 
 
+def call_input_rank_updates(callee, actual, formal, *, by_value_kernel_formal=False):
+    """Rank updates for one already-bound call edge; the caller posts changes."""
+    # N4 advance_pieces region111 converts scalar int64 zero to double for
+    # index_assign_double's %values pointer. A shared repository kernel's
+    # buffer formal may also receive spans from other calls; its shape is
+    # not a shape equality with this caller's scalar. Copying rank1 onto
+    # that Cast invented a span with no extent origin. The declared kernel
+    # ABI owns pointer/value transport, while each actual owns its axes.
+    if (callee.metadata or {}).get('llvm_argument_names'):
+        return ()
+    def rank(value):
+        return max(
+            len(tuple(value.shape or ())),
+            int((value.accounting or {}).get('program_abi_rank', 0) or 0),
+            int((value.accounting or {}).get('ssa_call_rank', 0) or 0),
+        )
+    actual_rank, formal_rank = rank(actual), rank(formal)
+    call_rank = 0 if by_value_kernel_formal else max(actual_rank, formal_rank)
+    return tuple((value, call_rank) for value, own_rank in (
+        (actual, actual_rank), (formal, formal_rank),
+    ) if own_rank != call_rank and call_rank != 0)
+
+
 def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
     """Restore exact region-feed views after result projection rewiring.
 
@@ -700,6 +723,28 @@ def _adapt_physical_call_inputs_round(
                         # integer's bytes as a double.  Physical/program ABI
                         # storage remains immutable and follows the stricter
                         # region rule below.
+                        logical_pointer_scalar_conversion = bool(
+                            not actual.shape
+                            and not accounting.get('program_abi_storage')
+                            and not accounting.get('physical_dtype')
+                            and int(actual.id) not in caller_formals
+                            and int(accounting.get('program_abi_rank') or 0) == 0
+                            and int(accounting.get('ssa_call_rank') or 0) == 0
+                            and accounting.get('program_abi_storage') not in {'span', 'table', 'keyed'}
+                            and not accounting.get('sequence_arena')
+                            and 'sequence_row_shape' not in accounting
+                            and formal.dtype == 'ptr'
+                            and source_dtype in numeric
+                            and target_dtype in numeric
+                            and source_dtype != target_dtype
+                            and not _call_writes_argument(instruction, index)
+                            and read_only(callee, formal.id)
+                        )
+                        # Authored `array[2] = False` produces a local bool
+                        # Const, not a caller formal or an explicitly physical
+                        # slot. The pointer contract still requires a VALUE
+                        # conversion to its inferred double element type;
+                        # without it C/LLVM read eight bytes from a bool slot.
                         logical_scalar_conversion = bool(
                             not actual.shape
                             and not formal.shape
@@ -741,7 +786,7 @@ def _adapt_physical_call_inputs_round(
                             or _call_writes_argument(instruction, index)
                             or not read_only(callee, formal.id)
                         )
-                        if not logical_scalar_conversion and not physical_conversion:
+                        if not (logical_scalar_conversion or logical_pointer_scalar_conversion or physical_conversion):
                             continue
                         # Only numerical scalar representation changes belong
                         # here. Records, references and string tokens are not
@@ -762,14 +807,14 @@ def _adapt_physical_call_inputs_round(
                                 'call_input_conversion': (caller.name, int(actual.id), callee.name, int(formal.id)),
                                 'call_input_conversion_kind': (
                                     'read_only_scalar_numeric'
-                                    if logical_scalar_conversion
+                                    if logical_scalar_conversion or logical_pointer_scalar_conversion
                                     else 'physical_region'
                                 )})
                         conversion_attributes = {
                             'target_dtype': target_dtype,
                             'source_dtype': source_dtype,
                         }
-                        if logical_scalar_conversion:
+                        if logical_scalar_conversion or logical_pointer_scalar_conversion:
                             conversion_attributes['concordant_call_input_conversion'] = True
                         else:
                             conversion_attributes['physical_region_input_conversion'] = True
@@ -791,7 +836,7 @@ def _adapt_physical_call_inputs_round(
                             'target_dtype': str(target_dtype),
                             'kind': (
                                 'read_only_scalar_numeric'
-                                if logical_scalar_conversion
+                                if logical_scalar_conversion or logical_pointer_scalar_conversion
                                 else 'physical_region'
                             ),
                         }

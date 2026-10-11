@@ -6,6 +6,62 @@ from src.compiler.identity_concordance import concordance_report
 from src.compiler.identity_concordance import CorrelationTable
 
 
+@pytest.mark.parametrize('unresolved_side', ['target', 'source', 'both'])
+def test_capture_audit_reports_unresolved_binding_instead_of_crashing(unresolved_side):
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book, Unresolved, NEW
+    from src.compiler.concordance_declarations import BindingFact
+    from src.transmogrifier.ssa import IRModule
+    book, token = begin_identity_book()
+    try:
+        fact = BindingFact(7, True, (), '')
+        unresolved = Unresolved(NEW)
+        book.page('name_binding').set(('scope', 'target', 0), 0,
+                                      unresolved if unresolved_side in {'target', 'both'} else fact)
+        book.page('name_binding').set(('scope', 'source', 0), 0,
+                                      unresolved if unresolved_side in {'source', 'both'} else fact)
+        book.page('name_binding_capture').set(('scope', 'target', 0), 0, ('source', 0, None))
+        module = IRModule({}, metadata={'identity_book': book})
+        findings = CorrelationTable._name_binding_capture_findings(module)
+        assert len(findings) == 1
+        assert findings[0].kind == 'name-binding-capture-disagreement'
+        assert 'Unresolved' in findings[0].detail
+    finally:
+        end_identity_book(token)
+
+
+@pytest.mark.parametrize('already_removed', [False, True])
+def test_removed_binding_retires_its_capture_with_the_same_provenance(already_removed):
+    from types import SimpleNamespace
+    import networkx as nx
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book, Unresolved
+    from src.compiler.concordance_declarations import BindingFact, BINDING_VERSION_REMOVED
+    from src.compiler.planner_concordance_posts import _post_identity_table_mutation
+    from src.transmogrifier.ssa import IRModule
+    book, token = begin_identity_book()
+    try:
+        graph = SimpleNamespace(G=nx.DiGraph())
+        graph.G.graph['lexical_read_scope'] = ('scope', 0)
+        scope = ('scope', 0)
+        for name in ('target', 'source'):
+            book.page('name_binding').set((scope, name, 0), 0,
+                Unresolved(BINDING_VERSION_REMOVED) if already_removed
+                else BindingFact(310, True, (), ''))
+        row = (scope, 'target', 0)
+        book.page('canonical_value').set((scope, 310), 0, ('removed',))
+        book.page('name_binding_capture').set(row, 0, ('source', 0, None))
+        _post_identity_table_mutation(graph, removed=(310,))
+        retired = book.page('name_binding_capture').latest(row)
+        assert isinstance(retired, Unresolved) and retired.reason == BINDING_VERSION_REMOVED
+        assert retired.read
+        module = IRModule({}, metadata={'identity_book': book})
+        assert CorrelationTable._name_binding_capture_findings(module) == []
+        history = book.page('name_binding_capture').history(row)
+        _post_identity_table_mutation(graph, removed=(310,))
+        assert book.page('name_binding_capture').history(row) == history
+    finally:
+        end_identity_book(token)
+
+
 @pytest.mark.parametrize('declare_root_types', [False, True])
 def test_controller_audit_preserves_existing_restore_type_contract(declare_root_types):
     namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/audit_identity_concordance.py'))

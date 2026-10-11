@@ -912,8 +912,13 @@ def lower_record_sequence_append_with_child_copy(
     full = builder.block("capacity_exhausted")
     inserted = builder.block("inserted")
     result_block = builder.block("result")
-    zero = builder.const(entry, 0)
-    one = builder.const(entry, 1)
+    # N4 child-copy helpers seeded an int64 loop Phi with the builder's
+    # default int32 zero. Index/length arithmetic is int64 on both edges;
+    # status and live-flag stores retain their separate int/bool contracts.
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
+    status_zero = builder.const(entry, 0)
+    live_one = builder.const(entry, True, dtype="bool")
 
     outer_length_slot = builder.fresh("ptr")
     outer_length = builder.fresh("int64")
@@ -992,7 +997,7 @@ def lower_record_sequence_append_with_child_copy(
         ])
     if pool.live_flags_value_id is not None:
         child_live_address = builder.fresh("ptr")
-        child_live_value = one
+        child_live_value = live_one
         if source.live_flags_value_id is not None:
             source_live_address = builder.fresh("ptr")
             child_live_value = builder.fresh("bool")
@@ -1023,7 +1028,7 @@ def lower_record_sequence_append_with_child_copy(
         builder.emit(publish_child, "GetElementPtr", [
             SSAValue(pool.status_value_id, dtype="int"), outer_length,
         ], child_status_slot)
-        builder.emit(publish_child, "Store", [zero, child_status_slot])
+        builder.emit(publish_child, "Store", [status_zero, child_status_slot])
 
     row_value_iter = iter(row_values)
     for index, column in enumerate(destination_columns):
@@ -1039,7 +1044,7 @@ def lower_record_sequence_append_with_child_copy(
             SSAValue(destination.live_flags_value_id, dtype="bool"),
             outer_length,
         ], live_address)
-        builder.emit(publish_child, "Store", [one, live_address])
+        builder.emit(publish_child, "Store", [live_one, live_address])
     builder.emit(publish_child, "Store", [
         next_outer_length, outer_length_slot,
     ])

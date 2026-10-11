@@ -17889,6 +17889,15 @@ def lower_control_sections_to_ssa(
                         "program_abi_rank", 0
                     ) or 0),
                 )
+                # A selected child span's flat arena does not limit its
+                # logical axes. `selected[:, index]` supplies two exact
+                # index ports on Indexed's base, so its consumer requires
+                # at least rank2 even when the Mapping[str, Tensor] schema
+                # has only the default rank1. Carry that demand on the same
+                # lookup identity into the existing shape concordance.
+                if (instruction.op == "Indexed" and instruction.args
+                        and int(instruction.args[0].id) == value_id):
+                    rank = max(rank, len(instruction.args) - 1)
                 if rank <= 0:
                     continue
                 _post_derived_or_raw(

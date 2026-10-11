@@ -1,5 +1,55 @@
 # Test baseline and hazards — read before running any test
 
+2026-10-11 N4 COMPLETE ERROR CENSUS / SOURCE FIXES (patch35):
+Authorized N4 run at aa18da80 still failed:496.725s including four stale
+leaf rebuilds; source-to-SSA completed. Saved190,213,415-byte repository-ssa.pkl
+at build/profile_rules_4_llvm_wfdofixz. Complete emission census SIX:
+four scalar Casts wrongly promoted to rank1 at pointer-kernel call settlement,
+and two child-copy append int64 Phis seeded with default int32 constants.
+Prior replacement Phis are absent from the complete census.
+Source fixes keep shared kernel pointer transport distinct from actual
+semantic rank; child-copy indices are int64, status int and live flags bool.
+Also fixed authored local bool-to-double pointer input conversion (False
+previously read garbage in both C/LLVM, reproduced on untouched tg-base).
+All native conversions still mint/post through existing concordance causes.
+
+Saved-module audit first crashed on Unresolved bindings. It now reports
+unresolved captures without crashing; the binding-removal writer tombstones
+owned capture claims with derived provenance. N4's five structural findings
+were followed up: two cross-frame result ids misrecorded as local aliases,
+two duplicate sequence-descriptor findings caused by live private extent
+reads not following a proven handle alias, and one retired binding capture.
+Existing retirement operators now use exact return edges/descriptor roles;
+no name-based suppression. Native LLVM tests prove live extent rebinding.
+Adjacent keyed tensor tests no longer select hardcoded region0 and require
+exact row-base/shape/rank feeds; two-axis Indexed ports publish their rank
+demand on the existing lookup shape concordance (real lowering gap fixed).
+
+In-memory DIAGNOSTIC replay on the unchanged saved module:
+one descriptor and two aliases retired; structural audit5->0 on14727 rows/
+996 functions. Replayed prevention of four bad rank posts and regenerated
+two child-copy helpers with the corrected source builder: LLVM shortfalls0,
+complete native build succeeded. Final replay23.485s, artifact directory
+build/n4_saved_ssa_repair_8_ww2w6k. This is NOT a fresh source compile or a
+full dt execution/physics test. Eight/all35 were NOT started. Next fresh
+user N4 command: python -u tools/compiler_probes/profile_memory_n2.py 4 --backend llvm --save-ssa
+Use canonical repo; no trace, timeout, or job termination. Do not claim4 passed
+end-to-end until that source run completes. Main parallelism/paging remain open.
+Saved-book migration remains60507 unsourced facts/468 unposted minted ids,
+latch OPEN; these were not hidden or relabeled as structural success.
+
+Focused gate172 passed84.43s, zero failures/skips; final native live-extent
+regression additionally1 passed1.47s. Cffi deprecation unsuppressed.
+Canonical and both copied compilers/tests synchronized; unrelated files untouched.
+Matching storage-effects products rebuilt and load-only verified:
+live ecd4a6b2c54ed8b047a70f0fa79dbd3a,
+benchmark70daf59e20ba7b1b94d27fcabfbacfdb,
+repairdd182144082e22902246e76c5075b096.
+Each1690 rows/188 functions/0 structural findings/0 unposted ids,
+1116 unsourced facts OPEN.
+
+Prompt history: "All errors need to be fixed"
+
 2026-10-11 N4 EMISSION FOLLOW-UP (patch34 sequence_phi_span_cast_extents.patch):
 Observed N4 first-five negative list: four replacement helper i64 Phis fed
 by i32 zero constants, plus a planned-region span Cast without runtime extent

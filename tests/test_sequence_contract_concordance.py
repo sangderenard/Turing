@@ -267,6 +267,76 @@ def test_finalization_closes_terminal_alias_with_no_surviving_identity():
         end_identity_book(token)
 
 
+def test_sequence_alias_with_live_length_reads_rebinds_all_descriptor_members(tmp_path):
+    from src.transmogrifier.ssa import SSAValue, BasicBlock, Instr
+    from src.compiler.ssa_llvm_backend import compile_artifact, prepare_artifact_execution
+    import numpy as np
+    book, token = begin_identity_book()
+    try:
+        resident = SSASequenceDescriptor(10, (10,), 12, 13, column_dtypes=('int64',))
+        duplicate = SSASequenceDescriptor(20, (10,), 22, 23, column_dtypes=('int64',))
+        values = {i: SSAValue(i, 'int64') for i in (10, 12, 13, 22, 23)}
+        output = SSAValue(30, 'int64')
+        call = Instr('Call', [values[10], values[22], values[23]], output,
+                     attributes={'callee': 'consumer'})
+        function = Function('solve', list(values.values()), {
+            'entry': BasicBlock('entry', [call, Instr('Ret', [output], None)])})
+        sequences = SSASequenceTable(owner='solve', book=book)
+        sequences.register(resident)
+        sequences.register(duplicate)
+        _publish_concordant_function_aliases(function, {20: 10}, provenance='exact_handle')
+        assert _retire_concordant_sequence_aliases(
+            {'solve': function}, {'solve': sequences}, {},
+        ) == 1
+        assert [v.id for v in call.args] == [10, 12, 13]
+        assert sequences.by_id(20) is None
+        assert {v.id for v in function.args} == {10, 12, 13}
+        zero, address, length = SSAValue(31, 'int64'), SSAValue(32, 'ptr'), SSAValue(33, 'int64')
+        consumer = Function('consumer', [SSAValue(10, 'int64'), SSAValue(22, 'int64', (1,)),
+                                         SSAValue(23, 'int64')], {
+            'entry': BasicBlock('entry', [Instr('Const', [], zero, attributes={'value': 0}),
+                Instr('GetElementPtr', [SSAValue(22, 'int64', (1,)), zero], address),
+                Instr('Load', [address], length), Instr('Ret', [length], None)])})
+        from src.transmogrifier.ssa import IRModule
+        module = IRModule({'solve': function, 'consumer': consumer}, sequence_tables={
+            'solve': sequences, 'consumer': SSASequenceTable({20: duplicate}),
+        })
+        artifact = emit_ssa_function_to_llvm(module, 'solve')
+        assert artifact.complete, artifact.shortfalls
+        native = compile_artifact(artifact, directory=tmp_path / 'native')
+        for count in (0, 3, 7):
+            execution = prepare_artifact_execution(native, {
+                10: np.arange(8, dtype=np.int64), 12: np.array([count], dtype=np.int64),
+                13: np.array([8], dtype=np.int64),
+            }).run()
+            assert execution.buffers[30].item() == count
+    finally:
+        end_identity_book(token)
+
+
+def test_finalization_does_not_mistake_callee_output_identity_for_local_alias():
+    from src.transmogrifier.ssa import SSAValue, BasicBlock, Instr
+    book, token = begin_identity_book()
+    try:
+        output = SSAValue(1040, 'float64', (22,))
+        producer = Function('producer', [output], {
+            'entry': BasicBlock('entry', [Instr('Ret', [output], None)])})
+        projected = SSAValue(1041, 'float64', (22,), accounting={
+            'ssa_call_result_from': ('producer', 1040),
+        })
+        function = Function('solve', [], {'entry': BasicBlock('entry', [
+            Instr('Load', [SSAValue(99, 'ptr')], projected),
+            Instr('Ret', [projected], None)])})
+        _publish_concordant_function_aliases(function, {1041: 1040}, provenance='region_output')
+        assert _retire_dead_planning_aliases(
+            {'solve': function, 'producer': producer}, {}, {}, {}, book,
+        ) == 1
+        assert function.metadata['value_aliases'] == {}
+        assert function.blocks['entry'].instrs[-1].args == [projected]
+    finally:
+        end_identity_book(token)
+
+
 def test_output_settlement_keeps_frame_arena_as_physical_resident():
     function = Function("get_state", [], {})
     function.metadata["value_aliases"] = {
@@ -484,11 +554,16 @@ def sample(reading: Reading, key: str):
         instruction
         for block in root.blocks.values()
         for instruction in block.instrs
-        if str(instruction.attributes.get("callee") or "").endswith(
-            "__planned_region_0"
-        )
+        if module.functions.get(str(instruction.attributes.get("callee") or "")) is not None
+        and module.functions[str(instruction.attributes["callee"])].metadata.get("source_region_integral")
+        and any(int(value.id) == int(row_base.id) for value in instruction.args)
     )
-    assert tuple(value.id for value in region_call.args) == (row_base.id,)
+    assert row_base.id in {value.id for value in region_call.args}
+    # Region numbers are planner-local, not an API. Dynamic span consumers
+    # also receive their exact shape/rank operands through this call edge.
+    assert {int(row_base.accounting[key]) for key in (
+        'tensor_shape_value_id', 'tensor_rank_value_id',
+    )} <= {int(value.id) for value in region_call.args}
     assert row_base.shape == ()
     assert row_base.accounting["program_abi_storage"] == "span"
     assert row_base.accounting["program_abi_rank"] == 1
@@ -605,9 +680,9 @@ def sample(reading: Reading, key: str, index: int):
         instruction
         for block in root.blocks.values()
         for instruction in block.instrs
-        if str(instruction.attributes.get("callee") or "").endswith(
-            "__planned_region_0"
-        )
+        if module.functions.get(str(instruction.attributes.get("callee") or "")) is not None
+        and module.functions[str(instruction.attributes["callee"])].metadata.get("source_region_integral")
+        and any(int(value.id) == int(row_base.id) for value in instruction.args)
     )
     region = module.functions[region_call.attributes["callee"]]
     shape_id = int(row_base.accounting["tensor_shape_value_id"])

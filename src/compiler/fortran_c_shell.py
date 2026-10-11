@@ -14600,6 +14600,19 @@ def _retire_concordant_sequence_aliases(
         replacements: dict[int, int] = {}
         private_members: dict[int, set[int]] = {}
 
+        def rebind_member_reads(owner, bindings):
+            residents = {int(value.id): value for value in owner.args}
+            residents.update((int(i.res.id), i.res) for b in owner.blocks.values()
+                             for i in b.instrs if i.res is not None)
+            for block in owner.blocks.values():
+                for instruction in block.instrs:
+                    instruction.args = [
+                        residents.get(int(bindings[int(value.id)]),
+                                      replace(value, id=int(bindings[int(value.id)])))
+                        if int(value.id) in bindings else value
+                        for value in instruction.args
+                    ]
+
         def resident(value_id: int) -> int:
             return int(aliases.get(int(value_id), int(value_id)))
 
@@ -14644,6 +14657,14 @@ def _retire_concordant_sequence_aliases(
             from copy import deepcopy
             trial = deepcopy(function)
             _strip_dead_cell_bookkeeping(trial, stale_private)
+            # N4 sequence555 already concords to sequence162, including its
+            # arena, but live copy calls still read 555's private length.
+            # The exact handle proof owns ALL descriptor roles, not just the
+            # column pointer. Redirect surviving reads before retiring cells;
+            # removable initialization stores above must not reset the owner.
+            member_bindings: dict[int, int] = {}
+            _bind_sequence_storage_members(member_bindings, descriptor, incumbent)
+            rebind_member_reads(trial, member_bindings)
             if any(
                 int(argument.id) in stale_private
                 for block in trial.blocks.values()
@@ -14703,6 +14724,7 @@ def _retire_concordant_sequence_aliases(
             )
             stale_private = private_members[int(stale_id)]
             _strip_dead_cell_bookkeeping(function, stale_private)
+            rebind_member_reads(function, member_bindings)
             still_consumed = {
                 int(argument.id)
                 for block in function.blocks.values()
@@ -14881,6 +14903,30 @@ def _retire_dead_planning_aliases(
                 for other_alias, other_target in aliases.items()
             )
         ]
+        # N4 Load1041 is the caller projection of region109's returned1040.
+        # Those ids inhabit different frames: the retained result-from edge
+        # is authoritative, while a flat local alias1041->1040 is not. Close
+        # only an exact returned-value edge whose provider is present; never
+        # remove a genuinely missing local target or guess by field/name.
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                value = instruction.res
+                if instruction.op != "Load" or value is None:
+                    continue
+                origin = (value.accounting or {}).get("ssa_call_result_from")
+                if not isinstance(origin, tuple) or len(origin) != 2:
+                    continue
+                provider_name, source_id = str(origin[0]), int(origin[1])
+                provider = all_functions.get(provider_name)
+                if (provider is None or provider_name == str(symbol)
+                        or source_id in physical_ids
+                        or aliases.get(int(value.id)) != source_id):
+                    continue
+                if any(int(argument.id) == source_id
+                       for provider_block in provider.blocks.values()
+                       for operation in provider_block.instrs if operation.op == "Ret"
+                       for argument in operation.args):
+                    removable.append((int(value.id), source_id))
         if not removable:
             continue
         for alias_id, target_id in removable:
@@ -14890,7 +14936,8 @@ def _retire_dead_planning_aliases(
                 "retired_dead_planning_aliases", []
             ).append((
                 alias_id, target_id,
-                "absent_from_final_ssa_and_descriptors",
+                ("exact_cross_frame_result_identity" if alias_id in physical_ids
+                 else "absent_from_final_ssa_and_descriptors"),
             ))
             retired += 1
         function.metadata["value_aliases"] = aliases
@@ -37678,7 +37725,10 @@ def _class_surface_ssa_program(
     # here is a defect in the unification rules, not in the program: refuse
     # with the cycling values named instead of spinning (the managed tire's
     # lowering sat 3.5 h in this loop on 2026-09-03).
-    from .ssa_call_input_adapters import adapt_physical_call_inputs, physical_call_input_conflicts
+    from .ssa_call_input_adapters import (
+        adapt_physical_call_inputs, physical_call_input_conflicts,
+        call_input_rank_updates,
+    )
 
     module_metadata["physical_region_input_conversions"] = (
         adapt_physical_call_inputs(all_functions, progress=report)
@@ -37852,32 +37902,10 @@ def _class_surface_ssa_program(
                                 ),
                             ) is not None
                         )
-                        actual_rank = max(
-                            len(tuple(actual.shape or ())),
-                            int((actual.accounting or {}).get(
-                                "program_abi_rank", 0
-                            )),
-                            int((actual.accounting or {}).get(
-                                "ssa_call_rank", 0
-                            )),
-                        )
-                        formal_rank = max(
-                            len(tuple(formal.shape or ())),
-                            int((formal.accounting or {}).get(
-                                "program_abi_rank", 0
-                            )),
-                            int((formal.accounting or {}).get(
-                                "ssa_call_rank", 0
-                            )),
-                        )
-                        call_rank = max(actual_rank, formal_rank)
-                        if by_value_kernel_formal:
-                            call_rank = 0
-                        for value, rank in (
-                            (actual, actual_rank), (formal, formal_rank)
+                        for value, call_rank in call_input_rank_updates(
+                            callee, actual, formal,
+                            by_value_kernel_formal=by_value_kernel_formal,
                         ):
-                            if rank == call_rank or call_rank == 0:
-                                continue
                             value.accounting = {
                                 **dict(value.accounting or {}),
                                 "ssa_call_rank": call_rank,

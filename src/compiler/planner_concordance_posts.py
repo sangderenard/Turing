@@ -494,6 +494,7 @@ def _post_identity_table_mutation(
     from ..common.tensors.topological_reducer import node_identity_cell
     from .concordance_declarations import (
         BINDING_VERSION_REMOVED, BindingFact, CANONICAL_VALUE, NAME_BINDING,
+        NAME_BINDING_CAPTURE,
         PLANNER_STRUCTURAL_FOLD, RETURN_SITE_SLOT,
     )
     from .identity_concordance import (
@@ -527,9 +528,25 @@ def _post_identity_table_mutation(
                 source_cells[node_id] = None
         return source_cells[node_id]
 
+    def retire_capture(row, cells):
+        captures = book.pages.get(NAME_BINDING_CAPTURE.name)
+        capture = None if captures is None else captures.latest(row)
+        if capture is None or (isinstance(capture, Unresolved)
+                               and capture.reason == BINDING_VERSION_REMOVED):
+            return
+        capture_cells = tuple(dict.fromkeys((
+            book.latest_ref(NAME_BINDING_CAPTURE, row),
+            book.latest_ref(NAME_BINDING, row), *cells,
+        )))
+        book.post(NAME_BINDING_CAPTURE, row,
+                  Unresolved(BINDING_VERSION_REMOVED, read=capture_cells),
+                  stage=stage, provenance=Derived(capture_cells), mode=Mode.REVISE)
+
     for row in tuple(page.scope_rows(scope)):
         fact = page.latest(row)
         if not isinstance(fact, BindingFact):
+            if isinstance(fact, Unresolved) and fact.reason == BINDING_VERSION_REMOVED:
+                retire_capture(row, fact.read)
             continue
         value_id = int(fact.value_id)
         previous = book.latest_ref(NAME_BINDING, row)
@@ -543,6 +560,11 @@ def _post_identity_table_mutation(
                 Unresolved(BINDING_VERSION_REMOVED, read=cells),
                 stage=stage, provenance=Derived(cells), mode=Mode.REVISE,
             )
+            # N4 dt_cap17 and lattice_value0 both lost canonical node310.
+            # Retire the capture owned by this removed target in the same
+            # transaction; otherwise the audit sees a live equality claim
+            # whose two binding versions have explicitly ceased to exist.
+            retire_capture(row, cells)
         elif value_id in aliases:
             replacement = aliases[value_id]
             new_fact = BindingFact(

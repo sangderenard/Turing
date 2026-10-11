@@ -1,0 +1,789 @@
+diff --git a/src/compiler/fortran_c_shell.py b/src/compiler/fortran_c_shell.py
+index f356538e..b3d9c334 100644
+--- a/src/compiler/fortran_c_shell.py
++++ b/src/compiler/fortran_c_shell.py
+@@ -14600,6 +14600,19 @@ def _retire_concordant_sequence_aliases(
+         replacements: dict[int, int] = {}
+         private_members: dict[int, set[int]] = {}
+ 
++        def rebind_member_reads(owner, bindings):
++            residents = {int(value.id): value for value in owner.args}
++            residents.update((int(i.res.id), i.res) for b in owner.blocks.values()
++                             for i in b.instrs if i.res is not None)
++            for block in owner.blocks.values():
++                for instruction in block.instrs:
++                    instruction.args = [
++                        residents.get(int(bindings[int(value.id)]),
++                                      replace(value, id=int(bindings[int(value.id)])))
++                        if int(value.id) in bindings else value
++                        for value in instruction.args
++                    ]
++
+         def resident(value_id: int) -> int:
+             return int(aliases.get(int(value_id), int(value_id)))
+ 
+@@ -14644,6 +14657,14 @@ def _retire_concordant_sequence_aliases(
+             from copy import deepcopy
+             trial = deepcopy(function)
+             _strip_dead_cell_bookkeeping(trial, stale_private)
++            # N4 sequence555 already concords to sequence162, including its
++            # arena, but live copy calls still read 555's private length.
++            # The exact handle proof owns ALL descriptor roles, not just the
++            # column pointer. Redirect surviving reads before retiring cells;
++            # removable initialization stores above must not reset the owner.
++            member_bindings: dict[int, int] = {}
++            _bind_sequence_storage_members(member_bindings, descriptor, incumbent)
++            rebind_member_reads(trial, member_bindings)
+             if any(
+                 int(argument.id) in stale_private
+                 for block in trial.blocks.values()
+@@ -14703,6 +14724,7 @@ def _retire_concordant_sequence_aliases(
+             )
+             stale_private = private_members[int(stale_id)]
+             _strip_dead_cell_bookkeeping(function, stale_private)
++            rebind_member_reads(function, member_bindings)
+             still_consumed = {
+                 int(argument.id)
+                 for block in function.blocks.values()
+@@ -14881,6 +14903,30 @@ def _retire_dead_planning_aliases(
+                 for other_alias, other_target in aliases.items()
+             )
+         ]
++        # N4 Load1041 is the caller projection of region109's returned1040.
++        # Those ids inhabit different frames: the retained result-from edge
++        # is authoritative, while a flat local alias1041->1040 is not. Close
++        # only an exact returned-value edge whose provider is present; never
++        # remove a genuinely missing local target or guess by field/name.
++        for block in function.blocks.values():
++            for instruction in block.instrs:
++                value = instruction.res
++                if instruction.op != "Load" or value is None:
++                    continue
++                origin = (value.accounting or {}).get("ssa_call_result_from")
++                if not isinstance(origin, tuple) or len(origin) != 2:
++                    continue
++                provider_name, source_id = str(origin[0]), int(origin[1])
++                provider = all_functions.get(provider_name)
++                if (provider is None or provider_name == str(symbol)
++                        or source_id in physical_ids
++                        or aliases.get(int(value.id)) != source_id):
++                    continue
++                if any(int(argument.id) == source_id
++                       for provider_block in provider.blocks.values()
++                       for operation in provider_block.instrs if operation.op == "Ret"
++                       for argument in operation.args):
++                    removable.append((int(value.id), source_id))
+         if not removable:
+             continue
+         for alias_id, target_id in removable:
+@@ -14890,7 +14936,8 @@ def _retire_dead_planning_aliases(
+                 "retired_dead_planning_aliases", []
+             ).append((
+                 alias_id, target_id,
+-                "absent_from_final_ssa_and_descriptors",
++                ("exact_cross_frame_result_identity" if alias_id in physical_ids
++                 else "absent_from_final_ssa_and_descriptors"),
+             ))
+             retired += 1
+         function.metadata["value_aliases"] = aliases
+@@ -37678,7 +37725,10 @@ def _class_surface_ssa_program(
+     # here is a defect in the unification rules, not in the program: refuse
+     # with the cycling values named instead of spinning (the managed tire's
+     # lowering sat 3.5 h in this loop on 2026-09-03).
+-    from .ssa_call_input_adapters import adapt_physical_call_inputs, physical_call_input_conflicts
++    from .ssa_call_input_adapters import (
++        adapt_physical_call_inputs, physical_call_input_conflicts,
++        call_input_rank_updates,
++    )
+ 
+     module_metadata["physical_region_input_conversions"] = (
+         adapt_physical_call_inputs(all_functions, progress=report)
+@@ -37852,32 +37902,10 @@ def _class_surface_ssa_program(
+                                 ),
+                             ) is not None
+                         )
+-                        actual_rank = max(
+-                            len(tuple(actual.shape or ())),
+-                            int((actual.accounting or {}).get(
+-                                "program_abi_rank", 0
+-                            )),
+-                            int((actual.accounting or {}).get(
+-                                "ssa_call_rank", 0
+-                            )),
+-                        )
+-                        formal_rank = max(
+-                            len(tuple(formal.shape or ())),
+-                            int((formal.accounting or {}).get(
+-                                "program_abi_rank", 0
+-                            )),
+-                            int((formal.accounting or {}).get(
+-                                "ssa_call_rank", 0
+-                            )),
+-                        )
+-                        call_rank = max(actual_rank, formal_rank)
+-                        if by_value_kernel_formal:
+-                            call_rank = 0
+-                        for value, rank in (
+-                            (actual, actual_rank), (formal, formal_rank)
++                        for value, call_rank in call_input_rank_updates(
++                            callee, actual, formal,
++                            by_value_kernel_formal=by_value_kernel_formal,
+                         ):
+-                            if rank == call_rank or call_rank == 0:
+-                                continue
+                             value.accounting = {
+                                 **dict(value.accounting or {}),
+                                 "ssa_call_rank": call_rank,
+diff --git a/src/compiler/identity_concordance.py b/src/compiler/identity_concordance.py
+index e50c73b8..4eb3e84f 100644
+--- a/src/compiler/identity_concordance.py
++++ b/src/compiler/identity_concordance.py
+@@ -1304,6 +1304,8 @@ class CorrelationTable:
+     def _name_binding_capture_findings(module: Any) -> list[Finding]:
+         """A capture connects two exact binding versions of one value."""
+ 
++        from .concordance_declarations import BindingFact, BINDING_VERSION_REMOVED
++
+         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+         if book is None or "name_binding_capture" not in book.pages:
+             return []
+@@ -1311,6 +1313,12 @@ class CorrelationTable:
+         with book.borrowed("name_binding_capture") as captures, book.borrowed("name_binding") as names:
+             for row in captures.rows():
+                 capture = captures.latest(row)
++                if (isinstance(capture, Unresolved)
++                        and capture.reason == BINDING_VERSION_REMOVED):
++                    target = names.latest(row)
++                    if (isinstance(target, Unresolved)
++                            and target.reason == BINDING_VERSION_REMOVED):
++                        continue
+                 if (not isinstance(capture, tuple) or len(capture) != 3
+                         or not isinstance(capture[0], str)
+                         or not isinstance(capture[1], int) or capture[1] < 0
+@@ -1319,7 +1327,13 @@ class CorrelationTable:
+                 else:
+                     target = names.latest(row)
+                     source = names.latest((row[0], capture[0], capture[1]))
+-                    if target is not None and source is not None and target.value_id == source.value_id:
++                    # The full N4 book retains explicitly unresolved bindings.
++                    # Those are not BindingFacts and do not carry value_id.
++                    # Report their capture as unresolved, never crash the audit
++                    # or accept two missing identities as an equality.
++                    if (isinstance(target, BindingFact)
++                            and isinstance(source, BindingFact)
++                            and target.value_id == source.value_id):
+                         continue
+                     detail = f"capture {row!r} connects target {target!r} to source {source!r}"
+                 found.append(Finding("name-binding-capture-disagreement", str(row[0]), None, detail))
+diff --git a/src/compiler/ir_sequence_tables.py b/src/compiler/ir_sequence_tables.py
+index 7fdf7618..c7e9feeb 100644
+--- a/src/compiler/ir_sequence_tables.py
++++ b/src/compiler/ir_sequence_tables.py
+@@ -912,8 +912,13 @@ def lower_record_sequence_append_with_child_copy(
+     full = builder.block("capacity_exhausted")
+     inserted = builder.block("inserted")
+     result_block = builder.block("result")
+-    zero = builder.const(entry, 0)
+-    one = builder.const(entry, 1)
++    # N4 child-copy helpers seeded an int64 loop Phi with the builder's
++    # default int32 zero. Index/length arithmetic is int64 on both edges;
++    # status and live-flag stores retain their separate int/bool contracts.
++    zero = builder.const(entry, 0, dtype="int64")
++    one = builder.const(entry, 1, dtype="int64")
++    status_zero = builder.const(entry, 0)
++    live_one = builder.const(entry, True, dtype="bool")
+ 
+     outer_length_slot = builder.fresh("ptr")
+     outer_length = builder.fresh("int64")
+@@ -992,7 +997,7 @@ def lower_record_sequence_append_with_child_copy(
+         ])
+     if pool.live_flags_value_id is not None:
+         child_live_address = builder.fresh("ptr")
+-        child_live_value = one
++        child_live_value = live_one
+         if source.live_flags_value_id is not None:
+             source_live_address = builder.fresh("ptr")
+             child_live_value = builder.fresh("bool")
+@@ -1023,7 +1028,7 @@ def lower_record_sequence_append_with_child_copy(
+         builder.emit(publish_child, "GetElementPtr", [
+             SSAValue(pool.status_value_id, dtype="int"), outer_length,
+         ], child_status_slot)
+-        builder.emit(publish_child, "Store", [zero, child_status_slot])
++        builder.emit(publish_child, "Store", [status_zero, child_status_slot])
+ 
+     row_value_iter = iter(row_values)
+     for index, column in enumerate(destination_columns):
+@@ -1039,7 +1044,7 @@ def lower_record_sequence_append_with_child_copy(
+             SSAValue(destination.live_flags_value_id, dtype="bool"),
+             outer_length,
+         ], live_address)
+-        builder.emit(publish_child, "Store", [one, live_address])
++        builder.emit(publish_child, "Store", [live_one, live_address])
+     builder.emit(publish_child, "Store", [
+         next_outer_length, outer_length_slot,
+     ])
+diff --git a/src/compiler/planner_concordance_posts.py b/src/compiler/planner_concordance_posts.py
+index 335fc686..f26712f6 100644
+--- a/src/compiler/planner_concordance_posts.py
++++ b/src/compiler/planner_concordance_posts.py
+@@ -494,6 +494,7 @@ def _post_identity_table_mutation(
+     from ..common.tensors.topological_reducer import node_identity_cell
+     from .concordance_declarations import (
+         BINDING_VERSION_REMOVED, BindingFact, CANONICAL_VALUE, NAME_BINDING,
++        NAME_BINDING_CAPTURE,
+         PLANNER_STRUCTURAL_FOLD, RETURN_SITE_SLOT,
+     )
+     from .identity_concordance import (
+@@ -527,9 +528,25 @@ def _post_identity_table_mutation(
+                 source_cells[node_id] = None
+         return source_cells[node_id]
+ 
++    def retire_capture(row, cells):
++        captures = book.pages.get(NAME_BINDING_CAPTURE.name)
++        capture = None if captures is None else captures.latest(row)
++        if capture is None or (isinstance(capture, Unresolved)
++                               and capture.reason == BINDING_VERSION_REMOVED):
++            return
++        capture_cells = tuple(dict.fromkeys((
++            book.latest_ref(NAME_BINDING_CAPTURE, row),
++            book.latest_ref(NAME_BINDING, row), *cells,
++        )))
++        book.post(NAME_BINDING_CAPTURE, row,
++                  Unresolved(BINDING_VERSION_REMOVED, read=capture_cells),
++                  stage=stage, provenance=Derived(capture_cells), mode=Mode.REVISE)
++
+     for row in tuple(page.scope_rows(scope)):
+         fact = page.latest(row)
+         if not isinstance(fact, BindingFact):
++            if isinstance(fact, Unresolved) and fact.reason == BINDING_VERSION_REMOVED:
++                retire_capture(row, fact.read)
+             continue
+         value_id = int(fact.value_id)
+         previous = book.latest_ref(NAME_BINDING, row)
+@@ -543,6 +560,11 @@ def _post_identity_table_mutation(
+                 Unresolved(BINDING_VERSION_REMOVED, read=cells),
+                 stage=stage, provenance=Derived(cells), mode=Mode.REVISE,
+             )
++            # N4 dt_cap17 and lattice_value0 both lost canonical node310.
++            # Retire the capture owned by this removed target in the same
++            # transaction; otherwise the audit sees a live equality claim
++            # whose two binding versions have explicitly ceased to exist.
++            retire_capture(row, cells)
+         elif value_id in aliases:
+             replacement = aliases[value_id]
+             new_fact = BindingFact(
+diff --git a/src/compiler/precompile_to_ssa.py b/src/compiler/precompile_to_ssa.py
+index 38421780..324133b9 100644
+--- a/src/compiler/precompile_to_ssa.py
++++ b/src/compiler/precompile_to_ssa.py
+@@ -17889,6 +17889,15 @@ def lower_control_sections_to_ssa(
+                         "program_abi_rank", 0
+                     ) or 0),
+                 )
++                # A selected child span's flat arena does not limit its
++                # logical axes. `selected[:, index]` supplies two exact
++                # index ports on Indexed's base, so its consumer requires
++                # at least rank2 even when the Mapping[str, Tensor] schema
++                # has only the default rank1. Carry that demand on the same
++                # lookup identity into the existing shape concordance.
++                if (instruction.op == "Indexed" and instruction.args
++                        and int(instruction.args[0].id) == value_id):
++                    rank = max(rank, len(instruction.args) - 1)
+                 if rank <= 0:
+                     continue
+                 _post_derived_or_raw(
+diff --git a/src/compiler/ssa_call_input_adapters.py b/src/compiler/ssa_call_input_adapters.py
+index 0931b8a8..beba87e8 100644
+--- a/src/compiler/ssa_call_input_adapters.py
++++ b/src/compiler/ssa_call_input_adapters.py
+@@ -17,6 +17,29 @@ from ..transmogrifier.ssa import Instr, SSAValue
+ _NUMERIC_DTYPES = {'bool', 'int32', 'int64', 'float32', 'float64'}
+ 
+ 
++def call_input_rank_updates(callee, actual, formal, *, by_value_kernel_formal=False):
++    """Rank updates for one already-bound call edge; the caller posts changes."""
++    # N4 advance_pieces region111 converts scalar int64 zero to double for
++    # index_assign_double's %values pointer. A shared repository kernel's
++    # buffer formal may also receive spans from other calls; its shape is
++    # not a shape equality with this caller's scalar. Copying rank1 onto
++    # that Cast invented a span with no extent origin. The declared kernel
++    # ABI owns pointer/value transport, while each actual owns its axes.
++    if (callee.metadata or {}).get('llvm_argument_names'):
++        return ()
++    def rank(value):
++        return max(
++            len(tuple(value.shape or ())),
++            int((value.accounting or {}).get('program_abi_rank', 0) or 0),
++            int((value.accounting or {}).get('ssa_call_rank', 0) or 0),
++        )
++    actual_rank, formal_rank = rank(actual), rank(formal)
++    call_rank = 0 if by_value_kernel_formal else max(actual_rank, formal_rank)
++    return tuple((value, call_rank) for value, own_rank in (
++        (actual, actual_rank), (formal, formal_rank),
++    ) if own_rank != call_rank and call_rank != 0)
++
++
+ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
+     """Restore exact region-feed views after result projection rewiring.
+ 
+@@ -700,6 +723,28 @@ def _adapt_physical_call_inputs_round(
+                         # integer's bytes as a double.  Physical/program ABI
+                         # storage remains immutable and follows the stricter
+                         # region rule below.
++                        logical_pointer_scalar_conversion = bool(
++                            not actual.shape
++                            and not accounting.get('program_abi_storage')
++                            and not accounting.get('physical_dtype')
++                            and int(actual.id) not in caller_formals
++                            and int(accounting.get('program_abi_rank') or 0) == 0
++                            and int(accounting.get('ssa_call_rank') or 0) == 0
++                            and accounting.get('program_abi_storage') not in {'span', 'table', 'keyed'}
++                            and not accounting.get('sequence_arena')
++                            and 'sequence_row_shape' not in accounting
++                            and formal.dtype == 'ptr'
++                            and source_dtype in numeric
++                            and target_dtype in numeric
++                            and source_dtype != target_dtype
++                            and not _call_writes_argument(instruction, index)
++                            and read_only(callee, formal.id)
++                        )
++                        # Authored `array[2] = False` produces a local bool
++                        # Const, not a caller formal or an explicitly physical
++                        # slot. The pointer contract still requires a VALUE
++                        # conversion to its inferred double element type;
++                        # without it C/LLVM read eight bytes from a bool slot.
+                         logical_scalar_conversion = bool(
+                             not actual.shape
+                             and not formal.shape
+@@ -741,7 +786,7 @@ def _adapt_physical_call_inputs_round(
+                             or _call_writes_argument(instruction, index)
+                             or not read_only(callee, formal.id)
+                         )
+-                        if not logical_scalar_conversion and not physical_conversion:
++                        if not (logical_scalar_conversion or logical_pointer_scalar_conversion or physical_conversion):
+                             continue
+                         # Only numerical scalar representation changes belong
+                         # here. Records, references and string tokens are not
+@@ -762,14 +807,14 @@ def _adapt_physical_call_inputs_round(
+                                 'call_input_conversion': (caller.name, int(actual.id), callee.name, int(formal.id)),
+                                 'call_input_conversion_kind': (
+                                     'read_only_scalar_numeric'
+-                                    if logical_scalar_conversion
++                                    if logical_scalar_conversion or logical_pointer_scalar_conversion
+                                     else 'physical_region'
+                                 )})
+                         conversion_attributes = {
+                             'target_dtype': target_dtype,
+                             'source_dtype': source_dtype,
+                         }
+-                        if logical_scalar_conversion:
++                        if logical_scalar_conversion or logical_pointer_scalar_conversion:
+                             conversion_attributes['concordant_call_input_conversion'] = True
+                         else:
+                             conversion_attributes['physical_region_input_conversion'] = True
+@@ -791,7 +836,7 @@ def _adapt_physical_call_inputs_round(
+                             'target_dtype': str(target_dtype),
+                             'kind': (
+                                 'read_only_scalar_numeric'
+-                                if logical_scalar_conversion
++                                if logical_scalar_conversion or logical_pointer_scalar_conversion
+                                 else 'physical_region'
+                             ),
+                         }
+diff --git a/tests/test_concordance_audit_contracts.py b/tests/test_concordance_audit_contracts.py
+index f464c54b..5ed7799c 100644
+--- a/tests/test_concordance_audit_contracts.py
++++ b/tests/test_concordance_audit_contracts.py
+@@ -6,6 +6,62 @@ from src.compiler.identity_concordance import concordance_report
+ from src.compiler.identity_concordance import CorrelationTable
+ 
+ 
++@pytest.mark.parametrize('unresolved_side', ['target', 'source', 'both'])
++def test_capture_audit_reports_unresolved_binding_instead_of_crashing(unresolved_side):
++    from src.compiler.identity_concordance import begin_identity_book, end_identity_book, Unresolved, NEW
++    from src.compiler.concordance_declarations import BindingFact
++    from src.transmogrifier.ssa import IRModule
++    book, token = begin_identity_book()
++    try:
++        fact = BindingFact(7, True, (), '')
++        unresolved = Unresolved(NEW)
++        book.page('name_binding').set(('scope', 'target', 0), 0,
++                                      unresolved if unresolved_side in {'target', 'both'} else fact)
++        book.page('name_binding').set(('scope', 'source', 0), 0,
++                                      unresolved if unresolved_side in {'source', 'both'} else fact)
++        book.page('name_binding_capture').set(('scope', 'target', 0), 0, ('source', 0, None))
++        module = IRModule({}, metadata={'identity_book': book})
++        findings = CorrelationTable._name_binding_capture_findings(module)
++        assert len(findings) == 1
++        assert findings[0].kind == 'name-binding-capture-disagreement'
++        assert 'Unresolved' in findings[0].detail
++    finally:
++        end_identity_book(token)
++
++
++@pytest.mark.parametrize('already_removed', [False, True])
++def test_removed_binding_retires_its_capture_with_the_same_provenance(already_removed):
++    from types import SimpleNamespace
++    import networkx as nx
++    from src.compiler.identity_concordance import begin_identity_book, end_identity_book, Unresolved
++    from src.compiler.concordance_declarations import BindingFact, BINDING_VERSION_REMOVED
++    from src.compiler.planner_concordance_posts import _post_identity_table_mutation
++    from src.transmogrifier.ssa import IRModule
++    book, token = begin_identity_book()
++    try:
++        graph = SimpleNamespace(G=nx.DiGraph())
++        graph.G.graph['lexical_read_scope'] = ('scope', 0)
++        scope = ('scope', 0)
++        for name in ('target', 'source'):
++            book.page('name_binding').set((scope, name, 0), 0,
++                Unresolved(BINDING_VERSION_REMOVED) if already_removed
++                else BindingFact(310, True, (), ''))
++        row = (scope, 'target', 0)
++        book.page('canonical_value').set((scope, 310), 0, ('removed',))
++        book.page('name_binding_capture').set(row, 0, ('source', 0, None))
++        _post_identity_table_mutation(graph, removed=(310,))
++        retired = book.page('name_binding_capture').latest(row)
++        assert isinstance(retired, Unresolved) and retired.reason == BINDING_VERSION_REMOVED
++        assert retired.read
++        module = IRModule({}, metadata={'identity_book': book})
++        assert CorrelationTable._name_binding_capture_findings(module) == []
++        history = book.page('name_binding_capture').history(row)
++        _post_identity_table_mutation(graph, removed=(310,))
++        assert book.page('name_binding_capture').history(row) == history
++    finally:
++        end_identity_book(token)
++
++
+ @pytest.mark.parametrize('declare_root_types', [False, True])
+ def test_controller_audit_preserves_existing_restore_type_contract(declare_root_types):
+     namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/audit_identity_concordance.py'))
+diff --git a/tests/test_native_scalar_index_store.py b/tests/test_native_scalar_index_store.py
+index 63ac7df8..6eec9ad3 100644
+--- a/tests/test_native_scalar_index_store.py
++++ b/tests/test_native_scalar_index_store.py
+@@ -2,12 +2,76 @@ import pickle
+ import subprocess
+ import sys
+ 
++import pytest
++
+ from src.compiler.extraction_contract import ExtractionContract
+ from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+ from src.compiler.ssa_c_backend import emit_ssa_to_c
+ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import c_backend_repository_ssa_reference
+ 
+ 
++@pytest.mark.parametrize('backend', ['c', 'llvm'])
++def test_scalar_integer_stores_do_not_inherit_shared_kernel_buffer_rank(tmp_path, backend):
++    """N4 pub_contract stores scalar zero through a pointer-taking kernel."""
++    policy = ExtractionContract(
++        'extraction_contracts/program_extraction.yaml'
++    ).with_execution_file('extraction_contracts/vehicle_full_native_execution.yaml').with_program_abi({
++        'bindings': [], 'values': [{
++            'function': 'root', 'parameter': 'array', 'storage': 'span',
++            'python_type': 'numpy.ndarray', 'dtype': 'float64',
++            'rank': 1, 'shape': [4], 'mutable': True,
++        }, {
++            'function': 'root', 'parameter': 'value', 'storage': 'scalar',
++            'dtype': 'int64', 'rank': 0, 'python_type': 'int',
++        }],
++    })
++    module, _, exports = lower_ast_source_to_ssa(
++        'def root(array, value):\n'
++        '    array[0] = value\n'
++        '    array[1] = value\n'
++        '    array[2] = False\n'
++        '    array[3] = value\n'
++        '    return array\n',
++        'root', name='scalar_integer_index_store', extraction_contract=policy,
++        tensor_ssa_reference=c_backend_repository_ssa_reference(),
++    )
++    conversions = [i for fn in module.functions.values()
++                   for block in fn.blocks.values() for i in block.instrs
++                   if i.op == 'Cast' and i.res.accounting.get('call_input_conversion')]
++    assert conversions
++    for instruction in conversions:
++        assert instruction.res.shape == ()
++        assert int(instruction.res.accounting.get('ssa_call_rank', 0)) == 0
++    if backend == 'llvm':
++        from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm, compile_artifact
++        artifact = emit_ssa_function_to_llvm(module, exports[0])
++    else:
++        artifact = emit_ssa_to_c(module, exports[0])
++    assert artifact.complete, artifact.shortfalls
++    if backend == 'llvm':
++        artifact = compile_artifact(artifact, directory=tmp_path / 'native')
++    else:
++        artifact.compile(tmp_path / 'native')
++    parameters = dict(module.functions[exports[0]].metadata['parameter_names'])
++    saved = tmp_path / 'artifact.pkl'
++    saved.write_bytes(pickle.dumps((artifact, parameters)))
++    result = subprocess.run([sys.executable, '-u', '-c', '''
++import pickle, sys
++import numpy as np
++artifact, parameters = pickle.load(open(sys.argv[1], 'rb'))
++if hasattr(artifact, 'prepare_execution'):
++    prepare = artifact.prepare_execution
++else:
++    from src.compiler.ssa_llvm_backend import prepare_artifact_execution
++    prepare = lambda feeds: prepare_artifact_execution(artifact, feeds)
++for value in (0, 1, -2, 2**40):
++    execution = prepare({parameters['array']: np.full(4, 91.),
++                         parameters['value']: np.array([value], dtype=np.int64)}).run()
++    np.testing.assert_array_equal(execution.buffers[parameters['array']], [value, value, 0., value])
++''', str(saved)], capture_output=True, text=True)
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
+ def test_indexed_unary_scalar_rank_survives_program_abi_settlement():
+     """A scalar indexed read has rank zero even without static extents."""
+     from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
+diff --git a/tests/test_sequence_contract_concordance.py b/tests/test_sequence_contract_concordance.py
+index 8b895675..503488ec 100644
+--- a/tests/test_sequence_contract_concordance.py
++++ b/tests/test_sequence_contract_concordance.py
+@@ -267,6 +267,76 @@ def test_finalization_closes_terminal_alias_with_no_surviving_identity():
+         end_identity_book(token)
+ 
+ 
++def test_sequence_alias_with_live_length_reads_rebinds_all_descriptor_members(tmp_path):
++    from src.transmogrifier.ssa import SSAValue, BasicBlock, Instr
++    from src.compiler.ssa_llvm_backend import compile_artifact, prepare_artifact_execution
++    import numpy as np
++    book, token = begin_identity_book()
++    try:
++        resident = SSASequenceDescriptor(10, (10,), 12, 13, column_dtypes=('int64',))
++        duplicate = SSASequenceDescriptor(20, (10,), 22, 23, column_dtypes=('int64',))
++        values = {i: SSAValue(i, 'int64') for i in (10, 12, 13, 22, 23)}
++        output = SSAValue(30, 'int64')
++        call = Instr('Call', [values[10], values[22], values[23]], output,
++                     attributes={'callee': 'consumer'})
++        function = Function('solve', list(values.values()), {
++            'entry': BasicBlock('entry', [call, Instr('Ret', [output], None)])})
++        sequences = SSASequenceTable(owner='solve', book=book)
++        sequences.register(resident)
++        sequences.register(duplicate)
++        _publish_concordant_function_aliases(function, {20: 10}, provenance='exact_handle')
++        assert _retire_concordant_sequence_aliases(
++            {'solve': function}, {'solve': sequences}, {},
++        ) == 1
++        assert [v.id for v in call.args] == [10, 12, 13]
++        assert sequences.by_id(20) is None
++        assert {v.id for v in function.args} == {10, 12, 13}
++        zero, address, length = SSAValue(31, 'int64'), SSAValue(32, 'ptr'), SSAValue(33, 'int64')
++        consumer = Function('consumer', [SSAValue(10, 'int64'), SSAValue(22, 'int64', (1,)),
++                                         SSAValue(23, 'int64')], {
++            'entry': BasicBlock('entry', [Instr('Const', [], zero, attributes={'value': 0}),
++                Instr('GetElementPtr', [SSAValue(22, 'int64', (1,)), zero], address),
++                Instr('Load', [address], length), Instr('Ret', [length], None)])})
++        from src.transmogrifier.ssa import IRModule
++        module = IRModule({'solve': function, 'consumer': consumer}, sequence_tables={
++            'solve': sequences, 'consumer': SSASequenceTable({20: duplicate}),
++        })
++        artifact = emit_ssa_function_to_llvm(module, 'solve')
++        assert artifact.complete, artifact.shortfalls
++        native = compile_artifact(artifact, directory=tmp_path / 'native')
++        for count in (0, 3, 7):
++            execution = prepare_artifact_execution(native, {
++                10: np.arange(8, dtype=np.int64), 12: np.array([count], dtype=np.int64),
++                13: np.array([8], dtype=np.int64),
++            }).run()
++            assert execution.buffers[30].item() == count
++    finally:
++        end_identity_book(token)
++
++
++def test_finalization_does_not_mistake_callee_output_identity_for_local_alias():
++    from src.transmogrifier.ssa import SSAValue, BasicBlock, Instr
++    book, token = begin_identity_book()
++    try:
++        output = SSAValue(1040, 'float64', (22,))
++        producer = Function('producer', [output], {
++            'entry': BasicBlock('entry', [Instr('Ret', [output], None)])})
++        projected = SSAValue(1041, 'float64', (22,), accounting={
++            'ssa_call_result_from': ('producer', 1040),
++        })
++        function = Function('solve', [], {'entry': BasicBlock('entry', [
++            Instr('Load', [SSAValue(99, 'ptr')], projected),
++            Instr('Ret', [projected], None)])})
++        _publish_concordant_function_aliases(function, {1041: 1040}, provenance='region_output')
++        assert _retire_dead_planning_aliases(
++            {'solve': function, 'producer': producer}, {}, {}, {}, book,
++        ) == 1
++        assert function.metadata['value_aliases'] == {}
++        assert function.blocks['entry'].instrs[-1].args == [projected]
++    finally:
++        end_identity_book(token)
++
++
+ def test_output_settlement_keeps_frame_arena_as_physical_resident():
+     function = Function("get_state", [], {})
+     function.metadata["value_aliases"] = {
+@@ -484,11 +554,16 @@ def sample(reading: Reading, key: str):
+         instruction
+         for block in root.blocks.values()
+         for instruction in block.instrs
+-        if str(instruction.attributes.get("callee") or "").endswith(
+-            "__planned_region_0"
+-        )
++        if module.functions.get(str(instruction.attributes.get("callee") or "")) is not None
++        and module.functions[str(instruction.attributes["callee"])].metadata.get("source_region_integral")
++        and any(int(value.id) == int(row_base.id) for value in instruction.args)
+     )
+-    assert tuple(value.id for value in region_call.args) == (row_base.id,)
++    assert row_base.id in {value.id for value in region_call.args}
++    # Region numbers are planner-local, not an API. Dynamic span consumers
++    # also receive their exact shape/rank operands through this call edge.
++    assert {int(row_base.accounting[key]) for key in (
++        'tensor_shape_value_id', 'tensor_rank_value_id',
++    )} <= {int(value.id) for value in region_call.args}
+     assert row_base.shape == ()
+     assert row_base.accounting["program_abi_storage"] == "span"
+     assert row_base.accounting["program_abi_rank"] == 1
+@@ -605,9 +680,9 @@ def sample(reading: Reading, key: str, index: int):
+         instruction
+         for block in root.blocks.values()
+         for instruction in block.instrs
+-        if str(instruction.attributes.get("callee") or "").endswith(
+-            "__planned_region_0"
+-        )
++        if module.functions.get(str(instruction.attributes.get("callee") or "")) is not None
++        and module.functions[str(instruction.attributes["callee"])].metadata.get("source_region_integral")
++        and any(int(value.id) == int(row_base.id) for value in instruction.args)
+     )
+     region = module.functions[region_call.attributes["callee"]]
+     shape_id = int(row_base.accounting["tensor_shape_value_id"])
+
+diff --git a/tests/test_native_sequence_append_child.py b/tests/test_native_sequence_append_child.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_native_sequence_append_child.py
+@@ -0,0 +1,92 @@
++"""Child-copy indices have the same width on every loop edge (N4)."""
++import pickle
++import subprocess
++import sys
++
++import pytest
++
++from src.compiler.ir_sequence_tables import lower_record_sequence_append_with_child_copy
++from src.transmogrifier.ssa import (
++    IRModule, SSASequenceDescriptor, SSASequenceTable, SSAChildTablePoolDescriptor,
++)
++
++
++@pytest.mark.parametrize('backend', ['c', 'llvm'])
++@pytest.mark.parametrize('live_flags', [False, True])
++def test_native_child_append_preserves_snapshot_and_capacity(tmp_path, backend, live_flags):
++    pool = SSAChildTablePoolDescriptor(
++        handle_column=2, column_value_ids=(90,), length_value_id=91,
++        capacity_value_id=92, row_stride_value_id=93, status_value_id=94,
++        column_dtypes=('int64',), key_columns=(),
++        live_flags_value_id=95 if live_flags else None,
++    )
++    destination = SSASequenceDescriptor(
++        80, (81, 82, 83), 84, 85,
++        column_dtypes=('float64', 'bool', 'int64'), child_table_pool=pool,
++        live_flags_value_id=86 if live_flags else None,
++    )
++    source = SSASequenceDescriptor(
++        100, (101,), 102, 103, column_dtypes=('int64',),
++        live_flags_value_id=104 if live_flags else None,
++    )
++    lowering = lower_record_sequence_append_with_child_copy(destination, source, function_name='append')
++    assert lowering.complete, lowering.shortfalls
++    fn = lowering.functions[0]
++    phi = next(i for i in fn.blocks['copy_header'].instrs if i.op == 'Phi')
++    assert phi.res.dtype == 'int64'
++    assert {arg.dtype for arg in phi.args} == {'int64'}
++    module = IRModule({'append': fn}, sequence_tables={
++        'append': SSASequenceTable({80: destination, 100: source}),
++    })
++    if backend == 'llvm':
++        from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm, compile_artifact
++        artifact = emit_ssa_function_to_llvm(module, 'append')
++    else:
++        from src.compiler.ssa_c_backend import emit_ssa_module_to_c
++        artifact = emit_ssa_module_to_c(module, 'append')
++    assert artifact.complete, artifact.shortfalls
++    if backend == 'llvm':
++        artifact = compile_artifact(artifact, directory=tmp_path / 'native')
++    else:
++        artifact.compile(tmp_path / 'native')
++    saved = tmp_path / 'artifact.pkl'
++    saved.write_bytes(pickle.dumps((artifact, tuple(v.id for v in fn.args[-2:]),
++                                   fn.metadata['named_outputs'][0][1], live_flags)))
++    result = subprocess.run([sys.executable, '-u', '-c', '''
++import pickle, sys
++import numpy as np
++artifact, row_ids, status, live = pickle.load(open(sys.argv[1], 'rb'))
++feeds = {81: np.zeros(3), 82: np.zeros(3, dtype=np.bool_), 83: np.zeros(3, dtype=np.int64),
++         84: np.array([0], dtype=np.int64), 85: np.array([3], dtype=np.int64),
++         90: np.full(12, -1, dtype=np.int64), 91: np.zeros(3, dtype=np.int64),
++         92: np.array([12], dtype=np.int64), 93: np.array([4], dtype=np.int64),
++         94: np.full(3, -1, dtype=np.int32), 101: np.array([7, 9, 11, 13], dtype=np.int64),
++         102: np.array([2], dtype=np.int64), 103: np.array([4], dtype=np.int64),
++         row_ids[0]: np.array([3.5]), row_ids[1]: np.array([True], dtype=np.bool_)}
++if live:
++    feeds.update({86: np.zeros(3, dtype=np.bool_), 95: np.zeros(12, dtype=np.bool_),
++                  104: np.array([True, False, True, True], dtype=np.bool_)})
++if hasattr(artifact, 'prepare_execution'):
++    execution = artifact.prepare_execution(feeds)
++else:
++    from src.compiler.ssa_llvm_backend import prepare_artifact_execution
++    execution = prepare_artifact_execution(artifact, feeds)
++b = execution.buffers
++for row, length in enumerate((2, 0, 3)):
++    b[102][0] = length
++    execution.run()
++    assert b[status].item() == 1
++    assert b[84].item() == row + 1
++    assert b[91][row] == length and b[94][row] == 0
++    assert b[83][row] == row and b[81][row] == 3.5 and b[82][row]
++    np.testing.assert_array_equal(b[90][row*4:row*4+length], b[101][:length])
++    if live:
++        assert b[86][row]
++        np.testing.assert_array_equal(b[95][row*4:row*4+length], b[104][:length])
++snapshot = b[90].copy()
++b[101][:] = 123
++execution.run()
++assert b[status].item() == 2 and b[84].item() == 3
++np.testing.assert_array_equal(b[90], snapshot)
++''', str(saved)], capture_output=True, text=True)
++    assert result.returncode == 0, result.stdout + result.stderr
+
+diff --git a/tests/test_ssa_call_rank_contracts.py b/tests/test_ssa_call_rank_contracts.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_ssa_call_rank_contracts.py
+@@ -0,0 +1,30 @@
++"""A shared native kernel buffer formal is not the actual's semantic shape."""
++import pytest
++
++from src.compiler.ssa_call_input_adapters import call_input_rank_updates
++from src.transmogrifier.ssa import BasicBlock, Function, SSAValue
++
++
++@pytest.mark.parametrize('shape', [(), (1,), (4,), (2, 3)])
++def test_repository_pointer_formal_does_not_promote_or_overwrite_actual_rank(shape):
++    kernel = Function('kernel', [], {'entry': BasicBlock('entry')},
++                      metadata={'llvm_argument_names': ('values',)})
++    actual = SSAValue(1, 'float64', shape, accounting={'physical_dtype': 'float64'})
++    formal = SSAValue(582, 'ptr', (1,), accounting={
++        'program_abi_storage': 'span', 'program_abi_rank': 1,
++        'physical_dtype': 'float64',
++    })
++    assert call_input_rank_updates(kernel, actual, formal) == ()
++
++
++def test_authored_internal_dynamic_span_still_propagates_rank():
++    function = Function('authored', [], {})
++    actual = SSAValue(1, 'float64', accounting={'program_abi_rank': 2})
++    formal = SSAValue(2, 'float64')
++    assert call_input_rank_updates(function, actual, formal) == ((formal, 2),)
++
++
++def test_repository_by_value_formal_remains_scalar():
++    function = Function('kernel', [], {}, metadata={'llvm_argument_names': ('value',)})
++    assert call_input_rank_updates(function, SSAValue(1, 'float64', (1,)),
++                                   SSAValue(2, 'float64'), by_value_kernel_formal=True) == ()

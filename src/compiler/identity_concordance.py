@@ -1304,6 +1304,8 @@ class CorrelationTable:
     def _name_binding_capture_findings(module: Any) -> list[Finding]:
         """A capture connects two exact binding versions of one value."""
 
+        from .concordance_declarations import BindingFact, BINDING_VERSION_REMOVED
+
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None or "name_binding_capture" not in book.pages:
             return []
@@ -1311,6 +1313,12 @@ class CorrelationTable:
         with book.borrowed("name_binding_capture") as captures, book.borrowed("name_binding") as names:
             for row in captures.rows():
                 capture = captures.latest(row)
+                if (isinstance(capture, Unresolved)
+                        and capture.reason == BINDING_VERSION_REMOVED):
+                    target = names.latest(row)
+                    if (isinstance(target, Unresolved)
+                            and target.reason == BINDING_VERSION_REMOVED):
+                        continue
                 if (not isinstance(capture, tuple) or len(capture) != 3
                         or not isinstance(capture[0], str)
                         or not isinstance(capture[1], int) or capture[1] < 0
@@ -1319,7 +1327,13 @@ class CorrelationTable:
                 else:
                     target = names.latest(row)
                     source = names.latest((row[0], capture[0], capture[1]))
-                    if target is not None and source is not None and target.value_id == source.value_id:
+                    # The full N4 book retains explicitly unresolved bindings.
+                    # Those are not BindingFacts and do not carry value_id.
+                    # Report their capture as unresolved, never crash the audit
+                    # or accept two missing identities as an equality.
+                    if (isinstance(target, BindingFact)
+                            and isinstance(source, BindingFact)
+                            and target.value_id == source.value_id):
                         continue
                     detail = f"capture {row!r} connects target {target!r} to source {source!r}"
                 found.append(Finding("name-binding-capture-disagreement", str(row[0]), None, detail))
