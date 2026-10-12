@@ -1,3 +1,22 @@
+2026-10-12 TRY-COMPARTMENT / PREDICATE IDENTITY REPAIR (CURRENT WORKTREE):
+The real compiler partition's 48 `sequence-mutation-guard` shortfalls had one
+cause.  `_branch_compartments` correctly records lexical compartments for
+`Try`, `If`, `IfExp`, and short-circuit expressions, but the sequence-mutation
+installer treated every compartment role spelled `body` as a boolean arm.  It
+therefore asked the outer `Try` node for a predicate identity which does not
+exist.  The installer now admits a predicate guard only when the retained
+source-control owner is exactly `If` or `IfExp`; Try/dataflow and resource
+scope handling remain on their existing paths.
+
+A focused regression proves a mutation in `Try.body` is placed lexically
+without an invented predicate.  Branch-compartment and control-to-SSA gates
+pass 126 tests in 2.17s.  A bounded rerun of only
+`aot_compile.py::_lower_process_graph_to_compilation` reduced the structured
+SSA frontier from 58 to 10 shortfalls in 24.55s: all 48 false mutation-guard
+failures are gone.  The remaining five carried-state, one loop-carried, and
+four mapping-operation shortfalls are separate iterative repair targets.  No
+outer bootstrap or all-rules compile was launched.
+
 2026-10-12 STRUCTURED BACKEND-NEUTRAL SSA FRONTIER (CURRENT WORKTREE):
 The whole-object lowering aggregate is no longer raised as
 `FortranEmissionError`.  It occurs before target emission and now raises the

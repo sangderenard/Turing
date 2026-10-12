@@ -17,12 +17,14 @@ from src.compiler.glsl_deployment_strategy import (
 )
 from src.compiler.control_source import (
     ConditionalBlock, ControlExpression, ControlProgram, SequenceBlock,
-    LoopControlBlock, StatementBlock, WhileBlock,
+    ControlSequenceMutation, LoopControlBlock, SequenceMutationBlock,
+    StatementBlock, WhileBlock,
     enrich_represented_conditionals,
 )
 from src.compiler.glsl_deployment_strategy import _retain_source_sequence_mutation_records
 from src.compiler.fortran_c_shell import (
     _apply_phi_initial_identity_repairs_to_control,
+    _install_lexical_sequence_mutations,
 )
 
 
@@ -419,6 +421,39 @@ def test_sequence_effect_index_preserves_nested_arm_ownership():
     _retain_source_sequence_mutation_records(graph)
     assert set(records[30]['branch_memberships']) == {(10, 'body'), (20, 'body')}
     assert set(records[40]['branch_memberships']) == {(10, 'body'), (20, 'orelse')}
+
+
+def test_try_body_membership_is_not_invented_as_a_predicate_guard():
+    source_try = ast.parse(
+        "try:\n"
+        "    values.append(item)\n"
+        "finally:\n"
+        "    release()\n"
+    ).body[0]
+    effect = source_try.body[0].value
+    graph = nx.DiGraph()
+    graph.add_node(10, expr_obj=source_try)
+    graph.add_node(11, expr_obj=effect, value_id=11, attributes={})
+    graph.graph["source_control_records"] = {
+        10: {"expression": source_try, "predicate_id": None},
+    }
+    mutation = ControlSequenceMutation(
+        sequence_value_id=20,
+        operator="append",
+        argument_value_ids=(21,),
+        effect_node_id=11,
+        policy="duplicates",
+    )
+
+    installed, shortfalls = _install_lexical_sequence_mutations(
+        ControlProgram(SequenceBlock(())),
+        SimpleNamespace(G=graph),
+        (),
+        extra_mutations=(mutation,),
+    )
+
+    assert shortfalls == ()
+    assert installed.root == SequenceBlock((SequenceMutationBlock(mutation),))
 
 
 def test_record_field_state_key_correlates_phi_and_setattr_history():

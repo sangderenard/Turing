@@ -10430,6 +10430,30 @@ def _install_lexical_sequence_mutations(
         return control, ()
 
     memberships = _branch_compartments(graph)
+    source_control_records = _source_control_records(graph.G)
+
+    def predicate_memberships(node_id: int):
+        """Return only memberships whose owner selects a boolean arm.
+
+        ``_branch_compartments`` also records ``Try.body``/``orelse`` and
+        short-circuit operands because region planning needs every lexical
+        compartment.  Those roles do not denote an SSA predicate.  Treating
+        the word ``body`` alone as proof of one made every mutation inside a
+        source ``try`` ask the Try node for a nonexistent predicate identity.
+        The retained source-control record is the authoritative owner kind.
+        """
+
+        return tuple(
+            (int(owner), str(arm))
+            for owner, arm in memberships.get(int(node_id), ())
+            if str(arm) in {"body", "orelse"}
+            and isinstance(
+                (source_control_records.get(int(owner)) or {}).get(
+                    "expression"
+                ),
+                (ast.If, ast.IfExp),
+            )
+        )
 
     def enclosing_loop_span(loop_block) -> tuple[int, int] | None:
         source_id = getattr(loop_block, "source_loop_node_id", None)
@@ -10736,9 +10760,9 @@ def _install_lexical_sequence_mutations(
             for item in block.sequence_mutations:
                 effect_id = int(item.effect_node_id)
                 guards = tuple(
-                    (int(owner), str(arm))
-                    for owner, arm in memberships.get(effect_id, ())
-                    if str(arm) in {"body", "orelse"} and int(owner) in owners
+                    (owner, arm)
+                    for owner, arm in predicate_memberships(effect_id)
+                    if owner in owners
                 )
                 if guards:
                     arm_relocated.append(
@@ -10805,9 +10829,7 @@ def _install_lexical_sequence_mutations(
                 continue
         guarded = tuple(dict.fromkeys((
             *tuple(
-            (int(owner), str(arm))
-            for owner, arm in memberships.get(int(mutation.effect_node_id), ())
-            if str(arm) in {"body", "orelse"}
+                predicate_memberships(int(mutation.effect_node_id))
             ),
             *tuple(
                 (int(owner), str(arm))
@@ -10853,7 +10875,7 @@ def _install_lexical_sequence_mutations(
                     key=lambda item: node_position(item[0]),
                     reverse=True,
                 )[0]
-                record = _source_control_records(graph.G).get(owner_id)
+                record = source_control_records.get(owner_id)
                 owner_node_id = (
                     int(owner_id) if int(owner_id) in graph.G else next((
                         int(node_id)
