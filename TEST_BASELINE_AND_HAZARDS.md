@@ -1,3 +1,19 @@
+2026-10-12 SCALAR MAPPING SETDEFAULT SSA (CURRENT WORKTREE):
+The mapping mutation lowerer no longer assumes every `dict.setdefault` value
+is a nested child table.  For an exact flat mapping schema with key columns
+and one scalar value column, it now performs the existing table lookup, reads
+the lookup status, stores the authored default only on the missing edge, and
+publishes the call result as the Phi of the existing and inserted values.  The
+nested child-table handle path remains unchanged.
+
+The focused scalar regression proves lookup, conditional store, and result
+Phi ownership.  A bounded rerun of only
+`aot_compile.py::_lower_process_graph_to_compilation` reduced the structured
+frontier from 10 to 7 in 24.0s; all three scalar `setdefault` shortfalls are
+gone.  Remaining: four carried-name identities, one carried-field version,
+one loop-carried producer, and one fixed-aggregate mapping update.  No outer
+bootstrap or all-rules compile was launched.
+
 2026-10-12 TRY-COMPARTMENT / PREDICATE IDENTITY REPAIR (CURRENT WORKTREE):
 The real compiler partition's 48 `sequence-mutation-guard` shortfalls had one
 cause.  `_branch_compartments` correctly records lexical compartments for

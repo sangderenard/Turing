@@ -8587,6 +8587,123 @@ class _ControlSSABuilder(TiledObject):
             if operation == "setdefault":
                 pool = destination.child_table_pool
                 key_count = len(destination.key_columns)
+                value_columns = tuple(
+                    column
+                    for column in range(len(destination.column_value_ids))
+                    if column not in destination.key_columns
+                )
+                if (
+                    pool is None
+                    and key_count
+                    and len(value_columns) == 1
+                    and len(mutation.argument_value_ids) == key_count + 1
+                ):
+                    from .ir_sequence_tables import lower_table_lookup
+
+                    key_ids = tuple(map(
+                        int, mutation.argument_value_ids[:key_count]
+                    ))
+                    default_id = int(mutation.argument_value_ids[-1])
+                    lookup_name = self._sequence_helper_name(
+                        int(destination.sequence_id), "setdefault_lookup",
+                    )
+                    lookup = lower_table_lookup(
+                        destination,
+                        function_name=lookup_name,
+                        first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+                    )
+                    self._register_sequence_lowering(lookup)
+                    query_values = self._table_query_values(key_ids)
+                    existing = self.fresh_value(
+                        dtype=str(destination.column_dtypes[value_columns[0]]),
+                        transform=TABLE_LOOKUP,
+                        operands=(
+                            self._sequence_contract_cell(
+                                int(destination.sequence_id)
+                            ),
+                            *query_values,
+                        ),
+                    )
+                    self.emit(
+                        Handler.Call,
+                        [
+                            *self.sequence_storage_values[
+                                int(destination.sequence_id)
+                            ],
+                            self.sequence_status_values[
+                                int(destination.sequence_id)
+                            ],
+                            *query_values,
+                        ],
+                        existing,
+                        attributes={
+                            "callee": lookup_name,
+                            "source_linked": True,
+                            "ssa_sequence_operation": "setdefault_lookup",
+                            "sequence_id": int(destination.sequence_id),
+                        },
+                    )
+                    status_cell = self._sequence_status_address(
+                        self.sequence_status_values[
+                            int(destination.sequence_id)
+                        ]
+                    )
+                    status = self.fresh_value(
+                        dtype="int", transform=LOAD, operands=(status_cell,),
+                    )
+                    self.emit(
+                        Handler.Load, [status_cell], status,
+                        attributes={"binding": "ssa_mapping_setdefault_status"},
+                    )
+                    found = self.fresh_value(
+                        dtype="bool", transform=CONTROL_PREDICATE,
+                        operands=(status,),
+                    )
+                    self.emit(
+                        Handler.Gt,
+                        [status, self.constant_value(0, status)],
+                        found,
+                        attributes={"binding": "ssa_mapping_setdefault_found"},
+                    )
+                    found_block = self.new_block("mapping_setdefault_found")
+                    missing_block = self.new_block("mapping_setdefault_missing")
+                    complete = self.new_block("mapping_setdefault_merge")
+                    self.conditional_branch(found, found_block, missing_block)
+
+                    self.current = found_block
+                    self.branch(complete)
+
+                    self.current = missing_block
+                    default = self.external_value(default_id)
+                    self._emit_table_store(
+                        int(mutation.effect_node_id), key_ids, default_id,
+                        int(destination.sequence_id),
+                    )
+                    self.branch(complete)
+
+                    self.current = complete
+                    result = self.produced_value(
+                        int(mutation.effect_node_id),
+                        dtype=str(existing.dtype or default.dtype or "unknown"),
+                        claim_provisional_definition=True,
+                        cause=(existing, default, found),
+                    )
+                    self.emit(
+                        Handler.Phi,
+                        [existing, default],
+                        result,
+                        attributes={
+                            "incoming_blocks": (
+                                found_block.name, missing_block.name,
+                            ),
+                            "binding": "ssa_mapping_setdefault_result",
+                        },
+                    )
+                    self._bind(
+                        int(mutation.effect_node_id), result,
+                        BindingKind.SEQUENCE_RESULT, existing, default,
+                    )
+                    return
                 if (
                     pool is None
                     or len(mutation.argument_value_ids) != key_count + 1

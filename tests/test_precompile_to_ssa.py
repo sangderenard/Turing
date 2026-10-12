@@ -1747,6 +1747,58 @@ def test_mapping_setdefault_returns_initialized_child_table_handle():
     )
 
 
+def test_mapping_setdefault_returns_existing_or_inserted_scalar_value():
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            20,
+            "setdefault",
+            (21, 22),
+            23,
+            policy="unique",
+            argument_kind="mapping_setdefault",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="mapping_scalar_setdefault",
+        first_value_id=1000,
+        sequence_declarations=((20, "unique", 2, True),),
+        sequence_column_dtypes={20: ("int64", "float64")},
+        resolved_sequence_schemas={20: ResolvedSequenceSchema(
+            column_count=2,
+            policy="unique",
+            writable=True,
+            retains_deleted_rows=False,
+            nested_table=False,
+        )},
+    )
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+
+    assert shortfalls == ()
+    assert any(
+        instruction.attributes.get("ssa_sequence_operation")
+        == "setdefault_lookup"
+        for instruction in instructions
+    )
+    assert any(
+        instruction.attributes.get("ssa_sequence_operation") == "table_store"
+        for instruction in instructions
+    )
+    result = next(
+        instruction
+        for instruction in instructions
+        if instruction.res is not None and instruction.res.id == 23
+    )
+    assert str(result.op).casefold() == "phi"
+    assert result.attributes["binding"] == "ssa_mapping_setdefault_result"
+
+
 def test_mapping_pop_none_lowers_to_typed_optional_lookup_then_delete():
     control = ControlProgram(LoopBlock(
         "item", "0", "1", "1", SequenceBlock(()),
