@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 
 from src.compiler.control_source import (
-    ConditionalBlock, ControlProgram, LoopBlock, SequenceBlock, StatementBlock,
-    overlay_scheduled_control,
+    AuthoredControlSite, ConditionalBlock, ControlProgram, LoopBlock,
+    SequenceBlock, StatementBlock, overlay_scheduled_control,
 )
 
 
@@ -70,6 +70,40 @@ def test_nested_regionless_loop_refuses_unproven_placement(fault):
         overlay_scheduled_control((0,), (ControlProgram(loop), ControlProgram(parent, (0,))),
             known_nesting={1: (0,)}, source_graph=SimpleNamespace(G=graph),
             region_source_nodes={0: (20, 21)})
+
+
+@pytest.mark.parametrize("slot", ["iter", "ifs", "elt"])
+def test_nested_regionless_loop_consumes_exact_comprehension_site(slot):
+    parent = LoopBlock(
+        "parent",
+        "0",
+        "n",
+        "1",
+        SequenceBlock((StatementBlock(("body",)),)),
+        source_loop_node_id=11,
+    )
+    child = LoopBlock(
+        "child", "0", "m", "1", SequenceBlock(()), source_loop_node_id=13
+    )
+    graph = nx.DiGraph()
+    graph.add_nodes_from(((11, {"expr_obj": ast.comprehension()}), (13, {})))
+
+    program = overlay_scheduled_control(
+        (),
+        (ControlProgram(parent), ControlProgram(child)),
+        known_nesting={0: (1,)},
+        authored_control_sites={
+            (0, 1): AuthoredControlSite(11, 13, slot, path=(slot,))
+        },
+        source_graph=SimpleNamespace(G=graph),
+    )
+
+    if slot == "iter":
+        assert program.root == SequenceBlock((child, parent))
+    else:
+        projected = program.root.blocks[0]
+        assert isinstance(projected, LoopBlock)
+        assert projected.body.blocks == (child, StatementBlock(("body",)))
 
 
 @pytest.mark.parametrize('arm', ['body', 'orelse'])

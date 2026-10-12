@@ -1,3 +1,31 @@
+2026-10-12 EXACT AUTHORED CONTROL-SITE RETENTION (CURRENT WORKTREE):
+The compiler no longer collapses a direct control-nesting edge to a bare
+parent/child relation when the child is a region-less comprehension loop.
+Planning now retains the exact authored AST slot and path.  An inner loop in
+an owning comprehension's iterable executes as a prelude; one in an `ifs`,
+`elt`, `key`, or `value` executes inside the owning iteration.  Multiple exact
+children retain authored evaluation order.  Ordinary `body`/`orelse` placement
+continues to use the existing exact-arm proof and still refuses ambiguity.
+
+The same real partition exposed three downstream consumers that had also
+discarded exact identity.  Conditional containment now treats `IfExp` arms as
+their AST-valued expressions rather than splatting them as statement lists;
+an already-recorded unresolved field arm retains its precise reason instead
+of attempting a causeless revision; and one authored parameter name publishes
+one control ABI slot even when later lexical versions are separate region
+arguments.
+
+Bounded verification compiled only
+`aot_compile.py::_lower_process_graph_to_compilation`, not the outer bootstrap.
+It now lowers all 44 regions and reaches the intended aggregate
+`FortranEmissionError` listing the remaining unsupported mapping/update,
+carried-value, and mutation-guard frontiers.  It no longer fails at
+`declared nested loop has no exact authored arm`, `IfExp` arm iteration,
+causeless concordance revision, or duplicate `class_navigation`/`map_ir`
+parameter names.  Focused control, ownership, overlay, and SSA gates pass 47
+tests in 5.21s; the user retains ownership of the next observable all-rules
+bootstrap run.
+
 2026-10-12 NON-BLOCKING COMPILER BOOTSTRAP FRONTIERS (CURRENT WORKTREE):
 Project bootstrap no longer converts one failed authored compiler unit into an
 immediate project-wide `NativeInstallationRequiredError`.  The catalogue's

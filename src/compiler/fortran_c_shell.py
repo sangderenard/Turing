@@ -16871,6 +16871,17 @@ def _class_surface_ssa_program(
                 for block in conditional_blocks
                 if block is not None and block.source_node_id is not None
             }
+
+            def authored_conditional_arms(expression):
+                """Return both authored arms without changing their AST shape."""
+
+                if isinstance(expression, ast.IfExp):
+                    return (expression.body, expression.orelse)
+                return (
+                    *getattr(expression, "body", ()),
+                    *getattr(expression, "orelse", ()),
+                )
+
             parent_by_child: dict[int, int] = {}
             for child_index, child in enumerate(conditional_blocks, start=1):
                 if child is None or child.source_node_id is None:
@@ -16891,9 +16902,9 @@ def _class_surface_ssa_program(
                     if expression is None:
                         continue
                     descendants = {
-                        _ast_source_signature(member) for statement in (
-                            *expression.body, *expression.orelse
-                        ) for member in ast.walk(statement)
+                        _ast_source_signature(member)
+                        for statement in authored_conditional_arms(expression)
+                        for member in ast.walk(statement)
                     }
                     child_expression = source_expressions.get(
                         int(child.source_node_id)
@@ -16990,10 +17001,9 @@ def _class_surface_ssa_program(
                 if container is None or inner is None:
                     return True
                 return _ast_source_signature(inner) in {
-                    _ast_source_signature(member) for statement in (
-                        *getattr(container, "body", ()),
-                        *getattr(container, "orelse", ()),
-                    ) for member in ast.walk(statement)
+                    _ast_source_signature(member)
+                    for statement in authored_conditional_arms(container)
+                    for member in ast.walk(statement)
                 }
 
             control = overlay_scheduled_control(

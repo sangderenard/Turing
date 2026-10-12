@@ -31,3 +31,67 @@ def test_comprehension_ownership_uses_conditional_arm_slots(in_predicate):
     hints = _source_control_nesting_hints((reduction,), (control,), (), graph)
 
     assert hints == ({} if in_predicate else {1: frozenset({0})})
+
+
+@pytest.mark.parametrize(
+    ("source", "child_selector", "expected_slot"),
+    [
+        (
+            "result = [item for item in (value for value in values)]",
+            lambda tree: next(
+                node for node in ast.walk(tree.generators[0].iter)
+                if isinstance(node, ast.comprehension)
+            ),
+            "iter",
+        ),
+        (
+            "result = [item for item in values if any(value for value in item)]",
+            lambda tree: next(
+                node for node in ast.walk(tree.generators[0].ifs[0])
+                if isinstance(node, ast.comprehension)
+            ),
+            "ifs",
+        ),
+        (
+            "result = [(value for value in item) for item in values]",
+            lambda tree: next(
+                node for node in ast.walk(tree.elt)
+                if isinstance(node, ast.comprehension)
+            ),
+            "elt",
+        ),
+    ],
+)
+def test_comprehension_ownership_preserves_exact_authored_site(
+    source, child_selector, expected_slot
+):
+    aggregate = ast.parse(source).body[0].value
+    parent = aggregate.generators[0]
+    child = child_selector(aggregate)
+    graph_data = nx.DiGraph()
+    graph_data.add_node(1, expr_obj=parent)
+    graph_data.add_node(2, expr_obj=child)
+    graph_data.add_node(3, expr_obj=aggregate, parents=((1, "generators"),))
+    graph_data.add_edge(1, 3)
+    graph = SimpleNamespace(G=graph_data)
+    reductions = (
+        SimpleNamespace(loop_node_id=1, control_program=None, region_indices=(0,)),
+        SimpleNamespace(loop_node_id=2, control_program=None, region_indices=()),
+    )
+    loop_plans = (SimpleNamespace(
+        loop=SimpleNamespace(node_id=1, body_nodes=(2,)),
+    ),)
+    sites = {}
+
+    hints = _source_control_nesting_hints(
+        reductions,
+        (),
+        loop_plans,
+        graph,
+        authored_control_site_sink=sites,
+    )
+
+    assert hints == {0: frozenset({1})}
+    assert sites[(0, 1)].parent_source_node_id == 1
+    assert sites[(0, 1)].child_source_node_id == 2
+    assert sites[(0, 1)].slot == expected_slot

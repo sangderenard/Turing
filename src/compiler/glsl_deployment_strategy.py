@@ -59,6 +59,7 @@ class CompilationSubdivisionRequired(ValueError):
 
 from .deployment_fifo import DeploymentFIFO
 from .control_source import (
+    AuthoredControlSite,
     CallBlock,
     ControlExpression,
     ControlOverlayScopeError,
@@ -8517,6 +8518,8 @@ def _source_control_nesting_hints(
     conditional_programs: "Sequence[ControlProgram]",
     loop_plans: "Iterable[LoopPlan]",
     graph: Any,
+    *,
+    authored_control_site_sink: "dict[tuple[int, int], AuthoredControlSite] | None" = None,
 ) -> dict[int, frozenset[int]]:
     """Correlate loop and conditional controls by authored AST identity.
 
@@ -8531,12 +8534,14 @@ def _source_control_nesting_hints(
     conditionals = tuple(conditional_programs)
     offset = len(reductions)
     expressions: dict[int, ast.AST] = {}
+    source_node_ids: dict[int, int] = {}
     for index, reduction in enumerate(reductions):
         if int(reduction.loop_node_id) not in graph.G:
             continue
         expression = graph.G.nodes[int(reduction.loop_node_id)].get("expr_obj")
         if isinstance(expression, ast.AST):
             expressions[index] = expression
+            source_node_ids[index] = int(reduction.loop_node_id)
     from .control_source import ConditionalBlock
     for local_index, program in enumerate(conditionals):
         block = next((
@@ -8557,6 +8562,7 @@ def _source_control_nesting_hints(
         )
         if isinstance(expression, ast.AST):
             expressions[offset + local_index] = expression
+            source_node_ids[offset + local_index] = int(block.source_node_id)
 
     children: dict[int, set[int]] = {
         int(parent): set(map(int, nested))
@@ -8623,8 +8629,127 @@ def _source_control_nesting_hints(
     if not nx.is_directed_acyclic_graph(ownership):
         raise ValueError('authored control ownership contains a cycle')
     direct = nx.transitive_reduction(ownership)
-    return {parent: frozenset(direct.successors(parent)) for parent in direct
-            if direct.out_degree(parent)}
+    nesting = {
+        parent: frozenset(direct.successors(parent))
+        for parent in direct if direct.out_degree(parent)
+    }
+
+    def identity_paths(root: ast.AST, target: ast.AST):
+        found = []
+
+        def visit(value, path):
+            if value is target:
+                found.append(tuple(path))
+            if isinstance(value, ast.AST):
+                for field, member in ast.iter_fields(value):
+                    visit(member, (*path, str(field)))
+            elif isinstance(value, list):
+                for ordinal, member in enumerate(value):
+                    visit(member, (*path, int(ordinal)))
+
+        visit(root, ())
+        return tuple(found)
+
+    def authored_site(parent_index: int, child_index: int):
+        parent = expressions.get(int(parent_index))
+        child = expressions.get(int(child_index))
+        parent_id = source_node_ids.get(int(parent_index))
+        child_id = source_node_ids.get(int(child_index))
+        if not (
+            isinstance(parent, ast.AST)
+            and isinstance(child, ast.AST)
+            and parent_id is not None
+            and child_id is not None
+        ):
+            return None
+
+        fields = []
+        if isinstance(parent, ast.comprehension):
+            fields.append(("iter", None, parent.iter))
+            fields.extend(
+                ("ifs", ordinal, condition)
+                for ordinal, condition in enumerate(parent.ifs)
+            )
+            # A comprehension clause does not contain its element expression.
+            # The aggregate materializer owns both the ordered generator list
+            # and elt/key/value, and its existing graph roles are therefore
+            # the authoritative bridge between those authored AST objects.
+            for owner_id in graph.G.successors(int(parent_id)):
+                owner = graph.G.nodes[int(owner_id)].get("expr_obj")
+                if not isinstance(
+                    owner,
+                    (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+                ):
+                    continue
+                if not any(
+                    int(source) == int(parent_id)
+                    and str(role) == "generators"
+                    for source, role in graph.G.nodes[int(owner_id)].get(
+                        "parents", ()
+                    )
+                ):
+                    continue
+                for field in ("elt", "key", "value"):
+                    member = getattr(owner, field, None)
+                    if isinstance(member, ast.AST):
+                        fields.append((field, None, member))
+                fields.extend(
+                    ("generators", ordinal, generator)
+                    for ordinal, generator in enumerate(owner.generators)
+                    if generator is not parent
+                )
+        elif isinstance(parent, ast.For):
+            fields.append(("iter", None, parent.iter))
+            fields.extend(("body", ordinal, statement)
+                          for ordinal, statement in enumerate(parent.body))
+            fields.extend(("orelse", ordinal, statement)
+                          for ordinal, statement in enumerate(parent.orelse))
+        elif isinstance(parent, ast.While):
+            fields.append(("test", None, parent.test))
+            fields.extend(("body", ordinal, statement)
+                          for ordinal, statement in enumerate(parent.body))
+            fields.extend(("orelse", ordinal, statement)
+                          for ordinal, statement in enumerate(parent.orelse))
+        elif isinstance(parent, ast.If):
+            fields.extend(("body", ordinal, statement)
+                          for ordinal, statement in enumerate(parent.body))
+            fields.extend(("orelse", ordinal, statement)
+                          for ordinal, statement in enumerate(parent.orelse))
+        elif isinstance(parent, ast.IfExp):
+            fields.extend((
+                ("body", 0, parent.body),
+                ("orelse", 0, parent.orelse),
+            ))
+
+        matches = []
+        for slot, ordinal, member in fields:
+            for path in identity_paths(member, child):
+                matches.append(AuthoredControlSite(
+                    int(parent_id),
+                    int(child_id),
+                    str(slot),
+                    ordinal,
+                    (
+                        str(slot),
+                        *(() if ordinal is None else (int(ordinal),)),
+                        *path,
+                    ),
+                ))
+        if len(matches) > 1:
+            raise ValueError(
+                "authored control relation has multiple exact execution sites"
+            )
+        return matches[0] if matches else None
+
+    if authored_control_site_sink is not None:
+        authored_control_site_sink.clear()
+        authored_control_site_sink.update({
+            (int(parent), int(child)): site
+            for parent, children in nesting.items()
+            for child in children
+            if (site := authored_site(int(parent), int(child))) is not None
+        })
+    return nesting
 
 
 def _overlay_control_or_require_subdivision(
@@ -8634,7 +8759,9 @@ def _overlay_control_or_require_subdivision(
     loop_controls: Sequence[ControlProgram],
     conditional_controls: Sequence[ControlProgram],
     nesting: Mapping[int, Iterable[int]],
-    *, region_dependencies: Iterable[tuple[int, int]] = (),
+    *,
+    authored_control_sites: "Mapping[tuple[int, int], AuthoredControlSite] | None" = None,
+    region_dependencies: Iterable[tuple[int, int]] = (),
     dispatch_subgraphs: Iterable[Any] = (),
 ) -> ControlProgram:
     """Turn a named cross-scope overlay refusal into loop-owned frontier data."""
@@ -8707,6 +8834,7 @@ def _overlay_control_or_require_subdivision(
             runtime_regions,
             (*loop_controls, *conditional_controls),
             known_nesting=nesting,
+            authored_control_sites=authored_control_sites,
             source_graph=graph,
             region_source_nodes={
                 index: tuple(subgraph.G.graph.get("deployment_nodes", ()))
@@ -24665,11 +24793,13 @@ class ProcessGraphGLSLDeployment(TiledObject):
                     f"source_conditional_ids={sorted({int((data.get('attributes') or {}).get('source_conditional_id')) for _node, data in target.process_graph.G.nodes(data=True) if (data.get('attributes') or {}).get('source_conditional_id') is not None})}",
                     file=sys.stderr,
                 )
+            authored_control_sites = {}
             nesting = _source_control_nesting_hints(
                 considered_reductions,
                 conditional_controls,
                 target.loop_plans,
                 target.process_graph,
+                authored_control_site_sink=authored_control_sites,
             )
             shell_control = _overlay_control_or_require_subdivision(
                 target.process_graph,
@@ -24678,6 +24808,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 loop_controls,
                 conditional_controls,
                 nesting,
+                authored_control_sites=authored_control_sites,
                 region_dependencies=region_dependencies,
                 dispatch_subgraphs=target.dispatch_subgraphs,
             )
@@ -26495,11 +26626,13 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 )
                 for reduction in considered_reductions
             )
+            authored_control_sites = {}
             nesting = _source_control_nesting_hints(
                 considered_reductions,
                 conditional_controls,
                 self.loop_plans,
                 self.process_graph,
+                authored_control_site_sink=authored_control_sites,
             )
             shell_control = _overlay_control_or_require_subdivision(
                 self.process_graph,
@@ -26508,6 +26641,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 loop_controls,
                 conditional_controls,
                 nesting,
+                authored_control_sites=authored_control_sites,
                 region_dependencies=region_dependencies,
                 dispatch_subgraphs=self.dispatch_subgraphs,
             )

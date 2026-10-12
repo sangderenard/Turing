@@ -3620,6 +3620,86 @@ def test_inplace_scalar_field_effect_uses_resident_incumbent_on_false_arm(scalar
     assert check_definition_dominance(IRModule({function.name: function})) == []
 
 
+def test_repeated_missing_field_arm_reuses_exact_unresolved_fact(
+    scalar_field_version_fixture,
+):
+    from src.compiler.concordance_declarations import (
+        CONTROL_SSA,
+        FIELD_WRITE_DTYPE_UNPROVEN,
+        SSA_FIELD_VERSION,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        Mode,
+        Unresolved,
+        current_identity_book,
+    )
+
+    scope, observed, written, merged = scalar_field_version_fixture
+    current_identity_book().post(
+        SSA_FIELD_VERSION,
+        (scope, written),
+        Unresolved(FIELD_WRITE_DTYPE_UNPROVEN, read=(written,)),
+        stage=CONTROL_SSA,
+        provenance=Derived((written,)),
+        mode=Mode.REVISE,
+    )
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=10,
+        body=SequenceBlock(()),
+        orelse=SequenceBlock(()),
+        predicate_expression=ControlExpression("value", value_id=10),
+        carried_aliases=((40, 40, 40, 42),),
+        carried_field_cells=((written, observed, merged),),
+        source_node_id=50,
+    ))
+    arguments = {
+        "lexical_read_scope": scope,
+        "region_value_meta": {
+            10: Meta((), "bool"),
+            30: Meta((), "int64"),
+        },
+    }
+
+    _first_function, first_shortfalls = lower_control_program_to_ssa(
+        control, **arguments
+    )
+    _second_function, second_shortfalls = lower_control_program_to_ssa(
+        control, **arguments
+    )
+
+    assert [item.name for item in first_shortfalls] == [
+        "carried-field-arm-missing"
+    ]
+    assert [item.name for item in second_shortfalls] == [
+        "carried-field-arm-missing"
+    ]
+
+
+def test_reassigned_parameter_name_has_one_control_abi_slot():
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_0__",)),
+        region_indices=(0,),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="reassigned_parameter",
+        region_callees={0: "reassigned_parameter_region_0"},
+        region_signatures={0: ((14, 131), ())},
+        region_value_meta={
+            14: Meta((), "int64"),
+            131: Meta((), "int64"),
+        },
+        value_name_histories={"class_navigation": (14, 131)},
+        parameter_names=("class_navigation",),
+    )
+
+    assert shortfalls == ()
+    assert len(function.metadata["parameter_names"]) == 1
+    assert function.metadata["parameter_names"][0][0] == "class_navigation"
+
+
 def test_sequential_conditional_uses_prior_merge_for_reused_arm_identity():
     """A later if sees the first if's merge, not its true-arm temporary."""
 

@@ -4806,6 +4806,8 @@ class _ControlSSABuilder(TiledObject):
         if row is None:
             return snapshot, None
         version_ref = book.latest_ref(SSA_FIELD_VERSION, row)
+        recorded_missing = None
+        recorded_reason = ARM_VERSION_MISSING
         if version_ref is not None:
             fact = book.pages[SSA_FIELD_VERSION.name].latest(row)
             value = self.field_version_values.get(version_ref)
@@ -4817,6 +4819,17 @@ class _ControlSSABuilder(TiledObject):
                 )
             if value is not None:
                 return value, version_ref
+            if (
+                isinstance(fact, Unresolved)
+                and arm_cell in fact.read
+            ):
+                # A prior control section may already have read this exact
+                # authored arm and recorded the more precise reason it has no
+                # SSA version (for example, an unproven write dtype).  Keep
+                # that fact: replacing its reason without a changed source
+                # would be a false revision.
+                recorded_missing = version_ref
+                recorded_reason = fact.reason
         kind = self._field_state_kind(arm_cell)
         if arm_cell == other_arm_cell or kind in {
             FieldStateKind.OBSERVED, FieldStateKind.ARM_SELECTED,
@@ -4845,8 +4858,9 @@ class _ControlSSABuilder(TiledObject):
                 return storage, (
                     version_ref if version_ref is not None else arm_cell
                 )
-        missing = book.post(
-            SSA_FIELD_VERSION, row,
+        missing = recorded_missing or book.post(
+            SSA_FIELD_VERSION,
+            row,
             Unresolved(ARM_VERSION_MISSING, read=(arm_cell,)),
             stage=CONTROL_SSA,
             provenance=Derived((arm_cell,)),
@@ -4856,7 +4870,7 @@ class _ControlSSABuilder(TiledObject):
             "control", "carried-field-arm-missing", path,
             "a field-carried conditional arm names a field-state cell with "
             f"no ssa_field_version: row={missing.row!r} "
-            f"(recorded {ARM_VERSION_MISSING.name})",
+            f"(recorded {recorded_reason.name})",
         ))
         return snapshot, None
 
@@ -12162,13 +12176,25 @@ class _ControlSSABuilder(TiledObject):
         # real ABI use: the caller must supply it, so it must keep its name.
         used_value_ids.update(int(value.id) for value in returned)
         named_parameters = {name for name, _ in parameter_value_names}
-        parameter_value_names += tuple(
-            (name, value_id)
-            for name in self.parameter_names
-            if name not in named_parameters
-            for value_id in self.value_name_histories.get(name, ())
-            if int(value_id) in argument_ids and int(value_id) in used_value_ids
-        )
+        additional_parameters = []
+        for name in self.parameter_names:
+            if name in named_parameters:
+                continue
+            value_id = next((
+                int(candidate)
+                for candidate in self.value_name_histories.get(name, ())
+                if int(candidate) in argument_ids
+                and int(candidate) in used_value_ids
+            ), None)
+            if value_id is None:
+                continue
+            # One authored parameter name is one ABI slot.  Reassignments of
+            # that name may also be control-function arguments when their
+            # producing region is linked separately, but they are later
+            # lexical versions, not additional parameters with the same name.
+            additional_parameters.append((name, value_id))
+            named_parameters.add(name)
+        parameter_value_names += tuple(additional_parameters)
         deployment_regions = []
         for record in self.deployment_records:
             declared_lanes = {

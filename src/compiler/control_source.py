@@ -35,6 +35,24 @@ class ControlOverlayScopeError(ValueError):
         }
 
 
+@dataclass(frozen=True)
+class AuthoredControlSite:
+    """Exact authored execution slot for one control-to-control edge.
+
+    ``known_nesting`` says which control is structurally related to which;
+    this record preserves the part of that source fact which cannot be
+    reconstructed from region containment.  In particular, a comprehension
+    used as another comprehension's iterable is a prelude, while one in its
+    filter or element executes inside each owning iteration.
+    """
+
+    parent_source_node_id: int
+    child_source_node_id: int
+    slot: str
+    ordinal: int | None = None
+    path: tuple[str | int, ...] = ()
+
+
 class ControlTarget(str, Enum):
     PYTHON = "python"
     C = "c"
@@ -3465,6 +3483,7 @@ def overlay_scheduled_control(
     controls: Iterable[ControlProgram],
     *,
     known_nesting: "Mapping[int, Iterable[int]] | None" = None,
+    authored_control_sites: "Mapping[tuple[int, int], AuthoredControlSite] | None" = None,
     lexical_encloses: "Callable[[int, int], bool] | None" = None,
     source_graph: Any = None,
     region_source_nodes: Mapping[int, Iterable[int]] | None = None,
@@ -3518,6 +3537,10 @@ def overlay_scheduled_control(
     direct_children = {
         int(parent): frozenset(int(child) for child in children)
         for parent, children in (known_nesting or {}).items()
+    }
+    authored_control_sites = {
+        (int(parent), int(child)): site
+        for (parent, child), site in (authored_control_sites or {}).items()
     }
     nested_children_overall = frozenset(
         child
@@ -3777,7 +3800,7 @@ def overlay_scheduled_control(
 
     nested_roots: dict[int, ControlBlock] = {}
 
-    def place_regionless_loop(root, child_root):
+    def place_regionless_loop(root, child_root, authored_site=None):
         """Consume the declared nesting edge in its exact authored arm.
 
         In root(value,memo)->visit(item), conditional 11 owns comprehension
@@ -3803,6 +3826,68 @@ def overlay_scheduled_control(
             )
 
         child_expression = expression(child_root.source_loop_node_id)
+
+        def insert_at_comprehension_site(block):
+            """Consume an exact comprehension slot without arm inference."""
+
+            if authored_site is None or authored_site.slot not in {
+                "iter", "ifs", "elt", "key", "value", "generators",
+            }:
+                return block, False
+            node_id = getattr(block, "source_loop_node_id", None)
+            if node_id == authored_site.parent_source_node_id:
+                if not isinstance(block, (LoopBlock, WhileBlock)):
+                    raise ValueError(
+                        "authored comprehension site does not name a loop control"
+                    )
+                if authored_site.slot == "iter":
+                    return SequenceBlock((child_root, block)), True
+                if isinstance(block, WhileBlock) and authored_site.slot == "ifs":
+                    condition = _flatten_control_sequence(block.condition)
+                    return replace(
+                        block,
+                        condition=SequenceBlock((child_root, *condition)),
+                    ), True
+                body = _flatten_control_sequence(block.body)
+                return replace(
+                    block,
+                    body=SequenceBlock((child_root, *body)),
+                ), True
+            if isinstance(block, SequenceBlock):
+                found = False
+                children = []
+                for member in block.blocks:
+                    projected, owned = insert_at_comprehension_site(member)
+                    if owned and found:
+                        raise ValueError(
+                            "authored comprehension site has multiple control owners"
+                        )
+                    found |= owned
+                    children.append(projected)
+                return replace(block, blocks=tuple(children)), found
+            if isinstance(block, ConditionalBlock):
+                body, body_found = insert_at_comprehension_site(block.body)
+                orelse = block.orelse
+                else_found = False
+                if orelse is not None:
+                    orelse, else_found = insert_at_comprehension_site(orelse)
+                return replace(block, body=body, orelse=orelse), (
+                    body_found or else_found
+                )
+            if isinstance(block, (LoopBlock, WhileBlock)):
+                body, found = insert_at_comprehension_site(block.body)
+                return replace(block, body=body), found
+            return block, False
+
+        if authored_site is not None and authored_site.slot in {
+            "iter", "ifs", "elt", "key", "value", "generators",
+        }:
+            projected, found = insert_at_comprehension_site(root)
+            if not found:
+                raise ValueError(
+                    "declared nested loop has no exact authored execution site"
+                )
+            return projected
 
         def source_ids(block):
             if isinstance(block, StatementBlock):
@@ -3888,12 +3973,33 @@ def overlay_scheduled_control(
         # continue`` in a while body) the marker would otherwise already sit
         # inside the sibling's arm, and the child -- whose merge the
         # sibling's test reads -- was nested into that arm.
-        for child in sorted(direct_children.get(index, ())):
+        children = tuple(direct_children.get(index, ()))
+        exact_comprehension_children = sorted(
+            (
+                child for child in children
+                if (site := authored_control_sites.get((index, child)))
+                is not None
+                and site.slot in {
+                    "iter", "ifs", "elt", "key", "value", "generators",
+                }
+            ),
+            key=lambda child: authored_control_sites[(index, child)].path,
+            reverse=True,
+        )
+        remaining_children = sorted(
+            set(children).difference(exact_comprehension_children)
+        )
+        # Exact comprehension sites insert at the front of their execution
+        # slot.  Consume later-authored siblings first so repeated insertion
+        # preserves source evaluation order.
+        for child in (*exact_comprehension_children, *remaining_children):
             control = controls[child]
             if (not control.region_indices
                     and isinstance(control.root, (LoopBlock, WhileBlock))):
                 root = place_regionless_loop(
-                    root, nested_root(child, visiting | {index}),
+                    root,
+                    nested_root(child, visiting | {index}),
+                    authored_control_sites.get((index, child)),
                 )
                 continue
             if not _anchored_control(control):
