@@ -11,6 +11,10 @@ import tools.compile_project_catalogue as compile_project_catalogue
 from src.compiler.glsl_deployment_strategy import (
     CompilationSubdivisionRequired,
 )
+from src.compiler.precompile_to_ssa import (
+    SSALoweringIncompleteError,
+    SSALoweringShortfall,
+)
 
 from src.compiler.project_compilation_product import (
     compilation_creep_frontier,
@@ -424,6 +428,51 @@ def test_project_bootstrap_installs_an_independent_unit_past_a_failed_unit(
         "qualified_name": "root",
         "stage": "compiler-unit",
         "reason": "ValueError: semantic boundary was not lowered",
+    }]
+
+
+def test_project_bootstrap_classifies_incomplete_ssa_lowering_separately(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "compiler_part.py"
+    source.write_text("def root(value):\n    return value\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_project_product",
+        lambda _source, _output, **_kwargs: {
+            "units": [{
+                "qualified_name": "root",
+                "status": "failed",
+                "error_type": "SSALoweringIncompleteError",
+                "error": "whole-object SSA lowering is incomplete",
+                "frontier_kind": "ssa-lowering-incomplete",
+                "lowering_stage": "backend-neutral-ssa",
+                "lowering_shortfall_count": 3,
+                "lowering_shortfall_kinds": {
+                    "mapping-update": 1,
+                    "sequence-mutation-guard": 2,
+                },
+            }],
+            "automatic_native_verification": [],
+            "creep_frontier": [{"qualified_name": "root"}],
+        },
+    )
+
+    manifest = compile_project_bootstrap_creep(
+        source, tmp_path / "creep", max_rounds=1,
+    )
+
+    assert manifest["rounds"][0]["continuation_failures"] == [{
+        "qualified_name": "root",
+        "stage": "ssa-lowering",
+        "frontier_kind": "ssa-lowering-incomplete",
+        "reason": (
+            "backend-neutral SSA lowering reported 3 unsupported mechanic(s)"
+        ),
+        "shortfall_count": 3,
+        "shortfall_kinds": {
+            "mapping-update": 1,
+            "sequence-mutation-guard": 2,
+        },
     }]
 
 
@@ -841,6 +890,62 @@ def test_project_worker_publishes_structured_loop_subdivision(
     assert integral["function_references"] == [7]
     assert integral["region_indices"] == [3]
     assert integral["blockers"] == ["With"]
+
+
+def test_project_worker_publishes_structured_ssa_lowering_frontier(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "source.py"
+    source.write_text("def kernel():\n    return 1\n", encoding="utf-8")
+    output = tmp_path / "worker"
+
+    def refuse(_source, _entry, _directory, **_kwargs):
+        raise SSALoweringIncompleteError((
+            ("kernel", SSALoweringShortfall(
+                domain="control",
+                name="sequence-mutation-guard",
+                location="kernel.body[2]",
+                reason="mutation predicate is not exact",
+            )),
+            ("kernel", SSALoweringShortfall(
+                domain="operator",
+                name="mapping-update",
+                location="kernel.body[4]",
+                reason="fixed aggregate is absent",
+            )),
+        ))
+
+    monkeypatch.setattr(
+        compile_project_catalogue, "compile_project_call", refuse,
+    )
+    result = compile_project_catalogue.main([
+        "--worker", "--source", str(source), "--entry", "kernel",
+        "--output", str(output),
+    ])
+
+    assert result == 1
+    failure = json.loads((output / "failure.json").read_text())
+    assert failure["error_type"] == "SSALoweringIncompleteError"
+    assert failure["frontier_kind"] == "ssa-lowering-incomplete"
+    assert failure["lowering_stage"] == "backend-neutral-ssa"
+    assert failure["lowering_shortfall_count"] == 2
+    assert failure["lowering_shortfall_kinds"] == {
+        "mapping-update": 1,
+        "sequence-mutation-guard": 1,
+    }
+    assert failure["lowering_shortfalls"] == [{
+        "symbol": "kernel",
+        "domain": "control",
+        "name": "sequence-mutation-guard",
+        "location": "kernel.body[2]",
+        "reason": "mutation predicate is not exact",
+    }, {
+        "symbol": "kernel",
+        "domain": "operator",
+        "name": "mapping-update",
+        "location": "kernel.body[4]",
+        "reason": "fixed aggregate is absent",
+    }]
 
 
 def test_subdivision_plan_uses_actual_fallback_owner_not_selected_parent(
@@ -1412,6 +1517,46 @@ def test_bounded_failure_names_the_next_compilation_creep_action():
         "failure_stage": "planning complete control/operator graph",
         "error_type": "ResourceLimitExceeded",
     }]
+
+
+def test_incomplete_ssa_lowering_names_its_exact_compilation_frontier():
+    error = SSALoweringIncompleteError((
+        ("outer", SSALoweringShortfall(
+            domain="control",
+            name="sequence-mutation-guard",
+            location="outer.body[2]",
+            reason="mutation predicate is not exact",
+        )),
+        ("outer", SSALoweringShortfall(
+            domain="control",
+            name="sequence-mutation-guard",
+            location="outer.body[7]",
+            reason="mutation predicate is not exact",
+        )),
+        ("outer", SSALoweringShortfall(
+            domain="operator",
+            name="mapping-update",
+            location="outer.body[9]",
+            reason="fixed aggregate is absent",
+        )),
+    ))
+    failure = {
+        "qualified_name": "outer",
+        "status": "failed",
+        "error_type": type(error).__name__,
+        "error": str(error),
+        **error.to_failure_mapping(),
+    }
+
+    frontier, = compilation_creep_frontier([failure], {"outer": ()})
+
+    assert frontier["action"] == "lower-unsupported-ssa-mechanics"
+    assert frontier["frontier_kind"] == "ssa-lowering-incomplete"
+    assert frontier["lowering_shortfall_count"] == 3
+    assert frontier["lowering_shortfall_kinds"] == {
+        "mapping-update": 1,
+        "sequence-mutation-guard": 2,
+    }
 
 
 def test_bounded_failure_uses_resolved_process_graph_units_as_deeper_cut():

@@ -1,3 +1,22 @@
+2026-10-12 STRUCTURED BACKEND-NEUTRAL SSA FRONTIER (CURRENT WORKTREE):
+The whole-object lowering aggregate is no longer raised as
+`FortranEmissionError`.  It occurs before target emission and now raises the
+distinct `SSALoweringIncompleteError`.  The error retains every exact
+`SSALoweringShortfall` and publishes `frontier_kind=ssa-lowering-incomplete`,
+`lowering_stage=backend-neutral-ssa`, the total count, counts by mechanic, and
+the full symbol/domain/name/location/reason records through worker failure,
+project product, creep frontier, and bootstrap continuation receipts.  Other
+exceptions still use the general `compiler-unit` failure path.
+
+A bounded rerun of only
+`aot_compile.py::_lower_process_graph_to_compilation` reached this new type in
+23.96s with 58 shortfalls: 48 sequence-mutation guards, four carried-name
+arms, three `setdefault` operations, and one each of mapping `update`, a
+carried-field arm, and a loop-carried producer.  This is the same real
+backend-neutral frontier previously mislabeled as a Fortran emission failure;
+no outer bootstrap or all-rules compile was launched.  Project-product and
+whole-bootstrap gates pass 79 tests in 59.91s.
+
 2026-10-12 EXACT AUTHORED CONTROL-SITE RETENTION (CURRENT WORKTREE):
 The compiler no longer collapses a direct control-nesting edge to a bare
 parent/child relation when the child is a region-less comprehension loop.

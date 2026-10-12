@@ -3203,6 +3203,8 @@ def compilation_creep_frontier(
                 if process_graph_subunits else
                 "subdivide-minimum-authored-integral"
             )
+        elif record.get("frontier_kind") == "ssa-lowering-incomplete":
+            action = "lower-unsupported-ssa-mechanics"
         elif status == "partial":
             action = (
                 "lower-compiler-graph-table-abi"
@@ -3271,6 +3273,16 @@ def compilation_creep_frontier(
                if record.get("failure_stage") else {}),
             **({"error_type": record["error_type"]}
                if record.get("error_type") else {}),
+            **({
+                "frontier_kind": record["frontier_kind"],
+                "lowering_shortfall_count": int(
+                    record.get("lowering_shortfall_count") or 0
+                ),
+                "lowering_shortfall_kinds": dict(
+                    record.get("lowering_shortfall_kinds") or {}
+                ),
+            } if record.get("frontier_kind") == "ssa-lowering-incomplete"
+              else {}),
         })
     return frontier
 
@@ -7925,6 +7937,20 @@ def compile_project_product(
                         "subdivision_boundaries": list(
                             failure.get("subdivision_boundaries") or ()
                         ),
+                        **({
+                            "lowering_stage": failure.get("lowering_stage"),
+                            "lowering_shortfall_count": int(
+                                failure.get("lowering_shortfall_count") or 0
+                            ),
+                            "lowering_shortfall_kinds": dict(
+                                failure.get("lowering_shortfall_kinds") or {}
+                            ),
+                            "lowering_shortfalls": list(
+                                failure.get("lowering_shortfalls") or ()
+                            ),
+                        } if failure.get("frontier_kind") == (
+                            "ssa-lowering-incomplete"
+                        ) else {}),
                     } if failure.get("frontier_kind") else {}),
                 } if failure else {}),
                 **({
@@ -8475,13 +8501,32 @@ def compile_project_bootstrap_creep(
             # retained the authored Python body instead of linking an unsafe
             # native dependency.  Keep the exact failure visible while other
             # units, verified native boundaries, and subdivision plans finish.
-            continuation_failures.append({
-                "qualified_name": str(
-                    unit.get("qualified_name") or "<unknown>"
-                ),
-                "stage": "compiler-unit",
-                "reason": reason or "compiler unit reported failed",
-            })
+            qualified_name = str(
+                unit.get("qualified_name") or "<unknown>"
+            )
+            if unit.get("frontier_kind") == "ssa-lowering-incomplete":
+                shortfall_count = int(
+                    unit.get("lowering_shortfall_count") or 0
+                )
+                continuation_failures.append({
+                    "qualified_name": qualified_name,
+                    "stage": "ssa-lowering",
+                    "frontier_kind": "ssa-lowering-incomplete",
+                    "reason": (
+                        "backend-neutral SSA lowering reported "
+                        f"{shortfall_count} unsupported mechanic(s)"
+                    ),
+                    "shortfall_count": shortfall_count,
+                    "shortfall_kinds": dict(
+                        unit.get("lowering_shortfall_kinds") or {}
+                    ),
+                })
+            else:
+                continuation_failures.append({
+                    "qualified_name": qualified_name,
+                    "stage": "compiler-unit",
+                    "reason": reason or "compiler unit reported failed",
+                })
         for qualified_name in sorted(completed_names):
             verification = verification_by_name.get(qualified_name)
             if verification is None or verification.get("status") != "verified":

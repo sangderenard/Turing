@@ -15026,6 +15026,7 @@ def _class_surface_ssa_program(
     )
     from .glsl_deployment_strategy import _walk_planned_shells
     from .precompile_to_ssa import (
+        SSALoweringIncompleteError,
         SSALoweringShortfall,
         lower_control_sections_to_ssa,
         resolve_sequence_schemas,
@@ -19312,13 +19313,7 @@ def _class_surface_ssa_program(
             f"shortfalls={len(shortfalls)}"
         )
     if lowering_failures:
-        raise FortranEmissionError(
-            "whole-object methods have operators without an SSA handler: "
-            + "; ".join(
-                f"{symbol}::{item.location}::{item.name} ({item.reason})"
-                for symbol, item in lowering_failures
-            )
-        )
+        raise SSALoweringIncompleteError(lowering_failures)
     if release_dispatch_regions:
         from .glsl_deployment_strategy import release_dispatch_region_copies
         from .memory_regulation import stage_end

@@ -226,6 +226,51 @@ class SSALoweringShortfall:
     reason: str
 
 
+class SSALoweringIncompleteError(ValueError):
+    """A valid source unit reached SSA planning but has unlowered mechanics.
+
+    This is a durable compilation frontier, not a target-emitter failure and
+    not an unexpected compiler exception.  The structured mapping lets worker
+    and bootstrap manifests retain each exact missing mechanic without parsing
+    a backend-named exception string.
+    """
+
+    def __init__(
+        self,
+        failures: Iterable[tuple[str, SSALoweringShortfall]],
+    ) -> None:
+        self.failures = tuple(
+            (str(symbol), shortfall) for symbol, shortfall in failures
+        )
+        super().__init__(
+            "whole-object SSA lowering is incomplete: "
+            + "; ".join(
+                f"{symbol}::{item.location}::{item.name} ({item.reason})"
+                for symbol, item in self.failures
+            )
+        )
+
+    def to_failure_mapping(self) -> dict[str, Any]:
+        kinds: dict[str, int] = {}
+        records = []
+        for symbol, item in self.failures:
+            kinds[str(item.name)] = kinds.get(str(item.name), 0) + 1
+            records.append({
+                "symbol": symbol,
+                "domain": str(item.domain),
+                "name": str(item.name),
+                "location": str(item.location),
+                "reason": str(item.reason),
+            })
+        return {
+            "frontier_kind": "ssa-lowering-incomplete",
+            "lowering_stage": "backend-neutral-ssa",
+            "lowering_shortfall_count": len(records),
+            "lowering_shortfall_kinds": dict(sorted(kinds.items())),
+            "lowering_shortfalls": records,
+        }
+
+
 @dataclass(frozen=True, order=True)
 class SSACycle:
     function: str
