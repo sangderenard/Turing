@@ -27,6 +27,7 @@ from .compressed_tiles import CompressedTile, DiskTile, DiskTileStore, DiskTileD
 
 
 _ACTIVE_ARENA = ContextVar("compiler_live_tile_arena", default=None)
+_ACTIVE_REGISTRAR = ContextVar("compiler_live_root_registrar", default=None)
 _MEMO_SOURCES = object()
 _PLAIN_VALUE_TYPES = frozenset({type(None), str, bytes, int, float, complex,
                                bool, dict, list, tuple, set, frozenset})
@@ -56,6 +57,16 @@ class LiveTileStats:
     catalogued_headers: int = 0
     decoded_bytes: int = 0
     decoded_peak_bytes: int = 0
+    pressure_level: int = 0
+    routing_reloads: int = 0
+    payload_reloads: int = 0
+    retained_index_tiles: int = 0
+    payload_hot_tiles: int = 0
+    route_hits: int = 0
+    route_misses: int = 0
+    retained_index_bytes: int = 0
+    payload_decoded_bytes: int = 0
+    payload_hot_peak: int = 0
 
 
 @dataclass(slots=True)
@@ -65,25 +76,84 @@ class _DecodedSize:
     rows: array
 
 
+_EMPTY_ROUTE = (1 << 64) - 1
+
+
+class _RouteIndex:
+    """Compact resident hash-to-bucket accelerator for an authoritative trie."""
+
+    def __init__(self):
+        self.codes = array("Q", [0]) * 8
+        self.handles = array("Q", [_EMPTY_ROUTE]) * 8
+        self.count = 0
+
+    @staticmethod
+    def _slot(code, mask):
+        return (code ^ (code >> 33) ^ (code >> 17)) & mask
+
+    def get(self, code):
+        mask = len(self.handles) - 1
+        slot = self._slot(code, mask)
+        while self.handles[slot] != _EMPTY_ROUTE:
+            if self.codes[slot] == code:
+                return self.handles[slot]
+            slot = (slot + 1) & mask
+        return None
+
+    def set(self, code, handle):
+        if (self.count + 1) * 10 >= len(self.handles) * 7:
+            self._resize(len(self.handles) * 2)
+        self._insert(code, handle)
+
+    def _insert(self, code, handle):
+        mask = len(self.handles) - 1
+        slot = self._slot(code, mask)
+        while self.handles[slot] != _EMPTY_ROUTE:
+            if self.codes[slot] == code:
+                self.handles[slot] = handle
+                return
+            slot = (slot + 1) & mask
+        self.codes[slot], self.handles[slot] = code, handle
+        self.count += 1
+
+    def _resize(self, capacity):
+        old_codes, old_handles = self.codes, self.handles
+        self.codes = array("Q", [0]) * capacity
+        self.handles = array("Q", [_EMPTY_ROUTE]) * capacity
+        self.count = 0
+        for code, handle in zip(old_codes, old_handles):
+            if handle != _EMPTY_ROUTE:
+                self._insert(code, handle)
+
+    def resident_bytes(self):
+        return sys.getsizeof(self) + sys.getsizeof(self.codes) + sys.getsizeof(self.handles)
+
+
 class LiveTileArena:
-    """One shared bounded decoded cache, not one cache per graph or function.
+    """One shared decoded arena, coarse first and bounded only under pressure.
 
     A tile contains at most tile_rows storage records. Maps split before a
     bucket exceeds bucket_rows; sequences use independently indexed chunks.
     Opaque semantic leaves stay exact and are counted, never silently copied.
-    This bounds decoded tiles, not Python allocator slack or a giant leaf.
+    Level zero keeps every touched tile decoded. Pressure progressively enables
+    the configured bounds; those still do not bound allocator slack or a giant
+    indivisible leaf.
     """
     def __init__(self, *, tile_rows=64, hot_tiles=8, bucket_rows=64, directory=None,
                  decoded_budget_bytes=128 << 20):
         if min(tile_rows, hot_tiles, bucket_rows) <= 0:
             raise ValueError("live tile bounds must be positive")
         self.tile_rows, self.hot_limit, self.bucket_rows = tile_rows, hot_tiles, bucket_rows
+        self.payload_limit = hot_tiles
         self.directory = directory
         if decoded_budget_bytes <= 0:
             raise ValueError("decoded tile budget must be positive")
         self.decoded_budget_bytes = decoded_budget_bytes
         self._decoded_sizes = {}
         self._decoded_bytes = self._decoded_peak = 0
+        self._retained_decoded_bytes = self._payload_decoded_bytes = 0
+        self._payload_hot_count = 0
+        self._payload_hot_peak = 0
         self._tiles = []
         self._hot = OrderedDict()
         self._dirty = set()
@@ -99,12 +169,19 @@ class LiveTileArena:
         self._page_kinds = array("B")
         self._row_lengths = array("I")
         self._leaf_refs = {}
+        self._route_indexes = {}
+        self.route_hits = self.route_misses = 0
         self._lock = RLock()
         self._store = None
         self._live_disk_bytes = 0
         self.compactions = 0
         self.disk_mode = False
+        # 0: fully decoded fast path; 1: LRU tail backed by disk;
+        # 2: bounded decoded front with compressed-RAM backing;
+        # 3: one decoded payload tile plus retained search metadata, disk backing.
+        self.pressure_level = 0
         self.compressions = self.reloads = self.hot_peak = 0
+        self.routing_reloads = self.payload_reloads = 0
         self.categories = set()
         self.pressure_probe = None
         self._operations = 0
@@ -164,7 +241,7 @@ class LiveTileArena:
                 raise ValueError("unknown compiler tile reference")
         return Reader(io.BytesIO(data)).load()
 
-    def _encode(self, index):
+    def _encode(self, index, *, disk=None):
         if index not in self._dirty and self._tiles[index] is not None:
             return
         records = self._hot[index]
@@ -173,7 +250,9 @@ class LiveTileArena:
         # Dirty active tiles use zlib9 on disk (RAM uses zlib1). LZMA belongs
         # to the cold escalation, not every clock/operand update: forcing it
         # on every dirty eviction made two-tile micro-compiles minutes long.
-        record = (self._disk_store().write(data, len(records), heavy=False) if self.disk_mode
+        if disk is None:
+            disk = self.disk_mode or self.pressure_level in (1, 3)
+        record = (self._disk_store().write(data, len(records), heavy=False) if disk
                   else CompressedTile.encode(data, len(records), 1))
         previous = self._tiles[index]
         self._tiles[index] = record
@@ -275,8 +354,15 @@ class LiveTileArena:
             return value
 
     def _trim(self, except_index=None):
-        while (len(self._hot) > self.hot_limit or self._decoded_bytes > self.decoded_budget_bytes):
-            victim = next((i for i in self._hot if i != except_index), None)
+        if self.pressure_level == 0:
+            return
+        while (self._payload_hot_count > self.payload_limit
+               or self._payload_decoded_bytes > self.decoded_budget_bytes):
+            # Compact identity-header pages remain decoded. Mutable-map trie
+            # routes are retained separately in _RouteIndex, so preserving the
+            # search index does not preserve bucket payloads.
+            victim = next((i for i in self._hot
+                           if i != except_index and not self._page_kinds[i]), None)
             if victim is None:
                 break  # the one accessed tile is the current decoding workspace
             self._encode(victim)
@@ -293,6 +379,10 @@ class LiveTileArena:
                                 else self._load(record.decode()))
             self._measure_page(index)
             self.reloads += 1
+            if self._page_kinds[index]:
+                self.routing_reloads += 1
+            else:
+                self.payload_reloads += 1
         self._hot.move_to_end(index)
         self._trim(except_index=index)
         self.hot_peak = max(self.hot_peak, len(self._hot))
@@ -300,7 +390,12 @@ class LiveTileArena:
 
     def _set_size(self, index, size):
         current = self._decoded_sizes[index]
-        self._decoded_bytes += size - current.total
+        delta = size - current.total
+        self._decoded_bytes += delta
+        if self._page_kinds[index]:
+            self._retained_decoded_bytes += delta
+        else:
+            self._payload_decoded_bytes += delta
         current.total = size
         self._decoded_peak = max(self._decoded_peak, self._decoded_bytes)
 
@@ -309,13 +404,48 @@ class LiveTileArena:
         sizes = array("Q", (_owned_row_bytes(value) for value in rows))
         size = sys.getsizeof(rows) + sum(sizes) + sys.getsizeof(sizes)
         previous = self._decoded_sizes.get(index)
-        self._decoded_bytes += size - (0 if previous is None else previous.total)
+        delta = size - (0 if previous is None else previous.total)
+        self._decoded_bytes += delta
+        if self._page_kinds[index]:
+            self._retained_decoded_bytes += delta
+        else:
+            self._payload_decoded_bytes += delta
+            if previous is None:
+                self._payload_hot_count += 1
+                self._payload_hot_peak = max(self._payload_hot_peak, self._payload_hot_count)
         self._decoded_sizes[index] = _DecodedSize(size, sizes)
         self._decoded_peak = max(self._decoded_peak, self._decoded_bytes)
 
     def _drop_hot(self, index):
         del self._hot[index]
-        self._decoded_bytes -= self._decoded_sizes.pop(index).total
+        size = self._decoded_sizes.pop(index).total
+        self._decoded_bytes -= size
+        if self._page_kinds[index]:
+            self._retained_decoded_bytes -= size
+        else:
+            self._payload_decoded_bytes -= size
+            self._payload_hot_count -= 1
+
+    def cached_route(self, owner_handle, code):
+        if self.pressure_level == 0:
+            return None
+        with self._lock:
+            index = self._route_indexes.get(owner_handle)
+            handle = None if index is None else index.get(code)
+            if handle is None:
+                self.route_misses += 1
+            else:
+                self.route_hits += 1
+            return handle
+
+    def remember_route(self, owner_handle, code, handle):
+        if self.pressure_level > 0:
+            with self._lock:
+                self._route_indexes.setdefault(owner_handle, _RouteIndex()).set(code, handle)
+
+    def invalidate_routes(self, owner_handle):
+        with self._lock:
+            self._route_indexes.pop(owner_handle, None)
 
     def allocate(self, value, *, header=False):
         self._pressure()
@@ -456,18 +586,58 @@ class LiveTileArena:
         self.categories.add(type(value).__module__ + "." + type(value).__name__)
         return value
 
-    def flush(self):
+    def flush(self, *, disk=None, preserve_routing=False):
         with self._lock:
             for index in tuple(self._hot):
-                self._encode(index)
-                self._drop_hot(index)
+                self._encode(index, disk=disk)
+                if not (preserve_routing and self._page_kinds[index]):
+                    self._drop_hot(index)
+        return self.stats()
+
+    def offload_cold_tail(self):
+        """Enter the first pressure tier and disk-back only the LRU tail.
+
+        The newest ``hot_limit`` tiles within ``decoded_budget_bytes`` remain
+        decoded. No stage boundary calls this while the compile is below its
+        RSS budget, so the ordinary path pays no codec churn.
+        """
+        with self._lock:
+            self.pressure_level = max(self.pressure_level, 1)
+            while self._payload_hot_count > 1:
+                count_over = self._payload_hot_count > self.payload_limit
+                bytes_over = self._payload_decoded_bytes > self.decoded_budget_bytes
+                if not (count_over or bytes_over):
+                    break
+                victim = next((i for i in self._hot if not self._page_kinds[i]), None)
+                if victim is None:
+                    break
+                self._encode(victim, disk=True)
+                self._drop_hot(victim)
+        return self.stats()
+
+    def compress_resident_ram(self):
+        """Enter the second tier: compressed RAM plus a bounded decoded front."""
+        with self._lock:
+            self.pressure_level = max(self.pressure_level, 2)
+            self.disk_mode = False
+            self.flush(disk=False, preserve_routing=True)
         return self.stats()
 
     def offload_to_disk(self):
-        """Future dirty evictions also go directly to the stronger disk tier."""
+        """Enter the final tier: disk backing and one decoded payload tile.
+
+        Every resident encoded tile is decoded and written once.  With the
+        codec dictionary capped at 1 MiB this is O(B + T) time for B payload
+        bytes and T tile-directory entries, with one decoded tile of workspace.
+        Compact identity headers and mutable-map route indexes remain resident;
+        actual cache-missing payload accesses cost O(A*S) codec bytes in the
+        worst case for A accesses and largest payload tile S.
+        """
         with self._lock:
+            self.pressure_level = 3
             self.disk_mode = True
-            self.flush()
+            self.payload_limit = 1
+            self.flush(disk=True, preserve_routing=True)
             store = self._disk_store()
             for index, record in enumerate(self._tiles):
                 if record is not None and not isinstance(record, DiskTile):
@@ -504,10 +674,22 @@ class LiveTileArena:
         Mark bits and the traversal frontier are disk-backed bounded buffers;
         no second semantic/provenance ledger or whole-graph working copy.
         Missing roots are never inferred from names, SSA ids or refcounts.
+
+        The configured tile, mark-window and codec dictionary sizes are fixed,
+        so the operational bound is O(B + V + E): encoded bytes, reachable
+        records and storage edges.  Parameterizing the maximum decoded tile
+        size S exposes the locality caveat: the one-tile DFS cache may decode
+        on every cross-tile visit, making the strict worst case
+        O(V*S + E + B).  The sweep and subsequent compaction remain O(B + V).
         """
         with self._lock:
             previous_probe, self.pressure_probe = self.pressure_probe, None
             try:
+                # Drop decoded generations while determining reachability so
+                # cached payload objects cannot become artificial roots. The
+                # retained search pages are eagerly restored after the sweep.
+                retained_pages = tuple(index for index, kind in enumerate(self._page_kinds)
+                                       if kind)
                 self.flush()
                 gc.collect()
                 roots = tuple(self._refs.keys())
@@ -534,7 +716,7 @@ class LiveTileArena:
                         record = cache[position]
                         if record is None:
                             raise ValueError("live compiler handle points to reclaimed storage")
-                        if self._page_kinds[index]:
+                        if self._page_kinds[index] == 1:
                             tag = record[0]
                             if tag == "dict":
                                 edge(record[1]); edge(record[2])
@@ -567,11 +749,18 @@ class LiveTileArena:
                                 work.extend(getattr(value, field.name) for field in dataclass_fields(value))
                     # No mutation until marking succeeds. Sweep one encoded
                     # tile at a time; its surviving rows keep the SAME handles.
+                    live_route_indexes = set()
                     for index, encoded in enumerate(self._tiles):
                         if encoded is None:
                             continue
                         rows = self._raw_load(encoded.decode())
                         keep = [marked.contains(index * self.tile_rows + p) for p in range(len(rows))]
+                        if self._page_kinds[index] == 1:
+                            live_route_indexes.update(
+                                index * self.tile_rows + position
+                                for position, (row, live) in enumerate(zip(rows, keep))
+                                if live and isinstance(row, tuple) and row and row[0] == "dict"
+                            )
                         dead = sum(row is not None and not live for row, live in zip(rows, keep))
                         if not dead:
                             continue
@@ -589,11 +778,18 @@ class LiveTileArena:
                         self._dirty.add(index)
                         self._encode(index)
                         self._drop_hot(index)
+                self._route_indexes = {
+                    handle: route for handle, route in self._route_indexes.items()
+                    if handle in live_route_indexes
+                }
                 removed = len(self._leaf_refs) - len(leaves)
                 self._leaf_refs = {identity: self._leaf_refs[identity] for identity in leaves}
                 gc.collect()
                 if self.disk_mode:
                     self.compact_disk()
+                for index in retained_pages:
+                    if index < len(self._tiles) and self._tiles[index] is not None:
+                        self._page(index)
                 return {"reclaimed_records": reclaimed, "reclaimed_leaves": removed,
                         "live_roots": len(roots)}
             finally:
@@ -624,6 +820,8 @@ class LiveTileArena:
         Only this arena's exclusive records move. A failed candidate leaves
         the original index/file readable; old shared files survive readers.
         Compaction is also the deeper LZMA/zlib9 cold compression pass.
+        With the fixed codec windows it is O(B + T) time and O(S) arena
+        workspace for B live payload bytes, T entries and largest tile S.
         """
         with self._lock:
             if self._store is None:
@@ -656,9 +854,12 @@ class LiveTileArena:
             if isinstance(record, DiskTile):
                 disk_bytes += record.stored_bytes
                 disk_count += 1
+        route_bytes = (sys.getsizeof(self._route_indexes)
+                       + sum(route.resident_bytes() for route in self._route_indexes.values()))
         headers = (sys.getsizeof(self._refs) + sys.getsizeof(self._refs.data)
                    + sys.getsizeof(self._leaf_refs) + sys.getsizeof(self._decoded_sizes)
-                   + sys.getsizeof(self._classes) + sys.getsizeof(self._class_ids))
+                   + sys.getsizeof(self._classes) + sys.getsizeof(self._class_ids)
+                   + route_bytes)
         headers += sum(sys.getsizeof(measured) for measured in self._decoded_sizes.values())
         if isinstance(self._tiles, DiskTileDirectory):
             headers += self._tiles.resident_bytes()
@@ -687,7 +888,13 @@ class LiveTileArena:
         return LiveTileStats(self._count, len(self._tiles), len(self._hot), self.hot_peak,
                              encoded, disk_bytes, disk_count,
                              self.compressions, self.reloads, len(self._refs), headers,
-                             self._reference_count, self._decoded_bytes, self._decoded_peak)
+                             self._reference_count, self._decoded_bytes, self._decoded_peak,
+                             self.pressure_level, self.routing_reloads, self.payload_reloads,
+                             sum(bool(self._page_kinds[index]) for index in self._hot),
+                             self._payload_hot_count, self.route_hits, self.route_misses,
+                             self._retained_decoded_bytes + route_bytes,
+                             self._payload_decoded_bytes,
+                             self._payload_hot_peak)
 
 
 class _TupleAnchor:
@@ -807,6 +1014,9 @@ class TiledDict(dict, MutableMapping):
     The dict superclass preserves existing isinstance contracts. ALL ordinary
     methods are overridden; explicit dict.__setitem__ bypass is unsupported.
     Values can escape eviction because they are handles into this same arena.
+    Under pressure, a compact resident uint64 hash-to-bucket index accelerates
+    the authoritative trie. Equality remains in the decoded bucket; collisions
+    therefore retain Python mapping semantics without repeated routing reads.
     """
     __slots__ = ("_arena", "_root", "_order", "_count", "_version", "_ref", "__weakref__")
 
@@ -818,15 +1028,22 @@ class TiledDict(dict, MutableMapping):
         self._ref = arena.reference(self)
 
     def _bucket(self, key):
-        handle, code = self._root, hash(key) & ((1 << 64) - 1)
+        code = hash(key) & ((1 << 64) - 1)
+        cached = self._arena.cached_route(self._ref, code)
+        handle = self._root if cached is None else cached
+        collision_head = None
         next_bit = 0
         while True:
             tag, payload = self._arena.read(handle)
             if tag == "leaf":
+                self._arena.remember_route(self._ref, code, handle)
                 return handle, payload, next_bit
             if tag == "collision":
+                if collision_head is None:
+                    collision_head = handle
                 bucket, following = payload
                 if key in bucket or following is None:
+                    self._arena.remember_route(self._ref, code, collision_head)
                     return handle, bucket, 64
                 handle = following
                 continue
@@ -842,6 +1059,10 @@ class TiledDict(dict, MutableMapping):
     def _split(self, handle, items, bit=0):
         if len(items) <= self._arena.bucket_rows:
             self._replace_bucket(handle, items)
+            if bit < 64:
+                for key in items:
+                    self._arena.remember_route(
+                        self._ref, hash(key) & ((1 << 64) - 1), handle)
             return
         # Equal full hashes cannot be separated by another trie bit. Keep
         # equality authoritative in bounded overflow buckets, rather than
@@ -854,6 +1075,9 @@ class TiledDict(dict, MutableMapping):
             rest = dict(entries)  # at most one newly inserted entry
             tail = self._arena.allocate(("collision", (rest, following)))
             self._arena.write(handle, ("collision", (first, tail)))
+            # _bucket cached the collision-chain HEAD before returning this
+            # possibly later segment. Preserve that head for every equal full
+            # hash; caching this local handle would skip earlier candidates.
             return
         # Skip bits shared by every key: no empty 64-level chain for identical
         # hashes, and no redundant branch levels on later insertions.
@@ -996,6 +1220,7 @@ class TiledDict(dict, MutableMapping):
         if not self._count:
             return
         self._root = self._arena.allocate(("leaf", {}))
+        self._arena.invalidate_routes(self._ref)
         self._order, self._count = None, 0
         self._version += 1
         self._arena.save_header(self)
@@ -1502,6 +1727,7 @@ class TiledSet(MutableSet):
 class TiledObject:
     """Original compiler object/identity; its fields become a writable tile map."""
     __slots__ = ()
+    __live_storage_root__ = False
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         original = cls.__dict__.get("__post_init__")
@@ -1515,6 +1741,10 @@ class TiledObject:
         arena = _ACTIVE_ARENA.get()
         if arena is not None:
             arena.attach(self)
+        else:
+            registrar = _ACTIVE_REGISTRAR.get()
+            if registrar is not None and type(self).__live_storage_root__:
+                registrar(self)
 
     def __getattribute__(self, name):
         if name in {"_tile_arena", "_tile_fields", "_tile_ref", "__class__"}:
@@ -1579,8 +1809,32 @@ def live_digraph(arena=None):
     import networkx as nx
     arena = arena or _ACTIVE_ARENA.get()
     if arena is None:
-        return nx.DiGraph()
+        graph = nx.DiGraph()
+        registrar = _ACTIVE_REGISTRAR.get()
+        if registrar is not None:
+            registrar(graph)
+        return graph
     return LiveDiGraph(arena=arena)
+
+
+def adopt_digraph(graph, arena):
+    """Move an existing ordinary NetworkX graph into the live arena in place."""
+    if isinstance(graph, LiveDiGraph):
+        graph._tile_owner = arena
+        arena.attach(graph)
+        return graph
+    import networkx as nx
+    if not isinstance(graph, nx.DiGraph):
+        return graph
+    # NetworkX's documented map attributes are the authority. Their setters
+    # invalidate cached views, and outer tiled maps adopt all future inner maps.
+    graph.graph = arena.manage(graph.graph)
+    graph._node = arena.manage(graph._node)
+    graph._adj = arena.manage(graph._adj)
+    graph._succ = graph._adj
+    graph._pred = arena.manage(graph._pred)
+    arena.categories.add("ProcessGraph.NetworkX")
+    return graph
 
 
 import networkx as nx

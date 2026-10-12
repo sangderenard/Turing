@@ -14,7 +14,72 @@ from src.compiler.live_tiles import (
 
 
 def arena(tmp_path):
-    return LiveTileArena(tile_rows=4, hot_tiles=1, bucket_rows=4, directory=tmp_path)
+    owner = LiveTileArena(tile_rows=4, hot_tiles=1, bucket_rows=4, directory=tmp_path)
+    owner.compress_resident_ram()  # Most storage tests deliberately force the bounded tier.
+    return owner
+
+
+def test_pressure_ladder_stays_fully_decoded_until_explicit_escalation(tmp_path):
+    owner = LiveTileArena(tile_rows=2, hot_tiles=1, bucket_rows=1,
+                          decoded_budget_bytes=256, directory=tmp_path)
+    values = [owner.manage({"value": index, "payload": "x" * 200})
+              for index in range(8)]
+
+    fast = owner.stats()
+    assert fast.pressure_level == 0
+    assert fast.hot_tiles > owner.hot_limit
+    assert fast.compressions == 0
+    assert [value["value"] for value in values] == list(range(8))
+
+    tail = owner.offload_cold_tail()
+    assert tail.pressure_level == 1
+    assert tail.payload_hot_tiles == 1
+    assert tail.hot_tiles == tail.retained_index_tiles + 1
+    assert tail.disk_tiles > 0
+
+    ram = owner.compress_resident_ram()
+    assert ram.pressure_level == 2
+    assert ram.payload_hot_tiles == 0
+    assert ram.hot_tiles == ram.retained_index_tiles
+    assert [value["value"] for value in values] == list(range(8))
+
+    minimum = owner.offload_to_disk()
+    assert minimum.pressure_level == 3
+    assert owner.hot_limit == 1
+    assert owner.payload_limit == 1
+    assert minimum.payload_hot_tiles == 0
+    assert minimum.hot_tiles == minimum.retained_index_tiles
+    assert [value["value"] for value in values] == list(range(8))
+
+
+def test_maximum_pressure_retains_mutable_search_routing(tmp_path):
+    owner = LiveTileArena(tile_rows=2, hot_tiles=1, bucket_rows=1,
+                          decoded_budget_bytes=512, directory=tmp_path)
+    mapping = owner.manage({index: index * 3 for index in range(64)})
+    owner.offload_to_disk()
+    before = owner.stats().reloads
+    assert [mapping[index] for index in range(64)] == [index * 3 for index in range(64)]
+    first_pass = owner.stats().reloads - before
+    before = owner.stats().reloads
+    hits = owner.stats().route_hits
+    assert [mapping[index] for index in range(64)] == [index * 3 for index in range(64)]
+    second_pass = owner.stats().reloads - before
+
+    # The first pass discovers authoritative trie routes. Every later lookup
+    # goes directly to its bucket: at most one payload reload per key, never a
+    # repeated chain of branch-page reads.
+    stats = owner.stats()
+    assert stats.route_hits - hits == 64
+    assert second_pass <= 64
+    assert first_pass > second_pass
+
+    for index in range(64, 96):
+        mapping[index] = index * 3
+    hits, misses = owner.stats().route_hits, owner.stats().route_misses
+    assert [mapping[index] for index in range(96)] == [index * 3 for index in range(96)]
+    stats = owner.stats()
+    assert stats.route_hits - hits == 96
+    assert stats.route_misses == misses
 
 
 def test_mutable_nested_views_survive_eviction_and_disk(tmp_path):
@@ -33,7 +98,7 @@ def test_mutable_nested_views_survive_eviction_and_disk(tmp_path):
     owner.flush()
     assert list(table) == [i for i in range(30) if i != 2] + [88]
     assert table[12]["value"] == 42
-    assert owner.stats().hot_peak == 1
+    assert owner.stats().payload_hot_tiles <= 1
     assert owner.stats().disk_tiles > 0
     assert owner.stats().resident_encoded_bytes == 0
 
@@ -475,8 +540,10 @@ def test_fresh_source_compilation_forced_disk(tmp_path, monkeypatch):
     )
     owner = object.__getattribute__(module, "__dict__")["_tile_arena"]
     stats = owner.flush()
-    assert stats.disk_tiles > 0 and stats.hot_peak <= 2
+    assert stats.disk_tiles > 0 and stats.hot_tiles == 0
+    assert stats.pressure_level == 3
     assert stats.resident_encoded_bytes == 0
+    assert stats.retained_index_bytes > 0
     assert any(name.endswith(".ProcessGraphGLSLDeployment") for name in owner.categories)
     assert any(name.endswith(".ControlProgram") for name in owner.categories)
     assert any(name.endswith(".Instr") for name in owner.categories)
@@ -639,7 +706,7 @@ def test_compaction_reclaims_superseded_records_without_whole_rehydrate(tmp_path
     assert os.path.getsize(owner._store.path) < before
     assert table[20] == (9, "updated repeated text " * 100)
     assert table[79] == "repeat " * 100
-    assert owner.stats().hot_peak == 1
+    assert owner.stats().payload_hot_tiles == 1
 
 
 def test_pressure_can_escalate_inside_storage_writes_without_stage_boundary(tmp_path, monkeypatch):
@@ -656,11 +723,12 @@ def test_pressure_can_escalate_inside_storage_writes_without_stage_boundary(tmp_
         book = IdentityBook()
         regulator, token, release = regulation.begin_regulation(book)
         try:
-            assert not regulator.live_arena.disk_mode
+            assert regulator.live_arena is None
             monkeypatch.setattr(regulation, "process_rss_bytes", lambda: 200)
             regulator._last_pressure_read = 0
             graph = live_digraph()
             graph.add_nodes_from((i, {"payload": i}) for i in range(200))
+            regulator.pressure_checkpoint("fixture pressure")
             assert regulator.live_arena.disk_mode
             assert regulator.live_arena.stats().disk_tiles > 0
             assert graph.nodes[187]["payload"] == 187
@@ -677,8 +745,8 @@ def test_decoded_cache_obeys_byte_limit_not_only_tile_count(tmp_path):
     owner.offload_to_disk()
     for i in range(200):
         assert table[i].startswith(str(i))
-        assert owner.stats().decoded_bytes <= owner.decoded_budget_bytes
-    assert owner.stats().hot_tiles < owner.hot_limit
+        assert owner.stats().payload_decoded_bytes <= owner.decoded_budget_bytes
+    assert owner.stats().payload_hot_tiles < owner.hot_limit
 
 
 def test_failed_compile_setup_restores_active_storage_context(monkeypatch):
@@ -694,10 +762,18 @@ def test_failed_compile_setup_restores_active_storage_context(monkeypatch):
     def fail(page, owner):
         raise OSError("fixture tile setup failure")
     monkeypatch.setattr(live_tiles, "tile_identity_page", fail)
+    regulator = token = None
     try:
+        book = IdentityBook()
+        regulator, token, release = regulation.begin_regulation(book)
+        monkeypatch.setattr(regulation, "process_rss_bytes", lambda: 20 << 30)
         with pytest.raises(OSError, match="tile setup failure"):
-            regulation.begin_regulation(IdentityBook())
-        assert regulation._ACTIVE.get() is previous_regulator
+            regulator.pressure_checkpoint("fixture activation")
+        assert regulation._ACTIVE.get() is regulator
         assert _ACTIVE_ARENA.get() is previous_arena
+        assert "_storage_pressure_activated" not in book.__dict__
     finally:
+        if regulator is not None and regulation._ACTIVE.get() is regulator:
+            regulator.budget_bytes = None
+            regulation.end_regulation(regulator, token, releases_book_state=False)
         set_active_contract(previous_contract)

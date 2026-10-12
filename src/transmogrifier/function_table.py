@@ -153,6 +153,7 @@ class StaticFunctionSlot:
 
 class FunctionTable(TiledObject):
     """Addressable, recursion-aware function registry shared by compiler IRs."""
+    __live_storage_root__ = True
 
     def __init__(self) -> None:
         self._entries: dict[FunctionReference, FunctionEntry] = {}

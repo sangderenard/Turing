@@ -23572,6 +23572,7 @@ from .live_tiles import TiledObject
 
 
 class ProcessGraphGLSLDeployment(TiledObject):
+    __live_storage_root__ = True
     # Per-compile values. A fresh subclass is created for each compiled
     # ProcessGraph (see strategize_shell_deployment) with these overridden
     # via ordinary class-attribute assignment -- no source-text templating.

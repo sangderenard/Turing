@@ -1,3 +1,101 @@
+2026-10-12 RETAINED LIVE-MAP SEARCH INDEX (CURRENT WORKTREE):
+The earlier maximum-tier design repeatedly evicted the mutable TiledDict hash
+trie itself.  A logical lookup therefore reread several routing tiles before it
+could read the requested bucket.  That was the source of the improper read
+storm; compiler-unit interfaces were not its cause.
+
+* Each live mutable map now retains a compact open-addressed pair of uint64
+  columns mapping full Python hash to its authoritative trie bucket handle.
+  Keys and equality remain in the tiled bucket, so the index cannot invent
+  equality and full-hash collisions still traverse their bounded exact chain.
+  Trie splits rewrite routes for the affected bucket; clear drops the index;
+  physical mark/sweep drops indexes whose owning dictionary is unreachable.
+* Identity-header tiles remain decoded, but bucket payloads do not.  Maximum
+  pressure therefore means one decoded PAYLOAD tile plus compact search state,
+  not one arbitrary tile that continually evicts its own addressing metadata.
+  Configured live_resident_tiles remains the sourced policy; a separate
+  working_hot_limit records the final payload allowance.
+* For H discovered hashes, the retained index is O(H) fixed-width storage.
+  First route discovery follows the authoritative trie, O(D*S) worst-case for
+  trie depth D and tile decode bound S.  A retained route is expected O(1)
+  (strict open-addressing worst case O(H)) plus at most the requested payload
+  decode O(S).  Thus repeated lookup no longer pays O(D*S); actual alternating
+  payloads can still pay O(A*S), which is real data traffic rather than index
+  rediscovery.
+* The synthetic maximum-pressure regression proves the discovery pass performs
+  more reads than the next pass, then records64/64 route hits with at most one
+  payload reload per key. Collision, split, compaction and GC ownership tests
+  are included. Current storage/regulation gate excluding the long forced
+  source case:53 passed,1 deselected in11.23s. Fresh forced-disk public source,
+  LLVM execution and concordance audit0:1 passed in61.25s.
+* The formerly pathological forced-disk dual-IR Jacobian now PASSES in399.31s
+  (6m39s). The rejected version was manually interrupted unfinished after
+  1251.88s (20m51s). At five minutes the repaired run had207,587 read
+  operations versus4,193,142 observed by sixteen minutes in the rejected run.
+  This is a large measured correction, not a claim that maximum compression is
+  fast or that all remaining payload-locality work is complete.
+
+2026-10-12 AUTOMATIC COARSE-TO-FINE STORAGE LADDER (CURRENT WORKTREE):
+The default compiler policy is now dormant below a 10 GiB process-RSS
+threshold.  It does not create tiled accessors, post compression policy facts,
+flush at boundaries, compress IdentityBook pages, or run tile mark/sweep while
+below that threshold.  This is a default capability, not an instruction to
+compress every compile.
+
+* On the first over-budget observation, the regulator late-adopts registered
+  live compiler roots and IdentityBook pages into the existing live-tile
+  mechanism.  It then escalates monotonically only while RSS remains over the
+  limit: (1) disk-back the cold decoded LRU tail, (2) compress all remaining
+  resident tile contents in RAM and collect dead physical records, (3) put all
+  tile backing on disk and reduce the decoded payload working set to one tile
+  while retaining compact search metadata.
+* ProcessGraph/NetworkX, ControlProgram, IRModule, FusedProgram, deployment,
+  control-SSA builder and FunctionTable roots opt into weak late registration.
+  Ordinary NetworkX graphs remain ordinary dict-backed graphs until pressure;
+  adoption changes their documented map attributes in place so extant graph
+  identity survives.
+* Complexity vocabulary for the slowest tier: let B be live encoded payload
+  bytes, T tile count, V reachable storage records, E storage edges and S the
+  largest decoded tile.  Full disk conversion and strong compaction each read
+  and write every tile once: O(B+T) time and O(S) arena workspace with the
+  configured fixed <=1 MiB codec dictionary.  Mark/sweep visits each record and
+  edge once, but its intentionally one-tile DFS cache can re-decode on every
+  adversarial cross-tile visit.  Its strict parameterized bound is therefore
+  O(V*S+E+B), followed by O(B+V) sweep/compaction.  Because tile rows, codec
+  dictionary, 64 KiB mark window and 4096-handle frontier block are fixed in
+  this implementation, the configured operational form is O(B+V+E), with a
+  potentially severe locality constant.  Do not describe maximum compression
+  as constant-time or as merely O(number of tiles).
+* The maximum-tier transition is not the whole wall-clock model.  Once only one
+  decoded tile remains, A later accesses that alternate tiles can each incur a
+  decode and dirty eviction, adding O(A*S) codec work and disk traffic.  If K
+  declared dead-stage boundaries run collection while at maximum pressure, the
+  complete storage overhead is bounded by O(B+T + A*S +
+  K*(V*S+E+B)) in the parameterized model.  Fixed S makes that formally linear
+  in accesses and graph size, but does not make its compression/I/O constant
+  small.  This separates the cheap pressure decision, the one-time transition,
+  and the real steady-state wall-clock penalty.
+* Focused current receipts: memory-regulation unit gate 19 passed in 1.77s;
+  memory-regulation/live-tile gate excluding the known long forced-source case
+  52 passed, 1 deselected in 37.56s; ordinary dual-IR/splicing source gate
+  20 passed, 1 deselected in 14.81s.  The ordinary gate confirms that the
+  automatic default does not activate storage below the limit.
+* HISTORICAL RED PERFORMANCE RECEIPT, superseded by the retained-index result
+  above: the isolated forced-disk
+  dual-IR Jacobian was manually interrupted after 1251.88s (20m51s), still in
+  control-SSA finalization.  At an earlier 16-minute sample it had issued
+  4,193,142 reads / 1.65 GB read while RSS held near 518 MiB.  The interrupt
+  stack was TiledDict update -> tile load -> decoded owned-row measurement,
+  direct evidence for the old routing/cache-miss term.  That run had no pass
+  result. Counters for cumulative
+  tile reloads, recompressions and hot peak are now retained in the live report
+  so future runs can distinguish transition cost from steady-state thrash.
+
+OPEN: late adoption necessarily has a transient migration allocation and only
+roots using the declared registration mechanism are covered.  Opaque leaves,
+native/backend buffers, allocator slack and a single indivisible value remain
+outside the tile working-set bound.  The 10 GiB threshold is not a hard RSS cap.
+
 2026-10-12 PAGED DIRECTORY / ACCESSOR FOLLOW-UP (CHECKPOINTED, INCOMPLETE):
 Concurrent "Review dual IR math groundwork" work completed; its edits were
 preserved. No full/all-law run was started. The user subsequently requested

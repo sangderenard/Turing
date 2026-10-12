@@ -595,6 +595,7 @@ class RecursionRegion(TiledObject):
 
 @dataclass(frozen=True)
 class ControlProgram(TiledObject):
+    __live_storage_root__ = True
     root: ControlBlock
     region_indices: tuple[int, ...] = ()
     uniforms: tuple["ControlUniform", ...] = ()

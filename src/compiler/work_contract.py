@@ -199,13 +199,16 @@ class WorkContract:
     # (callee, signature) per round (``signature``) or once per callsite
     # (``callsite``).  See ``_HONORED_CALLSITE_DESCRIPTOR_REUSE``.
     callsite_descriptor_reuse: str = "signature"
-    # Resident-set budget for one compile, in bytes; ``None`` = unregulated.
-    # At every stage boundary ``memory_regulation`` reads the process resident
+    # Resident-set budget for one compile, in bytes; ``None`` = explicitly
+    # unregulated. Ordinary compilation starts fully decoded and fast. Only
+    # after crossing this default 10 GiB limit does memory regulation escalate
+    # through cold-tail disk, compressed RAM, and a minimum working set.
+    # At stage boundaries ``memory_regulation`` reads the process resident
     # set and, above the budget, releases RECOMPUTABLE items in declared order
     # (each a ``memory_release_receipt`` row on the book) until it is under
     # it.  Nothing is killed or refused, and the compile's output does not
     # depend on it: a release only drops what a later read recomputes.
-    memory_budget_bytes: int | None = None
+    memory_budget_bytes: int | None = 10 << 30
     # Cold-page spill (``identity_spill``): at every stage boundary the
     # identity book writes the pages no later stage reads out to its spill
     # file and drops them from RAM, whether or not the process is over
@@ -217,7 +220,7 @@ class WorkContract:
     # Independent of disk spill: cold tables remain compressed IN RAM and
     # ordinary identity-page reads decode only matching tiles. Mutations
     # explicitly promote the target page. Both policies together are refused.
-    compress_cold_pages: bool = False
+    compress_cold_pages: bool = True
     # Stronger disk compression of the SAME tiles when the declared process
     # budget is exceeded. This is not legacy whole-page spill; reads stay local.
     compressed_tile_disk: bool = True

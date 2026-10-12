@@ -47,6 +47,7 @@ import gc
 import os
 import sys
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -113,6 +114,10 @@ class MemoryRegulator:
     graph_pool: Any = None
     live_arena: Any = None
     live_token: Any = None
+    live_registrar_token: Any = None
+    live_roots: dict[int, weakref.ReferenceType] = field(default_factory=dict)
+    live_settings: tuple[int, int, int, int] | None = None
+    live_policy_values: dict[str, str] = field(default_factory=dict)
     _report: bool = field(
         default_factory=lambda: bool(os.environ.get("TURING_COMPILE_RSS")),
     )
@@ -124,23 +129,9 @@ class MemoryRegulator:
         resident = process_rss_bytes()
         self.history.append((str(label), resident))
         self.label = str(label)
-        if self.live_arena is not None:
-            self.live_arena.flush()
-            if self.live_arena.disk_mode:
-                self._live_receipt(str(label))
         from .page_lifecycle import BOUNDARY_COMPLETES
 
         self.completed = BOUNDARY_COMPLETES.get(self.label, self.completed)
-        if self.compress_policy and self.owns_book and self.completed is not None:
-            from .page_lifecycle import cold_pages
-            from .identity_spill import PARTITIONED
-
-            names = cold_pages(tuple(dict.keys(self.book.pages)), self.completed)
-            if self.label == "compile: end":
-                names.extend(PARTITIONED)
-            self.book.compress_pages(names, budget_bytes=self.budget_bytes,
-                                     boundary=self.label)
-            resident = process_rss_bytes()
         if self.spill_policy:
             self.spill_cold("policy")
             resident = process_rss_bytes()
@@ -153,8 +144,8 @@ class MemoryRegulator:
         if budget is None or resident <= budget:
             return resident
         if self.compress_policy and self.tile_disk_policy:
-            self.offload_tiles(str(label), resident)
-            resident = process_rss_bytes()
+            self._activate_live_storage()
+            resident = self._climb_storage_ladder(str(label), resident)
             if resident <= budget:
                 return resident
         if self.compress_policy and label == "compile: end":
@@ -170,6 +161,114 @@ class MemoryRegulator:
                 break
         return resident
 
+    def register_live_root(self, value):
+        """Remember a native fast-path root weakly for possible late adoption."""
+        identity = id(value)
+        try:
+            self.live_roots[identity] = weakref.ref(
+                value, lambda _ref, key=identity, roots=self.live_roots: roots.pop(key, None))
+        except TypeError:
+            pass
+        return value
+
+    def _activate_live_storage(self):
+        """Adopt live roots only after the process actually crosses its limit."""
+        if self.live_arena is not None or self.live_settings is None:
+            return self.live_arena
+        from .live_tiles import (
+            LiveTileArena, TiledObject, _ACTIVE_ARENA, adopt_digraph, tile_identity_page,
+        )
+
+        from .concordance_declarations import COMPILE_POLICY, MEMORY_REGULATION, POLICY_DECLARATION
+        from .identity_concordance import Mode, Novel
+
+        for key, value in self.live_policy_values.items():
+            self.book.post(COMPILE_POLICY, (key,), value, stage=MEMORY_REGULATION,
+                           provenance=Novel(POLICY_DECLARATION, ()), mode=Mode.CONCORD)
+        self.live_policy_sources = tuple(
+            self.book.latest_ref(COMPILE_POLICY, (key,)) for key in self.live_policy_values)
+
+        rows, hot, buckets, decoded = self.live_settings
+        arena = LiveTileArena(tile_rows=rows, hot_tiles=hot, bucket_rows=buckets,
+                              decoded_budget_bytes=decoded)
+        self.live_arena = arena
+        self.live_token = _ACTIVE_ARENA.set(arena)
+        try:
+            for page in tuple(dict.values(self.book.pages)):
+                if not page.__dict__.get("spill") and not page.__dict__.get("_compressed_ram"):
+                    tile_identity_page(page, arena)
+            for reference in tuple(self.live_roots.values()):
+                value = reference()
+                if value is None:
+                    continue
+                adopt_digraph(value, arena)
+                if isinstance(value, TiledObject):
+                    arena.attach(value)
+            arena.pressure_probe = self.pressure_checkpoint
+            # Persist only after adoption succeeds: the returned native module
+            # may build after regulation closes, but a failed setup must not
+            # masquerade as an activated compressed book.
+            self.book.__dict__["_storage_pressure_activated"] = True
+        except BaseException:
+            _ACTIVE_ARENA.reset(self.live_token)
+            self.live_token = None
+            self.live_arena = None
+            raise
+        return arena
+
+    def _cold_page_names(self):
+        if not (self.owns_book and self.completed is not None):
+            return ()
+        from .page_lifecycle import cold_pages
+        from .identity_spill import PARTITIONED
+
+        names = cold_pages(tuple(dict.keys(self.book.pages)), self.completed)
+        if self.label == "compile: end":
+            names.extend(PARTITIONED)
+        return tuple(names)
+
+    def _climb_storage_ladder(self, label: str, resident: int) -> int:
+        """Escalate only while the measured process remains over budget.
+
+        0 -> disk-back the cold decoded tail; 1 -> compress the remaining RAM
+        contents; 2 -> put all backing on disk and keep one decoded payload
+        tile plus the compact search metadata required to address it.
+        This ladder is monotonic for one compile and never runs below budget.
+        The maximum tier's storage pass is linear for the configured fixed
+        tile/codec windows; LiveTileArena.collect_unused documents the stricter
+        parameterized bound of its one-tile traversal cache.
+        """
+        if not (self.compress_policy and self.tile_disk_policy and self.owns_book
+                and self.budget_bytes is not None and resident > self.budget_bytes
+                and self.live_arena is not None):
+            return resident
+        while resident > self.budget_bytes and self.live_arena.pressure_level < 3:
+            level = self.live_arena.pressure_level
+            if level == 0:
+                stats = self.live_arena.offload_cold_tail()
+                action = "cold-tail-disk"
+            elif level == 1:
+                names = self._cold_page_names()
+                if names:
+                    self.book.compress_pages(names, budget_bytes=self.budget_bytes,
+                                             boundary=label)
+                stats = self.live_arena.compress_resident_ram()
+                # Mark/sweep is deliberately deferred until compression is
+                # already necessary; the fully decoded fast path never pays it.
+                self.live_arena.collect_unused()
+                action = "compressed-ram"
+            else:
+                self.offload_tiles(label, resident)
+                stats = self.live_arena.stats()
+                action = "minimum-working-set"
+            self._live_receipt(label)
+            print(f"[compiler-memory] {label}: {action} level={stats.pressure_level} "
+                  f"hot={stats.hot_tiles} disk_tiles={stats.disk_tiles} "
+                  f"disk={stats.disk_bytes / 2**20:.2f} MiB",
+                  file=sys.stderr, flush=True)
+            resident = process_rss_bytes()
+        return resident
+
     def offload_tiles(self, label: str, resident: int):
         if not (self.compress_policy and self.tile_disk_policy and self.owns_book
                 and self.budget_bytes is not None and resident > self.budget_bytes):
@@ -178,12 +277,12 @@ class MemoryRegulator:
 
         result = offload_book_tiles(self.book, budget_bytes=self.budget_bytes,
                                    resident_bytes=resident, boundary=label)
-        if self.live_arena is not None and not self.live_arena.disk_mode:
+        if self.live_arena is not None and self.live_arena.pressure_level < 3:
             stats = self.live_arena.offload_to_disk()
             self._live_receipt(label)
             print(f"[compiler-memory] {label}: LIVE graph/control/deployment/SSA "
                   f"disk tiles={stats.disk_tiles} disk={stats.disk_bytes / 2**20:.2f} MiB "
-                  f"decoded limit={self.live_arena.hot_limit}", file=sys.stderr, flush=True)
+                  f"decoded limit={self.live_arena.payload_limit}", file=sys.stderr, flush=True)
         if result.released_bytes:
             print(f"[compiler-memory] {label}: disk tiles={result.disk_tiles} "
                   f"disk={result.disk_bytes / 2**20:.2f} MiB "
@@ -197,9 +296,22 @@ class MemoryRegulator:
             "boundary": label, "budget_bytes": self.budget_bytes,
             "disk_tiles": stats.disk_tiles, "disk_bytes": stats.disk_bytes,
             "hot_limit": self.live_arena.hot_limit, "tile_rows": self.live_arena.tile_rows,
+            "working_hot_limit": self.live_arena.payload_limit,
             "bucket_rows": self.live_arena.bucket_rows,
             "decoded_budget_bytes": self.live_arena.decoded_budget_bytes,
             "decoded_bytes": stats.decoded_bytes,
+            "pressure_level": stats.pressure_level,
+            # These cumulative counters expose the A*S locality term: a high
+            # reload/compression count at level three distinguishes cache
+            # thrash from the one-time O(B+T) disk transition.
+            "tile_compressions": stats.compressions,
+            "tile_reloads": stats.reloads,
+            "routing_reloads": stats.routing_reloads,
+            "payload_reloads": stats.payload_reloads,
+            "route_hits": stats.route_hits,
+            "route_misses": stats.route_misses,
+            "retained_index_bytes": stats.retained_index_bytes,
+            "hot_peak": stats.hot_peak,
             "policy_sources": getattr(self, "live_policy_sources", ()),
         }
 
@@ -212,7 +324,11 @@ class MemoryRegulator:
         if now - self._last_pressure_read < 0.5:
             return None
         self._last_pressure_read = now
-        return self.offload_tiles(label, process_rss_bytes())
+        resident = process_rss_bytes()
+        if resident <= self.budget_bytes:
+            return resident
+        self._activate_live_storage()
+        return self._climb_storage_ladder(label, resident)
 
     def spill_cold(self, trigger: str) -> int:
         """Spill the book's pages that the completed stages made cold; the
@@ -295,6 +411,9 @@ def begin_regulation(
             from .live_tiles import _ACTIVE_ARENA
             regulator.live_arena.pressure_probe = None
             _ACTIVE_ARENA.reset(regulator.live_token)
+        if regulator.live_registrar_token is not None:
+            from .live_tiles import _ACTIVE_REGISTRAR
+            _ACTIVE_REGISTRAR.reset(regulator.live_registrar_token)
         _ACTIVE.reset(token)
         raise
     return regulator, token, outermost and owned_book
@@ -303,11 +422,14 @@ def begin_regulation(
 def _initialize_regulation(regulator, contract):
     book = regulator.book
     if regulator.compress_policy:
-        from .live_tiles import LiveTileArena, _ACTIVE_ARENA
-        from .concordance_declarations import COMPILE_POLICY, MEMORY_REGULATION, POLICY_DECLARATION
-        from .identity_concordance import Mode, Novel
+        from .live_tiles import _ACTIVE_REGISTRAR
+        regulator.live_settings = (
+            contract.live_tile_rows, contract.live_resident_tiles,
+            contract.live_bucket_rows, contract.live_decoded_budget_bytes,
+        )
+        regulator.live_registrar_token = _ACTIVE_REGISTRAR.set(regulator.register_live_root)
 
-        policies = {
+        regulator.live_policy_values = {
             "compressed_tile_disk": "true" if regulator.tile_disk_policy else "false",
             "live_tile_rows": str(contract.live_tile_rows),
             "live_resident_tiles": str(contract.live_resident_tiles),
@@ -315,21 +437,7 @@ def _initialize_regulation(regulator, contract):
             "live_decoded_budget_bytes": str(contract.live_decoded_budget_bytes),
         }
         if regulator.budget_bytes is not None:
-            policies["memory_budget_bytes"] = str(regulator.budget_bytes)
-        for key, value in policies.items():
-            book.post(COMPILE_POLICY, (key,), value, stage=MEMORY_REGULATION,
-                      provenance=Novel(POLICY_DECLARATION, ()), mode=Mode.CONCORD)
-        regulator.live_policy_sources = tuple(book.latest_ref(COMPILE_POLICY, (key,)) for key in policies)
-        regulator.live_arena = LiveTileArena(tile_rows=contract.live_tile_rows,
-                                           hot_tiles=contract.live_resident_tiles,
-                                           bucket_rows=contract.live_bucket_rows,
-                                           decoded_budget_bytes=contract.live_decoded_budget_bytes)
-        regulator.live_token = _ACTIVE_ARENA.set(regulator.live_arena)
-        from .live_tiles import tile_identity_page
-        for page in tuple(dict.values(book.pages)):
-            if not page.__dict__.get("spill") and not page.__dict__.get("_compressed_ram"):
-                tile_identity_page(page, regulator.live_arena)
-        regulator.live_arena.pressure_probe = regulator.pressure_checkpoint
+            regulator.live_policy_values["memory_budget_bytes"] = str(regulator.budget_bytes)
 
 
 def stage_boundary(label: str) -> None:
@@ -369,7 +477,8 @@ def stage_end(label: str) -> None:
 
     regulator = _ACTIVE.get()
     if regulator is not None:
-        if regulator.live_arena is not None:
+        if (regulator.live_arena is not None
+                and regulator.live_arena.pressure_level > 0):
             # Python collection alone cannot see dead records in compressed
             # tiles. The SAME arena traces its physical handles after dropping
             # decoded cache roots; it does not mint new concordance identities.
@@ -398,7 +507,8 @@ def end_regulation(
             release_compile_planning_state(regulator.book)
             _release_dependency_levels()
             _release_polymorphic_formal_scans()
-            if regulator.live_arena is not None:
+            if (regulator.live_arena is not None
+                    and regulator.live_arena.pressure_level > 0):
                 regulator.live_arena.collect_unused()
             else:
                 gc.collect()
@@ -414,4 +524,7 @@ def end_regulation(
                 # regulator callback/book retention cycle or stale policies.
                 regulator.live_arena.pressure_probe = None
                 _ACTIVE_ARENA.reset(regulator.live_token)
+            if regulator.live_registrar_token is not None:
+                from .live_tiles import _ACTIVE_REGISTRAR
+                _ACTIVE_REGISTRAR.reset(regulator.live_registrar_token)
             _ACTIVE.reset(token)

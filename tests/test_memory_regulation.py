@@ -109,8 +109,10 @@ def test_release_ordinals_continue_across_boundaries(monkeypatch):
     )
 
 
-def test_work_contract_budget_is_validated_and_defaults_to_none():
-    assert all(preset.memory_budget_bytes is None for preset in PRESETS.values())
+def test_work_contract_budget_is_validated_and_defaults_to_automatic_ladder():
+    assert all(preset.memory_budget_bytes == 10 << 30 for preset in PRESETS.values())
+    assert all(preset.compress_cold_pages for preset in PRESETS.values())
+    assert all(preset.compressed_tile_disk for preset in PRESETS.values())
     assert WorkContract(
         "t", register_reuse=False, inexact_identities=False,
         contract_multiply_add=False, memory_budget_bytes=1 << 30,
@@ -134,6 +136,74 @@ def test_environment_budget_overrides_without_renaming_the_contract(monkeypatch)
     contract = active_contract()
     assert contract.memory_budget_bytes == 3 << 30
     assert contract.name == "develop"
+
+
+def test_default_regulation_is_fast_until_pressure_then_climbs_all_tiers(monkeypatch):
+    from dataclasses import replace
+
+    readings = iter((1, 500, 500, 500, 90, 90))
+    last = [90]
+
+    def rss():
+        try:
+            last[0] = next(readings)
+        except StopIteration:
+            pass
+        return last[0]
+
+    monkeypatch.setattr(regulation, "process_rss_bytes", rss)
+    contract = replace(PRESETS["develop"], memory_budget_bytes=100,
+                       live_tile_rows=2, live_resident_tiles=1,
+                       live_bucket_rows=1, live_decoded_budget_bytes=128)
+    set_active_contract(contract)
+    book = IdentityBook()
+    regulator, token, releases = regulation.begin_regulation(book)
+    try:
+        from src.compiler.live_tiles import TiledDict, live_digraph
+
+        graph = live_digraph()
+        for i in range(8):
+            graph.add_node(i, payload="x" * 200)
+        assert regulator.live_arena is None
+        assert type(graph._node) is dict
+        assert regulator.boundary("pressure") == 90
+        owner = regulator.live_arena
+        assert owner.pressure_level == 3
+        assert owner.hot_limit == contract.live_resident_tiles
+        assert owner.payload_limit == 1
+        assert isinstance(graph._node, TiledDict)
+        assert list(graph) == list(range(8))
+        report = book.__dict__["_live_tile_report"]
+        assert report["pressure_level"] == 3
+        assert report["tile_compressions"] >= 1
+        assert report["tile_reloads"] >= 0
+    finally:
+        regulation.end_regulation(regulator, token, releases_book_state=releases)
+        set_active_contract(None)
+
+
+def test_automatic_ladder_stops_as_soon_as_rss_recovers(monkeypatch):
+    from dataclasses import replace
+
+    readings = iter((1, 500, 90, 90))
+    monkeypatch.setattr(regulation, "process_rss_bytes", lambda: next(readings, 90))
+    set_active_contract(replace(PRESETS["develop"], memory_budget_bytes=100,
+                                live_tile_rows=2, live_resident_tiles=1,
+                                live_bucket_rows=1, live_decoded_budget_bytes=128))
+    book = IdentityBook()
+    regulator, token, releases = regulation.begin_regulation(book)
+    try:
+        from src.compiler.live_tiles import live_digraph
+
+        graph = live_digraph()
+        graph.add_nodes_from((i, {"payload": "x" * 200}) for i in range(8))
+        assert regulator.boundary("recover after coarse tier") == 90
+        assert regulator.live_arena.pressure_level == 1
+        assert list(graph) == list(range(8))
+    finally:
+        regulator.budget_bytes = None
+        regulation.end_regulation(regulator, token, releases_book_state=releases)
+        set_active_contract(None)
 
 
 def test_dependency_level_cache_holds_live_graphs_only():
@@ -250,6 +320,7 @@ def test_cleanup_reclaims_tile_garbage_without_a_second_book(cleanup):
 
     book = IdentityBook()
     arena = LiveTileArena(tile_rows=8, hot_tiles=2, bucket_rows=4)
+    arena.compress_resident_ram()  # This test exercises post-escalation tile GC.
     kept = arena.manage({"answer": 42})
     discarded = arena.manage({"unused": list(range(80))})
     discarded_handle = discarded._ref
@@ -267,6 +338,8 @@ def test_cleanup_reclaims_tile_garbage_without_a_second_book(cleanup):
     # Physical garbage is gone, not merely compressed. The live view keeps
     # its original handle/identity and no semantic/provenance rows are added.
     assert arena.read(discarded_handle) is None
+    assert discarded_handle not in arena._route_indexes
+    assert kept._ref in arena._route_indexes
     assert arena.resolve_reference(kept._ref) is kept
     assert kept["answer"] == 42
     assert tuple(book.pages) == pages_before

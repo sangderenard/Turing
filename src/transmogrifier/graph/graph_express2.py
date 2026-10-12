@@ -4009,6 +4009,7 @@ from ...compiler.live_tiles import TiledObject, live_digraph
 
 
 class ProcessGraph(TiledObject):
+    __live_storage_root__ = True
     def __init__(
         self,
         recombinatorics_level=0,

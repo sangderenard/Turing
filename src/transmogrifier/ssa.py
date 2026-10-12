@@ -2436,6 +2436,7 @@ class SSAMachineIndirectTable:
 
 @dataclass
 class IRModule(TiledObject):
+    __live_storage_root__ = True
     functions: Dict[str, Function]
     function_table: FunctionTable = field(default_factory=FunctionTable)
     # Class definitions the module holds (identity -> fields + methods). Empty

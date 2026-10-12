@@ -6983,6 +6983,11 @@ def _spill_book_after_build(module: Any) -> None:
         from .page_lifecycle import spill_cold_pages
 
         if contract.compress_cold_pages:
+            # Automatic compression is dormant below the process limit. A
+            # native build must not turn the ordinary fast path into an eager
+            # whole-book compression pass merely because the capability is on.
+            if not book.__dict__.get("_storage_pressure_activated"):
+                return
             from .page_lifecycle import cold_pages
             from .identity_spill import PARTITIONED
 

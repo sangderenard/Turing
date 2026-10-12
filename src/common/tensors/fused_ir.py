@@ -250,6 +250,7 @@ class FusedProgram(TiledObject):
     selected such a numeric region.  Treating it as the compiler boundary
     discards the non-numeric structure that Turing is required to retain.
     """
+    __live_storage_root__ = True
 
     version: int
     feeds: Set[int]

@@ -1369,6 +1369,7 @@ def _control_expression_mapping(
 
 
 class _ControlSSABuilder(TiledObject):
+    __live_storage_root__ = True
     def __init__(
         self,
         program: ControlProgram,
