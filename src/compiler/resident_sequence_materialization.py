@@ -38,6 +38,8 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
 
     aliases: dict[int, int] = {}
     chainable = {"indexedstore", "loopresult", "loopexit"}
+    store_versions: set[int] = set()
+    loop_versions: dict[int, int] = {}
 
     def node_kind(node_id) -> str:
         data = graph_obj.nodes.get(node_id) or {}
@@ -51,6 +53,7 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
         kind = str(data.get("op") or data.get("type") or "").casefold()
         parents = tuple(data.get("parents") or ())
         if kind == "indexedstore":
+            store_versions.add(value_id_of(node_id))
             base = next(
                 (parent for parent, role in parents
                  if str(role) == "base" and parent in graph_obj),
@@ -72,8 +75,28 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
                 if parent is None:
                     continue
                 if node_kind(parent) in chainable:
-                    aliases[value_id_of(node_id)] = value_id_of(parent)
+                    loop_versions[value_id_of(node_id)] = value_id_of(parent)
                 break
+    # second=total makes LoopResult(second) point at LoopResult(total), but
+    # those scalar exit values have different seeds on a zero-trip path.
+    # A loop identity alone does not prove shared storage. Propagate the
+    # actual IndexedStore proof backwards through the preferred-parent graph
+    # in O(V+E); only its proven cone belongs in this storage-alias ledger.
+    from collections import deque
+    dependents: dict[int, list[int]] = {}
+    for source, target in loop_versions.items():
+        dependents.setdefault(target, []).append(source)
+    pending = deque(store_versions)
+    proven = set(store_versions)
+    while pending:
+        for source in dependents.get(pending.popleft(), ()):
+            if source not in proven:
+                proven.add(source)
+                pending.append(source)
+    aliases.update({
+        source: target for source, target in loop_versions.items()
+        if source in proven
+    })
     def root(value):
         seen = set()
         while value in aliases and value not in seen:

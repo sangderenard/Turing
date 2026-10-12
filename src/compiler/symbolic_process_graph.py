@@ -866,10 +866,7 @@ def ingest_sympy_expression(
     graph.roots = []
     memo: dict[sympy.Basic, int] = {}
     fallbacks: list[str] = []
-    next_id = max(
-        (int(node_id) for node_id in graph.G if isinstance(node_id, int)),
-        default=-1,
-    ) + 1
+    from .process_graph_value_ids import next_process_value_id
 
     def make_node(
         value: sympy.Basic,
@@ -879,9 +876,10 @@ def ingest_sympy_expression(
         attributes: Mapping[str, Any] | None = None,
         source_cells: Sequence[Any] = (),
     ) -> int:
-        nonlocal next_id
-        node_id = next_id
-        next_id += 1
+        # The expression-set Tuple envelope is removed after ingestion.
+        # Allocate through the monotonic graph watermark so a later graph
+        # transformation cannot reuse that retired value identity.
+        node_id = next_process_value_id(graph)
         attributes = dict(attributes or {})
         attributes.setdefault("source_type", type(value).__name__)
         node_type = rule.node_type or rule.operation
@@ -1446,6 +1444,12 @@ def ingest_sympy_expression(
                 # Declared by what SymPy says the node is: a call to an
                 # external the host supplies (``external_functions``).
                 attributes["external_function"] = str(value.func.__name__)
+                # This is the durable identity of the unresolved function
+                # declaration.  Python object identity does not survive the
+                # symbolic compilation cache; the declaration's canonical
+                # structural representation does.  Graph-function sockets
+                # consume this exact key rather than guessing from a name.
+                attributes["external_function_identity"] = sympy.srepr(value.func)
                 # The call's authored form: the key of its ``external_
                 # callsite`` rows (``post_external_functions``), which the
                 # lowered call's ``external_call_lowering`` row derives from.

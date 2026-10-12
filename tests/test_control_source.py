@@ -273,6 +273,21 @@ def test_initial_source_loop_projection_defers_carried_update_pruning():
     assert projected.root.carried_aliases == ((4, 1),)
 
 
+def test_overlay_retains_regionless_owner_of_effect_only_guard():
+    guard = ConditionalBlock(
+        3, StatementBlock(("__plan_callsite_7__",)),
+        source_node_id=4, body_callsite_ids=(7,),
+    )
+    owner = ControlProgram(SequenceBlock(()))
+    child = ControlProgram(SequenceBlock((guard,)))
+
+    overlaid = overlay_scheduled_control(
+        (), (owner, child), known_nesting={0: (1,)},
+    )
+
+    assert overlaid.root == SequenceBlock((guard,))
+
+
 def test_overlay_uses_known_nesting_for_equal_region_sets():
     inner = ControlProgram(
         LoopBlock(

@@ -24,6 +24,11 @@ def object_type_classes(vocabulary):
                  ('dict', 'list', 'tuple', 'set', 'frozenset', 'object',
                   'bool', 'int', 'float', 'str', 'bytes')}
     supported['builtins.NoneType'] = type(None)
+    # Closed compiler-owned set view, not arbitrary ABC/user class admission.
+    # A builtin set subclass with empty C storage cannot page: set(view) and
+    # frozenset(view) would bypass iteration and silently produce empties.
+    from .live_tiles import TiledSet
+    supported['src.compiler.live_tiles.TiledSet'] = TiledSet
     if any(token not in supported for token in vocabulary):
         raise ValueError('object type evidence supports declared builtin guards only')
     return tuple(supported[token] for token in vocabulary)
@@ -76,7 +81,7 @@ def source_object_type_tests(graph, admitted, context):
             continue
         targets = (attributes.get('static_call_values') or {}).get('arg:1')
         targets = targets if type(targets) is tuple else (targets,)
-        if not targets or any(type(target) is not type or target not in classes for target in targets):
+        if not targets or any(not isinstance(target, type) or target not in classes for target in targets):
             continue
         operands = [int(graph.nodes[parent].get('value_id', parent))
                     for parent, role in data.get('parents') or () if role == 'arg:0']

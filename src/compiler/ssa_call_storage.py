@@ -9,12 +9,14 @@ remain function-local throughout.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 
 def call_array_argument_ids(
     functions: Mapping[str, object],
     function_names: Iterable[str] | None = None,
+    *,
+    call_is_semantic_edge: Callable[[object], bool] | None = None,
 ) -> dict[str, frozenset[int]]:
     """Return array-valued formal ids for each selected function.
 
@@ -67,6 +69,11 @@ def call_array_argument_ids(
             for block in caller.blocks.values():
                 for instruction in block.instrs:
                     if instruction.op not in {"Call", "call"}:
+                        continue
+                    if call_is_semantic_edge is not None and not call_is_semantic_edge(instruction):
+                        # A target may spell a legalized kernel directly.
+                        # Its pointer transport does not change the authored
+                        # scalar into a span in that target's call graph.
                         continue
                     callee_name = str(
                         instruction.attributes.get("callee") or ""

@@ -244,16 +244,11 @@ def step(m: Metrics, rejected: bool) -> Metrics:
 ''',
 }
 
-@pytest.mark.parametrize('variant', [
-    pytest.param(name, marks=pytest.mark.xfail(strict=True, reason=(
-        'HELD (port onto 854e145c): a declared scalar field with no live '
-        'read or write is not a record output on this head (same as a field '
-        'never mentioned). The proposal projected every declared scalar '
-        'parameter field at entry to make it one; that ABI change was not '
-        'ported. See docs/concordance_census/CONTINUATION_return_site_port.md.'
-    ))) if name == 'static_branch' else name
-    for name in RETURN_VARIANTS
-])
+RETURN_VARIANTS['unmentioned_field'] = RETURN_VARIANTS['static_branch'].replace(
+    '        if False:\n            m.hard_failure = True\n            return m\n', '',
+)
+
+@pytest.mark.parametrize('variant', RETURN_VARIANTS)
 def test_nested_and_fallthrough_returns_match_native_python(variant, tmp_path, monkeypatch):
     monkeypatch.setattr(probe, 'SOURCE', RETURN_VARIANTS[variant])
     _assert_native_returns(probe.lower(), tmp_path)

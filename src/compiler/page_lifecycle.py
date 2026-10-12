@@ -106,6 +106,7 @@ REPAIRS = "pre-native-repairs"
 EMISSION = "emission"
 
 PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
+    "graph_math_output": PageLifecycle(LOWERING, EMISSION, EMISSION),
     "abstract_tensor_program_value": PageLifecycle(LOWERING, None, LOWERING),
     "aggregate_ledger": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "aggregate_passthrough_rebinding": PageLifecycle(LOWERING, LOWERING, LOWERING),

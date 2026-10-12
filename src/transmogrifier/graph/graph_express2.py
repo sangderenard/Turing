@@ -4005,7 +4005,10 @@ class ExpressionTensor:
         return f"ExpressionTensor(shape={self.shape}, data={self.data})"
 
 
-class ProcessGraph:
+from ...compiler.live_tiles import TiledObject, live_digraph
+
+
+class ProcessGraph(TiledObject):
     def __init__(
         self,
         recombinatorics_level=0,
@@ -4021,7 +4024,7 @@ class ProcessGraph:
         # can operate even when the experimental allocator is unavailable.
         self.materialize_memory = materialize_memory
         self.MG = BitTensorMemoryGraph(size=0) if materialize_memory else None
-        self.G = self.MG.G if self.MG is not None else nx.DiGraph()
+        self.G = self.MG.G if self.MG is not None else live_digraph()
         self._graph_lock = threading.RLock()
         self._graph_condition = threading.Condition(self._graph_lock)
         self._graph_revision = 0
@@ -4070,6 +4073,7 @@ class ProcessGraph:
             if external_function_table is None
             else external_function_table
         )
+        TiledObject.__post_init__(self)
 
     def __getstate__(self):
         """Serialize compiler state without live synchronization observers."""

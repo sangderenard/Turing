@@ -33,6 +33,7 @@ from types import MappingProxyType, ModuleType, SimpleNamespace
 
 import networkx as nx
 import numpy as np
+from .live_tiles import live_digraph
 
 
 class CompilationSubdivisionRequired(ValueError):
@@ -933,7 +934,7 @@ def _atomic_region_node_order(
         for node_id in record.get("control_members", ())
         if int(node_id) in G
     )
-    unit_graph = nx.DiGraph()
+    unit_graph = live_digraph()
     unit_graph.add_nodes_from(members)
     for node_id in topological_nodes:
         node_id = int(node_id)
@@ -6080,6 +6081,7 @@ def _dispatch_metadata_node_classifier(graph: Any):
                      ).values()
                  )}
         G.graph["_dispatch_metadata_cache"] = cache
+        cache = G.graph["_dispatch_metadata_cache"]
     planning_scope = cache["__scope__"]
 
     def post_verdict(node_id: int, rule: MetadataRule) -> None:
@@ -8346,7 +8348,7 @@ def _repair_missing_phi_initial_identities(graph_obj):
         int(data.get("value_id", node_id)): node_id
         for node_id, data in graph_obj.nodes(data=True)
     }
-    dataflow = nx.DiGraph()
+    dataflow = live_digraph()
     dataflow.add_nodes_from(graph_obj.nodes)
     for node_id, data in graph_obj.nodes(data=True):
         for parent, _role in data.get("parents") or ():
@@ -8614,7 +8616,7 @@ def _source_control_nesting_hints(
     # Keep the Hasse diagram of the existing relation, not a second parent
     # chosen by region sizes or coordinates. Reachability is unchanged.
     import networkx as nx
-    ownership = nx.DiGraph()
+    ownership = live_digraph()
     ownership.add_edges_from((parent, child)
                              for parent, nested in children.items()
                              for child in nested)
@@ -23566,7 +23568,10 @@ def _callsite_specialized_shell_type(
 MAX_UNROLL_LIMIT = 4096
 
 
-class ProcessGraphGLSLDeployment:
+from .live_tiles import TiledObject
+
+
+class ProcessGraphGLSLDeployment(TiledObject):
     # Per-compile values. A fresh subclass is created for each compiled
     # ProcessGraph (see strategize_shell_deployment) with these overridden
     # via ordinary class-attribute assignment -- no source-text templating.
@@ -23615,6 +23620,7 @@ class ProcessGraphGLSLDeployment:
         tuning = dict(tuning)
         tuning["legacy_fused_network"] = bool(legacy_fused_network)
         tuning["shell_language"] = str(shell_language)
+        TiledObject.__post_init__(self)
         self.state = {}
         self.tuning = dict(tuning)
         self.legacy_fused_network = bool(legacy_fused_network)
@@ -23664,14 +23670,17 @@ class ProcessGraphGLSLDeployment:
         # chain intact.  Eagerly constructing a catalogue from one of those
         # children re-entered this constructor before the chain could be
         # passed down, making recursive call topologies expand forever.
+        def instantiate_member(shell_type):
+            from .memory_regulation import pressure_checkpoint
+
+            pressure_checkpoint("deployment: function catalogue member")
+            return shell_type(**tuning, _defer_callsite_planning=True)
+
         self.function_shells = (
             (_function_catalogue if _function_catalogue is not None else {})
             if self._callsite_planning_deferred
             else {
-                reference: shell_type(
-                    **tuning,
-                    _defer_callsite_planning=True,
-                )
+                reference: instantiate_member(shell_type)
                 for reference, shell_type in self.function_shell_types.items()
             }
         )
@@ -23723,6 +23732,7 @@ class ProcessGraphGLSLDeployment:
 
         def plan_callsites(owner, active_references=()):
             nonlocal callsite_planning_total
+            from .memory_regulation import pressure_checkpoint
             recursive_signature_owners.add(id(owner))
             owner.callsite_function_shells = {}
             for node_id, data in owner.process_graph.G.nodes(data=True):
@@ -23805,6 +23815,7 @@ class ProcessGraphGLSLDeployment:
                 ) + 1
                 callsite_planning_visits[planning_key] = planning_visit
                 callsite_planning_total += 1
+                pressure_checkpoint("deployment: callsite specialization")
                 compile_count(
                     "callsite-plan", callsite_planning_total,
                     label="callsite activations visited",
@@ -27295,6 +27306,10 @@ def strategize_shell_deployment(
             "visits": {},
             "events": [],
         }
+        from .live_tiles import _ACTIVE_ARENA
+        _live_owner = _ACTIVE_ARENA.get()
+        if _live_owner is not None:
+            _selection_trace = _live_owner.manage(_selection_trace)
     trace = _selection_trace
     graph_metadata = graph.G.graph
     function_identity = str(

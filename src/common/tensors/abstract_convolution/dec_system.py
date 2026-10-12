@@ -499,6 +499,16 @@ class DECSystem:
         """
         return self.delta1(self.d0(scalar))
 
+    def laplace0_diagram(self, *, edge_laws=None, joint_laws=None):
+        """A compiler graph wiring view over these same edges and Hodge slots.
+
+        Default local laws realize delta1(d0(u)); optional per-edge constitutive
+        and per-joint response graphs share the exact complex cell identities.
+        Geometry stays caller-owned. This does not materialize a dense matrix.
+        """
+        from ....compiler.dual_ir_math import DECGraphDiagram
+        return DECGraphDiagram.laplace0(self, edge_laws=edge_laws, joint_laws=joint_laws)
+
     def laplace1(self, one_form):
         """``delta2 d1 + d0 delta1`` on 1-forms: curl-curl plus grad-div.
 

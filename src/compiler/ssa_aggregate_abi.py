@@ -369,6 +369,22 @@ def _post_passthrough_rebinding(
         identity_cells(function, source, replacement),
         stage=AGGREGATE_ABI_LEGALIZATION, mode=Mode.REVISE,
     )
+    # Folding advance's returned publication spans retired their projection
+    # slots, but return-field Phi aliases still pointed at those slots. The
+    # operand rewrite below and the residency ledger are the same proven fold,
+    # not independent records. Advance dependent aliases through this exact
+    # passthrough row before removing the source definition.
+    aliases = dict(function.metadata.get("value_aliases", {}) or {})
+    if int(source.id) in aliases or int(source.id) in set(map(int, aliases.values())):
+        from .fortran_c_shell import _publish_concordant_function_aliases
+        _publish_concordant_function_aliases(
+            function, {int(source.id): int(replacement.id)},
+            provenance="exact_aggregate_passthrough_rebinding",
+            sources={int(source.id): (
+                book.latest_ref(AGGREGATE_PASSTHROUGH_REBINDING, row),
+                *identity_cells(function, source, replacement),
+            )},
+        )
     return int(book.page(AGGREGATE_PASSTHROUGH_REBINDING).latest(row)[0])
 
 

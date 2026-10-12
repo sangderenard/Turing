@@ -24,4 +24,17 @@ def test_loop_uniform_preserves_explicit_storage_contract(dtype):
         instruction for block in function.blocks.values()
         for instruction in block.instrs if instruction.op == "Lt"
     )
-    assert comparison.args[1] is count
+    if dtype == "int64":
+        assert comparison.args[1] is count
+    else:
+        # Loop induction has a declared int64 arithmetic width. Its range
+        # cast must consume, not relabel or replace, the authored uniform.
+        widened = comparison.args[1]
+        assert widened.dtype == "int64"
+        cast = next(
+            instruction for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Cast" and instruction.res is widened
+        )
+        assert cast.args == [count]
+        assert cast.attributes["binding"] == "loop_range_width"

@@ -23,6 +23,7 @@ import weakref
 from typing import Any, Callable, Iterable, Mapping
 
 import networkx as nx
+from ...compiler.live_tiles import live_digraph
 
 from ...compiler.native_compiler_accelerators import (
     lexicographical_topological_order,
@@ -9200,7 +9201,7 @@ def _normalize_lexical_values(
         node_id: value_id for value_id, node_id in enumerate(ordered)
     }
     relabeled = nx.relabel_nodes(graph.G, mapping, copy=True)
-    ordered_graph = nx.DiGraph()
+    ordered_graph = live_digraph()
     ordered_graph.graph.update(relabeled.graph)
     ordered_graph.graph["canonical_value_ids"] = True
     # Renumbering changes the id space; a watermark from the AST-id
@@ -12917,7 +12918,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         graph.roots = [root for root in graph.roots if root != node_id]
         graph.G.remove_node(node_id)
 
-    call_graph = nx.DiGraph()
+    call_graph = live_digraph()
     call_graph.add_nodes_from(
         reference.address for reference in function_nodes.values()
     )

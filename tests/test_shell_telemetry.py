@@ -1,5 +1,19 @@
 import pytest
 
+
+def test_windows_rss_sampling_does_not_retain_one_ctypes_type_per_read():
+    import ctypes
+    import sys
+    from src.compiler.shell_telemetry import process_rss_bytes
+
+    if sys.platform != "win32":
+        pytest.skip("Windows ctypes RSS binding")
+    assert process_rss_bytes() > 0
+    before = len(ctypes._pointer_type_cache)
+    for _ in range(1000):
+        assert process_rss_bytes() > 0
+    assert len(ctypes._pointer_type_cache) == before
+
 from src.compiler.shell_telemetry import (
     ERROR,
     KINDS,

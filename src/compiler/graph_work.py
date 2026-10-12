@@ -27,9 +27,19 @@ import tempfile
 from typing import Any
 
 import networkx as nx
+from .live_tiles import TiledSet
 
 
 _BOOTSTRAPPING = ContextVar("compiler_graph_foundation_bootstrap", default=False)
+_MEMO_SOURCES = object()
+
+
+def _retain_codec_source(value, memo):
+    # Tiled reads can yield a decoded tuple whose page is evicted by the next
+    # read. An id-only recursion memo must keep that tuple alive for THIS
+    # bounded region conversion, or CPython can reuse its address for an
+    # unrelated dict and the memo substitutes that dict for a graph endpoint.
+    memo.setdefault(_MEMO_SOURCES, []).append(value)
 
 
 def ensure_graph_foundation(progress=None) -> None:
@@ -285,6 +295,7 @@ def _managed(value, pool, identity, memo=None):
             and value._generation == pool.entries[identity].generation):
         return value  # Already belongs to this exact writable generation.
     memo = {} if memo is None else memo
+    _retain_codec_source(value, memo)
     if id(value) in memo:
         return memo[id(value)]
     if isinstance(value, (dict, list)):
@@ -305,7 +316,7 @@ def _managed(value, pool, identity, memo=None):
             return incumbent
         memo[id(value)] = result
         return result
-    if isinstance(value, set):
+    if isinstance(value, (set, TiledSet)):
         result = _LeasedSet(value)
         result._pool, result._identity = pool, identity
         result._generation = pool.entries[identity].generation
@@ -317,6 +328,7 @@ def _managed(value, pool, identity, memo=None):
 def _freeze(value, memo=None):
     """Escaping read views cannot write a stale, evicted payload."""
     memo = {} if memo is None else memo
+    _retain_codec_source(value, memo)
     if id(value) in memo:
         return memo[id(value)]
     if isinstance(value, dict):
@@ -337,7 +349,7 @@ def _freeze(value, memo=None):
             return incumbent
         memo[id(value)] = result
         return result
-    if isinstance(value, set):
+    if isinstance(value, (set, TiledSet)):
         result = _FrozenSet(value)
         memo[id(value)] = result
         return result
@@ -444,6 +456,7 @@ class RegionTopologyPool:
         # Reuse BookSpill's registry-aware framing. Semantic leaves are shared
         # pointers on the coordinator, not recursive copies of bound programs.
         memo = {} if memo is None else memo
+        _retain_codec_source(value, memo)
         if decode and isinstance(value, _Leaf):
             return self.leaves[value.identity]
         if id(value) in memo:
@@ -458,7 +471,7 @@ class RegionTopologyPool:
                 result.extend(self._codec(v, decode=decode, memo=memo) for v in value)
             return result
         if isinstance(value, (tuple, set, frozenset)):
-            constructor = tuple if isinstance(value, tuple) else set if isinstance(value, set) else frozenset
+            constructor = tuple if isinstance(value, tuple) else set if isinstance(value, (set, TiledSet)) else frozenset
             result = constructor(self._codec(v, decode=decode, memo=memo) for v in value)
             incumbent = memo.get(id(value))
             if incumbent is not None:

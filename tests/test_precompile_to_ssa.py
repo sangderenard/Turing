@@ -1973,6 +1973,33 @@ def test_structural_dependency_chain_delays_early_sequence_mutation():
     )
 
 
+@pytest.mark.parametrize("action", ("return", "continue", "break"))
+def test_nested_terminal_guard_separates_flat_effect_ranks(action):
+    from src.compiler.hierarchical_plan import PlanCall, PlanClosure
+    from src.compiler.precompile_to_ssa import _schedule_loop_callsites
+
+    early = StatementBlock(("__scheduled_region_0__",))
+    guard = ConditionalBlock(
+        9, SequenceBlock((LoopControlBlock(action=action, return_value_ids=(10,)),)),
+        source_node_id=30,
+    )
+    call = StatementBlock(("__plan_callsite_2__",))
+    late = StatementBlock(("__scheduled_region_1__",))
+    exit_edge = LoopControlBlock(action="return", return_value_ids=(21,))
+    # The flat hierarchy omits the guarded terminal. Its inverted rank is
+    # not permission to pull the late call's dependency cone across that edge.
+    hierarchy = PlanClosure("root", (), (
+        PlanClosure("region_1", (), ()),
+        PlanClosure("region_0", (), ()),
+        PlanCall(2, PlanClosure("tick", (), ()), result_bindings=((0, 20),)),
+    ))
+    scheduled, _ = _schedule_loop_callsites(
+        ControlProgram(SequenceBlock((early, guard, call, late, exit_edge))),
+        hierarchy, {0: ((), (9, 10)), 1: ((20,), (21,))},
+    )
+    assert scheduled.root.blocks == (early, guard, call, late, exit_edge)
+
+
 def test_loop_dependency_surface_moves_invariant_producer_before_loop():
     from src.compiler.hierarchical_plan import PlanClosure
     from src.compiler.precompile_to_ssa import _schedule_loop_callsites
@@ -2454,11 +2481,6 @@ def test_loop_carried_temporal_versions_survive_storage_concordance():
     )
 
     assert shortfalls == ()
-    seed = next(
-        instruction
-        for instruction in function.blocks["entry"].instrs
-        if instruction.attributes.get("binding") == "loop_carried_seed"
-    )
     carried = next(
         instruction
         for instruction in function.blocks["loop_header"].instrs
@@ -2469,8 +2491,15 @@ def test_loop_carried_temporal_versions_survive_storage_concordance():
         for instruction in function.blocks["loop_exit"].instrs
         if instruction.attributes.get("binding") == "loop_result_port"
     )
-    assert seed.args[0].id == 10
     assert [argument.id for argument in carried.args] == [10, 20]
+    definitions = [
+        (block.name, instruction)
+        for block in function.blocks.values() for instruction in block.instrs
+        if instruction.res is not None and instruction.res.id == 20
+    ]
+    assert len(definitions) == 1
+    assert definitions[0][0] == "loop_body"
+    assert definitions[0][1].res is carried.args[1]
     assert result.res.id == 30
 
 

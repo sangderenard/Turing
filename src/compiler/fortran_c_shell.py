@@ -32,6 +32,7 @@ from typing import Callable
 
 import numpy as np
 import networkx as nx
+from .live_tiles import live_digraph
 
 from ..common.tensors.accelerator_backends.profiled_c_shell import (
     _C_SOURCE, _C_TRACE_SOURCE,
@@ -428,7 +429,7 @@ def _apply_concorded_function_aliases(
     if not block_names:
         return ()
     entry = "entry" if "entry" in function.blocks else block_names[0]
-    cfg = nx.DiGraph()
+    cfg = live_digraph()
     cfg.add_nodes_from(block_names)
     for block_name, block in function.blocks.items():
         cfg.add_edges_from(
@@ -1074,13 +1075,19 @@ def _drop_unused_root_private_formals(function: Any, sequence_table: Any = None)
         return 0
 
     metadata = dict(getattr(function, "metadata", {}) or {})
+    record_parameters = set(map(str, dict(metadata.get("parameter_record_abi") or {})))
     protected = {
         int(value_id)
-        for _name, value_id in (
-            *metadata.get("parameter_names", ()),
-            *metadata.get("named_outputs", ()),
-        )
+        for parameter, value_id in metadata.get("parameter_names", ())
+        if str(parameter) not in record_parameters
     }
+    # The real step wrapper retains an unused conceptual Targets formal after
+    # its fields have become the physical ABI. Protecting its authored name
+    # left a None-typed scalar slot which tried to convert Targets to double.
+    # Match callee pruning: a record container is correlation, not a native
+    # buffer. Only a genuinely unused container is removed; leaves, outputs
+    # and every consumed identity remain protected by the existing rules.
+    protected.update(int(value_id) for _, value_id in metadata.get("named_outputs", ()))
     # ``parts=[0.0]; parts[0]=n; return parts[0]`` retains a live sequence
     # descriptor. Its unused capacity/status cells are still descriptor
     # members, not anonymous dead formals. Use the same exact member-liveness
@@ -3872,7 +3879,8 @@ def _lower_planned_region_record_projection_captures(
     value across the region boundary and replace the projection with a cast.
 
     The proof is deliberately closed: the region names one owner, every
-    projection result reaches a finite owner alias chain, the call's receiver
+    projection result reaches a finite owner alias chain or is already an
+    explicitly owned ProgramABI field, the call's receiver
     names an owner record, and that record's named scalar field contains the
     alias incumbent.  Cycles, ambiguity, and incompatible candidates make no
     change.  Equal evidence reuses the first capture already installed for
@@ -3966,8 +3974,17 @@ def _lower_planned_region_record_projection_captures(
                     or ""
                 )
                 resident_id = alias_incumbent(owner, int(instruction.res.id))
+                direct_field = next((
+                    value for value in owner.args
+                    if int(value.id) == int(instruction.res.id)
+                    and (value.accounting or {}).get("program_abi_field") == attribute
+                    and (value.accounting or {}).get("program_abi_parameter")
+                ), None) if resident_id is None else None
+                if direct_field is not None:
+                    resident_id = int(direct_field.id)
                 resident = (
                     None if resident_id is None
+                    else direct_field if direct_field is not None
                     else owner_values.get(resident_id)
                 )
                 if (
@@ -4046,7 +4063,7 @@ def _lower_planned_region_record_projection_captures(
                     if descriptor is not None and len(matching) != 1:
                         proven = False
                         break
-                    if descriptor is None and not same_receiver:
+                    if descriptor is None and (direct_field is not None or not same_receiver):
                         proven = False
                         break
                 if proven:
@@ -4064,9 +4081,18 @@ def _lower_planned_region_record_projection_captures(
                 if occupied is not None:
                     # A pre-existing definition has priority.  It is usable
                     # only when it is already the same formal capture.
-                    if occupied not in region.args:
+                    if occupied not in region.args and occupied is not instruction.res:
                         continue
                     capture = occupied
+                    if occupied is instruction.res:
+                        # A first conditional write creates an entered-state
+                        # GetAttr whose result IS the declared incoming slot.
+                        # It is not a competing producer or a self-cast: expose
+                        # that same slot as the capture and retire the read.
+                        capture.accounting = {
+                            **dict(resident.accounting or {}),
+                            **dict(capture.accounting or {}),
+                        }
                 else:
                     capture = SSAValue(
                         resident_id,
@@ -4081,6 +4107,7 @@ def _lower_planned_region_record_projection_captures(
                             "capture_owner": owner_name,
                         },
                     )
+                if capture not in region.args:
                     region.args.append(capture)
                     region_values[resident_id] = capture
                     for _caller, call in caller_calls:
@@ -4104,19 +4131,23 @@ def _lower_planned_region_record_projection_captures(
                     integral["capture_value_ids"] = tuple(capture_ids)
                 captures.setdefault(resident_id, capture)
 
-            instruction.op = "Cast"
-            instruction.args = [capture]
-            instruction.arg_roles = []
-            instruction.attributes = {
-                "target_dtype": str(
-                    instruction.res.dtype or capture.dtype or "float64"
-                ),
-                "resolved_record_field_projection": True,
-                "record_receiver_id": receiver_id,
-                "record_field": attribute,
-                "resident_value_id": resident_id,
-                "tie_policy": "incumbent",
-            }
+            if capture is instruction.res:
+                for block in region.blocks.values():
+                    block.instrs[:] = [item for item in block.instrs if item is not instruction]
+            else:
+                instruction.op = "Cast"
+                instruction.args = [capture]
+                instruction.arg_roles = []
+                instruction.attributes = {
+                    "target_dtype": str(
+                        instruction.res.dtype or capture.dtype or "float64"
+                    ),
+                    "resolved_record_field_projection": True,
+                    "record_receiver_id": receiver_id,
+                    "record_field": attribute,
+                    "resident_value_id": resident_id,
+                    "tie_policy": "incumbent",
+                }
             receipts.append((
                 int(instruction.res.id), attribute, receiver_id, resident_id,
             ))
@@ -6943,17 +6974,28 @@ def _spill_book_after_build(module: Any) -> None:
     try:
         from .work_contract import active_contract
 
-        if not active_contract().spill_cold_pages:
+        contract = active_contract()
+        if not (contract.spill_cold_pages or contract.compress_cold_pages):
             return
         book = (getattr(module, "metadata", None) or {}).get("identity_book")
         if book is None:
             return
         from .page_lifecycle import spill_cold_pages
 
-        spill_cold_pages(
-            book, "build", trigger="policy",
-            boundary="build: native executable built",
-        )
+        if contract.compress_cold_pages:
+            from .page_lifecycle import cold_pages
+            from .identity_spill import PARTITIONED
+
+            book.compress_pages(
+                (*cold_pages(tuple(dict.keys(book.pages)), "build"), *PARTITIONED),
+                budget_bytes=contract.memory_budget_bytes,
+                boundary="build: native executable built",
+            )
+        else:
+            spill_cold_pages(
+                book, "build", trigger="policy",
+                boundary="build: native executable built",
+            )
     except Exception as error:  # a memory courtesy must not lose a build
         import warnings
 
@@ -21946,6 +21988,13 @@ def _class_surface_ssa_program(
     numeric_record_abi_page = current_identity_book().page(
         "source_numeric_record_abi_concordance"
     )
+    public_record_return_symbols = {
+        function_symbols[int(reference)]
+        for reference in getattr(compilation.deployment, "activation_root_references", ())
+        if int(reference) in function_symbols
+    }
+    if getattr(compilation.deployment, "prepare_complete_catalogue", False):
+        public_record_return_symbols.update(export_symbols)
     # A function's local reads, writes, and structural-layout requirements
     # are roles of the same exact field.  They are forwarded transitively
     # below via ``record_forwarding_edges``.  In particular, a write several
@@ -21991,6 +22040,27 @@ def _class_surface_ssa_program(
                 str, dict(record.get("fields") or {})
             ))
             record_identity = str(record.get("identity") or "")
+            # Returning the parameter at a public entry is itself a read of its declared scalar
+            # payload. A field need not have a GetAttr in the body to reach an
+            # observer (including a field mentioned only in a dead branch).
+            # Use the source output identity, not writes from other sites, so
+            # an untouched field retains its incoming value. Parameters merely
+            # forwarded to a field-selecting callee remain demand-minimized.
+            source_function = all_functions.get(str(source_symbol))
+            returned_parameter_ids = parameter_ids.intersection(map(
+                int, ({} if source_function is None else source_function.metadata).get(
+                    "source_output_value_ids", (),
+                ),
+            )) if str(source_symbol) in public_record_return_symbols else set()
+            if returned_parameter_ids:
+                for field_name, field in dict(record.get("fields") or {}).items():
+                    if str(field.get("storage") or "") != "scalar":
+                        continue
+                    note_record_field_access(
+                        key, record, str(field_name), "read",
+                        (("source-record-return", str(source_symbol),
+                          tuple(sorted(returned_parameter_ids))),),
+                    )
             if any(
                 record_identity == row_identity
                 or record_identity.rsplit(".", 1)[-1] == row_identity
@@ -25229,6 +25299,35 @@ def _class_surface_ssa_program(
                     # descriptor entirely leaves method receivers without the
                     # presence member and leases a private false Boolean.
                     incumbent = table.records.get(int(parameter_id))
+                    if incumbent is not None:
+                        # Material.accept's descriptor still named read3,
+                        # although this producer proved read3 -> written span1.
+                        # Keeping that stale field leased private scratch at the
+                        # call and lost the mutation. Preserve scalar versions,
+                        # but settle physical span members through the exact
+                        # storage relation we just published, with its causes.
+                        resident_fields = tuple(
+                            replace(field, value_ids=tuple(
+                                resolve_record_storage(int(value_id))
+                                for value_id in field.value_ids
+                            )) if field.storage is SSARecordFieldStorage.SPAN
+                            else field
+                            for field in incumbent.fields
+                        )
+                        if resident_fields != incumbent.fields:
+                            sources = _frame_cells(
+                                _frame_table_cell(table, int(parameter_id), RECORD_DESCRIPTOR),
+                                *(current_identity_book().latest_ref(
+                                    RECORD_STORAGE_ALIAS,
+                                    (record_storage_alias_scope, int(value_id)),
+                                ) for field in incumbent.fields for value_id in field.value_ids
+                                  if resolve_record_storage(int(value_id)) != int(value_id)),
+                            )
+                            incumbent = replace(incumbent, fields=resident_fields)
+                            table.records.assign(
+                                int(parameter_id), incumbent, sources=sources,
+                                stage=RECORD_ABI_MATERIALIZATION,
+                            )
                     incumbent_names = {
                         field.name for field in (
                             () if incumbent is None else incumbent.fields
@@ -25301,6 +25400,7 @@ def _class_surface_ssa_program(
         constants = []
         table = all_record_tables.setdefault(symbol, SSARecordTable(owner=symbol))
         layouts = []
+        storage_aliases = _concordant_function_aliases(function)
         source_nodes_by_value_id = {
             int(data.get("value_id", node_id)): data
             for node_id, data in graph.nodes(data=True)
@@ -25375,6 +25475,7 @@ def _class_surface_ssa_program(
             ]
             fields = []
             physical_layout = []
+            literal_source_cells = []
             # A composite numeral is registered only whole: every declared
             # field materialized, or the constructor frame path owns it.
             numeral_literal_page = current_identity_book().page(
@@ -25461,6 +25562,34 @@ def _class_surface_ssa_program(
                         # allocation, or transient aggregate id in repository
                         # SSA.
                         physical_value_ids = leaves
+                if str(field.get("storage")) == "span":
+                    # advance writes state.pub_contract[0], then returns
+                    # Metrics(pub_contract=state.pub_contract). The read is
+                    # graph16, whose recorded storage alias is arena1. graph16
+                    # has no separate SSA result: checking only values[16]
+                    # silently omitted the returned field and callers later
+                    # minted uninitialized private input storage for it.
+                    # A span retains its arena across writes. Read the existing
+                    # concordance, keeping scalar versions out of this rule.
+                    resolved_members = tuple(
+                        int(storage_aliases.get(int(member), int(member)))
+                        for member in physical_value_ids
+                    )
+                    if resolved_members != physical_value_ids:
+                        from .concordance_declarations import CONTROL_VALUE_ALIAS
+                        from .ssa_record_return_state import function_scope_of
+                        literal_source_cells.extend(
+                            cell
+                            for member in physical_value_ids
+                            for cell in (
+                                _frame_graph_cell(graph, int(member)),
+                                book.latest_ref(CONTROL_VALUE_ALIAS, (
+                                    function_scope_of(function), int(member),
+                                )),
+                            )
+                            if cell is not None
+                        )
+                        physical_value_ids = resolved_members
                 for physical_value_id in physical_value_ids:
                     if int(physical_value_id) in values:
                         continue
@@ -25873,6 +26002,7 @@ def _class_surface_ssa_program(
             if fields:
                 field_cells = identity_cells(
                     function,
+                    *literal_source_cells,
                     *(value_id for field in fields for value_id in field.value_ids),
                     *(
                         record_descriptor_cell(table, field.record_id)
@@ -26584,7 +26714,7 @@ def _class_surface_ssa_program(
         if not aliases_by_result:
             return
 
-        cfg = nx.DiGraph()
+        cfg = live_digraph()
         cfg.add_nodes_from(function.blocks)
         for block_name, block in function.blocks.items():
             cfg.add_edges_from(
@@ -31148,7 +31278,11 @@ def _class_surface_ssa_program(
                 )
                 projection_is_unaccounted_formal = any(
                     int(argument.id) == projection_id
-                    and not (argument.accounting or {})
+                    # Shape/dtype refinement does not provide storage. A
+                    # provisional GetAttr arena can acquire those facts before
+                    # its exact returned-record descriptor is materialized.
+                    # Only a real parameter owner exempts it from rebinding.
+                    and not (argument.accounting or {}).get("program_abi_parameter")
                     for argument in function.args
                 ) and not any(
                     instruction.res is not None
@@ -41300,7 +41434,7 @@ def _class_surface_ssa_program(
             "entry" if "entry" in function.blocks
             else next(iter(function.blocks))
         )
-        cfg = nx.DiGraph()
+        cfg = live_digraph()
         cfg.add_nodes_from(function.blocks)
         for block_name, block in function.blocks.items():
             cfg.add_edges_from(
@@ -42465,7 +42599,6 @@ def _lower_ast_source_to_ssa_impl(
         )
 
     import contextlib
-    import io
     from types import SimpleNamespace
 
     from ..common.tensors.accelerator_backends.aot_compile import (
@@ -43395,11 +43528,11 @@ def _lower_ast_source_to_ssa_impl(
     # A runtime-only election intentionally drops the repository SSA and
     # authored definition. The normal piece link needs both; silently skipping
     # it would make source pursuit ingest LLVMPiece's execution implementation.
-    for name, value in python_bindings.items():
+    for binding_name, value in python_bindings.items():
         piece = llvm_piece_of(value)
         if piece is not None and not getattr(piece, "retain_compilation", True):
             raise ValueError(
-                f"LLVM piece {name!r} is runtime-only (retain_compilation=False); "
+                f"LLVM piece {binding_name!r} is runtime-only (retain_compilation=False); "
                 "source linking requires a piece with retained compiler metadata")
     linked_pieces = {
         str(name): piece
@@ -43802,7 +43935,11 @@ def _lower_ast_source_to_ssa_impl(
             f"ssa-source: intercepted {len(layout_type_classes)} laid-out "
             f"type(s) into struct/union rows"
         )
-    with contextlib.redirect_stdout(io.StringIO()):
+    # These legacy stdout diagnostics are discarded, never read. StringIO
+    # retained every printed line until the entire source closure finished,
+    # needlessly competing with live graph tiles for the RAM allowance.
+    # The explicit report callback above still carries normal live telemetry.
+    with open(os.devnull, "w", encoding="utf-8") as _discarded_stdout, contextlib.redirect_stdout(_discarded_stdout):
         graph.build_from_ast(
             tree,
             resolve_unresolved_parents=True,
@@ -45317,6 +45454,17 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
                 )
             )
         ok = True
+        if _regulator.live_arena is not None:
+            from dataclasses import asdict
+            _live_arena = _regulator.live_arena
+            module.metadata["live_tiles"] = {
+                "schema": "turing.live-compiler-tiles.v1",
+                "stats": asdict(_live_arena.stats()),
+                "categories": tuple(sorted(_live_arena.categories)),
+                "hot_limit": _live_arena.hot_limit,
+                "tile_rows": _live_arena.tile_rows,
+                "bucket_rows": _live_arena.bucket_rows,
+            }
         if _regulator.graph_pool is not None:
             module.metadata["graph_work"] = _regulator.graph_pool.summary()
             if _progress is not None:
@@ -45340,6 +45488,9 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
         )
         if module is not None and _regulator.graph_pool is not None:
             module.metadata["graph_work"] = _regulator.graph_pool.summary()
+        if module is not None and _regulator.live_arena is not None:
+            from dataclasses import asdict
+            module.metadata["live_tiles"]["stats"] = asdict(_regulator.live_arena.stats())
 
 
 lower_ast_source_to_ssa.__canonical_source_compiler__ = True

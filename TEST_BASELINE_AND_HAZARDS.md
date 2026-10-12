@@ -1,3 +1,467 @@
+2026-10-12 PAGED DIRECTORY / ACCESSOR FOLLOW-UP (CHECKPOINTED, INCOMPLETE):
+Concurrent "Review dual IR math groundwork" work completed; its edits were
+preserved. No full/all-law run was started. The user subsequently requested
+the command for their own all-law run, not an agent launch.
+
+* The SAME physical DiskTile headers now use DiskTileDirectory: fixed-width
+  disk entries and at most one64KiB metadata window. Live arena directory,
+  kind and row-length columns share that index. Cold CompressedTable and its
+  DiskPackedIndex also use it once offloaded; cold functional point updates
+  clone scalar directory entries on disk, not list(N headers) in RAM.
+* Ordered-map deletions tombstone their existing entry ordinal and compact
+  amortized. Sequence slice edits rebuild once into paged storage; sorting
+  uses bounded stable runs and pairwise merges. Mutable set update operators
+  no longer make tuple(self). Explicit exports/copies can still materialize.
+* Original Python data descriptors remain canonical field writers/readers;
+  setter-only NetworkX descriptors must still read the paged instance field.
+  Rebinding graph maps invalidates the weak-header cached views at that writer.
+* Immutable concordance value facts retain their original classes and exact
+  registry leaves. Large owned fields can use the SAME paged containers; byte
+  accounting now follows owned fact fields instead of charging only56 bytes.
+  Existing decoded-size accounting caches one scalar per decoded row and drops
+  it on eviction, avoiding a second traversal of the old row on every write.
+  This is bounded physical cache metadata, not another semantic/provenance book.
+* Unread legacy graph-build stdout now goes to NUL rather than accumulating
+  a whole StringIO. The existing compiler fingerprint covers live storage,
+  regulation, native boundaries and the completed symbolic/linking files.
+* Storage/live/regulation gate67 passed12.12s,3 deselected. Separate cold
+  storage gate including paged cold directory update22 passed1.30s. Byte
+  measurement/fact repro2 passed0.24s. Initially red descriptor/cache-view
+  and owned-fact accounting repros now pass at the exact accessors.
+* Public16-add source + LLVM O3/Python oracle, audit0,4MiB decoded cache,
+  forced disk, unchanged compiler fingerprint:3 passed236.16s (before the
+  final cache-local measurement change). Serialized live payload4,037,609B,
+  disk624,030B, resident directory66,041B. The forced threshold1B is NOT RSS
+  acceptance and payload was slightly smaller than the declared cache.
+* Current source-control LLVM/C/Fortran oracle gate + forced-disk Jacobian
+  + writable book +800-node graph footprint:16 passed347.06s. Tiny two-tile
+  graph stress alone239.738s: selected raw storage1,419,460B; RAM compressed
+  tiles plus counted headers215,099B; disk headers86,033B plus128,292B file.
+  This selected component reduction is NOT a whole-process RSS bound or speedup.
+* Same one-expression profiled forced-disk source:22.836s ->18.420s; function
+  calls91.01M ->67.14M; byte-accounting cumulative12.880s ->8.755s. Both
+  source fingerprints remained unchanged during each run. No orbital timing
+  or controlled multicore speed inference; profiled timings include overhead.
+
+Still OPEN: exact live opaque AST/foreign objects, whole copy-memo/native
+boundary/export/sort construction buffers and allocator floor; headroom-aware
+end-to-end RSS acceptance through all source stages. The dependency_levels
+source kernel remains red as recorded below. Do not assert that10737418240B
+is a hard process cap: it is the current disk-escalation threshold.
+
+2026-10-12 LIVE STORAGE OWNERSHIP UPDATE (CHECKPOINTED, INCOMPLETE):
+This opening update supersedes the older retention/foundation claims below.
+The user's stop on all35 remains in force. No large run was restarted.
+
+* Live managed headers are weakly cached. Cold containers and original
+  compiler objects have physical layout descriptors in the SAME compressed
+  tile store, not a second IdentityBook. The descriptors hold type/layout and
+  storage addresses; existing graph value IDs, book clocks, registry objects
+  and provenance remain authoritative. These descriptors DO add physical
+  metadata overhead; do not describe them as free or a second semantic ledger.
+* NetworkX cached views no longer enter the strong opaque-leaf registry. Original
+  Meta/OpStep/FusedProgram and the control builder use the same optional store.
+  Builder exit contexts must be rebound to their published managed container;
+  mutable sets need the explicit TiledSet protocol, not an empty builtin set
+  subclass (set(view) silently read its empty C backing store).
+* collect_unused traces actual physical references using disk-backed mark bits
+  and a bounded disk-backed traversal frontier, then sweeps unreachable rows
+  and opaque leaves. It now runs at existing dead-working-set stage_end points
+  and owned outermost compile cleanup. It does not add book pages/identities.
+  Shared live views, cycles and handles remain valid across reclamation.
+* Decoded cache admission now checks both tile count and conservative owned-row
+  bytes. WorkContract defaults: 4096 tiles and 128MiB decoded bytes; override
+  TURING_LIVE_DECODED_BUDGET_BYTES. A single decode workspace/opaque allocation
+  is not a hard process cap. Physical tile-directory entries, opaque live
+  objects, scratch/export/native marshalling buffers remain open memory floors.
+* Current memory_regulation + live_tiles gate:42 passed304.58s. Includes
+  forced-disk PUBLIC SOURCE compilation, LLVM O3 execution against authored
+  Python for three inputs, zero concordance findings, and dead-stage/compile
+  cleanup tests that assert no extra IdentityBook pages. Cleanup-only gate:
+  17 passed1.41s. The intentionally two-tile test configuration still thrashes;
+  this is NOT an all-law timing or hard-RSS acceptance receipt.
+* The topology indegree formal2/75 failure was resolved in the exact source-read
+  resolver: resolve the authored loop generation before consulting its durable
+  planning alias, never the temporary cyclic body spelling. Topology foundation
+  plus LLVM accumulator/held-seed source gate:3 passed7.80s (tiling off).
+* RED: dependency_levels foundation cannot compile: conditional arms63/21 and
+  34/11 name inner-loop body generations unavailable on their loop exits. The
+  same graph-work native-workers test FAILS on untouched C:/dev/tg-parity-base
+  (12.92s), so this is not attributed to the live-storage cleanup. Observed
+  source builder bindings:63 Load in while_body.3,34 Load in while_body.2;
+  consumers are while_exit.3 and while_exit.2, which those producers do not
+  dominate. Find the canonical loop/conditional exit-port writer; do not bypass
+  dominance or insert late IR repairs. Prior current gate:52 passed1 failed33.42s.
+* Stale hot-book gate PID37008/session21466 (old code, many hours CPU) was stopped
+  after its exact command was checked; its interrupted exit is not a test result.
+
+Acceptance still requires bounded physical indexing/opaque and pass buffers,
+real payload larger than declared headroom through every public source stage,
+current C/LLVM/Fortran oracle parity, and the dependency-level kernel repair.
+Do not declare fully out-of-core compilation or restart all35 from these micros.
+
+2026-10-11 LIVE WRITABLE TILE CHECKPOINT (CHECKPOINTED, INCOMPLETE):
+The all35 LLVM probe PID27420 was stopped at the user's explicit request after
+verifying its exact command. Its exec session90567 ended exit1 from that stop;
+there is NO completed all35 receipt. Do not restart the large run before the
+remaining out-of-core work is ready. Only small regression tests are authorized.
+
+* live_tiles.py extends the SAME CompressedTile/DiskTileStore to writable
+  NetworkX dict factories, original ProcessGraph/control/deployment/SSA object
+  fields, and the IdentityBook's hot tables. Shared views survive eviction,
+  mutable edge aliases preserve identity, and book clocks/registry references
+  remain authoritative. --ram-tiles enables this path; the existing explicit
+  budget triggers its disk escalation during storage accesses as well as stages.
+* A compile-wide decoded LRU bounds tile COUNT. Disk mode writes active dirty
+  tiles with zlib9; cold offload/compaction choose bounded-workspace LZMA2/zlib9.
+  Streaming compaction reclaims superseded file frames and retains the original
+  index on failure. This is temporary storage, not a durable restart facility.
+* Forced eviction exposed real source-writer bugs: MutableMapping.setdefault
+  returned an obsolete raw default; a region's final Ret was appended to its
+  raw construction list instead of its published BasicBlock; identity-only
+  copy memos allowed recycled Python addresses to alias decoded source records;
+  inherited list.__reversed__ read empty subclass backing storage and lost
+  book as-of reads. Fixes are at canonical writers/accessors, not IR repairs.
+  Sequence ordering and full-hash collision overflow now have bounded regression
+  tests. Failed initial regulation setup restores both active contexts.
+* Latest storage/live/regulation gate:54 passed19.07s. Includes the setup-cleanup
+  test (earlier standalone regulation gate16 passed1.13s). Fresh public source
+  root(x)=x*x+1 compiled under forced disk, tile_rows8/hot_limit2, produced a
+  complete LLVM artifact and concordance audit0; it now also builds O3 and
+  executes three inputs against the SAME authored Python source oracle.
+* Same cProfile fixture before/after the codec primitive fast path:56.48s ->
+  21.18s pytest wall;139.35M ->35.54M calls. persistent_id17.79M visits cost
+  16.83s self/37.06s cumulative before,17.35M cost3.26s self/4.33s cumulative
+  after. Large numbers of ABC isinstance checks were avoidable. No all-law
+  speedup or whole-process bound is inferred from this measurement.
+* The800-node real-NetworkX metadata fixture earlier measured raw selected
+  reachable storage1,419,460 bytes; tiled RAM plus counted headers1,214,878;
+  disk headers1,118,156 plus85,976 disk bytes; hot_peak2,3.725s conversion.
+  This is about14.4% selected owned-storage reduction in RAM, NOT an RSS cap.
+  Opaque leaf payloads, allocator slack and some DiskTile scalar/header fields
+  are outside that accounting. The raw comparison graph was also retained.
+
+RED / OPEN -- DO NOT DECLARE FULL OUT-OF-CORE COMPILATION:
+* Strong identity-header and opaque-leaf registries still retain every managed
+  object until the arena dies. Logical dead rows are not reclaimed. Compaction
+  removes superseded disk frames, not unreachable compiler subgraphs.
+* Tile-row/cache-count bounds are not byte bounds. Giant leaves, ASTs, builder
+  locals, sorting/export buffers, and native-boundary materialization can remain
+  whole resident allocations. Ordered map deletion and sequence shifts can be
+  quadratic. Backend emission/build has not been proved bounded.
+* Source-native topology foundation currently FAILS even with tiling disabled:
+  function_parameter for compiler_graph_topology__topological_order@control:0,
+  indegree recorded2/proposed75.75 is provisionally minted through _region_feed
+  ->_read->external_value despite a planning alias75->2. The writer
+  _bind_loop_result_ports_inside_body posts LOOP_BODY_SPELLING2->75 under loop118;
+  initial2 still has Meta(shape=(),dtype=int64) and no accounting at that point.
+  Why the explicit span contract did not reach that writer remains unresolved;
+  do not hide the disagreement in finish metadata.
+  The untouched C:/dev/tg-parity-base and pre-live copied child pass this test.
+  Disabling inactive TiledObject hooks did not remove the canonical failure.
+  Thus attribution to the live implementation is NOT yet established. A stale
+  native copier cache no longer loading is only an unproven hypothesis.
+* The earlier forced source-control gate was11 passed1 failed304.19s, failing
+  only PyYAML export of tile-backed metadata; explicit ABI export was fixed.
+  A hot-book source-control plus math gate PID37008/session21466 remains active
+  as of this checkpoint; it loaded older code and is not a final current gate.
+  A separate hot-book loop+math gate passed12/12 in498.16s before the codec fix.
+  No claims of complete C/LLVM/Fortran parity or all-law success follow.
+
+Acceptance before any full run: resolve the red source foundation; establish
+live-unit ownership/reclamation from existing graph/lifecycle contracts; bound
+pass working buffers and decode bytes; test real payloads larger than declared
+headroom through the public source compiler and Python numerical oracle; audit
+the existing sourced storage receipts. Keep the user's large-run stop in force.
+
+2026-10-11 STRONGER DISK TILE TIER RECEIPT (CHECKPOINTED):
+User: "nono, we need to be able to dump tiles to heavier compression on disk"
+This supersedes the earlier RAM-only/no-disk description for the tile mode.
+It does NOT turn on legacy whole-page disk spill beside compressed tables.
+
+* CompressedTable.offload_to_disk moves independently encoded data tiles AND
+  packed hash/ordinal index chunks into one shared temporary tile file. LZMA2
+  preset6 with <=1MiB dictionary (bounded encoder workspace); zlib9/raw is
+  retained when smaller. Same lookup/iteration/select/map/reduce/point-update
+  interfaces, no whole-page decode. Index reads retain only one8KiB chunk each.
+* File writes commit before releasing the RAM tile. A simulated partial disk
+  failure preserves every value in the mixed RAM/disk table. CRC/length checks
+  detect damaged records. Shared views retain the file until their last owner
+  releases it; whole-book serialization explicitly promotes a mutable copy and
+  does not serialize a live file handle. These are temporary caches, not durable
+  restart checkpoints. Incompressible data and metadata have irreducible size.
+* WorkContract.compressed_tile_disk=True enables escalation for --ram-tiles
+  WHEN memory_budget_bytes is set and exceeded. --budget-bytes supplies that
+  threshold; no threshold is inferred by the compiler if it is absent. Old
+  pure-RAM manual regulators can leave tile_disk_policy=False. The probe now
+  prints resolved RAM/disk flags and budget in RULE_SUBMISSION.
+* Pressure checkpoints are inside function-catalogue instantiation and callsite
+  specialization, throttled to one RSS query/.5s and independent of UI. The
+  predeclared disk/budget policy refs license a sourced runtime offload receipt
+  retained on the SAME book; posting new private edges during pressure would
+  thaw their whole page and undo the release. Concordance audit checks these
+  exact source cells; missing/disagreeing causes produce tile-storage-policy.
+* 20,000-fact real-book fixture:2,993,542 RAM tile/index bytes ->157,464 resident
+  bytes,1,703,012 disk bytes,1112 data tiles;94.74% further retained-storage
+  reduction. Offload2.587400s. RSS60,628,992 ->56,233,984 bytes (4.19MiB decrease).
+  Lookup/registry identity exact, no whole-page reload. One-byte forced budget
+  deliberately reports target_met=False: not a plausible process-RSS target.
+* Final storage/regulation/telemetry/callsite/math/concordance gate119 passed,
+  28.20s. Includes a fresh public source Jacobian compile with forced disk tier,
+  structural audit0, and LLVM O3 execution versus authored analytic Python.
+  Earlier all10 math tests under forced one-byte disk pressure passed9.09s.
+  Existing cffi imp deprecation warning only. No all-law compile launched or
+  existing process killed, restarted or dynamically reconfigured.
+
+OPEN: this tier covers compressed identity tables, NOT arbitrary live
+ProcessGraphs, instantiated shell state or final SSA bodies. Writers/full-book
+exports can still promote a whole page. RSS allocator slack/other processes
+can defeat the declared target even after all eligible tiles are on disk.
+Do not call this a hard process/system memory cap or full-main out-of-core
+compilation. The supplied35-rule log stopped during deployment instantiation
+at770/1253,20.74GB RSS; it contains no completed main-build/parity receipt.
+
+2026-10-11 COMPRESSED-IN-RAM / DUAL-IR MATH RECEIPT (CHECKPOINTED):
+Canonical C:/dev/Powershell/turing; earlier repairs below remain in place.
+User correction: "did you not understand then why I said we'd make an object,
+we would make the accessors and operators to work compressed IN RAM"
+
+OBSERVED:
+* compressed_tiles.CompressedTable keeps keys and values in independent resident
+  compressed tiles with two uint64 hash/ordinal index arrays. Lookup verifies
+  actual equality, including collisions; identity-sensitive/duplicate keys refuse.
+  Missing hashes decode no tiles. items/select/map/reduce stream; with_value
+  encodes only one tile and shares untouched tiles. No disk or whole-map decode.
+* IdentityBook.compress_pages installs those mappings behind existing accessors.
+  cell/latest/history/stamp/edge/mint reads remain tiled and registered Page,
+  Stage/Transform/Reason references resolve against the SAME registry. Canonical
+  writes and whole-book copies explicitly promote a mutable page; no invisible
+  read promotion. Held dictionaries/unserialisable facts refuse, not disappear.
+  Private provenance tables can compress at compile-end after admission receipts.
+  This is cold-book storage, NOT live ProcessGraph/SSA tiling or parallel lowering.
+* WorkContract.compress_cold_pages and TURING_COMPRESS_COLD_PAGES select RAM
+  storage; disk spill remains separate and mutually exclusive. The existing
+  budget supplies headroom, with measured recompression and an explicit unmet
+  result. No arbitrary guaranteed ratio or process-RSS cap. --ram-tiles added to
+  profile_memory_n2.py; its report now distinguishes uncompressed cells from
+  resident compressed buffers/indexes. No long orbital compile launched here.
+* Hand-posted REAL book fixture: 20,000 facts/40,000 cells before receipts.
+  Estimated reachable selected Python table footprint:21,833,969 bytes before;
+  compressed buffers/indexes/headers:2,994,252 bytes after (7.292x,86.29% saved).
+  Registry/codec shared objects and allocator slack excluded from retained
+  buffer accounting. Compression .290646s; lookup .000153s/ONE decoded cells
+  tile. No refused pages. 14 additional cells are compression-policy receipts.
+  RSS59,600,896 ->62,685,184 bytes: rose3,084,288 bytes. Smaller table storage
+  does NOT demonstrate smaller whole-process or full-compile peak RSS.
+* Windows RSS sampler previously declared a new ctypes Structure/POINTER for
+  EVERY sample; 1000 reads retained1000 classes and grew pointer cache1017,
+  also reproduced on untouched HEAD8eb40eae. Binding is now created once under
+  a lock; regression proves pointer cache grows0 across1000 warmed reads.
+  The ~67k ctypes type counts in the supplied log match this leak's shape,
+  but attributing their entire byte total to it remains an inference.
+* Storage/spill/regulation/telemetry gate:82 passed,6.61s. Math/DEC gate:
+  37 passed,4.32s earlier; RAM-enabled full math gate10 passed,3.75s, including
+  fresh source-to-LLVM O3 execution against authored analytic Python/DEC oracles
+  and structural concordance0. One existing cffi imp deprecation warning.
+
+DUAL-IR MATH / DEC SCOPE:
+dual_ir_math.py retains actual ProcessGraph + ControlProgram + explicit region
+ownership, original source shell/map/hierarchy and concordance book by reference.
+Pure scalar-component symbolic ops include composition, exact seed coefficient
+extraction, Jacobian/Hessian/divergence/curl/Laplacian/biharmonic and heat/wave/
+Poisson/Helmholtz residual graphs. These are not PDE solvers or Riemannian
+covariant operators. General control/effects, opaque calls and unspecified
+tensor components refuse. Existing controlled reverse is delegated to, not
+reimplemented. Existing DECSystem.laplace0_diagram composes oriented local edge
+and joint functions; source glue retains those call boundaries, uses existing
+star0/star1 and matches existing eager DEC. No dense DEC matrix stand-in.
+
+SUPPLIED 16-RULE LOG: build success, NOT target numerical acceptance.
+2570 functions; elapsed2827.058s; sampled peak19672MiB/19.21GiB;
+3,062,484 cells all RAM and0 spill pages at sampled peak. DLL exists in copied
+native-fallback-link child; LLVM SHA256 matches supplied log:
+94570d8cf04e341aed4a5642e7f42a4d461781d2ffc55db4273dfa222c1f042c.
+No target execution in the probe; revision not established by log. New math and
+RAM storage did NOT cause that historical run's build success.
+
+ACTION / AUDIT PLAN, WITH ACCEPTANCE CONDITIONS:
+1. Land and verify resident compressed lookup/operators/registry identity:
+   DONE on small fixtures and fresh source/native math execution. Measure cold
+   table retained bytes separately from conversion peak RSS and latency.
+2. Audit live graph/planning/SSA retained owners at real boundaries. Reuse exact
+   graph identities and existing region tiles; do not duplicate graph authority.
+   Extend compressed column access to those owners only with a proved read/write
+   contract. Required: actual peak-RSS reduction on unchanged source workload,
+   no disk dependency and no hidden whole-graph rehydration. NOT DONE.
+3. Bound writable hot tiles and whole-copy/export admissions. Current book
+   writes/copies promote a whole page; giant individual facts are indivisible.
+   Compression targets can fail when live graphs/indexes/held objects exhaust
+   the budget. Never label this a hard RAM bound. NOT DONE.
+4. Extend math audit beyond current pure scalar-component lane: controlled
+   reverse wrapper, general registry VJP Call/Indexed bodies, exact tensor port
+   extents, source control/map cause edges and every missing source identity.
+   Gate each with symbolic identity + fresh public source lowering + independent
+   authored Python oracle. C/Fortran math execution not yet covered.
+5. Finish encapsulated DEC suites using existing DEC code: local law overrides,
+   orientation/cochain degree/Hodge contracts, bounded batched composition, then
+   higher-degree operators. Current laplace0 is a small unrolled proof, not a
+   general large diagram scheduler.
+6. User launches unchanged N4 acceptance when desired, now optionally
+   python -u tools/compiler_probes/profile_memory_n2.py 4 --backend llvm --ram-tiles --save-ssa
+   No timeout. Build success alone is not parity; compare source trajectory to
+   authored Python/SymPy truth before8/all. Main parallelism remains unfinished.
+
+2026-10-11 PI / PRIVATE RECORD / SOURCE PARITY REPAIR RECEIPT (CHECKPOINTED):
+User requested: "God fucking damn it fix the pi and the uninitialized private record and FUCKING DONT STOP UNTIL YOU ARE FINISHED REMOVING ALL BUGS"
+Canonical source: C:/dev/Powershell/turing. Changes below are in the compiler
+source, exercised through lower_ast_source_to_ssa, not saved/emitted IR edits.
+Older receipts below are preserved as history and superseded where stated.
+
+OBSERVED FIRST WRITERS AND REPAIRS:
+* _schedule_loop_callsites chained hierarchical ranks across a nested
+  Conditional terminal return. It placed accept-tail PI before the no-save
+  guard and then executed no-save PI too. Terminal-edge detection now includes
+  nested Sequence/Conditional edges, not unrelated callee/nested-loop returns.
+  Fresh 235-function real dt-step source compiled to LLVM O3 matches authored
+  Python for rollback False/True, dt .01/.025, two repeated executions each.
+  At the .01 case, next dt is .013027846332858448 and controller accumulator
+  .029389333245105932; the wrong values were .013416407864998741 and
+  .058778666490211864. Return, accumulator, state.x and pub_contract agree.
+* materialize_program_abi_record_literals looked up raw SPAN member16 although
+  the exact record-storage alias resolved it to resident1. It omitted the
+  pub_contract member, leaving a private root input without a producer.
+  Constructor members now consult the existing storage/concordance identity.
+  Parameter SPAN descriptors also use exact formal storage, not a competing
+  alias. Provisional returned-record projections now bind physical ownership,
+  not merely shape/dtype accounting; unused conceptual containers are omitted.
+  Fresh written-span source returns15,16,17 on repeated calls in C/LLVM/Fortran,
+  matching authored Python, with no private root input and structural audit0.
+* The scalar loop builder seeded an already-reserved body result a second time
+  in the preheader and confused a reservation with a produced definition.
+  The header Phi owns entry; reservation and produced-update sets are distinct.
+  All six previously recorded loop-carried failures are now passing.
+* _post_passthrough_rebinding rewrote exact operands/initial values but left
+  dependent shared-planning aliases pointing at pruned output ids6656..6664.
+  It now advances those aliases with the existing passthrough proof and book
+  cells in the same transaction. Real-step structural findings9 ->0.
+* _loop_carried_storage_aliases equated scalar LoopResult versions merely
+  because they were connected. Storage identity now requires a dependency
+  cone anchored in an actual IndexedStore; reverse adjacency/BFS is O(V+E).
+  Scalar versions and unanchored cycles are not storage-equivalent.
+* LLVM's reference-identity cone ignored the existing
+  ssa_storage_identity_backedge proof on an unranked arena Phi. It allocated
+  a one-double snapshot, then Jacobi row stores wrote beyond it. The proof
+  now seeds the existing reference cone, including exit Phis. Ordinary scalar
+  Phis retain snapshot semantics. Untouched HEAD8eb40eae reproduces the crash;
+  all seven compiled-linalg tests, including native Jacobi eigh, now pass.
+* Public entry returning a record now demands its declared scalar output
+  fields through the existing activation-root and record ABI contracts,
+  even if unread or only written in a dead branch. Internal helpers stay lazy.
+  The old static_branch strict xfail is now a passing parity test, with an
+  additional wholly-unmentioned field case. No generic whole-record projection.
+* A first conditional field write's initial GetAttr reused its already-owned
+  root ABI scalar slot. Region capture required an alias to another id and
+  missed that exact ownership. It now accepts only exact formal, field,
+  receiver and descriptor proof and consumes that projection without self-Cast.
+  Four source/native field-reader variants and six regional proof tests pass.
+* id_scale counted intentional bit61 MINTED ids as raw memory addresses.
+  It now checks serial_of and rejects undeclared bits; flagged address-sized
+  serials remain rejected. Three optional-record false failures are cleared.
+* Python-shell trace test hardcoded id7 rather than the actual carried header
+  Phi. It now follows the parameter binding and asserts the unchanged exact
+  history2,1.9,1.805,1.71475. No widened numerical tolerance.
+* Fortran uses its existing direct rank1 scalar indexed-store and reference
+  mutation contracts. Returned inout spans retain caller storage even when
+  their returned value is ignored. Source span parity covers all three backends.
+
+FINISHED VERIFICATION (overlapping suites, do not add counts together):
+* Final focused compiler/dt/concordance/native/Fortran gate:335 passed,
+  0 failed,0 xfailed,178.78s. Includes fresh real dt-step source LLVM execution
+  versus authored Python and a zero-structural-findings audit.
+* LLVM backend/Python shell/loop-carried/optional-record gate:80 passed,
+  3 existing skips,29.51s. The skips share the pre-existing disabled whole-XOR
+  capture fixture (unbounded child-process hazard); they are NOT acceptance.
+* Compiled linalg:7 passed,11.10s, including full native Jacobi.
+* Earlier Fortran-focused gate:75 passed,1.70s.
+* Graph-native reverse follow-up:4 passed,20 deselected,19.39s, covering
+  ProcessGraph and AbstractTensor reverse acquisition, shared-use accumulation,
+  and a real abstract_nn linear-loss adjoint compiled and executed natively.
+* Fresh controller520rows/27functions, energy490rows/22functions,
+  oscillator332rows/22functions: structural0 and unposted0 each.
+  Unsourced facts642/272/232 remain OPEN respectively. Real-step structural0
+  does not mean all minted identities/facts are fully posted/sourced.
+* All failures encountered in these gates were followed up; baseline comparison
+  used untouched C:/dev/tg-parity-base HEAD8eb40eae, never stash/reset.
+  No new skips/xfails, no test deletion and no numerical tolerance relaxation.
+
+CORRECTION / LIMITS:
+The prior energy-presence buffer claim was too broad: passed private bool9497
+through root19948, but callee formals9419/9420 have no operand uses in
+_propose/_apply. That is not evidence of an actual uninitialized numerical read.
+The untyped linalg fixture still has a pre-existing unused unaccounted formal
+audit finding; numeric execution passing does not close that ABI diagnostic.
+Full N4/8/all35 has NOT been rerun in this turn. Older saved N4 artifacts remain
+untouched. Do not claim whole-program trajectory parity or "all bugs gone".
+Source/SSA paging, ordinary-main parallelism and unsourced provenance debt remain
+unfinished. The latest edits are in the canonical-source checkpoint; ignored
+copied child worktrees are not automatically current.
+User-run acceptance command (no timeout):
+python -u tools/compiler_probes/profile_memory_n2.py 4 --backend llvm --save-ssa
+
+2026-10-11 NUMERICAL PARITY FOLLOW-UP / THREE SOURCE FIXES (CHECKPOINTED):
+User requested: "Okay well whatever you elected not to do because the issue is what it is please do now because you are tasked with helping me fix these"
+The previous fresh N4 build passes emission, NOT numerical acceptance.
+Independent authored Python/SymPy execution (native calls forbidden in the
+oracle) previously demonstrated extra controller updates, stale elapsed-time
+accumulation, and reads of private record storage without a producer. The
+118 independent law-output checks were within 2.173e-16 relative; isolated
+PI arithmetic matched Python. Do not mistake those local successes for N4.
+
+Repairs now in canonical source, not a saved module or emitted IR:
+1. control_source.overlay_scheduled_control materializes a regionless owner
+   with declared children. Previously a class surface Sequence owned an
+   effect-only conditional but was dropped, so both return calls executed.
+2. _ControlSSABuilder._region_feed retains exact consumer operand identities
+   while resolving planning aliases. total=tensor(0) is carried as graph3;
+   its canonical resident2 is the literal0. Reading2 lost the header/latch
+   generation and produced .01 twice instead of .01 then .02. Resolve3 by
+   the existing lexical-read and loop-entry concordance; distinct generations
+   cannot silently share one regional formal. Pre-loop held bindings remain
+   separate, even when they share the original seed.
+3. Fortran emits direct Store(value, scalar formal) as assignment through
+   its existing reference ABI. Mutation propagates on existing call edges;
+   scalar rank and input identity remain unchanged.
+
+Real public-source compilation + native execution versus authored Python:
+nine parameterized cases across C/LLVM/Fortran pass, including both distinct
+guard arms, .01/.037/.007 accumulation, and a pre-loop held seed.
+Final focused gate134 passed /1 existing strict xfail /0 failures,55.38s.
+The xfail remains static_branch declared-but-unread scalar record output;
+it is not new, not removed, and not silently treated as numerical success.
+Controller/energy concordance audits before and after:520/488 rows,
+0 structural findings,0 unposted ids;642/272 unsourced facts remain OPEN.
+
+Wider census: six loop-carried producer tests and one native rejection-effect
+test fail identically on untouched HEAD8eb40eae at C:/dev/tg-parity-base.
+Two uniform-bound assertions also failed there: updated to check the existing
+int64 range Cast consumes the original uniform (not identity relabeling).
+No other tests deleted, weakened, skipped, or given a new tolerance.
+
+STILL OPEN: actual N4 accept-tail PI call executes before its no-save guard
+and the no-save PI then executes too. The precise first writer of that
+placement is not yet trapped; do not assert that the newly fixed effect-only
+guard explains it. The actual N4 coerce_metrics/private-frame pub_contract,
+exchange-time and energy-presence slots have no root producer/initializer.
+Their exact return/formal identity must be resolved, not zero-filled.
+An existing real-step diagnostic (rollback=False literal, original source,
+no IR edits) stopped after121.24s before linking on repeated unresolved
+ssa_field_version for unresolved_report; it did not verify those defects.
+A separate tiny Pair constructor slice refuses a right-field member binding;
+it did not execute and is not evidence of the N4 private-buffer bug.
+No fresh N4/8/all35 run was launched in this repair turn. Preserve these
+negative receipts; source-and-SSA paging and ordinary-main parallelism remain
+unfinished. Prior saved N4 and diagnostic artifacts remain untouched.
+
 # Test baseline and hazards — read before running any test
 
 2026-10-11 FRESH N4 SOURCE COMPILE VERIFIED:

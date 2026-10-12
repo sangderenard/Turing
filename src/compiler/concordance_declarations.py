@@ -641,7 +641,7 @@ GRAPH_WORK_PUBLICATION = declare_page("graph_work_publication", (
 
 @dataclass(frozen=True)
 class PageSpill:
-    action: str                     # "spill" | "reload" | "refuse"
+    action: str                     # disk spill/reload/refuse or RAM compression
     page: str
     #: What moved: "page" (the page's own cells/stamps/indexes) and/or the
     #: name of a private edge page whose rows are OWNED by ``page``
@@ -660,6 +660,7 @@ class PageSpill:
     #: refusal.
     trigger: str
     boundary: str                   # the stage-boundary label ("" if none)
+    storage: str = "disk"           # "ram": no segment/file; tile-local reads
 
 
 #: ``identity_spill`` (cold-page spill): the book wrote a page that no later
@@ -2315,6 +2316,46 @@ FORWARD_LOSS_BACKWARD_FUSION = declare_stage("forward_loss_backward_fusion")
 ADJOINT_OF = declare_transform("adjoint_of", 1)
 
 FORWARD_GRAPH_UNSCOPED = declare_reason("forward_graph_unscoped")
+
+# Exact graph mathematics: one source/output receipt before symbolic ingestion.
+# The importer derives every resulting expression/node from these cells.
+GRAPH_MATH = declare_stage("graph_math")
+GRAPH_MATH_SOURCE = declare_transform("graph_math_source", 0)
+
+# An unresolved symbolic function application is an exact socket in an
+# already-ingested ProcessGraph.  Splicing copies each required body value
+# into that occurrence.  The new value is novel from two identities: the
+# application being replaced and the exact body value being copied.
+GRAPH_FUNCTION_SPLICE_STAGE = declare_stage("graph_function_splice")
+GRAPH_FUNCTION_SPLICE = declare_transform("graph_function_splice", 2)
+
+
+@dataclass(frozen=True)
+class GraphFunctionSocketFact:
+    function_identity: str
+    body_scope: Any
+    parameter_ids: tuple[int, ...]
+    argument_ids: tuple[int, ...]
+    body_output_id: int
+    replacement_id: int
+
+
+GRAPH_FUNCTION_SOCKET = declare_page("graph_function_socket", (
+    RowField("ingestion_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+), GraphFunctionSocketFact)            # NOVEL(call, body output); CONCORD
+
+
+@dataclass(frozen=True)
+class MathOutputFact:
+    operation: str
+    shape: tuple[int, ...]
+    component: int
+    expression: str
+
+
+GRAPH_MATH_OUTPUT = declare_page("graph_math_output", (
+    RowField("scope", K.SCOPE), RowField("component", K.INDEX),
+), MathOutputFact)                     # DERIVED(source nodes) | NOVEL(authored function)
 
 
 @dataclass(frozen=True)

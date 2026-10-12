@@ -429,3 +429,77 @@ def test_one_value_held_by_two_bindings_computes_the_authored_answer(label):
         expected = authored(*probe)
         produced = compiled(**dict(zip(names, probe)))
         assert produced == pytest.approx(expected, abs=1e-12), probe
+
+
+_NATIVE_CARRIED_PROGRAMS = {
+    **_SHARED_VALUE_PROGRAMS,
+    "call-round-trip": (_CALL_ROUND_TRIP, ((2.0, 3), (2.0, 1), (-1.5, 4), (2.0, 0))),
+    "two-numeric": (_TWO_CARRIED_NUMERIC, ((1.0, 0.0, 4), (3.0, -1.0, 6), (2.0, 1.0, 0))),
+}
+
+
+@pytest.mark.parametrize("label", sorted(_NATIVE_CARRIED_PROGRAMS))
+def test_loop_carried_sources_match_authored_python_in_native_llvm(label, tmp_path):
+    import inspect
+    import numpy as np
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.identity_concordance import concordance_report
+    from src.compiler.ssa_llvm_backend import (
+        emit_ssa_function_to_llvm, compile_artifact, prepare_artifact_execution,
+    )
+
+    source, probes = _NATIVE_CARRIED_PROGRAMS[label]
+    namespace = {}
+    exec(source, namespace)
+    authored = namespace["train"]
+    names = tuple(inspect.signature(authored).parameters)
+    integer_names = {"n", "count", "epochs"}
+    contract = ExtractionContract(CONTRACT).with_program_abi({
+        "records": {}, "bindings": [],
+        "values": [{
+            "function": "train", "parameter": name, "storage": "scalar", "rank": 0,
+            "dtype": "int64" if name in integer_names else "float64",
+            "python_type": "builtins.int" if name in integer_names else "builtins.float",
+        } for name in names],
+    }).with_execution_file("extraction_contracts/vehicle_full_native_execution.yaml")
+    module, outputs, exports = lower_ast_source_to_ssa(
+        source, "train", name="native_" + label.replace("-", "_"),
+        extraction_contract=contract, progress=lambda _: None,
+    )
+    root = module.functions[exports[0]]
+    report = concordance_report(module)
+    assert report.splitlines()[0].endswith("0 finding(s)"), report
+    artifact = emit_ssa_function_to_llvm(module, root.name)
+    assert artifact.complete, artifact.shortfalls
+    artifact = compile_artifact(artifact, directory=tmp_path, optimization="O3")
+    parameter_ids = dict(root.metadata["parameter_names"])
+    for inputs in probes:
+        feeds = {
+            parameter_ids[name]: np.asarray(value, dtype=np.int64 if name in integer_names else np.float64)
+            for name, value in zip(names, inputs)
+            if name in parameter_ids
+        }
+        execution = prepare_artifact_execution(artifact, feeds).run()
+        expected = authored(*inputs)
+        expected = expected if isinstance(expected, tuple) else (expected,)
+        actual = tuple(execution.buffers[value.id].reshape(-1)[0] for value in outputs[root.name])
+        assert actual == expected, (label, inputs, actual, expected)
+
+
+def test_loop_result_storage_aliases_require_an_indexed_store_in_their_cone():
+    import networkx as nx
+    from src.compiler.resident_sequence_materialization import _loop_carried_storage_aliases
+    graph = nx.DiGraph()
+    for identifier, op, parents in (
+        (0, "parameter", ()),
+        (1, "indexedstore", ((0, "base"),)),
+        (2, "loopresult", ((1, "value"),)),
+        (3, "loopexit", ((2, "value"),)),
+        (4, "loopresult", ((5, "value"),)),
+        (5, "loopresult", ((6, "value"),)),
+        (6, "add", ()),
+        (7, "loopresult", ((8, "value"),)),
+        (8, "loopresult", ((7, "value"),)),
+    ):
+        graph.add_node(identifier, op=op, value_id=identifier, parents=parents)
+    assert _loop_carried_storage_aliases(graph) == {1: 0, 2: 0, 3: 0}

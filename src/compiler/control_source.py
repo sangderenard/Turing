@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 from .deployment_frame import DeploymentFrame, DeploymentJoin
+from .live_tiles import TiledObject
 
 
 class ControlOverlayScopeError(ValueError):
@@ -45,19 +46,19 @@ class ControlTarget(str, Enum):
 
 
 @dataclass(frozen=True)
-class StatementBlock:
+class StatementBlock(TiledObject):
     """Already-lowered statements in planner-approved execution order."""
 
     lines: tuple[str, ...]
 
 
 @dataclass(frozen=True)
-class SequenceBlock:
+class SequenceBlock(TiledObject):
     blocks: tuple["ControlBlock", ...]
 
 
 @dataclass(frozen=True)
-class ControlExpression:
+class ControlExpression(TiledObject):
     """Typed scalar expression evaluated by the compiled control backend."""
 
     op: str
@@ -80,7 +81,7 @@ class ControlExpression:
 
 
 @dataclass(frozen=True)
-class ConditionalBlock:
+class ConditionalBlock(TiledObject):
     """Execute one compiled control body under a resident predicate."""
 
     predicate_value_id: int
@@ -132,7 +133,7 @@ class ConditionalBlock:
 
 
 @dataclass(frozen=True)
-class ControlSequenceMutation:
+class ControlSequenceMutation(TiledObject):
     """One explicit mutation of caller-provided sequence/table storage."""
 
     sequence_value_id: int
@@ -152,7 +153,7 @@ class ControlSequenceMutation:
 
 
 @dataclass(frozen=True)
-class LoopBlock:
+class LoopBlock(TiledObject):
     induction: str
     start: str
     stop: str
@@ -215,7 +216,7 @@ class LoopBlock:
 
 
 @dataclass(frozen=True)
-class WhileBlock:
+class WhileBlock(TiledObject):
     """Condition-controlled loop with an explicitly scheduled predicate.
 
     ``condition`` is run before the first test and again at the latch.  This
@@ -247,7 +248,7 @@ class WhileBlock:
 
 
 @dataclass(frozen=True)
-class LoopControlBlock:
+class LoopControlBlock(TiledObject):
     """A planner-owned ``break`` or ``continue`` edge.
 
     When ``predicate_value_id`` is absent the edge is unconditional.  A
@@ -295,7 +296,7 @@ class LoopControlBlock:
 
 
 @dataclass(frozen=True)
-class StateMachineTick:
+class StateMachineTick(TiledObject):
     """One compiled state transition, not a host polling loop.
 
     ``state`` is the spelling the renderers print (a loop induction name, a
@@ -330,7 +331,7 @@ class StateMachineTick:
 
 
 @dataclass(frozen=True)
-class ParallelDeployment:
+class ParallelDeployment(TiledObject):
     """Independent scheduled lanes available to one backend deployment."""
 
     lanes: tuple["ControlBlock", ...]
@@ -346,7 +347,7 @@ class ParallelDeployment:
 
 
 @dataclass(frozen=True)
-class ControlDeploymentLane:
+class ControlDeploymentLane(TiledObject):
     """One proven-independent lane in a backend-neutral deployment region."""
 
     index: int
@@ -356,7 +357,7 @@ class ControlDeploymentLane:
 
 
 @dataclass(frozen=True)
-class ControlDeploymentRegion:
+class ControlDeploymentRegion(TiledObject):
     """Durable parallelism evidence beside the lexical Control IR.
 
     The record grants a later deployment pass permission to schedule the
@@ -398,7 +399,7 @@ class ControlDeploymentRegion:
 
 
 @dataclass(frozen=True)
-class CallBlock:
+class CallBlock(TiledObject):
     """Planner-owned nested closure invocation with explicit value bindings."""
 
     callsite_id: int
@@ -408,7 +409,7 @@ class CallBlock:
 
 
 @dataclass(frozen=True)
-class ResourceScopeBlock:
+class ResourceScopeBlock(TiledObject):
     """Lexical resource cleanup, including nonlocal return/break/continue.
 
     Cleanup operations consume captured handles and have no published result.
@@ -427,7 +428,7 @@ class ResourceScopeBlock:
 
 
 @dataclass(frozen=True)
-class DispatchBlock:
+class DispatchBlock(TiledObject):
     """An ordered dispatcher operation with explicit SSA handle/value ports.
 
     The operation is semantic (for example condition_wait), not a C symbol.
@@ -444,7 +445,7 @@ class DispatchBlock:
 
 
 @dataclass(frozen=True)
-class ExternalReferenceCallBlock:
+class ExternalReferenceCallBlock(TiledObject):
     """One authored call through the shell external-reference capability."""
 
     callsite_id: int
@@ -461,7 +462,7 @@ class ExternalReferenceCallBlock:
 
 
 @dataclass(frozen=True)
-class ValidationBlock:
+class ValidationBlock(TiledObject):
     """Device-side predicate whose failure is reported through shell errors."""
 
     predicate_value_id: int
@@ -472,14 +473,14 @@ class ValidationBlock:
 
 
 @dataclass(frozen=True)
-class SequenceMutationBlock:
+class SequenceMutationBlock(TiledObject):
     """One lexical resident-sequence effect outside implicit loop storage."""
 
     mutation: ControlSequenceMutation
 
 
 @dataclass(frozen=True)
-class ScalarFieldWriteBlock:
+class ScalarFieldWriteBlock(TiledObject):
     """Publish a scalar field version at its authored effect site.
 
     ``field_value_id`` names resident parameter storage when the receiver has a
@@ -500,7 +501,7 @@ class ScalarFieldWriteBlock:
 
 
 @dataclass(frozen=True)
-class SequenceQueryBlock:
+class SequenceQueryBlock(TiledObject):
     """Read one scalar fact from a resident sequence at lexical position."""
 
     result_value_id: int
@@ -540,7 +541,7 @@ class SequenceQueryBlock:
 
 
 @dataclass(frozen=True)
-class StreamPublishBlock:
+class StreamPublishBlock(TiledObject):
     """Publish one value range to a planner-owned backpressured stream.
 
     This is a logical output operation.  It does not imply Python ``yield``,
@@ -578,7 +579,7 @@ ControlBlock = (
 
 
 @dataclass(frozen=True)
-class RecursionRegion:
+class RecursionRegion(TiledObject):
     """One cached strongly connected ProcessGraph region."""
 
     region_id: int
@@ -593,7 +594,7 @@ class RecursionRegion:
 
 
 @dataclass(frozen=True)
-class ControlProgram:
+class ControlProgram(TiledObject):
     root: ControlBlock
     region_indices: tuple[int, ...] = ()
     uniforms: tuple["ControlUniform", ...] = ()
@@ -797,14 +798,14 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
 
 
 @dataclass(frozen=True)
-class ControlUniform:
+class ControlUniform(TiledObject):
     name: str
     value_id: int
     dtype: str = "int"
 
 
 @dataclass(frozen=True)
-class RegionCode:
+class RegionCode(TiledObject):
     """One backend implementation selected for a logical region.
 
     ``body`` is source in the interior's own language.  ``launch_body`` is
@@ -4048,7 +4049,12 @@ def overlay_scheduled_control(
         if not control.region_indices
         and index not in nested_children_overall
         and (
-            isinstance(control.root, LoopBlock)
+            # An effect-only guard inside an otherwise empty class surface
+            # has no scheduled region. Its declared containment edge still
+            # owns the guard and return. Materialize that owner so nested_root
+            # does not silently discard the child before callsite placement.
+            (bool(direct_children.get(index)) and not _anchored_control(control))
+            or isinstance(control.root, LoopBlock)
             and (
                 bool(control.root.sequence_mutations)
                 or str(control.root.induction) in call_only_inductions

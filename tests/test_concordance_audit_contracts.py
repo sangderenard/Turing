@@ -6,6 +6,29 @@ from src.compiler.identity_concordance import concordance_report
 from src.compiler.identity_concordance import CorrelationTable
 
 
+def test_record_handle_alias_is_owned_but_not_a_physical_operand():
+    from src.transmogrifier.ssa import (
+        SSAValue, Instr, Function, BasicBlock, IRModule,
+        SSARecordDescriptor, SSARecordFieldDescriptor, SSARecordTable,
+    )
+    leaf = SSAValue(0, "float64")
+    function = Function("root", [leaf], {
+        "entry": BasicBlock("entry", [Instr("Ret", [leaf], None)]),
+    }, metadata={"value_aliases": {6: 5, 8: 7}})
+    module = IRModule({"root": function})
+    module.record_tables["root"] = SSARecordTable(records={
+        5: SSARecordDescriptor(5, "Metrics", (
+            SSARecordFieldDescriptor("value", "scalar", value_ids=(0,), dtype="float64"),
+        )),
+    })
+    findings = CorrelationTable.build(module).findings(module)
+    missing = [finding.value_id for finding in findings if finding.kind == "alias-target-missing"]
+    assert missing == [8]
+    function.blocks["entry"].instrs = [Instr("Ret", [SSAValue(5, "unknown")], None)]
+    findings = CorrelationTable.build(module).findings(module)
+    assert any(finding.kind == "operand-never-written" and finding.value_id == 5 for finding in findings)
+
+
 @pytest.mark.parametrize('unresolved_side', ['target', 'source', 'both'])
 def test_capture_audit_reports_unresolved_binding_instead_of_crashing(unresolved_side):
     from src.compiler.identity_concordance import begin_identity_book, end_identity_book, Unresolved, NEW

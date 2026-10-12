@@ -70,11 +70,26 @@ def book_report() -> list[str]:
         reverse=True,
     )
     lines = [f"  identity book: {sum(n for n, _ in pages):,} cells "
-             f"({book.resident_cell_count():,} in RAM, "
+             f"({book.resident_cell_count():,} uncompressed cells in RAM, "
              f"{len(book.spilled_pages())} pages spilled), "
              f"{len(book.scope_projections):,} projected scopes, "
              f"{len(book.__dict__.get('_node_universes', {})):,} interned node sets"]
     lines += [f"    {count:>10,}  {name}" for count, name in pages[:10]]
+    if book.compressed_pages():
+        from src.compiler.identity_compression import compression_stats, disk_tile_stats
+
+        raw, resident = compression_stats(book)
+        disk_tiles, disk_bytes = disk_tile_stats(book)
+        lines.append(f"  compressed IN RAM: {len(book.compressed_pages())} pages, "
+                     f"{resident / MIB:.2f} MiB retained buffers/indexes, "
+                     f"{raw / MIB:.2f} MiB tile serialization, "
+                     f"disk_tiles={disk_tiles} disk_MiB={disk_bytes / MIB:.2f}, "
+                     f"budget_met={book.__dict__.get('_compression_budget_met')}")
+    live = book.__dict__.get("_live_tile_report")
+    if live is not None:
+        lines.append(f"  LIVE graph/control/deployment/SSA/book disk tiles={live['disk_tiles']:,} "
+                     f"disk_MiB={live['disk_bytes'] / MIB:.2f} "
+                     f"decoded tile limit={live['hot_limit']} tile_rows={live['tile_rows']}")
     lines.append(
         "  planning memos: "
         f"callsite shell types {len(strategy._CALLSITE_SHELL_TYPE_CACHE):,}, "
@@ -96,6 +111,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--save-ssa", action="store_true", help="retain the public lowerer's SSA before backend emission, for failure analysis")
     parser.add_argument("--budget-bytes", type=int)
+    parser.add_argument("--ram-tiles", action="store_true", help="live graph/control/deployment/SSA/book tiles; stronger disk tier above --budget-bytes")
     parser.add_argument("--digest-only", action="store_true", help="retained compatibility option")
     options = parser.parse_args(argv[1:])
     os.chdir(ROOT)
@@ -115,9 +131,12 @@ def main(argv: list[str]) -> int:
     from src.compiler import memory_regulation
     from src.compiler.work_contract import active_contract, set_active_contract
 
-    if budget is not None:
+    if budget is not None or options.ram_tiles:
         set_active_contract(dataclasses.replace(
-            active_contract(), memory_budget_bytes=budget,
+            active_contract(),
+            memory_budget_bytes=budget if budget is not None else active_contract().memory_budget_bytes,
+            compress_cold_pages=options.ram_tiles or active_contract().compress_cold_pages,
+            spill_cold_pages=False if options.ram_tiles else active_contract().spill_cold_pages,
         ))
 
     table: list[tuple[float, str, int, int]] = []
@@ -166,9 +185,13 @@ def main(argv: list[str]) -> int:
     if pieces_wanted is not None and pieces_wanted > len(rules):
         parser.error(f"N={pieces_wanted} exceeds this craft's {len(rules)} rules")
     selected = rules if pieces_wanted is None else rules[:pieces_wanted]
+    storage_contract = active_contract()
     print(f"RULE_SUBMISSION count={len(selected)} available={len(rules)} backend={options.backend} "
           f"source_compilation={options.source_compilation} optimization={options.optimization} "
-          f"trace={tracing} compiler_root={ROOT}", flush=True)
+          f"trace={tracing} compiler_root={ROOT} "
+          f"ram_tiles={storage_contract.compress_cold_pages} "
+          f"tile_disk={storage_contract.compressed_tile_disk} "
+          f"memory_budget_bytes={storage_contract.memory_budget_bytes}", flush=True)
     for name, equations in selected:
         path = (honorary._LLVM_LAW_CACHE_DIR / name / "b1"
                 / honorary._llvm_piece_cache_key(name, 1, tuple(equations))

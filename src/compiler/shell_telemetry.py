@@ -478,6 +478,45 @@ def summarize_process_graph(graph: Any, *, limit: int = 400) -> dict[str, Any]:
     }
 
 
+_WINDOWS_RSS_BINDING = None
+_WINDOWS_RSS_LOCK = threading.Lock()
+
+
+def _windows_rss_binding():
+    # The 16-rule log retained ~67k PyCStructType/PyCPointerType objects.
+    # A 1000-read microprobe here (also on untouched HEAD8eb40eae) retained
+    # 1000 _Counters classes: POINTER caches every newly declared type.
+    # Declare/bind once, not at the telemetry sampling frequency.
+    global _WINDOWS_RSS_BINDING
+    with _WINDOWS_RSS_LOCK:
+        if _WINDOWS_RSS_BINDING is None:
+            import ctypes
+            from ctypes import wintypes
+
+            class _Counters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            current = kernel32.GetCurrentProcess
+            current.restype = wintypes.HANDLE
+            query = kernel32.K32GetProcessMemoryInfo
+            query.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Counters), wintypes.DWORD]
+            query.restype = wintypes.BOOL
+            _WINDOWS_RSS_BINDING = (_Counters, current, query)
+        return _WINDOWS_RSS_BINDING
+
+
 def process_rss_bytes() -> int:
     """This process's resident set (working set on Windows), in bytes.
 
@@ -490,32 +529,10 @@ def process_rss_bytes() -> int:
 
     if sys.platform == "win32":
         import ctypes
-        from ctypes import wintypes
-
-        class _Counters(ctypes.Structure):
-            _fields_ = [
-                ("cb", wintypes.DWORD),
-                ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            ]
-
+        _Counters, current, query = _windows_rss_binding()
         counters = _Counters()
         counters.cb = ctypes.sizeof(_Counters)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        # K32GetProcessMemoryInfo lives in kernel32 on Windows 7 and later.
-        query = kernel32.K32GetProcessMemoryInfo
-        query.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Counters),
-                          wintypes.DWORD]
-        query.restype = wintypes.BOOL
-        if not query(kernel32.GetCurrentProcess(), ctypes.byref(counters),
+        if not query(current(), ctypes.byref(counters),
                      counters.cb):
             return 0
         return int(counters.WorkingSetSize)

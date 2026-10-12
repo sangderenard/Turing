@@ -1,6 +1,9 @@
 import sympy
 import networkx as nx
-class ILPScheduler:
+from ..compiler.live_tiles import TiledObject
+
+
+class ILPScheduler(TiledObject):
     def __init__(self, process_graph):
         self.G = process_graph.G
         self.operator_signatures = process_graph.role_schemas if hasattr(process_graph, 'role_schemas') else {}
@@ -10,6 +13,7 @@ class ILPScheduler:
         self.phase_symbols = {}
         self.ilp_constraints = []
         self.phase_constraints = []
+        TiledObject.__post_init__(self)
 
     def compute_levels(self, method, order):
         return_value = None

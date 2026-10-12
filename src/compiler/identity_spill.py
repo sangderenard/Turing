@@ -377,7 +377,9 @@ def _post_receipt(
             sum(segment.rows for segment in segments),
             trigger, boundary,
         )
-        row = (owner, spill.receipts)
+        ordinal = book.__dict__.get("_storage_receipts", 0)
+        row = (owner, ordinal)
+        book.__dict__["_storage_receipts"] = ordinal + 1
         spill.receipts += 1
         ref = book.post(
             PAGE_SPILL_RECEIPT, row, fact, stage=MEMORY_REGULATION,
@@ -514,6 +516,8 @@ def spill_pages(
         if page is None or never_spilled(book, name):
             continue
         state = page.__dict__
+        if state.get("_compressed_ram"):
+            continue    # already a resident compressed table; don't copy to disk
         if state.get("spill") is not None or "cells" not in state:
             continue
         if name in spill.refused:

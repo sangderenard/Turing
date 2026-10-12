@@ -2141,6 +2141,12 @@ def _emit_repository_call_module(
             ))
             if _declared_span_rank(value) > 0 or _value_llvm_type(value) == "ptr"
             or (value.accounting or {}).get("sequence_arena")
+            # Untyped IndexedStore loops also prove an arena identity. Taking
+            # a scalar snapshot of rotate's a-phi allocated one double, then
+            # nested row indexing wrote past it. The control builder already
+            # posted the storage backedge proof; carry that reference through
+            # the existing Phi dependency cone even without static extents.
+            or (value.accounting or {}).get("ssa_storage_identity_backedge")
         }
         phi_dependents: dict[int, list[int]] = {}
         for _block, item in scheduled_instructions:

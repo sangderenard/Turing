@@ -133,7 +133,9 @@ def metadata_copy_source():
     root = ast.parse('def metadata_copy_program(value, metadata_memo):\n'
                      '    return isolate_metadata(value)\n').body[0]
     root.body.insert(0, copier)
-    return ast.unparse(ast.fix_missing_locations(ast.Module(body=[root], type_ignores=[])))
+    imports = ast.ImportFrom(module='src.compiler.live_tiles',
+                             names=[ast.alias(name='TiledSet')], level=0)
+    return ast.unparse(ast.fix_missing_locations(ast.Module(body=[imports, root], type_ignores=[])))
 
 
 def _native_metadata_copy_runner(artifact, abi):
@@ -156,9 +158,10 @@ def _native_metadata_copy_runner(artifact, abi):
                 # type evidence alone does not admit their native payload.
                 # Decide BEFORE execution, never retry a native fault.
                 return tuple(copier(value) for value in values)
-            # One memo key per imported container identity is a proven bound,
-            # including tuple reentry. Native temporary births add no keys.
-            capacity = max(1, int(boundary.buffers[context.objects.length_address_id][0]))
+            # A copy entry AND its source keepalive share the incumbent memo.
+            # Tile-local reads can otherwise recycle an identity mid-copy.
+            # Native temporary births add no keys; at most two per source.
+            capacity = max(1, 2 * int(boundary.buffers[context.objects.length_address_id][0]))
             feeds = {
                 abi['parameter']: np.array([boundary.roots[0]], dtype=np.int64),
                 memo.column_value_ids[0]: np.zeros(capacity, dtype=np.int64),
@@ -261,7 +264,8 @@ def compile_and_register_metadata_copy_accelerator(directory=None, *, registry=c
     context = SSAObjectContext('compiler.metadata.context',
         table(('opaque_ref', 'int64', 'int64'), (0,)),
         table(('opaque_ref', 'opaque_ref', 'opaque_ref'), (0, 1)), mint(), kinds,
-        type_vocabulary=(*kinds, *( 'builtins.' + name for name in ('bool','int','float','str','bytes','NoneType'))))
+        type_vocabulary=(*kinds, *( 'builtins.' + name for name in ('bool','int','float','str','bytes','NoneType')),
+                         'src.compiler.live_tiles.TiledSet'))
     repository = Path(__file__).resolve().parents[2]
     contract = ExtractionContract(repository / 'extraction_contracts/program_extraction.yaml').with_program_abi({
         'records': {}, 'bindings': [], 'values': [

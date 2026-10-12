@@ -34,12 +34,13 @@ from collections.abc import Mapping
 from .function_table import FunctionTable
 from .dtype_layout import resolve as _resolve_dtype_layout
 from ..compiler.deployment_frame import DeploymentFrame, DeploymentJoin
+from ..compiler.live_tiles import TiledObject
 
 # -----------------------------------------------------------------------------
 # Core SSA Data Structures
 # -----------------------------------------------------------------------------
 @dataclass
-class SSAValue:
+class SSAValue(TiledObject):
     """
     Represents a single SSA value.
 
@@ -61,7 +62,7 @@ class SSAValue:
 
 
 @dataclass
-class Instr:
+class Instr(TiledObject):
     """
     Represents a single SSA instruction in a linear sequence.
 
@@ -85,13 +86,13 @@ from enum import Enum
 from .ssa_registry import Handler, sympy_ssa_name_map, sympy_ssa_disambig, SSARegistry
 
 @dataclass
-class BasicBlock:
+class BasicBlock(TiledObject):
     name: str
     instrs: List[Instr] = field(default_factory=list)
     successors: List[str] = field(default_factory=list)  # for CFG edges
 
 @dataclass
-class Function:
+class Function(TiledObject):
     name: str
     args: List[SSAValue]
     blocks: Dict[str, BasicBlock]
@@ -2434,7 +2435,7 @@ class SSAMachineIndirectTable:
 
 
 @dataclass
-class IRModule:
+class IRModule(TiledObject):
     functions: Dict[str, Function]
     function_table: FunctionTable = field(default_factory=FunctionTable)
     # Class definitions the module holds (identity -> fields + methods). Empty
@@ -2509,7 +2510,7 @@ class IRModule:
             value, SSAUnionTable
         ):
             value = SSAUnionTable(dict(value), owner=self._layout_owner())
-        object.__setattr__(self, name, value)
+        TiledObject.__setattr__(self, name, value)
 
     def _layout_owner(self) -> Any:
         """The one book scope this module's struct and union rows share.

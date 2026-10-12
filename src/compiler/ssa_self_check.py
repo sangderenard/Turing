@@ -278,17 +278,26 @@ def check_id_scale(module: Any) -> list[Finding]:
     Does not prove ids are dense or gap-free, only that none is absurd.
     """
 
+    from .id_space import FLAG_BITS, SERIAL_BITS, serial_of
+
+    def suspicious_id(value_id: int) -> bool:
+        # Native record slots use the central issuer's MINTED flag (bit 61),
+        # not an object address. Inspect the serial, preserving the guard on
+        # escaped addresses and rejecting bits outside the declared id space.
+        return (serial_of(value_id) > ID_SCALE_THRESHOLD
+                or bool(int(value_id) & ~(FLAG_BITS | SERIAL_BITS)))
+
     findings: list[Finding] = []
     for name, function in _functions(module):
         suspicious: set[int] = set()
         for argument in getattr(function, "args", ()):
-            if int(argument.id) > ID_SCALE_THRESHOLD:
+            if suspicious_id(int(argument.id)):
                 suspicious.add(int(argument.id))
         for instruction in _instructions(function):
             for operand in instruction.args:
-                if int(operand.id) > ID_SCALE_THRESHOLD:
+                if suspicious_id(int(operand.id)):
                     suspicious.add(int(operand.id))
-            if instruction.res is not None and int(instruction.res.id) > ID_SCALE_THRESHOLD:
+            if instruction.res is not None and suspicious_id(int(instruction.res.id)):
                 suspicious.add(int(instruction.res.id))
         if suspicious:
             findings.append(Finding(

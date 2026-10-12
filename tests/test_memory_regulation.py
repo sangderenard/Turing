@@ -244,6 +244,34 @@ def test_a_compile_resuming_a_callers_book_keeps_that_books_planning_state():
     regulation.end_regulation(regulator, token, releases_book_state=releases)
 
 
+@pytest.mark.parametrize("cleanup", ["stage", "compile"])
+def test_cleanup_reclaims_tile_garbage_without_a_second_book(cleanup):
+    from src.compiler.live_tiles import LiveTileArena
+
+    book = IdentityBook()
+    arena = LiveTileArena(tile_rows=8, hot_tiles=2, bucket_rows=4)
+    kept = arena.manage({"answer": 42})
+    discarded = arena.manage({"unused": list(range(80))})
+    discarded_handle = discarded._ref
+    del discarded
+    pages_before = tuple(book.pages)
+    regulator = regulation.MemoryRegulator(book, live_arena=arena)
+    token = regulation._ACTIVE.set(regulator)
+    if cleanup == "compile":
+        regulation.end_regulation(regulator, token, releases_book_state=True)
+    else:
+        try:
+            regulation.stage_end("test: dead working set")
+        finally:
+            regulation._ACTIVE.reset(token)
+    # Physical garbage is gone, not merely compressed. The live view keeps
+    # its original handle/identity and no semantic/provenance rows are added.
+    assert arena.read(discarded_handle) is None
+    assert arena.resolve_reference(kept._ref) is kept
+    assert kept["answer"] == 42
+    assert tuple(book.pages) == pages_before
+
+
 def test_released_dispatch_region_copies_are_gone_and_reads_fail_loudly():
     from src.compiler.glsl_deployment_strategy import (
         ReleasedDispatchRegions, release_dispatch_region_copies,

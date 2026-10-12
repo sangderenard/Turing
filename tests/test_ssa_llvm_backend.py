@@ -785,6 +785,37 @@ def test_pointer_phi_refuses_incompatible_physical_element_types():
     assert any(item.operation == "Phi" and "physical element" in item.reason for item in artifact.shortfalls)
 
 
+def test_unranked_storage_backedge_and_its_exit_phi_keep_the_arena(tmp_path):
+    import numpy as np
+    from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
+    from src.compiler.ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution
+    arena = SSAValue(0, "float64")
+    carried = SSAValue(1, "float64", accounting={"ssa_storage_identity_backedge": True})
+    exited, index = SSAValue(2, "float64"), SSAValue(3, "int64")
+    address, replacement = SSAValue(4, "float64"), SSAValue(5, "float64")
+    function = Function("phi_arena", [arena], {
+        "entry": BasicBlock("entry", [Instr("Br", [], None, attributes={"target": "header"})], ["header"]),
+        "header": BasicBlock("header", [
+            Instr("Phi", [arena], carried, attributes={"incoming_blocks": ("entry",)}),
+            Instr("Br", [], None, attributes={"target": "exit"}),
+        ], ["exit"]),
+        "exit": BasicBlock("exit", [
+            Instr("Phi", [carried], exited, attributes={"incoming_blocks": ("header",)}),
+            Instr("Const", [], index, attributes={"value": 2}),
+            Instr("Const", [], replacement, attributes={"value": 31.0}),
+            Instr("GetElementPtr", [exited, index], address),
+            Instr("Store", [replacement, address], None), Instr("Ret", [], None),
+        ]),
+    })
+    artifact = emit_ssa_function_to_llvm(IRModule({function.name: function}), function.name)
+    assert artifact.complete, artifact.shortfalls
+    assert "%phi.value.1 = alloca" not in artifact.llvm_ir
+    assert "%phi.value.2 = alloca" not in artifact.llvm_ir
+    native = compile_artifact(artifact, directory=tmp_path)
+    result = prepare_artifact_execution(native, {arena.id: np.array([1., 2., 3., 4.])}).run()
+    np.testing.assert_array_equal(result.buffers[arena.id], [1., 2., 31., 4.])
+
+
 def test_scalar_phi_captures_a_value_before_its_selected_slot_is_reused(tmp_path):
     import numpy as np
     from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue

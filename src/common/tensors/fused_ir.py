@@ -22,10 +22,11 @@ from numbers import Real
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
 from ...compiler.id_space import serial_of as _id_serial_of
+from ...compiler.live_tiles import TiledObject
 
 
 @dataclass
-class Meta:
+class Meta(TiledObject):
     """Per-id snapshot of tensor metadata.
 
     A value can either own storage (the default: ``source_id`` is ``None``)
@@ -62,7 +63,7 @@ class Meta:
 
 
 @dataclass
-class OpStep:
+class OpStep(TiledObject):
     """Single linearised tensor operation."""
 
     step_id: int
@@ -235,7 +236,7 @@ def unroll_feed_axis_reductions(program: "FusedProgram") -> "FusedProgram":
 
 
 @dataclass
-class FusedProgram:
+class FusedProgram(TiledObject):
     """Dependency-resolved IR for one flat numeric segment.
 
     Despite the historical name, this object is neither a compiler nor a

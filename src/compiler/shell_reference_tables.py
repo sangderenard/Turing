@@ -22,10 +22,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from ..transmogrifier.graph.graph_express2 import instance_attribute_slot
+from .live_tiles import TiledObject
 
 
 @dataclass(frozen=True)
-class ShellFunctionReference:
+class ShellFunctionReference(TiledObject):
     """One shell-local function-table slot."""
 
     index: int
@@ -38,7 +39,7 @@ class ShellFunctionReference:
 
 
 @dataclass(frozen=True)
-class ShellConstantReference:
+class ShellConstantReference(TiledObject):
     """One literal constant owned by the shell graph."""
 
     index: int
@@ -47,7 +48,7 @@ class ShellConstantReference:
 
 
 @dataclass(frozen=True)
-class ShellMemoryReference:
+class ShellMemoryReference(TiledObject):
     """One boundary or derived storage reference."""
 
     index: int
@@ -59,7 +60,7 @@ class ShellMemoryReference:
 
 
 @dataclass(frozen=True)
-class ShellReferenceCorrelation:
+class ShellReferenceCorrelation(TiledObject):
     """Trace one local table slot back to its ProcessGraph origin."""
 
     table: str
@@ -71,7 +72,7 @@ class ShellReferenceCorrelation:
 
 
 @dataclass(frozen=True)
-class ShellRecursionReference:
+class ShellRecursionReference(TiledObject):
     """One shell-local reference to a cached recursive SCC."""
 
     index: int
@@ -86,7 +87,7 @@ class ShellRecursionReference:
 
 
 @dataclass
-class ShellReferenceTables:
+class ShellReferenceTables(TiledObject):
     """Ordinary indexed lists installed on one deployment shell."""
 
     functions: list[ShellFunctionReference]

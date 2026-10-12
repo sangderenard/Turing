@@ -214,6 +214,19 @@ class WorkContract:
     # back, so the compile's output does not depend on it; each spill and
     # reload is a ``page_spill_receipt`` row derived from the policy cell.
     spill_cold_pages: bool = False
+    # Independent of disk spill: cold tables remain compressed IN RAM and
+    # ordinary identity-page reads decode only matching tiles. Mutations
+    # explicitly promote the target page. Both policies together are refused.
+    compress_cold_pages: bool = False
+    # Stronger disk compression of the SAME tiles when the declared process
+    # budget is exceeded. This is not legacy whole-page spill; reads stay local.
+    compressed_tile_disk: bool = True
+    # Shared live graph/control/deployment/SSA decoded storage cache. Cold
+    # records use the SAME compression/disk codecs as concordance tiles.
+    live_tile_rows: int = 64
+    live_resident_tiles: int = 4096
+    live_bucket_rows: int = 64
+    live_decoded_budget_bytes: int = 128 << 20
     # Compile-wide bound on cached dispatch topologies, not a promise about
     # source graphs, SSA, or the process RSS. None preserves eager residency.
     graph_resident_regions: int | None = 8
@@ -229,7 +242,17 @@ class WorkContract:
     ssa_resident_regions: int | None = 8
 
     def __post_init__(self) -> None:
+        if type(self.compressed_tile_disk) is not bool:
+            raise ValueError("compressed_tile_disk must be a bool")
+        if type(self.compress_cold_pages) is not bool:
+            raise ValueError("compress_cold_pages must be a bool")
+        if self.compress_cold_pages and self.spill_cold_pages:
+            raise ValueError("choose compressed RAM or disk spill, not both")
         for label, value, optional in (
+            ("live_tile_rows", self.live_tile_rows, False),
+            ("live_resident_tiles", self.live_resident_tiles, False),
+            ("live_bucket_rows", self.live_bucket_rows, False),
+            ("live_decoded_budget_bytes", self.live_decoded_budget_bytes, False),
             ("graph_resident_regions", self.graph_resident_regions, True),
             ("graph_workers", self.graph_workers, False),
             ("graph_region_node_limit", self.graph_region_node_limit, False),
@@ -394,10 +417,20 @@ def active_contract() -> WorkContract:
     # Likewise the spill policy: a regulation of this process, not a fidelity
     # choice, so it does not rename the contract.
     spill = _flag("TURING_SPILL_COLD_PAGES")
-    if spill is not None and spill != contract.spill_cold_pages:
-        contract = dataclasses.replace(contract, spill_cold_pages=spill)
+    compressed = _flag("TURING_COMPRESS_COLD_PAGES")
+    if spill is not None or compressed is not None:
+        contract = dataclasses.replace(
+            contract,
+            spill_cold_pages=contract.spill_cold_pages if spill is None else spill,
+            compress_cold_pages=(contract.compress_cold_pages
+                                 if compressed is None else compressed),
+        )
 
     for variable, field in (
+        ("TURING_LIVE_TILE_ROWS", "live_tile_rows"),
+        ("TURING_LIVE_RESIDENT_TILES", "live_resident_tiles"),
+        ("TURING_LIVE_BUCKET_ROWS", "live_bucket_rows"),
+        ("TURING_LIVE_DECODED_BUDGET_BYTES", "live_decoded_budget_bytes"),
         ("TURING_GRAPH_RESIDENT_REGIONS", "graph_resident_regions"),
         ("TURING_GRAPH_WORKERS", "graph_workers"),
         ("TURING_GRAPH_REGION_NODE_LIMIT", "graph_region_node_limit"),

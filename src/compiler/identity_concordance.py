@@ -42,7 +42,8 @@ Findings (each is one concrete disagreement, with the two claims):
     an instruction reads a value whose definition does not dominate the
     read (Phi operands exempt; they arrive over predecessor edges).
 ``alias-target-missing``
-    a recorded value alias points at a value the function never defines.
+    a recorded value alias points at neither a physical definition nor an
+    owned structural record descriptor.
 ``alias-not-concorded``
     a durable function-local alias receipt is absent from, or disagrees with,
     the shared planning identity page.
@@ -1062,6 +1063,10 @@ class CorrelationTable:
         record_table = (getattr(module, "record_tables", {}) or {}).get(name)
         if record_table is not None:
             for record in record_table.records.values():
+                self.claim(
+                    name, int(record.record_id), "record-owner",
+                    str(record.identity), "record_table",
+                )
                 for record_field in record.fields:
                     for value_id in record_field.value_ids:
                         self.claim(
@@ -1104,6 +1109,7 @@ class CorrelationTable:
         found.extend(self._name_binding_capture_findings(module))
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._graph_work_publication_findings(module))
+        found.extend(self._tile_storage_findings(module))
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._source_numeric_component_findings(module))
@@ -1128,6 +1134,54 @@ class CorrelationTable:
         # on their own line.
         found.extend(self._unsourced_findings(module))
         return found
+
+    @staticmethod
+    def _tile_storage_findings(module: Any) -> list[Finding]:
+        """A disk-tier runtime receipt must cite this book's exact policies.
+
+        Representation movement must not post edges by thawing a cold private
+        page under pressure. Its sourced runtime receipt instead retains refs
+        to the predeclared policies; audit those refs without a full-page load.
+        """
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        report = None if book is None else book.__dict__.get("_tile_offload_report")
+        live = None if book is None else book.__dict__.get("_live_tile_report")
+        live_findings = []
+        if live is not None:
+            expected_live = {
+                ("compressed_tile_disk",): "true",
+                ("memory_budget_bytes",): str(live["budget_bytes"]),
+                ("live_tile_rows",): str(live["tile_rows"]),
+                ("live_bucket_rows",): str(live["bucket_rows"]),
+                ("live_resident_tiles",): str(live["hot_limit"]),
+            }
+            if "decoded_budget_bytes" in live:
+                expected_live[("live_decoded_budget_bytes",)] = str(live["decoded_budget_bytes"])
+            matched_live = set()
+            for ref in live.get("policy_sources", ()):
+                if (isinstance(ref, Ref) and ref.page is book.registry.pages.get("compile_policy")
+                        and ref.row in expected_live
+                        and book.page(ref.page).cell(ref.row, ref.column) == expected_live[ref.row]):
+                    matched_live.add(ref.row)
+            if matched_live != set(expected_live) or live["budget_bytes"] <= 0:
+                live_findings.append(Finding("live-tile-storage-policy", "<compiler-storage>", None,
+                                            "live tile offload disagrees with exact cache/disk/budget policies"))
+        if report is None:
+            return live_findings
+        expected = {
+            ("compressed_tile_disk",): "true",
+            ("memory_budget_bytes",): str(report.budget_bytes),
+        }
+        matched = set()
+        for ref in report.policy_sources:
+            if not isinstance(ref, Ref) or ref.page is not book.registry.pages.get("compile_policy"):
+                continue
+            if ref.row in expected and book.page(ref.page).cell(ref.row, ref.column) == expected[ref.row]:
+                matched.add(ref.row)
+        if matched != set(expected) or report.budget_bytes <= 0:
+            return live_findings + [Finding("tile-storage-policy", "<compiler-storage>", None,
+                            "disk tile receipt has missing/disagreeing exact budget or disk-policy cells")]
+        return live_findings
 
     @staticmethod
     def _graph_work_publication_findings(module: Any) -> list[Finding]:
@@ -2878,6 +2932,12 @@ class CorrelationTable:
                 target = rows.get(int(claim.key))
                 if target is None or (
                     not target.is_formal and not target.definitions
+                    # coerce_metrics returns the exact Metrics handle. Once
+                    # flattened, its fields have physical definitions but the
+                    # container only exists in its authoritative record table.
+                    # This is not permission for a raw SSA operand to use it:
+                    # the separate undefined-operand check still rejects that.
+                    and not any(c.kind == "record-owner" for c in target.claims)
                 ):
                     found.append(Finding(
                         "alias-target-missing", name, value_id,
@@ -3706,6 +3766,16 @@ class IdentityPage:
         # A page built with cells already in hand indexes them once here.
         if self.cells and not self.row_columns:
             self._reindex()
+        from .live_tiles import _ACTIVE_ARENA, tile_identity_page
+        arena = _ACTIVE_ARENA.get()
+        if arena is not None:
+            tile_identity_page(self, arena)
+
+    def __setattr__(self, name, value):
+        arena = self.__dict__.get("_live_tile_owner")
+        if arena is not None and name in _SPILLABLE_TABLES:
+            value = arena.manage(value)
+        object.__setattr__(self, name, value)
 
     def __setstate__(self, state: dict) -> None:
         # A page pickled before the index existed is indexed on arrival.
@@ -3768,6 +3838,10 @@ class IdentityPage:
 
     def __getstate__(self) -> dict:
         # A copy or a pickle of a page is of the whole page.
+        if self.__dict__.get("_compressed_ram"):
+            from .identity_compression import thaw_page
+
+            thaw_page(self)
         state = self.__dict__
         book = state.get("book")
         if book is not None and (
@@ -3777,9 +3851,14 @@ class IdentityPage:
         return {
             key: value for key, value in self.__dict__.items()
             if key not in ("spill", "_detached", "_borrow")
+            and key != "_live_tile_owner"
         }
 
     def _reindex(self) -> None:
+        if self.__dict__.get("_compressed_ram"):
+            from .identity_compression import thaw_page
+
+            thaw_page(self)
         self.column_positions = {
             column: position for position, column in enumerate(self.columns)
         }
@@ -3798,6 +3877,10 @@ class IdentityPage:
         ``IdentityBook.post`` writes a fact and its edges through this so
         they share one reading; it ticks the clock once afterwards.
         """
+        if self.__dict__.get("_compressed_ram"):
+            from .identity_compression import thaw_page
+
+            thaw_page(self)
         positions = self.column_positions
         if len(positions) != len(self.columns):
             self._reindex()
@@ -4372,6 +4455,7 @@ class IdentityBook:
             self.reload_all("pickle")
         state = dict(self.__dict__)
         state["_spill"] = None
+        state.pop("_tile_store", None)  # the serialized copy owns no tile file
         return state
 
     def __setstate__(self, state: dict) -> None:
@@ -4400,6 +4484,10 @@ class IdentityBook:
         """Read every spilled page and edge partition back into RAM."""
         from .identity_spill import PARTITIONED, make_whole, restore_all
 
+        from .identity_compression import thaw_page
+
+        for page in dict.values(self.pages):
+            thaw_page(page)
         restored = restore_all(self, reason)
         for part in PARTITIONED:
             restored += make_whole(self, part, reason)
@@ -4458,7 +4546,19 @@ class IdentityBook:
         return sum(
             len(page.__dict__["cells"])
             for page in dict.values(self.pages) if "cells" in page.__dict__
+            and not page.__dict__.get("_compressed_ram")
+            and not page.__dict__.get("_live_tile_owner")
         )
+
+    def compress_pages(self, names: Iterable[str], **kwargs: Any) -> Any:
+        """Install resident compressed tables; ordinary reads stay tile-local."""
+        from .identity_compression import compress_pages
+
+        return compress_pages(self, names, **kwargs)
+
+    def compressed_pages(self) -> tuple[str, ...]:
+        return tuple(name for name, page in dict.items(self.pages)
+                     if page.__dict__.get("_compressed_ram"))
 
     def spilled_pages(self) -> tuple[str, ...]:
         """Pages whose own tables are in the spill file, in page order."""

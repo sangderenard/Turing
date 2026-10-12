@@ -129,8 +129,16 @@ class CompiledProgramAPI:
 
     def to_yaml(self) -> str:
         import yaml
-
-        return yaml.safe_dump(self.to_mapping(), sort_keys=False)
+        # Serialization is an explicit boundary. The YAML library dispatches
+        # on exact builtin types, whereas compiler metadata can be tile-backed
+        # dict/list subclasses. Export the ABI description, not live IR storage.
+        def plain(value):
+            if isinstance(value, Mapping):
+                return {key: plain(member) for key, member in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [plain(member) for member in value]
+            return value
+        return yaml.safe_dump(plain(self.to_mapping()), sort_keys=False)
 
     def write(self, path: str | Path) -> Path:
         destination = Path(path)

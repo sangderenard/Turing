@@ -11,6 +11,40 @@ from src.transmogrifier.ssa import (
 )
 
 
+def test_aggregate_passthrough_advances_operands_and_dependent_shared_aliases():
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+    from src.compiler.fortran_c_shell import _publish_concordant_function_aliases
+    from src.compiler.ssa_record_return_state import mint_ssa_value
+    from src.compiler.ssa_aggregate_abi import _replace_exact_uses
+    from src.compiler.concordance_declarations import RECORD_FIELD_PHI, RECORD_PHI_EXPANSION_STAGE, PLANNING_VALUE
+
+    book, token = begin_identity_book()
+    try:
+        root = Function("root", [], {})
+        def value():
+            return SSAValue(mint_ssa_value(
+                root, RECORD_FIELD_PHI, (), dtype="float64", shape=(1,),
+                stage=RECORD_PHI_EXPANSION_STAGE,
+            ), "float64", shape=(1,))
+        actual, stale, other, result = (value() for _ in range(4))
+        root.args = [actual, other]
+        phi = Instr("Phi", [stale, stale], result, attributes={"initial_value_id": stale.id})
+        root.blocks = {"entry": BasicBlock("entry", [phi, Instr("Ret", [result, other], None)])}
+        _publish_concordant_function_aliases(
+            root, {result.id: stale.id}, provenance="provisional_aggregate_position",
+        )
+        _replace_exact_uses(root, stale, actual, via=("forward", stale.id))
+        assert [v.id for v in phi.args] == [actual.id, actual.id]
+        assert phi.attributes["initial_value_id"] == actual.id
+        assert root.blocks["entry"].instrs[-1].args == [result, other]
+        assert root.metadata["value_aliases"][result.id] == actual.id
+        assert book.page(PLANNING_VALUE).latest((root.name, result.id)) == actual.id
+        claim = book.latest_ref(PLANNING_VALUE, (root.name, result.id))
+        assert book.edges_into(claim)
+    finally:
+        end_identity_book(token)
+
+
 def test_forwarded_record_result_tracks_the_settled_input_frame():
     left, right = SSAValue(100, "float64"), SSAValue(101, "float64")
     callee = Function("forward", [left, right], {

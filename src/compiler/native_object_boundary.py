@@ -49,6 +49,12 @@ class NativeObjectBoundary:
         from .ssa_object_context import object_type_classes
         inspection_classes = object_type_classes(context.type_vocabulary)
         objects, members, pending, identities = [], [], deque(), {}
+        from .live_tiles import TiledDict, TiledList, TiledTuple, TiledSet
+        # These are compiler-owned implementations of the builtin container
+        # contracts, not arbitrary user subclasses with unknown semantics.
+        container_types = {**_CONTAINERS, TiledDict: "builtins.dict",
+                           TiledList: "builtins.list", TiledTuple: "builtins.tuple",
+                           TiledSet: "builtins.set"}
 
         def reference(value):
             identity = id(value)
@@ -57,7 +63,7 @@ class NativeObjectBoundary:
             handle = codec.retain(value)
             self.retained.append(handle)
             identities[identity] = handle
-            label = _CONTAINERS.get(type(value), 'builtins.object')
+            label = container_types.get(type(value), 'builtins.object')
             row = (handle, kinds[label])
             if context.type_vocabulary:
                 mask = sum(1 << bit for bit, target in enumerate(inspection_classes)
@@ -76,10 +82,10 @@ class NativeObjectBoundary:
             self.roots = tuple(reference(value) for value in roots)
             while pending:
                 owner, value = pending.popleft()
-                if type(value) is dict:
+                if type(value) in (dict, TiledDict):
                     for key, item in value.items():
                         members.append((owner, reference(key), reference(item)))
-                elif type(value) in (list, tuple):
+                elif type(value) in (list, tuple, TiledList, TiledTuple):
                     for index, item in enumerate(value, 1):
                         members.append((owner, index, reference(item)))
                 else:

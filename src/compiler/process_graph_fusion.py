@@ -18,6 +18,7 @@ from typing import Any, Iterable, Mapping
 
 import networkx as nx
 import numpy as np
+from .live_tiles import live_digraph, TiledSet
 
 from ..common.tensors.fused_ir import (
     AXIS_REDUCTION_FOLDS,
@@ -180,6 +181,11 @@ def extract_clean_process_subgraph(
         if identity in metadata_memo:
             return metadata_memo[identity]
         if isinstance(value, dict):
+            # An id-only copy memo must retain its source containers too.
+            # Tile reads can evict the decoded generation mid-traversal;
+            # without this, its address can be reused by an unrelated row.
+            # Negative ids are disjoint from all positive Python identities.
+            metadata_memo[-identity] = value
             isolated = {}
             metadata_memo[identity] = isolated
             isolated.update(
@@ -188,11 +194,13 @@ def extract_clean_process_subgraph(
             )
             return isolated
         if isinstance(value, list):
+            metadata_memo[-identity] = value
             isolated = []
             metadata_memo[identity] = isolated
             isolated.extend(isolate_metadata(item) for item in value)
             return isolated
         if isinstance(value, tuple):
+            metadata_memo[-identity] = value
             isolated = tuple(isolate_metadata(item) for item in value)
             # Immutable containers cannot directly contain themselves.  A
             # cycle through a mutable container is broken by that container's
@@ -206,12 +214,14 @@ def extract_clean_process_subgraph(
                 isolated = value
             metadata_memo[identity] = isolated
             return isolated
-        if isinstance(value, set):
+        if isinstance(value, (set, TiledSet)):
+            metadata_memo[-identity] = value
             isolated = set()
             metadata_memo[identity] = isolated
             isolated.update(isolate_metadata(item) for item in value)
             return isolated
         if isinstance(value, frozenset):
+            metadata_memo[-identity] = value
             members = tuple(value)
             isolated_members = tuple(isolate_metadata(item) for item in members)
             if all(new is old for new, old in zip(isolated_members, members)):
@@ -801,7 +811,7 @@ def reduce_scheduled_shader_regions(
             for region_id, members in active.items()
             for node_id in members
         }
-        quotient_graph = nx.DiGraph()
+        quotient_graph = live_digraph()
         quotient_graph.add_nodes_from(active)
         for left, right in projected_execution_edges:
             left_owner = owner.get(left)

@@ -1,5 +1,19 @@
 # Continuation: porting proposal 02 (return-site identity) onto 854e145c (2026-10-03)
 
+## Current narrow closure (2026-10-11)
+
+The historical held static_branch gap below is now closed at the existing
+public source-entry record ABI demand writer in fortran_c_shell.py. An exact
+deployment activation-root return of a declared parameter record demands its
+declared scalar fields even when unread or written only under a dead branch.
+Internal helper returns retain lazy demand. This does not port the proposal's
+blanket OBSERVED projection mechanism or promise unknown dynamic/nested layouts.
+
+Both static_branch and a wholly-unmentioned scalar output field now pass
+authored-Python versus source-compiled native execution; the former strict
+xfail was removed only after it passed. The 335-test final focused gate passes.
+Older porting analysis below remains history, not an active static_branch veto.
+
 Source: `02-return-site-identity.patch` (author "dot", written against
 3559a8fd, 29 commits behind). Applied with `git am --3way` in a detached
 worktree at 854e145c; conflicts resolved by hand, the am'd commit amended.

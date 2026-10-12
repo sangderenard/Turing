@@ -358,6 +358,19 @@ _DTYPE_KIND: dict[str, str] = fortran_kind_table()
 DEFAULT_DTYPE = "float64"
 
 
+def _static_span_assignment(instruction: Instr) -> bool:
+    """A normalized rank-one indexed write emitted directly in Fortran."""
+    shape = tuple(instruction.attributes.get("basic_index_source_shape") or ())
+    axes = tuple(instruction.attributes.get("basic_index_axes") or ())
+    return (
+        instruction.op in {"Call", "call"}
+        and instruction.attributes.get("callee") == "index_assign_double"
+        and len(instruction.args) == 7 and len(shape) == len(axes) == 1
+        and all(0 <= int(index) < int(shape[0]) for index in axes[0][0])
+        and (not axes[0][1] or len(axes[0][0]) == 1)
+    )
+
+
 
 def supported_tensor_operations() -> frozenset[str]:
     """Canonical tensor operations this emitter can spell directly.
@@ -823,6 +836,7 @@ class _FunctionEmitter:
             )
         )
         self.mutated_base_ids = {int(value_id) for value_id in mutated_base_ids}
+        self._formal_value_ids = frozenset(int(value.id) for value in function.args)
         self.callee_extents = dict(callee_extents or {})
         self.callee_arity = dict(callee_arity or {})
         self.callee_output_count = dict(callee_output_count or {})
@@ -2359,6 +2373,20 @@ class _FunctionEmitter:
                             f"    {_name(extra)} = {_name(first)}"
                         )
                     continue
+                # A returned span may be the very input the callee mutates.
+                # No aggregate projection means "ignore the return value",
+                # not "replace its in/out argument with a discard copy".
+                # The exact signature identity proves that owner already.
+                inout_inputs = tuple(
+                    input_index for input_index, output_index
+                    in self.callee_inout_pairs.get(str(callee), ())
+                    if output_index == slot and input_index < len(instr.args)
+                )
+                if len(inout_inputs) == 1:
+                    actual = instr.args[inout_inputs[0]]
+                    output_binding_values.append(actual)
+                    output_binding_names.append(self._operand(actual))
+                    continue
                 typed_formal = self._typed(formal)
                 # The callee's DECLARED dtype for this slot, the same
                 # authority the bridge above uses when the slot is consumed.
@@ -2734,12 +2762,53 @@ class _FunctionEmitter:
         the pair collapses into one assignment.
         """
 
+        if _static_span_assignment(instr):
+            # Tensor lowering preserves the normalized authored axes beside
+            # this seven-operand kernel ABI. A Metrics span write (including
+            # a one-element span) is an in-place assignment, not an unknown
+            # intrinsic or a new output array. Read those exact axes.
+            axes = tuple(instr.attributes.get("basic_index_axes") or ())
+            base, value = instr.args[0], instr.args[5]
+            shape = tuple(instr.attributes.get("basic_index_source_shape") or ())
+            if len(shape) != 1 or len(axes) != 1:
+                return None
+            positions, drop_axis = axes[0]
+            positions = tuple(map(int, positions))
+            if any(position < 0 or position >= int(shape[0]) for position in positions):
+                return None
+            if not positions:
+                return []
+            if drop_axis:
+                if len(positions) != 1:
+                    return None
+                subscript = str(positions[0] + 1)
+            else:
+                subscript = "[" + ", ".join(str(position + 1) for position in positions) + "]"
+            expression = self._operand(value)
+            if tuple(self._typed(value).shape) and _element_count(tuple(self._typed(value).shape)) == 1:
+                expression = f"sum({expression})"
+            return [f"    {self._operand(base)}({subscript}) = {expression}"]
         if instr.op not in ("Store", "store") or len(instr.args) != 2:
             return None
         source, address = instr.args
         producer = self._address_producers.get(address.id)
         if producer is None:
             if int(address.id) not in self.array_base_ids:
+                # Authored ctrl.n += 1 in a retained while body lowers to
+                # Store(value, the scalar record formal). That formal is the
+                # storage cell, not a GetElementPtr result. C/LLVM write its
+                # incoming pointer; Fortran writes its reference dummy. Do not
+                # manufacture an array or change the scalar's semantic rank.
+                if (
+                    int(address.id) in self.mutated_base_ids
+                    and int(address.id) in self._formal_value_ids
+                    and not _is_array(self._typed(address))
+                    and str(self._typed(address).dtype) not in {"ptr", "opaque_ref"}
+                ):
+                    expression = self._coerce_value_to_target(
+                        address, source, self._operand(source),
+                    )
+                    return [f"    {self._operand(address)} = {expression}"]
                 return None
             return [
                 f"    {self._operand(address)}(1) = {self._operand(source)}"
@@ -4691,7 +4760,7 @@ def emit_module(
                     # A canonical tensor operation is emitted as a native
                     # Fortran expression.  Its C/LLVM helper name is retained
                     # for those targets, but is not a Fortran call edge.
-                    if instruction.attributes.get("tensor_operation"):
+                    if instruction.attributes.get("tensor_operation") or _static_span_assignment(instruction):
                         continue
                     callee = instruction.attributes.get("callee")
                     if callee in functions and callee not in reachable:
@@ -4711,6 +4780,7 @@ def emit_module(
                     for instruction in block.instrs
                     if instruction.op in {"Call", "call"}
                     and not instruction.attributes.get("tensor_operation")
+                    and not _static_span_assignment(instruction)
                     and instruction.attributes.get("callee") in functions
                 }
                 if function_name in reachable:
@@ -4753,7 +4823,7 @@ def emit_module(
     method_array_bases: dict[str, set[int]] = {
         function_name: set(value_ids)
         for function_name, value_ids in call_array_argument_ids(
-            functions
+            functions, call_is_semantic_edge=lambda instruction: not _static_span_assignment(instruction),
         ).items()
     }
     method_mutated_bases: dict[str, set[int]] = {}
@@ -4761,6 +4831,7 @@ def emit_module(
         method = str(function_name)
         array_bases = method_array_bases.setdefault(method, set())
         mutated_bases = method_mutated_bases.setdefault(method, set())
+        store_formal_ids = frozenset(int(formal.id) for formal in function.args)
         array_bases.update(
             int(argument.id)
             for argument in function.args
@@ -4795,10 +4866,26 @@ def emit_module(
                         )
         for block in function.blocks.values():
             for instruction in block.instrs:
+                if (
+                    instruction.op in {"Call", "call"}
+                    and instruction.attributes.get("callee") == "index_assign_double"
+                    and len(instruction.args) == 7
+                ):
+                    # The kernel's first argument is its written resident.
+                    # Propagate this through the same mutation graph as Store.
+                    array_bases.add(int(instruction.args[0].id))
+                    mutated_bases.add(int(instruction.args[0].id))
                 if instruction.op in ("Store", "store") and len(instruction.args) == 2:
-                    base = address_to_base.get(int(instruction.args[1].id))
+                    destination = int(instruction.args[1].id)
+                    base = address_to_base.get(destination)
                     if base is not None:
                         mutated_bases.add(base)
+                    elif destination in store_formal_ids:
+                        # Direct stores write reference formals too. Publish
+                        # that mutation into the incumbent call-edge fixed
+                        # point so callers and the public ABI pass a reference,
+                        # not a disposable scalar VALUE copy.
+                        mutated_bases.add(destination)
     # Rank follows actual call edges by argument position. Numeric ids remain
     # function-local: only the caller operand and the corresponding callee
     # parameter are unified. This reaches pass-through wrappers without
@@ -4973,6 +5060,8 @@ def emit_module(
                             changed_ranks = True
                     if instruction.op not in {"Call", "call"}:
                         continue
+                    if _static_span_assignment(instruction):
+                        continue
                     callee_name = str(
                         instruction.attributes.get("callee") or ""
                     )
@@ -5117,6 +5206,8 @@ def emit_module(
                                 changed_scalars = True
                     if instruction.op not in {"Call", "call"}:
                         continue
+                    if _static_span_assignment(instruction):
+                        continue
                     callee_name = str(instruction.attributes.get("callee") or "")
                     callee = functions.get(callee_name)
                     if callee is None:
@@ -5196,6 +5287,8 @@ def emit_module(
                 )
                 for instruction in block.instrs:
                     if instruction.op not in {"Call", "call"}:
+                        continue
+                    if _static_span_assignment(instruction):
                         continue
                     callee_name = str(instruction.attributes.get("callee") or "")
                     callee = functions.get(callee_name)
@@ -5343,6 +5436,8 @@ def emit_module(
                 )
                 for instruction in block.instrs:
                     if instruction.op not in {"Call", "call"}:
+                        continue
+                    if _static_span_assignment(instruction):
                         continue
                     callee_name = str(instruction.attributes.get("callee") or "")
                     callee = functions.get(callee_name)
@@ -6509,4 +6604,3 @@ class FortranCoreNative:
         return FortranCoreExecution(
             buffers, self._packed, pointers, len(slots), slots,
         )
-

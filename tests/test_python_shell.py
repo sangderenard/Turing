@@ -71,17 +71,22 @@ def test_the_shell_computes_the_authored_answer(loop_shell):
 def test_the_trace_shows_every_iteration_of_a_carried_value(loop_shell):
     """Not just the final value: the whole history, one entry per commit."""
 
-    _module, shell = loop_shell
+    module, shell = loop_shell
     run = shell.run(w=2.0, n=3)
+    root = module.functions["ps__train"]
+    initial = dict(root.metadata["parameter_names"])["w"]
+    carried_phis = [instruction for block in root.blocks.values() for instruction in block.instrs
+                    if instruction.op == "Phi"
+                    and instruction.attributes.get("binding") == "loop_carried"
+                    and instruction.attributes.get("initial_spelled_value_id") == initial]
+    assert len(carried_phis) == 1
     carried = [
         entry.value
         for entry in run.trace
-        if entry.function == "ps__train" and entry.value_id == 7
+        if entry.function == "ps__train" and entry.value_id == carried_phis[0].res.id
     ]
-    # The preheader SEED first -- the carried slot is initialized from the
-    # entry value so a body reading the slot at the top of iteration one
-    # reads w, not garbage -- then one entry per iteration, then the
-    # post-loop port rebinding.
+    # The header Phi observes the entered value first, then each latch's
+    # produced value. A fixed old body id is neither its ABI nor its history.
     assert carried[:4] == pytest.approx([2.0, 1.9, 1.805, 1.71475], abs=1e-12)
 
 
@@ -240,6 +245,14 @@ def test_central_issuer_id_is_not_reported_as_a_memory_address():
         "entry": BasicBlock("entry", []),
     })})
     assert check_id_scale(module) == []
+
+
+def test_a_group_flag_does_not_hide_a_poisoned_address_serial():
+    from src.compiler.id_space import MINTED, compose
+    from src.transmogrifier.ssa import BasicBlock, Function, IRModule, SSAValue
+    value = SSAValue(compose(2266697258353, MINTED))
+    module = IRModule({"f": Function("f", [value], {"entry": BasicBlock("entry", [])})})
+    assert check_id_scale(module)
 
 
 def test_disagreeing_output_contracts_are_a_finding():

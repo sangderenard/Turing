@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping
 
 import networkx as nx
+from .live_tiles import TiledObject
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from .id_space import serial_of as _id_serial_of
@@ -1367,7 +1368,7 @@ def _control_expression_mapping(
     }
 
 
-class _ControlSSABuilder:
+class _ControlSSABuilder(TiledObject):
     def __init__(
         self,
         program: ControlProgram,
@@ -1433,6 +1434,7 @@ class _ControlSSABuilder:
         native_object_collections: Mapping[int, Mapping[str, Any]] | None = None,
         native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
     ):
+        TiledObject.__post_init__(self)
         from .evolution_metagraph import (
             active_evolution_metagraph,
             record_control_program_evolution,
@@ -5137,6 +5139,20 @@ class _ControlSSABuilder:
             self._resolve_read(value_id, bindings, reader)
             if self.enclosing_loop_states else None
         )
+        if resolved is None and self.enclosing_loop_states:
+            # topological_order's indegree store spelling75 is a planning
+            # alias of resident2, not a new scalar formal. Neither enclosing
+            # loop carries75; the temporary body aliases2->75 and75->2 must
+            # not mint75 as a second ABI argument. Consult the durable
+            # planning resident AFTER the exact authored generation: doing
+            # this first would lose total=tensor(0)'s carried constructor in
+            # favour of its literal-zero resident. Both reads use the same
+            # lexical binding edges; no name/dtype/storage guess is involved.
+            resident = self._concorded_resident(int(value_id))
+            if resident != int(value_id):
+                resolved = self._resolve_read(resident, bindings, reader)
+                if resolved is None:
+                    return self.external_value(resident)
         return self.external_value(int(value_id)) if resolved is None else resolved
 
     def _callsite_argument(
@@ -5251,6 +5267,7 @@ class _ControlSSABuilder:
         consumers = book.page(REGION_FEED_CONSUMER).latest(feed_row) or ()
         operand_page = book.page("consumer_operand")
         operands = []
+        source_operands = {}
         for consumer in consumers:
             positions = operand_page.latest(
                 (self.lexical_read_scope, int(consumer), int(value_id))
@@ -5259,12 +5276,21 @@ class _ControlSSABuilder:
                 # The consumer's operand is a version that resolves to this
                 # feed (an in-place store chain resolving to its arena): its
                 # row is keyed by that version.
-                positions = tuple(
-                    position
-                    for alias in self._aliases_resolving_to(int(value_id))
-                    for position in (operand_page.latest(
+                alias_positions_for_consumer = []
+                for alias in self._aliases_resolving_to(int(value_id)):
+                    alias_positions = operand_page.latest(
                         (self.lexical_read_scope, int(consumer), alias)
-                    ) or ())
+                    ) or ()
+                    if alias_positions:
+                        alias_positions_for_consumer.extend(alias_positions)
+                        source_operands.setdefault(alias, []).extend(
+                            (int(consumer), role, ordinal)
+                            for role, ordinal in alias_positions
+                        )
+                positions = tuple(alias_positions_for_consumer)
+            else:
+                source_operands.setdefault(int(value_id), []).extend(
+                    (int(consumer), role, ordinal) for role, ordinal in positions
                 )
             if not positions:
                 # No ``consumer_operand`` row: recorded before the fallback
@@ -5275,10 +5301,31 @@ class _ControlSSABuilder:
                     self._canonical_cell(consumer),
                 )
                 operands.append((int(consumer), None, 0))
+                source_operands.setdefault(int(value_id), []).append(
+                    (int(consumer), None, 0),
+                )
                 continue
             operands.extend(
                 (int(consumer), role, ordinal) for role, ordinal in positions
             )
+        if source_operands:
+            # total = tensor(0); total += amount: planning aliases the tensor
+            # constructor to its literal, but the loop carries the constructor
+            # identity. Resolve each exact consumer operand in its lexical
+            # generation, not the physical planning resident (constant zero).
+            # Different carried generations cannot share one regional formal.
+            reads = [
+                self._read(source_id, self._operand_bindings(rows),
+                           f"region {region_index}")
+                for source_id, rows in source_operands.items()
+            ]
+            if len({read.id for read in reads}) != 1:
+                raise ValueError(
+                    f"{self.function_name}: region {region_index} feed "
+                    f"{value_id} aliases distinct lexical generations: "
+                    f"{tuple((source, read.id) for source, read in zip(source_operands, reads))!r}"
+                )
+            return reads[0]
         return self._read(
             value_id, self._operand_bindings(operands),
             f"region {region_index}",
@@ -10206,6 +10253,7 @@ class _ControlSSABuilder:
             )
         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
         own_result_ports = {int(port_id) for port_id, *_ in loop.result_ports}
+        reserved_updates: set[int] = set()
         for updated_id, initial_id in loop.carried_aliases:
             updated_id = int(updated_id)
             initial_id = int(initial_id)
@@ -10241,7 +10289,8 @@ class _ControlSSABuilder:
                     updated_id, updated_value, BindingKind.LOOP_SEED,
                     initial_value, self._construct_cell(loop.source_loop_node_id),
                 )
-            else:
+                reserved_updates.add(updated_id)
+            elif updated_id not in reserved_updates:
                 # An authored binding may be updated to a value which
                 # already exists before the loop (``last = proposal``).
                 # That value is the exact backedge resident.  Reserving a
@@ -10278,28 +10327,12 @@ class _ControlSSABuilder:
         latch = self.new_block("loop_latch")
         exit_block = self.new_block("loop_exit")
         self.current = preheader
-        # Seed every carried SLOT from its initial value before entering the
-        # loop. The carried updated id is one storage slot: the body reads it
-        # at the top of an iteration (a linked call's argument binds there --
-        # that is the aliased-input/output design, one slot per carried value,
-        # no copies inside the loop) and writes it before the latch. Reading
-        # slot-then-writing-slot is correct on every iteration EXCEPT the
-        # first, where nothing has written the slot yet; without this seed the
-        # first iteration reads an uninitialized slot, which the materializer
-        # reports as use-before-def and a native backend reads as garbage.
-        # The seed is emitted onto the SAME reserved SSAValue object the body
-        # will later redefine -- in-place reuse of one slot, which the
-        # well-formedness rules accept for one object (diagnose stage 2a).
-        for _updated_id, _initial_id, initial_value, reserved, _current in carried:
-            self.emit(
-                Handler.Cast,
-                [initial_value],
-                reserved,
-                attributes={
-                    "binding": "loop_carried_seed",
-                    "target_dtype": str(initial_value.dtype or "float64"),
-                },
-            )
+        # The header Phi already selects the preheader seed. Its reserved
+        # backedge value belongs to the body's producer, not a second Cast
+        # definition in the preheader. In `m=next_m; w=next_w; total=w`, two
+        # bindings share that update; seeding it twice made legalization pick
+        # the preheader value instead of the body's result and froze the loop.
+        # A reused reservation also is not a pre-existing authored update.
         if deployment_id is not None:
             self.emit_deployment_boundary(Handler.Deploy, record)
         self.branch(header)
@@ -10428,6 +10461,7 @@ class _ControlSSABuilder:
             ),
         }
         self.loop_exit_contexts.append(exit_context)
+        exit_context = self.loop_exit_contexts[-1]
         if deployment_id is not None:
             # Lane zero is the SSA template for every independent iteration;
             # the iteration space above tells a deployment pass how to fan it
@@ -10822,7 +10856,9 @@ class _ControlSSABuilder:
                     "induction": loop.induction,
                 },
             )
-        blocks_before_body = {id(existing) for existing in self.blocks.values()}
+        # CFG keys and SSA ids survive storage eviction; Python object
+        # addresses do not. These are the function's authoritative identities.
+        blocks_before_body = {existing.name for existing in self.blocks.values()}
         initial_counts: dict[int, int] = {}
         for _updated_id, initial_id, *_rest in carried:
             initial_counts[int(initial_id)] = (
@@ -10851,7 +10887,7 @@ class _ControlSSABuilder:
         body_blocks = [
             candidate
             for candidate in self.blocks.values()
-            if id(candidate) not in blocks_before_body or candidate is body
+            if candidate.name not in blocks_before_body or candidate.name == body.name
         ]
         # A nested retained loop may carry the same source state as this loop.
         # Its exit Phi is then the value produced by this iteration, but the
@@ -10880,13 +10916,13 @@ class _ControlSSABuilder:
         # its seed, which is the exact miscompilation shape this check exists
         # to refuse.
         produced_results = {
-            id(instruction.res)
+            int(instruction.res.id)
             for basic_block in body_blocks
             for instruction in basic_block.instrs
             if instruction.res is not None
         }
         for entry, (updated_id, _initial_id, _initial, updated, _current) in enumerate(carried):
-            if id(carried_updates[entry]) not in produced_results:
+            if int(carried_updates[entry].id) not in produced_results:
                 if updated.accounting.get(
                     "loop_carried_preexisting_update"
                 ):
@@ -11357,11 +11393,12 @@ class _ControlSSABuilder:
             ),
         }
         self.loop_exit_contexts.append(exit_context)
+        exit_context = self.loop_exit_contexts[-1]
         preserved_before_body = set(self.preserved_region_output_ids)
         self.preserved_region_output_ids.update(
             int(initial_id) for _updated_id, initial_id, *_rest in carried
         )
-        blocks_before_body = {id(existing) for existing in self.blocks.values()}
+        blocks_before_body = {existing.name for existing in self.blocks.values()}
         initial_counts: dict[int, int] = {}
         for _updated_id, initial_id, *_rest in carried:
             initial_counts[int(initial_id)] = (
@@ -11390,7 +11427,7 @@ class _ControlSSABuilder:
         body_blocks = [
             candidate
             for candidate in self.blocks.values()
-            if id(candidate) not in blocks_before_body or candidate is body
+            if candidate.name not in blocks_before_body or candidate.name == body.name
         ]
         carried_updates: dict[int, SSAValue] = {}
         for entry, (updated_id, _initial_id, _initial, reserved, _current) in enumerate(carried):
@@ -11407,13 +11444,13 @@ class _ControlSSABuilder:
                 flush=True,
             )
         produced_results = {
-            id(instruction.res)
+            int(instruction.res.id)
             for basic_block in body_blocks
             for instruction in basic_block.instrs
             if instruction.res is not None
         }
         for entry, (updated_id, _initial_id, _initial, updated, current) in enumerate(carried):
-            if id(carried_updates[entry]) not in produced_results:
+            if int(carried_updates[entry].id) not in produced_results:
                 if updated.accounting.get(
                     "loop_carried_preexisting_update"
                 ):
@@ -14522,6 +14559,20 @@ def _schedule_loop_callsites(
         )
         return min(positions) if positions else None
 
+    def has_terminal_edge(block: Any) -> bool:
+        """Does this subtree cut the current lexical fallthrough edge?"""
+        if isinstance(block, LoopControlBlock):
+            return True
+        if isinstance(block, SequenceBlock):
+            return any(has_terminal_edge(child) for child in block.blocks)
+        if isinstance(block, ConditionalBlock):
+            return has_terminal_edge(block.body) or (
+                block.orelse is not None and has_terminal_edge(block.orelse)
+            )
+        # A nested loop owns its break/continue edges; they do not cut this
+        # enclosing sequence's fallthrough. Callee exits likewise stay local.
+        return False
+
     def dependency_order(block: Any) -> Any:
         """Stable-toposort exact structural dependencies in one lexical arm.
 
@@ -14590,7 +14641,7 @@ def _schedule_loop_callsites(
                 terminal_segment = 0
                 for child in run:
                     terminal_segments.append(terminal_segment)
-                    if isinstance(child, LoopControlBlock):
+                    if has_terminal_edge(child):
                         terminal_segment += 1
                 ranked_by_segment: dict[int, list[tuple[int, int]]] = {}
                 for position, hierarchy_position in enumerate(hierarchy_positions):
@@ -14681,7 +14732,12 @@ def _schedule_loop_callsites(
                     # A source-placed call following a guarded continue/return
                     # must not execute on that terminal edge while waiting for
                     # the guard's numerical producer.
-                    if isinstance(child, LoopControlBlock):
+                    # The real dt step's no-save ConditionalBlock contains a
+                    # return. Treating only bare LoopControlBlocks as terminals
+                    # chained accept region27 -> early region14 by flat rank;
+                    # its dependency cone pulled the accept PI ahead of no-save.
+                    # That return cuts fallthrough just as a bare edge does.
+                    if has_terminal_edge(child):
                         last_terminal = position
                     elif isinstance(child, StatementBlock) and last_terminal is not None:
                         if any(
@@ -17490,6 +17546,11 @@ def lower_control_sections_to_ssa(
                 arguments,
                 {"entry": BasicBlock("entry", instructions)},
             )
+            # Construction adopts the authoritative mutable tile handles.
+            # The publication Ret below and later feed refinements must write
+            # this block, not the raw construction list it replaced.
+            instructions = region_function.blocks["entry"].instrs
+            arguments = region_function.args
             # A planned region is a compile-complementary source integral,
             # not an anonymous backend kernel.  Retain its deterministic
             # structural address so a bounded project compile can publish a

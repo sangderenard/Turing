@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import importlib
 from typing import Any, Callable, Iterable, Mapping
+from ..compiler.live_tiles import TiledObject
 
 
 @dataclass(frozen=True, order=True)
@@ -104,7 +105,7 @@ def _parameter_contracts(
 
 
 @dataclass
-class FunctionEntry:
+class FunctionEntry(TiledObject):
     """One named function and its available representations."""
 
     reference: FunctionReference
@@ -150,7 +151,7 @@ class StaticFunctionSlot:
         return self._target(*args, **kwargs)
 
 
-class FunctionTable:
+class FunctionTable(TiledObject):
     """Addressable, recursion-aware function registry shared by compiler IRs."""
 
     def __init__(self) -> None:
@@ -158,6 +159,7 @@ class FunctionTable:
         self._bindings: dict[str, FunctionReference] = {}
         self._qualified: dict[str, FunctionReference] = {}
         self._next_address = 0
+        TiledObject.__post_init__(self)
 
     def declare(
         self,

@@ -1,0 +1,1662 @@
+"""Writable compiler storage over the existing compressed RAM/disk tiles.
+
+NetworkX remains the graph implementation; SSA/control objects remain their
+original objects. Only their container/attribute ownership changes. References
+are encoded by the arena, not recursively pickled into independent copies.
+An escaping container view is a stable handle, never a stale decoded payload.
+"""
+from __future__ import annotations
+
+from collections import OrderedDict
+from array import array
+from collections.abc import MutableMapping, MutableSequence, MutableSet, Set
+from contextvars import ContextVar
+from dataclasses import dataclass
+from dataclasses import is_dataclass
+from dataclasses import fields as dataclass_fields
+import gc
+import io
+import operator
+import pickle
+import sys
+import tempfile
+from threading import RLock
+import weakref
+
+from .compressed_tiles import CompressedTile, DiskTile, DiskTileStore, DiskTileDirectory
+
+
+_ACTIVE_ARENA = ContextVar("compiler_live_tile_arena", default=None)
+_MEMO_SOURCES = object()
+_PLAIN_VALUE_TYPES = frozenset({type(None), str, bytes, int, float, complex,
+                               bool, dict, list, tuple, set, frozenset})
+
+
+def _value_fact(kind):
+    """The immutable value vocabulary of the SAME concordance tile codec."""
+    return (kind.__module__ in {"src.compiler.concordance_declarations",
+                                "src.compiler.identity_concordance"}
+            and kind.__name__ not in {"Page", "Stage", "Transform", "Reason"}
+            and is_dataclass(kind) and kind.__dataclass_params__.frozen)
+
+
+@dataclass(frozen=True)
+class LiveTileStats:
+    records: int
+    tiles: int
+    hot_tiles: int
+    hot_peak: int
+    resident_encoded_bytes: int
+    disk_bytes: int
+    disk_tiles: int
+    compressions: int
+    reloads: int
+    identity_headers: int
+    owned_header_bytes: int = 0
+    catalogued_headers: int = 0
+    decoded_bytes: int = 0
+    decoded_peak_bytes: int = 0
+
+
+@dataclass(slots=True)
+class _DecodedSize:
+    """Size measurements for the currently decoded rows, discarded on eviction."""
+    total: int
+    rows: array
+
+
+class LiveTileArena:
+    """One shared bounded decoded cache, not one cache per graph or function.
+
+    A tile contains at most tile_rows storage records. Maps split before a
+    bucket exceeds bucket_rows; sequences use independently indexed chunks.
+    Opaque semantic leaves stay exact and are counted, never silently copied.
+    This bounds decoded tiles, not Python allocator slack or a giant leaf.
+    """
+    def __init__(self, *, tile_rows=64, hot_tiles=8, bucket_rows=64, directory=None,
+                 decoded_budget_bytes=128 << 20):
+        if min(tile_rows, hot_tiles, bucket_rows) <= 0:
+            raise ValueError("live tile bounds must be positive")
+        self.tile_rows, self.hot_limit, self.bucket_rows = tile_rows, hot_tiles, bucket_rows
+        self.directory = directory
+        if decoded_budget_bytes <= 0:
+            raise ValueError("decoded tile budget must be positive")
+        self.decoded_budget_bytes = decoded_budget_bytes
+        self._decoded_sizes = {}
+        self._decoded_bytes = self._decoded_peak = 0
+        self._tiles = []
+        self._hot = OrderedDict()
+        self._dirty = set()
+        self._count = 0
+        self._refs = weakref.WeakValueDictionary()
+        self._reference_count = 0
+        self._classes = []
+        self._class_ids = {}
+        # Identity descriptors contain only scalar handles, never payload
+        # objects. Separate allocation pages prevent a data tile's decoder
+        # from recursively trying to decode its own identity catalogue.
+        self._cursors = {}
+        self._page_kinds = array("B")
+        self._row_lengths = array("I")
+        self._leaf_refs = {}
+        self._lock = RLock()
+        self._store = None
+        self._live_disk_bytes = 0
+        self.compactions = 0
+        self.disk_mode = False
+        self.compressions = self.reloads = self.hot_peak = 0
+        self.categories = set()
+        self.pressure_probe = None
+        self._operations = 0
+        self._inside_probe = False
+
+    def _pressure(self):
+        self._operations += 1
+        if self._operations % 128 == 0 and self.pressure_probe is not None and not self._inside_probe:
+            self._inside_probe = True
+            try:
+                self.pressure_probe("live storage access/allocation")
+            finally:
+                self._inside_probe = False
+
+    def _dump(self, records):
+        stream = io.BytesIO()
+        owner = self
+        class Writer(pickle.Pickler):
+            def persistent_id(self, value):
+                # The one-expression forced-disk source repro made 17.8M
+                # visits here. Ordinary ints/strings/container records need
+                # no identity lookup; checking ABC-backed tiled classes first
+                # spent most encoding time dispatching __instancecheck__.
+                kind = type(value)
+                if kind in _PLAIN_VALUE_TYPES:
+                    return None
+                if kind is _StorageLink:
+                    return None
+                if isinstance(value, (TiledDict, TiledList, TiledTuple, TiledSet)):
+                    if value._arena is owner:
+                        return ("live", value._ref)
+                if isinstance(value, TiledObject):
+                    state = object.__getattribute__(value, "__dict__")
+                    if state.get("_tile_arena") is owner:
+                        return ("live", state["_tile_ref"])
+                # Concordance facts are immutable value records, already
+                # serialized by value in the existing book tile codec. Only
+                # their registry Page/Stage/Transform/Reason leaves are exact
+                # shared identities. Do not pin millions of fact payloads.
+                if _value_fact(kind):
+                    return None
+                # Non-container semantic leaves must preserve actual identity:
+                # AST objects, registries, tensor descriptors, imported bindings.
+                owner._leaf_refs[id(value)] = value
+                return ("leaf", id(value))
+        Writer(stream, protocol=pickle.HIGHEST_PROTOCOL).dump(records)
+        return stream.getvalue()
+
+    def _load(self, data):
+        owner = self
+        class Reader(pickle.Unpickler):
+            def persistent_load(self, key):
+                if key[0] == "live":
+                    return owner.resolve_reference(key[1])
+                if key[0] == "leaf":
+                    return owner._leaf_refs[key[1]]
+                raise ValueError("unknown compiler tile reference")
+        return Reader(io.BytesIO(data)).load()
+
+    def _encode(self, index):
+        if index not in self._dirty and self._tiles[index] is not None:
+            return
+        records = self._hot[index]
+        data = self._dump(records)
+        # Commit the replacement before dropping the decoded generation.
+        # Dirty active tiles use zlib9 on disk (RAM uses zlib1). LZMA belongs
+        # to the cold escalation, not every clock/operand update: forcing it
+        # on every dirty eviction made two-tile micro-compiles minutes long.
+        record = (self._disk_store().write(data, len(records), heavy=False) if self.disk_mode
+                  else CompressedTile.encode(data, len(records), 1))
+        previous = self._tiles[index]
+        self._tiles[index] = record
+        if isinstance(record, DiskTile):
+            self._live_disk_bytes += record.stored_bytes - (
+                previous.stored_bytes if isinstance(previous, DiskTile) else 0)
+        self._dirty.discard(index)
+        self.compressions += 1
+
+    def _disk_store(self):
+        if self._store is None:
+            self._store = DiskTileStore(self.directory)
+        return self._store
+
+    def reference(self, value):
+        handle = self.allocate(self._descriptor(value), header=True)
+        self._remember(handle, value)
+        self._reference_count += 1
+        return handle
+
+    def _remember(self, handle, value):
+        if isinstance(value, TiledTuple):
+            # CPython tuples cannot be weak-referenced. A collectable anchor
+            # cycle retains the same tuple while it is externally alive,
+            # without turning the catalogue into a strong owner of every row.
+            anchor = _TupleAnchor(value)
+            value._anchor = anchor
+            self._refs[handle] = anchor
+        else:
+            self._refs[handle] = value
+
+    def _descriptor(self, value):
+        if isinstance(value, TiledDict):
+            return ("dict", value._root,
+                    -1 if value._order is None else value._order._ref,
+                    value._count, value._version)
+        if isinstance(value, TiledList):
+            return ("list", -1 if value._first is None else value._first,
+                    -1 if value._chunks is None else value._chunks._ref,
+                    value._count)
+        if isinstance(value, TiledTuple):
+            return ("tuple", value._sequence._ref)
+        if isinstance(value, TiledSet):
+            return ("set", value._members._ref)
+        kind = type(value)
+        class_id = self._class_ids.get(kind)
+        if class_id is None:
+            class_id = len(self._classes)
+            self._classes.append(kind)
+            self._class_ids[kind] = class_id
+        state = object.__getattribute__(value, "__dict__")
+        return ("object", class_id, state["_tile_fields"]._ref)
+
+    def save_header(self, value):
+        self.write(value._ref, self._descriptor(value))
+
+    def resolve_reference(self, handle):
+        with self._lock:
+            value = self._refs.get(handle)
+            if value is not None:
+                return value.value if isinstance(value, _TupleAnchor) else value
+            descriptor = self.read(handle)
+            tag = descriptor[0]
+            if tag == "dict":
+                _, root, order, count, version = descriptor
+                value = dict.__new__(TiledDict)
+                value._arena, value._root = self, root
+                value._order, value._count, value._version, value._ref = None, count, version, handle
+                self._remember(handle, value)
+                if order != -1:
+                    value._order = self.resolve_reference(order)
+            elif tag == "list":
+                _, first, chunks, count = descriptor
+                value = list.__new__(TiledList)
+                value._arena, value._first = self, None if first == -1 else first
+                value._chunks, value._count, value._ref = None, count, handle
+                self._remember(handle, value)
+                if chunks != -1:
+                    value._chunks = self.resolve_reference(chunks)
+            elif tag == "tuple":
+                value = tuple.__new__(TiledTuple)
+                value._sequence = self.resolve_reference(descriptor[1])
+                value._arena, value._ref = self, handle
+                self._remember(handle, value)
+            elif tag == "set":
+                value = object.__new__(TiledSet)
+                value._arena, value._ref = self, handle
+                self._remember(handle, value)
+                value._members = self.resolve_reference(descriptor[1])
+            elif tag == "object":
+                kind = self._classes[descriptor[1]]
+                value = object.__new__(kind)
+                state = object.__getattribute__(value, "__dict__")
+                state.update(_tile_arena=self, _tile_ref=handle)
+                self._remember(handle, value)
+                state["_tile_fields"] = self.resolve_reference(descriptor[2])
+            else:
+                raise ValueError("invalid compiler identity descriptor")
+            return value
+
+    def _trim(self, except_index=None):
+        while (len(self._hot) > self.hot_limit or self._decoded_bytes > self.decoded_budget_bytes):
+            victim = next((i for i in self._hot if i != except_index), None)
+            if victim is None:
+                break  # the one accessed tile is the current decoding workspace
+            self._encode(victim)
+            self._drop_hot(victim)
+        if (self._store is not None
+                and self._store.bytes_written - self._live_disk_bytes >= 64 << 20
+                and self._store.bytes_written > 2 * self._live_disk_bytes):
+            self.compact_disk()
+
+    def _page(self, index):
+        if index not in self._hot:
+            record = self._tiles[index]
+            self._hot[index] = ([None] * self._row_lengths[index] if record is None
+                                else self._load(record.decode()))
+            self._measure_page(index)
+            self.reloads += 1
+        self._hot.move_to_end(index)
+        self._trim(except_index=index)
+        self.hot_peak = max(self.hot_peak, len(self._hot))
+        return self._hot[index]
+
+    def _set_size(self, index, size):
+        current = self._decoded_sizes[index]
+        self._decoded_bytes += size - current.total
+        current.total = size
+        self._decoded_peak = max(self._decoded_peak, self._decoded_bytes)
+
+    def _measure_page(self, index):
+        rows = self._hot[index]
+        sizes = array("Q", (_owned_row_bytes(value) for value in rows))
+        size = sys.getsizeof(rows) + sum(sizes) + sys.getsizeof(sizes)
+        previous = self._decoded_sizes.get(index)
+        self._decoded_bytes += size - (0 if previous is None else previous.total)
+        self._decoded_sizes[index] = _DecodedSize(size, sizes)
+        self._decoded_peak = max(self._decoded_peak, self._decoded_bytes)
+
+    def _drop_hot(self, index):
+        del self._hot[index]
+        self._decoded_bytes -= self._decoded_sizes.pop(index).total
+
+    def allocate(self, value, *, header=False):
+        self._pressure()
+        with self._lock:
+            cursor = self._cursors.get(header)
+            if cursor is None or cursor[1] == self.tile_rows:
+                index = len(self._tiles)
+                position = 0
+                if isinstance(self._tiles, DiskTileDirectory):
+                    self._tiles.append(None, kind=int(header))
+                else:
+                    self._tiles.append(None)
+                    self._page_kinds.append(int(header))
+                    self._row_lengths.append(0)
+                self._hot[index] = []
+                self._measure_page(index)
+            else:
+                index, position = cursor
+            rows = self._page(index)
+            measured = self._decoded_sizes[index]
+            before = sys.getsizeof(rows) + sys.getsizeof(measured.rows)
+            size = _owned_row_bytes(value)
+            rows.append(value)
+            measured.rows.append(size)
+            self._set_size(index, measured.total + size + sys.getsizeof(rows)
+                           + sys.getsizeof(measured.rows) - before)
+            self._row_lengths[index] += 1
+            self._dirty.add(index)
+            handle = index * self.tile_rows + position
+            self._cursors[header] = (index, position + 1)
+            self._count += 1
+            return handle
+
+    def read(self, handle):
+        self._pressure()
+        with self._lock:
+            index, position = divmod(handle, self.tile_rows)
+            value = self._page(index)[position]
+            # An individually oversized tile need not remain cached once its
+            # requested row has been selected. The caller holds only that row.
+            self._trim()
+            return value
+
+    def write(self, handle, value):
+        self._pressure()
+        with self._lock:
+            index, position = divmod(handle, self.tile_rows)
+            rows = self._page(index)
+            measured = self._decoded_sizes[index]
+            before = measured.rows[position]
+            size = _owned_row_bytes(value)
+            rows[position] = value
+            # The old writer re-traversed the entire previous bounded row
+            # just to subtract the same measurement made at its last write.
+            # Keep that scalar only while this row is decoded; eviction drops
+            # it with the payload. This is cache accounting, not graph identity.
+            measured.rows[position] = size
+            self._set_size(index, measured.total + size - before)
+            self._dirty.add(index)
+            self._trim()
+
+    def manage(self, value, memo=None):
+        if isinstance(value, (TiledDict, TiledList, TiledTuple, TiledSet)):
+            return value
+        if isinstance(value, TiledObject):
+            self.attach(value)
+            return value
+        memo = {} if memo is None else memo
+        memo.setdefault(_MEMO_SOURCES, []).append(value)
+        if id(value) in memo:
+            return memo[id(value)]
+        if type(value) is dict:
+            result = TiledDict(self)
+            memo[id(value)] = result
+            for key, member in value.items():
+                result._set(key, self.manage(member, memo))
+            return result
+        if type(value) is tuple and len(value) <= self.bucket_rows:
+            # Immutable small records need no mutable container header. Their
+            # object edges still use the arena's exact-reference codec.
+            members = tuple(self.manage(member, memo) for member in value)
+            return value if all(a is b for a, b in zip(value, members)) else members
+        if type(value) in {list, tuple}:
+            result = TiledList(self)
+            view = TiledTuple(result) if type(value) is tuple else result
+            memo[id(value)] = view
+            for member in value:
+                result._append(self.manage(member, memo))
+            return view
+        if type(value) is set:
+            result = TiledSet(self)
+            memo[id(value)] = result
+            for member in value:
+                result.add(self.manage(member, memo))
+            return result
+        if _value_fact(type(value)):
+            # Derived(cells=(...)) was one giant decoded pickle row, counted
+            # as just56 bytes. Page/Stage/Transform/Reason identities remain
+            # exact leaves; immutable fact fields use the same paged sequence
+            # protocol as ordinary data, retaining the original fact class.
+            result = object.__new__(type(value))
+            memo[id(value)] = result
+            changed = False
+            for field in dataclass_fields(value):
+                previous = getattr(value, field.name)
+                member = self.manage(previous, memo)
+                changed |= member is not previous
+                object.__setattr__(result, field.name, member)
+            if not changed:
+                memo[id(value)] = value
+                return value
+            # Frozen Ref's cached hash remains valid: field values are equal.
+            state = getattr(value, "__dict__", {})
+            for name, member in state.items():
+                if name not in result.__dict__:
+                    object.__setattr__(result, name, member)
+            return result
+        return value
+
+    def attach(self, value):
+        state = object.__getattribute__(value, "__dict__")
+        if "_tile_arena" in state:
+            return value
+        # Install the handle before following edges: self/recursive references
+        # belong to the SAME object, not a reconstructed compiler graph.
+        fields = TiledDict(self)
+        previous = dict(state)
+        state.clear()
+        state.update(_tile_arena=self, _tile_fields=fields)
+        state["_tile_ref"] = self.reference(value)
+        try:
+            for name, member in previous.items():
+                fields[name] = member
+        except BaseException:
+            state.clear()
+            state.update(previous)
+            raise
+        self.categories.add(type(value).__module__ + "." + type(value).__name__)
+        return value
+
+    def flush(self):
+        with self._lock:
+            for index in tuple(self._hot):
+                self._encode(index)
+                self._drop_hot(index)
+        return self.stats()
+
+    def offload_to_disk(self):
+        """Future dirty evictions also go directly to the stronger disk tier."""
+        with self._lock:
+            self.disk_mode = True
+            self.flush()
+            store = self._disk_store()
+            for index, record in enumerate(self._tiles):
+                if record is not None and not isinstance(record, DiskTile):
+                    self._tiles[index] = store.write(record.decode(), record.rows)
+                    self._live_disk_bytes += self._tiles[index].stored_bytes
+            if not isinstance(self._tiles, DiskTileDirectory):
+                directory = DiskTileDirectory(store, self.directory)
+                for index, record in enumerate(self._tiles):
+                    directory.append(record, kind=self._page_kinds[index], rows=self._row_lengths[index])
+                directory.flush()
+                self._tiles = directory
+                self._page_kinds, self._row_lengths = directory.kinds, directory.row_lengths
+        return self.stats()
+
+    def _raw_load(self, data):
+        owner = self
+        class Reader(pickle.Unpickler):
+            def persistent_load(self, key):
+                if key[0] == "live":
+                    return _ManagedLink(key[1])
+                if key[0] == "leaf":
+                    leaf = owner._leaf_refs[key[1]]
+                    # NEWOBJ requires the actual class, but a payload's opaque
+                    # leaf can be a marker. No compiler objects are revived by
+                    # the collector merely to find their storage edges.
+                    return leaf if isinstance(leaf, type) else _OpaqueLink(key[1])
+                raise ValueError("unknown compiler tile reference")
+        return Reader(io.BytesIO(data)).load()
+
+    def collect_unused(self):
+        """Mark/sweep the actual storage graph from still-live handle views.
+
+        Drain decoded caches first so they do not become artificial roots.
+        Mark bits and the traversal frontier are disk-backed bounded buffers;
+        no second semantic/provenance ledger or whole-graph working copy.
+        Missing roots are never inferred from names, SSA ids or refcounts.
+        """
+        with self._lock:
+            previous_probe, self.pressure_probe = self.pressure_probe, None
+            try:
+                self.flush()
+                gc.collect()
+                roots = tuple(self._refs.keys())
+                leaves = set()
+                # Class objects are codec vocabulary, not graph payloads.
+                leaves.update(identity for identity, leaf in self._leaf_refs.items()
+                              if isinstance(leaf, type))
+                reclaimed = 0
+                with _DiskMarks(self.directory) as marked, _DiskFrontier(self.directory) as pending:
+                    def edge(handle):
+                        if handle != -1 and marked.mark(handle):
+                            pending.push(handle)
+                    for handle in roots:
+                        edge(handle)
+                    cache_index, cache = -1, None
+                    while pending:
+                        handle = pending.pop()
+                        index, position = divmod(handle, self.tile_rows)
+                        if index != cache_index:
+                            encoded = self._tiles[index]
+                            cache = ([None] * self._row_lengths[index] if encoded is None
+                                     else self._raw_load(encoded.decode()))
+                            cache_index = index
+                        record = cache[position]
+                        if record is None:
+                            raise ValueError("live compiler handle points to reclaimed storage")
+                        if self._page_kinds[index]:
+                            tag = record[0]
+                            if tag == "dict":
+                                edge(record[1]); edge(record[2])
+                            elif tag == "list":
+                                edge(record[1]); edge(record[2])
+                            elif tag in {"tuple", "set"}:
+                                edge(record[1])
+                            elif tag == "object":
+                                edge(record[2])
+                            continue
+                        if isinstance(record, tuple) and len(record) == 2:
+                            tag, payload = record
+                            if tag == "branch":
+                                edge(payload[1]); edge(payload[2])
+                            elif tag == "collision" and payload[1] is not None:
+                                edge(payload[1])
+                        work = [record]
+                        while work:
+                            value = work.pop()
+                            if isinstance(value, (_StorageLink, _ManagedLink)):
+                                edge(value.handle)
+                            elif isinstance(value, _OpaqueLink):
+                                leaves.add(value.identity)
+                            elif type(value) is dict:
+                                for key, member in value.items():
+                                    work.extend((key, member))
+                            elif type(value) in {tuple, list, set, frozenset}:
+                                work.extend(value)
+                            elif is_dataclass(value):
+                                work.extend(getattr(value, field.name) for field in dataclass_fields(value))
+                    # No mutation until marking succeeds. Sweep one encoded
+                    # tile at a time; its surviving rows keep the SAME handles.
+                    for index, encoded in enumerate(self._tiles):
+                        if encoded is None:
+                            continue
+                        rows = self._raw_load(encoded.decode())
+                        keep = [marked.contains(index * self.tile_rows + p) for p in range(len(rows))]
+                        dead = sum(row is not None and not live for row, live in zip(rows, keep))
+                        if not dead:
+                            continue
+                        reclaimed += dead
+                        if not any(keep):
+                            self._tiles[index] = None
+                            if isinstance(encoded, DiskTile):
+                                self._live_disk_bytes -= encoded.stored_bytes
+                            continue
+                        # Decode actual references only in a partially live
+                        # tile, then release unmarked rows before re-encoding.
+                        self._hot[index] = [self._restore_raw(v) if live else None
+                                            for v, live in zip(rows, keep)]
+                        self._measure_page(index)
+                        self._dirty.add(index)
+                        self._encode(index)
+                        self._drop_hot(index)
+                removed = len(self._leaf_refs) - len(leaves)
+                self._leaf_refs = {identity: self._leaf_refs[identity] for identity in leaves}
+                gc.collect()
+                if self.disk_mode:
+                    self.compact_disk()
+                return {"reclaimed_records": reclaimed, "reclaimed_leaves": removed,
+                        "live_roots": len(roots)}
+            finally:
+                self.pressure_probe = previous_probe
+
+    def _restore_raw(self, value):
+        # Restore only marked rows. Loading the whole original tile would
+        # revive dead headers, including ones an earlier sweep reclaimed.
+        if isinstance(value, _ManagedLink):
+            return self.resolve_reference(value.handle)
+        if isinstance(value, _OpaqueLink):
+            return self._leaf_refs[value.identity]
+        kind = type(value)
+        if kind is dict:
+            return {self._restore_raw(k): self._restore_raw(v) for k, v in value.items()}
+        if kind in {list, tuple, set, frozenset}:
+            return kind(self._restore_raw(v) for v in value)
+        if kind is not _StorageLink and is_dataclass(value) and not isinstance(value, type):
+            result = object.__new__(kind)
+            for field in dataclass_fields(value):
+                object.__setattr__(result, field.name, self._restore_raw(getattr(value, field.name)))
+            return result
+        return value
+
+    def compact_disk(self):
+        """Reclaim superseded disk records, streaming one tile at a time.
+
+        Only this arena's exclusive records move. A failed candidate leaves
+        the original index/file readable; old shared files survive readers.
+        Compaction is also the deeper LZMA/zlib9 cold compression pass.
+        """
+        with self._lock:
+            if self._store is None:
+                return self.stats()
+            candidate = DiskTileStore(self.directory)
+            replacements = DiskTileDirectory(candidate, self.directory)
+            live = 0
+            for index, record in enumerate(self._tiles):
+                if isinstance(record, DiskTile):
+                    record = candidate.write(record.decode(), record.rows)
+                    live += record.stored_bytes
+                elif record is not None:
+                    record = candidate.write(record.decode(), record.rows)
+                    live += record.stored_bytes
+                replacements.append(record, kind=self._page_kinds[index], rows=self._row_lengths[index])
+            replacements.flush()
+            # Atomic index commit; no whole graph/table is decoded together.
+            self._tiles = replacements
+            self._page_kinds, self._row_lengths = replacements.kinds, replacements.row_lengths
+            self._store = candidate
+            self._live_disk_bytes = live
+            self.compactions += 1
+        return self.stats()
+
+    def stats(self):
+        encoded = sum(sys.getsizeof(t) + sys.getsizeof(t.payload)
+                      for t in self._tiles if isinstance(t, CompressedTile))
+        disk_bytes = disk_count = 0
+        for record in self._tiles:
+            if isinstance(record, DiskTile):
+                disk_bytes += record.stored_bytes
+                disk_count += 1
+        headers = (sys.getsizeof(self._refs) + sys.getsizeof(self._refs.data)
+                   + sys.getsizeof(self._leaf_refs) + sys.getsizeof(self._decoded_sizes)
+                   + sys.getsizeof(self._classes) + sys.getsizeof(self._class_ids))
+        headers += sum(sys.getsizeof(measured) for measured in self._decoded_sizes.values())
+        if isinstance(self._tiles, DiskTileDirectory):
+            headers += self._tiles.resident_bytes()
+        else:
+            headers += (sys.getsizeof(self._tiles) + sys.getsizeof(self._page_kinds)
+                        + sys.getsizeof(self._row_lengths))
+            headers += sum(sys.getsizeof(t) for t in self._tiles if isinstance(t, DiskTile))
+        headers += sum(sys.getsizeof(identity) for identity in self._leaf_refs)
+        scalar_seen = set()
+        def scalar(value):
+            if value is None or id(value) in scalar_seen:
+                return 0
+            scalar_seen.add(id(value))
+            return sys.getsizeof(value)
+        for cached in self._refs.values():
+            value = cached.value if isinstance(cached, _TupleAnchor) else cached
+            if isinstance(value, (TiledDict, TiledList, TiledObject, TiledTuple, TiledSet)):
+                headers += sys.getsizeof(value)
+                if isinstance(value, TiledList):
+                    headers += sum(scalar(v) for v in (value._first, value._count, value._ref))
+                elif isinstance(value, TiledDict):
+                    headers += sum(scalar(v) for v in (value._root, value._count, value._version, value._ref))
+                elif isinstance(value, TiledObject):
+                    state = object.__getattribute__(value, "__dict__")
+                    headers += sys.getsizeof(state) + scalar(state.get("_tile_ref"))
+        return LiveTileStats(self._count, len(self._tiles), len(self._hot), self.hot_peak,
+                             encoded, disk_bytes, disk_count,
+                             self.compressions, self.reloads, len(self._refs), headers,
+                             self._reference_count, self._decoded_bytes, self._decoded_peak)
+
+
+class _TupleAnchor:
+    __slots__ = ("value", "__weakref__")
+    def __init__(self, value):
+        self.value = value
+
+
+def _owned_row_bytes(value):
+    """Conservative owned bytes for one bounded raw row, not foreign heaps."""
+    work, seen, size = [value], set(), 0
+    while work:
+        item = work.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        size += sys.getsizeof(item)
+        kind = type(item)
+        if kind is dict:
+            for k, v in item.items():
+                work.extend((k, v))
+        elif kind in {list, tuple, set, frozenset}:
+            work.extend(item)
+        elif _value_fact(kind):
+            state = getattr(item, "__dict__", None)
+            if state is not None:
+                work.append(state)
+            else:
+                work.extend(getattr(item, field.name) for field in dataclass_fields(item))
+    return size
+
+
+@dataclass(frozen=True, slots=True)
+class _StorageLink:
+    handle: int
+
+
+@dataclass(frozen=True, slots=True)
+class _OpaqueLink:
+    identity: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ManagedLink:
+    handle: int
+
+
+class _DiskMarks:
+    """External reachability bitmap with one 64KiB read/write window."""
+    window_bytes = 64 << 10
+    def __init__(self, directory):
+        self.file = tempfile.TemporaryFile(dir=directory)
+        self.index, self.window, self.dirty = -1, bytearray(), False
+
+    def _window(self, handle):
+        byte, bit = divmod(handle, 8)
+        index, position = divmod(byte, self.window_bytes)
+        if index != self.index:
+            self._flush()
+            self.file.seek(index * self.window_bytes)
+            self.window = bytearray(self.file.read(self.window_bytes).ljust(self.window_bytes, b"\0"))
+            self.index = index
+        return position, 1 << bit
+
+    def _flush(self):
+        if self.dirty:
+            self.file.seek(self.index * self.window_bytes)
+            self.file.write(self.window)
+            self.dirty = False
+
+    def mark(self, handle):
+        position, mask = self._window(handle)
+        if self.window[position] & mask:
+            return False
+        self.window[position] |= mask
+        self.dirty = True
+        return True
+
+    def contains(self, handle):
+        position, mask = self._window(handle)
+        return bool(self.window[position] & mask)
+
+    def __enter__(self): return self
+    def __exit__(self, *error): self.file.close()
+
+
+class _DiskFrontier:
+    """External DFS work stack; at most4096 uint64 handles in RAM."""
+    block_items = 4096
+    def __init__(self, directory):
+        self.file = tempfile.TemporaryFile(dir=directory)
+        self.buffer, self.blocks = array("Q"), 0
+
+    def push(self, handle):
+        self.buffer.append(handle)
+        if len(self.buffer) == self.block_items:
+            self.file.seek(self.blocks * self.block_items * 8)
+            self.file.write(self.buffer.tobytes())
+            self.blocks += 1
+            self.buffer = array("Q")
+
+    def pop(self):
+        if not self.buffer:
+            self.blocks -= 1
+            self.file.seek(self.blocks * self.block_items * 8)
+            self.buffer.frombytes(self.file.read(self.block_items * 8))
+        return self.buffer.pop()
+
+    def __bool__(self): return bool(self.buffer) or self.blocks > 0
+    def __enter__(self): return self
+    def __exit__(self, *error): self.file.close()
+
+
+class TiledDict(dict, MutableMapping):
+    """Ordered mutable mapping; hash-trie buckets and order are separate tiles.
+
+    The dict superclass preserves existing isinstance contracts. ALL ordinary
+    methods are overridden; explicit dict.__setitem__ bypass is unsupported.
+    Values can escape eviction because they are handles into this same arena.
+    """
+    __slots__ = ("_arena", "_root", "_order", "_count", "_version", "_ref", "__weakref__")
+
+    def __init__(self, arena):
+        self._arena = arena
+        self._root = arena.allocate(("leaf", {}))
+        self._order = None
+        self._count = self._version = 0
+        self._ref = arena.reference(self)
+
+    def _bucket(self, key):
+        handle, code = self._root, hash(key) & ((1 << 64) - 1)
+        next_bit = 0
+        while True:
+            tag, payload = self._arena.read(handle)
+            if tag == "leaf":
+                return handle, payload, next_bit
+            if tag == "collision":
+                bucket, following = payload
+                if key in bucket or following is None:
+                    return handle, bucket, 64
+                handle = following
+                continue
+            bit, left, right = payload
+            handle = right if (code >> bit) & 1 else left
+            next_bit = bit + 1
+
+    def _replace_bucket(self, handle, items):
+        tag, payload = self._arena.read(handle)
+        self._arena.write(handle, ("collision", (items, payload[1]))
+                          if tag == "collision" else ("leaf", items))
+
+    def _split(self, handle, items, bit=0):
+        if len(items) <= self._arena.bucket_rows:
+            self._replace_bucket(handle, items)
+            return
+        # Equal full hashes cannot be separated by another trie bit. Keep
+        # equality authoritative in bounded overflow buckets, rather than
+        # silently placing every colliding key in one decoded RAM record.
+        if bit == 64:
+            tag, payload = self._arena.read(handle)
+            following = payload[1] if tag == "collision" else None
+            entries = iter(items.items())
+            first = dict(next(entries) for _ in range(self._arena.bucket_rows))
+            rest = dict(entries)  # at most one newly inserted entry
+            tail = self._arena.allocate(("collision", (rest, following)))
+            self._arena.write(handle, ("collision", (first, tail)))
+            return
+        # Skip bits shared by every key: no empty 64-level chain for identical
+        # hashes, and no redundant branch levels on later insertions.
+        codes = [hash(key) & ((1 << 64) - 1) for key in items]
+        differences = 0
+        for code in codes[1:]:
+            differences |= code ^ codes[0]
+        differences >>= bit
+        if not differences:
+            self._split(handle, items, 64)
+            return
+        bit += (differences & -differences).bit_length() - 1
+        left, right = {}, {}
+        for key, value in items.items():
+            (right if (hash(key) >> bit) & 1 else left)[key] = value
+        a = self._arena.allocate(("leaf", {}))
+        b = self._arena.allocate(("leaf", {}))
+        self._split(a, left, bit + 1)
+        self._split(b, right, bit + 1)
+        self._arena.write(handle, ("branch", (bit, a, b)))
+
+    def _set(self, key, value):
+        with self._arena._lock:
+            handle, bucket, bit = self._bucket(key)
+            # A nested allocation can evict this generation. Never mutate a
+            # previously returned raw bucket AFTER that allocation.
+            fresh = dict(bucket)
+            exists = key in fresh
+            ordinal = fresh[key][1] if exists else -1
+            if not exists:
+                if self._order is not None:
+                    ordinal = len(self._order)
+                    self._order._append((True, key))
+                self._count += 1
+                self._version += 1
+            fresh[key] = (value, ordinal)
+            if self._order is None and len(fresh) > self._arena.bucket_rows:
+                self._order = TiledList(self._arena)
+                for position, item in enumerate(fresh):
+                    self._order._append((True, item))
+                    fresh[item] = (fresh[item][0], position)
+            self._split(handle, fresh, bit)
+            self._arena.save_header(self)
+
+    def __setitem__(self, key, value):
+        self._set(key, self._arena.manage(value))
+
+    def __getitem__(self, key):
+        return self._bucket(key)[1][key][0]
+
+    def __delitem__(self, key):
+        handle, bucket, _ = self._bucket(key)
+        fresh = dict(bucket)
+        ordinal = fresh[key][1]
+        del fresh[key]
+        self._replace_bucket(handle, fresh)
+        if self._order is not None:
+            # The old ordered-map writer scanned and shifted every later key
+            # on each deletion, making N removals quadratic. The ordinal is
+            # part of the existing bucket entry; tombstone its exact slot.
+            self._order[ordinal] = (False, None)
+        self._count -= 1
+        self._version += 1
+        if self._count == 0:
+            self._root = self._arena.allocate(("leaf", {}))
+            self._order = None
+        elif self._order is not None and len(self._order) > 2 * self._count + self._arena.bucket_rows:
+            self._compact_order()
+        self._arena.save_header(self)
+
+    def _compact_order(self):
+        # Reclaim tombstones amortized, streaming the same insertion order.
+        # No list of all keys and no second key->ordinal index is needed.
+        replacement = TiledList(self._arena)
+        for present, key in self._order:
+            if not present:
+                continue
+            handle, bucket, _ = self._bucket(key)
+            fresh = dict(bucket)
+            fresh[key] = (fresh[key][0], len(replacement))
+            self._replace_bucket(handle, fresh)
+            replacement._append((True, key))
+        self._order = replacement
+
+    def __iter__(self):
+        version = self._version
+        keys = (self._order if self._order is not None
+                else ((True, key) for key in tuple(self._arena.read(self._root)[1])))
+        for present, key in keys:
+            if version != self._version:
+                raise RuntimeError("dictionary changed size during iteration")
+            if present:
+                yield key
+
+    def __reversed__(self):
+        version = self._version
+        keys = (reversed(self._order) if self._order is not None
+                else ((True, key) for key in reversed(tuple(self._arena.read(self._root)[1]))))
+        for present, key in keys:
+            if version != self._version:
+                raise RuntimeError("dictionary changed size during iteration")
+            if present:
+                yield key
+
+    def __len__(self):
+        return self._count
+
+    def __contains__(self, key):
+        return key in self._bucket(key)[1]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    keys = MutableMapping.keys
+    values = MutableMapping.values
+    items = MutableMapping.items
+    update = MutableMapping.update
+    def setdefault(self, key, default=None):
+        # MutableMapping.setdefault returns the RAW default after __setitem__.
+        # Here insertion adopts a managed container, so that raw default is
+        # no longer the writer. E.g. loop_control_site_bindings.setdefault(...,
+        # {})[span] = fact must mutate the authoritative tiled map immediately.
+        try:
+            return self[key]
+        except KeyError:
+            self[key] = default
+            return self[key]
+    pop = MutableMapping.pop
+    def popitem(self):
+        if not self:
+            raise KeyError("popitem(): dictionary is empty")
+        key = next(reversed(self))
+        value = self[key]
+        del self[key]
+        return key, value
+    def clear(self):
+        if not self._count:
+            return
+        self._root = self._arena.allocate(("leaf", {}))
+        self._order, self._count = None, 0
+        self._version += 1
+        self._arena.save_header(self)
+
+    def copy(self):
+        return dict(self.items())
+
+    def __repr__(self):
+        return repr(self.copy())
+
+    def __eq__(self, other):
+        if not isinstance(other, dict):
+            return NotImplemented
+        if len(self) != len(other):
+            return False
+        for key, value in self.items():
+            if key not in other:
+                return False
+            member = other[key]
+            if value is not member and value != member:
+                return False
+        return True
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __or__(self, other):
+        return self.copy() | other
+
+    def __ror__(self, other):
+        return other | self.copy()
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def __reduce_ex__(self, protocol):
+        return dict, (self.copy(),)
+
+
+def _sequence_compare(left, right, expected_type, relation):
+    """Builtin lexicographic semantics, with no whole-sequence work buffer."""
+    if not isinstance(right, expected_type):
+        return NotImplemented
+    for a, b in zip(left, right):
+        if a is b or a == b:
+            continue
+        return relation(a, b)
+    return relation(len(left), len(right))
+
+
+class TiledList(list, MutableSequence):
+    """Mutable sequence indexed by independent bounded chunks."""
+    __slots__ = ("_arena", "_first", "_chunks", "_count", "_ref", "__weakref__")
+
+    def __init__(self, arena):
+        self._arena, self._first, self._chunks, self._count = arena, None, None, 0
+        self._ref = arena.reference(self)
+
+    def _handle(self, chunk):
+        return self._first if chunk == 0 else self._chunks[chunk - 1].handle
+
+    def __len__(self):
+        return self._count
+
+    def _position(self, index):
+        if index < 0:
+            index += self._count
+        if not 0 <= index < self._count:
+            raise IndexError(index)
+        return divmod(index, self._arena.bucket_rows)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(self._count))]
+        chunk, position = self._position(index)
+        return self._arena.read(self._handle(chunk))[position]
+
+    def __setitem__(self, index, value):
+        if isinstance(index, slice):
+            indices = range(*index.indices(self._count))
+            # Consume the iterable before mutation (including self-aliases),
+            # but stage it in the same paged store, not an unbounded raw list.
+            values = TiledList(self._arena)
+            values.extend(value)
+            if index.step not in (None, 1):
+                if len(indices) != len(values):
+                    raise ValueError("extended slice size mismatch")
+                for i, member in zip(indices, values):
+                    self[i] = member
+            else:
+                start, stop, _ = index.indices(self._count)
+                replacement = TiledList(self._arena)
+                for i in range(start):
+                    replacement._append(self[i])
+                for member in values:
+                    replacement._append(member)
+                for i in range(max(start, stop), self._count):
+                    replacement._append(self[i])
+                self._replace_sequence(replacement)
+            return
+        member = self._arena.manage(value)
+        chunk, position = self._position(index)
+        values = list(self._arena.read(self._handle(chunk)))
+        values[position] = member
+        self._arena.write(self._handle(chunk), values)
+
+    def _append(self, value):
+        position = self._count % self._arena.bucket_rows
+        if position == 0:
+            handle = self._arena.allocate([])
+            if self._count == 0:
+                self._first = handle
+            else:
+                if self._chunks is None:
+                    self._chunks = TiledDict(self._arena)
+                self._chunks[self._count // self._arena.bucket_rows - 1] = _StorageLink(handle)
+        handle = self._handle(self._count // self._arena.bucket_rows)
+        values = list(self._arena.read(handle))
+        values.append(value)
+        self._arena.write(handle, values)
+        self._count += 1
+        self._arena.save_header(self)
+
+    def append(self, value):
+        self._append(self._arena.manage(value))
+
+    def insert(self, index, value):
+        index = max(0, min(self._count, index if index >= 0 else self._count + index))
+        self.append(value)
+        for i in range(self._count - 1, index, -1):
+            self[i] = self[i - 1]
+        self[index] = value
+
+    def __delitem__(self, index):
+        if isinstance(index, slice):
+            removed = range(*index.indices(self._count))
+            if not removed:
+                return
+            replacement = TiledList(self._arena)
+            for i, member in enumerate(self):
+                if i not in removed:
+                    replacement._append(member)
+            self._replace_sequence(replacement)
+            return
+        chunk, position = self._position(index)
+        start = chunk * self._arena.bucket_rows + position
+        for i in range(start, self._count - 1):
+            self[i] = self[i + 1]
+        handle = self._handle((self._count - 1) // self._arena.bucket_rows)
+        last = list(self._arena.read(handle))
+        last.pop()
+        self._arena.write(handle, last)
+        self._count -= 1
+        if not last:
+            if self._count == 0:
+                self._first = None
+            else:
+                del self._chunks[self._count // self._arena.bucket_rows - 1]
+        self._arena.save_header(self)
+
+    def _replace_sequence(self, replacement):
+        self._first, self._chunks, self._count = (replacement._first, replacement._chunks,
+                                                  replacement._count)
+        self._arena.save_header(self)
+
+    def __iter__(self):
+        # Do not retain a decoded page across yield: another graph/SSA accessor
+        # can evict it while this iterator is suspended.
+        index = 0
+        while index < self._count:
+            yield self[index]
+            index += 1
+
+    def __reversed__(self):
+        # list.__reversed__ reads the empty superclass storage directly. Book
+        # copy-on-read resolves revisions newest-first with reversed(columns);
+        # inheriting it made all as-of lexical binding reads falsely absent.
+        for index in range(self._count - 1, -1, -1):
+            yield self[index]
+
+    __contains__ = MutableSequence.__contains__
+    index = MutableSequence.index
+    count = MutableSequence.count
+    extend = MutableSequence.extend
+    pop = MutableSequence.pop
+    remove = MutableSequence.remove
+    def clear(self):
+        self._first = self._chunks = None
+        self._count = 0
+        self._arena.save_header(self)
+    reverse = MutableSequence.reverse
+
+    def sort(self, *, key=None, reverse=False):
+        # Stable external merge sort. Only one bounded run is sorted in RAM;
+        # keys are evaluated once and merge intermediates use this same arena.
+        # The old sorted(self) unfurled the entire sequence at the boundary.
+        current = TiledList(self._arena)
+        run, run_bytes = [], 0
+        width = max(1, self._arena.bucket_rows)
+        # Equal-sized runs are needed by the merge schedule. The byte limit
+        # below may shorten them; record each run boundary in a paged sequence.
+        boundaries = TiledList(self._arena)
+        def emit_run():
+            for entry in sorted(run, key=lambda entry: entry[0], reverse=reverse):
+                current._append(entry)
+            boundaries._append(len(current))
+        for member in self:
+            entry = (member if key is None else key(member), member)
+            size = _owned_row_bytes(entry)
+            if run and (len(run) == width or run_bytes + size > self._arena.decoded_budget_bytes // 4):
+                emit_run()
+                run.clear()
+                run_bytes = 0
+            run.append(entry)
+            run_bytes += size
+        if run:
+            emit_run()
+        while len(boundaries) > 1:
+            merged = TiledList(self._arena)
+            next_boundaries = TiledList(self._arena)
+            start = 0
+            for boundary in range(0, len(boundaries), 2):
+                middle = boundaries[boundary]
+                stop = boundaries[boundary + 1] if boundary + 1 < len(boundaries) else middle
+                left, right = start, middle
+                while left < middle and right < stop:
+                    a, b = current[left], current[right]
+                    take_right = a[0] < b[0] if reverse else b[0] < a[0]
+                    merged._append(b if take_right else a)
+                    if take_right: right += 1
+                    else: left += 1
+                for position in range(left, middle):
+                    merged._append(current[position])
+                for position in range(right, stop):
+                    merged._append(current[position])
+                next_boundaries._append(len(merged))
+                start = stop
+            current, boundaries = merged, next_boundaries
+        replacement = TiledList(self._arena)
+        for _sort_key, member in current:
+            replacement._append(member)
+        self._replace_sequence(replacement)
+
+    def copy(self):
+        return list(self)
+
+    def __repr__(self):
+        return repr(list(self))
+
+    def __eq__(self, other):
+        return _sequence_compare(self, other, list, operator.eq)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __lt__(self, other):
+        return _sequence_compare(self, other, list, operator.lt)
+
+    def __le__(self, other):
+        return _sequence_compare(self, other, list, operator.le)
+
+    def __gt__(self, other):
+        return _sequence_compare(self, other, list, operator.gt)
+
+    def __ge__(self, other):
+        return _sequence_compare(self, other, list, operator.ge)
+
+    def __add__(self, other):
+        return list(self) + other
+
+    def __radd__(self, other):
+        return other + list(self)
+
+    def __iadd__(self, other):
+        self.extend(other)
+        return self
+
+    def __mul__(self, count):
+        return list(self) * count
+
+    __rmul__ = __mul__
+
+    def __imul__(self, count):
+        self[:] = list(self) * count
+        return self
+
+    def __reduce_ex__(self, protocol):
+        return list, (list(self),)
+
+
+class TiledTuple(tuple):
+    """Immutable tuple-compatible view of a chunked sequence."""
+    def __new__(cls, sequence):
+        result = tuple.__new__(cls)
+        result._sequence, result._arena = sequence, sequence._arena
+        result._ref = sequence._arena.reference(result)
+        return result
+
+    def __len__(self):
+        return len(self._sequence)
+
+    def __iter__(self):
+        return iter(self._sequence)
+
+    def __getitem__(self, index):
+        result = self._sequence[index]
+        return tuple(result) if isinstance(index, slice) else result
+
+    def __repr__(self):
+        return repr(tuple(self))
+
+    def __eq__(self, other):
+        return _sequence_compare(self, other, tuple, operator.eq)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __lt__(self, other):
+        return _sequence_compare(self, other, tuple, operator.lt)
+
+    def __le__(self, other):
+        return _sequence_compare(self, other, tuple, operator.le)
+
+    def __gt__(self, other):
+        return _sequence_compare(self, other, tuple, operator.gt)
+
+    def __ge__(self, other):
+        return _sequence_compare(self, other, tuple, operator.ge)
+
+    def __hash__(self):
+        return hash(tuple(self))
+
+    def __contains__(self, item):
+        return item in self._sequence
+
+    def __add__(self, other):
+        return tuple(self) + other
+
+    def __radd__(self, other):
+        return other + tuple(self)
+
+    def __mul__(self, count):
+        return tuple(self) * count
+
+    __rmul__ = __mul__
+    index = TiledList.index
+    count = TiledList.count
+
+    def __reduce_ex__(self, protocol):
+        return tuple, (tuple(self),)
+
+
+class TiledSet(MutableSet):
+    """The mutable set protocol over the same bounded hash-trie storage."""
+    __slots__ = ("_arena", "_members", "_ref", "__weakref__")
+    def __init__(self, arena, values=()):
+        self._arena, self._members = arena, TiledDict(arena)
+        self._ref = arena.reference(self)
+        self.update(values)
+
+    def __len__(self):
+        return len(self._members)
+
+    def __iter__(self):
+        return iter(self._members)
+
+    def __contains__(self, value):
+        if isinstance(value, set):
+            value = frozenset(value)
+        return value in self._members
+
+    def add(self, value):
+        self._members[value] = None
+
+    def discard(self, value):
+        if isinstance(value, set):
+            value = frozenset(value)
+        self._members.pop(value, None)
+
+    def remove(self, value):
+        if value not in self:
+            raise KeyError(value)
+        self.discard(value)
+
+    def pop(self):
+        if not self:
+            raise KeyError("pop from an empty set")
+        value = next(iter(self))
+        self.discard(value)
+        return value
+
+    def clear(self):
+        self._members.clear()
+
+    def update(self, *others):
+        for other in others:
+            for value in other:
+                self.add(value)
+
+    def intersection_update(self, *others):
+        admitted = tuple(other if isinstance(other, Set) else TiledSet(self._arena, other)
+                         for other in others)
+        replacement = TiledDict(self._arena)
+        for value in self:
+            if all(value in other for other in admitted):
+                replacement[value] = None
+        self._members = replacement
+        self._arena.save_header(self)
+
+    def difference_update(self, *others):
+        for other in others:
+            if other is self:
+                self.clear()
+                continue
+            for value in other:
+                self.discard(value)
+
+    def symmetric_difference_update(self, other):
+        if other is self:
+            self.clear()
+            return
+        other = other if isinstance(other, Set) else TiledSet(self._arena, other)
+        for value in other:
+            self.discard(value) if value in self else self.add(value)
+
+    def copy(self):
+        return TiledSet(self._arena, self)
+
+    def union(self, *others):
+        result = self.copy()
+        result.update(*others)
+        return result
+
+    def intersection(self, *others):
+        return TiledSet(self._arena, (v for v in self if all(v in other for other in others)))
+
+    def difference(self, *others):
+        return TiledSet(self._arena, (v for v in self if not any(v in other for other in others)))
+
+    def symmetric_difference(self, other):
+        result = self.copy()
+        result.symmetric_difference_update(other)
+        return result
+
+    def __or__(self, other):
+        return self.union(other) if isinstance(other, Set) else NotImplemented
+
+    __ror__ = __or__
+
+    def __and__(self, other):
+        return self.intersection(other) if isinstance(other, Set) else NotImplemented
+
+    __rand__ = __and__
+
+    def __sub__(self, other):
+        return self.difference(other) if isinstance(other, Set) else NotImplemented
+
+    def __rsub__(self, other):
+        return TiledSet(self._arena, (v for v in other if v not in self)) if isinstance(other, Set) else NotImplemented
+
+    def __xor__(self, other):
+        return self.symmetric_difference(other) if isinstance(other, Set) else NotImplemented
+
+    __rxor__ = __xor__
+    __eq__, __ne__ = MutableSet.__eq__, MutableSet.__ne__
+    __lt__, __le__ = MutableSet.__lt__, MutableSet.__le__
+    __gt__, __ge__ = MutableSet.__gt__, MutableSet.__ge__
+    def __ior__(self, other):
+        if not isinstance(other, Set): return NotImplemented
+        self.update(other)
+        return self
+
+    def __iand__(self, other):
+        if not isinstance(other, Set): return NotImplemented
+        self.intersection_update(other)
+        return self
+
+    def __isub__(self, other):
+        if not isinstance(other, Set): return NotImplemented
+        self.difference_update(other)
+        return self
+
+    def __ixor__(self, other):
+        if not isinstance(other, Set): return NotImplemented
+        self.symmetric_difference_update(other)
+        return self
+    isdisjoint = MutableSet.isdisjoint
+
+    def issubset(self, other):
+        other = other if isinstance(other, Set) else TiledSet(self._arena, other)
+        return all(value in other for value in self)
+
+    def issuperset(self, other):
+        return all(value in self for value in other)
+
+    def __repr__(self):
+        return repr(set(self))
+
+    def __reduce_ex__(self, protocol):
+        return set, (set(self),)
+
+
+class TiledObject:
+    """Original compiler object/identity; its fields become a writable tile map."""
+    __slots__ = ()
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        original = cls.__dict__.get("__post_init__")
+        if original is not None:
+            def initialize(self, *args, **kwargs):
+                original(self, *args, **kwargs)
+                TiledObject.__post_init__(self)
+            cls.__post_init__ = initialize
+
+    def __post_init__(self):
+        arena = _ACTIVE_ARENA.get()
+        if arena is not None:
+            arena.attach(self)
+
+    def __getattribute__(self, name):
+        if name in {"_tile_arena", "_tile_fields", "_tile_ref", "__class__"}:
+            return object.__getattribute__(self, name)
+        state = object.__getattribute__(self, "__dict__")
+        fields = state.get("_tile_fields")
+        if fields is not None:
+            if name == "__dict__":
+                return fields
+            # The amount-property repro returned7 rather than14 because the
+            # tiled writer bypassed the original property's setter, and a
+            # paged field then shadowed its getter. Python data descriptors
+            # remain the authoritative writer/reader, ahead of instance data.
+            descriptor = _data_descriptor(type(self), name)
+            if descriptor is not None and hasattr(type(descriptor), "__get__"):
+                return object.__getattribute__(self, name)
+            try:
+                return fields[name]
+            except KeyError:
+                pass
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name, value):
+        state = object.__getattribute__(self, "__dict__")
+        fields = state.get("_tile_fields")
+        if fields is not None and name not in {"_tile_arena", "_tile_fields", "_tile_ref"}:
+            if _data_descriptor(type(self), name) is not None:
+                object.__setattr__(self, name, value)
+            else:
+                fields[name] = value
+        else:
+            object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        state = object.__getattribute__(self, "__dict__")
+        if "_tile_fields" in state:
+            if _data_descriptor(type(self), name) is not None:
+                object.__delattr__(self, name)
+            else:
+                try:
+                    del state["_tile_fields"][name]
+                except KeyError:
+                    raise AttributeError(name) from None
+        else:
+            object.__delattr__(self, name)
+
+    def __getstate__(self):
+        return dict(self.__dict__.items())
+
+    def __setstate__(self, state):
+        object.__getattribute__(self, "__dict__").update(state)
+
+
+def _data_descriptor(kind, name):
+    descriptor = getattr(kind, name, None)
+    protocol = type(descriptor)
+    return descriptor if hasattr(protocol, "__set__") or hasattr(protocol, "__delete__") else None
+
+
+def live_digraph(arena=None):
+    """NetworkX with its documented dictionary factories; no surrogate graph."""
+    import networkx as nx
+    arena = arena or _ACTIVE_ARENA.get()
+    if arena is None:
+        return nx.DiGraph()
+    return LiveDiGraph(arena=arena)
+
+
+import networkx as nx
+
+
+class LiveDiGraph(TiledObject, nx.DiGraph):
+    """The normal NetworkX graph, with compile-wide writable dict factories."""
+    def __init__(self, incoming_graph_data=None, *, arena=None, **attr):
+        self._tile_owner = arena or _ACTIVE_ARENA.get()
+        super().__init__(incoming_graph_data, **attr)
+        if self._tile_owner is not None:
+            self._tile_owner.categories.add("ProcessGraph.NetworkX")
+            self._tile_owner.attach(self)
+
+    def __getattribute__(self, name):
+        # NetworkX cached views are derived from its authoritative maps. Keep
+        # them only with the live graph header, not as opaque leaves in the
+        # arena: OutEdgeView holds _graph and would pin every cold graph.
+        if name in _NETWORKX_CACHED_VIEWS:
+            state = object.__getattribute__(self, "__dict__")
+            cache = state.setdefault("_tile_views", {})
+            if name not in cache:
+                cache[name] = _NETWORKX_CACHED_VIEWS[name].func(self)
+            return cache[name]
+        return TiledObject.__getattribute__(self, name)
+
+    def _mapping(self):
+        return {} if self._tile_owner is None else TiledDict(self._tile_owner)
+
+    def __setattr__(self, name, value):
+        TiledObject.__setattr__(self, name, value)
+        if name in {"_adj", "_succ", "_pred", "_node"}:
+            # NetworkX invalidates its __dict__ cache in these descriptors.
+            # Our views intentionally live with the weak graph header instead;
+            # rebinding must invalidate that cache at the SAME writer too.
+            state = object.__getattribute__(self, "__dict__")
+            state.get("_tile_views", {}).clear()
+
+    node_dict_factory = _mapping
+    node_attr_dict_factory = _mapping
+    adjlist_outer_dict_factory = _mapping
+    adjlist_inner_dict_factory = _mapping
+    edge_attr_dict_factory = _mapping
+    graph_attr_dict_factory = _mapping
+
+    def __reduce_ex__(self, protocol):
+        # Explicit export is a snapshot, never a pickle of active file handles.
+        return _restore_digraph, (dict(self.graph.items()), list(self.nodes(data=True)),
+                                  list(self.edges(data=True)))
+
+
+_NETWORKX_CACHED_VIEWS = {
+    name: getattr(nx.DiGraph, name) for name in
+    ("nodes", "edges", "adj", "succ", "pred", "in_edges", "out_edges",
+     "degree", "in_degree", "out_degree")
+}
+
+
+def _restore_digraph(metadata, nodes, edges):
+    graph = live_digraph()
+    graph.graph.update(metadata)
+    graph.add_nodes_from(nodes)
+    graph.add_edges_from(edges)
+    return graph
+
+
+def tile_identity_page(page, arena):
+    """Tile the authoritative book tables too, including writable hot pages.
+
+    The construction clock and registry are NOT cloned. A write uses the same
+    page._stamp and the same book clock; no whole-page promotion is necessary.
+    """
+    if page.__dict__.get("_live_tile_owner") is arena:
+        return
+    from .identity_spill import SPILLABLE_ATTRS
+    page.__dict__["_live_tile_owner"] = arena
+    for name in SPILLABLE_ATTRS:
+        setattr(page, name, getattr(page, name))
+    arena.categories.add("IdentityBook.writable-tables")
