@@ -1,273 +1,281 @@
-"""Build the source compiler as one linked native program.
+"""Versioned native partitions of the compiler's existing outer stages.
 
-This is deliberately not the historical compiler-bootstrap creep.  There are
-no generations, independently installed Python callables, or native products
-fed back into the next compile.  The canonical source compiler pursues one
-fixed-signature root into one ProcessGraph, lowers the complete reachable
-program to one repository-SSA module, and the C backend emits that root and
-its complete ``Call`` closure into one DLL.
+The abandoned v1 experiment tried to replace the compiler with one DLL rooted
+at ``compile_program``. That erased the useful boundaries already proved by
+the compiler and made one enormous Python-object interface the prerequisite
+for every gain. This module now describes one composition instead:
 
-The planning and lowering stages are separate because the compiler's resolved
-compilation-unit plan is useful evidence in its own right.  Planning does not
-claim a native result.  A native result exists only after C emission reports no
-shortfalls and the single shared library has been linked.
+* the Python coordinator and IdentityBook remain the semantic authority;
+* existing native foundations are named, versioned boundary components;
+* a whole outer compiler stage is the unit offered to bootstrap creep;
+* independently verified inner products may feed the next build of that same
+  outer stage, but they are never confused with completion of the stage.
+
+Every component version includes its authored source, its declared boundary
+contract and the compiler toolchain fingerprint. Source changes therefore
+select a new versioned product directory and can flow into later compiles;
+stale native code is never silently selected for a changed source tree.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
-import os
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Mapping
+
+from .native_compiler_accelerators import (
+    BROADCAST_SHAPES, DEAD_METADATA_ORDER, DEPENDENCY_LEVELS, METADATA_COPY,
+    READ_ONLY_MODULE, TOPOLOGICAL_ORDER,
+)
 
 
-BOOTSTRAP_SCHEMA = "turing.whole-program-compiler-bootstrap.v1"
-COMPILER_PROGRAM_SOURCE = """\
-def compile_program(source, entrypoint, extraction_contract):
-    return source_compiler_impl(
-        source,
-        entrypoint,
-        extraction_contract=extraction_contract,
-    )
-"""
+BOOTSTRAP_SCHEMA = "turing.partitioned-compiler-bootstrap.v2"
+STRATEGY = "versioned-native-boundary-composition"
+
+
+@dataclass(frozen=True)
+class CompilerBoundary:
+    """One coarse compiler boundary or an existing native foundation."""
+
+    name: str
+    kind: str
+    source: str
+    entrypoint: str
+    semantic: str
+    consumes: str
+    produces: str
+    disposition: str = "available"
+
+    def receipt(self, repository: Path, toolchain: Mapping[str, Any]) -> dict[str, Any]:
+        source_path = repository / self.source
+        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        contract = {
+            "name": self.name,
+            "kind": self.kind,
+            "source": self.source,
+            "entrypoint": self.entrypoint,
+            "semantic": self.semantic,
+            "consumes": self.consumes,
+            "produces": self.produces,
+            "disposition": self.disposition,
+        }
+        version = hashlib.sha256(json.dumps({
+            "contract": contract,
+            "source_sha256": source_sha256,
+            "compiler_toolchain_sha256": toolchain["sha256"],
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return {
+            **contract,
+            "source_sha256": source_sha256,
+            "compiler_toolchain_sha256": toolchain["sha256"],
+            "version": version,
+        }
+
+
+# These are the boundaries that exist in the compiler, not a second registry.
+# Semantics match native_compiler_accelerators exactly. The metadata copier is
+# retained as negative evidence: it is versioned, but it is not an admitted
+# component because its frequently crossed object boundary lost decisively.
+BOUNDARIES = (
+    CompilerBoundary(
+        "graph-topology", "native-foundation",
+        "src/compiler/graph_refinement_kernels.py", "topological_order",
+        TOPOLOGICAL_ORDER,
+        "one admitted integer graph", "one lexical order",
+    ),
+    CompilerBoundary(
+        "graph-dependency-levels", "native-foundation",
+        "src/compiler/graph_refinement_kernels.py", "dependency_levels",
+        DEPENDENCY_LEVELS,
+        "one admitted graph and order", "one dependency-level table",
+    ),
+    CompilerBoundary(
+        "graph-dead-metadata", "native-foundation",
+        "src/compiler/graph_refinement_kernels.py", "dead_metadata_order",
+        DEAD_METADATA_ORDER,
+        "one admitted metadata graph", "one ordered removal proposal",
+    ),
+    CompilerBoundary(
+        "descriptor-broadcast", "native-foundation",
+        "src/compiler/graph_refinement_kernels.py", "broadcast_shapes",
+        BROADCAST_SHAPES,
+        "one descriptor batch", "one shape proposal table",
+    ),
+    CompilerBoundary(
+        "whole-module-storage-effects", "native-foundation",
+        "src/compiler/graph_refinement_kernels.py", "read_only_storage_effects",
+        READ_ONLY_MODULE,
+        "one complete SSA module fact table",
+        "read-only and pointer-storage fixed points",
+    ),
+    CompilerBoundary(
+        "metadata-copy", "rejected-boundary",
+        "src/compiler/process_graph_fusion.py", "isolate_metadata",
+        METADATA_COPY,
+        "frequent Python object batches", "copied Python object batches",
+        disposition="rejected-hot-boundary",
+    ),
+    CompilerBoundary(
+        "process-graph-lowering", "outer-partition",
+        "src/common/tensors/accelerator_backends/aot_compile.py",
+        "_lower_process_graph_to_compilation",
+        "compiler.process_graph.lowering",
+        "one complete built ProcessGraph plus its compile policy",
+        "one AOTCompilation containing planned graph, control and region products",
+        disposition="bootstrap-target",
+    ),
+    CompilerBoundary(
+        "python-ast-ingestion", "frontend-partition",
+        "src/transmogrifier/graph/graph_express2.py", "ProcessGraph.build_from_ast",
+        "compiler.frontend.python_ast_ingestion",
+        "one complete Python AST and extraction policy", "one built ProcessGraph",
+        disposition="candidate-after-process-graph-lowering",
+    ),
+    CompilerBoundary(
+        "sympy-ingestion", "frontend-partition",
+        "src/compiler/symbolic_process_graph.py", "ingest_sympy_expressions",
+        "compiler.frontend.sympy_ingestion",
+        "one complete named SymPy expression set", "one canonical ProcessGraph",
+        disposition="candidate-after-process-graph-lowering",
+    ),
+)
 
 
 @dataclass(frozen=True)
 class WholeProgramCompilerProduct:
-    """The single-image bootstrap result and its audit receipt."""
+    """A bootstrap-creep product for one versioned outer partition."""
 
-    module: Any
-    outputs: Mapping[str, Any]
-    exports: tuple[str, ...]
-    root: str
-    artifact: Any
-    library: Path
+    boundary: Mapping[str, Any]
+    product: Mapping[str, Any]
     manifest: Path
 
 
-def _source_sha256(source: str) -> str:
-    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+def compiler_boundary_receipts() -> tuple[dict[str, Any], ...]:
+    from .project_compilation_product import compiler_toolchain_fingerprint
 
-
-@contextmanager
-def _without_incremental_bootstrap(directory: Path) -> Iterator[None]:
-    """Keep the canonical compiler from activating historical products.
-
-    ``lower_ast_source_to_ssa`` checks the receipt-gated registry on every
-    invocation.  Pointing that check at an absent file is the supported way to
-    obtain the authored compiler.  Restoring both variables matters in shared
-    test processes and interactive sessions.
-    """
-
-    from .compiler_bootstrap_runtime import (
-        COMPILER_BOOTSTRAP_PRODUCTS_ENV,
-        COMPILER_BOOTSTRAP_REGISTRY_ENV,
-    )
-
-    previous = {
-        name: os.environ.get(name)
-        for name in (
-            COMPILER_BOOTSTRAP_PRODUCTS_ENV,
-            COMPILER_BOOTSTRAP_REGISTRY_ENV,
-        )
-    }
-    os.environ[COMPILER_BOOTSTRAP_PRODUCTS_ENV] = ""
-    os.environ[COMPILER_BOOTSTRAP_REGISTRY_ENV] = str(
-        directory / "no-incremental-bootstrap-registry.json"
-    )
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
-
-def _compiler_bindings(
-    source_compiler_impl: Callable[..., Any] | None,
-) -> dict[str, Any]:
-    if source_compiler_impl is None:
-        # Compile the implementation behind the public identity-book wrapper.
-        # The outer invocation still enters exclusively through the canonical
-        # public lower_ast_source_to_ssa entry.  Giving the compiled program a
-        # fixed signature avoids turning *args/**kwargs transport into part of
-        # the native ABI while preserving the compiler implementation itself.
-        from .fortran_c_shell import _lower_ast_source_to_ssa_impl
-
-        source_compiler_impl = _lower_ast_source_to_ssa_impl
-    return {"source_compiler_impl": source_compiler_impl}
+    repository = Path(__file__).resolve().parents[2]
+    toolchain = compiler_toolchain_fingerprint()
+    return tuple(boundary.receipt(repository, toolchain) for boundary in BOUNDARIES)
 
 
 def plan_whole_program_compiler(
     directory: str | Path,
     *,
-    source_compiler_impl: Callable[..., Any] | None = None,
-    extraction_contract: str | Path = (
-        "extraction_contracts/program_extraction.yaml"
-    ),
     progress: Callable[[str], None] | None = None,
+    **_legacy_options: Any,
 ) -> dict[str, Any]:
-    """Resolve the compiler program and return its exact compilation-unit plan."""
-
-    from .fortran_c_shell import lower_ast_source_to_ssa
+    """Publish the versioned composition without launching a compiler build."""
 
     destination = Path(directory).resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    plans: list[dict[str, Any]] = []
-    with _without_incremental_bootstrap(destination):
-        lower_ast_source_to_ssa(
-            COMPILER_PROGRAM_SOURCE,
-            "compile_program",
-            python_bindings=_compiler_bindings(source_compiler_impl),
-            extraction_contract=extraction_contract,
-            name="whole_program_compiler",
-            compilation_unit_plan_sink=lambda plan: plans.append(dict(plan)),
-            stop_after_compilation_unit_plan=True,
-            progress=progress,
-        )
-    if len(plans) != 1:
-        raise RuntimeError(
-            "compiler planning did not publish exactly one compilation-unit plan"
-        )
+    boundaries = compiler_boundary_receipts()
+    target = next(
+        boundary for boundary in boundaries
+        if boundary["name"] == "process-graph-lowering"
+    )
     receipt = {
         "schema": BOOTSTRAP_SCHEMA,
         "stage": "planned",
-        "strategy": "single-root-single-module-single-library",
-        "incremental_bootstrap_products": [],
-        "program_source_sha256": _source_sha256(COMPILER_PROGRAM_SOURCE),
-        "compilation_unit_plan": plans[0],
+        "strategy": STRATEGY,
+        "semantic_authority": "python-coordinator-and-identity-book",
+        "boundaries": list(boundaries),
+        "next_partition": target,
+        "source_update_policy": (
+            "source-or-toolchain changes select a new versioned product; "
+            "only receipt-verified matching products may activate"
+        ),
     }
     path = destination / "plan.json"
     path.write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
+        encoding="utf-8", newline="\n",
     )
-    return receipt
-
-
-def _root_export(exports: tuple[str, ...]) -> str:
-    matches = tuple(
-        name for name in map(str, exports)
-        if name == "whole_program_compiler__compile_program"
-        or name.endswith("__compile_program")
-    )
-    if len(matches) != 1:
-        raise RuntimeError(
-            "whole compiler image must expose exactly one compile_program root; "
-            f"exports={exports!r}"
+    if progress is not None:
+        progress(
+            "compiler-bootstrap: planned versioned boundary composition; "
+            f"next={target['name']} version={target['version'][:12]}"
         )
-    return matches[0]
+    return receipt
 
 
 def build_whole_program_compiler(
     directory: str | Path,
     *,
-    source_compiler_impl: Callable[..., Any] | None = None,
-    extraction_contract: str | Path = (
-        "extraction_contracts/program_extraction.yaml"
-    ),
-    optimization: str = "O0",
+    jobs: int | None = None,
+    max_total_resident_bytes: int | None = None,
+    worker_resident_reservation_bytes: int = 8 << 30,
+    max_worker_memory_bytes: int | None = 12 << 30,
+    unit_timeout_seconds: float | None = 1800.0,
+    max_rounds: int = 16,
     progress: Callable[[str], None] | None = None,
+    **_legacy_options: Any,
 ) -> WholeProgramCompilerProduct:
-    """Lower and link the complete reachable compiler program into one DLL."""
+    """Bootstrap the complete ProcessGraph-to-AOT outer partition.
 
-    from .fortran_c_shell import lower_ast_source_to_ssa
-    from .ssa_c_backend import emit_ssa_to_c
+    The existing project bootstrap owns subdivision, native verification,
+    receipt-gated activation and fixed-point iteration. This function merely
+    selects the already-existing outer seam as its root and gives the product
+    a source/toolchain-derived version directory.
+    """
+
+    from .project_compilation_product import compile_project_bootstrap_creep
 
     destination = Path(directory).resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    with _without_incremental_bootstrap(destination):
-        module, outputs, exports_value = lower_ast_source_to_ssa(
-            COMPILER_PROGRAM_SOURCE,
-            "compile_program",
-            python_bindings=_compiler_bindings(source_compiler_impl),
-            extraction_contract=extraction_contract,
-            name="whole_program_compiler",
-            progress=progress,
-        )
-    exports = tuple(map(str, exports_value))
-    root = _root_export(exports)
-    artifact = emit_ssa_to_c(
-        module,
-        root,
-        entry_name="turing_compile_program",
+    plan = plan_whole_program_compiler(destination, progress=progress)
+    boundary = dict(plan["next_partition"])
+    repository = Path(__file__).resolve().parents[2]
+    product_root = (
+        destination / "products" / boundary["name"] / boundary["version"]
     )
-    if not artifact.complete:
-        frontier = {
-            "schema": BOOTSTRAP_SCHEMA,
-            "stage": "c-emission-frontier",
-            "strategy": "single-root-single-module-single-library",
-            "incremental_bootstrap_products": [],
-            "root": root,
-            "ssa_function_count": len(module.functions),
-            "shortfalls": [
-                {
-                    "operation": str(item.operation),
-                    "reason": str(item.reason),
-                }
-                for item in artifact.shortfalls
-            ],
-        }
-        path = destination / "frontier.json"
-        path.write_text(
-            json.dumps(frontier, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        raise RuntimeError(
-            "whole compiler reached C emission with shortfalls; "
-            f"see {path}"
-        )
-    artifact.compile(destination, optimization=optimization)
-    if artifact.library_path is None or not artifact.library_path.is_file():
-        raise RuntimeError("C backend returned without a linked compiler DLL")
-    calls = tuple(sorted(map(str, module.functions)))
+
+    def report(event: Mapping[str, Any]) -> None:
+        if progress is not None:
+            progress(
+                "compiler-bootstrap: "
+                + str(event.get("stage") or "progress")
+                + " "
+                + json.dumps(dict(event), sort_keys=True, default=str)
+            )
+
+    product = compile_project_bootstrap_creep(
+        repository / boundary["source"],
+        product_root,
+        entries=(boundary["entrypoint"],),
+        expand_entry_dependencies=True,
+        jobs=jobs,
+        max_total_resident_bytes=max_total_resident_bytes,
+        worker_resident_reservation_bytes=worker_resident_reservation_bytes,
+        max_worker_memory_bytes=max_worker_memory_bytes,
+        unit_timeout_seconds=unit_timeout_seconds,
+        max_rounds=max_rounds,
+        progress=report,
+    )
     manifest_value = {
         "schema": BOOTSTRAP_SCHEMA,
-        "stage": "linked",
-        "strategy": "single-root-single-module-single-library",
-        "incremental_bootstrap_products": [],
-        "program_source_sha256": _source_sha256(COMPILER_PROGRAM_SOURCE),
-        "root": root,
-        "exports": list(exports),
-        "ssa_function_count": len(calls),
-        "ssa_functions": list(calls),
-        "library": artifact.library_path.name,
-        "library_sha256": hashlib.sha256(
-            artifact.library_path.read_bytes()
-        ).hexdigest(),
-        "optimization": optimization,
-        "compilation_unit_plan": module.metadata.get(
-            "compilation_unit_plan", {}
-        ),
+        "stage": "built" if product.get("status") == "sealed" else "frontier",
+        "strategy": STRATEGY,
+        "boundary": boundary,
+        "product": product,
+        "product_directory": product_root.as_posix(),
     }
     manifest = destination / "manifest.json"
     manifest.write_text(
         json.dumps(manifest_value, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
+        encoding="utf-8", newline="\n",
     )
-    return WholeProgramCompilerProduct(
-        module=module,
-        outputs=outputs,
-        exports=exports,
-        root=root,
-        artifact=artifact,
-        library=artifact.library_path,
-        manifest=manifest,
-    )
+    return WholeProgramCompilerProduct(boundary, product, manifest)
 
 
 __all__ = [
     "BOOTSTRAP_SCHEMA",
-    "COMPILER_PROGRAM_SOURCE",
+    "BOUNDARIES",
+    "CompilerBoundary",
+    "STRATEGY",
     "WholeProgramCompilerProduct",
     "build_whole_program_compiler",
+    "compiler_boundary_receipts",
     "plan_whole_program_compiler",
 ]

@@ -1,3 +1,22 @@
+2026-10-12 VERSIONED OUTER COMPILER PARTITION (CURRENT WORKTREE):
+The abandoned whole-program bootstrap no longer frames compiler self-hosting as
+one replacement DLL.  Its plan now composes the existing topology, dependency,
+dead-metadata, broadcast and whole-module storage-effect native semantics around
+the Python coordinator/IdentityBook authority.  The measured losing metadata
+copier remains in the receipt as a rejected hot boundary, not an active piece.
+
+Every boundary version hashes its exact authored source, declared input/output
+contract and the compiler toolchain fingerprint.  A source or toolchain change
+therefore selects a new side-by-side product directory; only the existing
+receipt-verified bootstrap activation may feed a product into a later compile.
+The next target is the existing complete `_lower_process_graph_to_compilation`
+seam: one built ProcessGraph enters; reduction, unit planning, map/class tables,
+deployment planning and capture remain inside; one AOTCompilation leaves.
+Python-AST and SymPy ingestion are recorded as later sibling front ends to that
+same seam.  No inner graph kernel was added and no outer bootstrap compile was
+launched, per the user's request to run and observe it.  Non-compiling manifest,
+version invalidation, delegation and catalogue tests: 4 passed in 0.27s.
+
 2026-10-12 INHERITED DUAL-IR PRESSURE / COMPRESSION TELEMETRY (CURRENT WORKTREE):
 The symbolic compiler's pressure arena now remains the active physical storage
 arena when the public source compiler resumes the SAME IdentityBook.  The
