@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from array import array
 from collections.abc import MutableMapping, MutableSequence, MutableSet, Set
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import is_dataclass
@@ -17,10 +18,12 @@ from dataclasses import fields as dataclass_fields
 import gc
 import io
 import operator
+import os
 import pickle
 import sys
 import tempfile
 from threading import RLock
+import time
 import weakref
 
 from .compressed_tiles import CompressedTile, DiskTile, DiskTileStore, DiskTileDirectory
@@ -67,6 +70,11 @@ class LiveTileStats:
     retained_index_bytes: int = 0
     payload_decoded_bytes: int = 0
     payload_hot_peak: int = 0
+    payload_cache_hits: int = 0
+    payload_evictions: int = 0
+    parallel_compression_jobs: int = 0
+    compression_seconds: float = 0.0
+    compression_workers: int = 1
 
 
 @dataclass(slots=True)
@@ -140,7 +148,7 @@ class LiveTileArena:
     indivisible leaf.
     """
     def __init__(self, *, tile_rows=64, hot_tiles=8, bucket_rows=64, directory=None,
-                 decoded_budget_bytes=128 << 20):
+                 decoded_budget_bytes=128 << 20, compression_workers=None):
         if min(tile_rows, hot_tiles, bucket_rows) <= 0:
             raise ValueError("live tile bounds must be positive")
         self.tile_rows, self.hot_limit, self.bucket_rows = tile_rows, hot_tiles, bucket_rows
@@ -149,6 +157,9 @@ class LiveTileArena:
         if decoded_budget_bytes <= 0:
             raise ValueError("decoded tile budget must be positive")
         self.decoded_budget_bytes = decoded_budget_bytes
+        self.compression_workers = max(
+            1, int(compression_workers if compression_workers is not None
+                   else min(4, os.cpu_count() or 1)))
         self._decoded_sizes = {}
         self._decoded_bytes = self._decoded_peak = 0
         self._retained_decoded_bytes = self._payload_decoded_bytes = 0
@@ -182,6 +193,9 @@ class LiveTileArena:
         self.pressure_level = 0
         self.compressions = self.reloads = self.hot_peak = 0
         self.routing_reloads = self.payload_reloads = 0
+        self.payload_cache_hits = self.payload_evictions = 0
+        self.parallel_compression_jobs = 0
+        self.compression_seconds = 0.0
         self.categories = set()
         self.pressure_probe = None
         self._operations = 0
@@ -383,6 +397,8 @@ class LiveTileArena:
                 self.routing_reloads += 1
             else:
                 self.payload_reloads += 1
+        elif not self._page_kinds[index]:
+            self.payload_cache_hits += 1
         self._hot.move_to_end(index)
         self._trim(except_index=index)
         self.hot_peak = max(self.hot_peak, len(self._hot))
@@ -425,6 +441,8 @@ class LiveTileArena:
         else:
             self._payload_decoded_bytes -= size
             self._payload_hot_count -= 1
+            if self.pressure_level > 0:
+                self.payload_evictions += 1
 
     def cached_route(self, owner_handle, code):
         if self.pressure_level == 0:
@@ -626,9 +644,15 @@ class LiveTileArena:
     def offload_to_disk(self):
         """Enter the final tier: disk backing and one decoded payload tile.
 
-        Every resident encoded tile is decoded and written once.  With the
-        codec dictionary capped at 1 MiB this is O(B + T) time for B payload
-        bytes and T tile-directory entries, with one decoded tile of workspace.
+        Every non-disk or dirty tile is written once.  Serialization remains
+        ordered under the arena lock because it discovers exact semantic leaf
+        identities.  Independent bounded-memory codec jobs run in the pool in
+        batches of at most ``compression_workers``.  With each codec dictionary
+        capped at 1 MiB this is O(B + T) work.  Serialization is necessarily
+        ordered and remains O(B + T); after each bounded batch is serialized,
+        its codec portion has O(B/W + S + T) span for B payload bytes, T
+        tile-directory entries, W workers and largest tile S.  Workspace is at
+        most W raw tiles plus W bounded codec dictionaries.
         Compact identity headers and mutable-map route indexes remain resident;
         actual cache-missing payload accesses cost O(A*S) codec bytes in the
         worst case for A accesses and largest payload tile S.
@@ -637,12 +661,49 @@ class LiveTileArena:
             self.pressure_level = 3
             self.disk_mode = True
             self.payload_limit = 1
-            self.flush(disk=True, preserve_routing=True)
             store = self._disk_store()
-            for index, record in enumerate(self._tiles):
-                if record is not None and not isinstance(record, DiskTile):
-                    self._tiles[index] = store.write(record.decode(), record.rows)
-                    self._live_disk_bytes += self._tiles[index].stored_bytes
+            candidates = (
+                index for index, record in enumerate(self._tiles)
+                if index in self._dirty or not isinstance(record, DiskTile)
+            )
+            job_count = 0
+            with ThreadPoolExecutor(
+                max_workers=self.compression_workers,
+                thread_name_prefix="compiler-compress",
+            ) as pool:
+                started = time.perf_counter()
+                while True:
+                    batch = []
+                    for index in candidates:
+                        previous = self._tiles[index]
+                        dirty = index in self._dirty or previous is None
+                        source = self._dump(self._hot[index]) if dirty else previous
+                        batch.append((index, source, self._row_lengths[index], previous, dirty))
+                        if len(batch) == self.compression_workers:
+                            break
+                    if not batch:
+                        break
+
+                    def write(job):
+                        index, source, rows, previous, dirty = job
+                        data = source if isinstance(source, bytes) else source.decode()
+                        return index, store.write(data, rows), previous, dirty
+
+                    # pool.map has only this bounded batch to submit; neither
+                    # futures nor raw payload arguments can grow with the arena.
+                    for index, record, previous, dirty in pool.map(write, batch):
+                        self._tiles[index] = record
+                        self._live_disk_bytes += record.stored_bytes - (
+                            previous.stored_bytes if isinstance(previous, DiskTile) else 0)
+                        if dirty:
+                            self._dirty.discard(index)
+                            self.compressions += 1
+                        if index in self._hot and not self._page_kinds[index]:
+                            self._drop_hot(index)
+                        job_count += 1
+            if job_count:
+                self.parallel_compression_jobs += job_count
+                self.compression_seconds += time.perf_counter() - started
             if not isinstance(self._tiles, DiskTileDirectory):
                 directory = DiskTileDirectory(store, self.directory)
                 for index, record in enumerate(self._tiles):
@@ -894,7 +955,53 @@ class LiveTileArena:
                              self._payload_hot_count, self.route_hits, self.route_misses,
                              self._retained_decoded_bytes + route_bytes,
                              self._payload_decoded_bytes,
-                             self._payload_hot_peak)
+                             self._payload_hot_peak, self.payload_cache_hits,
+                             self.payload_evictions, self.parallel_compression_jobs,
+                             self.compression_seconds, self.compression_workers)
+
+
+def arena_for_book(book):
+    """Return the one live arena already carried by a concordance book."""
+    arenas = {
+        id(owner): owner
+        for page in dict.values(book.pages)
+        if (owner := page.__dict__.get("_live_tile_owner")) is not None
+    }
+    if len(arenas) > 1:
+        raise RuntimeError("one identity book is backed by multiple live tile arenas")
+    return next(iter(arenas.values()), None)
+
+
+def live_storage_report(book):
+    """Current physical-storage telemetry, including inherited arenas."""
+    arena = arena_for_book(book)
+    if arena is None:
+        return {"source_and_ssa_paged": False, "storage_pressure_level": 0}
+    stats = arena.stats()
+    source_and_ssa = any(
+        category == "ProcessGraph.NetworkX"
+        or category.endswith(".ControlProgram")
+        or category.endswith(".Instr")
+        for category in arena.categories
+    )
+    return {
+        "source_and_ssa_paged": source_and_ssa,
+        "storage_pressure_level": stats.pressure_level,
+        "storage_disk_tiles": stats.disk_tiles,
+        "storage_disk_bytes": stats.disk_bytes,
+        "storage_decoded_bytes": stats.decoded_bytes,
+        "storage_payload_hot_tiles": stats.payload_hot_tiles,
+        "storage_payload_cache_hits": stats.payload_cache_hits,
+        "storage_payload_reloads": stats.payload_reloads,
+        "storage_payload_evictions": stats.payload_evictions,
+        "storage_routing_reloads": stats.routing_reloads,
+        "storage_route_hits": stats.route_hits,
+        "storage_route_misses": stats.route_misses,
+        "storage_retained_index_bytes": stats.retained_index_bytes,
+        "storage_compression_jobs": stats.parallel_compression_jobs,
+        "storage_compression_seconds": stats.compression_seconds,
+        "storage_compression_workers": stats.compression_workers,
+    }
 
 
 class _TupleAnchor:

@@ -583,9 +583,11 @@ class RegionTopologyPool:
         self.entries.pop(identity)
 
     def summary(self):
+        from .live_tiles import live_storage_report
+
         return {**self.stats, "worker_threads": len(self.stats["worker_threads"]),
                 "resident_limit": self.limit, "resident_now": len(self.resident),
-                "source_and_ssa_paged": False}
+                **live_storage_report(self.book)}
 
     def worker_executor(self, workers):
         self._check()

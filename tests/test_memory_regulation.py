@@ -206,6 +206,55 @@ def test_automatic_ladder_stops_as_soon_as_rss_recovers(monkeypatch):
         set_active_contract(None)
 
 
+def test_resumed_dual_ir_book_reuses_pressure_arena_for_source_storage(monkeypatch):
+    from dataclasses import replace
+    from src.compiler.live_tiles import LiveDiGraph, _ACTIVE_ARENA, live_digraph
+
+    monkeypatch.setattr(regulation, "process_rss_bytes", lambda: 500)
+    set_active_contract(replace(
+        PRESETS["develop"], memory_budget_bytes=100,
+        live_tile_rows=2, live_resident_tiles=2,
+        live_bucket_rows=2, live_decoded_budget_bytes=512,
+    ))
+    book = IdentityBook()
+    first, first_token, release = regulation.begin_regulation(book)
+    owner = first.live_arena
+    try:
+        assert owner is not None and owner.pressure_level == 3
+    finally:
+        first.budget_bytes = None
+        regulation.end_regulation(first, first_token, releases_book_state=release)
+
+    resumed, resumed_token, release = regulation.begin_regulation(
+        book, owned_book=False,
+    )
+    try:
+        assert resumed.live_arena is owner
+        assert _ACTIVE_ARENA.get() is owner
+        climbed = []
+        original_climb = resumed._climb_storage_ladder
+
+        def observed_climb(label, resident):
+            climbed.append((label, resident))
+            return original_climb(label, resident)
+
+        resumed._climb_storage_ladder = observed_climb
+        resumed._last_pressure_read = 0.0
+        resumed.pressure_checkpoint("resumed source work")
+        assert climbed == [("resumed source work", 500)]
+        graph = live_digraph()
+        assert isinstance(graph, LiveDiGraph)
+        graph.add_edge("symbolic", "source")
+        resumed._live_receipt("source fixture")
+        report = book.__dict__["_live_tile_report"]
+        assert report["source_and_ssa_paged"]
+        assert report["pressure_level"] == 3
+    finally:
+        resumed.budget_bytes = None
+        regulation.end_regulation(resumed, resumed_token, releases_book_state=release)
+        set_active_contract(None)
+
+
 def test_dependency_level_cache_holds_live_graphs_only():
     from src.compiler import region_scheduling as scheduling
 

@@ -3,11 +3,13 @@ import ast
 from dataclasses import dataclass
 import pickle
 import sys
+from threading import current_thread
 import time
 
 import networkx as nx
 import pytest
 
+from src.compiler.compressed_tiles import DiskTileStore
 from src.compiler.live_tiles import (
     LiveTileArena, TiledDict, TiledList, TiledObject, _ACTIVE_ARENA, live_digraph,
 )
@@ -50,6 +52,34 @@ def test_pressure_ladder_stays_fully_decoded_until_explicit_escalation(tmp_path)
     assert minimum.payload_hot_tiles == 0
     assert minimum.hot_tiles == minimum.retained_index_tiles
     assert [value["value"] for value in values] == list(range(8))
+
+
+def test_maximum_tier_uses_bounded_parallel_compression_jobs(tmp_path, monkeypatch):
+    codec_threads = set()
+    write = DiskTileStore.write
+
+    def observed_write(self, data, rows, *, heavy=True):
+        if heavy:
+            codec_threads.add(current_thread().name)
+        return write(self, data, rows, heavy=heavy)
+
+    monkeypatch.setattr(DiskTileStore, "write", observed_write)
+    owner = LiveTileArena(
+        tile_rows=2, hot_tiles=2, bucket_rows=2, directory=tmp_path,
+        compression_workers=2,
+    )
+    values = [owner.manage({"value": index, "payload": "x" * 4000})
+              for index in range(24)]
+    owner.compress_resident_ram()
+    stats = owner.offload_to_disk()
+
+    assert stats.disk_tiles > 0
+    assert stats.parallel_compression_jobs > 1
+    assert stats.compression_workers == 2
+    assert stats.compression_seconds >= 0.0
+    assert codec_threads
+    assert all(name.startswith("compiler-compress") for name in codec_threads)
+    assert [value["value"] for value in values] == list(range(24))
 
 
 def test_maximum_pressure_retains_mutable_search_routing(tmp_path):

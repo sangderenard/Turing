@@ -216,6 +216,29 @@ class MemoryRegulator:
             raise
         return arena
 
+    def _bind_inherited_storage(self, arena):
+        """Continue the SAME arena when source lowering resumes a dual-IR book."""
+        if self.live_arena is arena and self.live_token is not None:
+            return arena
+        from .live_tiles import _ACTIVE_ARENA
+
+        self.live_arena = arena
+        self.live_token = _ACTIVE_ARENA.set(arena)
+        arena.pressure_probe = self.pressure_checkpoint
+        self.book.__dict__["_storage_pressure_activated"] = True
+        self._live_receipt("compile: inherited storage")
+        stats = arena.stats()
+        print(
+            f"[compiler-memory] compile: inherited storage level={stats.pressure_level} "
+            f"decoded={stats.decoded_bytes / 2**20:.2f} MiB "
+            f"payload_hot={stats.payload_hot_tiles} disk_tiles={stats.disk_tiles} "
+            f"route_hits={stats.route_hits} route_misses={stats.route_misses} "
+            f"payload_hits={stats.payload_cache_hits} "
+            f"payload_reloads={stats.payload_reloads}",
+            file=sys.stderr, flush=True,
+        )
+        return arena
+
     def _cold_page_names(self):
         if not (self.owns_book and self.completed is not None):
             return ()
@@ -238,11 +261,13 @@ class MemoryRegulator:
         tile/codec windows; LiveTileArena.collect_unused documents the stricter
         parameterized bound of its one-tile traversal cache.
         """
-        if not (self.compress_policy and self.tile_disk_policy and self.owns_book
+        if not (self.compress_policy and self.tile_disk_policy
                 and self.budget_bytes is not None and resident > self.budget_bytes
                 and self.live_arena is not None):
             return resident
         while resident > self.budget_bytes and self.live_arena.pressure_level < 3:
+            before = resident
+            started = time.perf_counter()
             level = self.live_arena.pressure_level
             if level == 0:
                 stats = self.live_arena.offload_cold_tail()
@@ -262,15 +287,24 @@ class MemoryRegulator:
                 stats = self.live_arena.stats()
                 action = "minimum-working-set"
             self._live_receipt(label)
-            print(f"[compiler-memory] {label}: {action} level={stats.pressure_level} "
-                  f"hot={stats.hot_tiles} disk_tiles={stats.disk_tiles} "
-                  f"disk={stats.disk_bytes / 2**20:.2f} MiB",
-                  file=sys.stderr, flush=True)
             resident = process_rss_bytes()
+            print(f"[compiler-memory] {label}: {action} level={stats.pressure_level} "
+                  f"elapsed={time.perf_counter() - started:.3f}s "
+                  f"rss={before / 2**20:.0f}->{resident / 2**20:.0f} MiB "
+                  f"decoded={stats.decoded_bytes / 2**20:.2f} MiB "
+                  f"payload_hot={stats.payload_hot_tiles} "
+                  f"disk_tiles={stats.disk_tiles} disk={stats.disk_bytes / 2**20:.2f} MiB "
+                  f"route_hits={stats.route_hits} route_misses={stats.route_misses} "
+                  f"payload_hits={stats.payload_cache_hits} "
+                  f"payload_reloads={stats.payload_reloads} "
+                  f"payload_evictions={stats.payload_evictions} "
+                  f"compression_jobs={stats.parallel_compression_jobs} "
+                  f"compression_workers={stats.compression_workers}",
+                  file=sys.stderr, flush=True)
         return resident
 
     def offload_tiles(self, label: str, resident: int):
-        if not (self.compress_policy and self.tile_disk_policy and self.owns_book
+        if not (self.compress_policy and self.tile_disk_policy
                 and self.budget_bytes is not None and resident > self.budget_bytes):
             return None
         from .identity_compression import offload_book_tiles
@@ -312,12 +346,23 @@ class MemoryRegulator:
             "route_misses": stats.route_misses,
             "retained_index_bytes": stats.retained_index_bytes,
             "hot_peak": stats.hot_peak,
+            "payload_cache_hits": stats.payload_cache_hits,
+            "payload_evictions": stats.payload_evictions,
+            "compression_jobs": stats.parallel_compression_jobs,
+            "compression_seconds": stats.compression_seconds,
+            "compression_workers": stats.compression_workers,
+            "source_and_ssa_paged": any(
+                category == "ProcessGraph.NetworkX"
+                or category.endswith(".ControlProgram")
+                or category.endswith(".Instr")
+                for category in self.live_arena.categories
+            ),
             "policy_sources": getattr(self, "live_policy_sources", ()),
         }
 
     def pressure_checkpoint(self, label: str):
         """Throttled pressure check INSIDE instantiation, independent of UI."""
-        if not (self.compress_policy and self.tile_disk_policy and self.owns_book
+        if not (self.compress_policy and self.tile_disk_policy
                 and self.budget_bytes is not None):
             return None
         now = time.monotonic()
@@ -358,6 +403,7 @@ class MemoryRegulator:
 
         book = self.book
         ensure_declared(book)       # (a book with a registry of its own)
+        ordinal = int(book.__dict__.get("_memory_release_ordinal", self.releases))
         book.post(
             COMPILE_POLICY, ("memory_budget_bytes",), str(budget),
             stage=MEMORY_REGULATION,
@@ -365,12 +411,13 @@ class MemoryRegulator:
         )
         policy_cell = book.latest_ref(COMPILE_POLICY, ("memory_budget_bytes",))
         book.post(
-            MEMORY_RELEASE_RECEIPT, (label, self.releases),
+            MEMORY_RELEASE_RECEIPT, (label, ordinal),
             MemoryRelease(item, before, after, budget, released),
             stage=MEMORY_REGULATION, provenance=Derived((policy_cell,)),
             mode=Mode.CONCORD,
         )
-        self.releases += 1
+        self.releases = ordinal + 1
+        book.__dict__["_memory_release_ordinal"] = self.releases
 
 
 _ACTIVE: contextvars.ContextVar[MemoryRegulator | None] = (
@@ -422,12 +469,23 @@ def begin_regulation(
 def _initialize_regulation(regulator, contract):
     book = regulator.book
     if regulator.compress_policy:
-        from .live_tiles import _ACTIVE_REGISTRAR
+        from .live_tiles import _ACTIVE_REGISTRAR, arena_for_book
         regulator.live_settings = (
             contract.live_tile_rows, contract.live_resident_tiles,
             contract.live_bucket_rows, contract.live_decoded_budget_bytes,
         )
         regulator.live_registrar_token = _ACTIVE_REGISTRAR.set(regulator.register_live_root)
+
+        inherited = arena_for_book(book)
+        if inherited is not None:
+            expected = regulator.live_settings
+            actual = (inherited.tile_rows, inherited.hot_limit,
+                      inherited.bucket_rows, inherited.decoded_budget_bytes)
+            if actual != expected:
+                raise ValueError(
+                    f"resumed live storage settings {actual!r} disagree with "
+                    f"active work contract {expected!r}")
+            regulator._bind_inherited_storage(inherited)
 
         regulator.live_policy_values = {
             "compressed_tile_disk": "true" if regulator.tile_disk_policy else "false",

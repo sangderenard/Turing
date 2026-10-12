@@ -1,3 +1,39 @@
+2026-10-12 INHERITED DUAL-IR PRESSURE / COMPRESSION TELEMETRY (CURRENT WORKTREE):
+The symbolic compiler's pressure arena now remains the active physical storage
+arena when the public source compiler resumes the SAME IdentityBook.  The
+non-owning source regulator may continue the coarse-to-fine pressure ladder and
+its throttled in-stage checks; ownership still gates lifecycle decisions about
+which semantic book pages are cold, not physical regulation of already-adopted
+storage.
+
+* `graph_work.source_and_ssa_paged` is no longer hard-coded false.  It is true
+  only after ProcessGraph, ControlProgram or SSA instruction storage has
+  actually joined the book's arena.  The same report exposes pressure level,
+  disk/decoded bytes, hot payload count, route hits/misses, payload cache
+  hits/reloads/evictions and compression jobs/time/workers.
+* Every pressure-tier transition now logs its action, elapsed wall time, RSS
+  before/after and those physical-storage counters.  Resuming inherited
+  pressure emits an explicit line, so a long source stage no longer hides that
+  it is operating on the symbolic compiler's evicted material.
+* Maximum-tier strong disk codecs run through a bounded worker pool.  Semantic
+  serialization remains ordered because it discovers exact shared leaves;
+  only independent tile codecs are parallel.  At most W raw tiles and W
+  <=1MiB codec dictionaries exist for W workers, rather than a whole-arena
+  future/input queue.
+* Let B be live payload bytes, T tile count, S largest tile and W bounded codec
+  workers.  Maximum conversion remains O(B+T) total work and overall worst-case
+  elapsed time because ordered serialization is O(B+T).  Within each serialized
+  bounded batch the codec span is O(B/W+S+T).  This is a wall-clock reduction,
+  not a false claim that the required full-storage traversal became sublinear.
+  Subsequent alternating payload accesses retain the existing O(A*S) term;
+  retained route indexes prevent repeated trie rediscovery but cannot remove a
+  real requested payload read.
+* Focused live-storage, regulation and graph-work gate: 76 passed, 1 deselected
+  in 78.26s.  The deselected native-worker bootstrap test fails at clean
+  7e892712 with the same pre-existing `carried-name-arm-missing` SSA error, so
+  it is recorded rather than attributed to this change.  The full orbital
+  all-rule receipt is intentionally pending the user's requested run.
+
 2026-10-12 RETAINED LIVE-MAP SEARCH INDEX (CURRENT WORKTREE):
 The earlier maximum-tier design repeatedly evicted the mutable TiledDict hash
 trie itself.  A logical lookup therefore reread several routing tiles before it
