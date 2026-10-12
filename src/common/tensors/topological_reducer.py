@@ -7432,6 +7432,15 @@ def _normalize_lexical_values(
             )
             for index, expression in enumerate(expressions):
                 value = resolve_expression(expression)
+                if isinstance(value, _StaticPythonReference):
+                    # A returned compiler symbol crosses the same explicit
+                    # host boundary as a symbol stored into a field or passed
+                    # to a call.  Materialize its existing StaticReference
+                    # identity before publishing the return-site receipt;
+                    # leaving the ephemeral resolver object here made the
+                    # later value-id bookkeeping call ``int()`` on a Python
+                    # object and discarded the boundary entirely.
+                    value = static_reference_node(value)
                 slot_values.append(value if isinstance(value, int) else None)
                 if value is None:
                     continue
@@ -9885,6 +9894,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     kind = "dict"
                 elif isinstance(value, ast.Tuple):
                     kind = "tuple"
+                elif isinstance(value, ast.Name):
+                    # Source pursuit records constructor classes in
+                    # ``_python_bindings`` for discovery.  They are not the
+                    # runtime identity of an authored alias.  Preserve the
+                    # exact lexical storage relation here so a nested
+                    # function capturing ``trace`` after
+                    # ``trace = _selection_trace`` receives the same keyed
+                    # storage input instead of resolving the weaker
+                    # discovery marker ``trace: dict`` as a static Python
+                    # reference.
+                    kind = kinds.get(value.id)
                 elif (
                     isinstance(value, ast.Call)
                     and isinstance(value.func, ast.Name)
@@ -13506,6 +13526,65 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             return tuple(actual for _rank, actual in sorted(ranked))
 
         changed = False
+        formal_evidence: dict[
+            tuple[str, int], dict[str, Any]
+        ] = {}
+        numeric_class_identities = set(_NUMERIC_TYPE_FEATURES)
+        pending_numeric_bases = list(numeric_class_identities)
+        while pending_numeric_bases:
+            derived = pending_numeric_bases.pop()
+            for base in class_bases.get(derived, ()):
+                if base not in numeric_class_identities:
+                    numeric_class_identities.add(base)
+                    pending_numeric_bases.append(base)
+
+        def publish_formal_class(
+            callee_scope: str,
+            formal_id: int,
+            callee: Any,
+            class_identity: str,
+            limbs: int,
+            transfer_source: str,
+        ) -> None:
+            nonlocal changed
+            formal_attributes = callee.nodes[formal_id].setdefault(
+                "attributes", {}
+            )
+            prior = (
+                formal_attributes.get("result_class_ref"),
+                int(formal_attributes.get("precision_limbs") or 1),
+            )
+            _concord_source_value_class(
+                callee_scope,
+                formal_id,
+                str(class_identity),
+                precision_limbs=int(limbs),
+                source=transfer_source,
+            )
+            # The actual-to-formal edge transfers the instance's class
+            # identity; it does not turn the formal Input into a constructor.
+            # ``class_ref`` is consumed by deployment as a request to call
+            # ``__init__``.  Stamping it here recursively constructed every
+            # specialized ``self`` and ``other`` parameter and exported the
+            # resulting private frames all the way to the root ABI.
+            formal_attributes.pop("class_ref", None)
+            formal_attributes.update({
+                "result_class_ref": str(class_identity),
+                "precision_limbs": int(limbs),
+                "numeric_identity_source": transfer_source,
+            })
+            descriptor = numeric_feature_descriptor(
+                str(class_identity) + (
+                    f"[{int(limbs)}]" if int(limbs) > 1 else ""
+                )
+            )
+            if descriptor is not None:
+                formal_attributes["numeric_feature_descriptor"] = (
+                    descriptor.receipt()
+                )
+            changed = changed or prior != (
+                str(class_identity), int(limbs),
+            )
         for caller_entry in entries.values():
             caller = caller_entry.graph.G
             if not caller.graph.get("source_pursuit_active"):
@@ -13662,6 +13741,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 for position, actual_id in enumerate(actuals):
                     if position >= len(parameter_names):
                         break
+                    formal_id = formal_nodes.get(parameter_names[position])
+                    if formal_id is None:
+                        continue
+                    formal_key = (callee_scope, formal_id)
+                    evidence = formal_evidence.setdefault(formal_key, {
+                        "graph": callee,
+                        "facts": [],
+                    })
                     class_page = current_identity_book().page(
                         "source_value_class_concordance"
                     )
@@ -13678,12 +13765,6 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     )
                     if class_identity is None:
                         continue
-                    formal_id = formal_nodes.get(parameter_names[position])
-                    if formal_id is None:
-                        continue
-                    formal_attributes = callee.nodes[formal_id].setdefault(
-                        "attributes", {}
-                    )
                     actual_attributes = (
                         caller.nodes[int(actual_id)].get("attributes") or {}
                     )
@@ -13696,42 +13777,37 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             else ""
                         )
                     )
-                    prior = (
-                        formal_attributes.get("result_class_ref"),
-                        int(formal_attributes.get("precision_limbs") or 1),
-                    )
-                    _concord_source_value_class(
-                        callee_scope,
-                        formal_id,
-                        str(class_identity),
-                        precision_limbs=int(limbs),
-                        source=transfer_source,
-                    )
-                    # The actual-to-formal edge transfers the instance's
-                    # class identity; it does not turn the formal Input into
-                    # a constructor.  ``class_ref`` is consumed by deployment
-                    # as a request to call ``__init__``.  Stamping it here
-                    # recursively constructed every specialized ``self`` and
-                    # ``other`` parameter and exported the resulting private
-                    # frames all the way to the root ABI.
-                    formal_attributes.pop("class_ref", None)
-                    formal_attributes.update({
-                        "result_class_ref": str(class_identity),
-                        "precision_limbs": int(limbs),
-                        "numeric_identity_source": transfer_source,
-                    })
-                    descriptor = numeric_feature_descriptor(
-                        str(class_identity) + (
-                            f"[{int(limbs)}]" if int(limbs) > 1 else ""
+                    if str(class_identity) in numeric_class_identities:
+                        publish_formal_class(
+                            callee_scope, formal_id, callee,
+                            str(class_identity), int(limbs), transfer_source,
                         )
-                    )
-                    if descriptor is not None:
-                        formal_attributes["numeric_feature_descriptor"] = (
-                            descriptor.receipt()
-                        )
-                    changed = changed or prior != (
-                        str(class_identity), int(limbs),
-                    )
+                    else:
+                        evidence["facts"].append((
+                            str(class_identity), int(limbs), transfer_source,
+                        ))
+        for (callee_scope, formal_id), evidence in formal_evidence.items():
+            facts = tuple(evidence["facts"])
+            distinct = {
+                (class_identity, limbs)
+                for class_identity, limbs, _source in facts
+            }
+            # A formal owns one class concordance row.  Publish it only when
+            # all resolved authored incoming call edges prove the same
+            # identity.  Multiple legitimate record variants mean the formal
+            # remains generic; selecting the first call would invent an
+            # identity and make traversal order semantic.  Unknown actuals
+            # supply no contradictory class fact and may settle in a later
+            # fixed-point round.
+            if len(distinct) != 1:
+                continue
+            class_identity, limbs = next(iter(distinct))
+            transfer_source = facts[0][2]
+            callee = evidence["graph"]
+            publish_formal_class(
+                callee_scope, formal_id, callee,
+                str(class_identity), int(limbs), transfer_source,
+            )
         return changed
 
     # Operators reveal new exact callees; those call edges reveal the

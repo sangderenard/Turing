@@ -709,6 +709,32 @@ def test_profile_collection_without_display_keeps_callbacks_and_counts():
                for row in layer.channel.profile_summary())
 
 
+def test_stage_state_sink_receives_exact_declared_states_not_work_items():
+    clock = Clock()
+    states = []
+    layer = CompileProgress(
+        enabled=False, collect_profile=True, stages=FAKE_STAGES,
+        clock=clock, rss=lambda: GIB, state_sink=states.append,
+    )
+    with layer:
+        layer.count('nodes', 1, total=10)
+        layer.substage('finding exact owners')
+        clock.now += 2
+        layer.stage('beta')
+        layer.count('nodes', 2, total=10)
+
+    assert [state['status'] for state in states] == [
+        'running', 'running', 'running', 'complete',
+    ]
+    assert states[1]['substage'] == 'finding exact owners'
+    assert states[2]['stage_key'] == 'beta'
+    assert states[2]['stage_number'] == 2
+    assert states[2]['stage_count'] == 3
+    assert [row['state'] for row in states[2]['stages']] == [
+        'done', 'running', 'pending',
+    ]
+
+
 def test_timing_dataframe_uses_accumulated_stage_values():
     pytest.importorskip('pandas')
     layer, _events, _bars, clock = make_layer()

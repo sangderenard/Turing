@@ -16,6 +16,42 @@ def _worker_key(prefix: str, qualified_name: str, index: Any = "") -> str:
     return f"{prefix}:{qualified_name}:{index}"
 
 
+def _show_worker(
+    display,
+    key: str,
+    label: str,
+    current: Mapping[str, Any],
+    *,
+    status: str = "running",
+    rss_bytes: int = 0,
+) -> None:
+    compiler = dict(current.get("compiler") or {})
+    if hasattr(display, "worker"):
+        display.worker(
+            key,
+            label=label,
+            status=status,
+            stage_number=int(compiler.get("stage_number") or 0),
+            stage_count=int(compiler.get("stage_count") or 0),
+            stage_label=str(
+                compiler.get("stage_label")
+                or current.get("message")
+                or "starting"
+            ),
+            substage=str(compiler.get("substage") or ""),
+            elapsed_seconds=float(current.get("elapsed_seconds") or 0.0),
+            rss_bytes=int(
+                rss_bytes or current.get("resident_bytes") or 0
+            ),
+            stages=tuple(compiler.get("stages") or ()),
+        )
+        return
+    display.count(
+        key, 0, total=1, label=label,
+        detail=str(current.get("message") or "starting"),
+    )
+
+
 def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
     """Project all worker events onto the one parent-owned terminal frame."""
 
@@ -31,9 +67,7 @@ def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
         qualified_name = str(worker.get("qualified_name") or "worker")
         key = _worker_key("catalogue", qualified_name)
         if worker_stage == "unit_start":
-            display.count(
-                key, 0, total=1, label=qualified_name, detail="starting",
-            )
+            _show_worker(display, key, qualified_name, {}, status="starting")
         elif worker_stage == "worker_snapshot":
             display.count(
                 "catalogue-total",
@@ -47,19 +81,34 @@ def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
                 name = str(row.get("qualified_name") or "worker")
                 row_key = _worker_key("catalogue", name)
                 current = dict(row.get("stage") or {})
-                detail = str(current.get("message") or "running")
+                current["elapsed_seconds"] = float(
+                    row.get("elapsed_seconds") or 0.0
+                )
                 resident = int(row.get("resident_bytes") or 0)
-                if resident:
-                    detail += f" | rss {resident / (1 << 30):.2f}GB"
-                display.count(row_key, 0, total=1, label=name, detail=detail)
+                _show_worker(
+                    display, row_key, name, current,
+                    status="running", rss_bytes=resident,
+                )
         elif worker_stage == "worker_output":
             message = str(worker.get("message") or "")
             if message:
                 display.log(f"[{qualified_name}] {message}")
         elif worker_stage == "unit_complete":
             status = str(worker.get("status") or "unknown")
-            display.count(key, 1, total=1, label=qualified_name, detail=status)
-            display.count_close(key)
+            failure_stage = worker.get("failure_stage")
+            current = dict(
+                failure_stage if isinstance(failure_stage, Mapping)
+                else worker.get("stage")
+                if isinstance(worker.get("stage"), Mapping)
+                else {}
+            )
+            current.setdefault(
+                "elapsed_seconds", float(worker.get("elapsed_seconds") or 0.0)
+            )
+            _show_worker(
+                display, key, qualified_name, current, status=status,
+                rss_bytes=int(worker.get("peak_resident_bytes") or 0),
+            )
             display.log(f"{qualified_name}: {status}")
         return
     if stage == "bootstrap_creep_subdivision":
@@ -130,6 +179,8 @@ def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
                     for item in failures
                 )
             )
+        if hasattr(display, "worker_clear"):
+            display.worker_clear()
         return
 
 

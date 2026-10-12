@@ -1,3 +1,36 @@
+2026-10-12 PARENT-OWNED COMPILER PROGRESS (CURRENT WORKTREE):
+The whole-program bootstrap still owns exactly one terminal compositor.  Its
+workers do not create terminal displays.  Each worker now publishes the exact
+ten-stage state emitted by `CompileProgress` into its durable
+`compile-progress.json`; the parent renders those stages as rows and concurrent
+workers as columns.  A failed worker remains visible while independent workers
+continue.  Only the outer bootstrap scope closes the display.  Stage
+publication occurs at stage and substage transitions, not at work-item count
+updates, so this adds no callback to the per-item lowering path.
+
+The telemetry, live-display, project-product, and whole-bootstrap gate passes
+136 tests in 66.85 seconds.  Four focused structured-state tests pass in 1.30
+seconds.  The outer bootstrap was not launched; the user owns the next
+observable run.
+
+2026-10-12 COMPILER BOOTSTRAP FRONTIERS (CURRENT WORKTREE):
+The current worktree retains the exact authored identities exposed by the
+latest bootstrap frontier: returned static Python values are materialized as
+their existing `StaticReference`; generic formals accept multiple record class
+variants without traversal-order stamping; and authored aliases retain their
+lexical aggregate kind.  Resolved graph checkpoints now use the existing
+import-owned identity and AOT-checkpoint contracts for cached descriptors,
+context variables, standard streams, and synchronization handles.  Native
+build commands use a short transient working directory while keeping every
+artifact path absolute.  Finally, the runtime catalogue republishes its
+existing recursion table and condensation levels before asking for dependency
+order, so authored backedges do not reach NetworkX as an unclassified cycle.
+
+Seven focused identity, checkpoint, progress, and native-path tests pass in
+2.02 seconds.  The persisted 109,611-node failed catalogue graph was also
+loaded directly: rebuilding its existing recursion facts allowed dependency
+ordering to return all 109,611 nodes.  No outer bootstrap was launched.
+
 2026-10-12 PROJECT SOURCE MODULE IDENTITY (CURRENT WORKTREE):
 Project compilation no longer discards the module identity it already resolved
 from the authored source path.  The sanctioned source compiler now receives

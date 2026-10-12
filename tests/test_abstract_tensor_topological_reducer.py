@@ -3,9 +3,11 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import pickle
 import re._constants
 import subprocess
 import sys
+import threading
 
 import networkx as nx
 import pytest
@@ -27,6 +29,7 @@ from src.compiler.extraction_contract import (
 )
 from src.compiler.identity_concordance import (
     begin_identity_book,
+    current_identity_book,
     end_identity_book,
 )
 
@@ -99,6 +102,66 @@ def classify(value):
     serialized = io.BytesIO()
     _dump_resolved_process_graph(graph, serialized)
     assert serialized.tell() > 0
+
+
+def test_resolved_graph_pickle_retains_import_owned_cached_property_identity():
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+
+    serialized = io.BytesIO()
+    _dump_resolved_process_graph(
+        {"nodes_descriptor": nx.Graph.nodes}, serialized,
+    )
+
+    restored = pickle.loads(serialized.getvalue())
+    assert restored["nodes_descriptor"] is nx.Graph.nodes
+
+
+def test_resolved_graph_pickle_retains_import_owned_context_var_identity():
+    from src.compiler.identity_concordance import _ACTIVE_IDENTITY_BOOK
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+
+    serialized = io.BytesIO()
+    _dump_resolved_process_graph(
+        {"active_book": _ACTIVE_IDENTITY_BOOK}, serialized,
+    )
+
+    restored = pickle.loads(serialized.getvalue())
+    assert restored["active_book"] is _ACTIVE_IDENTITY_BOOK
+
+
+def test_resolved_graph_pickle_recreates_checkpoint_locks():
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+
+    serialized = io.BytesIO()
+    _dump_resolved_process_graph(
+        {"lock": threading.Lock(), "rlock": threading.RLock()}, serialized,
+    )
+
+    restored = pickle.loads(serialized.getvalue())
+    assert restored["lock"].acquire(blocking=False)
+    restored["lock"].release()
+    assert restored["rlock"].acquire(blocking=False)
+    restored["rlock"].release()
+
+
+def test_resolved_graph_pickle_retains_standard_stream_module_slot():
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+
+    if not isinstance(sys.__stderr__, io.TextIOWrapper):
+        pytest.skip("interpreter standard error is not a TextIOWrapper")
+    serialized = io.BytesIO()
+    _dump_resolved_process_graph({"stream": sys.__stderr__}, serialized)
+
+    restored = pickle.loads(serialized.getvalue())
+    assert restored["stream"] is sys.__stderr__
 
 
 def test_tuple_comprehension_publishes_fixed_resident_row_width():
@@ -1042,6 +1105,52 @@ def run(value):
     assert calls["worker.apply(value)"]["attributes"]["method_ref"] == (
         method_ref
     )
+
+
+def test_generic_formal_accepts_distinct_record_variants_without_class_stamp():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Transition:
+    pass
+
+class Move(Transition):
+    pass
+
+class Retire(Transition):
+    pass
+
+def receive(value):
+    return value
+
+def entry():
+    receive(Move())
+    receive(Retire())
+    return 0
+"""
+    )
+    entry = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "entry"
+    )
+    entry._source_pursuit_active = True
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    receive = graph.function_table.entry("receive").graph.G
+    formal_id, formal = next(
+        (node_id, data)
+        for node_id, data in receive.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "value"
+    )
+    attributes = formal.get("attributes") or {}
+    assert "result_class_ref" not in attributes
+    assert current_identity_book().page(
+        "source_value_class_concordance"
+    ).latest(("receive", formal_id)) is None
 
 
 def test_field_aggregate_contract_follows_an_authored_method_result():
@@ -2000,6 +2109,34 @@ def attach(parameter):
     )
     assert function_graph.G.nodes[value_id]["type"] == "StaticReference"
     assert set_attr["attributes"]["static_value_boundary"] == "registry.handler"
+
+
+def test_returned_static_python_value_remains_an_explicit_host_boundary():
+    class Registry:
+        handler = object()
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"registry": Registry}
+    module = ast.parse(
+        """
+def selected_handler():
+    return registry.handler
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("selected_handler").graph
+
+    returned_ids = tuple(
+        function_graph.G.graph["return_value_nodes"].values()
+    )
+    assert len(returned_ids) == 1
+    returned = function_graph.G.nodes[returned_ids[0]]
+    assert returned["type"] == "StaticReference"
+    assert returned["attributes"]["static_python_reference"] == (
+        "registry.handler"
+    )
 
 
 def test_autograd_tape_assignment_remains_an_explicit_recursive_seam():

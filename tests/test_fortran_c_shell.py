@@ -2975,6 +2975,55 @@ end module linked_fortran
 
 
 @pytest.mark.skipif(
+    os.name != "nt" or fortran_compiler() is None,
+    reason="Windows long-path native build requires a Fortran compiler",
+)
+def test_compiled_library_uses_a_short_transient_working_directory(tmp_path):
+    output = (
+        tmp_path
+        / ("version-" + "a" * 64)
+        / ("unit-" + "b" * 80)
+        / ("region-" + "c" * 80)
+    )
+    assert len(str(output.resolve())) > 260
+    source = """
+module long_path_fortran
+  use, intrinsic :: iso_c_binding
+  implicit none
+contains
+  subroutine authored_root() bind(C, name="authored_root")
+  end subroutine authored_root
+end module long_path_fortran
+"""
+    module = FortranModule(
+        "long_path_fortran",
+        source,
+        api=CompiledProgramAPI(
+            module="long_path_fortran",
+            language="fortran",
+            entry="authored_root",
+            entry_points=(EntryPoint(
+                name="authored_root",
+                symbol="authored_root",
+                kind="control",
+                parameters=(),
+            ),),
+        ),
+    )
+
+    artifact = compile_fortran_module_c_shell(
+        module,
+        {},
+        output,
+        entrypoint="authored_root",
+        name="long_path_native",
+        library=True,
+    )
+
+    assert artifact.executable_path.is_file()
+
+
+@pytest.mark.skipif(
     fortran_compiler() is None,
     reason="no Fortran compiler installed",
 )

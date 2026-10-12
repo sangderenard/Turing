@@ -98,6 +98,45 @@ def test_rule_batch_clock_is_the_top_line_and_bars_remain_at_the_bottom():
     assert active_rule_batch_progress() is None
 
 
+def test_one_live_renders_concurrent_compilers_as_columns_and_keeps_failure():
+    progress, _, _ = layer()
+    failed_stages = [
+        {"label": f"stage {index}", "state": "done" if index < 4 else
+         "failed" if index == 4 else "pending"}
+        for index in range(10)
+    ]
+    failed_stages[4]["label"] = "deployment select"
+    failed_stages[8]["label"] = "SSA lowering"
+    working_stages = [
+        {"label": failed_stages[index]["label"],
+         "state": "done" if index < 8 else
+         "running" if index == 8 else "pending"}
+        for index in range(10)
+    ]
+    working_stages[8]["label"] = "SSA lowering"
+    with progress:
+        progress.worker(
+            'failed', label='failed_unit', status='failed',
+            stage_number=5, stage_count=10, stage_label='deployment select',
+            elapsed_seconds=12.5, rss_bytes=2 * 1024 ** 3,
+            stages=failed_stages,
+        )
+        progress.worker(
+            'working', label='working_unit', status='running',
+            stage_number=9, stage_count=10, stage_label='SSA lowering',
+            substage='lower-functions', elapsed_seconds=20,
+            rss_bytes=3 * 1024 ** 3,
+            stages=working_stages,
+        )
+        current = frame_text(progress, width=160)
+        assert 'Compiler workers' in current
+        assert 'Compiler stage' in current
+        assert 'failed_unit' in current and 'deployment select' in current
+        assert 'working_unit' in current and 'SSA lowering' in current
+        assert 'failed' in current and 'running' in current
+        assert 'compile 1/10' not in current
+
+
 @pytest.mark.parametrize('width,height', [(100, 30), (80, 14), (40, 10), (20, 6)])
 def test_resize_keeps_active_stage_visible_without_terminal_overflow(width, height):
     progress, _, _ = layer()

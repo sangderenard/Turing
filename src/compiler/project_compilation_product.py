@@ -12,10 +12,13 @@ from __future__ import annotations
 import ast
 import copy
 import copyreg
+import contextvars
 import dataclasses
 from dataclasses import dataclass
+import functools
 import hashlib
 import importlib
+import io
 import json
 import os
 from pathlib import Path
@@ -3387,6 +3390,7 @@ def _unexplained_root_argument_ids(function: Any) -> tuple[int, ...]:
             "source_name",
             "source_parameter",
             "sequence_source_name",
+            "exact_region_feed_source",
             "compiler_frame_storage",
             "linked_call_frame_storage",
             "returned_record_storage",
@@ -3503,6 +3507,7 @@ def source_region_integral_accounting(
         address_base_ids: set[int] = set()
         retained_calls: list[str] = []
         retained_references: list[int] = []
+        unlowered_aggregate_operators: list[dict[str, Any]] = []
         for block in function.blocks.values():
             for instruction in block.instrs:
                 for argument in instruction.args:
@@ -3522,6 +3527,40 @@ def source_region_integral_accounting(
                     retained_references.append(int(
                         instruction.attributes.get("reference_handle", -1)
                     ))
+                aggregate_arguments = tuple(
+                    int(argument.id)
+                    for argument in instruction.args
+                    if (
+                        (accounting := dict(argument.accounting or {})).get(
+                            "sequence_id"
+                        ) is not None
+                        or str(accounting.get("program_abi_storage") or "")
+                        in {"span", "sequence"}
+                    )
+                )
+                if (
+                    aggregate_arguments
+                    and str(instruction.op).casefold()
+                    in {"bitor", "bitand", "bitxor"}
+                    and instruction.res is not None
+                    and not tuple(instruction.res.shape or ())
+                    and not dict(instruction.res.accounting or {}).get(
+                        "sequence_id"
+                    )
+                ):
+                    # Python set algebra reached repository SSA as a scalar
+                    # numeric bitwise instruction.  The span arguments are
+                    # the exact storage record; accepting the scalar result
+                    # would make native emission silently change container
+                    # semantics (and currently produces rank-invalid
+                    # Fortran).  This compartment remains a visible lowering
+                    # frontier until keyed-sequence algebra supplies its
+                    # output storage contract.
+                    unlowered_aggregate_operators.append({
+                        "operation": str(instruction.op),
+                        "argument_value_ids": list(aggregate_arguments),
+                        "result_value_id": int(instruction.res.id),
+                    })
                 if instruction.res is not None:
                     result_id = int(instruction.res.id)
                     produced[result_id] = instruction.res
@@ -3600,6 +3639,11 @@ def source_region_integral_accounting(
             shortfalls.append({
                 "kind": "retained-python-references",
                 "handles": retained_references,
+            })
+        if unlowered_aggregate_operators:
+            shortfalls.append({
+                "kind": "unlowered-aggregate-operators",
+                "occurrences": unlowered_aggregate_operators,
             })
         unresolved_required = tuple(
             function.metadata.get("unresolved_required_source_values", ())
@@ -4369,6 +4413,83 @@ def _dump_pickle_artifact(path: str | Path, value: Any) -> None:
     Path(path).write_bytes(pickle.dumps(value, protocol=5))
 
 
+def _resolve_qualified_module_attribute(
+    module_name: str, owner_path: str, attribute_name: str,
+) -> Any:
+    """Resolve one import-owned descriptor without copying its implementation."""
+
+    owner: Any = importlib.import_module(str(module_name))
+    if owner_path:
+        for component in str(owner_path).split("."):
+            owner = getattr(owner, component)
+    return getattr(owner, str(attribute_name))
+
+
+def _reduce_importable_cached_property(
+    descriptor: functools.cached_property,
+) -> tuple[Any, tuple[str, str, str]]:
+    """Name an import-owned cached property by its declaring class slot.
+
+    ``cached_property.func`` retains the authored function, but that function
+    is intentionally hidden behind the descriptor at its module-qualified
+    name.  Stock pickle therefore cannot resolve the function by name.  The
+    declaring class slot is the stable Python identity and reconstructs the
+    exact live descriptor on the worker side.
+    """
+
+    function = descriptor.func
+    module_name = str(function.__module__)
+    parts = str(function.__qualname__).split(".")
+    if len(parts) < 2 or "<locals>" in parts:
+        raise pickle.PicklingError(
+            "cached_property has no import-owned declaring class slot: "
+            f"{module_name}.{function.__qualname__}"
+        )
+    return (
+        _resolve_qualified_module_attribute,
+        (module_name, ".".join(parts[:-1]), parts[-1]),
+    )
+
+
+def _reduce_import_owned_context_var(
+    variable: contextvars.ContextVar,
+) -> tuple[Any, tuple[str, str, str]]:
+    """Name a process-local context variable by an existing module slot."""
+
+    return _reduce_import_owned_module_slot(variable, "ContextVar")
+
+
+def _reduce_import_owned_module_slot(
+    value: Any, kind: str,
+) -> tuple[Any, tuple[str, str, str]]:
+    """Reduce process-local state only when a module already owns it."""
+
+    candidates = sorted(
+        (str(module_name), str(attribute_name))
+        for module_name, module in tuple(sys.modules.items())
+        if module is not None and hasattr(module, "__dict__")
+        for attribute_name, candidate in tuple(vars(module).items())
+        if candidate is value
+    )
+    if not candidates:
+        raise pickle.PicklingError(
+            f"{kind} has no import-owned module slot"
+        )
+    module_name, attribute_name = candidates[0]
+    return (
+        _resolve_qualified_module_attribute,
+        (module_name, "", attribute_name),
+    )
+
+
+def _reduce_import_owned_text_stream(
+    stream: io.TextIOWrapper,
+) -> tuple[Any, tuple[str, str, str]]:
+    """Resolve standard process streams from their authoritative module slot."""
+
+    return _reduce_import_owned_module_slot(stream, "TextIOWrapper")
+
+
 def _dump_resolved_process_graph(graph: Any, stream: Any) -> None:
     """Serialize a reduced graph while preserving importable module bindings.
 
@@ -4379,11 +4500,35 @@ def _dump_resolved_process_graph(graph: Any, stream: Any) -> None:
     the live graph nor changes global pickle behavior.
     """
 
+    import threading
+    from ..common.tensors.accelerator_backends.aot_checkpoint import (
+        _new_lock,
+        _new_rlock,
+    )
+
     pickler = pickle.Pickler(stream, protocol=5)
     pickler.dispatch_table = copyreg.dispatch_table.copy()
     pickler.dispatch_table[types.ModuleType] = lambda module: (
         importlib.import_module,
         (str(module.__name__),),
+    )
+    pickler.dispatch_table[functools.cached_property] = (
+        _reduce_importable_cached_property
+    )
+    pickler.dispatch_table[contextvars.ContextVar] = (
+        _reduce_import_owned_context_var
+    )
+    pickler.dispatch_table[io.TextIOWrapper] = (
+        _reduce_import_owned_text_stream
+    )
+    # Resolved graph publication is a process checkpoint.  Synchronization
+    # handles have no transferable ownership state; use the compiler's
+    # existing AOT-checkpoint contract to create fresh worker-local handles.
+    pickler.dispatch_table[type(threading.Lock())] = lambda _lock: (
+        _new_lock, (),
+    )
+    pickler.dispatch_table[type(threading.RLock())] = lambda _lock: (
+        _new_rlock, (),
     )
     pickler.dump(graph)
 
@@ -4978,6 +5123,37 @@ def compile_project_call(
     trace_events: list[dict[str, Any]] = []
     trace_started = time.perf_counter()
     last_trace_write = 0.0
+    compiler_progress_state: dict[str, Any] | None = None
+
+    def write_trace(current: Mapping[str, Any]) -> None:
+        payload = dict(current)
+        if compiler_progress_state is not None:
+            payload["compiler"] = dict(compiler_progress_state)
+        _atomic_json(trace_path, {
+            "schema": "turing.project-compilation-unit-progress.v1",
+            "qualified_name": str(qualified_name),
+            "process_id": os.getpid(),
+            "current": payload,
+            "events": trace_events,
+        })
+
+    def report_compiler_progress(state: Mapping[str, Any]) -> None:
+        nonlocal compiler_progress_state, last_trace_write
+        compiler_progress_state = dict(state)
+        elapsed = time.perf_counter() - trace_started
+        current = {
+            "elapsed_seconds": elapsed,
+            "message": (
+                f"compiler stage {state.get('stage_number')}/"
+                f"{state.get('stage_count')} {state.get('stage_label')}"
+            ),
+            "resident_bytes": resident_bytes(os.getpid()),
+        }
+        try:
+            write_trace(current)
+        except OSError:
+            pass
+        last_trace_write = elapsed
 
     def report(message: str) -> None:
         nonlocal last_trace_write
@@ -4992,13 +5168,7 @@ def compile_project_call(
             trace_events.append(event)
             del trace_events[:-128]
             try:
-                _atomic_json(trace_path, {
-                    "schema": "turing.project-compilation-unit-progress.v1",
-                    "qualified_name": str(qualified_name),
-                    "process_id": os.getpid(),
-                    "current": event,
-                    "events": trace_events,
-                })
+                write_trace(event)
             except OSError:
                 # Compilation is authoritative; tracing is observational.
                 pass
@@ -5097,6 +5267,7 @@ def compile_project_call(
             resolved_process_graph_sink=publish_resolved_process_graph,
             stop_after_compilation_unit_plan=bool(plan_only),
             progress_bars=progress_bars,
+            compile_progress_state_sink=report_compiler_progress,
         )
     if plan_only:
         receipt = {
@@ -7665,6 +7836,7 @@ def compile_project_product(
             return {
                 "qualified_name": state["qualified_name"],
                 "process_id": int(state["process"].pid),
+                "elapsed_seconds": time.perf_counter() - float(state["started"]),
                 "resident_bytes": int(state["resident"]),
                 "peak_resident_bytes": int(state["peak_resident"]),
                 "private_bytes": int(state["private"]),
@@ -7833,6 +8005,15 @@ def compile_project_product(
             drain_worker_output()
         elapsed = time.perf_counter() - float(state["started"])
         unit_receipt_path = unit_root / "unit.json"
+        durable_stage = None
+        progress_path = unit_root / "compile-progress.json"
+        if progress_path.is_file():
+            try:
+                durable_stage = json.loads(
+                    progress_path.read_text(encoding="utf-8")
+                ).get("current")
+            except (OSError, TypeError, ValueError):
+                durable_stage = None
         process_graph_plan_path = unit_root / "process-graph-units.json"
         process_graph_plan = (
             json.loads(process_graph_plan_path.read_text(encoding="utf-8"))
@@ -7859,6 +8040,7 @@ def compile_project_product(
                 "peak_resident_bytes": int(state["peak_resident"]),
                 "peak_private_bytes": int(state["peak_private"]),
                 "elapsed_seconds": elapsed,
+                **({"stage": durable_stage} if durable_stage else {}),
                 "exports": unit_receipt.get("exports", []),
                 "repository_ssa_complete": repository_complete,
                 "source_region_integrals": list(
@@ -7935,6 +8117,7 @@ def compile_project_product(
                 "peak_resident_bytes": int(state["peak_resident"]),
                 "peak_private_bytes": int(state["peak_private"]),
                 "elapsed_seconds": elapsed,
+                **({"stage": durable_stage} if durable_stage else {}),
                 "returncode": int(process.returncode),
                 **({
                     "error_type": failure.get("error_type"),

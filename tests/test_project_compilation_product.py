@@ -99,6 +99,70 @@ def test_public_compiler_preserves_module_context_for_relative_imports(
     assert observed["graph"].function_table.reference("imported_step") is not None
 
 
+def test_source_pursued_captured_mapping_remains_runtime_storage(
+    tmp_path, monkeypatch,
+):
+    package = tmp_path / "compiler_mapping_capture_probe"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    helper_path = package / "helper.py"
+    helper_path.write_text(
+        "def imported_step(_selection_trace=None):\n"
+        "    if _selection_trace is None:\n"
+        "        _selection_trace = {'sequence': 0}\n"
+        "    trace = _selection_trace\n"
+        "    def selection_event():\n"
+        "        trace['sequence'] = int(trace.get('sequence', 0)) + 1\n"
+        "        return trace['sequence']\n"
+        "    return selection_event()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "from .helper import imported_step\n\n"
+        "def target():\n"
+        "    return imported_step()\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    policy = ExtractionContract(
+        "extraction_contracts/program_extraction.yaml"
+    ).with_sources((("compiler_mapping_capture_probe.helper", helper_path),))
+
+    observed = {}
+    lower_ast_source_to_ssa(
+        source,
+        "target",
+        source_module="compiler_mapping_capture_probe.target",
+        python_package="compiler_mapping_capture_probe",
+        extraction_contract=policy,
+        stop_after_compilation_unit_plan=True,
+        compilation_unit_plan_sink=lambda plan: observed.setdefault(
+            "plan", plan
+        ),
+        resolved_process_graph_sink=lambda graph: observed.setdefault(
+            "graph", graph
+        ),
+    )
+
+    selection_event = observed["graph"].function_table.entry(
+        "selection_event"
+    ).graph
+    store = next(
+        data
+        for _node_id, data in selection_event.G.nodes(data=True)
+        if data.get("type") == "IndexedStore"
+    )
+    base = next(
+        parent
+        for parent, role in store.get("parents", ())
+        if role == "base"
+    )
+    base_data = selection_event.G.nodes[base]
+    assert base_data.get("type") == "Input"
+    assert base_data["attributes"]["binding_name"] == "trace"
+    assert base_data["attributes"]["aggregate_kind"] == "dict"
+
+
 def test_project_worker_hands_its_resolved_module_context_to_ingestion(
     tmp_path, monkeypatch,
 ):
@@ -117,6 +181,15 @@ def test_project_worker_hands_its_resolved_module_context_to_ingestion(
 
     def lower(_source, _entrypoint, **options):
         observed.update(options)
+        options["compile_progress_state_sink"]({
+            "status": "running",
+            "stage_number": 3,
+            "stage_count": 10,
+            "stage_key": "topology-reduction",
+            "stage_label": "topology reduction",
+            "substage": "",
+            "stages": [],
+        })
         options["compilation_unit_plan_sink"]({
             "schema": "turing.compilation-unit-plan.v1",
             "units": (),
@@ -139,6 +212,11 @@ def test_project_worker_hands_its_resolved_module_context_to_ingestion(
 
     assert observed["source_module"] == "compiler_worker_probe.target"
     assert observed["python_package"] == "compiler_worker_probe"
+    current = json.loads(
+        (tmp_path / "product" / "compile-progress.json").read_text()
+    )["current"]
+    assert current["compiler"]["stage_key"] == "topology-reduction"
+    assert current["compiler"]["stage_count"] == 10
 
 
 def test_compiler_toolchain_fingerprint_is_deterministic_and_auditable():
@@ -1283,6 +1361,9 @@ def test_root_semantic_accounting_accepts_only_declared_workspace_and_projection
             }),
             SSAValue(3, dtype="int64"),
             SSAValue(4, dtype="int64"),
+            SSAValue(5, dtype="int64", accounting={
+                "exact_region_feed_source": ("root", 5, 0),
+            }),
         ],
         {},
         metadata={
@@ -1408,6 +1489,55 @@ def test_source_region_accounting_rejects_an_unranked_address_base():
     assert record["shortfalls"] == [{
         "kind": "unresolved-address-base-contracts",
         "value_ids": [1],
+    }]
+
+
+def test_source_region_accounting_rejects_scalarized_set_algebra():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    left = SSAValue(1, dtype="float64", accounting={
+        "sequence_id": 1,
+        "program_abi_storage": "span",
+        "program_abi_rank": 1,
+    })
+    right = SSAValue(2, dtype="float64", accounting={
+        "sequence_id": 2,
+        "program_abi_storage": "span",
+        "program_abi_rank": 1,
+    })
+    result = SSAValue(3, dtype="float64")
+    function = Function(
+        "builder__planned_region_3",
+        [left, right],
+        {"entry": BasicBlock("entry", [
+            Instr("BitOr", [left, right], result),
+        ])},
+        metadata={
+            "source_region_integral": {
+                "schema": "turing.source-region-integral.v1",
+                "owner": "builder",
+                "plan_name": "region_3",
+                "region_index": 3,
+                "closure_id": 6,
+                "identity_token_chain": (
+                    "source-region", "builder", "closure:6", "region_3",
+                ),
+            },
+        },
+    )
+
+    record = source_region_integral_accounting(
+        IRModule({function.name: function}), {function.name: (result,)},
+    )[0]
+
+    assert record["complete"] is False
+    assert record["shortfalls"] == [{
+        "kind": "unlowered-aggregate-operators",
+        "occurrences": [{
+            "operation": "BitOr",
+            "argument_value_ids": [1, 2],
+            "result_value_id": 3,
+        }],
     }]
 
 

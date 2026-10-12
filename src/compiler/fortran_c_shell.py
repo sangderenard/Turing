@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import ast
 import inspect
 import importlib
@@ -7353,19 +7354,28 @@ def compile_fortran_module_c_shell(
     if not library and _display_configuration(module, entry):
         link_command.extend(("-mwindows", "-lgdi32", "-luser32"))
     commands.append(link_command)
-    for command in commands:
-        completed = subprocess.run(
-            command,
-            cwd=str(output),
-            env=environment,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0:
-            raise FortranEmissionError(
-                "native Fortran/C-shell compilation failed:\n"
-                + (completed.stderr or completed.stdout)
+    # Every source, object, library and final artifact in ``commands`` has an
+    # absolute path.  The compiler working directory therefore owns only
+    # transient compiler files (not product identity).  Keeping it separate
+    # from ``output`` prevents Win32 process creation from rejecting deeply
+    # versioned product paths as an invalid cwd while the same exact paths
+    # remain valid artifact destinations.
+    with tempfile.TemporaryDirectory(
+        prefix="turing-native-build-",
+    ) as build_working_directory:
+        for command in commands:
+            completed = subprocess.run(
+                command,
+                cwd=build_working_directory,
+                env=environment,
+                capture_output=True,
+                text=True,
             )
+            if completed.returncode != 0:
+                raise FortranEmissionError(
+                    "native Fortran/C-shell compilation failed:\n"
+                    + (completed.stderr or completed.stdout)
+                )
     _spill_book_after_build(module)
     return FortranCShellExecutable(
         directory=output,
@@ -45365,6 +45375,7 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     """
     _collect_profile = kwargs.pop("compile_profile", True)
     _progress_renderer = kwargs.pop("progress_renderer", None)
+    _progress_state_sink = kwargs.pop("compile_progress_state_sink", None)
     partitioned_directory = kwargs.pop("partitioned_directory", None)
     partitioned_options = kwargs.pop("partitioned_options", {})
     if partitioned_directory is not None:
@@ -45411,7 +45422,8 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     # Off, ``progress`` is the caller's callback or the plain ``[compiler]``
     # line, exactly as before; on, it writes below-the-bars via tqdm.write.
     _bars = compile_progress(kwargs.pop("progress_bars", None), collect_profile=_collect_profile,
-                             renderer=_progress_renderer)
+                             renderer=_progress_renderer,
+                             state_sink=_progress_state_sink)
     kwargs["progress"] = _bars.progress_callback(kwargs.get("progress"))
 
     from .graph_work import ensure_graph_foundation

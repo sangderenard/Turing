@@ -791,6 +791,8 @@ class _CompileBars:
 
     def _stage_desc(self) -> str:
         stages = self.owner.stages
+        if self.owner._workers:
+            return "compiler bootstrap"
         return (
             f"compile {self.stage_index + 1}/{len(stages)} "
             f"{stages[self.stage_index].label}"
@@ -1075,10 +1077,18 @@ class _CompileLive(_CompileBars):
             status += f", peak {self.peak_rss / _GIB:.2f}GB"
         available = max(2, self.console.height - 4)  # reserve room for scrolling logs
         tasks = list(self.tasks.values())
+        workers = list(self.owner._workers.values())
         if self.console.width < 55 or available < 6:
             active = summary["stages"][self.stage_index]
             compact_status = ("FAILED " if self.failed else "done " if self.finished else "")
             compact_status += active["label"]
+            if workers:
+                lane = workers[-1]
+                compact_status = (
+                    f"{lane['label']} {lane['status']} "
+                    f"{lane['stage_number']}/{lane['stage_count']} "
+                    f"{lane['stage_label']}"
+                )
             # At 20 columns the stage-order prefix used to hide the actual
             # active stage. Give the operation's name first claim on width.
             lines = ([] if batch_status is None else [
@@ -1110,18 +1120,83 @@ class _CompileLive(_CompileBars):
                                         if rows[i]["state"] in {"done", "failed"}]
         priority += list(range(len(rows)))
         selected = set(list(dict.fromkeys(priority))[:budget])
-        table = self.Table(title="Compiler timings (wall time)", box=None,
-                           expand=True, pad_edge=False)
-        table.add_column("Stage", ratio=3, overflow="ellipsis", no_wrap=True)
-        table.add_column("State", no_wrap=True)
-        table.add_column("Wall(s)", justify="right", no_wrap=True)
-        table.add_column("RSS(GB)", justify="right", no_wrap=True)
-        for index, row in enumerate(rows):
-            if index in selected:
-                table.add_row(self.Text(row["label"]), row["state"],
-                              f"{row['seconds']:.2f}", f"{row['rss_bytes'] / _GIB:.2f}")
-        if len(selected) < len(rows):
-            table.caption = f"{len(rows) - len(selected)} stages hidden; full summary retained"
+        table = self.Table(
+            title=("Compiler workers" if workers else "Compiler timings (wall time)"),
+            box=None, expand=True, pad_edge=False,
+        )
+        if workers:
+            stage_rows = next(
+                (lane["stages"] for lane in workers if lane.get("stages")), ()
+            )
+            if stage_rows:
+                table.add_column(
+                    "Compiler stage", ratio=2, overflow="ellipsis", no_wrap=True,
+                )
+                for lane in workers:
+                    table.add_column(
+                        lane["label"], ratio=1, overflow="ellipsis", no_wrap=True,
+                    )
+                row_budget = max(
+                    1, available - progress_reserve - header_lines - 4
+                )
+                active_indices = {
+                    int(lane["stage_number"]) - 1
+                    for lane in workers if int(lane["stage_number"]) > 0
+                }
+                order = list(active_indices)
+                order += list(reversed(range(len(stage_rows))))
+                order += list(range(len(stage_rows)))
+                visible = set(list(dict.fromkeys(order))[:row_budget])
+                for index, stage_row in enumerate(stage_rows):
+                    if index not in visible:
+                        continue
+                    cells = []
+                    for lane in workers:
+                        lane_stages = lane.get("stages") or ()
+                        state = (
+                            str(lane_stages[index].get("state") or "pending")
+                            if index < len(lane_stages) else "pending"
+                        )
+                        if index == int(lane["stage_number"]) - 1:
+                            state = (
+                                f"{lane['status']} {lane['elapsed_seconds']:.0f}s "
+                                f"{lane['rss_bytes'] / _GIB:.2f}GB"
+                            )
+                        cells.append(state)
+                    table.add_row(str(stage_row.get("label") or ""), *cells)
+                if len(visible) < len(stage_rows):
+                    table.caption = (
+                        f"{len(stage_rows) - len(visible)} stages hidden; "
+                        "active and failed stages retained"
+                    )
+            else:
+                table.add_column("Unit", ratio=2, overflow="ellipsis", no_wrap=True)
+                table.add_column("Compiler stage", ratio=3, overflow="ellipsis", no_wrap=True)
+                table.add_column("State", no_wrap=True)
+                table.add_column("Wall(s)", justify="right", no_wrap=True)
+                table.add_column("RSS(GB)", justify="right", no_wrap=True)
+                for lane in workers:
+                    stage = (
+                        f"{lane['stage_number']}/{lane['stage_count']} "
+                        f"{lane['stage_label']}"
+                        + (f" · {lane['substage']}" if lane['substage'] else "")
+                    )
+                    table.add_row(
+                        self.Text(lane["label"]), stage, lane["status"],
+                        f"{lane['elapsed_seconds']:.2f}",
+                        f"{lane['rss_bytes'] / _GIB:.2f}",
+                    )
+        else:
+            table.add_column("Stage", ratio=3, overflow="ellipsis", no_wrap=True)
+            table.add_column("State", no_wrap=True)
+            table.add_column("Wall(s)", justify="right", no_wrap=True)
+            table.add_column("RSS(GB)", justify="right", no_wrap=True)
+            for index, row in enumerate(rows):
+                if index in selected:
+                    table.add_row(self.Text(row["label"]), row["state"],
+                                  f"{row['seconds']:.2f}", f"{row['rss_bytes'] / _GIB:.2f}")
+            if len(selected) < len(rows):
+                table.caption = f"{len(rows) - len(selected)} stages hidden; full summary retained"
         parts = ([] if batch_status is None else [
                      self.Text(batch_status, overflow="ellipsis", no_wrap=True)])
         parts += [table, self.Text(status, overflow="ellipsis", no_wrap=True)]
@@ -1267,6 +1342,7 @@ class CompileProgress:
         timing_table: bool = True,
         collect_profile: bool = False,
         renderer: str | None = None,
+        state_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ):
         self.stages = tuple(stages)
         self.enabled = bool(enabled) and bool(self.stages)
@@ -1297,6 +1373,7 @@ class CompileProgress:
         self.prefix = prefix
         self.timing_table = bool(timing_table)
         self.collect_profile = bool(collect_profile or enabled) and bool(self.stages)
+        self.state_sink = state_sink
         self.channel: TelemetryChannel | None = None
         self.bars: _CompileBars | None = None
         self._depth = 0
@@ -1305,9 +1382,11 @@ class CompileProgress:
         self._counts: dict[str, dict[str, Any]] = {}
         self._stage_index = 0
         self._stage_started = clock()
+        self._substage = ""
         self._stage_profiles: dict[str, Mapping[str, Any]] = {}
         self._stage_seconds: dict[str, float] = {}
         self._work: dict[str, dict[str, dict[str, Any]]] = {}
+        self._workers: dict[str, dict[str, Any]] = {}
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         if self.enabled or self.collect_profile:
@@ -1329,6 +1408,7 @@ class CompileProgress:
                 self._token = _ACTIVE_COMPILE_PROGRESS.set(self)
                 self._stage_index = 0
                 self._stage_started = self.clock()
+                self._substage = ""
                 self._stage_profiles.clear()
                 self._stage_seconds.clear()
                 self._work.clear()
@@ -1337,6 +1417,7 @@ class CompileProgress:
                     path="compile/start", scope="start",
                     metric="stage-order", fraction_is_progress=False,
                 )
+                self._publish_state("running")
                 if self.enabled and self.heartbeat_interval:
                     self._heartbeat_stop.clear()
                     self._heartbeat_thread = threading.Thread(
@@ -1373,6 +1454,7 @@ class CompileProgress:
                 scope="end", failed=bool(failed),
                 metric="stage-order", fraction_is_progress=False,
             )
+            self._publish_state("failed" if failed else "complete")
             _ACTIVE_COMPILE_PROGRESS.reset(self._token)
             self._token = None
 
@@ -1430,6 +1512,44 @@ class CompileProgress:
         return routed
 
     # -- stages ---------------------------------------------------------------
+
+    def _publish_state(self, status: str) -> None:
+        """Publish exact stage state without adding a per-item callback."""
+
+        if self.state_sink is None or not self.stages:
+            return
+        current = self.stages[self._stage_index]
+        rows = []
+        for index, stage in enumerate(self.stages):
+            profile = self._stage_profiles.get(stage.key)
+            rows.append({
+                "key": stage.key,
+                "label": stage.label,
+                "state": (
+                    "running" if status == "running" and index == self._stage_index
+                    else "failed" if profile and profile.get("failed")
+                    else "done" if profile is not None
+                    else "pending"
+                ),
+            })
+        payload = {
+            "status": str(status),
+            "stage_index": self._stage_index,
+            "stage_number": self._stage_index + 1,
+            "stage_count": len(self.stages),
+            "stage_key": current.key,
+            "stage_label": current.label,
+            "substage": self._substage,
+            "stage_elapsed_seconds": max(
+                0.0, self.clock() - self._stage_started
+            ),
+            "stages": rows,
+        }
+        try:
+            self.state_sink(payload)
+        except Exception:
+            # Compilation is authoritative; cross-process observation is not.
+            pass
 
     def _log_stage_finished(self, stage: CompileStage, *, failed: bool) -> None:
         seconds = max(0.0, self.clock() - self._stage_started)
@@ -1509,12 +1629,14 @@ class CompileProgress:
             self._counts.clear()
             self._stage_index = index
             self._stage_started = self.clock()
+            self._substage = ""
             self.channel.progress(
                 self.stages[index].label, done=index, total=len(self.stages),
                 path="compile/stage", scope="stage", key=key, index=index,
                 started=self._stage_started,
                 metric="stage-order", fraction_is_progress=False,
             )
+            self._publish_state("running")
 
     def substage(self, name: str, *, keep: Iterable[str] = ()) -> None:
         """Name the part of the stage now running (the bar's postfix).
@@ -1529,11 +1651,13 @@ class CompileProgress:
             for key in tuple(self._counts):
                 if key not in keep:
                     self.count_close(key)
+            self._substage = str(name)
             self.channel.progress(
                 str(name), done=self._stage_index, total=len(self.stages),
                 path="compile/substage", scope="substage", keep=keep,
                 metric="stage-order", fraction_is_progress=False,
             )
+            self._publish_state("running")
 
     # -- nested bars ------------------------------------------------------------
 
@@ -1609,6 +1733,54 @@ class CompileProgress:
                 key, done=0, total=0, path=f"compile/count/{key}",
                 scope="count", key=key, close=True,
             )
+
+    def worker(
+        self,
+        key: str,
+        *,
+        label: str,
+        status: str,
+        stage_number: int = 0,
+        stage_count: int = 0,
+        stage_label: str = "",
+        substage: str = "",
+        elapsed_seconds: float = 0.0,
+        rss_bytes: int = 0,
+        stages: Sequence[Mapping[str, Any]] = (),
+    ) -> None:
+        """Update one compiler worker lane in this display's single frame."""
+
+        if self.channel is None:
+            return
+        with self._lock:
+            prior = self._workers.get(str(key), {})
+            self._workers[str(key)] = {
+                "key": str(key), "label": str(label), "status": str(status),
+                "stage_number": int(stage_number or prior.get("stage_number") or 0),
+                "stage_count": int(stage_count or prior.get("stage_count") or 0),
+                "stage_label": str(stage_label or prior.get("stage_label") or ""),
+                "substage": str(substage or prior.get("substage") or ""),
+                "elapsed_seconds": float(
+                    elapsed_seconds or prior.get("elapsed_seconds") or 0.0
+                ),
+                "rss_bytes": int(rss_bytes or prior.get("rss_bytes") or 0),
+                "stages": [dict(row) for row in stages]
+                or list(prior.get("stages") or ()),
+            }
+            if self.bars is not None:
+                if isinstance(self.bars, _CompileLive):
+                    self.bars.heartbeat(force=True)
+                else:
+                    self.bars.heartbeat()
+
+    def worker_clear(self) -> None:
+        with self._lock:
+            self._workers.clear()
+            if self.bars is not None:
+                if isinstance(self.bars, _CompileLive):
+                    self.bars.heartbeat(force=True)
+                else:
+                    self.bars.heartbeat()
 
     def iterate(
         self,

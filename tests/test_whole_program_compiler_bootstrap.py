@@ -94,6 +94,7 @@ def test_parent_overlay_keeps_sibling_worker_after_one_failure():
             self.closed = []
             self.logs = []
             self.substages = []
+            self.workers = {}
 
         def count(self, key, done, **details):
             self.counts.append((key, done, details))
@@ -106,6 +107,9 @@ def test_parent_overlay_keeps_sibling_worker_after_one_failure():
 
         def substage(self, message):
             self.substages.append(message)
+
+        def worker(self, key, **details):
+            self.workers[key] = details
 
     display = Display()
     for index, name in enumerate(("failed", "working")):
@@ -130,18 +134,26 @@ def test_parent_overlay_keeps_sibling_worker_after_one_failure():
             "running": [{
                 "qualified_name": "working", "process_id": 22,
                 "resident_bytes": 1 << 30,
-                "stage": {"message": "still lowering"},
+                "stage": {
+                    "message": "still lowering",
+                    "elapsed_seconds": 13,
+                    "compiler": {
+                        "stage_number": 9, "stage_count": 10,
+                        "stage_label": "SSA lowering",
+                        "substage": "lower-functions",
+                    },
+                },
             }],
         },
     })
 
-    assert display.closed == ["catalogue:failed:"]
-    assert any(
-        key == "catalogue:working:" and details["detail"].startswith(
-            "still lowering"
-        )
-        for key, _done, details in display.counts
-    )
+    assert display.closed == []
+    assert display.workers["catalogue:failed:"]["status"] == "failed"
+    working = display.workers["catalogue:working:"]
+    assert working["stage_number"] == 9
+    assert working["stage_count"] == 10
+    assert working["stage_label"] == "SSA lowering"
+    assert working["substage"] == "lower-functions"
     assert "failed: failed" in display.logs
 
 
