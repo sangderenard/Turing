@@ -958,6 +958,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
             ))
             abi = (graph_obj.graph.get('linked_value_abi') or {}).get(int(value_id), {})
             if (attributes.get("aggregate_kind") == "tuple" and leaves
+                    and not mutation.argument_kind.startswith("mapping_")
                     and not (abi.get('storage') == 'reference' and abi.get('dtype') == 'opaque_ref')):
                 arguments.extend(leaves)
             else:

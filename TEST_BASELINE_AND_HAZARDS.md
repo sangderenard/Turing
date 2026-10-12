@@ -1,3 +1,18 @@
+2026-10-12 INDEXED MAPPING VALUE IDENTITY (CURRENT WORKTREE):
+The resident mutation extractor no longer flattens a tuple-valued mapping
+item into extra mapping columns.  An authored `mapping[key] = tuple_value`
+already supplies the exact two identities required by `mapping_items`: its
+key and its value.  Tuple expansion remains in place for sequence rows, but
+mapping keys and values now retain their own aggregate identities.
+
+A focused regression proves an `IndexedStore` with a tuple value remains one
+key/value pair.  The loop-composer gate passes 72 tests in 8.78s.  A bounded
+rerun of only `aot_compile.py::_lower_process_graph_to_compilation` reduced
+the structured frontier from 7 to 6 in 24.6s; the fixed-aggregate mapping
+`update` shortfall is gone.  Remaining: four carried-name identities, one
+carried-field version, and one loop-carried producer.  No outer bootstrap or
+all-rules compile was launched.
+
 2026-10-12 SCALAR MAPPING SETDEFAULT SSA (CURRENT WORKTREE):
 The mapping mutation lowerer no longer assumes every `dict.setdefault` value
 is a nested child table.  For an exact flat mapping schema with key columns

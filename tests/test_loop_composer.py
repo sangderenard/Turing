@@ -49,6 +49,9 @@ from src.compiler.glsl_deployment_strategy import (
     strategize_shell_deployment,
 )
 from src.compiler.precompile_to_ssa import lower_control_sections_to_ssa
+from src.compiler.resident_sequence_materialization import (
+    _sequence_append_call_mutations,
+)
 from src.compiler.loop_ir import (
     IterableAccess,
     IterableDomain,
@@ -1481,6 +1484,29 @@ def test_indexed_table_store_is_memory_effect_not_value_carried_phi():
         identity_table=graph.G.graph.get("identity_table") or {},
     )
     assert not any(item.name == "loop_carried" for item in shortfalls)
+
+
+def test_indexed_table_store_keeps_tuple_value_as_one_mapping_item():
+    graph = _function_graph(
+        "def kernel(rows):\n"
+        "    table = dict({})\n"
+        "    for key, value in rows:\n"
+        "        table[key] = (value, value + 1)\n"
+        "    return table\n",
+        "kernel",
+    )
+
+    mutation, = (
+        item for item in _sequence_append_call_mutations(graph.G)
+        if item.operator == "update"
+    )
+
+    assert mutation.argument_kind == "mapping_items"
+    assert len(mutation.argument_value_ids) == 2
+    value_id = mutation.argument_value_ids[1]
+    assert (graph.G.nodes[value_id].get("attributes") or {}).get(
+        "aggregate_kind"
+    ) == "tuple"
 
 
 def test_sequence_mutation_no_longer_uses_index_publication_shortcut():
