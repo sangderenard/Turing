@@ -13,7 +13,6 @@ from src.compiler.glsl_deployment_strategy import (
 )
 
 from src.compiler.project_compilation_product import (
-    NativeInstallationRequiredError,
     compilation_creep_frontier,
     compile_project_bootstrap_creep,
     compile_process_graph_creep,
@@ -326,7 +325,7 @@ def test_project_bootstrap_creep_feeds_only_newly_verified_products(
     assert manifest["fixed_point"]["kind"] == "no-new-proven-deployments"
 
 
-def test_project_bootstrap_hard_fails_a_complete_python_fallback(
+def test_project_bootstrap_records_a_complete_python_fallback_frontier(
     tmp_path, monkeypatch,
 ):
     source = tmp_path / "compiler_part.py"
@@ -348,32 +347,34 @@ def test_project_bootstrap_hard_fails_a_complete_python_fallback(
             "creep_frontier": [],
         },
     )
+    monkeypatch.setattr(
+        "src.compiler.compiler_bootstrap_runtime."
+        "activate_compiler_bootstrap_products",
+        lambda _paths: (),
+    )
 
-    try:
-        compile_project_bootstrap_creep(
-            source, tmp_path / "creep", max_rounds=1,
-        )
-    except NativeInstallationRequiredError as error:
-        assert error.failures == ({
-            "qualified_name": "leaf",
-            "stage": "native-verification",
-            "reason": "ABI not implemented",
-        },)
-    else:
-        raise AssertionError("completed Python fallback did not hard fail")
+    manifest = compile_project_bootstrap_creep(
+        source, tmp_path / "creep", max_rounds=1,
+    )
 
-    failure = json.loads((
-        tmp_path / "creep" / "round_000" / "native-installation-failure.json"
+    frontier = json.loads((
+        tmp_path / "creep" / "round_000" / "native-installation-frontier.json"
     ).read_text(encoding="utf-8"))
-    assert failure["status"] == "failed"
-    assert failure["completed_qualified_names"] == ["leaf"]
+    assert frontier["status"] == "frontier"
+    assert frontier["completed_qualified_names"] == ["leaf"]
+    assert frontier["failures"] == [{
+        "qualified_name": "leaf",
+        "stage": "native-verification",
+        "reason": "ABI not implemented",
+    }]
+    assert manifest["status"] == "frontier"
     progress = json.loads(
         (tmp_path / "creep" / "creep-progress.json").read_text(encoding="utf-8")
     )
-    assert progress["status"] == "hard-failed"
+    assert progress["status"] == "frontier"
 
 
-def test_project_bootstrap_hard_fails_an_explicitly_failed_compiler_unit(
+def test_project_bootstrap_installs_an_independent_unit_past_a_failed_unit(
     tmp_path, monkeypatch,
 ):
     source = tmp_path / "compiler_part.py"
@@ -386,24 +387,44 @@ def test_project_bootstrap_hard_fails_an_explicitly_failed_compiler_unit(
                 "status": "failed",
                 "error_type": "ValueError",
                 "error": "semantic boundary was not lowered",
+            }, {
+                "qualified_name": "independent",
+                "status": "complete",
+                "source_region_integrals": [],
             }],
-            "automatic_native_verification": [],
-            "creep_frontier": [],
+            "automatic_native_verification": [{
+                "qualified_name": "independent",
+                "status": "verified",
+            }],
+            "creep_frontier": [{"qualified_name": "root"}],
         },
     )
+    monkeypatch.setattr(
+        "src.compiler.compiler_bootstrap_runtime."
+        "activate_compiler_bootstrap_products",
+        lambda _paths: (SimpleNamespace(
+            qualified_name="independent",
+            status="verified",
+            native_probe_count=2,
+            fallback_probe_count=0,
+        ),),
+    )
+    monkeypatch.setattr(
+        "src.compiler.compiler_bootstrap_runtime."
+        "publish_compiler_bootstrap_products",
+        lambda _paths: tmp_path / "registry.json",
+    )
 
-    try:
-        compile_project_bootstrap_creep(
-            source, tmp_path / "creep", max_rounds=1,
-        )
-    except NativeInstallationRequiredError as error:
-        assert error.failures == ({
-            "qualified_name": "root",
-            "stage": "compiler-unit",
-            "reason": "ValueError: semantic boundary was not lowered",
-        },)
-    else:
-        raise AssertionError("failed compiler unit did not hard fail")
+    manifest = compile_project_bootstrap_creep(
+        source, tmp_path / "creep", max_rounds=1,
+    )
+
+    assert manifest["installed_qualified_names"] == ["independent"]
+    assert manifest["rounds"][0]["continuation_failures"] == [{
+        "qualified_name": "root",
+        "stage": "compiler-unit",
+        "reason": "ValueError: semantic boundary was not lowered",
+    }]
 
 
 def test_project_bootstrap_crawls_a_structured_failed_subdivision(
@@ -462,6 +483,72 @@ def test_project_bootstrap_crawls_a_structured_failed_subdivision(
     assert manifest["rounds"][0]["process_graph_creeps"][0]["status"] == (
         "sealed"
     )
+
+
+def test_project_bootstrap_continues_after_one_subdivision_raises(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "compiler_part.py"
+    source.write_text(
+        "def first(value):\n    return value\n\n"
+        "def second(value):\n    return value\n",
+        encoding="utf-8",
+    )
+
+    def compile_round(_source, output, **_kwargs):
+        units = []
+        for name in ("first", "second"):
+            unit_root = output / "units" / name
+            unit_root.mkdir(parents=True)
+            (unit_root / "resolved-process-graph.pkl").write_bytes(b"graph")
+            (unit_root / "process-graph-units.json").write_text(
+                "{}", encoding="utf-8",
+            )
+            units.append({
+                "qualified_name": name,
+                "status": "partial",
+                "path": f"units/{name}",
+                "process_graph_unit_plan": (
+                    f"units/{name}/process-graph-units.json"
+                ),
+            })
+        return {
+            "units": units,
+            "automatic_native_verification": [],
+            "creep_frontier": [
+                {"qualified_name": "first"},
+                {"qualified_name": "second"},
+            ],
+        }
+
+    observed = []
+
+    def crawl(_graph, _plan, output, **_kwargs):
+        observed.append(output.name)
+        if output.name == "first":
+            raise ValueError("first subdivision failed")
+        return {"status": "sealed", "verified_products": [], "fixed_points": []}
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_project_product",
+        compile_round,
+    )
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_process_graph_creep",
+        crawl,
+    )
+
+    manifest = compile_project_bootstrap_creep(
+        source, tmp_path / "creep", max_rounds=1,
+    )
+
+    assert observed == ["first", "second"]
+    creeps = manifest["rounds"][0]["process_graph_creeps"]
+    assert [(item["qualified_name"], item["status"]) for item in creeps] == [
+        ("first", "failed"),
+        ("second", "sealed"),
+    ]
+    assert creeps[0]["error"] == "first subdivision failed"
 
 
 def test_project_bootstrap_creep_automatically_crawls_partial_unit_plan(
@@ -709,7 +796,10 @@ def test_project_worker_publishes_structured_loop_subdivision(
     source.write_text("def kernel():\n    return 1\n", encoding="utf-8")
     output = tmp_path / "worker"
 
-    def refuse(_source, _entry, directory, **_kwargs):
+    observed = {}
+
+    def refuse(_source, _entry, directory, **kwargs):
+        observed.update(kwargs)
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "resolved-process-graph.pkl").write_bytes(b"graph")
         (directory / "process-graph-units.json").write_text(json.dumps({
@@ -741,6 +831,7 @@ def test_project_worker_publishes_structured_loop_subdivision(
     ])
 
     assert result == 1
+    assert observed["progress_bars"] is False
     failure = json.loads((output / "failure.json").read_text())
     assert failure["frontier_kind"] == "compilation-subdivision-required"
     plan = json.loads(

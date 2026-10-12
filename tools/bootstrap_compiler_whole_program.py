@@ -4,12 +4,133 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 from src.compiler.whole_program_compiler_bootstrap import (
     build_whole_program_compiler,
     plan_whole_program_compiler,
 )
+
+
+def _worker_key(prefix: str, qualified_name: str, index: Any = "") -> str:
+    return f"{prefix}:{qualified_name}:{index}"
+
+
+def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
+    """Project all worker events onto the one parent-owned terminal frame."""
+
+    stage = str(event.get("stage") or "")
+    if stage == "bootstrap_creep_round_start":
+        display.substage(
+            f"bootstrap round {int(event.get('round') or 0) + 1}"
+        )
+        return
+    if stage == "bootstrap_creep_worker":
+        worker = dict(event.get("event") or {})
+        worker_stage = str(worker.get("stage") or "")
+        qualified_name = str(worker.get("qualified_name") or "worker")
+        key = _worker_key("catalogue", qualified_name)
+        if worker_stage == "unit_start":
+            display.count(
+                key, 0, total=1, label=qualified_name, detail="starting",
+            )
+        elif worker_stage == "worker_snapshot":
+            display.count(
+                "catalogue-total",
+                int(worker.get("completed_count") or 0),
+                total=int(worker.get("count") or 0),
+                label="authored compiler units",
+                detail=f"{len(worker.get('running') or ())} running",
+            )
+            for row_value in worker.get("running") or ():
+                row = dict(row_value)
+                name = str(row.get("qualified_name") or "worker")
+                row_key = _worker_key("catalogue", name)
+                current = dict(row.get("stage") or {})
+                detail = str(current.get("message") or "running")
+                resident = int(row.get("resident_bytes") or 0)
+                if resident:
+                    detail += f" | rss {resident / (1 << 30):.2f}GB"
+                display.count(row_key, 0, total=1, label=name, detail=detail)
+        elif worker_stage == "worker_output":
+            message = str(worker.get("message") or "")
+            if message:
+                display.log(f"[{qualified_name}] {message}")
+        elif worker_stage == "unit_complete":
+            status = str(worker.get("status") or "unknown")
+            display.count(key, 1, total=1, label=qualified_name, detail=status)
+            display.count_close(key)
+            display.log(f"{qualified_name}: {status}")
+        return
+    if stage == "bootstrap_creep_subdivision":
+        qualified_name = str(event.get("qualified_name") or "subdivision")
+        nested = dict(event.get("event") or {})
+        if str(nested.get("stage") or "") == "creep_worker":
+            worker = dict(nested.get("event") or {})
+            worker_stage = str(worker.get("stage") or "")
+            unit_index = worker.get(
+                "unit_index", worker.get("integral_index", ""),
+            )
+            key = _worker_key("subdivision", qualified_name, unit_index)
+            if worker_stage in {
+                "resolved_worker_snapshot", "subdivision_worker_snapshot",
+            }:
+                index_field = (
+                    "unit_index" if worker_stage.startswith("resolved")
+                    else "integral_index"
+                )
+                display.count(
+                    f"{key}:total",
+                    int(worker.get("completed_count") or 0),
+                    total=int(worker.get("count") or 0),
+                    label=qualified_name,
+                    detail=f"{len(worker.get('running') or ())} subdivision workers",
+                )
+                for row_value in worker.get("running") or ():
+                    row = dict(row_value)
+                    row_index = row.get(index_field, "")
+                    row_key = _worker_key(
+                        "subdivision", qualified_name, row_index,
+                    )
+                    current = dict(row.get("stage") or {})
+                    detail = str(current.get("message") or "running")
+                    resident = int(row.get("resident_bytes") or 0)
+                    if resident:
+                        detail += f" | rss {resident / (1 << 30):.2f}GB"
+                    display.count(
+                        row_key, 0, total=1, label=qualified_name,
+                        detail=detail,
+                    )
+            elif worker_stage.endswith("_start"):
+                display.count(
+                    key, 0, total=1, label=qualified_name,
+                    detail=f"subdivision unit {unit_index}",
+                )
+            elif worker_stage.endswith(("_finish", "_failure")):
+                status = str(worker.get("status") or "complete")
+                display.count(
+                    key, 1, total=1, label=qualified_name, detail=status,
+                )
+                display.count_close(key)
+        elif str(nested.get("stage") or "") == "creep_round_finish":
+            counts = dict(nested.get("counts") or {})
+            display.count_close(
+                f"{_worker_key('subdivision', qualified_name)}:total"
+            )
+            display.log(f"{qualified_name}: subdivision {counts}")
+        return
+    if stage == "bootstrap_creep_round_finish":
+        display.count_close("catalogue-total")
+        failures = tuple(event.get("continuation_failures") or ())
+        if failures:
+            display.log(
+                "bootstrap round retained Python frontiers: "
+                + ", ".join(
+                    str(item.get("qualified_name") or "<unknown>")
+                    for item in failures
+                )
+            )
+        return
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -55,24 +176,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    product = build_whole_program_compiler(
-        arguments.output,
-        jobs=arguments.jobs,
-        max_total_resident_bytes=(
-            None if arguments.max_total_gb is None
-            else int(arguments.max_total_gb * (1 << 30))
-        ),
-        worker_resident_reservation_bytes=int(
-            arguments.worker_reserve_gb * (1 << 30)
-        ),
-        max_worker_memory_bytes=(
-            None if arguments.max_worker_gb is None
-            else int(arguments.max_worker_gb * (1 << 30))
-        ),
-        unit_timeout_seconds=arguments.unit_timeout_seconds,
-        max_rounds=arguments.max_rounds,
-        progress=report,
+    from src.compiler.shell_telemetry import CompileStage, compile_progress
+
+    display = compile_progress(
+        None,
+        stages=(CompileStage("bootstrap", "compiler bootstrap"),),
+        prefix="compiler-bootstrap: ",
     )
+    with display:
+        product = build_whole_program_compiler(
+            arguments.output,
+            jobs=arguments.jobs,
+            max_total_resident_bytes=(
+                None if arguments.max_total_gb is None
+                else int(arguments.max_total_gb * (1 << 30))
+            ),
+            worker_resident_reservation_bytes=int(
+                arguments.worker_reserve_gb * (1 << 30)
+            ),
+            max_worker_memory_bytes=(
+                None if arguments.max_worker_gb is None
+                else int(arguments.max_worker_gb * (1 << 30))
+            ),
+            unit_timeout_seconds=arguments.unit_timeout_seconds,
+            max_rounds=arguments.max_rounds,
+            progress=display.log,
+            event_progress=lambda event: _report_bootstrap_event(display, event),
+        )
     print(
         f"outer partition {product.boundary['name']} "
         f"ended at {product.product.get('status')}; "

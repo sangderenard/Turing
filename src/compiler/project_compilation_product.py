@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import pickle
+import queue
 import subprocess
 import symtable
 import sys
@@ -4922,6 +4923,7 @@ def compile_project_call(
         tuple[str, ...], tuple[str | Path, str | Path]
     ] | None = None,
     plan_only: bool = False,
+    progress_bars: bool | None = None,
 ) -> dict[str, Any]:
     """Worker operation: compile and atomically publish one authored call."""
 
@@ -5073,6 +5075,7 @@ def compile_project_call(
             compilation_unit_plan_sink=publish_process_graph_plan,
             resolved_process_graph_sink=publish_resolved_process_graph,
             stop_after_compilation_unit_plan=bool(plan_only),
+            progress_bars=progress_bars,
         )
     if plan_only:
         receipt = {
@@ -6628,6 +6631,29 @@ def compile_resolved_process_graph_plan(
         return root / "units" / f"unit_{int(index):03d}"
 
     def write_progress() -> None:
+        def running_record(index: int, state: Mapping[str, Any]) -> dict[str, Any]:
+            current = None
+            progress_path = unit_root(index) / "compile-progress.json"
+            if progress_path.is_file():
+                try:
+                    current = json.loads(
+                        progress_path.read_text(encoding="utf-8")
+                    ).get("current")
+                except (OSError, TypeError, ValueError):
+                    current = None
+            return {
+                "unit_index": index,
+                "process_id": int(state["process"].pid),
+                "resident_bytes": int(state["resident"]),
+                "private_bytes": int(state["private"]),
+                "elapsed_seconds": time.perf_counter() - state["started"],
+                **({"stage": current} if current is not None else {}),
+            }
+
+        running_records = [
+            running_record(index, state)
+            for index, state in sorted(running.items())
+        ]
         _atomic_json(root / "progress.json", {
             "schema": "turing.resolved-process-graph-plan-progress.v1",
             "resolved_process_graph": resolved_path.as_posix(),
@@ -6638,15 +6664,16 @@ def compile_resolved_process_graph_plan(
             "max_worker_memory_bytes": worker_limit_bytes,
             "unit_timeout_seconds": timeout,
             "pending": pending,
-            "running": [{
-                "unit_index": index,
-                "process_id": int(state["process"].pid),
-                "resident_bytes": int(state["resident"]),
-                "private_bytes": int(state["private"]),
-                "elapsed_seconds": time.perf_counter() - state["started"],
-            } for index, state in sorted(running.items())],
+            "running": running_records,
             "completed": [record for record in records if record is not None],
         })
+        report(
+            "resolved_worker_snapshot",
+            pending_count=len(pending),
+            completed_count=sum(record is not None for record in records),
+            count=len(units),
+            running=running_records,
+        )
 
     def launch(index: int) -> None:
         nonlocal concurrency_peak
@@ -6676,10 +6703,15 @@ def compile_resolved_process_graph_plan(
                 }, sort_keys=True),
             ))
             linked.append(dependency)
+        worker_log = (destination / "worker.log").open(
+            "w", encoding="utf-8", newline="\n",
+        )
         process = subprocess.Popen(
             command,
             cwd=repository_root,
             env=(None if worker_environment is None else dict(worker_environment)),
+            stdout=worker_log,
+            stderr=subprocess.STDOUT,
         )
         running[index] = {
             "process": process,
@@ -6687,6 +6719,7 @@ def compile_resolved_process_graph_plan(
             "resident": 0,
             "private": 0,
             "linked": linked,
+            "worker_log": worker_log,
         }
         concurrency_peak = max(concurrency_peak, len(running))
         report(
@@ -6707,6 +6740,7 @@ def compile_resolved_process_graph_plan(
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+        state["worker_log"].close()
         destination = unit_root(index)
         durable_stage = None
         progress_path = destination / "compile-progress.json"
@@ -6800,6 +6834,7 @@ def compile_resolved_process_graph_plan(
             return_code = process.poll()
             if return_code is None:
                 continue
+            state["worker_log"].close()
             destination = unit_root(index)
             receipt_path = destination / "unit.json"
             failure_path = destination / "failure.json"
@@ -6913,6 +6948,29 @@ def compile_process_graph_subdivision_plan(
         return root / "integrals" / f"integral_{int(index):03d}"
 
     def write_progress() -> None:
+        def running_record(index: int, state: Mapping[str, Any]) -> dict[str, Any]:
+            current = None
+            progress_path = integral_root(index) / "compile-progress.json"
+            if progress_path.is_file():
+                try:
+                    current = json.loads(
+                        progress_path.read_text(encoding="utf-8")
+                    ).get("current")
+                except (OSError, TypeError, ValueError):
+                    current = None
+            return {
+                "integral_index": index,
+                "process_id": int(state["process"].pid),
+                "resident_bytes": int(state["resident"]),
+                "private_bytes": int(state["private"]),
+                "elapsed_seconds": time.perf_counter() - state["started"],
+                **({"stage": current} if current is not None else {}),
+            }
+
+        running_records = [
+            running_record(index, state)
+            for index, state in sorted(running.items())
+        ]
         _atomic_json(root / "progress.json", {
             "schema": "turing.process-graph-subdivision-progress.v1",
             "subdivision_plan": source_plan_path.as_posix(),
@@ -6923,15 +6981,16 @@ def compile_process_graph_subdivision_plan(
             "max_worker_memory_bytes": worker_limit_bytes,
             "unit_timeout_seconds": timeout,
             "pending": pending,
-            "running": [{
-                "integral_index": index,
-                "process_id": int(state["process"].pid),
-                "resident_bytes": int(state["resident"]),
-                "private_bytes": int(state["private"]),
-                "elapsed_seconds": time.perf_counter() - state["started"],
-            } for index, state in sorted(running.items())],
+            "running": running_records,
             "completed": [record for record in records if record is not None],
         })
+        report(
+            "subdivision_worker_snapshot",
+            pending_count=len(pending),
+            completed_count=sum(record is not None for record in records),
+            count=len(integrals),
+            running=running_records,
+        )
 
     def launch(index: int) -> None:
         destination = integral_root(index)
@@ -7552,7 +7611,20 @@ def compile_project_product(
     records: list[dict[str, Any] | None] = [None] * len(selected_names)
     pending = list(enumerate(selected_names))
     running: dict[int, dict[str, Any]] = {}
+    worker_output: queue.Queue[tuple[int, str, str]] = queue.Queue(maxsize=4096)
+    capture_worker_output = progress is not None
     last_progress_write = 0.0
+
+    def drain_worker_output() -> None:
+        while True:
+            try:
+                index, qualified_name, message = worker_output.get_nowait()
+            except queue.Empty:
+                return
+            report(
+                "worker_output", index=index,
+                qualified_name=qualified_name, message=message,
+            )
 
     def write_live_progress() -> None:
         def running_record(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -7579,6 +7651,10 @@ def compile_project_product(
                 **({"stage": stage} if stage is not None else {}),
             }
 
+        running_records = [
+            running_record(state)
+            for _index, state in sorted(running.items())
+        ]
         _atomic_json(root / "progress.json", {
             "schema": "turing.project-compilation-progress.v1",
             "source": source_file.as_posix(),
@@ -7593,12 +7669,16 @@ def compile_project_product(
                 else extraction_contract_path.as_posix()
             ),
             "pending": [name for _index, name in pending],
-            "running": [
-                running_record(state)
-                for _index, state in sorted(running.items())
-            ],
+            "running": running_records,
             "completed": [record for record in records if record is not None],
         })
+        report(
+            "worker_snapshot",
+            pending_count=len(pending),
+            completed_count=sum(record is not None for record in records),
+            count=len(selected_names),
+            running=running_records,
+        )
 
     def launch(index: int, qualified_name: str) -> None:
         unit_root = root / "units" / encoded_call_name(qualified_name)
@@ -7676,7 +7756,36 @@ def compile_project_product(
             worker_environment[COMPILER_BOOTSTRAP_PRODUCTS_ENV] = os.pathsep.join(
                 str(path) for path in inherited_bootstrap_products
             )
-        process = subprocess.Popen(command, env=worker_environment)
+        process = subprocess.Popen(
+            command,
+            env=worker_environment,
+            stdout=(subprocess.PIPE if capture_worker_output else None),
+            stderr=(subprocess.STDOUT if capture_worker_output else None),
+            text=capture_worker_output,
+            encoding=("utf-8" if capture_worker_output else None),
+            errors=("replace" if capture_worker_output else None),
+            bufsize=1,
+        )
+        output_thread = None
+        if capture_worker_output:
+            def relay_output(
+                stream=process.stdout,
+                worker_index=index,
+                worker_name=qualified_name,
+            ) -> None:
+                if stream is None:
+                    return
+                for line in stream:
+                    worker_output.put((
+                        worker_index, worker_name, line.rstrip("\r\n"),
+                    ))
+
+            output_thread = threading.Thread(
+                target=relay_output,
+                name=f"compiler-worker-output-{index}",
+                daemon=True,
+            )
+            output_thread.start()
         running[index] = {
             "qualified_name": qualified_name,
             "root": unit_root,
@@ -7687,6 +7796,7 @@ def compile_project_product(
             "peak_private": 0,
             "private": 0,
             "resource_failure": None,
+            "output_thread": output_thread,
         }
         write_live_progress()
 
@@ -7694,6 +7804,12 @@ def compile_project_product(
         qualified_name = str(state["qualified_name"])
         unit_root = Path(state["root"])
         process = state["process"]
+        output_thread = state.get("output_thread")
+        if output_thread is not None:
+            while output_thread.is_alive():
+                drain_worker_output()
+                output_thread.join(timeout=0.01)
+            drain_worker_output()
         elapsed = time.perf_counter() - float(state["started"])
         unit_receipt_path = unit_root / "unit.json"
         process_graph_plan_path = unit_root / "process-graph-units.json"
@@ -7822,6 +7938,7 @@ def compile_project_product(
         report("unit_complete", **record, index=index, count=len(selected_names))
 
     while pending or running:
+        drain_worker_output()
         measured_total = sum(int(state["resident"]) for state in running.values())
         reserved_total = len(running) * worker_reservation
         admitted = False
@@ -7932,6 +8049,8 @@ def compile_project_product(
             # The first worker is always admitted even under a ceiling; this
             # branch is defensive against a future admission-policy change.
             time.sleep(0.1)
+
+    drain_worker_output()
 
     completed_records = dependency_ordered_records(
         root, [record for record in records if record is not None],
@@ -8324,6 +8443,7 @@ def compile_project_bootstrap_creep(
             str(record["qualified_name"]): dict(record)
             for record in product.get("automatic_native_verification") or ()
         }
+        continuation_failures = []
         native_completion_failures = []
         for unit in product.get("units") or ():
             if unit.get("status") != "failed":
@@ -8349,7 +8469,13 @@ def compile_project_bootstrap_creep(
             ):
                 continue
             reason = ": ".join(part for part in (error_type, error) if part)
-            native_completion_failures.append({
+            # A failed authored unit is a Python/native frontier, not a
+            # project-wide installation failure.  The catalogue scheduler has
+            # already released its callers after this terminal record and has
+            # retained the authored Python body instead of linking an unsafe
+            # native dependency.  Keep the exact failure visible while other
+            # units, verified native boundaries, and subdivision plans finish.
+            continuation_failures.append({
                 "qualified_name": str(
                     unit.get("qualified_name") or "<unknown>"
                 ),
@@ -8369,7 +8495,7 @@ def compile_project_bootstrap_creep(
                     ),
                 })
         activations = ()
-        if not native_completion_failures and completed_names:
+        if completed_names:
             from .compiler_bootstrap_runtime import (
                 activate_compiler_bootstrap_products,
             )
@@ -8388,6 +8514,12 @@ def compile_project_bootstrap_creep(
                     for activation in activations
                 }
                 for qualified_name in sorted(completed_names):
+                    verification = verification_by_name.get(qualified_name)
+                    if (
+                        verification is None
+                        or verification.get("status") != "verified"
+                    ):
+                        continue
                     activation = activation_by_name.get(qualified_name)
                     if (
                         activation is None
@@ -8404,36 +8536,41 @@ def compile_project_bootstrap_creep(
                                 "activation did not prove an exclusively native probe path"
                             ),
                         })
+        continuation_failures.extend(native_completion_failures)
         completion_requirement = {
             "schema": "turing.bootstrap-native-completion-requirement.v1",
-            "status": "failed" if native_completion_failures else "satisfied",
+            "status": "frontier" if continuation_failures else "satisfied",
             "completed_qualified_names": sorted(completed_names),
             "activated_qualified_names": sorted(
                 activation.qualified_name for activation in activations
             ),
-            "failures": native_completion_failures,
+            "failures": continuation_failures,
         }
         product["native_completion_requirement"] = completion_requirement
         _atomic_json(round_root / "manifest.json", product)
-        if native_completion_failures:
-            failure = {
+        if continuation_failures:
+            frontier = {
                 **completion_requirement,
                 "source": source_file.as_posix(),
                 "round": round_index,
             }
-            _atomic_json(round_root / "native-installation-failure.json", failure)
-            rounds.append({
-                "round": round_index,
-                "product": round_root.as_posix(),
-                "hard_failure": failure,
-            })
-            write_progress("hard-failed")
-            raise NativeInstallationRequiredError(native_completion_failures)
+            _atomic_json(
+                round_root / "native-installation-frontier.json", frontier,
+            )
+        activated_names = {
+            activation.qualified_name
+            for activation in activations
+            if (
+                activation.status == "verified"
+                and activation.native_probe_count >= 1
+                and activation.fallback_probe_count == 0
+            )
+        }
         verified_names = {
             str(record["qualified_name"])
             for record in product.get("automatic_native_verification") or ()
             if record.get("status") == "verified"
-        }
+        } & activated_names
         verified_regions = {
             tuple(map(str, region.get("identity_token_chain") or ()))
             for unit in product.get("units") or ()
@@ -8498,24 +8635,39 @@ def compile_project_bootstrap_creep(
                 round_root / "process-graph-creeps"
                 / encoded_call_name(qualified_name)
             )
-            subdivision = compile_process_graph_creep(
-                graph_path,
-                plan_path,
-                subdivision_root,
-                python_executable=python_executable,
-                jobs=jobs,
-                max_total_resident_bytes=max_total_resident_bytes,
-                worker_resident_reservation_bytes=(
-                    worker_resident_reservation_bytes
-                ),
-                max_worker_memory_bytes=max_worker_memory_bytes,
-                unit_timeout_seconds=unit_timeout_seconds,
-                bootstrap_products=active_products,
-                progress=lambda event, round_index=round_index, qualified_name=qualified_name: report(
-                    "bootstrap_creep_subdivision", round=round_index,
-                    qualified_name=qualified_name, event=dict(event),
-                ),
-            )
+            try:
+                subdivision = compile_process_graph_creep(
+                    graph_path,
+                    plan_path,
+                    subdivision_root,
+                    python_executable=python_executable,
+                    jobs=jobs,
+                    max_total_resident_bytes=max_total_resident_bytes,
+                    worker_resident_reservation_bytes=(
+                        worker_resident_reservation_bytes
+                    ),
+                    max_worker_memory_bytes=max_worker_memory_bytes,
+                    unit_timeout_seconds=unit_timeout_seconds,
+                    bootstrap_products=active_products,
+                    progress=lambda event, round_index=round_index, qualified_name=qualified_name: report(
+                        "bootstrap_creep_subdivision", round=round_index,
+                        qualified_name=qualified_name, event=dict(event),
+                    ),
+                )
+            except Exception as error:
+                # Subdivision products are independent continuation attempts.
+                # Preserve one exact refusal without preventing the remaining
+                # authored units from reaching their own terminal receipts.
+                subdivision_creeps.append({
+                    "qualified_name": qualified_name,
+                    "product": subdivision_root.as_posix(),
+                    "status": "failed",
+                    "verified_product_count": 0,
+                    "fixed_point_count": 0,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                })
+                continue
             subdivision_creeps.append({
                 "qualified_name": qualified_name,
                 "product": subdivision_root.as_posix(),
@@ -8542,6 +8694,7 @@ def compile_project_bootstrap_creep(
             ],
             "creep_frontier": list(product.get("creep_frontier") or ()),
             "native_verification_frontier": verification_frontier,
+            "continuation_failures": continuation_failures,
             "process_graph_creeps": subdivision_creeps,
         }
         rounds.append(round_record)

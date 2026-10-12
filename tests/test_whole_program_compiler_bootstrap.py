@@ -85,6 +85,66 @@ def test_build_delegates_the_complete_outer_partition_to_bootstrap_creep(
     assert product.manifest.is_file()
 
 
+def test_parent_overlay_keeps_sibling_worker_after_one_failure():
+    from tools.bootstrap_compiler_whole_program import _report_bootstrap_event
+
+    class Display:
+        def __init__(self):
+            self.counts = []
+            self.closed = []
+            self.logs = []
+            self.substages = []
+
+        def count(self, key, done, **details):
+            self.counts.append((key, done, details))
+
+        def count_close(self, key):
+            self.closed.append(key)
+
+        def log(self, message):
+            self.logs.append(message)
+
+        def substage(self, message):
+            self.substages.append(message)
+
+    display = Display()
+    for index, name in enumerate(("failed", "working")):
+        _report_bootstrap_event(display, {
+            "stage": "bootstrap_creep_worker",
+            "event": {
+                "stage": "unit_start", "qualified_name": name,
+                "index": index, "count": 2,
+            },
+        })
+    _report_bootstrap_event(display, {
+        "stage": "bootstrap_creep_worker",
+        "event": {
+            "stage": "unit_complete", "qualified_name": "failed",
+            "index": 0, "count": 2, "status": "failed",
+        },
+    })
+    _report_bootstrap_event(display, {
+        "stage": "bootstrap_creep_worker",
+        "event": {
+            "stage": "worker_snapshot", "completed_count": 1, "count": 2,
+            "running": [{
+                "qualified_name": "working", "process_id": 22,
+                "resident_bytes": 1 << 30,
+                "stage": {"message": "still lowering"},
+            }],
+        },
+    })
+
+    assert display.closed == ["catalogue:failed:"]
+    assert any(
+        key == "catalogue:working:" and details["detail"].startswith(
+            "still lowering"
+        )
+        for key, _done, details in display.counts
+    )
+    assert "failed: failed" in display.logs
+
+
 def test_outer_partition_is_an_authored_project_root():
     from src.compiler.project_compilation_product import discover_authored_calls
 

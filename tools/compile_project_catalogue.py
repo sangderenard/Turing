@@ -719,6 +719,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 linked_units=linked_units,
                 linked_regions=linked_regions,
                 plan_only=arguments.plan_only,
+                # The catalogue parent owns the one terminal overlay. Worker
+                # output is relayed through its queue; a child Live instance
+                # would compete for the same cursor and disappear when any
+                # sibling exits or fails.
+                progress_bars=False,
                 progress=lambda message: print(
                     f"[{arguments.entry[0]}] {message}", flush=True,
                 ),

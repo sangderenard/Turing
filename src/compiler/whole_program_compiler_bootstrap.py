@@ -210,6 +210,7 @@ def build_whole_program_compiler(
     unit_timeout_seconds: float | None = 1800.0,
     max_rounds: int = 16,
     progress: Callable[[str], None] | None = None,
+    event_progress: Callable[[Mapping[str, Any]], None] | None = None,
     **_legacy_options: Any,
 ) -> WholeProgramCompilerProduct:
     """Bootstrap the complete ProcessGraph-to-AOT outer partition.
@@ -232,7 +233,9 @@ def build_whole_program_compiler(
     )
 
     def report(event: Mapping[str, Any]) -> None:
-        if progress is not None:
+        if event_progress is not None:
+            event_progress(dict(event))
+        elif progress is not None:
             progress(
                 "compiler-bootstrap: "
                 + str(event.get("stage") or "progress")

@@ -1,3 +1,36 @@
+2026-10-12 NON-BLOCKING COMPILER BOOTSTRAP FRONTIERS (CURRENT WORKTREE):
+Project bootstrap no longer converts one failed authored compiler unit into an
+immediate project-wide `NativeInstallationRequiredError`.  The catalogue's
+existing dependency rule remains authoritative: callers wait for a dependency
+to become terminal; a verified complete dependency may be linked, while a
+partial or failed dependency remains its exact authored Python body.  Verified
+independent units are still activated only after automatic native verification
+and an exclusively native probe receipt.  Their installed names are now taken
+from successful activations rather than verification alone.
+
+Each failed compiler unit is persisted in the round's
+`native-installation-frontier.json` and `continuation_failures`.  Subdivision
+creeps run afterward, and an exception from one subdivision is recorded on
+that subdivision without preventing later independent plans from running.
+The CLI still exits nonzero for a frontier, but only after all available work
+has reached a receipt.
+The user's next outer-bootstrap run proved this continuation policy: the root
+failure remained a frontier while all four nested authored units reached their
+resolved-plan/subdivision receipts.  It also exposed terminal ownership: each
+authored worker inherited the same TTY and could start its own Rich Live, so a
+failed worker's cursor restoration removed the display while siblings kept
+working.  Authored-worker stdout is now captured by a bounded 4096-line parent
+queue, child progress overlays are disabled, resolved/subdivision worker stdout
+is durable per-worker output, and their stage/RSS snapshots feed one parent
+overlay.  Only that parent owns the stationary status/table and bottom work
+bars; completing or failing one row cannot close the display.
+
+Focused project-product gate: 69 passed in 1.13s.  After the display change,
+project-product, whole-bootstrap and live-Rich display gates pass 90 tests in
+65.01s under the already provisioned system Python.  PyYAML is declared in
+`requirements.txt`; the repository venv had omitted it even though extraction
+contracts import it.  The agent did not launch the outer bootstrap compile.
+
 2026-10-12 VERSIONED OUTER COMPILER PARTITION (CURRENT WORKTREE):
 The abandoned whole-program bootstrap no longer frames compiler self-hosting as
 one replacement DLL.  Its plan now composes the existing topology, dependency,
