@@ -1,3 +1,25 @@
+2026-10-12 PROJECT SOURCE MODULE IDENTITY (CURRENT WORKTREE):
+Project compilation no longer discards the module identity it already resolved
+from the authored source path.  The sanctioned source compiler now receives
+that exact module and package, records the module on source spans, and supplies
+the package to Python's relative-import resolver.  Before this change the
+compiler bootstrap's `aot_compile.py` slice recorded repository calls such as
+`build_map_dependency_regions` as external references whose entries had
+`python_callable=None`; their conditional results therefore had no possible
+SSA producer.  The calls now enter ordinary repository-source pursuit and the
+existing compilation-unit/call-frame machinery.
+
+A focused package regression proves that `from .helper import imported_step`
+becomes a real `callee_ref`, not an unresolved `external_callee_ref`, through
+the public source compiler.  A second regression proves the project worker
+hands that resolved module/package pair to ingestion.  The project-product
+gate passes 74 tests in 1.56s.
+A plan-only run of the real `_lower_process_graph_to_compilation` slice moved
+from its former four-second seven-unit truncated graph into imported compiler
+source pursuit; it was deliberately interrupted after 90 seconds because the
+user owns the next observable bootstrap run.  No native build or outer
+bootstrap was launched.
+
 2026-10-12 INDEXED MAPPING VALUE IDENTITY (CURRENT WORKTREE):
 The resident mutation extractor no longer flattens a tuple-valued mapping
 item into extra mapping columns.  An authored `mapping[key] = tuple_value`

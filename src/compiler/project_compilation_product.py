@@ -4964,6 +4964,13 @@ def compile_project_call(
     source_module_name, authored_record_contracts = (
         _authored_module_record_contracts(source_file)
     )
+    source_package_name = (
+        None
+        if source_module_name is None
+        else source_module_name
+        if source_file.name == "__init__.py"
+        else source_module_name.rpartition(".")[0] or None
+    )
     artifact_name = encoded_call_name(qualified_name)
     trace_path = root / "compile-progress.json"
     process_graph_plan_path = root / "process-graph-units.json"
@@ -5078,6 +5085,8 @@ def compile_project_call(
             compile_source,
             qualified_name,
             name=artifact_name,
+            source_module=source_module_name,
+            python_package=source_package_name,
             runtime_closure_only=True,
             progress=report,
             extraction_contract=extraction_contract,

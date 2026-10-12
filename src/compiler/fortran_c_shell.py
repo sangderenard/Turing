@@ -42577,6 +42577,8 @@ def _lower_ast_source_to_ssa_impl(
     source: str,
     entrypoint: str | None = None,
     *,
+    source_module: str | None = None,
+    python_package: str | None = None,
     python_bindings: Mapping[str, Any] | None = None,
     external_class_field_aggregate_kinds: Mapping[
         tuple[str, str], str
@@ -43875,6 +43877,12 @@ def _lower_ast_source_to_ssa_impl(
         boundary_namespace=boundary_namespace,
         source_language=source_language,
     )
+    # A source slice keeps the imports authored in its original module.  Their
+    # leading dots are meaningful only with that module's package identity.
+    # Project compilation already knows both identities from the source path;
+    # losing them here made repository imports into unresolved external table
+    # entries (python_callable=None), so their call results had no SSA producer.
+    graph.python_package = python_package
     graph.G.graph["assignment_normalization_receipts"] = assignment_receipts
     if native_object_context is not None:
         from ..transmogrifier.ssa import SSAObjectContext
@@ -43974,6 +43982,7 @@ def _lower_ast_source_to_ssa_impl(
     with open(os.devnull, "w", encoding="utf-8") as _discarded_stdout, contextlib.redirect_stdout(_discarded_stdout):
         graph.build_from_ast(
             tree,
+            filename=source_module,
             resolve_unresolved_parents=True,
             parent_include=(
                 extraction_policy

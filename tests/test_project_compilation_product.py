@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib
 import inspect
 import json
 import pickle
@@ -11,6 +12,8 @@ import tools.compile_project_catalogue as compile_project_catalogue
 from src.compiler.glsl_deployment_strategy import (
     CompilationSubdivisionRequired,
 )
+from src.compiler.extraction_contract import ExtractionContract
+from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.precompile_to_ssa import (
     SSALoweringIncompleteError,
     SSALoweringShortfall,
@@ -18,6 +21,7 @@ from src.compiler.precompile_to_ssa import (
 
 from src.compiler.project_compilation_product import (
     compilation_creep_frontier,
+    compile_project_call,
     compile_project_bootstrap_creep,
     compile_process_graph_creep,
     compile_process_graph_subdivision_plan,
@@ -43,6 +47,98 @@ from src.compiler.project_compilation_product import (
     verify_structural_resident_table_integral,
     verify_project_scalar_units_automatically,
 )
+
+
+def test_public_compiler_preserves_module_context_for_relative_imports(
+    tmp_path, monkeypatch,
+):
+    package = tmp_path / "compiler_probe"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    helper_path = package / "helper.py"
+    helper_path.write_text(
+        "def imported_step(value):\n"
+        "    return value + 1\n",
+        encoding="utf-8",
+    )
+    source = (
+        "from .helper import imported_step\n\n"
+        "def target(value):\n"
+        "    return imported_step(value)\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    policy = ExtractionContract(
+        "extraction_contracts/program_extraction.yaml"
+    ).with_sources((("compiler_probe.helper", helper_path),))
+    observed = {}
+
+    lower_ast_source_to_ssa(
+        source,
+        "target",
+        source_module="compiler_probe.target",
+        python_package="compiler_probe",
+        extraction_contract=policy,
+        stop_after_compilation_unit_plan=True,
+        compilation_unit_plan_sink=lambda plan: observed.setdefault(
+            "plan", plan
+        ),
+        resolved_process_graph_sink=lambda graph: observed.setdefault(
+            "graph", graph
+        ),
+    )
+
+    target = observed["graph"].function_table.entry("target").graph
+    call = next(
+        data
+        for _node_id, data in target.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+    )
+    assert "callee_ref" in call["attributes"]
+    assert "external_callee_ref" not in call["attributes"]
+    assert observed["graph"].function_table.reference("imported_step") is not None
+
+
+def test_project_worker_hands_its_resolved_module_context_to_ingestion(
+    tmp_path, monkeypatch,
+):
+    package = tmp_path / "compiler_worker_probe"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    source_path = package / "target.py"
+    source_path.write_text(
+        "def target(value):\n"
+        "    return value + 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    observed = {}
+
+    def lower(_source, _entrypoint, **options):
+        observed.update(options)
+        options["compilation_unit_plan_sink"]({
+            "schema": "turing.compilation-unit-plan.v1",
+            "units": (),
+        })
+        options["resolved_process_graph_sink"](
+            SimpleNamespace(module_context_probe=True)
+        )
+        return None, {}, ()
+
+    monkeypatch.setattr(
+        "src.compiler.fortran_c_shell.lower_ast_source_to_ssa", lower,
+    )
+
+    compile_project_call(
+        source_path,
+        "target",
+        tmp_path / "product",
+        plan_only=True,
+    )
+
+    assert observed["source_module"] == "compiler_worker_probe.target"
+    assert observed["python_package"] == "compiler_worker_probe"
 
 
 def test_compiler_toolchain_fingerprint_is_deterministic_and_auditable():
