@@ -643,6 +643,85 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
+_ACTIVE_RULE_BATCH: contextvars.ContextVar = contextvars.ContextVar(
+    "turing_compile_rule_batch", default=None,
+)
+
+
+class RuleBatchProgress:
+    """Wall-clock accounting shared by a sequence of rule compiles.
+
+    The individual compiler live displays are opened and closed inside this
+    scope. They read this one batch clock, so each replacement frame carries
+    the same completed/total rule status without owning another renderer.
+    """
+
+    def __init__(self, total: int, *, clock: Callable[[], float] = time.monotonic):
+        self.total = int(total)
+        if self.total < 0:
+            raise ValueError("rule batch total cannot be negative")
+        self.clock = clock
+        self.started = self.clock()
+        self.completed = 0
+        self.completed_seconds = 0.0
+        self.current = ""
+        self._token = None
+        self._lock = threading.RLock()
+
+    def __enter__(self):
+        self.started = self.clock()
+        self._token = _ACTIVE_RULE_BATCH.set(self)
+        return self
+
+    def __exit__(self, exc_type, exc, traceback_):
+        if self._token is not None:
+            _ACTIVE_RULE_BATCH.reset(self._token)
+            self._token = None
+
+    @contextmanager
+    def rule(self, name: str = ""):
+        started = self.clock()
+        with self._lock:
+            self.current = str(name)
+        try:
+            yield self
+        except BaseException:
+            raise
+        else:
+            with self._lock:
+                self.completed += 1
+                self.completed_seconds += max(0.0, self.clock() - started)
+        finally:
+            with self._lock:
+                self.current = ""
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            wall = max(0.0, self.clock() - self.started)
+            average = (self.completed_seconds / self.completed
+                       if self.completed else None)
+            projected = (max(wall, average * self.total)
+                         if average is not None else None)
+            return {
+                "completed": self.completed,
+                "total": self.total,
+                "wall_seconds": wall,
+                "average_rule_seconds": average,
+                "projected_total_seconds": projected,
+                "current": self.current,
+            }
+
+
+def compile_rule_batch(total: int, *, clock: Callable[[], float] = time.monotonic):
+    """Return the batch clock consumed by compiler terminal renderers."""
+
+    return RuleBatchProgress(total, clock=clock)
+
+
+def active_rule_batch_progress() -> RuleBatchProgress | None:
+    return _ACTIVE_RULE_BATCH.get()
+
+
 class _TqdmLineFile:
     """A file-like whose complete lines go through ``tqdm_class.write``.
 
@@ -976,6 +1055,18 @@ class _CompileLive(_CompileBars):
     def _frame(self):
         self._rss()
         summary = self.owner.summary()
+        batch = active_rule_batch_progress()
+        batch_summary = None if batch is None else batch.summary()
+        batch_status = None
+        if batch_summary is not None:
+            average = batch_summary["average_rule_seconds"]
+            projected = batch_summary["projected_total_seconds"]
+            batch_status = (
+                f"Rules {batch_summary['completed']}/{batch_summary['total']} | "
+                f"wall {_format_duration(batch_summary['wall_seconds'])} | "
+                f"average {'--' if average is None else _format_duration(average)} | "
+                f"projected total {'--' if projected is None else _format_duration(projected)}"
+            )
         status = (f"compile FAILED in {self.owner.stages[self.stage_index].label}" if self.failed
                   else f"compile done ({len(self.owner._stage_profiles)} timed stages)" if self.finished
                   else self._stage_desc())
@@ -990,22 +1081,29 @@ class _CompileLive(_CompileBars):
             compact_status += active["label"]
             # At 20 columns the stage-order prefix used to hide the actual
             # active stage. Give the operation's name first claim on width.
-            lines = [self.Text(compact_status, overflow="ellipsis", no_wrap=True),
+            lines = ([] if batch_status is None else [
+                         self.Text(batch_status, overflow="ellipsis", no_wrap=True)])
+            lines += [self.Text(compact_status, overflow="ellipsis", no_wrap=True),
                      self.Text(f"{active['state']} | wall {active['seconds']:.2f}s | "
                                f"rss {active['rss_bytes'] / _GIB:.2f}GB", no_wrap=True)]
-            if tasks and available > 2:
+            if tasks and available > len(lines):
                 task = self.progress.tasks[-1]
                 lines.append(self.Text(f"{task.description}: {task.fields['count']}",
                                        overflow="ellipsis", no_wrap=True))
             return self.Group(*lines)
 
-        work_budget = min(len(tasks), max(1, available // 4))
+        # The timing table never consumes the bottom four lines. Active work
+        # bars are always appended after the stationary status/table region.
+        progress_reserve = min(4, max(1, available - 6))
+        work_budget = min(len(tasks), progress_reserve)
         visible_tasks = set(tasks[-work_budget:]) if work_budget else set()
         for task in self.progress.tasks:
             task.visible = task.id in visible_tasks
         hidden_work = len(tasks) - work_budget
         rows = summary["stages"]
-        budget = max(1, available - work_budget - 4 - int(bool(hidden_work)))
+        header_lines = int(batch_status is not None)
+        budget = max(1, available - progress_reserve - header_lines
+                     - 4 - int(bool(hidden_work)))
         if self.finished:
             budget = len(rows)  # final frame is ordinary scrollback, not a redraw region
         priority = [self.stage_index] + [i for i in reversed(range(len(rows)))
@@ -1024,7 +1122,9 @@ class _CompileLive(_CompileBars):
                               f"{row['seconds']:.2f}", f"{row['rss_bytes'] / _GIB:.2f}")
         if len(selected) < len(rows):
             table.caption = f"{len(rows) - len(selected)} stages hidden; full summary retained"
-        parts = [table, self.Text(status, overflow="ellipsis", no_wrap=True)]
+        parts = ([] if batch_status is None else [
+                     self.Text(batch_status, overflow="ellipsis", no_wrap=True)])
+        parts += [table, self.Text(status, overflow="ellipsis", no_wrap=True)]
         if tasks:
             parts.append(self.progress)
         if hidden_work:
@@ -1763,11 +1863,13 @@ __all__ = [
     "SCHEMA",
     "TelemetryChannel",
     "active_compile_progress",
+    "active_rule_batch_progress",
     "attach_error_buffer",
     "compile_count",
     "compile_count_close",
     "compile_iter",
     "compile_progress",
+    "compile_rule_batch",
     "compile_profile_dataframe",
     "compile_selection_event",
     "compile_stage",

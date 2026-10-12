@@ -7,7 +7,10 @@ import sys
 
 import pytest
 
-from src.compiler.shell_telemetry import CompileProgress, CompileStage, active_compile_progress
+from src.compiler.shell_telemetry import (
+    CompileProgress, CompileStage, active_compile_progress,
+    active_rule_batch_progress, compile_rule_batch,
+)
 
 pytest.importorskip('rich')
 
@@ -71,6 +74,28 @@ def test_one_live_owns_logs_timing_and_completed_work_then_restores_streams():
     assert '[red]compiler[/red]' in text
     assert 'callback output' in text and 'ordinary diagnostic' in text
     assert 'compile done (2 timed stages)' in text
+
+
+def test_rule_batch_clock_is_the_top_line_and_bars_remain_at_the_bottom():
+    progress, _, clock = layer()
+    with compile_rule_batch(4, clock=lambda: clock[0]) as batch:
+        assert active_rule_batch_progress() is batch
+        with batch.rule('first'):
+            clock[0] += 10
+        with batch.rule('second'):
+            with progress:
+                clock[0] += 5
+                for index in range(6):
+                    progress.count(f'work{index}', index + 1, total=10,
+                                   label=f'work {index}')
+                current = frame_text(progress, width=100, height=18)
+                lines = current.splitlines()
+                assert lines[0].startswith(
+                    'Rules 1/4 | wall 15s | average 10s | projected total 40s')
+                assert len(lines) <= 18
+                assert current.index('Compiler timings') < current.index('6/10 (60%)')
+                assert '+2 other active counters' in current
+    assert active_rule_batch_progress() is None
 
 
 @pytest.mark.parametrize('width,height', [(100, 30), (80, 14), (40, 10), (20, 6)])

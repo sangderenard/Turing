@@ -192,14 +192,17 @@ def main(argv: list[str]) -> int:
           f"ram_tiles={storage_contract.compress_cold_pages} "
           f"tile_disk={storage_contract.compressed_tile_disk} "
           f"memory_budget_bytes={storage_contract.memory_budget_bytes}", flush=True)
-    for name, equations in selected:
-        path = (honorary._LLVM_LAW_CACHE_DIR / name / "b1"
-                / honorary._llvm_piece_cache_key(name, 1, tuple(equations))
-                / f"{name}.piece")
-        if not path.is_file() or piece_staleness(LLVMPiece.load(path)):
-            progress(f"profile: building piece {name}")
-            honorary.equation_piece(name, equations, batch=1)
-        paths.append(path)
+    from src.compiler.shell_telemetry import compile_rule_batch
+    with compile_rule_batch(len(selected)) as rule_progress:
+        for name, equations in selected:
+            with rule_progress.rule(name):
+                path = (honorary._LLVM_LAW_CACHE_DIR / name / "b1"
+                        / honorary._llvm_piece_cache_key(name, 1, tuple(equations))
+                        / f"{name}.piece")
+                if not path.is_file() or piece_staleness(LLVMPiece.load(path)):
+                    progress(f"profile: building piece {name}")
+                    honorary.equation_piece(name, equations, batch=1)
+                paths.append(path)
 
     (ROOT / "build").mkdir(exist_ok=True)
     build = Path(tempfile.mkdtemp(prefix=f"profile_rules_{len(selected)}_{options.backend}_", dir=ROOT / "build"))
