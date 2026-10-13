@@ -1524,7 +1524,7 @@ def _map_ir_from_ast(tree):
     }
 
 
-def _ast_definition_bindings(value):
+def _ast_definition_bindings(value, definition=None):
     """Obtain names needed only while recursively discovering source AST."""
 
     if inspect.ismethod(value):
@@ -1539,6 +1539,37 @@ def _ast_definition_bindings(value):
         bindings.update(closure.builtins)
         bindings.update(closure.globals)
         bindings.update(closure.nonlocals)
+        # Signature defaults are evaluated outside the function code object,
+        # so a global used only by ``parameter=NAME`` is intentionally absent
+        # from getclosurevars().  The pursued definition still contains that
+        # authored Name and the reducer must receive its exact defining-module
+        # value; otherwise every omitted callsite carries a copied AST object
+        # instead of the Python default.  Select only names loaded by default
+        # expressions, preserving the same narrow lexical boundary as the
+        # bytecode closure above.
+        if definition is None:
+            definition = _source_ast_definition(value)
+        if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            default_expressions = (
+                *definition.args.defaults,
+                *tuple(
+                    item for item in definition.args.kw_defaults
+                    if item is not None
+                ),
+            )
+            default_names = {
+                member.id
+                for expression in default_expressions
+                for member in ast.walk(expression)
+                if isinstance(member, ast.Name)
+                and isinstance(member.ctx, ast.Load)
+            }
+            function_globals = getattr(value, "__globals__", {})
+            bindings.update({
+                name: function_globals[name]
+                for name in default_names
+                if name in function_globals
+            })
         # Annotation-only names do not appear in function bytecode and are
         # therefore absent from getclosurevars(). They still declare receiver
         # schemas needed to resolve ``parameter.method`` source. Admit only
@@ -1559,7 +1590,6 @@ def _ast_definition_bindings(value):
             if owner is None:
                 break
         if inspect.isclass(owner):
-            definition = _source_ast_definition(value)
             if isinstance(
                 definition,
                 (ast.FunctionDef, ast.AsyncFunctionDef),
@@ -3638,7 +3668,7 @@ def _expand_unresolved_ast_parents(
         target_definitions[identity] = definition
         definition_bindings = _import_ast_bindings(
                 source_definition,
-                _ast_definition_bindings(source_target),
+                _ast_definition_bindings(source_target, source_definition),
                 package=str(
                     getattr(
                         inspect.getmodule(source_target),

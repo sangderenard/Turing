@@ -40,6 +40,13 @@ def _closed_source_helper():
     return _source_helper(3)
 
 
+_PURSUED_SOURCE_DEFAULT = 256
+
+
+def _defaulted_source_helper(local_size=_PURSUED_SOURCE_DEFAULT):
+    return local_size
+
+
 class _RegisteredMethodOwner:
     def run(self):
         return _source_helper(3)
@@ -150,6 +157,24 @@ def test_reachable_registered_method_pursues_body_without_new_bindings():
     assert "_source_helper" in discovered
     assert "_recursive_source_helper" not in discovered
     assert any(definition.name == "_source_helper" for definition, _call in links)
+
+
+def test_pursued_signature_default_resolves_its_module_constant():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {
+        "_defaulted_source_helper": _defaulted_source_helper,
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            "def entry():\n    return _defaulted_source_helper()\n",
+            resolve_unresolved_parents=True,
+            parent_include=_source_dependency_is_not_tensor_primitive,
+            pursuit_roots=("entry",),
+        )
+    reduce_abstract_tensor_topology(graph)
+
+    helper = graph.function_table.entry("_defaulted_source_helper").graph
+    assert helper.G.graph["parameter_defaults"]["local_size"] == 256
 
 
 def test_retained_source_method_pursues_its_method_body_dependencies():

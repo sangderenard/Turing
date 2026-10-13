@@ -13269,7 +13269,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     value = ast.literal_eval(default_expression)
                 except (ValueError, TypeError):
                     if isinstance(default_expression, ast.Name):
-                        value = static_bindings.get(
+                        value = definition_static_bindings.get(
                             default_expression.id,
                             default_expression,
                         )
