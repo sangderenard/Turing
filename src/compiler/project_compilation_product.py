@@ -4504,15 +4504,25 @@ class _ResolvedProcessGraphPickler(pickle.Pickler):
     """Checkpoint pickler for import-owned Python implementation objects."""
 
     def reducer_override(self, value: Any) -> Any:
-        if value is types.CodeType:
-            # CPython exposes this exact class through ``types.CodeType`` but
-            # reports it to pickle as ``builtins.code``.  The latter slot does
-            # not exist.  Preserve the import-owned identity used by authored
-            # ``isinstance(value, types.CodeType)`` checks.
-            return (
-                _resolve_qualified_module_attribute,
-                ("types", "", "CodeType"),
-            )
+        if isinstance(value, type):
+            # Let pickle keep every normally importable class.  Some CPython
+            # implementation classes declare a nominal slot that does not
+            # exist (for example ``builtins.code``) while an imported module
+            # owns the public identity.  Use the existing import-owned-slot
+            # contract for that entire class of objects, not a named-type
+            # exception.
+            module_name = str(getattr(value, "__module__", ""))
+            owner_path, _, attribute_name = str(
+                getattr(value, "__qualname__", "")
+            ).rpartition(".")
+            try:
+                nominal = _resolve_qualified_module_attribute(
+                    module_name, owner_path, attribute_name,
+                )
+            except (AttributeError, ImportError, TypeError, ValueError):
+                nominal = None
+            if nominal is not value:
+                return _reduce_import_owned_module_slot(value, "type")
         if isinstance(value, types.FunctionType):
             return _reduce_importable_cached_property_function(value)
         return NotImplemented

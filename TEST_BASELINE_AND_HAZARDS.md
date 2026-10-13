@@ -1,14 +1,16 @@
-2026-10-13 CODETYPE CLASS CHECKPOINT IDENTITY (CURRENT WORKTREE):
+2026-10-13 IMPORT-OWNED TYPE CHECKPOINT IDENTITY (CURRENT WORKTREE):
 The first real auto-bootstrap attempt completed whole-source closure and
 topology reduction, then failed before scheduling while checkpointing the
 resolved ProcessGraph.  The compiler source has long retained both CPython
 code instances and the exact `types.CodeType` class used in authored
 `isinstance` checks.  The graph checkpoint contract already serialized code
 instances through `marshal`, but stock pickle named the class itself as the
-nonexistent `builtins.code` slot.  The private resolved-graph pickler now
-restores that one class through its authoritative `types.CodeType` import slot.
-The regression checkpoints the class and an instance together, requires exact
-class identity after loading, and passes.  This is not a scheduling or memory-
+nonexistent `builtins.code` slot.  The private resolved-graph pickler now uses
+the existing import-owned-module-slot contract for any type whose declared
+module/qualname slot does not own that exact class.  Normally importable types
+still use stock pickle; this is a general identity rule, not a `CodeType`
+exception.  The regressions checkpoint the class and an instance together,
+require exact class identity after loading, and pass.  This is not a scheduling or memory-
 admission failure: the run stopped before auto measured plan width or launched
 a worker.  The failed `build/compiler-partitions` attempt tree was removed so
 the next user-owned run starts without its partial checkpoint.  No full

@@ -340,6 +340,22 @@ def test_resolved_graph_checkpoint_preserves_code_objects_and_their_type():
     assert restored["static_python_binding"].co_consts == authored.__code__.co_consts
 
 
+def test_resolved_graph_checkpoint_uses_general_import_owned_type_identity():
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+
+    class_declared_outside_its_public_slot = type((lambda: None).__code__)
+    stream = io.BytesIO()
+    _dump_resolved_process_graph(
+        {"implementation_type": class_declared_outside_its_public_slot},
+        stream,
+    )
+
+    restored = pickle.loads(stream.getvalue())
+    assert restored["implementation_type"] is class_declared_outside_its_public_slot
+
+
 def test_native_tensor_index_is_not_a_tuple_projection(tmp_path):
     source = "def leaf(x):\n    return x * 2.0\ndef root(x):\n    return leaf(x)[0] + 1.0\n"
     contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_program_abi({
