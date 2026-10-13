@@ -314,7 +314,7 @@ def test_universal_frontend_serial_uses_the_canonical_whole_graph_compiler():
     }
 
 
-def test_resolved_graph_checkpoint_preserves_code_objects():
+def test_resolved_graph_checkpoint_preserves_code_objects_and_their_type():
     from src.compiler.project_compilation_product import (
         _dump_resolved_process_graph,
     )
@@ -324,13 +324,20 @@ def test_resolved_graph_checkpoint_preserves_code_objects():
 
     stream = io.BytesIO()
     _dump_resolved_process_graph(
-        {"static_python_binding": authored.__code__}, stream,
+        {
+            "static_python_binding": authored.__code__,
+            "authored_isinstance_type": type(authored.__code__),
+        }, stream,
     )
-    restored = pickle.loads(stream.getvalue())["static_python_binding"]
+    restored = pickle.loads(stream.getvalue())
 
-    assert isinstance(restored, type(authored.__code__))
-    assert restored.co_code == authored.__code__.co_code
-    assert restored.co_consts == authored.__code__.co_consts
+    assert restored["authored_isinstance_type"] is type(authored.__code__)
+    assert isinstance(
+        restored["static_python_binding"],
+        restored["authored_isinstance_type"],
+    )
+    assert restored["static_python_binding"].co_code == authored.__code__.co_code
+    assert restored["static_python_binding"].co_consts == authored.__code__.co_consts
 
 
 def test_native_tensor_index_is_not_a_tuple_projection(tmp_path):

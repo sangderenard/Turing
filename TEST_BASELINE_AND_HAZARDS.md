@@ -1,3 +1,19 @@
+2026-10-13 CODETYPE CLASS CHECKPOINT IDENTITY (CURRENT WORKTREE):
+The first real auto-bootstrap attempt completed whole-source closure and
+topology reduction, then failed before scheduling while checkpointing the
+resolved ProcessGraph.  The compiler source has long retained both CPython
+code instances and the exact `types.CodeType` class used in authored
+`isinstance` checks.  The graph checkpoint contract already serialized code
+instances through `marshal`, but stock pickle named the class itself as the
+nonexistent `builtins.code` slot.  The private resolved-graph pickler now
+restores that one class through its authoritative `types.CodeType` import slot.
+The regression checkpoints the class and an instance together, requires exact
+class identity after loading, and passes.  This is not a scheduling or memory-
+admission failure: the run stopped before auto measured plan width or launched
+a worker.  The failed `build/compiler-partitions` attempt tree was removed so
+the next user-owned run starts without its partial checkpoint.  No full
+bootstrap was launched by the repair.
+
 2026-10-13 AUTOMATIC RESOLVED-GRAPH SCHEDULING AND ADMISSION (CURRENT WORKTREE):
 The canonical source compiler accepts `source_compilation="auto"` alongside
 serial and parallel operation.  It still resolves the complete ProcessGraph
