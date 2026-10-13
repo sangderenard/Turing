@@ -116,6 +116,7 @@ from ...transmogrifier.graph.python_special_cases import (
     canonicalize_python_static_bindings,
     interpret_python_special_case,
     interpret_python_static_value,
+    is_python_static_literal,
 )
 from ...transmogrifier.graph.python_identity_programs import (
     resolve_python_identity,
@@ -13268,13 +13269,21 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 try:
                     value = ast.literal_eval(default_expression)
                 except (ValueError, TypeError):
-                    if isinstance(default_expression, ast.Name):
-                        value = definition_static_bindings.get(
-                            default_expression.id,
-                            default_expression,
-                        )
-                    else:
+                    if (
+                        not isinstance(default_expression, ast.Name)
+                        or default_expression.id
+                        not in definition_static_bindings
+                    ):
                         continue
+                    value = definition_static_bindings[default_expression.id]
+                # ``parameter_defaults`` is executable/persisted graph data,
+                # not the source resolver's live Python namespace.  Objects
+                # such as compiler registries remain available in
+                # ``definition_static_bindings`` while their uses are
+                # normalized, but are never mislabeled as literal arguments
+                # or embedded in a worker checkpoint.
+                if not is_python_static_literal(value):
+                    continue
                 parameter_defaults[name] = value
                 if isinstance(
                     value,

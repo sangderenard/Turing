@@ -33,6 +33,7 @@ from .node_special_cases import (
 from .python_special_cases import (
     extraction_receipt,
     interpret_python_special_case,
+    is_python_static_literal,
     lower_python_shell_file_contexts,
     lower_python_threading,
     python_dispatch_entry_expressions,
@@ -1791,19 +1792,6 @@ def _reducer_facing_bindings(bindings):
 _UNRESOLVED_LITERAL = object()
 
 
-def _is_resolved_literal(value):
-    if isinstance(value, (type(None), bool, int, float, complex, str, bytes)):
-        return True
-    if isinstance(value, (tuple, list, set, frozenset)):
-        return all(_is_resolved_literal(item) for item in value)
-    if isinstance(value, dict):
-        return all(
-            _is_resolved_literal(key) and _is_resolved_literal(item)
-            for key, item in value.items()
-        )
-    return False
-
-
 def _resolved_ast_literal(node, bindings):
     """Evaluate only literal structure and previously proven literal names.
 
@@ -1818,7 +1806,10 @@ def _resolved_ast_literal(node, bindings):
         return node.value
     if isinstance(node, ast.Name):
         value = bindings.get(node.id, _UNRESOLVED_LITERAL)
-        if value is not _UNRESOLVED_LITERAL and _is_resolved_literal(value):
+        if (
+            value is not _UNRESOLVED_LITERAL
+            and is_python_static_literal(value)
+        ):
             return value
         return _UNRESOLVED_LITERAL
     if isinstance(node, (ast.Tuple, ast.List, ast.Set)):

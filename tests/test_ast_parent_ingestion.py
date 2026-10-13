@@ -1,6 +1,7 @@
 import ast
 import contextlib
 import io
+import pickle
 import re
 import types
 
@@ -45,6 +46,18 @@ _PURSUED_SOURCE_DEFAULT = 256
 
 def _defaulted_source_helper(local_size=_PURSUED_SOURCE_DEFAULT):
     return local_size
+
+
+class _UnpickleableDefault:
+    def __init__(self):
+        self.callback = lambda value: value
+
+
+_UNPICKLEABLE_DEFAULT = _UnpickleableDefault()
+
+
+def _object_defaulted_source_helper(registry=_UNPICKLEABLE_DEFAULT):
+    return 1
 
 
 class _RegisteredMethodOwner:
@@ -175,6 +188,27 @@ def test_pursued_signature_default_resolves_its_module_constant():
 
     helper = graph.function_table.entry("_defaulted_source_helper").graph
     assert helper.G.graph["parameter_defaults"]["local_size"] == 256
+
+
+def test_pursued_object_default_is_not_persisted_as_literal_data():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {
+        "_object_defaulted_source_helper": _object_defaulted_source_helper,
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            "def entry():\n    return _object_defaulted_source_helper()\n",
+            resolve_unresolved_parents=True,
+            parent_include=_source_dependency_is_not_tensor_primitive,
+            pursuit_roots=("entry",),
+        )
+    reduce_abstract_tensor_topology(graph)
+
+    helper = graph.function_table.entry(
+        "_object_defaulted_source_helper"
+    ).graph
+    assert "registry" not in helper.G.graph["parameter_defaults"]
+    pickle.dumps(graph, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def test_retained_source_method_pursues_its_method_body_dependencies():

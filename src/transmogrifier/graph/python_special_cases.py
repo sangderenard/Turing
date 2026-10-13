@@ -485,6 +485,23 @@ def canonicalize_python_static_bindings(
     }
 
 
+def is_python_static_literal(value: Any) -> bool:
+    """Whether ``value`` is exact literal data a ProcessGraph may persist."""
+
+    if value is None or value is Ellipsis or isinstance(
+        value, (bool, bytes, complex, float, int, str),
+    ):
+        return True
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return all(is_python_static_literal(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            is_python_static_literal(key) and is_python_static_literal(item)
+            for key, item in value.items()
+        )
+    return False
+
+
 def interpret_python_static_value(
     value: Any,
     *,
