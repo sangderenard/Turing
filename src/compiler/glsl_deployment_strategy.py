@@ -15552,6 +15552,15 @@ def _source_static_literal(
     raise ValueError("value is not source-static")
 
 
+def _canonical_planner_specialization_cells(contributions: Any) -> tuple:
+    """The set of cells proving one aggregate specialization, in one order."""
+
+    return tuple(sorted(dict.fromkeys(
+        cell for _value, cell_group, _omitted in contributions
+        for cell in cell_group
+    ), key=lambda cell: repr(cell.key)))
+
+
 def _propagate_callsite_planner_specializations(graph: Any) -> None:
     """Resolve consistent literal call arguments before any loop is planned."""
 
@@ -15691,10 +15700,14 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
         if callee is None or not contributions:
             continue
         values = [value for value, _cells, _omitted in contributions]
-        cells = tuple(dict.fromkeys(
-            cell for _value, cell_group, _omitted in contributions
-            for cell in cell_group
-        ))
+        # A specialization is one aggregate fact over every contributing
+        # callsite.  Function-table and graph insertion order can change
+        # between the catalogue pass and a nested function pass without any
+        # callsite identity changing.  ``Unresolved.read`` is part of the
+        # fact's equality, so give both the fact and its Derived provenance
+        # the same identity order rather than mistaking a traversal
+        # permutation for a new fact with no new cause.
+        cells = _canonical_planner_specialization_cells(contributions)
         if any(value is not_source_static for value in values):
             _post_planner_specialization(callee, parameter, Unresolved(
                 SPECIALIZATION_NOT_SOURCE_STATIC, read=cells,
