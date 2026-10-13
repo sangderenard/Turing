@@ -21,6 +21,73 @@ def arena(tmp_path):
     return owner
 
 
+def test_atom_management_preserves_exact_identity_and_memo_overrides(tmp_path):
+    owner = arena(tmp_path)
+    atoms = (None, True, 1234567, 1.25, 2j, "scalar", b"scalar")
+    memo = {}
+    for value in atoms:
+        assert owner.manage(value, memo) is value
+    assert memo == {}  # Scalars create no conversion bookkeeping.
+    replacement = object()
+    memo[id(atoms[2])] = replacement
+    assert owner.manage(atoms[2], memo) is replacement
+    class Integer(int):
+        pass
+    subclass = Integer(12)
+    subclass_memo = {}
+    assert owner.manage(subclass, subclass_memo) is subclass
+    assert subclass_memo  # Subclasses retain the existing conversion path.
+
+
+def test_strong_tile_relocation_validates_bytes_without_recompression(tmp_path, monkeypatch):
+    import random
+    import lzma
+    source = DiskTileStore(tmp_path)
+    target = DiskTileStore(tmp_path)
+    block = random.Random(12).randbytes(65536)
+    data = block * 16
+    tile = source.write(data, 7)
+    assert tile.codec == "lzma"
+    def unexpected_compression(*args, **kwargs):
+        raise AssertionError("already strong-compressed tile was re-encoded")
+    monkeypatch.setattr(lzma, "compress", unexpected_compression)
+    copied = target.copy_strong_tile(tile)
+    assert copied.decode() == data
+    assert (copied.stored_bytes, copied.raw_bytes, copied.rows, copied.checksum) == (
+        tile.stored_bytes, tile.raw_bytes, tile.rows, tile.checksum)
+    source._handle.seek(tile.offset)
+    source._handle.write(b"broken")
+    before = target.bytes_written
+    with pytest.raises((lzma.LZMAError, ValueError)):
+        target.copy_strong_tile(tile)
+    assert target.bytes_written == before
+
+
+def test_compaction_reuses_strong_payloads_and_keeps_mutations(tmp_path, monkeypatch):
+    import random
+    from src.compiler.compressed_tiles import DiskTile
+    owner = arena(tmp_path)
+    data = random.Random(12).randbytes(65536) * 16
+    values = owner.manage({"payload": data})
+    owner.offload_to_disk()
+    strong_count = sum(isinstance(tile, DiskTile) and tile.codec == "lzma"
+                       for tile in owner._tiles)
+    assert strong_count > 0
+    copies = []
+    copy = DiskTileStore.copy_strong_tile
+    def observe(store, tile):
+        copies.append(tile)
+        return copy(store, tile)
+    monkeypatch.setattr(DiskTileStore, "copy_strong_tile", observe)
+    owner.compact_disk()
+    assert len(copies) == strong_count
+    assert values["payload"] == data
+    values["payload"] = b"changed" + data
+    owner.flush()
+    owner.compact_disk()
+    assert values["payload"] == b"changed" + data
+
+
 def test_empty_map_reinsertion_routes_to_its_current_root(tmp_path):
     owner = arena(tmp_path)
     values = owner.manage({2: "first"})

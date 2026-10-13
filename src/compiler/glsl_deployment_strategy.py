@@ -8990,6 +8990,12 @@ def _control_partition_keys(
     ordering.
     """
 
+    # A source catalogue deliberately has no executable dispatch nodes.
+    # Its partition is empty; building graph-wide branch and descendant
+    # tables first consumed minutes and substantial memory during bootstrap.
+    if not node_ids:
+        return {}
+
     plans = tuple(loop_plans)
     branches = _branch_compartments(graph)
     expression_nodes = {
@@ -27496,8 +27502,20 @@ def strategize_shell_deployment(
     ))
     visits = trace.setdefault("visits", {})
     visits[visit_key] = int(visits.get(visit_key, 0)) + 1
+    selection_counts = (int(graph.G.number_of_nodes()), int(graph.G.number_of_edges()))
+    selection_counts_at = time.monotonic()
 
     def selection_event(stage: str, state: str, **facts: Any) -> None:
+        nonlocal selection_counts, selection_counts_at
+        measured_at = time.monotonic()
+        # Bootstrap callsite progress is frequent and the catalogue has over
+        # 100,000 nodes. NetworkX counts edges by traversing every degree.
+        # Keep exact counts at phase boundaries; progress samples refresh at
+        # most once a second and retain their measurement time in the receipt.
+        # This only bounds diagnostic scans, not memory-pressure checkpoints.
+        if state != "progress" or measured_at - selection_counts_at >= 1.0:
+            selection_counts = (int(graph.G.number_of_nodes()), int(graph.G.number_of_edges()))
+            selection_counts_at = measured_at
         trace["sequence"] = int(trace.get("sequence", 0)) + 1
         event = {
             "sequence": int(trace["sequence"]),
@@ -27509,8 +27527,11 @@ def strategize_shell_deployment(
             "visit": int(visits[visit_key]),
             "stage": str(stage),
             "state": str(state),
-            "nodes": int(graph.G.number_of_nodes()),
-            "edges": int(graph.G.number_of_edges()),
+            "nodes": selection_counts[0],
+            "edges": selection_counts[1],
+            "graph_counts_elapsed_seconds": round(
+                selection_counts_at - float(trace["started_at"]), 6
+            ),
             **facts,
         }
         events = trace.setdefault("events", [])

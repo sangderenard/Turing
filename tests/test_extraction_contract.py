@@ -41,6 +41,38 @@ def _contract_outer():
     return _contract_inner()
 
 
+def test_source_availability_is_probed_once_per_exact_definition(monkeypatch):
+    import inspect
+    contract = ExtractionContract(CONTRACT)
+    original = inspect.getsource
+    probes = []
+
+    def source(value):
+        probes.append(value)
+        return original(value)
+
+    monkeypatch.setattr(inspect, "getsource", source)
+    for _ in range(20):
+        assert contract.subject(_contract_inner).source_available
+    assert probes == [_contract_inner]
+    # Two definitions can carry the same displayed name without being the
+    # same source object. Their availability must still be probed separately.
+    alternate = type(_contract_inner)(_contract_inner.__code__, globals(),
+                                      _contract_inner.__name__)
+    assert contract.subject(alternate).source_available
+    assert len(probes) == 2
+    contract.with_program_abi(contract.program_abi).subject(_contract_inner)
+    assert len(probes) == 3
+    for _ in range(300):
+        definition = type(_contract_inner)(_contract_inner.__code__, globals(),
+                                           _contract_inner.__name__)
+        assert contract.subject(definition).source_available
+    assert len(contract._source_availability) == 256
+    before = len(probes)
+    contract.subject(_contract_inner)
+    assert len(probes) == before + 1
+
+
 def test_default_contract_draws_python_native_and_decompile_lines():
     contract = ExtractionContract(CONTRACT)
 

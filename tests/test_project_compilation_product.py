@@ -225,6 +225,38 @@ def test_project_worker_hands_its_resolved_module_context_to_ingestion(
     assert current["compiler"]["stage_count"] == 10
 
 
+def test_discarded_graph_progress_does_not_measure_process_memory(tmp_path, monkeypatch):
+    source = tmp_path / "source.py"
+    source.write_text("def target(value):\n    return value\n", encoding="utf-8")
+    measurements = []
+    messages = []
+
+    def memory(pid):
+        measurements.append(pid)
+        return 123456
+
+    def lower(_source, _entrypoint, **options):
+        report = options["progress"]
+        before = len(measurements)
+        for index in range(1, 1001):
+            report(f"[graph-build #{index}] source node")
+        assert len(measurements) == before
+        report("source closure complete")
+        assert len(measurements) == before + 1
+        options["resolved_process_graph_sink"](SimpleNamespace())
+        return None, {}, ()
+
+    monkeypatch.setattr("src.compiler.project_compilation_product.resident_bytes", memory)
+    monkeypatch.setattr("src.compiler.project_compilation_product.time.perf_counter", lambda: 0.5)
+    monkeypatch.setattr("src.compiler.fortran_c_shell.lower_ast_source_to_ssa", lower)
+    compile_project_call(source, "target", tmp_path / "product", plan_only=True,
+                         progress=messages.append)
+    assert "[graph-build #1000] source node" in messages
+    receipt = json.loads((tmp_path / "product" / "compile-progress.json").read_text())
+    assert any(event["message"] == "source closure complete"
+               and event["resident_bytes"] == 123456 for event in receipt["events"])
+
+
 def test_completed_unit_reports_its_compiler_stage_without_event_name_collision(
     tmp_path, monkeypatch,
 ):

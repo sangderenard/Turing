@@ -3085,8 +3085,9 @@ def _post_copy_on_read_fork(
         ScopeFork, ScopeProjection,
     )
 
-    # The nodes this copy holds, and the nodes of its source it does not.
-    not_held: frozenset = (universe - members) if projecting else frozenset()
+    # Query the complement directly. Materializing universe - members made
+    # every bootstrap function fork allocate another source-sized set, even
+    # though its read-time projection already stores universe and members.
     inherited = book.__dict__.get("scope_projections", {}).get(source)
     # Every callee copy is its own variant (design section 7.1): the
     # planner's specialization rows -- the literal / default fold and the
@@ -3115,7 +3116,7 @@ def _post_copy_on_read_fork(
                     # A node the copy does not hold: of a source node
                     # (read-refused), or of an id retired before the copy
                     # was cut.
-                    if row[1] in not_held:
+                    if row[1] in universe:
                         excluded += 1
                     else:
                         stale += 1
@@ -3131,7 +3132,9 @@ def _post_copy_on_read_fork(
         projection = ScopeProjection(
             pages=tuple(sorted(node_keyed)), node_count=len(members),
             node_digest=digest,
-            source_node_count=len(members) + len(not_held),
+            source_node_count=len(universe) + sum(
+                member not in universe for member in members
+            ),
             rows_carried=carried, rows_excluded=excluded, rows_stale=stale,
         )
     source_cell = book.latest_ref(SCOPE_REGISTRY, source)
@@ -12961,9 +12964,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
 
     compile_substage("topology: classify recursive call components")
     call_graph = live_digraph()
-    call_graph.add_nodes_from(
+    function_addresses = frozenset(
         reference.address for reference in function_nodes.values()
     )
+    call_graph.add_nodes_from(reference.address for reference in function_nodes.values())
     referenced_calls: list[tuple[int, Any, Any]] = []
     for call_id, owner in call_owners.items():
         if call_id not in graph.G:
@@ -12978,9 +12982,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             callee_entry = function_table.entry(callee_address)
         except KeyError:
             continue
-        if callee_entry.graph is None and callee_address not in {
-            reference.address for reference in function_nodes.values()
-        }:
+        if callee_entry.graph is None and callee_address not in function_addresses:
             continue
         call_graph.add_edge(owner.address, callee_address)
 
@@ -13006,6 +13008,16 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
 
     lexical_free_names_by_function: dict[int, tuple[str, ...]] = {}
     compile_substage("topology: extract lexical function graphs")
+    # The bootstrap's 621 function entries share one reduced source graph.
+    # Its terminal merges are already installed; function normalization below
+    # writes each detached function graph, not new merges into this source.
+    # Find the candidates once, retaining source order and the same exact
+    # return-value subset test for each function.
+    terminal_merge_candidates = tuple(
+        int(member)
+        for member, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("terminal_return_merge")
+    )
     for node_id, reference in compile_iter(function_nodes.items(),
             "lexical-functions", label="Lexical function graphs extracted"):
         if node_id not in graph.G:
@@ -13017,7 +13029,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         ]
         terminal_merges = [
             int(member)
-            for member in graph.G
+            for member in terminal_merge_candidates
             if (
                 (graph.G.nodes[member].get("attributes") or {}).get(
                     "terminal_return_merge"

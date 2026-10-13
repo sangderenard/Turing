@@ -1,3 +1,14 @@
+2026-10-13 BOOTSTRAP PERFORMANCE INVESTIGATION (CURRENT):
+See docs/compiler_convergence/11_bootstrap_performance.md for actual bootstrap
+timings, bounded source-probe and progress fast paths, empty catalogue control
+partition handling, scalar adoption, and validated relocation of already-LZMA
+disk tiles. Adaptive memory regulation, cold compression, collection and
+identity accounting remain enabled. Partial-bootstrap component timings are
+not a whole-bootstrap completion claim. Authored helper receipts still expose
+missing parameter/capture representation on unchanged main. Earlier scoped
+unit publication is the existing route for reducing deployment's broad RAM
+peak; holistic auto has not been silently replaced.
+
 2026-10-13 LIVE DEPLOYMENT STORAGE + ELEVEN-STAGE VISIBILITY (CURRENT):
 Deployment plans, loop plans, semantic loops, generated deployment-class
 catalogues, and ordinary NetworkX process graphs now enter the existing live

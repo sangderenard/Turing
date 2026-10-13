@@ -5403,13 +5403,16 @@ def compile_project_call(
     def report(message: str) -> None:
         nonlocal last_trace_write
         elapsed = time.perf_counter() - trace_started
-        event = {
-            "elapsed_seconds": elapsed,
-            "message": str(message),
-            "resident_bytes": resident_bytes(os.getpid()),
-        }
         graph_detail = str(message).startswith("[graph-build #")
         if not graph_detail or elapsed - last_trace_write >= 1.0:
+            # Bootstrap emits a graph-build event for every source node.
+            # Measure memory only for the retained one-second snapshots;
+            # discarded events previously still read /proc or queried Windows.
+            event = {
+                "elapsed_seconds": elapsed,
+                "message": str(message),
+                "resident_bytes": resident_bytes(os.getpid()),
+            }
             trace_events.append(event)
             del trace_events[:-128]
             try:

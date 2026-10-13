@@ -512,6 +512,19 @@ def _region_scenario(book):
     return source
 
 
+def test_projection_count_includes_members_outside_the_source_universe(book):
+    source = _region_scenario(book)
+    whole = _Graph((1, 2, 3, 4), source)
+    region = _Graph((2, 9), source)
+    fork_read_scope(region, "region-with-late-member", source_graph=whole)
+    forked = tuple(region.G.graph["lexical_read_scope"])
+    projection = book.page(SCOPE_ORIGIN).latest((forked,)).projection
+    assert (projection.node_count, projection.source_node_count) == (2, 5)
+    assert (projection.rows_carried, projection.rows_excluded,
+            projection.rows_stale) == (2, 3, 0)
+    assert book.page(LRB).latest((forked, 9, "arg0", 0)) == "retired"
+
+
 def test_a_dispatch_region_fork_composes_projection_with_copy_on_read(book):
     source = _region_scenario(book)
     page = book.page(LRB)

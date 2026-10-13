@@ -32,6 +32,7 @@ from .compressed_tiles import CompressedTile, DiskTile, DiskTileStore, DiskTileD
 _ACTIVE_ARENA = ContextVar("compiler_live_tile_arena", default=None)
 _ACTIVE_REGISTRAR = ContextVar("compiler_live_root_registrar", default=None)
 _MEMO_SOURCES = object()
+_PLAIN_ATOM_TYPES = frozenset({type(None), str, bytes, int, float, complex, bool})
 _PLAIN_VALUE_TYPES = frozenset({type(None), str, bytes, int, float, complex,
                                bool, dict, list, tuple, set, frozenset})
 
@@ -528,6 +529,10 @@ class LiveTileArena:
             self._trim()
 
     def manage(self, value, memo=None):
+        # Exact scalar atoms need neither container dispatch nor retention in
+        # the conversion memo. Subclasses still follow the ordinary path.
+        if type(value) in _PLAIN_ATOM_TYPES:
+            return memo.get(id(value), value) if memo is not None else value
         if isinstance(value, (TiledDict, TiledList, TiledTuple, TiledSet)):
             return value
         if isinstance(value, TiledObject):
@@ -972,7 +977,9 @@ class LiveTileArena:
             for index, record in compile_iter(enumerate(self._tiles), "storage-compaction",
                     label="Storage tiles compacted", total=len(self._tiles)):
                 if isinstance(record, DiskTile):
-                    record = candidate.write(record.decode(), record.rows)
+                    record = (candidate.copy_strong_tile(record)
+                              if record.codec == "lzma"
+                              else candidate.write(record.decode(), record.rows))
                     live += record.stored_bytes
                 elif record is not None:
                     record = candidate.write(record.decode(), record.rows)

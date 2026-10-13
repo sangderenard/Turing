@@ -65,6 +65,27 @@ class DiskTileStore:
         codec, payload = ("lzma", strong) if strong is not None and len(strong) < len(fast) else ("zlib", fast)
         if len(data) < len(payload):
             codec, payload = "raw", data
+        return self._append(payload, len(data), rows, codec, zlib.crc32(data))
+
+    def copy_strong_tile(self, tile):
+        """Relocate an already strong-compressed tile without encoding it again.
+
+        Validate the original decoded bytes before committing its header. Only
+        LZMA records qualify: zlib/raw records may still benefit from the cold
+        compression pass. Workspace remains bounded to one tile.
+        """
+        if tile.codec != "lzma":
+            raise ValueError("only an already strong-compressed tile can be copied")
+        tile.decode()  # Retain the compaction corruption/length check.
+        with tile.store._lock:
+            tile.store._handle.seek(tile.offset)
+            payload = tile.store._handle.read(tile.stored_bytes)
+            tile.store.reads += 1
+        if len(payload) != tile.stored_bytes:
+            raise OSError("truncated compressed tile")
+        return self._append(payload, tile.raw_bytes, tile.rows, tile.codec, tile.checksum)
+
+    def _append(self, payload, raw_bytes, rows, codec, checksum):
         with self._lock:
             self._handle.seek(0, os.SEEK_END)
             offset = self._handle.tell()
@@ -78,8 +99,7 @@ class DiskTileStore:
                 raise
             self.writes += 1
             self.bytes_written += len(payload)
-        return DiskTile(self, offset, len(payload), len(data), rows, codec,
-                        zlib.crc32(data))
+        return DiskTile(self, offset, len(payload), raw_bytes, rows, codec, checksum)
 
     def read(self, tile):
         with self._lock:

@@ -1063,6 +1063,9 @@ class ExtractionContract:
         ] = {}
         self._source_origins: set[Path] = set()
         self._source_bytes = 0
+        self._source_availability: dict[
+            tuple[int, str, str, str], tuple[Any, bool]
+        ] = {}
 
     def with_program_abi(
         self, program_abi: ProgramABIContract | Mapping[str, Any],
@@ -1328,11 +1331,32 @@ class ExtractionContract:
             )
             origin = str(getattr(defining_module, "__file__", "") or "")
         suffix = Path(origin).suffix.casefold()
-        try:
-            inspect.getsource(definition_target)
-            source_available = True
-        except (OSError, TypeError):
-            source_available = False
+        # The bootstrap meets the same compiler definitions at many calls.
+        # inspect.getsource reparses the defining module for a class even
+        # when the disposition is already cached. Probe once per exact source
+        # object in this contract; retained objects prevent recycled id hits.
+        # Derived contracts start fresh, and occurrence/classification below
+        # still come from this call rather than from another object's name.
+        availability_key = (id(definition_target), module, qualname, origin)
+        with self._lock:
+            availability = self._source_availability.get(availability_key)
+        if availability is None or availability[0] is not definition_target:
+            try:
+                inspect.getsource(definition_target)
+                source_available = True
+            except (OSError, TypeError):
+                source_available = False
+            with self._lock:
+                # Bound this observational cache independently of source
+                # closure size. It must not retain every encountered Python
+                # definition after the compiler's managed graph releases it.
+                if len(self._source_availability) >= 256:
+                    self._source_availability.pop(next(iter(self._source_availability)))
+                self._source_availability[availability_key] = (
+                    definition_target, source_available,
+                )
+        else:
+            source_available = availability[1]
         resolved = Path(origin).resolve() if origin else None
         if module == "builtins":
             classification = "builtin"

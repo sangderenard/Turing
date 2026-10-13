@@ -1,0 +1,320 @@
+{
+  "baseline_commit": "61a4818ae63c89cc160597f4550eec70d96ec0c4",
+  "complete_bootstrap_verified": false,
+  "helpers": [
+    {
+      "qualified_name": "_lower_process_graph_to_compilation._u00003c_locals_u00003e_._report",
+      "repository_ssa_complete": false,
+      "root_parameter_accounting": {
+        "complete": false,
+        "missing_lexical_captures": [
+          "progress"
+        ],
+        "missing_used_parameters": [
+          "message"
+        ],
+        "represented_parameters": [],
+        "unresolved_reference_fields": []
+      },
+      "root_semantic_accounting": {
+        "complete": false,
+        "unexplained_root_argument_details": [
+          {
+            "accounting": {},
+            "dtype": null,
+            "shape": [],
+            "uses": [
+              {
+                "binding": "control_expression",
+                "block": "entry",
+                "instruction_index": 1,
+                "operation": "Ne",
+                "role": "arg:0",
+                "source_value_id": 3
+              }
+            ],
+            "value_id": 1
+          }
+        ],
+        "unexplained_root_argument_ids": [
+          1
+        ],
+        "unresolved_required_source_values": []
+      }
+    },
+    {
+      "qualified_name": "_lower_process_graph_to_compilation._u00003c_locals_u00003e_.close_region_feed_set",
+      "repository_ssa_complete": false,
+      "root_parameter_accounting": {
+        "complete": false,
+        "missing_lexical_captures": [],
+        "missing_used_parameters": [
+          "program"
+        ],
+        "represented_parameters": [
+          "external_operands",
+          "produced"
+        ],
+        "unresolved_reference_fields": []
+      },
+      "root_semantic_accounting": {
+        "complete": false,
+        "unexplained_root_argument_details": [
+          {
+            "accounting": {},
+            "dtype": "float64",
+            "shape": [],
+            "uses": [
+              {
+                "block": "loop_body",
+                "callee": "_lower_process_graph_to_compilation__u00003c_locals_u00003e__close_region_feed_set__close_region_feed_set__planned_region_0",
+                "instruction_index": 2,
+                "operation": "Call",
+                "region_index": 0,
+                "role": "arg:0"
+              }
+            ],
+            "value_id": 5
+          },
+          {
+            "accounting": {},
+            "dtype": null,
+            "shape": [],
+            "uses": [
+              {
+                "binding": "iterable_extent",
+                "block": "entry",
+                "instruction_index": 49,
+                "operation": "Call",
+                "role": "arg:0",
+                "source_value_id": 6,
+                "tensor_operation": "extent"
+              },
+              {
+                "binding": "iterable",
+                "block": "loop_body",
+                "instruction_index": 0,
+                "operation": "GetElementPtr",
+                "role": "arg:0"
+              }
+            ],
+            "value_id": 6
+          },
+          {
+            "accounting": {},
+            "dtype": null,
+            "shape": [],
+            "uses": [
+              {
+                "binding": "iterable_extent",
+                "block": "loop_body.1",
+                "instruction_index": 2,
+                "operation": "Call",
+                "role": "arg:0",
+                "source_value_id": 7,
+                "tensor_operation": "extent"
+              },
+              {
+                "binding": "iterable",
+                "block": "loop_body.2",
+                "instruction_index": 0,
+                "operation": "GetElementPtr",
+                "role": "arg:0"
+              }
+            ],
+            "value_id": 7
+          },
+          {
+            "accounting": {
+              "iterable_element_dtype": "float64",
+              "iterable_target_value_id": 3
+            },
+            "dtype": "float64",
+            "shape": [],
+            "uses": [
+              {
+                "binding": "iterable_extent",
+                "block": "loop_exit",
+                "instruction_index": 1,
+                "operation": "Call",
+                "role": "arg:0",
+                "source_value_id": 8,
+                "tensor_operation": "extent"
+              },
+              {
+                "binding": "iterable",
+                "block": "loop_body.1",
+                "instruction_index": 0,
+                "operation": "GetElementPtr",
+                "role": "arg:0"
+              }
+            ],
+            "value_id": 8
+          },
+          {
+            "accounting": {
+              "iterable_element_dtype": "float64",
+              "iterable_target_value_id": 4
+            },
+            "dtype": "float64",
+            "shape": [],
+            "uses": [
+              {
+                "binding": "iterable_extent",
+                "block": "loop_exit.1",
+                "instruction_index": 1,
+                "operation": "Call",
+                "role": "arg:0",
+                "source_value_id": 9,
+                "tensor_operation": "extent"
+              },
+              {
+                "binding": "iterable",
+                "block": "loop_body.3",
+                "instruction_index": 0,
+                "operation": "GetElementPtr",
+                "role": "arg:0"
+              }
+            ],
+            "value_id": 9
+          }
+        ],
+        "unexplained_root_argument_ids": [
+          9,
+          8,
+          6,
+          5,
+          7
+        ],
+        "unresolved_required_source_values": []
+      }
+    },
+    {
+      "qualified_name": "_lower_process_graph_to_compilation._u00003c_locals_u00003e_.rooted_attribute_path",
+      "repository_ssa_complete": false,
+      "root_parameter_accounting": {
+        "complete": false,
+        "missing_lexical_captures": [
+          "root_parameters"
+        ],
+        "missing_used_parameters": [
+          "expression"
+        ],
+        "represented_parameters": [
+          "parts"
+        ],
+        "unresolved_reference_fields": []
+      },
+      "root_semantic_accounting": {
+        "complete": false,
+        "unexplained_root_argument_details": [
+          {
+            "accounting": {},
+            "dtype": null,
+            "shape": [],
+            "uses": [
+              {
+                "binding": "loop_carried",
+                "block": "while_header",
+                "instruction_index": 1,
+                "operation": "Phi",
+                "role": "arg:0"
+              }
+            ],
+            "value_id": 4
+          },
+          {
+            "accounting": {},
+            "dtype": null,
+            "shape": [],
+            "uses": [
+              {
+                "binding": "conditional_result",
+                "block": "if_merge.1",
+                "instruction_index": 0,
+                "operation": "Phi",
+                "role": "arg:1"
+              }
+            ],
+            "value_id": 40
+          }
+        ],
+        "unexplained_root_argument_ids": [
+          4,
+          40
+        ],
+        "unresolved_required_source_values": []
+      }
+    },
+    {
+      "qualified_name": "_lower_process_graph_to_compilation._u00003c_locals_u00003e_.collect_hierarchy_values",
+      "repository_ssa_complete": false,
+      "root_parameter_accounting": {
+        "complete": false,
+        "missing_lexical_captures": [
+          "collect_hierarchy_values",
+          "executable_value_ids"
+        ],
+        "missing_used_parameters": [
+          "closure"
+        ],
+        "represented_parameters": [],
+        "unresolved_reference_fields": []
+      },
+      "root_semantic_accounting": {
+        "complete": true,
+        "unexplained_root_argument_details": [],
+        "unexplained_root_argument_ids": [],
+        "unresolved_required_source_values": []
+      }
+    }
+  ],
+  "actual_pass_seconds": {
+    "source_closure": {
+      "baseline": 133.78,
+      "changed": 105.91
+    },
+    "tensor_callsite_specialization": {
+      "baseline": 581.12,
+      "changed": 185.07
+    }
+  },
+  "microbenchmark_seconds": {
+    "ten_1MiB_lzma_relocations": {
+      "recompression": 0.3268466180006726,
+      "validated_copy": 0.0044949060002181795,
+      "equal_stored_bytes": true
+    },
+    "100000_scalar_dispatches": {
+      "existing": 0.05677790400022786,
+      "exact_type": 0.004015475999949558
+    }
+  },
+  "mapping_audit": {
+    "identity_findings": 0,
+    "unsourced_facts": 21
+  },
+  "environment": {
+    "python": "3.12.14",
+    "cpu_quota_cores": 4,
+    "cgroup_RAM_GiB": 16,
+    "swap": false,
+    "tensor_backend": "pure Python",
+    "worker_budget_GiB": 10,
+    "aggregate_budget_GiB": 10,
+    "reserve_GiB": 2,
+    "elasticity_percent": 75
+  },
+  "final_storage_run": {
+    "status": "deliberately stopped after confirming existing helper failures",
+    "elapsed_seconds": 337.33822212700034,
+    "substage": "topology: extract lexical function graphs",
+    "rss_bytes": 3632181248,
+    "full_bootstrap_storage_speedup_measured": false
+  },
+  "final_focused_checks": {
+    "passed": 229,
+    "existing_optional_torch_failure": 1,
+    "identity_findings": 0
+  }
+}
