@@ -3866,6 +3866,7 @@ def _normalize_lexical_values(
     function_table: FunctionTable,
     lexical_function_bindings: dict[str, Any] | None = None,
     closure_aggregate_kinds: dict[str, str] | None = None,
+    closure_names: Iterable[str] = (),
     method_owner: str | None = None,
     class_field_aggregate_kinds: Mapping[tuple[str, str], str] | None = None,
     class_field_mapping_contracts: Mapping[
@@ -3876,7 +3877,7 @@ def _normalize_lexical_values(
     ] | None = None,
     class_field_classes: Mapping[tuple[str, str], str] | None = None,
     static_parameter_bindings: Mapping[str, Any] | None = None,
-) -> None:
+) -> dict[int, tuple[str, ...]]:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
     AST ingestion intentionally gives every ``Name`` occurrence its own node.
@@ -3941,6 +3942,7 @@ def _normalize_lexical_values(
     # the legacy receipts were keyed by source span.  Site cell -> span.
     return_site_spans: dict[_Ref, tuple[int, int, int, int]] = {}
     parameter_names = set(function_parameter_names(statement))
+    closure_names = frozenset(map(str, closure_names))
     static_parameter_bindings = dict(static_parameter_bindings or {})
     value_class_scope = _source_numeric_scope(
         graph, getattr(statement, "name", "<function>")
@@ -5386,7 +5388,10 @@ def _normalize_lexical_values(
                 producer_id = environment.get(expression.id)
                 if (
                     producer_id is None
-                    and expression.id in (closure_aggregate_kinds or {})
+                    and (
+                        expression.id in closure_names
+                        or expression.id in (closure_aggregate_kinds or {})
+                    )
                 ):
                     producer_id = input_value(
                         expression.id,
@@ -9703,6 +9708,8 @@ def _normalize_lexical_values(
             ]
             graph.roots.append(merge_id)
 
+    return dict(lexical_free_names_by_reference)
+
 
 def normalize_python_attribute_special_cases(graph: Any) -> None:
     """Canonicalize Python attribute loads on a graph already in the table.
@@ -12983,6 +12990,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         ] = True
         function_table.entry(owner).recursive = True
 
+    lexical_free_names_by_function: dict[int, tuple[str, ...]] = {}
     for node_id, reference in function_nodes.items():
         if node_id not in graph.G:
             continue
@@ -13454,13 +13462,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     local_mapping_contracts[
                         (str(local_owner), str(declaration.target.attr))
                     ] = contract
-        _normalize_lexical_values(
+        nested_lexical_free_names = _normalize_lexical_values(
             function_graph,
             normalization_statement,
             definition_static_bindings,
             function_table,
             lexical_functions_by_owner.get(int(reference.address), {}),
             closure_aggregate_kinds(node_id),
+            lexical_free_names_by_function.get(int(reference.address), ()),
             method_owner=method_owners.get(node_id),
             class_field_aggregate_kinds=class_field_aggregate_kinds,
             class_field_mapping_contracts=local_mapping_contracts,
@@ -13468,6 +13477,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             class_field_classes=class_field_classes,
             static_parameter_bindings=static_parameter_bindings,
         )
+        lexical_free_names_by_function.update(nested_lexical_free_names)
         generator_yields = tuple(
             node_id
             for node_id, node_data in function_graph.G.nodes(data=True)

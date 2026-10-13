@@ -4451,6 +4451,66 @@ def _reduce_importable_cached_property(
     )
 
 
+def _resolve_qualified_cached_property_function(
+    module_name: str, owner_path: str, attribute_name: str,
+) -> Any:
+    """Resolve the implementation owned by one import-owned descriptor."""
+
+    descriptor = _resolve_qualified_module_attribute(
+        module_name, owner_path, attribute_name,
+    )
+    if not isinstance(descriptor, functools.cached_property):
+        raise pickle.UnpicklingError(
+            "import-owned cached-property slot no longer holds its descriptor: "
+            f"{module_name}.{owner_path}.{attribute_name}"
+        )
+    return descriptor.func
+
+
+def _reduce_importable_cached_property_function(
+    function: types.FunctionType,
+) -> tuple[Any, tuple[str, str, str]] | type(NotImplemented):
+    """Name a cached property's hidden function by its declaring slot.
+
+    Source pursuit can retain ``descriptor.func`` as a static Python value.
+    Its qualified name names the descriptor (for example ``Graph.nodes``),
+    not a module attribute containing the hidden function, so stock pickle's
+    global lookup correctly refuses it.  The declaring class slot is already
+    the checkpoint identity used for the descriptor itself; retain that same
+    identity and select its function only after import on the worker side.
+    """
+
+    module_name = str(function.__module__)
+    parts = str(function.__qualname__).split(".")
+    if len(parts) < 2 or "<locals>" in parts:
+        return NotImplemented
+    try:
+        owner: Any = importlib.import_module(module_name)
+        for component in parts[:-1]:
+            owner = getattr(owner, component)
+        descriptor = vars(owner).get(parts[-1])
+    except (AttributeError, ImportError, TypeError):
+        return NotImplemented
+    if not (
+        isinstance(descriptor, functools.cached_property)
+        and descriptor.func is function
+    ):
+        return NotImplemented
+    return (
+        _resolve_qualified_cached_property_function,
+        (module_name, ".".join(parts[:-1]), parts[-1]),
+    )
+
+
+class _ResolvedProcessGraphPickler(pickle.Pickler):
+    """Checkpoint pickler for import-owned Python implementation objects."""
+
+    def reducer_override(self, value: Any) -> Any:
+        if isinstance(value, types.FunctionType):
+            return _reduce_importable_cached_property_function(value)
+        return NotImplemented
+
+
 def _reduce_import_owned_context_var(
     variable: contextvars.ContextVar,
 ) -> tuple[Any, tuple[str, str, str]]:
@@ -4506,7 +4566,7 @@ def _dump_resolved_process_graph(graph: Any, stream: Any) -> None:
         _new_rlock,
     )
 
-    pickler = pickle.Pickler(stream, protocol=5)
+    pickler = _ResolvedProcessGraphPickler(stream, protocol=5)
     pickler.dispatch_table = copyreg.dispatch_table.copy()
     pickler.dispatch_table[types.ModuleType] = lambda module: (
         importlib.import_module,

@@ -118,6 +118,20 @@ def test_resolved_graph_pickle_retains_import_owned_cached_property_identity():
     assert restored["nodes_descriptor"] is nx.Graph.nodes
 
 
+def test_resolved_graph_pickle_retains_cached_property_function_identity():
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+
+    serialized = io.BytesIO()
+    _dump_resolved_process_graph(
+        {"nodes_function": nx.Graph.nodes.func}, serialized,
+    )
+
+    restored = pickle.loads(serialized.getvalue())
+    assert restored["nodes_function"] is nx.Graph.nodes.func
+
+
 def test_resolved_graph_pickle_retains_import_owned_context_var_identity():
     from src.compiler.identity_concordance import _ACTIVE_IDENTITY_BOOK
     from src.compiler.project_compilation_product import (
@@ -2242,6 +2256,44 @@ def outer(value):
             data.get("type") in {"Nonlocal", "Global"}
             for _node_id, data in candidate.G.nodes(data=True)
         )
+
+
+def test_nested_comprehension_retains_nonaggregate_closure_iterable():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def outer(source):
+    function_table = source
+
+    def collect():
+        return {
+            entry: entry
+            for entry in function_table
+            if entry is not None
+        }
+
+    return collect()
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    executable = graph.function_table.entry("collect").graph.G
+    closure_id = next(
+        node_id
+        for node_id, data in executable.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name")
+        == "function_table"
+        and (data.get("attributes") or {}).get("binding_kind") == "closure"
+    )
+    loop = next(
+        data
+        for _node_id, data in executable.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.comprehension)
+    )
+    assert (closure_id, "iter") in loop["parents"]
 
 
 def test_delete_lowers_names_away_and_preserves_object_effects():
