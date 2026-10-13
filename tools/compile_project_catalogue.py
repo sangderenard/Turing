@@ -184,6 +184,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--entry", action="append", default=[])
     parser.add_argument("--partitioned-source", action="store_true",
                         help="plan source once, archive bounded SCC inputs, then lower in isolated workers")
+    parser.add_argument(
+        "--source-schedule", choices=("auto", "serial", "parallel"),
+        default="auto",
+        help="partitioned-source worker scheduling (default: auto from resolved plan)",
+    )
     parser.add_argument("--interface-tiles", action="store_true",
                         help="partitioned-source: compile native objects and import bodyless callee interfaces")
     parser.add_argument("--max-tile-nodes", type=int, default=4096,
@@ -218,7 +223,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--max-total-gb", type=float, default=None,
-        help="aggregate worker-RSS admission ceiling in GiB",
+        help=(
+            "aggregate worker-RSS ceiling; partitioned-source defaults to "
+            "an adaptive maximum of 10 GiB"
+        ),
+    )
+    parser.add_argument(
+        "--min-total-gb", type=float, default=2.0,
+        help="minimum adaptive worker-RSS admission ceiling (default: 2 GiB)",
+    )
+    parser.add_argument(
+        "--system-reserve-gb", type=float, default=2.0,
+        help="physical RAM kept available outside compiler workers (default: 2 GiB)",
     )
     parser.add_argument(
         "--worker-reserve-gb", type=float, default=4.0,
@@ -360,11 +376,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.source.read_text(encoding="utf-8"), arguments.output,
             entrypoint=arguments.entry[0] if arguments.entry else None,
             extraction_contract=arguments.extraction_contract,
-            jobs=arguments.jobs if arguments.jobs is not None else 2,
+            jobs=arguments.jobs,
+            schedule_mode=arguments.source_schedule,
             max_unit_source_nodes=arguments.max_tile_nodes,
             interface_tiles=arguments.interface_tiles,
-            max_total_resident_bytes=(None if arguments.max_total_gb is None
-                                      else int(arguments.max_total_gb * 1024 ** 3)),
+            max_total_resident_bytes=(
+                10 * 1024 ** 3 if arguments.max_total_gb is None
+                else int(arguments.max_total_gb * 1024 ** 3)
+            ),
+            minimum_total_resident_bytes=int(arguments.min_total_gb * 1024 ** 3),
+            system_reserve_bytes=int(arguments.system_reserve_gb * 1024 ** 3),
+            adaptive_memory_ceiling=True,
             worker_resident_reservation_bytes=int(arguments.worker_reserve_gb * 1024 ** 3),
             max_worker_memory_bytes=(None if arguments.max_worker_gb == 0
                                      else int(arguments.max_worker_gb * 1024 ** 3)),

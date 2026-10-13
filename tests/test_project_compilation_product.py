@@ -9,6 +9,8 @@ import pickle
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import tools.compile_project_catalogue as compile_project_catalogue
 from src.compiler.glsl_deployment_strategy import (
     CompilationSubdivisionRequired,
@@ -21,6 +23,7 @@ from src.compiler.precompile_to_ssa import (
 )
 
 from src.compiler.project_compilation_product import (
+    adaptive_worker_memory_ceiling,
     compilation_creep_frontier,
     compile_project_call,
     compile_project_bootstrap_creep,
@@ -43,6 +46,7 @@ from src.compiler.project_compilation_product import (
     partition_authored_source,
     open_project_compilation_product,
     publish_process_graph_subdivision_plan,
+    process_graph_plan_parallel_width,
     ready_process_graph_unit_indices,
     resident_bytes,
     source_region_integral_accounting,
@@ -1029,6 +1033,51 @@ def test_process_graph_workers_wait_for_terminal_dependencies_not_success():
     records[1] = {"status": "verified"}
     records[2] = {"status": "failed"}
     assert ready_process_graph_unit_indices([3], units, records) == (3,)
+
+
+def test_auto_schedule_uses_real_resolved_plan_width():
+    units = (
+        {"dependency_units": []},
+        {"dependency_units": []},
+        {"dependency_units": [0]},
+        {"dependency_units": [1]},
+        {"dependency_units": [2, 3]},
+    )
+
+    assert process_graph_plan_parallel_width(units) == 2
+    assert process_graph_plan_parallel_width((
+        {"dependency_units": []},
+        {"dependency_units": [0]},
+        {"dependency_units": [1]},
+    )) == 1
+
+
+def test_adaptive_worker_cap_tracks_availability_between_floor_and_ceiling():
+    gib = 1 << 30
+    options = {
+        "configured_maximum": 10 * gib,
+        "configured_minimum": 2 * gib,
+        "system_reserve": 2 * gib,
+        "measured_worker_bytes": 1 * gib,
+    }
+
+    assert adaptive_worker_memory_ceiling(
+        **options, available_memory_bytes=9 * gib,
+    ) == 8 * gib
+    assert adaptive_worker_memory_ceiling(
+        **options, available_memory_bytes=1 * gib,
+    ) == 2 * gib
+    assert adaptive_worker_memory_ceiling(
+        **options, available_memory_bytes=20 * gib,
+    ) == 10 * gib
+    with pytest.raises(ValueError, match="maximum is below its minimum"):
+        adaptive_worker_memory_ceiling(
+            configured_maximum=1 * gib,
+            configured_minimum=2 * gib,
+            system_reserve=2 * gib,
+            measured_worker_bytes=0,
+            available_memory_bytes=20 * gib,
+        )
 
 
 def test_structured_refusals_publish_name_based_deterministic_integrals(tmp_path):

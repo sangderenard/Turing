@@ -4789,10 +4789,14 @@ def publish_resolved_process_graph_inputs(
 
 def compile_partitioned_source(
     source: str, directory: str | Path, *, entrypoint: str | None = None,
-    jobs: int = 2, extraction_contract: Any = None,
+    jobs: int | None = None, schedule_mode: str = "parallel",
+    extraction_contract: Any = None,
     python_bindings: Mapping[str, Any] | None = None,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_total_resident_bytes: int | None = None,
+    minimum_total_resident_bytes: int | None = None,
+    system_reserve_bytes: int = 0,
+    adaptive_memory_ceiling: bool = False,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
     max_unit_source_nodes: int = 4096,
     interface_tiles: bool = False,
@@ -4880,8 +4884,12 @@ def compile_partitioned_source(
         progress({"stage": "source_plan_released", "unit_count": len(plans[0]["units"])})
     return compile_resolved_process_graph_plan(
         graph_path, plan_path, root / "product", jobs=jobs,
+        schedule_mode=schedule_mode,
         worker_resident_reservation_bytes=worker_resident_reservation_bytes,
         max_total_resident_bytes=max_total_resident_bytes,
+        minimum_total_resident_bytes=minimum_total_resident_bytes,
+        system_reserve_bytes=system_reserve_bytes,
+        adaptive_memory_ceiling=adaptive_memory_ceiling,
         max_worker_memory_bytes=max_worker_memory_bytes,
         progress=progress,
     )
@@ -6555,6 +6563,70 @@ def process_memory_bytes(process_id: int) -> tuple[int, int] | None:
     )
 
 
+def system_available_memory_bytes() -> int | None:
+    """Return immediately available physical memory without another package."""
+
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx(
+            ctypes.byref(status)
+        ):
+            return None
+        return int(status.ullAvailPhys)
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.is_file():
+        return None
+    for line in meminfo.read_text(encoding="ascii", errors="replace").splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) * 1024
+    return None
+
+
+def adaptive_worker_memory_ceiling(
+    *, configured_maximum: int | None, configured_minimum: int,
+    system_reserve: int, measured_worker_bytes: int,
+    available_memory_bytes: int | None = None,
+) -> int:
+    """Bound new worker admission by live availability, never below minimum."""
+
+    available = (
+        system_available_memory_bytes()
+        if available_memory_bytes is None
+        else int(available_memory_bytes)
+    )
+    minimum = int(configured_minimum)
+    if minimum < 1 or int(system_reserve) < 0:
+        raise ValueError("adaptive memory minimum/reserve is invalid")
+    if configured_maximum is not None and int(configured_maximum) < minimum:
+        raise ValueError("adaptive memory maximum is below its minimum")
+    if available is None:
+        return minimum if configured_maximum is None else int(configured_maximum)
+    available_capacity = max(
+        0, int(available) + int(measured_worker_bytes) - int(system_reserve),
+    )
+    ceiling = max(minimum, available_capacity)
+    if configured_maximum is not None:
+        ceiling = min(ceiling, int(configured_maximum))
+    return ceiling
+
+
 def resident_bytes(process_id: int) -> int | None:
     measured = process_memory_bytes(process_id)
     return None if measured is None else measured[0]
@@ -6753,6 +6825,31 @@ def ready_process_graph_unit_indices(
     return tuple(ready)
 
 
+def process_graph_plan_parallel_width(
+    units: Sequence[Mapping[str, Any]],
+) -> int:
+    """Return the widest dependency-ready wave in the resolved SCC plan."""
+
+    pending = list(range(len(units)))
+    completed: set[int] = set()
+    maximum = 0
+    while pending:
+        ready = tuple(
+            index for index in pending
+            if set(map(int, units[index].get("dependency_units") or ()))
+            <= completed
+        )
+        if not ready:
+            raise ValueError(
+                "resolved ProcessGraph unit plan contains a dependency cycle"
+            )
+        maximum = max(maximum, len(ready))
+        ready_set = set(ready)
+        pending = [index for index in pending if index not in ready_set]
+        completed.update(ready_set)
+    return maximum
+
+
 def compile_resolved_process_graph_plan(
     graph_path: str | Path,
     plan_path: str | Path,
@@ -6760,7 +6857,11 @@ def compile_resolved_process_graph_plan(
     *,
     python_executable: str | Path = sys.executable,
     jobs: int | None = None,
+    schedule_mode: str = "parallel",
     max_total_resident_bytes: int | None = None,
+    minimum_total_resident_bytes: int | None = None,
+    system_reserve_bytes: int = 0,
+    adaptive_memory_ceiling: bool = False,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
     worker_environment: Mapping[str, str] | None = None,
@@ -6801,7 +6902,17 @@ def compile_resolved_process_graph_plan(
         del graph
         import gc
         gc.collect()
-    worker_limit = int(jobs or min(4, os.cpu_count() or 1))
+    requested_worker_limit = int(jobs or min(4, os.cpu_count() or 1))
+    selected_schedule_mode = str(schedule_mode).lower()
+    if selected_schedule_mode not in {"auto", "serial", "parallel"}:
+        raise ValueError("resolved plan schedule must be auto, serial, or parallel")
+    plan_parallel_width = process_graph_plan_parallel_width(units)
+    worker_limit = (
+        1 if selected_schedule_mode == "serial"
+        else min(requested_worker_limit, max(1, plan_parallel_width))
+        if selected_schedule_mode == "auto"
+        else requested_worker_limit
+    )
     if worker_limit < 1:
         raise ValueError("resolved plan worker count must be positive")
     reservation = int(worker_resident_reservation_bytes)
@@ -6813,6 +6924,11 @@ def compile_resolved_process_graph_plan(
     )
     if total_limit is not None and total_limit < reservation:
         raise ValueError("resident ceiling cannot admit one worker reservation")
+    minimum_limit = int(minimum_total_resident_bytes or reservation)
+    if minimum_limit < reservation:
+        raise ValueError("adaptive resident minimum cannot admit one worker")
+    if total_limit is not None and minimum_limit > total_limit:
+        raise ValueError("adaptive resident minimum exceeds its maximum")
     worker_memory_budget = (
         None if max_worker_memory_bytes is None
         else int(max_worker_memory_bytes)
@@ -6881,6 +6997,27 @@ def compile_resolved_process_graph_plan(
     ]
     running: dict[int, dict[str, Any]] = {}
     concurrency_peak = 0
+    active_total_limit = total_limit
+    available_memory = None
+    last_available_memory_sample = 0.0
+
+    def refresh_admission_ceiling(measured_total: int) -> None:
+        nonlocal active_total_limit, available_memory
+        nonlocal last_available_memory_sample
+        if not adaptive_memory_ceiling:
+            return
+        now = time.monotonic()
+        if now - last_available_memory_sample < 1.0 and running:
+            return
+        available_memory = system_available_memory_bytes()
+        active_total_limit = adaptive_worker_memory_ceiling(
+            configured_maximum=total_limit,
+            configured_minimum=minimum_limit,
+            system_reserve=int(system_reserve_bytes),
+            measured_worker_bytes=measured_total,
+            available_memory_bytes=available_memory,
+        )
+        last_available_memory_sample = now
 
     def report(stage: str, **details: Any) -> None:
         if progress is not None:
@@ -6918,7 +7055,14 @@ def compile_resolved_process_graph_plan(
             "resolved_process_graph": resolved_path.as_posix(),
             "process_graph_unit_plan": unit_plan_path.as_posix(),
             "worker_jobs": worker_limit,
+            "schedule_mode": selected_schedule_mode,
+            "plan_parallel_width": plan_parallel_width,
             "max_total_resident_bytes": total_limit,
+            "active_total_resident_bytes": active_total_limit,
+            "minimum_total_resident_bytes": minimum_limit,
+            "system_reserve_bytes": int(system_reserve_bytes),
+            "system_available_memory_bytes": available_memory,
+            "adaptive_memory_ceiling": bool(adaptive_memory_ceiling),
             "worker_resident_reservation_bytes": reservation,
             "max_worker_memory_bytes": worker_memory_budget,
             "pending": pending,
@@ -6994,9 +7138,10 @@ def compile_resolved_process_graph_plan(
         measured_total = sum(
             max(reservation, int(state["resident"])) for state in running.values()
         )
+        refresh_admission_ceiling(measured_total)
         while pending and len(running) < worker_limit and (
-            total_limit is None
-            or measured_total + reservation <= total_limit
+            active_total_limit is None
+            or measured_total + reservation <= active_total_limit
         ):
             ready = ready_process_graph_unit_indices(pending, units, records)
             if not ready:
@@ -7073,6 +7218,12 @@ def compile_resolved_process_graph_plan(
         "process_graph_unit_plan": unit_plan_path.as_posix(),
         "process_graph_unit_plan_sha256": _file_sha256(unit_plan_path),
         "worker_jobs": worker_limit,
+        "schedule_mode": selected_schedule_mode,
+        "plan_parallel_width": plan_parallel_width,
+        "adaptive_memory_ceiling": bool(adaptive_memory_ceiling),
+        "max_total_resident_bytes": total_limit,
+        "minimum_total_resident_bytes": minimum_limit,
+        "system_reserve_bytes": int(system_reserve_bytes),
         "concurrent_workers_peak": concurrency_peak,
         "scoped_inputs": list(plan.get("scoped_inputs") or ()),
         "units": completed_records,
@@ -8862,6 +9013,7 @@ __all__ = [
     "ProjectCompilationProduct",
     "SOURCE_REGION_INTEGRAL_SCHEMA",
     "UNIT_ARTIFACT_SCHEMA",
+    "adaptive_worker_memory_ceiling",
     "compile_project_call",
     "compile_project_bootstrap_creep",
     "compile_project_product",
@@ -8881,12 +9033,14 @@ __all__ = [
     "encoded_call_name",
     "native_unit_name",
     "process_memory_bytes",
+    "process_graph_plan_parallel_width",
     "partition_authored_source",
     "publish_process_graph_subdivision_plan",
     "ready_process_graph_unit_indices",
     "open_project_compilation_product",
     "resident_bytes",
     "source_region_integral_accounting",
+    "system_available_memory_bytes",
     "verify_structural_resident_table_integral",
     "verify_project_unit_automatically",
     "verify_project_units_automatically",

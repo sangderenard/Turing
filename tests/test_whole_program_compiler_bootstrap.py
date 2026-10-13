@@ -62,7 +62,7 @@ def test_build_delegates_outer_partition_to_public_partitioned_compiler(
     def compile_partitioned(source, entrypoint, **kwargs):
         observed.append((source, entrypoint, kwargs))
         manifest = (
-            Path(kwargs["partitioned_directory"])
+            Path(kwargs["compilation_directory"])
             / "product" / "manifest.json"
         )
         manifest.parent.mkdir(parents=True)
@@ -83,7 +83,8 @@ def test_build_delegates_outer_partition_to_public_partitioned_compiler(
     assert options["source_module"].endswith(".aot_compile")
     assert options["python_package"].endswith(".accelerator_backends")
     assert options["partitioned_options"]["jobs"] == 2
-    assert Path(options["partitioned_directory"]).name == product.boundary["version"]
+    assert options["source_compilation"] == "auto"
+    assert Path(options["compilation_directory"]).name == product.boundary["version"]
     assert product.product["status"] == "sealed"
     assert product.manifest.is_file()
 
@@ -101,7 +102,7 @@ def test_build_uses_requested_bootstrap_memory_contract_by_default(
     def compile_partitioned(_source, _entrypoint, **kwargs):
         observed.update(kwargs["partitioned_options"])
         manifest = (
-            Path(kwargs["partitioned_directory"])
+            Path(kwargs["compilation_directory"])
             / "product" / "manifest.json"
         )
         manifest.parent.mkdir(parents=True)
@@ -116,6 +117,9 @@ def test_build_uses_requested_bootstrap_memory_contract_by_default(
     assert observed["max_total_resident_bytes"] == 10 << 30
     assert observed["max_worker_memory_bytes"] == 10 << 30
     assert observed["worker_resident_reservation_bytes"] == 2 << 30
+    assert observed["minimum_total_resident_bytes"] == 2 << 30
+    assert observed["system_reserve_bytes"] == 2 << 30
+    assert observed["adaptive_memory_ceiling"] is True
     assert "jobs" not in observed
 
 

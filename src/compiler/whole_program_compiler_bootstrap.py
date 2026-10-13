@@ -203,7 +203,11 @@ def build_whole_program_compiler(
     directory: str | Path,
     *,
     jobs: int | None = None,
+    source_compilation: str = "auto",
     max_total_resident_bytes: int | None = 10 << 30,
+    minimum_total_resident_bytes: int = 2 << 30,
+    system_reserve_bytes: int = 2 << 30,
+    adaptive_memory_ceiling: bool = True,
     worker_resident_reservation_bytes: int = 2 << 30,
     max_worker_memory_bytes: int | None = 10 << 30,
     progress: Callable[[str], None] | None = None,
@@ -232,6 +236,9 @@ def build_whole_program_compiler(
     source_module = ".".join(source_path.relative_to(repository).with_suffix("").parts)
     partitioned_options = {
         "max_total_resident_bytes": max_total_resident_bytes,
+        "minimum_total_resident_bytes": minimum_total_resident_bytes,
+        "system_reserve_bytes": system_reserve_bytes,
+        "adaptive_memory_ceiling": adaptive_memory_ceiling,
         "worker_resident_reservation_bytes": worker_resident_reservation_bytes,
         "max_worker_memory_bytes": max_worker_memory_bytes,
     }
@@ -244,7 +251,8 @@ def build_whole_program_compiler(
         python_package=source_module.rpartition(".")[0],
         extraction_contract=DEFAULT_PROJECT_EXTRACTION_CONTRACT,
         name="compiler_bootstrap",
-        partitioned_directory=product_root,
+        source_compilation=source_compilation,
+        compilation_directory=product_root,
         partitioned_options=partitioned_options,
         progress=progress,
     )

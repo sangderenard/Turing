@@ -45374,10 +45374,11 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     headless runs do not import it. The measured telemetry is unchanged.
 
     ``source_compilation="serial"`` lowers the complete resolved graph in the
-    current process. ``source_compilation="parallel"`` requires
+    current process. ``source_compilation="parallel"`` or ``"auto"`` requires
     ``compilation_directory=`` and cuts that same complete resolved graph into
-    dependency-planned worker units. In both modes this function remains the
-    sole source compiler and produces repository SSA.
+    dependency-planned worker units. Auto derives useful concurrency from the
+    resolved unit DAG. In every mode this function remains the sole source
+    compiler and produces repository SSA.
     """
     _collect_profile = kwargs.pop("compile_profile", True)
     _progress_renderer = kwargs.pop("progress_renderer", None)
@@ -45388,9 +45389,9 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     partitioned_options = kwargs.pop("partitioned_options", {})
     if source_compilation is not None:
         source_compilation = str(source_compilation).lower()
-        if source_compilation not in {"serial", "parallel"}:
+        if source_compilation not in {"auto", "serial", "parallel"}:
             raise ValueError(
-                "source_compilation must be 'serial' or 'parallel'"
+                "source_compilation must be 'auto', 'serial', or 'parallel'"
             )
         if source_compilation == "serial":
             if (
@@ -45416,11 +45417,22 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             )
             if partitioned_directory is None:
                 raise ValueError(
-                    "parallel source compilation requires compilation_directory"
+                    f"{source_compilation} source compilation requires "
+                    "compilation_directory"
                 )
+            partitioned_options = dict(partitioned_options)
+            declared_schedule = partitioned_options.get("schedule_mode")
+            if (
+                declared_schedule is not None
+                and str(declared_schedule).lower() != source_compilation
+            ):
+                raise ValueError(
+                    "source_compilation conflicts with partitioned schedule_mode"
+                )
+            partitioned_options["schedule_mode"] = source_compilation
     elif compilation_directory is not None:
         raise ValueError(
-            "compilation_directory requires source_compilation='parallel'"
+            "compilation_directory requires source_compilation='auto' or 'parallel'"
         )
     if partitioned_directory is not None:
         from .project_compilation_product import compile_partitioned_source, load_partitioned_source_interfaces
@@ -45452,9 +45464,16 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
         if hasattr(module, "metadata"):
             module.metadata["source_compilation"] = {
                 "schema": "turing.source-compilation-front-end.v1",
-                "mode": "parallel",
+                "mode": str(manifest.get("schedule_mode") or "parallel"),
+                "effective_mode": (
+                    "serial" if int(manifest.get("worker_jobs") or 1) == 1
+                    else "parallel"
+                ),
                 "partition_point": "resolved-process-graph",
                 "unit_count": len(manifest.get("units") or ()),
+                "plan_parallel_width": int(
+                    manifest.get("plan_parallel_width") or 1
+                ),
             }
         return result
     if partitioned_options:

@@ -1,3 +1,25 @@
+2026-10-13 AUTOMATIC RESOLVED-GRAPH SCHEDULING AND ADMISSION (CURRENT WORKTREE):
+The canonical source compiler accepts `source_compilation="auto"` alongside
+serial and parallel operation.  It still resolves the complete ProcessGraph
+before making any scheduling decision.  Auto measures the widest dependency-
+ready wave in that resolved SCC/unit DAG, then admits at most that many workers
+and never exceeds the explicit worker maximum.  A real three-unit compiler
+repro measured width two, ran two workers concurrently, and reproduced the
+native result.
+
+The partitioned compiler can now lower its aggregate worker admission ceiling
+from a configured maximum as physical RAM becomes unavailable.  The bootstrap
+CLI defaults to a 10 GiB maximum, 2 GiB minimum, and 2 GiB system reserve.
+Only new-worker admission changes; a running worker is never terminated.  The
+selected schedule, graph width, active ceiling, and sampled availability are
+published in progress receipts.  The disposable `build/compiler-whole-program`
+and `build/compiler-partitions` attempt trees were removed;
+`build/compiler_foundations` was preserved.  The universal frontend gate passes
+22 tests in 158.34 seconds, the whole-bootstrap gate passes 7 tests in 51.80
+seconds, focused scheduler/default tests pass 4 tests, and syntax, CLI-help, and
+diff checks pass.  No full bootstrap or orbital compile was launched, and no
+existing Python process was inspected or disturbed.
+
 2026-10-13 CANONICAL PARTITIONED BOOTSTRAP (CURRENT WORKTREE):
 The whole-program bootstrap no longer calls the separate project bootstrap-
 creep coordinator.  It submits the authored

@@ -28,8 +28,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="stop after publishing the resolved compilation-unit plan",
     )
-    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument(
+        "--jobs", type=int, default=None,
+        help="maximum workers; auto mode also limits this to resolved-plan width",
+    )
+    parser.add_argument(
+        "--source-compilation", choices=("auto", "parallel"), default="auto",
+        help="resolved-graph unit scheduling policy (default: auto)",
+    )
     parser.add_argument("--max-total-gb", type=float, default=10.0)
+    parser.add_argument(
+        "--min-total-gb", type=float, default=2.0,
+        help="minimum adaptive aggregate worker cap (default: 2 GiB)",
+    )
+    parser.add_argument(
+        "--system-reserve-gb", type=float, default=2.0,
+        help="RAM left available to the rest of the system (default: 2 GiB)",
+    )
     parser.add_argument("--worker-reserve-gb", type=float, default=2.0)
     parser.add_argument(
         "--max-worker-gb", type=float, default=10.0,
@@ -68,10 +83,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         product = build_whole_program_compiler(
             arguments.output,
             jobs=arguments.jobs,
+            source_compilation=arguments.source_compilation,
             max_total_resident_bytes=(
                 None if arguments.max_total_gb is None
                 else int(arguments.max_total_gb * (1 << 30))
             ),
+            minimum_total_resident_bytes=int(
+                arguments.min_total_gb * (1 << 30)
+            ),
+            system_reserve_bytes=int(
+                arguments.system_reserve_gb * (1 << 30)
+            ),
+            adaptive_memory_ceiling=True,
             worker_resident_reservation_bytes=int(
                 arguments.worker_reserve_gb * (1 << 30)
             ),

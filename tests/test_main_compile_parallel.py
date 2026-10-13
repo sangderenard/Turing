@@ -81,6 +81,35 @@ def test_main_native_units_use_existing_record_boundaries(tmp_path):
     assert_native_outputs(tmp_path, module, outputs, exports, feeds, [13.0])
 
 
+def test_auto_frontend_selects_real_resolved_graph_width(tmp_path):
+    module, outputs, exports = lower_ast_source_to_ssa(
+        RECORD_SOURCE,
+        "root",
+        extraction_contract=record_contract(),
+        source_compilation="auto",
+        compilation_directory=tmp_path / "auto-units",
+        partitioned_options={
+            "jobs": 4,
+            "max_unit_source_nodes": 128,
+            "worker_resident_reservation_bytes": 256 * 1024 ** 2,
+            "max_worker_memory_bytes": 2 * 1024 ** 3,
+        },
+        progress=lambda _message: None,
+    )
+
+    manifest = module.metadata["partitioned_source_product"]
+    assert manifest["schedule_mode"] == "auto"
+    assert manifest["plan_parallel_width"] == 2
+    assert manifest["worker_jobs"] == 2
+    assert manifest["concurrent_workers_peak"] == 2
+    feeds = {
+        int(value_id): np.array({"x": 2.0, "y": 3.0}[field.name])
+        for record in module.record_tables[exports[0]].records.values()
+        for field in record.fields for value_id in field.value_ids
+    }
+    assert_native_outputs(tmp_path, module, outputs, exports, feeds, [13.0])
+
+
 @pytest.mark.parametrize("nested", [False, True])
 def test_multi_result_interfaces_use_the_existing_projection_graph(tmp_path, nested):
     source = ("def leaf(x):\n    return x * 2.0, (x * 3.0, x * 4.0)\ndef root(x):\n    a, b = leaf(x)\n    return a + b[0] + b[1]\n" if nested else
@@ -188,8 +217,12 @@ def test_partitioned_public_entry_preserves_module_import_identity(
     assert observed["source_options"]["python_package"] == "package"
 
 
-def test_universal_frontend_parallel_uses_total_graph_partitioning(
-    tmp_path, monkeypatch,
+@pytest.mark.parametrize(
+    ("requested_mode", "worker_jobs", "effective_mode"),
+    (("parallel", 3, "parallel"), ("auto", 1, "serial")),
+)
+def test_universal_frontend_uses_total_graph_partitioning(
+    tmp_path, monkeypatch, requested_mode, worker_jobs, effective_mode,
 ):
     import src.compiler.project_compilation_product as products
 
@@ -201,7 +234,12 @@ def test_universal_frontend_parallel_uses_total_graph_partitioning(
             "directory": Path(directory),
             "options": options,
         })
-        return {"status": "sealed", "route": "resolved-graph-units"}
+        return {
+            "status": "sealed", "route": "resolved-graph-units",
+            "schedule_mode": options["schedule_mode"],
+            "worker_jobs": worker_jobs,
+            "plan_parallel_width": 3,
+        }
 
     monkeypatch.setattr(products, "compile_partitioned_source", compile_partitioned)
 
@@ -215,19 +253,22 @@ def test_universal_frontend_parallel_uses_total_graph_partitioning(
     result = lower_ast_source_to_ssa(
         "def root(value):\n    return value + 1\n",
         "root",
-        source_compilation="parallel",
+        source_compilation=requested_mode,
         compilation_directory=tmp_path / "compile",
         partitioned_options={"jobs": 3},
     )
 
     assert result[0].metadata["source_compilation"] == {
         "schema": "turing.source-compilation-front-end.v1",
-        "mode": "parallel",
+        "mode": requested_mode,
+        "effective_mode": effective_mode,
         "partition_point": "resolved-process-graph",
         "unit_count": 0,
+        "plan_parallel_width": 3,
     }
     assert observed["directory"] == tmp_path / "compile"
     assert observed["options"]["jobs"] == 3
+    assert observed["options"]["schedule_mode"] == requested_mode
     assert observed["options"]["interface_tiles"] is True
 
 
