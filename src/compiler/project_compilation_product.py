@@ -4504,6 +4504,14 @@ class _ResolvedProcessGraphPickler(pickle.Pickler):
     """Checkpoint pickler for import-owned Python implementation objects."""
 
     def reducer_override(self, value: Any) -> Any:
+        if isinstance(value, io.TextIOBase):
+            # A live terminal compositor can replace sys.stdout/stderr with
+            # a TextIOBase proxy (Rich FileProxy owns ConsoleThreadLocals).
+            # The standard-stream slot is the input identity; checkpointing
+            # its current implementation would capture the compiler's terminal
+            # in the submitted program. Apply the existing import-owned stream
+            # contract to the entire interface.
+            return _reduce_import_owned_text_stream(value)
         if isinstance(value, type):
             # Let pickle keep every normally importable class.  Some CPython
             # implementation classes declare a nominal slot that does not
@@ -4560,11 +4568,11 @@ def _reduce_import_owned_module_slot(
 
 
 def _reduce_import_owned_text_stream(
-    stream: io.TextIOWrapper,
+    stream: io.TextIOBase,
 ) -> tuple[Any, tuple[str, str, str]]:
     """Resolve standard process streams from their authoritative module slot."""
 
-    return _reduce_import_owned_module_slot(stream, "TextIOWrapper")
+    return _reduce_import_owned_module_slot(stream, "text stream")
 
 
 def _restore_code_object(payload: bytes) -> types.CodeType:
@@ -4806,6 +4814,143 @@ def publish_resolved_process_graph_inputs(
     return result
 
 
+class SourceListCompilationError(RuntimeError):
+    """All independent submissions were attempted before reporting failures."""
+
+    def __init__(self, failures, results):
+        self.failures, self.results = tuple(failures), tuple(results)
+        super().__init__("source schedule failed: " + "; ".join(
+            f"{item['label']}: {item['type']}: {item['message']}" for item in failures))
+
+
+def compile_source_submissions(submissions, *, mode, options=None, progress_bars=None,
+                               progress_renderer=None, progress_state_sink=None):
+    """The public compiler's explicit list schedule; inner lowering uses auto.
+
+    Requests retain the caller's source, entry, bindings, contract and schedule.
+    No discovery or new source cut is performed here. Ordinary requests return
+    repository SSA; authored-project requests use the existing accepted-product
+    publisher, which itself lowers through the same public source compiler.
+    """
+    import traceback
+    from .graph_work import CompilerWorkPolicy, bounded_compiler_work, compiler_work_policy
+    from .shell_telemetry import (CompileProgress, compile_progress,
+                                  _ACTIVE_COMPILE_PROGRESS)
+    from .work_contract import active_contract, scoped_work_contract
+    from .fortran_c_shell import lower_ast_source_to_ssa
+
+    requests = tuple(dict(request) for request in submissions)
+    names = [str(request.get("label") or request.get("entrypoint") or index)
+             for index, request in enumerate(requests)]
+    if len(names) != len(set(names)):
+        raise ValueError("source submission labels must be unique")
+    opts = dict(options or {})
+    if requests and all(request.get("authored_call") for request in requests):
+        # This is a supplied authored-call schedule, not an auto partition.
+        # Use the existing project publisher, native gate and dependency links.
+        paths = {str(Path(request["source_path"]).resolve()) for request in requests}
+        roots = {str(Path(request["product_directory"]).resolve()) for request in requests}
+        if len(paths) != 1 or len(roots) != 1:
+            raise ValueError("an authored-call product schedule must name one source and product root")
+        display = compile_progress(progress_bars, collect_profile=True,
+                                   renderer=progress_renderer, state_sink=progress_state_sink)
+        allowed = {"max_total_resident_bytes", "max_worker_memory_bytes", "worker_resident_reservation_bytes",
+                   "minimum_total_resident_bytes", "system_reserve_bytes", "adaptive_memory_ceiling",
+                   "worker_elastic_available_percent", "thread_working_bytes"}
+        with display:
+            manifest = compile_project_product(next(iter(paths)), next(iter(roots)),
+                entries=names, expand_entry_dependencies=False,
+                schedule_predecessors={name: tuple(request.get("after", ()))
+                                       for name, request in zip(names, requests)},
+                jobs=1 if mode == "serial" else opts.get("jobs"),
+                extraction_contract=requests[0].get("extraction_contract", DEFAULT_PROJECT_EXTRACTION_CONTRACT),
+                emit_native=True, progress=display.compilation_event,
+                **{key: value for key, value in opts.items() if key in allowed})
+        return list(manifest["units"])
+    contract = active_contract()
+    policy = CompilerWorkPolicy(mode=mode, jobs=opts.get("jobs"),
+        memory_bytes=opts.get("max_total_resident_bytes", contract.memory_budget_bytes),
+        reserve_bytes=opts.get("system_reserve_bytes", contract.memory_system_reserve_bytes),
+        working_bytes=opts.get("worker_resident_reservation_bytes", 2 << 30))
+    inner_policy = CompilerWorkPolicy(memory_bytes=policy.memory_bytes,
+        reserve_bytes=policy.reserve_bytes,
+        working_bytes=opts.get("thread_working_bytes", 128 << 20))
+    results, failures = [None] * len(requests), []
+    display = compile_progress(progress_bars, collect_profile=True,
+                               renderer=progress_renderer, state_sink=progress_state_sink)
+
+    def work(index):
+        request, label = requests[index], names[index]
+        started = time.monotonic()
+        thread_key = f"thread-{threading.get_ident()}"
+        def state_sink(state):
+            display.worker(thread_key, label=label, status=state["status"],
+                stage_number=state["stage_number"], stage_count=state["stage_count"],
+                stage_label=state["stage_label"], substage=state.get("substage", ""),
+                stages=state.get("stages", ()), elapsed_seconds=time.monotonic() - started,
+                rss_bytes=state.get("rss_bytes", 0))
+            for lane in state.get("workers", ()):
+                display.worker(f"source-{index}:{lane['key']}",
+                    **{key: value for key, value in lane.items() if key != "key"})
+        token = _ACTIVE_COMPILE_PROGRESS.set(None)
+        child = CompileProgress(enabled=False, collect_profile=True, state_sink=state_sink)
+        child.owner_display = display
+        worker_contract = dataclasses.replace(contract,
+            memory_budget_bytes=opts.get("max_worker_memory_bytes", contract.memory_budget_bytes),
+            memory_system_reserve_bytes=policy.reserve_bytes,
+            memory_elastic_available_percent=opts.get("worker_elastic_available_percent", contract.memory_elastic_available_percent))
+        worker_policy = dataclasses.replace(inner_policy, stats={})
+        try:
+            with child, compiler_work_policy(worker_policy), scoped_work_contract(worker_contract):
+                if request.get("authored_call"):
+                    result = compile_project_call(
+                        request["source_path"], request["entrypoint"], request["directory"],
+                        extraction_contract=request.get("extraction_contract", DEFAULT_PROJECT_EXTRACTION_CONTRACT),
+                        progress=lambda message: display.log(f"[{label}] {message}"),
+                        progress_bars=False,
+                    )
+                else:
+                    source = (request["source"] if "source" in request else
+                              Path(request["source_path"]).read_text(encoding="utf-8"))
+                    kwargs = dict(request.get("options") or {})
+                    inner_progress = kwargs.pop("progress", None)
+                    kwargs["progress"] = (lambda message: display.log(f"[{label}] {message}")) if inner_progress is None else inner_progress
+                    kwargs["progress_bars"] = False
+                    result = lower_ast_source_to_ssa(source, request.get("entrypoint"),
+                                                    source_compilation="auto", **kwargs)
+            module = result[0] if isinstance(result, tuple) else result
+            if hasattr(module, "metadata"):
+                module.metadata["compile_profile"] = child.summary()
+            return result, None
+        except Exception as error:
+            failure = {"label": label, "type": type(error).__name__,
+                       "message": str(error), "traceback": traceback.format_exc()}
+            display.log(f"[{label}] FAILED: {failure['type']}: {failure['message']}")
+            display.log(failure["traceback"])
+            return None, failure
+        finally:
+            _ACTIVE_COMPILE_PROGRESS.reset(token)
+
+    def publish(_ordinal, index, outcome):
+        result, failure = outcome
+        results[index] = result
+        if failure is not None:
+            failures.append(failure)
+        display.count("source submissions", sum(value is not None for value in results) + len(failures),
+                      total=len(requests), label="Source schedule completed", detail=names[index])
+
+    with display:
+        from .shell_telemetry import active_rule_batch_progress
+        batch = active_rule_batch_progress()
+        if batch is not None:
+            batch.worker_jobs = policy.capacity(len(requests))
+        bounded_compiler_work(tuple(range(len(requests))), work, publish,
+                              policy=policy, label="source submissions")
+        if failures:
+            raise SourceListCompilationError(failures, results)
+    return results
+
+
 def compile_partitioned_source(
     source: str, directory: str | Path, *, entrypoint: str | None = None,
     jobs: int | None = None, schedule_mode: str = "parallel",
@@ -4869,7 +5014,7 @@ def compile_partitioned_source(
         book_path = root / "source-concordance.pkl"
         temporary_book = book_path.with_suffix(".pkl.tmp")
         with temporary_book.open("wb") as stream:
-            pickle.dump(book, stream, protocol=5)
+            _dump_resolved_process_graph(book, stream)
         os.replace(temporary_book, book_path)
         source_concordance = {
             "path": book_path.as_posix(), "sha256": _file_sha256(book_path),
@@ -5014,6 +5159,7 @@ def _publish_native_unit_interface(module, outputs, exports, root, unit_index):
         declarations[name] = Function(name, list(function.args), {}, metadata={
             **{key: function.metadata[key] for key in (
                 "parameter_names", "named_outputs", "lowered_conditional_count",
+                "source_qualified_name",
                 "source_conditional_count", "authored_parameters", "parameter_record_abi",
                 "parameter_member_formals", "parameter_defaults", "positional_parameters",
                 "function_parameters", "method_binding") if key in function.metadata},
@@ -5710,7 +5856,7 @@ def compile_project_call(
     return receipt
 
 
-def compile_resolved_process_graph_unit(
+def _compile_resolved_process_graph_unit_impl(
     graph_path: str | Path,
     plan_path: str | Path,
     unit_index: int,
@@ -5719,6 +5865,7 @@ def compile_resolved_process_graph_unit(
     linked_units: Mapping[int, str | Path] | None = None,
     allow_function_shell_cut: bool = False,
     progress: Callable[[str], None] | None = None,
+    compile_progress_state_sink: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Compile one planned unit without repeating source ingestion/reduction.
 
@@ -5915,6 +6062,8 @@ def compile_resolved_process_graph_unit(
             tensor_ssa_reference=tensor_reference,
             allow_function_shell_cut=allow_function_shell_cut,
             progress=progress,
+            progress_bars=False,
+            compile_progress_state_sink=compile_progress_state_sink,
         )
     if interface_tiles:
         # Interior callsite variants remain in the object/diagnostic SSA.
@@ -6198,6 +6347,15 @@ def compile_resolved_process_graph_unit(
     }
     _atomic_json(root / "unit.json", receipt)
     return receipt
+
+
+def compile_resolved_process_graph_unit(*args, **kwargs):
+    """Own one headless compiler status through lowering and native publication."""
+    from .shell_telemetry import compile_progress
+
+    sink = kwargs.get("compile_progress_state_sink")
+    with compile_progress(False, collect_profile=True, state_sink=sink):
+        return _compile_resolved_process_graph_unit_impl(*args, **kwargs)
 
 
 def compile_process_graph_subdivision_integral(
@@ -7059,6 +7217,17 @@ def compile_resolved_process_graph_plan(
             running_record(index, state)
             for index, state in sorted(running.items())
         ]
+        for index, state in sorted(running.items()):
+            log_path = unit_root(index) / "worker.log"
+            if log_path.is_file():
+                with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+                    stream.seek(state.get("log_position", 0))
+                    lines = stream.read().splitlines()
+                    state["log_position"] = stream.tell()
+                for line in lines:
+                    report("resolved_worker_log", unit_index=index,
+                           qualified_names=units[index].get("qualified_names", ()),
+                           message=line)
         _atomic_json(root / "progress.json", {
             "schema": "turing.resolved-process-graph-plan-progress.v1",
             "resolved_process_graph": resolved_path.as_posix(),
@@ -7085,6 +7254,9 @@ def compile_resolved_process_graph_plan(
             completed_count=sum(record is not None for record in records),
             count=len(units),
             running=running_records,
+            completed=[record for record in records if record is not None],
+            units=units,
+            worker_jobs=worker_limit,
         )
 
     def launch(index: int) -> None:
@@ -7202,6 +7374,9 @@ def compile_resolved_process_graph_plan(
                 _atomic_json(failure_path, record)
             record["peak_resident_bytes"] = int(state["resident"])
             record["peak_private_bytes"] = int(state["private"])
+            progress_path = destination / "compile-progress.json"
+            if progress_path.is_file():
+                record["stage"] = json.loads(progress_path.read_text(encoding="utf-8")).get("current")
             record["linked_native_interface_units" if plan.get("interface_tiles") else "linked_verified_units"] = list(state["linked"])
             records[index] = record
             del running[index]
@@ -7778,11 +7953,17 @@ def compile_project_product(
     *,
     entries: Iterable[str] | None = None,
     expand_entry_dependencies: bool = True,
+    schedule_predecessors: Mapping[str, Iterable[str]] | None = None,
     python_executable: str | Path = sys.executable,
     jobs: int | None = None,
     max_total_resident_bytes: int | None = None,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
+    minimum_total_resident_bytes: int = 2 << 30,
+    system_reserve_bytes: int = 2 << 30,
+    adaptive_memory_ceiling: bool = True,
+    worker_elastic_available_percent: int = 25,
+    thread_working_bytes: int = 128 << 20,
     extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     emit_native: bool = False,
     seed_product: str | Path | None = None,
@@ -7862,7 +8043,7 @@ def compile_project_product(
     index_by_name = {
         name: index for index, name in enumerate(selected_names)
     }
-    worker_limit = int(jobs or min(4, os.cpu_count() or 1))
+    worker_limit = int(jobs if jobs is not None else max(1, len(selected_names)))
     if worker_limit < 1:
         raise ValueError("project compilation jobs must be positive")
     memory_ceiling = (
@@ -7872,6 +8053,23 @@ def compile_project_product(
     )
     if memory_ceiling is not None and memory_ceiling < 1:
         raise ValueError("project compilation memory ceiling must be positive")
+    memory_minimum = min(int(minimum_total_resident_bytes), memory_ceiling) if memory_ceiling is not None else int(minimum_total_resident_bytes)
+    if memory_minimum < 1 or system_reserve_bytes < 0 or thread_working_bytes < 1:
+        raise ValueError("project compilation memory minimum/reservations are invalid")
+    if not 0 <= worker_elastic_available_percent <= 100:
+        raise ValueError("worker elasticity must be between zero and 100 percent")
+    current_memory_ceiling = memory_ceiling
+    predecessors = {name: tuple(map(str, (schedule_predecessors or {}).get(name, ())))
+                    for name in selected_names}
+    if any(parent not in index_by_name or parent == name
+           for name, parents in predecessors.items() for parent in parents):
+        raise ValueError("source schedule predecessors must name other submitted sources")
+    import networkx as nx
+    schedule_graph = nx.DiGraph()
+    schedule_graph.add_nodes_from(selected_names)
+    schedule_graph.add_edges_from((parent, name) for name, parents in predecessors.items() for parent in parents)
+    if not nx.is_directed_acyclic_graph(schedule_graph):
+        raise ValueError("the supplied source schedule contains a cycle")
     worker_reservation = int(worker_resident_reservation_bytes)
     if worker_reservation < 1:
         raise ValueError("project compilation worker reservation must be positive")
@@ -7948,6 +8146,7 @@ def compile_project_product(
             "source": source_file.as_posix(),
             "worker_jobs": worker_limit,
             "max_total_resident_bytes": memory_ceiling,
+            "current_memory_ceiling_bytes": current_memory_ceiling,
             "worker_resident_reservation_bytes": worker_reservation,
             "max_worker_memory_bytes": worker_memory_budget,
             "extraction_contract": (
@@ -7964,6 +8163,8 @@ def compile_project_product(
             pending_count=len(pending),
             completed_count=sum(record is not None for record in records),
             count=len(selected_names),
+            worker_jobs=worker_limit,
+            current_memory_ceiling_bytes=current_memory_ceiling,
             running=running_records,
         )
 
@@ -8039,6 +8240,9 @@ def compile_project_product(
             worker_environment["TURING_MEMORY_BUDGET_BYTES"] = str(
                 worker_memory_budget
             )
+        worker_environment["TURING_MEMORY_SYSTEM_RESERVE_BYTES"] = str(system_reserve_bytes)
+        worker_environment["TURING_MEMORY_ELASTIC_AVAILABLE_PERCENT"] = str(worker_elastic_available_percent)
+        worker_environment["TURING_COMPILER_THREAD_WORKING_BYTES"] = str(thread_working_bytes)
         if inherited_bootstrap_products:
             from .compiler_bootstrap_runtime import (
                 COMPILER_BOOTSTRAP_PRODUCTS_ENV,
@@ -8262,13 +8466,16 @@ def compile_project_product(
         drain_worker_output()
         measured_total = sum(int(state["resident"]) for state in running.values())
         reserved_total = len(running) * worker_reservation
+        current_memory_ceiling = (adaptive_worker_memory_ceiling(
+            configured_maximum=memory_ceiling, configured_minimum=memory_minimum,
+            system_reserve=system_reserve_bytes, measured_worker_bytes=measured_total)
+            if adaptive_memory_ceiling else memory_ceiling)
         admitted = False
         while pending and len(running) < worker_limit and (
-            memory_ceiling is None
+            current_memory_ceiling is None
             or not running
             or (
-                reserved_total + worker_reservation <= memory_ceiling
-                and measured_total < memory_ceiling
+                max(reserved_total, measured_total) + worker_reservation <= current_memory_ceiling
             )
         ):
             ready_position = None
@@ -8286,14 +8493,16 @@ def compile_project_product(
                 if all(
                     record is not None
                     for record in dependency_records
-                ):
+                ) and all(records[index_by_name[parent]] is not None
+                          for parent in predecessors[candidate_name]):
                     ready_position = position
                     break
             if ready_position is None and not running and pending:
                 # The remaining dependency graph is cyclic. Compile one exact
                 # authored SCC member with its cycle bodies retained instead
                 # of deadlocking the scheduler or inventing an invalid cut.
-                ready_position = 0
+                ready_position = next((position for position, (_index, name) in enumerate(pending)
+                    if all(records[index_by_name[parent]] is not None for parent in predecessors[name])), None)
             if ready_position is None:
                 break
             index, qualified_name = pending.pop(ready_position)

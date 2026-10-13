@@ -17,14 +17,16 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import hashlib
+import os
 from pathlib import Path
 import threading
 import time
 import tempfile
 from typing import Any
+from contextvars import copy_context
 
 import networkx as nx
 from .live_tiles import TiledSet
@@ -32,6 +34,98 @@ from .live_tiles import TiledSet
 
 _BOOTSTRAPPING = ContextVar("compiler_graph_foundation_bootstrap", default=False)
 _MEMO_SOURCES = object()
+_COMPILER_SCHEDULE = ContextVar("compiler_deployment_schedule", default=None)
+
+
+@dataclass(frozen=True)
+class CompilerWorkPolicy:
+    """Admission policy, not a partitioner or an execution-time limit."""
+
+    mode: str = "auto"
+    jobs: int | None = None
+    memory_bytes: int | None = 10 << 30
+    reserve_bytes: int = 2 << 30
+    working_bytes: int = field(default_factory=lambda: int(
+        os.environ.get("TURING_COMPILER_THREAD_WORKING_BYTES", 128 << 20)))
+    stats: dict = field(default_factory=dict, compare=False)
+
+    def __post_init__(self):
+        if self.mode not in {"auto", "serial", "parallel"}:
+            raise ValueError("compiler work mode must be auto, serial or parallel")
+        if self.jobs is not None and (isinstance(self.jobs, bool) or self.jobs < 1):
+            raise ValueError("compiler jobs must be positive")
+        if self.working_bytes < 1 or self.reserve_bytes < 0:
+            raise ValueError("compiler working reservation must be positive and reserve nonnegative")
+        if self.memory_bytes is not None and self.memory_bytes < 1:
+            raise ValueError("compiler memory admission ceiling must be positive")
+
+    def capacity(self, ready: int) -> int:
+        from .shell_telemetry import process_rss_bytes, system_available_memory_bytes
+        if ready < 2 or self.mode == "serial":
+            return 1
+        available = system_available_memory_bytes()
+        headroom = None if available is None else max(0, available - self.reserve_bytes)
+        if self.memory_bytes is not None:
+            process_room = max(0, self.memory_bytes - process_rss_bytes())
+            headroom = process_room if headroom is None else min(headroom, process_room)
+        slots = ready if headroom is None else max(1, headroom // self.working_bytes)
+        return max(1, min(ready, slots, ready if self.jobs is None else self.jobs))
+
+
+@contextmanager
+def compiler_work_policy(policy):
+    token = _COMPILER_SCHEDULE.set(policy)
+    try:
+        yield policy
+    finally:
+        _COMPILER_SCHEDULE.reset(token)
+
+
+def compiler_work_settings():
+    policy = _COMPILER_SCHEDULE.get()
+    if policy is not None:
+        return policy
+    from .work_contract import active_contract
+    contract = active_contract()
+    return CompilerWorkPolicy(memory_bytes=contract.memory_budget_bytes,
+                              reserve_bytes=contract.memory_system_reserve_bytes)
+
+
+def bounded_compiler_work(jobs, work, publish, *, policy=None, label="compiler work"):
+    """Run already supplied jobs; publish results in their supplied order.
+
+    This never discovers, divides, copies, or checkpoints source. The caller
+    supplies either an explicit source schedule or existing deployment regions.
+    Completed results count against admission until the coordinator joins them.
+    Each thread receives its own Context, not an empty/detached identity book.
+    Falling RAM headroom changes admission only; it never kills running work.
+    """
+    policy = policy or compiler_work_settings()
+    count = len(jobs)
+    if not count:
+        return
+    capacity = policy.capacity(count)
+    policy.stats["jobs"] = policy.stats.get("jobs", 0) + count
+    policy.stats["admission_peak"] = max(policy.stats.get("admission_peak", 0), capacity)
+    if capacity == 1:
+        for ordinal, job in enumerate(jobs):
+            publish(ordinal, job, work(job))
+        return
+    queue = deque()
+    next_index = 0
+    # No fixed global thread ceiling: this pool creates only admitted workers.
+    with ThreadPoolExecutor(max_workers=count, thread_name_prefix="compiler-deployment") as executor:
+        while queue or next_index < count:
+            capacity = policy.capacity(count - next_index + len(queue))
+            while next_index < count and len(queue) < capacity:
+                job = jobs[next_index]
+                context = copy_context()
+                pending = executor.submit(context.run, work, job)
+                queue.append((next_index, job, pending))
+                policy.stats["outstanding_peak"] = max(policy.stats.get("outstanding_peak", 0), len(queue))
+                next_index += 1
+            ordinal, job, pending = queue.popleft()
+            publish(ordinal, job, pending.result())
 
 
 def _retain_codec_source(value, memo):

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import re
 import sys
 import threading
 import time
@@ -695,7 +696,8 @@ class RuleBatchProgress:
     the same completed/total rule status without owning another renderer.
     """
 
-    def __init__(self, total: int, *, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, total: int, *, clock: Callable[[], float] = time.monotonic,
+                 names: Sequence[str] | None = None):
         self.total = int(total)
         if self.total < 0:
             raise ValueError("rule batch total cannot be negative")
@@ -706,10 +708,18 @@ class RuleBatchProgress:
         self.current = ""
         self._token = None
         self._lock = threading.RLock()
+        self.names = None if names is None else frozenset(names)
+        self._completed_names = set()
+        self.worker_jobs = 1
 
     def __enter__(self):
         self.started = self.clock()
         self._token = _ACTIVE_RULE_BATCH.set(self)
+        layer = active_compile_progress()
+        if layer is not None:
+            # Heartbeats and queued log writes run in separate contexts. The
+            # one terminal owner must retain this batch independently of them.
+            getattr(layer, "owner_display", layer).rule_batch = self
         return self
 
     def __exit__(self, exc_type, exc, traceback_):
@@ -739,7 +749,7 @@ class RuleBatchProgress:
             wall = max(0.0, self.clock() - self.started)
             average = (self.completed_seconds / self.completed
                        if self.completed else None)
-            projected = (max(wall, average * self.total)
+            projected = (wall + average * (self.total - self.completed) / self.worker_jobs
                          if average is not None else None)
             return {
                 "completed": self.completed,
@@ -750,11 +760,21 @@ class RuleBatchProgress:
                 "current": self.current,
             }
 
+    def complete(self, name: str, seconds: float) -> None:
+        """Count a named terminal compiler receipt once, including cache hits."""
+        with self._lock:
+            if (self.names is not None and name not in self.names) or name in self._completed_names:
+                return
+            self._completed_names.add(name)
+            self.completed += 1
+            self.completed_seconds += max(0.0, float(seconds))
 
-def compile_rule_batch(total: int, *, clock: Callable[[], float] = time.monotonic):
+
+def compile_rule_batch(total: int, *, clock: Callable[[], float] = time.monotonic,
+                       names: Sequence[str] | None = None):
     """Return the batch clock consumed by compiler terminal renderers."""
 
-    return RuleBatchProgress(total, clock=clock)
+    return RuleBatchProgress(total, clock=clock, names=names)
 
 
 def active_rule_batch_progress() -> RuleBatchProgress | None:
@@ -835,12 +855,14 @@ class _CompileBars:
                 str(worker.get("status") or "unknown")
                 for worker in self.owner._workers.values()
             ]
+            if self.owner._stage_index > 0:
+                statuses.append("running" if self.owner._depth else "complete")
             running = sum(
                 status in {"running", "starting"} for status in statuses
             )
             failed = sum(status == "failed" for status in statuses)
             complete = sum(
-                status in {"complete", "partial", "verified"}
+                status in {"complete", "done", "partial", "verified"}
                 for status in statuses
             )
             return (
@@ -1151,7 +1173,7 @@ class _CompileLive(_CompileBars):
     def _frame(self):
         self._rss()
         summary = self.owner.summary()
-        batch = active_rule_batch_progress()
+        batch = self.owner.rule_batch or active_rule_batch_progress()
         batch_summary = None if batch is None else batch.summary()
         batch_status = None
         if batch_summary is not None:
@@ -1164,7 +1186,26 @@ class _CompileLive(_CompileBars):
                 f"projected total {'--' if projected is None else _format_duration(projected)}"
             )
         workers = list(self.owner._workers.values())
+        hidden_workers = 0
+        if workers and self.owner._stage_index > 0:
+            # A single holistic compile is also its workers' coordinator.
+            # Region snapshots cannot replace its later pre-native stages.
+            current_stage = summary["stages"][self.owner._stage_index]
+            workers.insert(0, {"key": "coordinator", "label": "source compiler",
+                "status": "failed" if self.failed else "complete" if self.finished else "running",
+                "stage_number": self.owner._stage_index + 1, "stage_count": len(summary["stages"]),
+                "stage_label": current_stage["label"], "substage": self.substage,
+                "elapsed_seconds": current_stage["seconds"], "rss_bytes": self.last_rss,
+                "stages": summary["stages"]})
         if workers:
+            # Keep useful column widths on real terminals. All lanes remain in
+            # the owner; prefer active/failed lanes, then recent completions.
+            column_budget = max(1, (self.console.width - 30) // 24)
+            if len(workers) > column_budget:
+                priority_workers = [lane for lane in workers if lane["status"] in {"running", "failed", "partial"}]
+                priority_workers += list(reversed([lane for lane in workers if lane not in priority_workers]))
+                hidden_workers = len(workers) - column_budget
+                workers = priority_workers[:column_budget]
             status = (
                 "compiler workers FAILED" if self.failed
                 else "compiler workers done" if self.finished
@@ -1239,7 +1280,7 @@ class _CompileLive(_CompileBars):
                 )
                 for lane in workers:
                     table.add_column(
-                        lane["label"], ratio=1, overflow="ellipsis", no_wrap=True,
+                        lane["label"].rsplit(".<locals>.", 1)[-1], ratio=1, overflow="ellipsis", no_wrap=True,
                     )
                 row_budget = max(
                     1, available - progress_reserve - header_lines - 4
@@ -1267,7 +1308,10 @@ class _CompileLive(_CompileBars):
                                 f"{lane['status']} {lane['elapsed_seconds']:.0f}s "
                                 f"{lane['rss_bytes'] / _GIB:.2f}GB"
                             )
-                        cells.append(state)
+                        style = ("bold red" if "failed" in state or "partial" in state
+                                 else "green" if "done" in state or "complete" in state
+                                 else "cyan" if "running" in state else "dim")
+                        cells.append(self.Text(state, style=style))
                     table.add_row(str(stage_row.get("label") or ""), *cells)
                 if len(visible) < len(stage_rows):
                     table.caption = (
@@ -1305,6 +1349,8 @@ class _CompileLive(_CompileBars):
         parts = ([] if batch_status is None else [
                      self.Text(batch_status, overflow="ellipsis", no_wrap=True)])
         parts += [table, self.Text(status, overflow="ellipsis", no_wrap=True)]
+        if hidden_workers:
+            parts.append(self.Text(f"+{hidden_workers} worker lanes retained; active/failed lanes shown first", no_wrap=True))
         if tasks:
             parts.append(self.progress)
         if hidden_work:
@@ -1323,7 +1369,12 @@ class _CompileLive(_CompileBars):
 
     def _write(self, text):
         if self.failure is None:
-            self.console.print(self.Text(f"{self.owner.prefix}{text}"))
+            lower = str(text).casefold()
+            style = ("bold red" if any(word in lower for word in ("failed", "error", "refused"))
+                     else "yellow" if "memory" in lower or "rss" in lower or "compress" in lower
+                     else "green" if "done" in lower or "complete" in lower or "verified" in lower
+                     else "cyan" if "stage" in lower else "magenta" if "deployment" in lower else None)
+            self.console.print(self.Text(f"{self.owner.prefix}{text}", style=style))
         else:
             print(f"{self.owner.prefix}{text}", file=self.owner.stream, flush=True)
 
@@ -1492,8 +1543,16 @@ class CompileProgress:
         self._stage_seconds: dict[str, float] = {}
         self._work: dict[str, dict[str, dict[str, Any]]] = {}
         self._workers: dict[str, dict[str, Any]] = {}
+        self.rule_batch = active_rule_batch_progress()
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
+        self._log_condition = threading.Condition()
+        self._log_queue = deque()
+        self._log_stopping = False
+        self._log_thread = None
+        self._log_file = None
+        self.log_path = None
+        self._console_log_omissions = 0
         if self.enabled or self.collect_profile:
             self.channel = channel or TelemetryChannel(
                 name="compile-progress", capacity=1024, kinds=(LOG, PROGRESS, PROFILE)
@@ -1517,6 +1576,18 @@ class CompileProgress:
                 self._stage_profiles.clear()
                 self._stage_seconds.clear()
                 self._work.clear()
+                if self.enabled:
+                    import tempfile
+                    from pathlib import Path
+                    directory = Path.cwd() / "build" / "compiler-logs"
+                    directory.mkdir(parents=True, exist_ok=True)
+                    self._log_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                        prefix="compile_", suffix=".log", dir=directory, delete=False)
+                    self.log_path = self._log_file.name
+                    self._log_stopping = False
+                    self._log_thread = threading.Thread(target=self._consume_logs,
+                        name="compiler-terminal-log", daemon=True)
+                    self._log_thread.start()
                 self.channel.progress(
                     self.stages[0].label, done=0, total=len(self.stages),
                     path="compile/start", scope="start",
@@ -1542,10 +1613,21 @@ class CompileProgress:
             self._depth -= 1
             if self._depth:
                 return
+            log_thread, self._log_thread = self._log_thread, None
             self._heartbeat_stop.set()
             thread, self._heartbeat_thread = self._heartbeat_thread, None
         if thread is not None:
             thread.join(timeout=2.0)
+        if log_thread is not None:
+            with self._log_condition:
+                self._log_stopping = True
+                self._log_condition.notify()
+            log_thread.join()
+            if self._console_log_omissions:
+                self.channel.log(f"{self._console_log_omissions} additional diagnostic lines retained in {self.log_path}")
+            self._log_file.close()
+            self._log_file = None
+            self.channel.log(f"compiler diagnostic log: {self.log_path}")
         with self._lock:
             stage = self.stages[self._stage_index]
             self._log_stage_finished(stage, failed=failed)
@@ -1582,9 +1664,59 @@ class CompileProgress:
         """One compiler line.  Through ``tqdm.write`` when enabled."""
 
         if not self.enabled:
+            owner = getattr(self, "owner_display", None)
+            if owner is not None:
+                owner.log(message)
+                return
             _plain_compiler_line(message)
             return
-        self.channel.log(message)
+        text = str(message)
+        with self._log_condition:
+            if self._log_file is None:
+                self.channel.log(text)
+                return
+            # Preserve every byte independently of console rendering. The
+            # producer only appends buffered text and updates a bounded queue;
+            # terminal drawing never runs on a compiler worker's call stack.
+            self._log_file.write(text + "\n")
+            urgent = any(word in text.casefold() for word in ("failed", "error", "traceback", "refused"))
+            shape = text if urgent else re.sub(r"\b\d+(?:\.\d+)?\b", "#", text)
+            if self._log_queue and self._log_queue[-1][0] == shape:
+                group = self._log_queue[-1]
+                group[2], group[3] = text, group[3] + 1
+            elif len(self._log_queue) < 1024 or urgent:
+                self._log_queue.append([shape, text, text, 1])
+            else:
+                self._console_log_omissions += 1
+            self._log_condition.notify()
+
+    def _consume_logs(self):
+        while True:
+            with self._log_condition:
+                self._log_condition.wait_for(lambda: self._log_queue or self._log_stopping)
+                if not self._log_queue and self._log_stopping:
+                    return
+                # One console write for a batch; identical/range-shaped runs
+                # keep their endpoints and exact repeat count. Full text stays
+                # in the durable log, including diagnostics not drawn live.
+                batch = []
+                console_bytes = 0
+                while self._log_queue and len(batch) < 128 and console_bytes < 8192:
+                    group = self._log_queue.popleft()
+                    batch.append(group)
+                    console_bytes += min(len(group[1]), 4096) + min(len(group[2]), 4096)
+                self._log_file.flush()
+            lines = []
+            def console_line(line):
+                if len(line) <= 4096:
+                    return line
+                return line[:4096] + f" … full diagnostic in {self.log_path}"
+            for _shape, first, last, count in batch:
+                lines.append(console_line(first))
+                if count > 1:
+                    lines.append(f"  … {count} related lines; last: {console_line(last)}")
+            with self._lock:
+                self.channel.log("\n".join(lines))
 
     def progress_callback(
         self, inner: Callable[[str], None] | None = None
@@ -1648,7 +1780,9 @@ class CompileProgress:
             "stage_elapsed_seconds": max(
                 0.0, self.clock() - self._stage_started
             ),
+            "rss_bytes": int(self.rss()),
             "stages": rows,
+            "workers": [dict(worker) for worker in self._workers.values()],
         }
         try:
             self.state_sink(payload)
@@ -1701,13 +1835,43 @@ class CompileProgress:
                                "total": None if prior["total"] is None or value["total"] is None
                                         else prior["total"] + value["total"],
                                "label": value["label"]}
-            return {"stages": rows, "work": work,
+            return {"stages": rows, "work": work, "log_path": self.log_path,
+                    "workers": [dict(worker) for worker in self._workers.values()],
                     "renderer": self.renderer if self.enabled else "none",
                     "profiles": () if self.channel is None else self.channel.profile_summary(),
                     "timing_semantics": "inclusive wall time; stage order is not percent progress"}
 
     def profile_dataframe(self):
         return compile_profile_dataframe(self.summary())
+
+    def inherit_completed_stages(self, keys: Sequence[str]) -> None:
+        """Retain the coordinator-completed prefix of a frozen graph worker.
+
+        These rows have no worker wall time: source ingestion/reduction already
+        happened once before the cut. All later transitions use stage() and the
+        ordinary compiler state sink.
+        """
+        if self.channel is None:
+            return
+        keys = tuple(keys)
+        if keys != tuple(stage.key for stage in self.stages[:len(keys)]):
+            raise ValueError("inherited compiler stages must be a declared prefix")
+        with self._lock:
+            for key in keys:
+                self._stage_profiles[key] = {"failed": False, "rss_bytes": 0,
+                                             "inherited": True}
+                self._stage_seconds[key] = 0.0
+            if len(keys) < len(self.stages):
+                self._stage_index = len(keys)
+                self._stage_started = self.clock()
+                stage = self.stages[self._stage_index]
+                self.channel.progress(
+                    stage.label, done=len(keys), total=len(self.stages),
+                    path="compile/stage", scope="stage", key=stage.key,
+                    index=self._stage_index, started=self._stage_started,
+                    metric="stage-order", fraction_is_progress=False,
+                )
+            self._publish_state("running")
 
     def stage(self, key: str) -> None:
         """Enter a declared stage; the previous stage's nested bars close."""
@@ -1859,6 +2023,10 @@ class CompileProgress:
             return
         with self._lock:
             prior = self._workers.get(str(key), {})
+            if prior.get("status") in {"failed", "partial"} and prior.get("label") != label:
+                # The thread may accept another source, but its failed receipt
+                # must remain visible until the outer compilation ends.
+                self._workers[f"{key}:failed:{prior['label']}"] = dict(prior)
             self._workers[str(key)] = {
                 "key": str(key), "label": str(label), "status": str(status),
                 "stage_number": int(stage_number or prior.get("stage_number") or 0),
@@ -1872,9 +2040,10 @@ class CompileProgress:
                 "stages": [dict(row) for row in stages]
                 or list(prior.get("stages") or ()),
             }
+            self._publish_state("running")
             if self.bars is not None:
                 if isinstance(self.bars, _CompileLive):
-                    self.bars.heartbeat(force=True)
+                    self.bars.heartbeat()
                 else:
                     self.bars.heartbeat()
 
@@ -1886,6 +2055,61 @@ class CompileProgress:
                     self.bars.heartbeat(force=True)
                 else:
                     self.bars.heartbeat()
+
+    def compilation_event(self, event: Mapping[str, Any]) -> None:
+        """Consume scheduler events from the universal source frontend."""
+        kind = event.get("stage")
+        if kind in {"worker_output", "unit_failed", "native_failed"}:
+            self.log(f"[{event.get('qualified_name', '')}] {event.get('message', event.get('error', ''))}")
+        elif kind == "worker_snapshot":
+            for record in event.get("running", ()):
+                current = record.get("stage") or {}
+                compiler = current.get("compiler") or {}
+                self.worker(f"process-{record['process_id']}",
+                    label=record["qualified_name"], status="running",
+                    stage_number=compiler.get("stage_number", 0), stage_count=compiler.get("stage_count", 10),
+                    stage_label=compiler.get("stage_label", "starting"), substage=compiler.get("substage", ""),
+                    stages=compiler.get("stages", ()), elapsed_seconds=record.get("elapsed_seconds", 0),
+                    rss_bytes=record.get("resident_bytes", 0))
+                for lane in compiler.get("workers", ()):
+                    self.worker(f"process-{record['process_id']}:{lane['key']}",
+                        **{key: value for key, value in lane.items() if key != "key"})
+        elif kind == "unit_complete":
+            compiler = (event.get("compiler_stage") or {}).get("compiler") or {}
+            for key, record in tuple(self._workers.items()):
+                if record["label"] == event.get("qualified_name"):
+                    self.worker(key, label=record["label"], status=event.get("status", "complete"),
+                        stage_number=compiler.get("stage_number", 0), stage_count=compiler.get("stage_count", 0),
+                        stages=compiler.get("stages", ()))
+        elif kind == "resolved_worker_snapshot":
+            units = event.get("units") or ()
+            batch = active_rule_batch_progress()
+            if batch is not None:
+                batch.worker_jobs = max(1, int(event.get("worker_jobs", 1)))
+            for record in (*event.get("running", ()), *event.get("completed", ())):
+                index = int(record["unit_index"])
+                unit = units[index] if index < len(units) else record.get("unit", {})
+                current = record.get("stage") or {}
+                compiler = current.get("compiler") or {}
+                self.worker(
+                    str(index), label=", ".join(unit.get("qualified_names") or (str(index),)),
+                    status=str(record.get("status") or "running"),
+                    stage_number=compiler.get("stage_number", 0),
+                    stage_count=compiler.get("stage_count", 0),
+                    stage_label=compiler.get("stage_label", ""),
+                    substage=compiler.get("substage", ""),
+                    stages=compiler.get("stages", ()),
+                    elapsed_seconds=record.get("elapsed_seconds", 0),
+                    rss_bytes=record.get("resident_bytes", record.get("peak_resident_bytes", 0)),
+                )
+                if batch is not None and record.get("status") in {"verified", "compiled-unverified"}:
+                    for name in unit.get("qualified_names", ()):
+                        batch.complete(name, record.get("elapsed_seconds", 0))
+            self.count("compiler-units", int(event.get("completed_count", 0)),
+                       total=int(event.get("count", 0)), label="Compilation units")
+        elif kind == "resolved_worker_log":
+            label = ", ".join(event.get("qualified_names") or ())
+            self.log(f"[{label}] {event.get('message', '')}")
 
     def iterate(
         self,
@@ -2033,6 +2257,35 @@ def compile_substage(name: str) -> None:
     layer = _ACTIVE_COMPILE_PROGRESS.get()
     if layer is not None:
         layer.substage(name)
+
+
+@contextmanager
+def compile_work(key: str, *, label: str):
+    """An admitted thread working within its owner's current compiler stage."""
+    layer = active_compile_progress()
+    if layer is None:
+        yield
+        return
+    identity = f"thread-{threading.get_ident()}"
+    started = time.monotonic()
+    stage = layer.stages[layer._stage_index]
+    rows = layer.summary()["stages"]
+    states = [{"key": row["key"], "label": row["label"], "state": row["state"]}
+              for row in rows]
+    def publish(status):
+        layer.worker(identity, label=label, status=status,
+                     stage_number=layer._stage_index + 1, stage_count=len(layer.stages),
+                     stage_label=stage.label, substage=key, stages=states,
+                     elapsed_seconds=time.monotonic() - started,
+                     rss_bytes=layer.rss())
+    publish("running")
+    try:
+        yield
+    except BaseException:
+        publish("failed")
+        raise
+    else:
+        publish("done")
 
 
 def compile_count(

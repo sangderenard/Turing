@@ -42435,7 +42435,7 @@ def extract_resolved_process_graph_subdivision_programs(
     )
 
 
-def lower_resolved_process_graph_unit_to_ssa(
+def _lower_resolved_process_graph_unit_to_ssa_impl(
     graph: Any,
     function_references: Iterable[int],
     *,
@@ -42502,35 +42502,45 @@ def lower_resolved_process_graph_unit_to_ssa(
             "implementation_kind": "linked-repository-ssa",
             "implementation_variants": ("repository-ssa",),
         })
-    from .identity_concordance import begin_identity_book, end_identity_book
-    source_book = graph.G.graph.pop("compilation_unit_identity_book", None)
-    _unit_book, token = begin_identity_book(source_book)
-    try:
-        module, outputs, exports = _lower_resolved_process_graph_deployment(
-            graph,
-            selected_names[0],
-            selected_function_references=tuple(dict.fromkeys((
-                *selected, *map(int, authored_dependency_references),
-            ))),
-            activation_function_references=selected,
-            name=name,
-            runtime_closure_only=True,
-            tensor_ssa_reference=tensor_ssa_reference,
-            allow_authored_source_callees=allow_function_shell_cut,
-            progress=progress,
+    module, outputs, exports = _lower_resolved_process_graph_deployment(
+        graph,
+        selected_names[0],
+        selected_function_references=tuple(dict.fromkeys((
+            *selected, *map(int, authored_dependency_references),
+        ))),
+        activation_function_references=selected,
+        name=name,
+        runtime_closure_only=True,
+        tensor_ssa_reference=tensor_ssa_reference,
+        allow_authored_source_callees=allow_function_shell_cut,
+        progress=progress,
+    )
+    # Late control legalization can leave an unreferenced private formal
+    # after the in-deployment prune. Use the canonical root-only prune at
+    # this completed-unit seam (_energy_time_limit presence input 80).
+    for export in exports:
+        _drop_unused_root_private_formals(
+            module.functions[export], module.sequence_tables.get(export),
         )
-        # Late control legalization can leave an unreferenced private formal
-        # after the in-deployment prune. Use the canonical root-only prune at
-        # this completed-unit seam (_energy_time_limit presence input 80).
-        for export in exports:
-            _drop_unused_root_private_formals(
-                module.functions[export], module.sequence_tables.get(export),
-            )
-    finally:
-        end_identity_book(token)
     module.metadata["compilation_unit_plan"] = plan.to_mapping()
     module.metadata["compiled_process_graph_unit"] = selected_record
     return module, outputs, exports
+
+
+def lower_resolved_process_graph_unit_to_ssa(
+    graph: Any, function_references: Iterable[int], **kwargs: Any,
+):
+    """Resume the same compiler transaction at a frozen compilation-unit cut."""
+
+    return _run_source_lowering(
+        _lower_resolved_process_graph_unit_to_ssa_impl,
+        graph, function_references,
+        identity_book=graph.G.graph.pop("compilation_unit_identity_book", None),
+        completed_stage_keys=("source-normalisation", "source-closure",
+                              "topology-reduction", "compilation-units"),
+        live_roots=(graph,),
+        **kwargs,
+    )
 
 
 def _linked_piece_interface_module(piece):
@@ -45373,12 +45383,11 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     the terminal renderer. Auto prefers an installed Rich Live compositor;
     headless runs do not import it. The measured telemetry is unchanged.
 
-    ``source_compilation="serial"`` lowers the complete resolved graph in the
-    current process. ``source_compilation="parallel"`` or ``"auto"`` requires
-    ``compilation_directory=`` and cuts that same complete resolved graph into
-    dependency-planned worker units. Auto derives useful concurrency from the
-    resolved unit DAG. In every mode this function remains the sole source
-    compiler and produces repository SSA.
+    ``source_compilation="auto"`` is one holistic compile. It never stops at
+    ingestion to prepartition source; workers consume the deployment regions
+    the ongoing compiler has already formed. Explicit ``serial``/``parallel``
+    schedules require a supplied list of source requests, each compiled with
+    auto internally. The legacy partitioned_directory route is explicit only.
     """
     _collect_profile = kwargs.pop("compile_profile", True)
     _progress_renderer = kwargs.pop("progress_renderer", None)
@@ -45387,53 +45396,40 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     compilation_directory = kwargs.pop("compilation_directory", None)
     partitioned_directory = kwargs.pop("partitioned_directory", None)
     partitioned_options = kwargs.pop("partitioned_options", {})
+    source = args[0] if args else kwargs.get("source")
+    if isinstance(source, (list, tuple)):
+        if source_compilation not in {"serial", "parallel"}:
+            raise ValueError("a source list requires an explicit serial or parallel schedule")
+        if len(args) > 1 or "entrypoint" in kwargs:
+            raise TypeError("source-list entries each own their entrypoint")
+        if compilation_directory is not None or partitioned_directory is not None:
+            raise TypeError("source-list entries each own their output directory")
+        kwargs.pop("source", None)
+        progress_bars = kwargs.pop("progress_bars", None)
+        if kwargs:
+            raise TypeError(f"source-list options belong to their requests: {sorted(kwargs)}")
+        from .project_compilation_product import compile_source_submissions
+        return compile_source_submissions(source, mode=source_compilation,
+            options=partitioned_options, progress_bars=progress_bars,
+            progress_renderer=_progress_renderer, progress_state_sink=_progress_state_sink)
     if source_compilation is not None:
         source_compilation = str(source_compilation).lower()
         if source_compilation not in {"auto", "serial", "parallel"}:
             raise ValueError(
                 "source_compilation must be 'auto', 'serial', or 'parallel'"
             )
-        if source_compilation == "serial":
+        if source_compilation in {"serial", "parallel"}:
+            raise ValueError("serial/parallel schedules require a supplied source list")
+        if source_compilation == "auto":
             if (
                 compilation_directory is not None
                 or partitioned_directory is not None
             ):
                 raise ValueError(
-                    "serial source compilation does not accept a compilation directory"
+                    "auto is a holistic compile; it does not accept a partition directory"
                 )
-        else:
-            if (
-                compilation_directory is not None
-                and partitioned_directory is not None
-            ):
-                raise ValueError(
-                    "parallel source compilation received both compilation_directory "
-                    "and the legacy partitioned_directory"
-                )
-            partitioned_directory = (
-                compilation_directory
-                if compilation_directory is not None
-                else partitioned_directory
-            )
-            if partitioned_directory is None:
-                raise ValueError(
-                    f"{source_compilation} source compilation requires "
-                    "compilation_directory"
-                )
-            partitioned_options = dict(partitioned_options)
-            declared_schedule = partitioned_options.get("schedule_mode")
-            if (
-                declared_schedule is not None
-                and str(declared_schedule).lower() != source_compilation
-            ):
-                raise ValueError(
-                    "source_compilation conflicts with partitioned schedule_mode"
-                )
-            partitioned_options["schedule_mode"] = source_compilation
     elif compilation_directory is not None:
-        raise ValueError(
-            "compilation_directory requires source_compilation='auto' or 'parallel'"
-        )
+        raise ValueError("compilation_directory is not used by holistic auto; supply source-list output directories")
     if partitioned_directory is not None:
         from .project_compilation_product import compile_partitioned_source, load_partitioned_source_interfaces
         options = dict(kwargs)
@@ -45442,7 +45438,7 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
         if len(args) > 2:
             raise TypeError("partitioned source accepts source and entrypoint positional arguments only")
         options.pop("name", None)
-        options.pop("progress_bars", None)
+        progress_bars = options.pop("progress_bars", None)
         progress = options.pop("progress", None)
         source_options = {key: options.pop(key) for key in (
             "tensor_ssa_reference", "tensor_code_references", "runtime_closure_only",
@@ -45455,11 +45451,18 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             raise TypeError(f"partitioned source does not support these source options: {sorted(set(options) - allowed)}")
         if "interface_tiles" in partitioned_options:
             raise TypeError("public partitioned source requires native interface tiles")
-        manifest = compile_partitioned_source(source, partitioned_directory, entrypoint=entrypoint,
-            **options, **partitioned_options, interface_tiles=True,
-            source_options=source_options,
-            progress=None if progress is None else lambda event: progress(f"partitioned-source: {event}"))
-        result = load_partitioned_source_interfaces(manifest)
+        display = compile_progress(progress_bars, collect_profile=_collect_profile,
+                                   renderer=_progress_renderer,
+                                   state_sink=_progress_state_sink)
+        with display:
+            def report_partitioned(event):
+                display.compilation_event(event)
+                if event.get("stage") == "source_plan" and progress is not None:
+                    progress(str(event["message"]))
+            manifest = compile_partitioned_source(source, partitioned_directory, entrypoint=entrypoint,
+                **options, **partitioned_options, interface_tiles=True,
+                source_options=source_options, progress=report_partitioned)
+            result = load_partitioned_source_interfaces(manifest)
         module = result[0] if isinstance(result, tuple) else result
         if hasattr(module, "metadata"):
             module.metadata["source_compilation"] = {
@@ -45476,8 +45479,40 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
                 ),
             }
         return result
-    if partitioned_options:
-        raise TypeError("partitioned_options requires partitioned_directory")
+    from .graph_work import CompilerWorkPolicy, compiler_work_policy, _COMPILER_SCHEDULE
+    from .work_contract import active_contract
+    contract = active_contract()
+    policy = _COMPILER_SCHEDULE.get() or CompilerWorkPolicy(
+        memory_bytes=partitioned_options.get("max_total_resident_bytes", contract.memory_budget_bytes),
+        reserve_bytes=partitioned_options.get("system_reserve_bytes", contract.memory_system_reserve_bytes),
+        working_bytes=partitioned_options.get("thread_working_bytes", int(os.environ.get("TURING_COMPILER_THREAD_WORKING_BYTES", 128 << 20))),
+        jobs=partitioned_options.get("jobs"))
+    with compiler_work_policy(policy):
+        return _run_source_lowering(
+            _lower_ast_source_to_ssa_impl, *args,
+            compile_profile=_collect_profile,
+            progress_renderer=_progress_renderer,
+            compile_progress_state_sink=_progress_state_sink,
+            source_compilation="auto",
+            **kwargs,
+        )
+
+
+def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
+    """One book, memory regulator, progress lifetime and final gate for lowering.
+
+    A frozen resolved unit has already completed ingestion and reduction in
+    its coordinator. Its deployment/SSA passes must enter this same transaction
+    as source lowering; calling the implementation directly bypassed both
+    compression and structured stage publication in partitioned workers.
+    """
+
+    _collect_profile = kwargs.pop("compile_profile", True)
+    _progress_renderer = kwargs.pop("progress_renderer", None)
+    _progress_state_sink = kwargs.pop("compile_progress_state_sink", None)
+    source_compilation = kwargs.pop("source_compilation", None)
+    completed_stage_keys = kwargs.pop("completed_stage_keys", ())
+    live_roots = kwargs.pop("live_roots", ())
     from .identity_concordance import begin_identity_book, end_identity_book
 
     resumed_book = kwargs.pop("identity_book", None)
@@ -45513,13 +45548,24 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     try:
         declare_progress_bars_policy(_bars.enabled)
         _bars.open()
-        result = _lower_ast_source_to_ssa_impl(*args, **kwargs)
+        if completed_stage_keys:
+            _bars.inherit_completed_stages(completed_stage_keys)
+        for root in live_roots:
+            _regulator.register_live_root(root)
+            if _regulator.live_arena is not None:
+                from .live_tiles import TiledObject, adopt_digraph
+                adopt_digraph(root, _regulator.live_arena)
+                if isinstance(root, TiledObject):
+                    _regulator.live_arena.attach(root)
+        result = lowering(*args, **kwargs)
         # The late dominance repairs run inside the implementation, before
         # the full-native gate and its first frame-formal concordance (see
         # ``_settle_late_dominance_repairs``).  A module that never reached
         # that point (no full-native policy) is settled here; for the
         # others every substitution is already made and this finds none.
         module = result[0] if isinstance(result, tuple) else result
+        if module is not None:
+            compile_stage("pre-native-repairs")
         from .ssa_object_context import publish_native_object_requirements
         publish_native_object_requirements(module)
         reconciled, _record_phi_temporal_repairs = (
@@ -45579,7 +45625,7 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
                 )
             )
         ok = True
-        if _regulator.live_arena is not None:
+        if module is not None and _regulator.live_arena is not None:
             from dataclasses import asdict
             _live_arena = _regulator.live_arena
             module.metadata["live_tiles"] = {
@@ -45590,16 +45636,19 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
                 "tile_rows": _live_arena.tile_rows,
                 "bucket_rows": _live_arena.bucket_rows,
             }
-        if _regulator.graph_pool is not None:
+        if module is not None and _regulator.graph_pool is not None:
             module.metadata["graph_work"] = _regulator.graph_pool.summary()
             if _progress is not None:
                 _progress(f"graph-work: {_regulator.graph_pool.summary()}")
-        if source_compilation == "serial":
+        if module is not None and source_compilation == "auto":
+            from .graph_work import compiler_work_settings
             module.metadata["source_compilation"] = {
                 "schema": "turing.source-compilation-front-end.v1",
-                "mode": "serial",
+                "mode": "auto",
                 "partition_point": None,
                 "unit_count": 1,
+                "worker_origin": "existing-deployment-regions",
+                "compiler_work": dict(compiler_work_settings().stats),
             }
         return result
     finally:

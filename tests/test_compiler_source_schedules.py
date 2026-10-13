@@ -1,0 +1,197 @@
+"""Small regressions for supplied schedules and in-compile deployment work."""
+import dataclasses
+import io
+import pickle
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def bounded_compiler_memory():
+    from src.compiler.work_contract import active_contract, scoped_work_contract
+    with scoped_work_contract(dataclasses.replace(active_contract(),
+            memory_budget_bytes=1 << 30, memory_elastic_available_percent=0)):
+        yield
+
+
+def test_auto_does_not_call_the_prepartitioner(monkeypatch):
+    from src.compiler import fortran_c_shell as shell, project_compilation_product as products
+    observed = []
+    monkeypatch.setattr(products, "compile_partitioned_source",
+                        lambda *a, **k: pytest.fail("auto prepartitioned source"))
+    monkeypatch.setattr(shell, "_run_source_lowering", lambda *a, **k: observed.append((a, k)))
+    shell.lower_ast_source_to_ssa("def root(x):\n    return x + 1\n", "root", source_compilation="auto")
+    assert observed[0][1]["source_compilation"] == "auto"
+    with pytest.raises(ValueError, match="source list"):
+        shell.lower_ast_source_to_ssa("def root():\n    return 1\n", "root", source_compilation="parallel")
+
+
+def test_parallel_book_posts_are_one_atomic_concordance_transaction():
+    from src.compiler.identity_concordance import (IdentityBook, Mode, Novel,
+                                                   concurrent_identity_publication)
+    from src.compiler.concordance_declarations import COMPILE_POLICY, COMPILE_ENTRY, POLICY_DECLARATION
+    book = IdentityBook()
+    def post(index):
+        return book.post(COMPILE_POLICY, (str(index),), str(index), stage=COMPILE_ENTRY,
+                         provenance=Novel(POLICY_DECLARATION, ()), mode=Mode.CONCORD)
+    with concurrent_identity_publication(book), ThreadPoolExecutor(max_workers=2) as pool:
+        refs = tuple(pool.map(post, range(32)))
+    assert type(book) is IdentityBook
+    assert book.clock[0] == 32
+    assert sorted(book.stamp_of(ref) for ref in refs) == list(range(32))
+    assert all(book.mint_of(ref) is not None for ref in refs)
+
+
+def test_workers_consume_existing_region_closures_without_recutting():
+    from src.compiler.hierarchical_plan import PlanClosure, PlanLine, expand_plan_regions
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+    from src.compiler.graph_work import CompilerWorkPolicy, compiler_work_policy
+    regions = tuple(PlanClosure(f"region_{i}", (0, 1, 2), (
+        PlanLine.create("Max", inputs=(0, 1, 2), outputs=(3 + i,), input_roles=("operand", "operand", "operand")),
+    ), closure_id=i, value_shapes=tuple((j, (), "float64") for j in range(5))) for i in range(2))
+    _book, token = begin_identity_book()
+    policy = CompilerWorkPolicy(memory_bytes=1 << 30, working_bytes=1 << 20)
+    try:
+        with compiler_work_policy(policy):
+            expanded = expand_plan_regions(PlanClosure("root", (), regions), resident_limit=2)
+        assert tuple(expanded) == tuple((region.name, region.closure_id) for region in regions)
+        temporaries = [int(instructions[0].res.id) for instructions in expanded.values()]
+        assert len(set(temporaries)) == 2
+        assert policy.stats["outstanding_peak"] == 2
+    finally:
+        end_identity_book(token)
+
+
+def test_live_standard_stream_checkpoint_preserves_module_slot():
+    import sys
+    from rich.console import Console
+    from rich.live import Live
+    from src.compiler.project_compilation_product import _dump_resolved_process_graph
+    with Live("status", console=Console(file=io.StringIO(), force_terminal=True), auto_refresh=False):
+        stream = io.BytesIO()
+        _dump_resolved_process_graph({"source_stdout": sys.stdout}, stream)
+        assert pickle.loads(stream.getvalue())["source_stdout"] is sys.stdout
+    with pytest.raises(pickle.PicklingError, match="module slot"):
+        _dump_resolved_process_graph(io.StringIO(), io.BytesIO())
+
+
+def test_terminal_queue_keeps_full_log_and_summarizes_numeric_runs(tmp_path, monkeypatch):
+    from src.compiler.shell_telemetry import CompileProgress
+    monkeypatch.chdir(tmp_path)
+    stream = io.StringIO()
+    display = CompileProgress(enabled=True, stream=stream, renderer="rich", heartbeat=None)
+    with display:
+        for index in range(32):
+            display.log(f"region node={index} prepared")
+    from pathlib import Path
+    saved = Path(display.log_path).read_text(encoding="utf-8")
+    assert saved.splitlines() == [f"region node={index} prepared" for index in range(32)]
+    assert "related lines" in stream.getvalue()
+
+
+def test_two_real_sources_share_scheduler_and_ten_stage_status():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.extraction_contract import ExtractionContract
+    contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_program_abi({
+        "records": {}, "bindings": [], "values": [
+            {"function": name, "parameter": "x", "storage": "scalar", "dtype": "float64",
+             "rank": 0, "shape": [], "python_type": "builtins.float"} for name in ("left", "right")],
+    })
+    results = lower_ast_source_to_ssa([
+        {"label": name, "source": f"def {name}(x):\n    return x * {factor}.0 + 1.0\n",
+         "entrypoint": name, "options": {"extraction_contract": contract}}
+        for name, factor in (("left", 2), ("right", 3))], source_compilation="parallel",
+        partitioned_options={"max_total_resident_bytes": 1 << 30,
+                             "max_worker_memory_bytes": 1 << 30,
+                             "worker_resident_reservation_bytes": 1 << 20}, progress_bars=False)
+    assert len(results) == 2
+    for module, outputs, exports in results:
+        assert outputs[exports[0]]
+        assert module.metadata["source_compilation"]["partition_point"] is None
+        stages = module.metadata["compile_profile"]["stages"]
+        assert len(stages) == 10
+        assert all(stage["state"] == "done" for stage in stages)
+
+
+def test_one_failed_source_does_not_stop_independent_work():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.project_compilation_product import SourceListCompilationError
+    from src.compiler.shell_telemetry import CompileProgress
+    display = CompileProgress(enabled=False, collect_profile=True)
+    with display, pytest.raises(SourceListCompilationError) as caught:
+        lower_ast_source_to_ssa([
+            {"label": "bad", "source": "def bad(:\n", "entrypoint": "bad",
+             "options": {"extraction_contract": "extraction_contracts/program_extraction.yaml"}},
+            {"label": "good", "source": "def good():\n    return 7\n", "entrypoint": "good",
+             "options": {"extraction_contract": "extraction_contracts/program_extraction.yaml"}},
+        ], source_compilation="parallel", progress_bars=False,
+            partitioned_options={"max_total_resident_bytes": 1 << 30,
+                "max_worker_memory_bytes": 1 << 30, "worker_resident_reservation_bytes": 1 << 20})
+    assert caught.value.failures[0]["label"] == "bad"
+    assert caught.value.results[1][2]
+    assert any(lane["label"] == "bad" and lane["status"] == "failed" for lane in display._workers.values())
+    assert any(lane["label"] == "good" and lane["status"] == "complete" for lane in display._workers.values())
+
+
+def test_rule_summary_survives_background_redraws(tmp_path, monkeypatch):
+    from src.compiler.shell_telemetry import CompileProgress, compile_rule_batch
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COLUMNS", "160")
+    display = CompileProgress(enabled=True, stream=io.StringIO(), renderer="rich", heartbeat=None)
+    with display, compile_rule_batch(2, names=("left", "right")) as batch:
+        batch.complete("left", 2.0)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            line = pool.submit(lambda: display.bars._frame().renderables[0].plain).result()
+        assert "Rules 1/2" in line and "average" in line and "projected total" in line
+
+
+def test_single_source_stage_advances_after_inner_workers_join(tmp_path, monkeypatch):
+    from src.compiler.shell_telemetry import CompileProgress
+    from rich.console import Console
+    monkeypatch.chdir(tmp_path)
+    display = CompileProgress(enabled=True, stream=io.StringIO(), renderer="rich", heartbeat=None)
+    with display:
+        display.stage("ssa-lowering")
+        display.worker("region-thread", label="SSA region", status="done", stage_number=9, stage_count=10,
+            stages=[{"key": stage.key, "label": stage.label, "state": "done" if index < 9 else "pending"}
+                    for index, stage in enumerate(display.stages)])
+        display.stage("pre-native-repairs")
+        output = io.StringIO()
+        display.bars.console.width = 160
+        display.bars.console.height = 30
+        Console(file=output, width=160, height=30).print(display.bars._frame())
+        frame = output.getvalue()
+        assert "source compiler" in frame and "pre-native repairs" in frame and "running" in frame
+
+
+def test_source_planning_cache_keeps_other_running_books():
+    from src.compiler.identity_concordance import IdentityBook
+    from src.compiler.glsl_deployment_strategy import _child_signature_results, release_compile_planning_state
+    first, second = IdentityBook(), IdentityBook()
+    first_answers = _child_signature_results(first)
+    first_answers["answer"] = 42
+    _child_signature_results(second)["answer"] = 7
+    assert _child_signature_results(first) is first_answers
+    release_compile_planning_state(second)
+    assert _child_signature_results(first)["answer"] == 42
+    release_compile_planning_state(first)
+
+
+def test_supplied_law_list_produces_exact_native_pieces(tmp_path):
+    import numpy as np
+    import sympy as sp
+    from src.compiler.native_package import pieces_from_equations
+    x = sp.Symbol("x")
+    pieces = pieces_from_equations({
+        "left_law": (sp.Eq(sp.Symbol("result"), x + 2, evaluate=False),),
+        "right_law": (sp.Eq(sp.Symbol("result"), x * 3, evaluate=False),),
+    }, 1, directory=tmp_path, source_compilation="parallel",
+        partitioned_options={"max_total_resident_bytes": 1 << 30,
+                             "max_worker_memory_bytes": 1 << 30,
+                             "worker_resident_reservation_bytes": 1 << 20},
+        progress=lambda _message: None)
+    for name, expected in (("left_law", 9.0), ("right_law", 21.0)):
+        result, = pieces[name](np.array([7.0]))
+        np.testing.assert_array_equal(result, np.array([expected]))
+        assert len(pieces[name].module.metadata["compile_profile"]["stages"]) == 10

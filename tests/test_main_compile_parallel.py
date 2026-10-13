@@ -81,27 +81,21 @@ def test_main_native_units_use_existing_record_boundaries(tmp_path):
     assert_native_outputs(tmp_path, module, outputs, exports, feeds, [13.0])
 
 
-def test_auto_frontend_selects_real_resolved_graph_width(tmp_path):
+def test_auto_frontend_keeps_whole_graph_and_native_record_result(tmp_path):
     module, outputs, exports = lower_ast_source_to_ssa(
         RECORD_SOURCE,
         "root",
         extraction_contract=record_contract(),
         source_compilation="auto",
-        compilation_directory=tmp_path / "auto-units",
         partitioned_options={
-            "jobs": 4,
-            "max_unit_source_nodes": 128,
-            "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3,
+            "thread_working_bytes": 1 << 20,
         },
         progress=lambda _message: None,
     )
 
-    manifest = module.metadata["partitioned_source_product"]
-    assert manifest["schedule_mode"] == "auto"
-    assert manifest["plan_parallel_width"] == 2
-    assert manifest["worker_jobs"] == 2
-    assert manifest["concurrent_workers_peak"] == 2
+    assert "partitioned_source_product" not in module.metadata
+    assert module.metadata["source_compilation"]["mode"] == "auto"
+    assert module.metadata["source_compilation"]["partition_point"] is None
     feeds = {
         int(value_id): np.array({"x": 2.0, "y": 3.0}[field.name])
         for record in module.record_tables[exports[0]].records.values()
@@ -171,16 +165,14 @@ def test_normal_linked_dt_entry_requests_existing_unit_workers(tmp_path, monkeyp
     monkeypatch.setattr(c_backend_llvm_ssa, "c_backend_repository_ssa_reference", lambda: None)
     class ObservedRoute(Exception):
         pass
-    def observe(source, entrypoint, **options):
-        assert entrypoint == "dt_system_over"
-        assert "def dt_system_over(" in source
-        if source_compilation == "serial":
-            assert "partitioned_options" not in options
-            assert "partitioned_directory" not in options
-        else:
-            assert options["partitioned_options"]["jobs"] >= 2
-            assert Path(options["partitioned_directory"]).is_relative_to(tmp_path)
-        assert options["retain_linked_piece_bodies"] is False
+    def observe(requests, **options):
+        assert len(requests) == 1
+        request = requests[0]
+        assert request["entrypoint"] == "dt_system_over"
+        assert "def dt_system_over(" in request["source"]
+        assert options["source_compilation"] == ("serial" if source_compilation == "serial" else "parallel")
+        assert "partitioned_directory" not in options
+        assert request["options"]["retain_linked_piece_bodies"] is False
         raise ObservedRoute()
     monkeypatch.setattr(compiler, "lower_ast_source_to_ssa", observe)
     with pytest.raises(ObservedRoute):
@@ -217,63 +209,30 @@ def test_partitioned_public_entry_preserves_module_import_identity(
     assert observed["source_options"]["python_package"] == "package"
 
 
-@pytest.mark.parametrize(
-    ("requested_mode", "worker_jobs", "effective_mode"),
-    (("parallel", 3, "parallel"), ("auto", 1, "serial")),
-)
-def test_universal_frontend_uses_total_graph_partitioning(
-    tmp_path, monkeypatch, requested_mode, worker_jobs, effective_mode,
-):
+@pytest.mark.parametrize("requested_mode", ["serial", "parallel"])
+def test_universal_frontend_hands_supplied_list_to_scheduler(monkeypatch, requested_mode):
     import src.compiler.project_compilation_product as products
 
     observed = {}
 
-    def compile_partitioned(source, directory, **options):
-        observed.update({
-            "source": source,
-            "directory": Path(directory),
-            "options": options,
-        })
-        return {
-            "status": "sealed", "route": "resolved-graph-units",
-            "schedule_mode": options["schedule_mode"],
-            "worker_jobs": worker_jobs,
-            "plan_parallel_width": 3,
-        }
-
-    monkeypatch.setattr(products, "compile_partitioned_source", compile_partitioned)
-
-    class Module:
-        metadata = {}
-
-    monkeypatch.setattr(
-        products, "load_partitioned_source_interfaces",
-        lambda manifest: (Module(), {}, ("root",)),
-    )
+    def schedule(requests, **options):
+        observed.update(requests=requests, **options)
+        return ["result"]
+    monkeypatch.setattr(products, "compile_source_submissions", schedule)
+    requests = [{"source": "def root(value):\n    return value + 1\n", "entrypoint": "root"}]
     result = lower_ast_source_to_ssa(
-        "def root(value):\n    return value + 1\n",
-        "root",
+        requests,
         source_compilation=requested_mode,
-        compilation_directory=tmp_path / "compile",
         partitioned_options={"jobs": 3},
     )
-
-    assert result[0].metadata["source_compilation"] == {
-        "schema": "turing.source-compilation-front-end.v1",
-        "mode": requested_mode,
-        "effective_mode": effective_mode,
-        "partition_point": "resolved-process-graph",
-        "unit_count": 0,
-        "plan_parallel_width": 3,
-    }
-    assert observed["directory"] == tmp_path / "compile"
+    assert result == ["result"]
+    assert observed["requests"] is requests
     assert observed["options"]["jobs"] == 3
-    assert observed["options"]["schedule_mode"] == requested_mode
-    assert observed["options"]["interface_tiles"] is True
+    assert observed["mode"] == requested_mode
 
 
 def test_universal_frontend_rejects_ambiguous_parallel_directories(tmp_path):
-    with pytest.raises(ValueError, match="both compilation_directory"):
+    with pytest.raises(ValueError, match="supplied source list"):
         lower_ast_source_to_ssa(
             "def root(value):\n    return value\n",
             "root",
@@ -296,22 +255,16 @@ def test_universal_frontend_serial_uses_the_canonical_whole_graph_compiler():
         }],
     })
     module, outputs, exports = lower_ast_source_to_ssa(
-        "def root(value):\n    return value * 2.0 + 1.0\n",
-        "root",
+        [{"source": "def root(value):\n    return value * 2.0 + 1.0\n", "entrypoint": "root",
+          "options": {"extraction_contract": contract, "progress": lambda _message: None}}],
         source_compilation="serial",
-        extraction_contract=contract,
-        progress=lambda _message: None,
         progress_bars=False,
-    )
+    )[0]
 
     assert len(exports) == 1
     assert outputs[exports[0]]
-    assert module.metadata["source_compilation"] == {
-        "schema": "turing.source-compilation-front-end.v1",
-        "mode": "serial",
-        "partition_point": None,
-        "unit_count": 1,
-    }
+    assert module.metadata["source_compilation"]["mode"] == "auto"
+    assert module.metadata["source_compilation"]["partition_point"] is None
 
 
 def test_resolved_graph_checkpoint_preserves_code_objects_and_their_type():

@@ -166,15 +166,12 @@ def expand_plan_regions(
 
     A region's lowering may synthesize temporaries an authored graph never
     named (the binary ``Max`` chain of a variadic ``max(a, b, c)``).  Those
-    temporaries live in the SAME value-id space as every other id of the
-    function, so they are allocated from one watermark that starts above
-    every id the function already has in play (``first_free_value_id``:
-    the plan alone is not the function -- control-only graph values such as
-    an ``is not None`` test are never plan lines) and advances past each
-    region's synthesized ids: no two regions coin the same temporary, and
-    no temporary lands on an authored id (region 2's ``max`` chain coined
-    50 while region 5's authored ``Div`` was 50, and the emitted function
-    defined one result twice).  Every consumer of a region's instructions
+    temporaries live in the SAME value-id space as authored graph values.
+    The sanctioned monotonic mint source allocates them atomically; neither
+    a worker-local watermark nor a region's position can coin an identity.
+    This prevents the historical collision between a Max-chain temporary
+    and an authored Div result, including when regions lower concurrently.
+    Every consumer of a region's instructions
     must read this one expansion so all stages agree on which ids the
     region defines.
     """
@@ -182,24 +179,44 @@ def expand_plan_regions(
     watermark = max(int(first_free_value_id), plan_value_id_watermark(plan))
     expanded = ({} if resident_limit is None else
                 RegionInstructionStore(resident_limit).view("expanded"))
-    for item in plan.items:
-        if not (
-            isinstance(item, PlanClosure) and item.name.startswith("region_")
-        ):
-            continue
+    regions = tuple(item for item in plan.items
+                    if isinstance(item, PlanClosure) and item.name.startswith("region_"))
+
+    def lower(item):
+        # The planner already owns this flat closure and its exact captures.
+        # Synthesised values use the sanctioned, thread-safe mint source;
+        # no worker assigns source ids or independently subdivides the plan.
+        from .shell_telemetry import compile_work
+        with compile_work("deployment regions", label=f"SSA region {item.name}"):
+            return plan_region_to_ssa_instrs(
+                item, first_free_value_id=watermark,
+                function_scope=function_scope, lexical_read_scope=lexical_read_scope,
+            )
+
+    def publish(_ordinal, item, instructions):
+        nonlocal watermark
+        for instruction in instructions:
+            for value in (*instruction.args,
+                          *((instruction.res,) if instruction.res is not None else ())):
+                watermark = max(watermark, int(value.id) + 1)
+        expanded[(str(item.name), int(item.closure_id))] = instructions
+
+    from .graph_work import bounded_compiler_work, compiler_work_settings
+    policy = compiler_work_settings()
+    if policy.capacity(len(regions)) > 1:
+        from .identity_concordance import current_identity_book, concurrent_identity_publication
+        with concurrent_identity_publication(current_identity_book()):
+            bounded_compiler_work(regions, lower, publish, policy=policy,
+                                  label="deployment region SSA lowering")
+        return expanded
+    for item in regions:
         instructions = plan_region_to_ssa_instrs(
             item,
             first_free_value_id=watermark,
             function_scope=function_scope,
             lexical_read_scope=lexical_read_scope,
         )
-        for instruction in instructions:
-            for value in (
-                *instruction.args,
-                *((instruction.res,) if instruction.res is not None else ()),
-            ):
-                watermark = max(watermark, int(value.id) + 1)
-        expanded[(str(item.name), int(item.closure_id))] = instructions
+        publish(0, item, instructions)
     return expanded
 
 

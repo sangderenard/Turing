@@ -1,3 +1,58 @@
+2026-10-13 SUPPLIED SOURCE SCHEDULES + IN-COMPILE AUTO (CURRENT):
+`lower_ast_source_to_ssa(source, entry, source_compilation="auto")` now runs
+the whole compiler without a preparatory source partition or unit-worker DAG.
+Automatic threads consume the flat region closures already formed by normal
+deployment planning, during SSA region expansion. Their temporary value ids
+come from the existing atomic monotonic issuer; their facts and provenance
+publish to the same IdentityBook under one joined publication transaction.
+Page reads share that transaction. The ordinary serial book/page methods have
+no added lock dispatch outside an actual parallel region join.
+
+Explicit serial/parallel schedules accept caller-supplied source-request lists.
+Each submission still lowers through the public source entry with auto inside.
+The bootstrap supplies its authored pieces and an explicit pieces-before-outer
+barrier to the existing project publisher. Orbital supplies its missing/stale
+law pieces, then the complete linked system. The scheduler does not invent a
+replacement source cut. Explicit legacy `partitioned_directory` remains
+available; the earlier receipt describing auto as prepartitioning a resolved
+unit DAG below is historical, not the current automatic path.
+
+Both commands default to a parallel supplied schedule. Worker admission uses
+live RAM headroom rather than a fixed global worker count: 10 GiB aggregate,
+10 GiB per-worker compression budgets, 2 GiB reservation/system reserve, and
+128 MiB inner working reservations. Bootstrap admission can contract to its
+2 GiB minimum; the existing signed decoded-cache elasticity remains active.
+Budgets never terminate running compiles. Independent source submissions keep
+working after a lone failure; final failures retain their original tracebacks.
+Per-book specialization caches no longer clear another running book's answers.
+
+There is one parent-owned terminal compositor for the entire command, including
+native publication. Exact ten-stage states and inner-thread lanes feed that
+same display. Failed lanes survive thread reuse, and joined region snapshots
+cannot hide the source coordinator's later pre-native stage. The rule clock is
+retained by the terminal owner so background redraws cannot remove its line.
+Log producers enqueue diagnostics; console writes are batched, numeric-shaped
+repeats are condensed, and oversized diagnostics have a bounded console preview.
+Complete diagnostic text is retained in build/compiler-logs and its path is
+printed at completion. Live standard-stream proxies checkpoint through their
+existing import-owned module slots, not their ConsoleThreadLocals internals.
+
+Verification: 32 selected small tests passed in 9.24 seconds, with a 1-GiB
+compiler budget and decoded elasticity disabled for those tests. The final
+single-source/after-join display regression also passed in 0.20 seconds.
+The gate includes two real parallel source programs, two actual LLVM law
+pieces with exact native results, whole-graph record native parity, independent
+failure continuation, atomic publication, command plumbing and real Rich
+rendering. The mapping audit reports 0 identity findings (its 21 unsourced facts
+remain visible and were not suppressed). Syntax and both CLI-help checks pass.
+No full bootstrap or orbital compile was launched; existing Python processes
+were neither inspected nor disturbed. Large-run throughput and remaining
+compiler semantic frontiers are not proven by this small gate.
+
+From C:/dev/Powershell/turing, user-owned runs:
+  python -u -m tools.bootstrap_compiler_whole_program
+  python -u tools/compiler_probes/profile_memory_n2.py all --backend llvm
+
 2026-10-13 ELASTIC DECODED COMPILER FRONT (CURRENT WORKTREE):
 Once live compiler storage enters a compressed tier, its backing tier remains
 monotonic but its decoded working front is now elastic.  Its effective process

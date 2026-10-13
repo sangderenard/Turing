@@ -140,10 +140,17 @@ def _planned_unit_progress_writer(
     root = directory.resolve()
     root.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
+    compiler_state = None
+
+    def publish_compiler(state):
+        nonlocal compiler_state
+        compiler_state = dict(state)
+        report(f"compiler stage {state['stage_number']}/{state['stage_count']}: "
+               f"{state['stage_label']} ({state['status']})")
 
     def report(message: str) -> None:
         text = str(message)
-        phase = (
+        phase = compiler_state["stage_key"] if compiler_state is not None else (
             "resolved-graph-load" if "loading post-reduction" in text else
             "deployment-selection" if "selecting complete" in text else
             "deployment-instantiation" if "instantiating complete" in text else
@@ -162,6 +169,7 @@ def _planned_unit_progress_writer(
                 "resident_bytes": int(measured[0]),
                 "private_bytes": int(measured[1]),
             } if measured is not None else {}),
+            **({"compiler": compiler_state} if compiler_state is not None else {}),
         }
         payload = {
             "schema": "turing.resolved-process-graph-unit-progress.v1",
@@ -174,6 +182,7 @@ def _planned_unit_progress_writer(
         _atomic_json(destination, payload)
         print(text, flush=True)
 
+    report.compiler_state = publish_compiler
     return report
 
 
@@ -657,6 +666,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.output,
                 linked_units=linked_units,
                 progress=planned_progress,
+                compile_progress_state_sink=planned_progress.compiler_state,
             )
         except Exception as error:
             failure = {

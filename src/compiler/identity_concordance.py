@@ -5234,6 +5234,89 @@ class IdentityBook:
         return None
 
 
+class _ConcurrentIdentityBook(IdentityBook):
+    """The same authority while isolated deployment workers publish to it.
+
+    A post's fact, provenance edges, reverse index and clock tick are one
+    transaction. Copy-on-read materialisation uses book-wide temporary state
+    and must participate in that transaction too. The serial book has no lock
+    dispatch in its hot path: this capability exists only across a worker join.
+    """
+
+    def _page(self, name):
+        with self._publication_lock:
+            page = IdentityBook._page(self, name)
+            if type(page) is IdentityPage:
+                page.__class__ = _ConcurrentIdentityPage
+            return page
+
+
+class _ConcurrentIdentityPage(IdentityPage):
+    """Page reads and writes observe the same atomic book publication."""
+
+
+def _concurrent_book_operation(operation):
+    from functools import wraps
+
+    @wraps(operation)
+    def locked(self, *args, **kwargs):
+        with self._publication_lock:
+            return operation(self, *args, **kwargs)
+    return locked
+
+
+for _operation in ("post", "latest_ref", "mint_scope", "_source_stamp",
+                   "_materialise_row", "_preserve_fork_snapshots", "register_read_through",
+                   "register_scope_projection", "edges_into", "edges_out_of", "mint_of"):
+    setattr(_ConcurrentIdentityBook, _operation,
+            _concurrent_book_operation(getattr(IdentityBook, _operation)))
+
+
+def _concurrent_page_operation(operation):
+    from functools import wraps
+
+    @wraps(operation)
+    def locked(self, *args, **kwargs):
+        with self.book._publication_lock:
+            return operation(self, *args, **kwargs)
+    return locked
+
+
+for _operation in ("latest", "latest_column", "history", "cell", "stamp_at", "is_virtual",
+                   "scope_rows", "materialised_scope_rows", "_stamp", "set", "revise", "concord"):
+    setattr(_ConcurrentIdentityPage, _operation,
+            _concurrent_page_operation(getattr(IdentityPage, _operation)))
+
+
+def concurrent_identity_publication(book):
+    """Activate atomic publication on this book until all workers have joined."""
+    from contextlib import contextmanager
+    from threading import RLock
+
+    @contextmanager
+    def joined():
+        if isinstance(book, _ConcurrentIdentityBook):
+            yield book
+            return
+        original_class = type(book)
+        if original_class is not IdentityBook:
+            raise TypeError("concurrent publication requires the authoritative IdentityBook")
+        book._publication_lock = RLock()
+        book.__class__ = _ConcurrentIdentityBook
+        for page in dict.values(book.pages):
+            if type(page) is IdentityPage:
+                page.__class__ = _ConcurrentIdentityPage
+        try:
+            yield book
+        finally:
+            for page in dict.values(book.pages):
+                if type(page) is _ConcurrentIdentityPage:
+                    page.__class__ = IdentityPage
+            book.__class__ = original_class
+            del book._publication_lock
+    return joined()
+
+
 @dataclass(frozen=True)
 class SequenceContract:
     """The physical row contract owned by one resident sequence identity."""

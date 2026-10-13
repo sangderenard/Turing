@@ -7,8 +7,8 @@ for every gain. This module now describes one composition instead:
 
 * the Python coordinator and IdentityBook remain the semantic authority;
 * existing native foundations are named, versioned boundary components;
-* the whole outer compiler stage is submitted through the public partitioned
-  source compiler used by ordinary compiled programs.
+* authored pieces, followed by the whole outer compiler stage, are submitted
+  as a source list through the public compiler used by ordinary programs.
 
 Every component version includes its authored source, its declared boundary
 contract and the compiler toolchain fingerprint. Source changes therefore
@@ -215,14 +215,15 @@ def build_whole_program_compiler(
 ) -> WholeProgramCompilerProduct:
     """Bootstrap the complete ProcessGraph-to-AOT outer partition.
 
-    Bootstrap uses the same public partitioned compiler entry as every other
+    Bootstrap uses the same public source-list compiler entry as every other
     program. This function only selects the existing outer seam and gives the
     resulting product a source/toolchain-derived version directory; it owns no
     compilation, memory, timeout, or fallback policy of its own.
     """
 
     from .fortran_c_shell import lower_ast_source_to_ssa
-    from .project_compilation_product import DEFAULT_PROJECT_EXTRACTION_CONTRACT
+    from .project_compilation_product import (DEFAULT_PROJECT_EXTRACTION_CONTRACT,
+        discover_authored_calls, dependency_ordered_authored_calls)
 
     destination = Path(directory).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -234,7 +235,6 @@ def build_whole_program_compiler(
     )
 
     source_path = repository / boundary["source"]
-    source_module = ".".join(source_path.relative_to(repository).with_suffix("").parts)
     partitioned_options = {
         "max_total_resident_bytes": max_total_resident_bytes,
         "minimum_total_resident_bytes": minimum_total_resident_bytes,
@@ -248,23 +248,35 @@ def build_whole_program_compiler(
     }
     if jobs is not None:
         partitioned_options["jobs"] = jobs
-    lower_ast_source_to_ssa(
-        source_path.read_text(encoding="utf-8"),
-        boundary["entrypoint"],
-        source_module=source_module,
-        python_package=source_module.rpartition(".")[0],
-        extraction_contract=DEFAULT_PROJECT_EXTRACTION_CONTRACT,
-        name="compiler_bootstrap",
-        source_compilation=source_compilation,
-        compilation_directory=product_root,
+    source = source_path.read_text(encoding="utf-8")
+    entry = boundary["entrypoint"]
+    # Preserve the bootstrap's authored pieces -> outer-call schedule. This
+    # list belongs to the caller; auto inside each compile makes no such list.
+    pieces = tuple(call.qualified_name for call in discover_authored_calls(source)
+                   if call.qualified_name.startswith(entry + ".<locals>."))
+    schedule = dependency_ordered_authored_calls(source, (*pieces, entry))
+    schedule = (*tuple(name for name in schedule if name != entry), entry)
+    requests = [{"label": name, "entrypoint": name, "source_path": source_path,
+                 "product_directory": product_root / "product", "authored_call": True,
+                 "after": pieces if name == entry else (),
+                 "extraction_contract": DEFAULT_PROJECT_EXTRACTION_CONTRACT}
+                for name in schedule]
+    lower_ast_source_to_ssa(requests,
+        source_compilation="parallel" if source_compilation == "auto" else source_compilation,
         partitioned_options=partitioned_options,
-        progress=progress,
     )
     product_manifest = product_root / "product" / "manifest.json"
     product = json.loads(product_manifest.read_text(encoding="utf-8"))
+    records = product.get("units", ())
+    if records:
+        complete = all(record.get("status") == "complete"
+                       and record.get("native_status") == "complete"
+                       and record.get("native_verification_status") == "verified"
+                       for record in records)
+        product["status"] = "sealed" if complete else "partial"
     manifest_value = {
         "schema": BOOTSTRAP_SCHEMA,
-        "stage": "built",
+        "stage": "built" if product.get("status") == "sealed" else "incomplete",
         "strategy": STRATEGY,
         "boundary": boundary,
         "product": product,

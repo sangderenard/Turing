@@ -82,6 +82,18 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
     )
     post_lowered_external_calls(module, compilation, source, book)
     entry = exports[0]
+    return _piece_from_lowered_law(compilation, law, batch, source,
+                                   module, outputs, entry, directory, optimization)
+
+
+def _piece_from_lowered_law(compilation, law, batch, source,
+                            module, outputs, entry, directory, optimization):
+    """Publish the existing piece ABI from an accepted compiler result."""
+    from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
+
+    metadata = compilation.function.metadata
+    argument_names = tuple(metadata["argument_names"])
+    output_names = tuple(metadata["output_names"])
     function = module.functions[entry]
     artifact = compile_artifact(
         emit_ssa_function_to_llvm(module, entry),
@@ -125,6 +137,76 @@ def piece_from_law(compilation: Any, law: str, batch: int, *,
         # compares it with the sources on disk; piece_staleness).
         compiler=route_compiler_record(),
     )
+
+
+def pieces_from_equations(
+    laws: Mapping[str, Sequence[Any]], batch: int, *, directory: str | Path,
+    source_compilation: str = "auto", partitioned_options: Mapping[str, Any] | None = None,
+    optimization: str = "O2", progress=None,
+) -> dict[str, LLVMPiece]:
+    """Supply the existing law-piece schedule; every submission lowers in auto.
+
+    Laws keep their own symbolic program books and piece ABIs. The public
+    compiler schedules the supplied sources, then each complete source compile
+    uses its own deployment regions. No replacement source partition is made.
+    """
+    from .identity_concordance import begin_identity_book, end_identity_book
+    from .symbolic_equation_compiler import compile_sympy_equations
+    from .external_functions import externals_for_law, post_lowered_external_calls
+    from .fortran_c_shell import lower_ast_source_to_ssa
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+
+    root = Path(directory).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if not laws:
+        return {}
+    prepared, requests = {}, []
+    for law, equations in laws.items():
+        book, token = begin_identity_book()
+        try:
+            if progress is not None:
+                progress(f"symbolic ingestion: {law}")
+            compilation = compile_sympy_equations(tuple(equations), name=law)
+            compilation, source, external_bindings = externals_for_law(
+                compilation, law, batch, book=book,
+            )
+            prepared[law] = (compilation, source, book)
+            requests.append({"label": law, "source": source, "entrypoint": law, "options": {
+                "python_bindings": {"AbstractTensor": AbstractTensor, **external_bindings},
+                "identity_book": book,
+                "tensor_ssa_reference": c_backend_repository_ssa_reference(),
+                "runtime_closure_only": True, "name": law,
+                "extraction_contract": batch_contract(law, tuple(compilation.function.metadata["argument_names"]), batch),
+            }})
+        finally:
+            end_identity_book(token)
+    schedule = "parallel" if source_compilation in {"auto", "units"} else source_compilation
+    results = lower_ast_source_to_ssa(requests, source_compilation=schedule,
+                                    partitioned_options=dict(partitioned_options or {}))
+    pieces = {}
+    from .shell_telemetry import active_rule_batch_progress, compile_substage
+    from time import monotonic
+    compile_substage("native law-piece publication")
+    for law, (module, outputs, exports) in zip(prepared, results):
+        started = monotonic()
+        compilation, source, book = prepared[law]
+        if len(exports) != 1:
+            raise ValueError(f"law {law!r} must retain its one authored export: {exports!r}")
+        _book, token = begin_identity_book(book)
+        try:
+            post_lowered_external_calls(module, compilation, source, book)
+            pieces[law] = _piece_from_lowered_law(
+                compilation, law, batch, source, module, outputs, exports[0], root / law, optimization,
+            )
+        finally:
+            end_identity_book(token)
+        rule_progress = active_rule_batch_progress()
+        if rule_progress is not None:
+            rule_progress.complete(law, monotonic() - started + sum(
+                row["seconds"] for row in module.metadata["compile_profile"]["stages"]))
+    return pieces
 
 
 def compose_native_package(source: str, entry: str, pieces: Mapping[str, LLVMPiece],

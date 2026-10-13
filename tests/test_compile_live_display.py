@@ -91,7 +91,7 @@ def test_rule_batch_clock_is_the_top_line_and_bars_remain_at_the_bottom():
                 current = frame_text(progress, width=100, height=18)
                 lines = current.splitlines()
                 assert lines[0].startswith(
-                    'Rules 1/4 | wall 15s | average 10s | projected total 40s')
+                    'Rules 1/4 | wall 15s | average 10s | projected total 45s')
                 assert len(lines) <= 18
                 assert current.index('Compiler timings') < current.index('6/10 (60%)')
                 assert '+2 other active counters' in current

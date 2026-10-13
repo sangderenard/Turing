@@ -16201,7 +16201,9 @@ _CHILD_CALLS_IN_PROGRESS: set[tuple] = set()
 def _child_signature_results(book: Any) -> dict:
     held = _CHILD_SIGNATURE_RESULTS.get(id(book))
     if held is None or held[0] is not book:
-        _CHILD_SIGNATURE_RESULTS.clear()
+        # Supplied source jobs own distinct books concurrently. A new book
+        # must not discard another running compile's specialization answers;
+        # release_compile_planning_state removes only the finished owner.
         held = _CHILD_SIGNATURE_RESULTS[id(book)] = (book, {})
     return held[1]
 
@@ -18009,7 +18011,7 @@ def release_compile_planning_state(book: Any) -> dict[str, int]:
     rest of the process.  Returns what was released, by item."""
 
     book_id = id(book)
-    shells = [key for key in _CALLSITE_SHELL_TYPE_CACHE if key[1] == book_id]
+    shells = [key for key in _CALLSITE_SHELL_TYPE_CACHE.copy() if key[1] == book_id]
     for key in shells:
         del _CALLSITE_SHELL_TYPE_CACHE[key]
     children = 0

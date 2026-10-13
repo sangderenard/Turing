@@ -104,9 +104,24 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from contextvars import ContextVar
 from typing import Any
 
 _HONORED_DEPLOYMENT = ("serial", "auto")
+_SCOPED_CONTRACT = ContextVar("compiler_work_contract", default=None)
+
+
+def scoped_work_contract(contract):
+    """A source worker's policy; never change another worker's active contract."""
+    from contextlib import contextmanager
+    @contextmanager
+    def scoped():
+        token = _SCOPED_CONTRACT.set(contract)
+        try:
+            yield contract
+        finally:
+            _SCOPED_CONTRACT.reset(token)
+    return scoped()
 _HONORED_COMPILER = ("zig-cc",)
 _HONORED_DESTINATION = ("native",)
 _HONORED_GLSL_GEMM = ("glslblas_gemm", "source_algorithm")
@@ -429,7 +444,7 @@ def active_contract() -> WorkContract:
     only one of them gets exactly the historical meaning.
     """
 
-    contract = _active
+    contract = _SCOPED_CONTRACT.get() or _active
     if contract is None:
         named = os.environ.get("TURING_WORK_CONTRACT")
         contract = _named(named) if named else PRESETS["develop"]

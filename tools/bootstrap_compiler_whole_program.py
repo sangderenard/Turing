@@ -15,7 +15,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Compile the ProcessGraph-to-AOT stage through the canonical "
-            "partitioned source compiler"
+            "source-list scheduler (auto inside each source)"
         ),
     )
     parser.add_argument(
@@ -26,16 +26,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--plan-only",
         action="store_true",
-        help="stop after publishing the resolved compilation-unit plan",
+        help="publish versioned boundary metadata without compiling",
     )
     parser.add_argument(
         "--jobs", type=int, default=None,
-        help="maximum workers; auto mode also limits this to resolved-plan width",
+        help="optional maximum source-list workers; inner auto remains implicit",
     )
     parser.add_argument(
-        "--source-compilation", choices=("auto", "parallel"), default="auto",
-        help="resolved-graph unit scheduling policy (default: auto)",
+        "--source-compilation", choices=("auto", "serial", "parallel"), default="auto",
+        help="auto inside each submitted source (default); legacy serial/parallel selects the source-list schedule",
     )
+    parser.add_argument("--source-schedule", choices=("serial", "parallel"), default="parallel")
     parser.add_argument("--max-total-gb", type=float, default=10.0)
     parser.add_argument(
         "--min-total-gb", type=float, default=2.0,
@@ -91,7 +92,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         product = build_whole_program_compiler(
             arguments.output,
             jobs=arguments.jobs,
-            source_compilation=arguments.source_compilation,
+            source_compilation=(arguments.source_schedule if arguments.source_compilation == "auto"
+                                else arguments.source_compilation),
             max_total_resident_bytes=(
                 None if arguments.max_total_gb is None
                 else int(arguments.max_total_gb * (1 << 30))
@@ -115,13 +117,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             progress=display.log,
         )
+        if product.product.get("status") != "sealed":
+            for record in product.product.get("units", ()):
+                if record.get("native_verification_status") != "verified":
+                    display.log(f"FAILED {record['qualified_name']}: "
+                        f"{record.get('error') or record.get('native_verification_reason') or record.get('native_failure') or record['status']}")
+            display.close(failed=True)
     print(
         f"outer partition {product.boundary['name']} "
         f"ended at {product.product.get('status')}; "
         f"manifest: {product.manifest}",
         flush=True,
     )
-    return 0
+    return 0 if product.product.get("status") == "sealed" else 1
 
 
 if __name__ == "__main__":

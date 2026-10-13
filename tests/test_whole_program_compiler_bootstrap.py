@@ -49,7 +49,7 @@ def test_boundary_version_changes_with_source_or_toolchain(tmp_path):
     assert changed_source["version"] != changed_toolchain["version"]
 
 
-def test_build_delegates_outer_partition_to_public_partitioned_compiler(
+def test_build_submits_authored_pieces_then_whole_to_public_source_scheduler(
     tmp_path, monkeypatch,
 ):
     from src.compiler import fortran_c_shell
@@ -59,12 +59,9 @@ def test_build_delegates_outer_partition_to_public_partitioned_compiler(
 
     observed = []
 
-    def compile_partitioned(source, entrypoint, **kwargs):
-        observed.append((source, entrypoint, kwargs))
-        manifest = (
-            Path(kwargs["compilation_directory"])
-            / "product" / "manifest.json"
-        )
+    def compile_partitioned(requests, **kwargs):
+        observed.append((requests, kwargs))
+        manifest = Path(requests[0]["product_directory"]) / "manifest.json"
         manifest.parent.mkdir(parents=True)
         manifest.write_text(json.dumps({"status": "sealed"}))
         return object()
@@ -77,14 +74,15 @@ def test_build_delegates_outer_partition_to_public_partitioned_compiler(
     )
 
     assert len(observed) == 1
-    source, entrypoint, options = observed[0]
-    assert "def _lower_process_graph_to_compilation(" in source
-    assert entrypoint == "_lower_process_graph_to_compilation"
-    assert options["source_module"].endswith(".aot_compile")
-    assert options["python_package"].endswith(".accelerator_backends")
+    requests, options = observed[0]
+    names = [request["entrypoint"] for request in requests]
+    assert names[-1] == "_lower_process_graph_to_compilation"
+    assert any(".<locals>." in name for name in names[:-1])
+    assert set(requests[-1]["after"]).issubset(names[:-1])
+    assert "def _lower_process_graph_to_compilation(" in Path(requests[0]["source_path"]).read_text()
     assert options["partitioned_options"]["jobs"] == 2
-    assert options["source_compilation"] == "auto"
-    assert Path(options["compilation_directory"]).name == product.boundary["version"]
+    assert options["source_compilation"] == "parallel"
+    assert Path(requests[0]["product_directory"]).parent.name == product.boundary["version"]
     assert product.product["status"] == "sealed"
     assert product.manifest.is_file()
 
@@ -99,12 +97,9 @@ def test_build_uses_requested_bootstrap_memory_contract_by_default(
 
     observed = {}
 
-    def compile_partitioned(_source, _entrypoint, **kwargs):
+    def compile_partitioned(requests, **kwargs):
         observed.update(kwargs["partitioned_options"])
-        manifest = (
-            Path(kwargs["compilation_directory"])
-            / "product" / "manifest.json"
-        )
+        manifest = Path(requests[0]["product_directory"]) / "manifest.json"
         manifest.parent.mkdir(parents=True)
         manifest.write_text(json.dumps({"status": "sealed"}))
         return object()
