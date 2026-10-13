@@ -1,3 +1,13 @@
+2026-10-13 NATIVE SHELL CHANNEL CHECK (CURRENT):
+Shell diagnostic facilities already exist: shared log/error/profile/progress/
+trace telemetry and native launch logging/bounded trace storage. The isolated
+bootstrap progress(str) capture has no recorded shell endpoint binding; the
+native profile logger has a different signature. See the shell-channel section
+in docs/compiler_convergence/11_bootstrap_performance.md. Two C-shell device_ns
+locals now match the declared unsigned-long-long pointer ABI, fixing the LP64
+Linux build failure reproduced on main. Four focused checks passed; a real
+native executable confirmed bounded trace overwrite/loss and launch status.
+
 2026-10-13 BOOTSTRAP CLOSURE ACCOUNTING REPAIR (CURRENT):
 Project unit completeness now consumes existing exact-source closure_formals
 receipts for surviving argument IDs, matching the existing SSA signature check.

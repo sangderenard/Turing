@@ -325,7 +325,10 @@ int turing_profiled_launch_ex(
 ) {
     uint64_t started;
     uint64_t finished;
-    uint64_t device_ns = 0;
+    /* Match turing_compute_closure's declared pointer type. On LP64 Linux,
+       uint64_t is unsigned long, not unsigned long long; equal width does
+       not make their pointer types compatible. */
+    unsigned long long device_ns = 0;
     uint64_t shell_ns;
     int status;
 
@@ -394,7 +397,7 @@ int turing_profiled_launch(
 unsigned long long turing_measure_launch_overhead_ps(int repeats) {
     uint64_t started;
     uint64_t finished;
-    uint64_t device_ns = 0;
+    unsigned long long device_ns = 0;
     int index;
     volatile int sink = 0;
 

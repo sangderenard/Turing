@@ -175,6 +175,41 @@ of the performance change, not measurements of this accounting repair.
 
 ## Validation and reproduction
 
+### Shell channel investigation
+
+The existing architecture provides shell information channels. The shared
+`shell_telemetry.TelemetryChannel` carries log/error/profile/progress/trace
+records. `CompileProgress.progress_callback` supplies the current compiler's
+Python diagnostic route, and `record_launch_profile` forwards native launch
+profiles into that same stream. `_lower_process_graph_to_compilation` receives
+this callback from its caller.
+
+The existing C native shell provides `turing_launch_logger(user, profile)` and
+an optional bounded `TuringTraceRing`. Standalone C main supplies the native
+logger and region context to `turing_profiled_launch_ex`; compute can be a C,
+LLVM, GLSL adapter, or Fortran closure. Native ring entries contain sequence,
+shell/device durations, region and status. That ABI is not the same signature
+as `_report`'s `progress(str)`, and its records do not contain arbitrary message
+strings. Shell file/external-reference boundaries have their own explicit API
+metadata. The isolated authored bootstrap request supplies no declaration
+binding the `progress` capture to a shell endpoint.
+
+Therefore the observed unresolved call is a missing connection to an existing
+shell facility, not evidence that shells lack diagnostics. Routing must retain
+the existing endpoint identity and invocation/text representation. This pass
+does not invent another channel, equate the different callback signatures, or
+mark the standalone helper complete without that binding.
+
+The native shell also had a reproducible LP64 Linux build error: its callback
+declaration accepts `unsigned long long *device_ns`, but two local variables
+used `uint64_t`, which is `unsigned long` on this platform. The locals now
+match the existing ABI. Both shell tests failed on unchanged main and passed
+after the fix; two shared-telemetry checks also passed. An executable compiled
+from the existing native shell sources with pointer-type errors enabled made
+three native launches into a two-record ring, retained sequences 1/2 for
+region 42/status 1, and correctly reported one overwritten record. No Python
+callback entered that native launch/logger path.
+
 Use the canonical public source entry. For the actual bootstrap:
 
 ```sh
