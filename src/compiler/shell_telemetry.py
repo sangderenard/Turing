@@ -792,7 +792,22 @@ class _CompileBars:
     def _stage_desc(self) -> str:
         stages = self.owner.stages
         if self.owner._workers:
-            return "compiler bootstrap"
+            statuses = [
+                str(worker.get("status") or "unknown")
+                for worker in self.owner._workers.values()
+            ]
+            running = sum(
+                status in {"running", "starting"} for status in statuses
+            )
+            failed = sum(status == "failed" for status in statuses)
+            complete = sum(
+                status in {"complete", "partial", "verified"}
+                for status in statuses
+            )
+            return (
+                f"compiler workers: {running} running, "
+                f"{complete} complete, {failed} failed"
+            )
         return (
             f"compile {self.stage_index + 1}/{len(stages)} "
             f"{stages[self.stage_index].label}"
@@ -924,6 +939,41 @@ class _CompileBars:
     def _refresh_table(self) -> None:
         if not self.table:
             return
+        workers = list(self.owner._workers.values())
+        if workers:
+            stage_rows = next(
+                (worker["stages"] for worker in workers if worker.get("stages")),
+                (),
+            )
+            self.table[0].set_description_str(
+                "Compiler stage | " + " | ".join(
+                    str(worker["label"]) for worker in workers
+                ),
+                refresh=False,
+            )
+            self.table[0].refresh()
+            for index, bar in enumerate(self.table[1:]):
+                if index >= len(stage_rows):
+                    bar.set_description_str("", refresh=False)
+                    bar.refresh()
+                    continue
+                states = []
+                for worker in workers:
+                    worker_stages = worker.get("stages") or ()
+                    state = (
+                        str(worker_stages[index].get("state") or "pending")
+                        if index < len(worker_stages) else "pending"
+                    )
+                    if index == int(worker["stage_number"]) - 1:
+                        state = str(worker["status"])
+                    states.append(state)
+                bar.set_description_str(
+                    f"{str(stage_rows[index].get('label') or '')} | "
+                    + " | ".join(states),
+                    refresh=False,
+                )
+                bar.refresh()
+            return
         rows = self.owner.summary()["stages"]
         self.table[0].set_description_str(
             "Stage                              State       Wall(s)    RSS(GB)", refresh=False)
@@ -998,12 +1048,17 @@ class _CompileBars:
         total = len(self.owner.stages)
         if failed:
             main.set_description_str(
+                "compiler workers FAILED" if self.owner._workers else
                 f"compile FAILED in {self.owner.stages[self.stage_index].label}",
                 refresh=False,
             )
         else:
             main.n = len(self.owner._stage_profiles)
-            main.set_description_str(f"compile done ({main.n} timed stages)", refresh=False)
+            main.set_description_str(
+                "compiler workers done" if self.owner._workers else
+                f"compile done ({main.n} timed stages)",
+                refresh=False,
+            )
         main.set_postfix_str(
             f"peak {max(self.peak_rss, self._rss()) / _GIB:.2f}GB, "
             f"stage {_format_duration(self.owner.clock() - self.stage_started)}",
@@ -1069,15 +1124,26 @@ class _CompileLive(_CompileBars):
                 f"average {'--' if average is None else _format_duration(average)} | "
                 f"projected total {'--' if projected is None else _format_duration(projected)}"
             )
-        status = (f"compile FAILED in {self.owner.stages[self.stage_index].label}" if self.failed
-                  else f"compile done ({len(self.owner._stage_profiles)} timed stages)" if self.finished
-                  else self._stage_desc())
+        workers = list(self.owner._workers.values())
+        if workers:
+            status = (
+                "compiler workers FAILED" if self.failed
+                else "compiler workers done" if self.finished
+                else self._stage_desc()
+            )
+        else:
+            status = (
+                f"compile FAILED in {self.owner.stages[self.stage_index].label}"
+                if self.failed
+                else f"compile done ({len(self.owner._stage_profiles)} timed stages)"
+                if self.finished
+                else self._stage_desc()
+            )
         status += ": " + self._main_postfix()
         if self.finished:
             status += f", peak {self.peak_rss / _GIB:.2f}GB"
         available = max(2, self.console.height - 4)  # reserve room for scrolling logs
         tasks = list(self.tasks.values())
-        workers = list(self.owner._workers.values())
         if self.console.width < 55 or available < 6:
             active = summary["stages"][self.stage_index]
             compact_status = ("FAILED " if self.failed else "done " if self.finished else "")

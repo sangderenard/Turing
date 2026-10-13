@@ -79,6 +79,8 @@ def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
 
     stage = str(event.get("stage") or "")
     if stage == "bootstrap_creep_round_start":
+        if hasattr(display, "worker_clear"):
+            display.worker_clear()
         display.substage(
             f"bootstrap round {int(event.get('round') or 0) + 1}"
         )
@@ -204,8 +206,6 @@ def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
                     for item in failures
                 )
             )
-        if hasattr(display, "worker_clear"):
-            display.worker_clear()
         return
 
 
@@ -252,11 +252,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    from src.compiler.shell_telemetry import CompileStage, compile_progress
+    from src.compiler.shell_telemetry import compile_progress
 
     display = compile_progress(
         None,
-        stages=(CompileStage("bootstrap", "compiler bootstrap"),),
         prefix="compiler-bootstrap: ",
     )
     with display:

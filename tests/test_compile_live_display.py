@@ -135,6 +135,7 @@ def test_one_live_renders_concurrent_compilers_as_columns_and_keeps_failure():
         assert 'working_unit' in current and 'SSA lowering' in current
         assert 'failed' in current and 'running' in current
         assert 'compile 1/10' not in current
+        assert 'compiler workers: 1 running, 0 complete, 1 failed' in current
 
 
 @pytest.mark.parametrize('width,height', [(100, 30), (80, 14), (40, 10), (20, 6)])

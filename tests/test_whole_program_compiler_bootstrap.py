@@ -192,6 +192,42 @@ def test_parent_display_has_the_ten_stage_matrix_at_worker_start():
     assert all(row["state"] == "pending" for row in worker["stages"][1:])
 
 
+def test_parent_keeps_last_worker_matrix_until_the_next_round_starts():
+    from tools.bootstrap_compiler_whole_program import _report_bootstrap_event
+
+    class Display:
+        def __init__(self):
+            self.clears = 0
+            self.substages = []
+            self.logs = []
+
+        def worker_clear(self):
+            self.clears += 1
+
+        def substage(self, value):
+            self.substages.append(value)
+
+        def count_close(self, _key):
+            pass
+
+        def log(self, value):
+            self.logs.append(value)
+
+    display = Display()
+    _report_bootstrap_event(display, {
+        "stage": "bootstrap_creep_round_finish",
+        "continuation_failures": [],
+    })
+    assert display.clears == 0
+
+    _report_bootstrap_event(display, {
+        "stage": "bootstrap_creep_round_start",
+        "round": 1,
+    })
+    assert display.clears == 1
+    assert display.substages == ["bootstrap round 2"]
+
+
 def test_outer_partition_is_an_authored_project_root():
     from src.compiler.project_compilation_product import discover_authored_calls
 
