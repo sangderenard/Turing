@@ -257,6 +257,86 @@ def test_discarded_graph_progress_does_not_measure_process_memory(tmp_path, monk
                and event["resident_bytes"] == 123456 for event in receipt["events"])
 
 
+def test_project_unit_recognizes_exact_lowered_closure_formals(tmp_path):
+    source = tmp_path / "closure.py"
+    source.write_text(
+        "def outer(captured):\n"
+        "    def inner(x):\n"
+        "        return x + captured\n"
+        "    return inner\n", encoding="utf-8",
+    )
+    receipt = compile_project_call(
+        source, "outer.<locals>.inner", tmp_path / "unit", progress_bars=False,
+    )
+    assert receipt["root_parameter_accounting"]["missing_lexical_captures"] == []
+    assert receipt["root_semantic_accounting"]["unexplained_root_argument_ids"] == []
+    assert receipt["repository_ssa_complete"]
+    from src.compiler.ssa_llvm_backend import (
+        emit_ssa_function_to_llvm, compile_artifact, prepare_artifact_execution,
+    )
+    module, outputs, exports = pickle.loads(
+        (tmp_path / "unit/repository-ssa.pkl").read_bytes()
+    )
+    function = module.functions[exports[0]]
+    x_id = dict(function.metadata["parameter_names"])["x"]
+    capture_id = function.metadata["closure_formals"][0]["value_id"]
+    artifact = compile_artifact(
+        emit_ssa_function_to_llvm(module, exports[0]), directory=tmp_path / "native",
+    )
+    namespace = {}
+    exec(source.read_text(), namespace)
+    for x, captured in ((2.0, 3.0), (-7.5, 1.25), (0.0, -4.0)):
+        execution = prepare_artifact_execution(
+            artifact, {x_id: x, capture_id: captured},
+        ).run()
+        actual = execution.buffers[outputs[function.name][0].id].reshape(-1)[0]
+        assert actual == namespace["outer"](captured)(x)
+
+
+def test_stale_closure_receipt_does_not_explain_another_argument():
+    import src.compiler.project_compilation_product as product
+    function = SimpleNamespace(
+        args=(SimpleNamespace(id=1, accounting={}),),
+        metadata={"closure_formals": ({
+            "name": "captured", "value_id": 99,
+            "priority": "exact_source_capture_identity",
+        },)},
+    )
+    assert product._represented_closure_formals(function) == ()
+    assert product._unexplained_root_argument_ids(function) == (1,)
+
+
+def test_bootstrap_report_capture_is_accounted_but_callback_remains_partial(tmp_path):
+    source = (Path(__file__).resolve().parents[1] / "src/common/tensors/"
+              "accelerator_backends/aot_compile.py")
+    receipt = compile_project_call(
+        source, "_lower_process_graph_to_compilation.<locals>._report",
+        tmp_path / "report", progress_bars=False,
+    )
+    assert receipt["root_parameter_accounting"]["missing_lexical_captures"] == []
+    assert receipt["root_parameter_accounting"]["missing_used_parameters"] == ["message"]
+    assert receipt["root_semantic_accounting"]["unexplained_root_argument_ids"] == []
+    assert not receipt["repository_ssa_complete"]
+
+
+def test_unplanned_callable_capture_cannot_publish_a_complete_no_argument_body(tmp_path):
+    source = tmp_path / "callback.py"
+    source.write_text(
+        "def outer(callback):\n"
+        "    def inner():\n"
+        "        if callback is not None:\n"
+        "            callback()\n"
+        "    return inner\n", encoding="utf-8",
+    )
+    receipt = compile_project_call(
+        source, "outer.<locals>.inner", tmp_path / "unit", progress_bars=False,
+    )
+    assert not receipt["repository_ssa_complete"]
+    unresolved = receipt["extraction_boundary_accounting"]["unresolved_call_records"]
+    assert len(unresolved) == 1
+    assert unresolved[0]["callee"] == "callback"
+
+
 def test_completed_unit_reports_its_compiler_stage_without_event_name_collision(
     tmp_path, monkeypatch,
 ):

@@ -2124,6 +2124,69 @@ def _resolved_source_literals_by_symbol(
     }
 
 
+def _record_unplanned_callable_inputs(module: Any, source_graphs: Mapping[str, Any]) -> None:
+    """Retain unresolved invocation edges to surviving callable inputs."""
+    from ..transmogrifier.ssa import SSACallRecord
+    from .concordance_declarations import FRAME_BINDING
+
+    for symbol, function in module.functions.items():
+        graph = _source_graph_for_lowered_function(source_graphs, str(symbol), function)
+        if graph is None:
+            continue
+        records = list(module.call_table.get(str(symbol), ()))
+        existing_count = len(records)
+        sources = []
+        represented = {int(record.callsite_id) for record in records}
+        represented.update(
+            int(instruction.attributes[key])
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for key in ("plan_callsite_id", "source_callsite_id")
+            if instruction.attributes.get(key) is not None
+        )
+        for node_id, data in graph.nodes(data=True):
+            if int(node_id) in represented or not isinstance(data.get("expr_obj"), ast.Call):
+                continue
+            attributes = data.get("attributes") or {}
+            if any(attributes.get(key) is not None for key in (
+                "callee_ref", "method_ref", "constructor_ref",
+            )):
+                continue
+            callees = tuple(
+                (parent, graph.nodes[parent]) for parent, role in data.get("parents", ())
+                if role == "callee" and parent in graph
+            )
+            if len(callees) != 1 or str(callees[0][1].get("type")) != "Input":
+                continue
+            callee_node_id, callee = callees[0]
+            binding = callee.get("attributes") or {}
+            if binding.get("binding_kind") not in {"parameter", "closure"}:
+                continue
+            # outer(callback).inner(): if callback is not None: callback()
+            # retains the exact Call/callee edge but produces no PlanCall and
+            # no SSA invocation. The call linker only visited PlanCalls, so
+            # its unresolved table was empty and publication blessed a no-op.
+            # Preserve this existing source occurrence as unresolved, with its
+            # node-cell provenance; neither fabricate an ABI nor omit it.
+            record = SSACallRecord(
+                caller=str(symbol), callsite_id=int(node_id),
+                callee_reference=None, callee_symbol=None,
+                callee_name=str(binding.get("binding_name") or ""),
+            )
+            records.append(record)
+            sources.extend(_frame_call_cells(graph, int(node_id)))
+            function.metadata.setdefault("unresolved_call_diagnostics", {})[int(node_id)] = {
+                "reason": "callable input has no planned or lowered invocation",
+                "callee_input_value_id": int(callee.get("value_id", callee_node_id)),
+                "binding_kind": str(binding["binding_kind"]),
+            }
+        if len(records) != existing_count:
+            module.call_table.assign(
+                str(symbol), records, sources=tuple(sources),
+                stage=FRAME_BINDING,
+            )
+
+
 def _record_module_closure_formals(
     module: Any,
     source_graphs: Mapping[str, Any] | None = None,
@@ -44727,6 +44790,7 @@ def _lower_ast_source_to_ssa_impl(
     module.metadata["closure_formal_receipts"] = _record_module_closure_formals(
         module, final_source_graphs_by_symbol,
     )
+    _record_unplanned_callable_inputs(module, final_source_graphs_by_symbol)
     if extraction_policy is not None:
         compile_substage("account extraction boundaries and native materializations")
         extraction_boundaries = tuple(

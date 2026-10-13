@@ -316,5 +316,135 @@
     "passed": 229,
     "existing_optional_torch_failure": 1,
     "identity_findings": 0
+  },
+  "closure_accounting_follow_up": {
+    "helpers": [
+      {
+        "helper": "_report",
+        "repository_ssa_complete": false,
+        "root_parameter_accounting": {
+          "complete": false,
+          "missing_lexical_captures": [],
+          "missing_used_parameters": [
+            "message"
+          ],
+          "represented_parameters": [
+            "progress"
+          ],
+          "unresolved_reference_fields": []
+        },
+        "unexplained_root_argument_ids": [],
+        "unresolved_call_records": [
+          {
+            "callee": "progress",
+            "caller": "_lower_process_graph_to_compilation__u00003c_locals_u00003e___report___report",
+            "callsite_id": 4,
+            "diagnostic": {
+              "binding_kind": "closure",
+              "callee_input_value_id": 1,
+              "reason": "callable input has no planned or lowered invocation"
+            }
+          }
+        ]
+      },
+      {
+        "helper": "close_region_feed_set",
+        "repository_ssa_complete": false,
+        "root_parameter_accounting": {
+          "complete": false,
+          "missing_lexical_captures": [],
+          "missing_used_parameters": [
+            "program"
+          ],
+          "represented_parameters": [
+            "external_operands",
+            "produced"
+          ],
+          "unresolved_reference_fields": []
+        },
+        "unexplained_root_argument_ids": [
+          9,
+          8,
+          6,
+          5,
+          7
+        ],
+        "unresolved_call_records": []
+      },
+      {
+        "helper": "collect_hierarchy_values",
+        "repository_ssa_complete": false,
+        "root_parameter_accounting": {
+          "complete": false,
+          "missing_lexical_captures": [
+            "collect_hierarchy_values",
+            "executable_value_ids"
+          ],
+          "missing_used_parameters": [
+            "closure"
+          ],
+          "represented_parameters": [],
+          "unresolved_reference_fields": []
+        },
+        "unexplained_root_argument_ids": [],
+        "unresolved_call_records": []
+      },
+      {
+        "helper": "rooted_attribute_path",
+        "repository_ssa_complete": false,
+        "root_parameter_accounting": {
+          "complete": false,
+          "missing_lexical_captures": [
+            "root_parameters"
+          ],
+          "missing_used_parameters": [
+            "expression"
+          ],
+          "represented_parameters": [
+            "parts"
+          ],
+          "unresolved_reference_fields": []
+        },
+        "unexplained_root_argument_ids": [
+          4,
+          40
+        ],
+        "unresolved_call_records": []
+      }
+    ],
+    "numeric_nested_closure_complete": true,
+    "native_input_pairs_verified": [
+      [
+        2.0,
+        3.0
+      ],
+      [
+        -7.5,
+        1.25
+      ],
+      [
+        0.0,
+        -4.0
+      ]
+    ],
+    "report_source_call": {
+      "value_id": 4,
+      "callee_input_id": 1,
+      "argument_input_id": 0,
+      "conditional_body_callsite_ids": [
+        4
+      ],
+      "planned_hierarchy_items": []
+    },
+    "mapping_audit": {
+      "identity_findings": 0,
+      "unsourced_facts": 21
+    },
+    "unplanned_callable_inputs_recorded": true,
+    "no_argument_callback_refused": true,
+    "final_checks": {
+      "passed": 99,
+      "broader_native_failures_reproduced_on_main": 2
+    }
   }
 }

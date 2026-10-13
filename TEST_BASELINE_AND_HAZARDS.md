@@ -1,3 +1,19 @@
+2026-10-13 BOOTSTRAP CLOSURE ACCOUNTING REPAIR (CURRENT):
+Project unit completeness now consumes existing exact-source closure_formals
+receipts for surviving argument IDs, matching the existing SSA signature check.
+A numeric nested closure previously failed despite that receipt; it now has
+complete repository SSA and passes three LLVM native input pairs. Stale capture
+IDs do not explain other arguments. Fresh _report lowering recognizes progress
+but still lacks message: its source Call 4 has conditional ownership but no
+PlanCall in the hierarchy. All four authored bootstrap helpers remain partial;
+Unbound callable-input Calls omitted from planning are now recorded in the
+existing unresolved-call table with their exact source node provenance. This
+also prevents a no-argument callback closure from looking complete after its
+capture is correctly recognized. Final focused gate: 99 passed. Two broader
+shaped native closure checks reproduced main's undefined binary_value operands.
+missing object/AST/hierarchy parameter representation is not bypassed. See the
+follow-up section in docs/compiler_convergence/11_bootstrap_performance.md.
+
 2026-10-13 BOOTSTRAP PERFORMANCE INVESTIGATION (CURRENT):
 See docs/compiler_convergence/11_bootstrap_performance.md for actual bootstrap
 timings, bounded source-probe and progress fast paths, empty catalogue control

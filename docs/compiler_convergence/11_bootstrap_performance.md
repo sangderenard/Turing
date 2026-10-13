@@ -99,7 +99,7 @@ workers, refusal of oversized closures, and actual native calls across units.
 
 ## Existing bootstrap correctness frontier
 
-The `_lower_process_graph_to_compilation._report` helper's actual `unit.json`
+Before the follow-up repair below, the `_lower_process_graph_to_compilation._report` helper's actual `unit.json`
 reports missing used parameter `message`, missing lexical capture `progress`,
 and an unexplained root argument used by a control-expression comparison.
 `repository_ssa_complete` is false. The same receipt occurs on unchanged main.
@@ -108,6 +108,70 @@ complete planner-owned integrals from upgrading an incomplete enclosing
 method, and the whole-program builder requires every source record and its
 native verification to be complete. This is evidence of a bootstrap failure,
 not proof of which source/ABI writer caused it.
+
+## Follow-up: exact closure accounting repair
+
+A real three-line nested numeric function (`inner(x): return x + captured`)
+reproduced a false completeness failure in about one second. Its reduced graph
+marks `captured` as a closure Input. `_record_module_closure_formals` publishes
+the same surviving argument ID under `closure_formals`, with
+`priority=exact_source_capture_identity`. The existing SSA signature checker
+already accepts that receipt. The project publisher ignored it in both the
+represented-parameter check and the unexplained-root-argument check.
+
+The publisher now consumes that existing receipt for the exact surviving
+argument ID. A stale receipt for a different ID does not explain another
+argument. The numeric nested function now has complete repository SSA; emitted
+LLVM native execution matched Python for three pairs of explicit parameter
+and capture inputs. No fabricated parameter, guessed name correlation or
+relaxed missing-parameter gate was added.
+
+Fresh compilation of all four actual bootstrap helpers gives:
+
+| Helper | Still missing parameters | Still missing captures | Unexplained root IDs |
+| --- | --- | --- | --- |
+| `_report` | `message` | none | none |
+| `close_region_feed_set` | `program` | none | 9, 8, 6, 5, 7 |
+| `rooted_attribute_path` | `expression` | `root_parameters` | 4, 40 |
+| `collect_hierarchy_values` | `closure` | `collect_hierarchy_values`, `executable_value_ids` | none |
+
+All four remain partial. `_report`'s source graph contains Input 0 (`message`),
+Input 1 (`progress`), and Call 4 with callee/argument edges to those exact
+inputs. Its conditional control block retains `body_callsite_ids=(4,)`.
+An observation hook at `_schedule_loop_callsites` sees an empty hierarchy plan;
+there is no `PlanCall` for that call to schedule. The final SSA true arm contains
+only a branch, and `message` has no formal. Correcting capture accounting does
+not provide a native invocation plan for this unbound callback/string call.
+It remains refused by the used-parameter gate.
+
+A no-argument callback variant exposed why that gate alone is insufficient:
+after recognizing its real capture, the omitted call could otherwise make the
+unit look complete. The compiler now records a surviving Call whose exact
+callee edge names an unbound parameter/closure Input and has no planned or
+lowered invocation in the existing unresolved `SSACallRecord` table. Existing
+resolved references and already represented calls are preserved. The record
+derives from the source node cells, carries the callee input ID in the existing
+diagnostic channel, and is consumed by existing extraction/native link gates.
+Records are published once per function rather than copying the growing tuple
+for every omitted call. `_report` now explicitly reports unresolved call 4 to
+`progress`; the no-argument variant also stays incomplete. No callback ABI or
+new opcode is invented.
+
+The other helpers manipulate `FusedProgram` fields, AST objects, and recursive
+hierarchy objects/captured mutable sets. Their observed missing input/capture
+representation and anonymous formals are still real frontiers. This pass does
+not identify every upstream writer responsible for those losses, or claim
+that a record ABI annotation alone would fix them. Their exact fresh receipts
+remain in `build/bootstrap-helper-accounting-final/<helper>/unit.json` in the
+workspace. Full bootstrap was not rerun for this narrowly reproduced repair.
+
+The final focused project/bootstrap/scoped-input gate passed 99 tests. Two
+broader existing shaped-closure native checks failed on undefined operands in
+imported `binary_value`, with the same two failures reproduced on unchanged
+main. The new scalar closure's three LLVM native pairs passed. The mapping
+audit before and after retains zero identity findings and 21 unsourced
+facts. The earlier component measurements above remain historical measurements
+of the performance change, not measurements of this accounting repair.
 
 ## Validation and reproduction
 

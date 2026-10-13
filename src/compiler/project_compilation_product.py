@@ -3364,6 +3364,19 @@ def _require_native_root_semantics(module: Any, entrypoint: str) -> Any:
     return root_function
 
 
+def _represented_closure_formals(function: Any) -> tuple[Mapping[str, Any], ...]:
+    """Read existing exact-source capture receipts for surviving formals."""
+    if function is None:
+        return ()
+    arguments = {int(argument.id) for argument in function.args}
+    return tuple(
+        row for row in function.metadata.get("closure_formals", ())
+        if row.get("priority") == "exact_source_capture_identity"
+        and row.get("name")
+        and row.get("value_id") in arguments
+    )
+
+
 def _unexplained_root_argument_ids(function: Any) -> tuple[int, ...]:
     """Return formals that have no authored parameter/storage correlation."""
 
@@ -3371,6 +3384,10 @@ def _unexplained_root_argument_ids(function: Any) -> tuple[int, ...]:
         int(value_id)
         for _name, value_id in function.metadata.get("parameter_names", ())
     }
+    # outer.<locals>.inner(x) -> x + captured already carries the capture's
+    # exact source-input identity in closure_formals. The publisher previously
+    # ignored that existing ABI receipt and falsely called the same id escaped.
+    authored_ids.update(int(row["value_id"]) for row in _represented_closure_formals(function))
     authored_projection_ids = {
         int(value_id)
         for value_id, source_name, transform
@@ -5599,6 +5616,9 @@ def compile_project_call(
         for value in (() if root_function is None else root_function.args)
         for accounting in (dict(value.accounting or {}),)
         if accounting.get("program_abi_parameter")
+    )
+    represented_parameters.update(
+        str(row["name"]) for row in _represented_closure_formals(root_function)
     )
     missing_used_parameters = tuple(
         name for name in parameter_contract["used_parameters"]
