@@ -206,6 +206,42 @@ def test_automatic_ladder_stops_as_soon_as_rss_recovers(monkeypatch):
         set_active_contract(None)
 
 
+def test_compressed_front_expands_with_headroom_and_contracts_before_escalation(
+    monkeypatch, tmp_path,
+):
+    from src.compiler.live_tiles import LiveTileArena
+
+    budget = 1 << 30
+    resident = 512 << 20
+    owner = LiveTileArena(
+        tile_rows=2, hot_tiles=1, bucket_rows=1,
+        decoded_budget_bytes=128 << 20, directory=tmp_path,
+    )
+    owner.compress_resident_ram()
+    regulator = regulation.MemoryRegulator(
+        IdentityBook(), budget_bytes=budget,
+        compress_policy=True, tile_disk_policy=True,
+    )
+    regulator.live_arena = owner
+    monkeypatch.setattr(regulation, "process_rss_bytes", lambda: resident)
+
+    regulator.pressure_checkpoint("active compressed work")
+    assert owner.pressure_level == 2
+    assert owner.decoded_budget_bytes == 576 << 20
+    assert owner.payload_limit >= owner.base_payload_limit
+
+    readings = iter((budget + 1, resident))
+    monkeypatch.setattr(
+        regulation, "process_rss_bytes",
+        lambda: next(readings, resident),
+    )
+    regulator._last_pressure_read = 0.0
+    assert regulator.pressure_checkpoint("active compressed work") == resident
+    assert owner.pressure_level == 2
+    assert owner.decoded_budget_bytes == owner.base_decoded_budget_bytes
+    assert owner.payload_limit == owner.base_payload_limit
+
+
 def test_resumed_dual_ir_book_reuses_pressure_arena_for_source_storage(monkeypatch):
     from dataclasses import replace
     from src.compiler.live_tiles import LiveDiGraph, _ACTIVE_ARENA, live_digraph

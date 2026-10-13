@@ -265,6 +265,30 @@ class MemoryRegulator:
                 and self.budget_bytes is not None and resident > self.budget_bytes
                 and self.live_arena is not None):
             return resident
+        arena = self.live_arena
+        contracted_limit = (
+            1 if arena.pressure_level >= 3 else arena.base_payload_limit
+        )
+        if (
+            arena.decoded_budget_bytes > arena.base_decoded_budget_bytes
+            or arena.payload_limit > contracted_limit
+        ):
+            before = resident
+            started = time.perf_counter()
+            stats = arena.contract_decoded_front()
+            resident = process_rss_bytes()
+            print(
+                f"[compiler-memory] {label}: contract-decoded-front "
+                f"level={stats.pressure_level} "
+                f"elapsed={time.perf_counter() - started:.3f}s "
+                f"rss={before / 2**20:.0f}->{resident / 2**20:.0f} MiB "
+                f"decoded={stats.decoded_bytes / 2**20:.2f} MiB "
+                f"payload_hot={stats.payload_hot_tiles}",
+                file=sys.stderr, flush=True,
+            )
+            self._live_receipt(label)
+            if resident <= self.budget_bytes:
+                return resident
         while resident > self.budget_bytes and self.live_arena.pressure_level < 3:
             before = resident
             started = time.perf_counter()
@@ -332,7 +356,8 @@ class MemoryRegulator:
             "hot_limit": self.live_arena.hot_limit, "tile_rows": self.live_arena.tile_rows,
             "working_hot_limit": self.live_arena.payload_limit,
             "bucket_rows": self.live_arena.bucket_rows,
-            "decoded_budget_bytes": self.live_arena.decoded_budget_bytes,
+            "decoded_budget_bytes": self.live_arena.base_decoded_budget_bytes,
+            "working_decoded_budget_bytes": self.live_arena.decoded_budget_bytes,
             "decoded_bytes": stats.decoded_bytes,
             "pressure_level": stats.pressure_level,
             # These cumulative counters expose the A*S locality term: a high
@@ -371,6 +396,33 @@ class MemoryRegulator:
         self._last_pressure_read = now
         resident = process_rss_bytes()
         if resident <= self.budget_bytes:
+            if (
+                self.live_arena is not None
+                and self.live_arena.pressure_level > 0
+            ):
+                # Keep a reserve for non-arena allocations.  The remainder is
+                # cache capacity, not an instruction to inflate memory: tiles
+                # enter it only when the active stage actually reads them.
+                reserve = max(64 << 20, self.budget_bytes // 20)
+                headroom = self.budget_bytes - resident - reserve
+                if headroom > 0:
+                    target = (
+                        self.live_arena.base_decoded_budget_bytes
+                        + headroom
+                    )
+                    before = self.live_arena.decoded_budget_bytes
+                    if target > before:
+                        stats = self.live_arena.expand_decoded_front(target)
+                        self._live_receipt(label)
+                        if self._report:
+                            print(
+                                f"[compiler-memory] {label}: expand-decoded-front "
+                                f"level={stats.pressure_level} "
+                                f"limit={before / 2**20:.0f}->"
+                                f"{self.live_arena.decoded_budget_bytes / 2**20:.0f} MiB "
+                                f"rss={resident / 2**20:.0f} MiB",
+                                file=sys.stderr, flush=True,
+                            )
             return resident
         self._activate_live_storage()
         return self._climb_storage_ladder(label, resident)
@@ -480,7 +532,8 @@ def _initialize_regulation(regulator, contract):
         if inherited is not None:
             expected = regulator.live_settings
             actual = (inherited.tile_rows, inherited.hot_limit,
-                      inherited.bucket_rows, inherited.decoded_budget_bytes)
+                      inherited.bucket_rows,
+                      inherited.base_decoded_budget_bytes)
             if actual != expected:
                 raise ValueError(
                     f"resumed live storage settings {actual!r} disagree with "

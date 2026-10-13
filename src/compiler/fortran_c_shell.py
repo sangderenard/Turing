@@ -45603,26 +45603,38 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             }
         return result
     finally:
-        _bars.close(failed=not ok)
-        if module is not None and _bars.channel is not None:
-            module.metadata["compile_profile"] = _bars.summary()
-        book = end_identity_book(_token)
-        entrypoint = kwargs.get("entrypoint")
-        if entrypoint is None and len(args) > 1:
-            entrypoint = args[1]
-        _dump_identity_book_log(
-            book, name=kwargs.get("name"), entrypoint=entrypoint, ok=ok,
-            level=identity_log_level, extra_lines=_log_summary,
-        )
-        end_regulation(
-            _regulator, _regulation_token,
-            releases_book_state=_releases_book_state,
-        )
-        if module is not None and _regulator.graph_pool is not None:
-            module.metadata["graph_work"] = _regulator.graph_pool.summary()
-        if module is not None and _regulator.live_arena is not None:
-            from dataclasses import asdict
-            module.metadata["live_tiles"]["stats"] = asdict(_regulator.live_arena.stats())
+        _finalization_ok = False
+        try:
+            book = end_identity_book(_token)
+            entrypoint = kwargs.get("entrypoint")
+            if entrypoint is None and len(args) > 1:
+                entrypoint = args[1]
+            _dump_identity_book_log(
+                book, name=kwargs.get("name"), entrypoint=entrypoint, ok=ok,
+                level=identity_log_level, extra_lines=_log_summary,
+            )
+            _progress = kwargs.get("progress")
+            if _progress is not None:
+                _progress("compiler storage: releasing completed planning state")
+            end_regulation(
+                _regulator, _regulation_token,
+                releases_book_state=_releases_book_state,
+            )
+            if _progress is not None:
+                _progress("compiler storage: completed planning state released")
+            if module is not None and _regulator.graph_pool is not None:
+                module.metadata["graph_work"] = _regulator.graph_pool.summary()
+            if module is not None and _regulator.live_arena is not None:
+                from dataclasses import asdict
+                module.metadata["live_tiles"]["stats"] = asdict(_regulator.live_arena.stats())
+            _finalization_ok = True
+        finally:
+            # Final compressed-arena collection can be substantial.  Keep the
+            # one compiler display alive until regulation has really ended so
+            # "compile done" never precedes invisible compiler work.
+            _bars.close(failed=not (ok and _finalization_ok))
+            if module is not None and _bars.channel is not None:
+                module.metadata["compile_profile"] = _bars.summary()
 
 
 lower_ast_source_to_ssa.__canonical_source_compiler__ = True

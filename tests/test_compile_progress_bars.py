@@ -461,7 +461,9 @@ def test_the_entry_is_wired_to_the_layer_and_keeps_the_plain_default():
     entry = entry[: entry.index("lower_ast_source_to_ssa.__canonical_source_compiler__")]
     assert 'kwargs.pop("progress_bars", None)' in entry
     assert "_bars.progress_callback(kwargs.get(\"progress\"))" in entry
-    assert "_bars.close(failed=not ok)" in entry
+    close = "_bars.close(failed=not (ok and _finalization_ok))"
+    assert close in entry
+    assert entry.index("end_regulation(") < entry.index(close)
     assert "declare_progress_bars_policy(" in entry
     # the plain default line lives in one place and is the one it always was
     plain = telemetry._plain_compiler_line

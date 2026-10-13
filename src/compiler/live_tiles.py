@@ -152,10 +152,12 @@ class LiveTileArena:
         if min(tile_rows, hot_tiles, bucket_rows) <= 0:
             raise ValueError("live tile bounds must be positive")
         self.tile_rows, self.hot_limit, self.bucket_rows = tile_rows, hot_tiles, bucket_rows
+        self.base_payload_limit = hot_tiles
         self.payload_limit = hot_tiles
         self.directory = directory
         if decoded_budget_bytes <= 0:
             raise ValueError("decoded tile budget must be positive")
+        self.base_decoded_budget_bytes = decoded_budget_bytes
         self.decoded_budget_bytes = decoded_budget_bytes
         self.compression_workers = max(
             1, int(compression_workers if compression_workers is not None
@@ -639,6 +641,40 @@ class LiveTileArena:
             self.pressure_level = max(self.pressure_level, 2)
             self.disk_mode = False
             self.flush(disk=False, preserve_routing=True)
+        return self.stats()
+
+    def expand_decoded_front(self, decoded_budget_bytes):
+        """Use available RAM as a larger cache over the same backing store.
+
+        Expansion is demand-driven: this does not decode a tile merely to
+        fill memory.  A subsequently accessed payload remains hot, avoiding
+        repeated decode/evict cycles while the process has budget headroom.
+        """
+
+        with self._lock:
+            if self.pressure_level == 0:
+                return self.stats()
+            target = max(
+                self.base_decoded_budget_bytes,
+                int(decoded_budget_bytes),
+            )
+            if target > self.decoded_budget_bytes:
+                self.decoded_budget_bytes = target
+                self.payload_limit = max(
+                    self.payload_limit, len(self._tiles),
+                )
+        return self.stats()
+
+    def contract_decoded_front(self):
+        """Return an expanded cache to this tier's declared working set."""
+
+        with self._lock:
+            self.decoded_budget_bytes = self.base_decoded_budget_bytes
+            self.payload_limit = (
+                1 if self.pressure_level >= 3
+                else self.base_payload_limit
+            )
+            self._trim()
         return self.stats()
 
     def offload_to_disk(self):

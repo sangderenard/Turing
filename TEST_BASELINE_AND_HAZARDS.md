@@ -1,3 +1,23 @@
+2026-10-13 ELASTIC DECODED COMPILER FRONT (CURRENT WORKTREE):
+Once live compiler storage enters a compressed tier, its backing tier remains
+monotonic but its decoded working front is now elastic.  Pressure checks below
+the worker memory budget lend otherwise unused process headroom to the decoded
+payload cache, with a five-percent/64-MiB reserve; tiles enter that larger front
+only when the active stage reads them.  A later budget crossing contracts the
+front to the work contract's declared tile/byte bounds before the regulator
+escalates storage.  The authoritative compressed backing, handles, route
+indexes, and concordance identities do not change.  Receipts distinguish the
+declared decoded budget from the current working decoded budget.
+
+Final storage release now completes before the canonical compiler progress
+display closes.  The pre-native row therefore remains present while the final
+compressed-arena mark/sweep runs, with explicit start/end log lines; “compile
+done” no longer precedes invisible compiler work.  The full live-storage,
+memory-regulation, and progress suites pass 96 tests in 77.47 seconds, and the
+mapping concordance audit reports zero findings.  No bootstrap or orbital
+compile was launched, and no existing Python process was inspected or
+disturbed.
+
 2026-10-13 IMPORT-OWNED TYPE CHECKPOINT IDENTITY (CURRENT WORKTREE):
 The first real auto-bootstrap attempt completed whole-source closure and
 topology reduction, then failed before scheduling while checkpointing the

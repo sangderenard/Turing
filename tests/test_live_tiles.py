@@ -54,6 +54,28 @@ def test_pressure_ladder_stays_fully_decoded_until_explicit_escalation(tmp_path)
     assert [value["value"] for value in values] == list(range(8))
 
 
+def test_compressed_backing_can_expand_and_contract_its_decoded_front(tmp_path):
+    owner = LiveTileArena(
+        tile_rows=2, hot_tiles=1, bucket_rows=1,
+        decoded_budget_bytes=256, directory=tmp_path,
+    )
+    values = [owner.manage({"value": index, "payload": "x" * 200})
+              for index in range(8)]
+    owner.compress_resident_ram()
+
+    owner.expand_decoded_front(4096)
+    assert owner.pressure_level == 2
+    assert owner.decoded_budget_bytes == 4096
+    assert [value["value"] for value in values] == list(range(8))
+    expanded = owner.stats()
+    assert expanded.payload_hot_tiles > owner.base_payload_limit
+
+    contracted = owner.contract_decoded_front()
+    assert owner.decoded_budget_bytes == owner.base_decoded_budget_bytes
+    assert owner.payload_limit == owner.base_payload_limit
+    assert contracted.payload_hot_tiles <= owner.base_payload_limit
+
+
 def test_maximum_tier_uses_bounded_parallel_compression_jobs(tmp_path, monkeypatch):
     codec_threads = set()
     write = DiskTileStore.write
