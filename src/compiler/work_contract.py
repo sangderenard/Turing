@@ -228,7 +228,7 @@ class WorkContract:
     # system headroom (available RAM minus the reserve) to the process budget.
     # The allowance is resampled, so low availability can lower the ceiling
     # while the disposable decoded front's compressed backing stays exact.
-    memory_elastic_available_percent: int = 25
+    memory_elastic_available_percent: int = 75
     memory_system_reserve_bytes: int = 2 << 30
     # Cold-page spill (``identity_spill``): at every stage boundary the
     # identity book writes the pages no later stage reads out to its spill

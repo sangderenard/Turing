@@ -627,6 +627,7 @@ LOWERING_STAGES: tuple[CompileStage, ...] = (
     CompileStage("graph-planning", "graph planning"),
     CompileStage("ssa-lowering", "SSA lowering"),
     CompileStage("pre-native-repairs", "pre-native repairs"),
+    CompileStage("compiler-finalization", "compiler finalization"),
 )
 #: A caller that owns the whole flow (SSA, then emission, then the native
 #: build) opens the layer with these, so the bar does not claim completion
@@ -1199,11 +1200,17 @@ class _CompileLive(_CompileBars):
                 "stages": summary["stages"]})
         if workers:
             # Keep useful column widths on real terminals. All lanes remain in
-            # the owner; prefer active/failed lanes, then recent completions.
+            # the owner; prefer active/failed lanes, then later-stage completions.
             column_budget = max(1, (self.console.width - 30) // 24)
             if len(workers) > column_budget:
                 priority_workers = [lane for lane in workers if lane["status"] in {"running", "failed", "partial"}]
-                priority_workers += list(reversed([lane for lane in workers if lane not in priority_workers]))
+                # A completed supplied source has reached stage ten; its
+                # region workers stopped at stage nine. Recent region lanes
+                # used to displace that source and show pre-native pending
+                # even after its real source coordinator had finished.
+                priority_workers += sorted(
+                    reversed([lane for lane in workers if lane not in priority_workers]),
+                    key=lambda lane: int(lane["stage_number"]), reverse=True)
                 hidden_workers = len(workers) - column_budget
                 workers = priority_workers[:column_budget]
             status = (
@@ -1539,7 +1546,9 @@ class CompileProgress:
         self._stage_index = 0
         self._stage_started = clock()
         self._substage = ""
+        self._substage_started = self._stage_started
         self._stage_profiles: dict[str, Mapping[str, Any]] = {}
+        self._entered_compiler_stage = False
         self._stage_seconds: dict[str, float] = {}
         self._work: dict[str, dict[str, dict[str, Any]]] = {}
         self._workers: dict[str, dict[str, Any]] = {}
@@ -1573,7 +1582,9 @@ class CompileProgress:
                 self._stage_index = 0
                 self._stage_started = self.clock()
                 self._substage = ""
+                self._substage_started = self._stage_started
                 self._stage_profiles.clear()
+                self._entered_compiler_stage = False
                 self._stage_seconds.clear()
                 self._work.clear()
                 if self.enabled:
@@ -1613,6 +1624,7 @@ class CompileProgress:
             self._depth -= 1
             if self._depth:
                 return
+            self._finish_substage(failed=failed)
             log_thread, self._log_thread = self._log_thread, None
             self._heartbeat_stop.set()
             thread, self._heartbeat_thread = self._heartbeat_thread, None
@@ -1630,7 +1642,15 @@ class CompileProgress:
             self.channel.log(f"compiler diagnostic log: {self.log_path}")
         with self._lock:
             stage = self.stages[self._stage_index]
-            self._log_stage_finished(stage, failed=failed)
+            if self._entered_compiler_stage or not self._workers:
+                self._log_stage_finished(stage, failed=failed)
+            elif self.enabled:
+                # The supplied-source coordinator never entered stage one.
+                # profile_memory_n2's post-native stdout error used to mint a
+                # spurious "source normalisation FAILED" timing here.
+                self.channel.log(
+                    f"source schedule {'FAILED after' if failed else 'done in'} "
+                    f"{_format_duration(self.clock() - self._stage_started)}")
             for key in tuple(self._counts):
                 self.count_close(key)
             self._counts.clear()
@@ -1666,7 +1686,8 @@ class CompileProgress:
         if not self.enabled:
             owner = getattr(self, "owner_display", None)
             if owner is not None:
-                owner.log(message)
+                label = getattr(self, "owner_label", "")
+                owner.log(f"[{label}] {message}" if label else message)
                 return
             _plain_compiler_line(message)
             return
@@ -1729,7 +1750,8 @@ class CompileProgress:
         """
 
         if not self.enabled:
-            return inner if inner is not None else _plain_compiler_line
+            self._diagnostic_callback = inner if inner is not None else _plain_compiler_line
+            return self._diagnostic_callback
         if inner is None:
             return self.log
         if self.renderer == "rich":
@@ -1749,6 +1771,16 @@ class CompileProgress:
         return routed
 
     # -- stages ---------------------------------------------------------------
+
+    def _phase_log(self, message: str) -> None:
+        # Phase observations use the same caller-selected diagnostics route.
+        # A profiling-only worker whose progress callback explicitly requests
+        # silence must not print hundreds of new lines through owner_display.
+        callback = getattr(self, "_diagnostic_callback", None)
+        if not self.enabled and callback is not None:
+            callback(message)
+        elif self.enabled or getattr(self, "owner_display", None) is not None:
+            self.log(message)
 
     def _publish_state(self, status: str) -> None:
         """Publish exact stage state without adding a per-item callback."""
@@ -1857,6 +1889,7 @@ class CompileProgress:
         if keys != tuple(stage.key for stage in self.stages[:len(keys)]):
             raise ValueError("inherited compiler stages must be a declared prefix")
         with self._lock:
+            self._entered_compiler_stage = bool(keys)
             for key in keys:
                 self._stage_profiles[key] = {"failed": False, "rss_bytes": 0,
                                              "inherited": True}
@@ -1888,8 +1921,13 @@ class CompileProgress:
                     f"undeclared compile stage {key!r}; declared: "
                     f"{[item.key for item in self.stages]}"
                 )
+            entered = self._entered_compiler_stage
+            self._entered_compiler_stage = True
             if index == self._stage_index:
+                if not entered:
+                    self._phase_log(f"stage {index + 1}/{len(self.stages)} {self.stages[index].label}: begin")
                 return
+            self._finish_substage()
             self._log_stage_finished(
                 self.stages[self._stage_index], failed=False
             )
@@ -1899,6 +1937,8 @@ class CompileProgress:
             self._stage_index = index
             self._stage_started = self.clock()
             self._substage = ""
+            self._substage_started = self._stage_started
+            self._phase_log(f"stage {index + 1}/{len(self.stages)} {self.stages[index].label}: begin")
             self.channel.progress(
                 self.stages[index].label, done=index, total=len(self.stages),
                 path="compile/stage", scope="stage", key=key, index=index,
@@ -1906,6 +1946,12 @@ class CompileProgress:
                 metric="stage-order", fraction_is_progress=False,
             )
             self._publish_state("running")
+
+    def _finish_substage(self, *, failed: bool = False) -> None:
+        if self._substage:
+            self._phase_log(f"compiler phase: {self._substage}: {'FAILED' if failed else 'end'} "
+                     f"wall={self.clock() - self._substage_started:.3f}s")
+        self._substage = ""
 
     def substage(self, name: str, *, keep: Iterable[str] = ()) -> None:
         """Name the part of the stage now running (the bar's postfix).
@@ -1916,6 +1962,10 @@ class CompileProgress:
         if self.channel is None:
             return
         with self._lock:
+            if str(name) != self._substage:
+                self._finish_substage()
+                self._substage_started = self.clock()
+                self._phase_log(f"compiler phase: {name}: begin")
             keep = tuple(keep)
             for key in tuple(self._counts):
                 if key not in keep:
@@ -1954,6 +2004,7 @@ class CompileProgress:
                 state = self._counts[key] = {
                     "n": 0, "total": None, "label": key, "detail": "",
                     "emitted": float("-inf"),
+                    "logged": float("-inf"),
                 }
             state["n"] = state["n"] + 1 if n is None else int(n)
             if total is not None:
@@ -1971,6 +2022,11 @@ class CompileProgress:
             ):
                 return
             state["emitted"] = now
+            if fresh or finished or now - state["logged"] >= 10.0:
+                state["logged"] = now
+                self._phase_log(f"compiler work: {state['label']} {state['n']}/{state['total'] or '?'}"
+                         + (f" {state['detail']}" if state["detail"] else ""))
+                self._publish_state("running")
             self.channel.progress(
                 state["label"], done=state["n"], total=state["total"] or 0,
                 path=f"compile/count/{key}", scope="count", key=key,
@@ -2067,7 +2123,7 @@ class CompileProgress:
                 compiler = current.get("compiler") or {}
                 self.worker(f"process-{record['process_id']}",
                     label=record["qualified_name"], status="running",
-                    stage_number=compiler.get("stage_number", 0), stage_count=compiler.get("stage_count", 10),
+                    stage_number=compiler.get("stage_number", 0), stage_count=compiler.get("stage_count", len(LOWERING_STAGES)),
                     stage_label=compiler.get("stage_label", "starting"), substage=compiler.get("substage", ""),
                     stages=compiler.get("stages", ()), elapsed_seconds=record.get("elapsed_seconds", 0),
                     rss_bytes=record.get("resident_bytes", 0))

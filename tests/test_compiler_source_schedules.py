@@ -2,6 +2,7 @@
 import dataclasses
 import io
 import pickle
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -25,6 +26,36 @@ def test_auto_does_not_call_the_prepartitioner(monkeypatch):
     assert observed[0][1]["source_compilation"] == "auto"
     with pytest.raises(ValueError, match="source list"):
         shell.lower_ast_source_to_ssa("def root():\n    return 1\n", "root", source_compilation="parallel")
+
+
+@pytest.mark.parametrize("inner_jobs", (3, None))
+def test_source_schedule_inner_limit_is_scoped_separately(monkeypatch, inner_jobs):
+    from types import SimpleNamespace
+    from src.compiler import fortran_c_shell as shell
+    from src.compiler.graph_work import compiler_work_settings
+    observed = []
+    def lower(_implementation, *args, **kwargs):
+        policy = compiler_work_settings()
+        observed.append((policy.jobs, policy.mode, kwargs["source_compilation"]))
+        return SimpleNamespace(metadata={}), {}, ()
+    monkeypatch.setattr(shell, "_run_source_lowering", lower)
+    prior = compiler_work_settings()
+    options = {"jobs": 1, "worker_resident_reservation_bytes": 1 << 20}
+    if inner_jobs is not None:
+        options["inner_jobs"] = inner_jobs
+    shell.lower_ast_source_to_ssa([
+        {"label": "whole", "source": "def whole():\n    return 7\n", "entrypoint": "whole"},
+    ], source_compilation="parallel", partitioned_options=options, progress_bars=False)
+    assert observed == [(inner_jobs, "auto", "auto")]
+    assert compiler_work_settings() == prior
+
+
+def test_parallel_ingestion_never_restores_a_closed_worker_stdout():
+    from tools.compiler_probes.probe_parallel_stdout_lifecycle import observe_parallel_ingestion_stdout
+    receipt = observe_parallel_ingestion_stdout()
+    assert receipt["sources_completed"] == 2
+    assert receipt["stdout_preserved"]
+    assert not receipt["stdout_closed"]
 
 
 def test_parallel_book_posts_are_one_atomic_concordance_transaction():
@@ -63,6 +94,58 @@ def test_workers_consume_existing_region_closures_without_recutting():
         end_identity_book(token)
 
 
+def test_parallel_admission_reopens_while_first_job_is_running():
+    from src.compiler.graph_work import bounded_compiler_work
+
+    second_started = threading.Event()
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class OpeningPolicy:
+        mode = "auto"
+        stats = {}
+        calls = 0
+
+        def capacity(self, ready):
+            self.calls += 1
+            return min(ready, 1 if self.calls < 3 else 2)
+
+    def work(job):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            if job == 0:
+                assert second_started.wait(2), "admission never reopened"
+            else:
+                second_started.set()
+            return job
+        finally:
+            with lock:
+                active -= 1
+
+    published = []
+    bounded_compiler_work((0, 1), work,
+        lambda ordinal, job, result: published.append((ordinal, job, result)),
+        policy=OpeningPolicy())
+    assert peak == 2
+    assert published == [(0, 0, 0), (1, 1, 1)]
+
+
+def test_minimum_workers_floor_memory_admission(monkeypatch):
+    from src.compiler import shell_telemetry
+    from src.compiler.graph_work import CompilerWorkPolicy
+
+    monkeypatch.setattr(shell_telemetry, "process_rss_bytes", lambda: 10 << 30)
+    monkeypatch.setattr(shell_telemetry, "system_available_memory_bytes", lambda: 2 << 30)
+    policy = CompilerWorkPolicy(minimum_jobs=12, memory_bytes=10 << 30,
+                                reserve_bytes=2 << 30, working_bytes=2 << 30)
+    assert policy.capacity(20) == 12
+    assert policy.capacity(7) == 7
+
+
 def test_live_standard_stream_checkpoint_preserves_module_slot():
     import sys
     from rich.console import Console
@@ -90,7 +173,7 @@ def test_terminal_queue_keeps_full_log_and_summarizes_numeric_runs(tmp_path, mon
     assert "related lines" in stream.getvalue()
 
 
-def test_two_real_sources_share_scheduler_and_ten_stage_status():
+def test_two_real_sources_share_scheduler_and_eleven_stage_status():
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.extraction_contract import ExtractionContract
     contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_program_abi({
@@ -110,8 +193,82 @@ def test_two_real_sources_share_scheduler_and_ten_stage_status():
         assert outputs[exports[0]]
         assert module.metadata["source_compilation"]["partition_point"] is None
         stages = module.metadata["compile_profile"]["stages"]
-        assert len(stages) == 10
+        assert len(stages) == 11
         assert all(stage["state"] == "done" for stage in stages)
+
+
+def test_every_source_still_reports_to_the_shared_terminal_queue(tmp_path, monkeypatch):
+    from pathlib import Path
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.shell_telemetry import CompileProgress
+    from src.compiler.extraction_contract import ExtractionContract
+    contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_execution_file(
+        "extraction_contracts/vehicle_full_native_execution.yaml")
+    monkeypatch.chdir(tmp_path)
+    display = CompileProgress(enabled=True, stream=io.StringIO(), renderer="rich", heartbeat=None)
+    with display:
+        lower_ast_source_to_ssa([
+            {"label": name, "source": f"def {name}():\n    return 7.0\n", "entrypoint": name,
+             "options": {"extraction_contract": contract}}
+            for name in ("left", "right")], source_compilation="parallel", progress_bars=False,
+            partitioned_options={"jobs": 2, "max_total_resident_bytes": 1 << 30,
+                "max_worker_memory_bytes": 1 << 30, "worker_resident_reservation_bytes": 1 << 20})
+    saved = Path(display.log_path).read_text(encoding="utf-8")
+    for name in ("left", "right"):
+        assert f"[{name}] ssa-source: building complete ProcessGraph source closure" in saved
+        assert f"[{name}] compiler storage: completed planning state released" in saved
+        for phase in (
+            "topology: extract lexical function graphs",
+            "instantiate shared function catalogue",
+            "release local dispatch graphs",
+            "record forwarding fixed point",
+            "link source call records",
+            "post-frame: reconcile record and sequence captures",
+            "apply precision pipeline",
+            "pre-native: full native link gate",
+            "final concordance detector",
+            "compiler finalization: release planning caches",
+        ):
+            assert f"[{name}] compiler phase: {phase}: begin" in saved
+        worker = next(lane for lane in display._workers.values() if lane["label"] == name)
+        assert worker["status"] == "complete"
+        assert len(worker["stages"]) == 11
+        assert all(stage["state"] == "done" for stage in worker["stages"])
+
+
+@pytest.mark.parametrize("fail_release", (False, True))
+def test_finalization_is_visible_until_storage_release_finishes(tmp_path, monkeypatch, fail_release):
+    from pathlib import Path
+    from src.compiler import memory_regulation
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.shell_telemetry import CompileProgress, active_compile_progress
+    contract = Path("extraction_contracts/program_extraction.yaml").resolve()
+    monkeypatch.chdir(tmp_path)
+    display = CompileProgress(enabled=True, stream=io.StringIO(), renderer="rich", heartbeat=None)
+    release = memory_regulation.end_regulation
+    observed = []
+
+    def observed_release(*args, **kwargs):
+        layer = active_compile_progress()
+        observed.append(layer.summary())
+        assert layer is display and layer._depth > 0
+        assert layer.stages[layer._stage_index].key == "compiler-finalization"
+        release(*args, **kwargs)
+        if fail_release:
+            raise RuntimeError("storage release fixture")
+
+    monkeypatch.setattr(memory_regulation, "end_regulation", observed_release)
+    if fail_release:
+        with pytest.raises(RuntimeError, match="storage release fixture"), display:
+            lower_ast_source_to_ssa("def root():\n    return 7.0\n", "root", extraction_contract=contract)
+    else:
+        with display:
+            lower_ast_source_to_ssa("def root():\n    return 7.0\n", "root", extraction_contract=contract)
+    assert observed[0]["stages"][-1]["state"] == "running"
+    assert display.summary()["stages"][-1]["state"] == ("failed" if fail_release else "done")
+    saved = Path(display.log_path).read_text(encoding="utf-8")
+    assert "stage 11/11 compiler finalization: begin" in saved
+    assert "compiler phase: identity log checkpoint: begin" in saved
 
 
 def test_one_failed_source_does_not_stop_independent_work():
@@ -153,7 +310,7 @@ def test_single_source_stage_advances_after_inner_workers_join(tmp_path, monkeyp
     display = CompileProgress(enabled=True, stream=io.StringIO(), renderer="rich", heartbeat=None)
     with display:
         display.stage("ssa-lowering")
-        display.worker("region-thread", label="SSA region", status="done", stage_number=9, stage_count=10,
+        display.worker("region-thread", label="SSA region", status="done", stage_number=9, stage_count=11,
             stages=[{"key": stage.key, "label": stage.label, "state": "done" if index < 9 else "pending"}
                     for index, stage in enumerate(display.stages)])
         display.stage("pre-native-repairs")
@@ -163,6 +320,46 @@ def test_single_source_stage_advances_after_inner_workers_join(tmp_path, monkeyp
         Console(file=output, width=160, height=30).print(display.bars._frame())
         frame = output.getvalue()
         assert "source compiler" in frame and "pre-native repairs" in frame and "running" in frame
+
+
+def test_completed_source_column_survives_more_recent_inner_lanes(tmp_path, monkeypatch):
+    from src.compiler.shell_telemetry import CompileProgress
+    from rich.console import Console
+    monkeypatch.chdir(tmp_path)
+    display = CompileProgress(enabled=True, stream=io.StringIO(), renderer="rich", heartbeat=None)
+    done = [{"key": stage.key, "label": stage.label, "state": "done"}
+            for stage in display.stages]
+    with display:
+        display.worker("source", label="whole source", status="complete", stage_number=11,
+                       stage_count=11, stages=done)
+        for index in range(4):
+            display.worker(f"inner-{index}", label=f"SSA region {index}", status="done",
+                           stage_number=9, stage_count=11,
+                           stages=[{**row, "state": "pending" if number == 9 else "done"}
+                                   for number, row in enumerate(done)])
+        display.bars.console.width = 80
+        display.bars.console.height = 30
+        output = io.StringIO()
+        Console(file=output, width=80, height=30).print(display.bars._frame())
+        assert "whole source" in output.getvalue()
+        assert "pre-native repairs" in output.getvalue()
+
+
+def test_post_native_reporting_error_is_not_a_source_normalisation_failure(tmp_path, monkeypatch):
+    from src.compiler.shell_telemetry import CompileProgress
+    monkeypatch.chdir(tmp_path)
+    stream = io.StringIO()
+    display = CompileProgress(enabled=True, stream=stream, renderer="rich", heartbeat=None)
+    with pytest.raises(ValueError, match="post-native report"), display:
+        display.worker("source", label="whole source", status="complete", stage_number=11,
+                       stage_count=11, stages=[
+                           {"key": stage.key, "label": stage.label, "state": "done"}
+                           for stage in display.stages])
+        raise ValueError("post-native report")
+    assert "source schedule FAILED" in stream.getvalue()
+    assert "source normalisation: FAILED" not in stream.getvalue()
+    assert not display._stage_profiles
+    assert display._workers["source"]["status"] == "complete"
 
 
 def test_source_planning_cache_keeps_other_running_books():
@@ -194,4 +391,4 @@ def test_supplied_law_list_produces_exact_native_pieces(tmp_path):
     for name, expected in (("left_law", 9.0), ("right_law", 21.0)):
         result, = pieces[name](np.array([7.0]))
         np.testing.assert_array_equal(result, np.array([expected]))
-        assert len(pieces[name].module.metadata["compile_profile"]["stages"]) == 10
+        assert len(pieces[name].module.metadata["compile_profile"]["stages"]) == 11

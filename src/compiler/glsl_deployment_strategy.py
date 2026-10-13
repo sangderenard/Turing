@@ -127,7 +127,7 @@ from .process_graph_fusion import (
     reduce_scheduled_shader_regions,
 )
 from .shell_reference_tables import build_shell_reference_tables
-from .shell_telemetry import compile_count, compile_iter, compile_selection_event
+from .shell_telemetry import compile_count, compile_iter, compile_selection_event, compile_substage
 from ..transmogrifier.function_table import FunctionReference
 from ..common.tensors.abstraction import AbstractTensor, tensor_identity
 from ..common.tensors.accelerator_backends.glsl_fused_network import (
@@ -15271,6 +15271,10 @@ def _compile_whole_process_graph(
     if identity in visited:
         return shell
     visited.add(identity)
+    if _visited is None:
+        compile_substage("validate deployment coverage and call references")
+    compile_count("deployment-coverage", len(visited), label="Deployment topologies visited",
+                  detail=str(shell.process_graph.G.graph.get("function_name", "<module>")))
 
     if (
         getattr(shell, "runtime_closure_only", False)
@@ -23807,6 +23811,8 @@ class ProcessGraphGLSLDeployment(TiledObject):
         self._callsite_planning_deferred = bool(
             _defer_callsite_planning
         )
+        if not self._callsite_planning_deferred:
+            compile_substage("instantiate shared function catalogue")
         # Only the outer deployment owns and instantiates the function
         # catalogue.  Catalogue members and literal-callsite shells are
         # constructed shallowly, attached to that one shared catalogue, and
@@ -23825,7 +23831,8 @@ class ProcessGraphGLSLDeployment(TiledObject):
             if self._callsite_planning_deferred
             else {
                 reference: instantiate_member(shell_type)
-                for reference, shell_type in self.function_shell_types.items()
+                for reference, shell_type in compile_iter(self.function_shell_types.items(),
+                    "function-instances", label="Function catalogue members instantiated")
             }
         )
         self._owns_function_shells = bool(self.function_shells) and not self._callsite_planning_deferred
@@ -24112,7 +24119,10 @@ class ProcessGraphGLSLDeployment(TiledObject):
             if self.runtime_closure_only
             else tuple(self.function_shells)
         )
-        for reference in activation_roots:
+        if not self._callsite_planning_deferred:
+            compile_substage("plan callsite activations and recursive signatures")
+        for reference in (compile_iter(activation_roots, "activation-root-planning",
+                label="Activation roots planned") if activation_roots else ()):
             function_shell = self.function_shells.get(int(reference))
             if function_shell is None:
                 continue
@@ -24159,6 +24169,8 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 target.hierarchy_plan, target.hierarchy_value_table = assign_hierarchy_ids(
                     _build_shell_hierarchy_plan(target), shell=target,
                 )
+        if not self._callsite_planning_deferred:
+            compile_substage("assign deployment hierarchy identities")
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
@@ -27443,6 +27455,15 @@ def strategize_shell_deployment(
     """
 
     from .identity_concordance import shape_scope_is_variant
+    from .memory_regulation import pressure_checkpoint, register_live_root
+
+    # Selection used to build all 460 bootstrap function classes before the
+    # first instantiation pressure check. Extracted ProcessGraphs bypass their
+    # constructors: register BOTH their copied topology and their original
+    # wrapper identity before allowing this phase to grow another plan.
+    register_live_root(graph.G)
+    register_live_root(graph)
+    pressure_checkpoint("deployment selection: begin")
 
     if max_nodes_per_dispatch is None:
         from .work_contract import active_contract
@@ -27523,6 +27544,7 @@ def strategize_shell_deployment(
 
     def selection_phase(name: str, action: Any) -> Any:
         phase_started = time.monotonic()
+        pressure_checkpoint(f"deployment selection: {name}")
         selection_event(name, "begin")
         try:
             result = action()
@@ -27539,6 +27561,7 @@ def strategize_shell_deployment(
             "end",
             duration_seconds=round(time.monotonic() - phase_started, 6),
         )
+        pressure_checkpoint(f"deployment selection: {name} complete")
         return result
 
     selection_event("deployment", "begin", repeated_visit=visits[visit_key] > 1)
@@ -28101,6 +28124,7 @@ def strategize_shell_deployment(
             "deployment_batches": node_locations,
         },
     )
+    register_live_root(deployment_class)
     function_shell_types = {}
     function_table = getattr(graph, "function_table", None)
     table_identity = id(function_table)
@@ -28220,6 +28244,10 @@ def strategize_shell_deployment(
         set(deployment_class.catalogued_function_references)
         - set(deployment_class.planned_function_references)
     ))
+    # The coordinator has now installed the child catalogue and activation
+    # sets. Adopt those final owned fields too, without copying any class.
+    register_live_root(deployment_class)
+    pressure_checkpoint("deployment selection: class retained")
     selection_event(
         "deployment",
         "end",

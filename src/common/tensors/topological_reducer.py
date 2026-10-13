@@ -9769,6 +9769,9 @@ def normalize_python_attribute_special_cases(graph: Any) -> None:
 def reduce_abstract_tensor_topology(graph: Any) -> Any:
     """Apply existing ProcessGraph names to the three structural AST nodes."""
 
+    from ...compiler.shell_telemetry import compile_substage, compile_iter
+
+    compile_substage("topology: numeric annotations and lexical owners")
     _record_numeric_annotation_descriptors(graph)
     function_table = getattr(graph, "function_table", None)
     if function_table is None:
@@ -9829,7 +9832,8 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     self.visit_ClassDef(member)
             return None
 
-    for owner_id, definition in function_definitions.items():
+    for owner_id, definition in compile_iter(function_definitions.items(),
+            "lexical-owners", label="Lexical function owners indexed"):
         if not isinstance(
             definition, (ast.FunctionDef, ast.AsyncFunctionDef)
         ):
@@ -9933,6 +9937,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             pending.extend(reversed(tuple(source_child_nodes(member))))
         return kinds
 
+    compile_substage("topology: class fields and aggregate contracts")
     local_aggregate_kinds_by_function = {
         definition_id: local_aggregate_kinds(definition)
         for definition_id, definition in function_definitions.items()
@@ -10682,6 +10687,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     field_value_kind_conflicts.add(alias_key)
                 elif not value_kind_was_present:
                     changed = True
+    compile_substage("topology: declare authored functions")
     for node_id, data in graph.G.nodes(data=True):
         statement = data.get("expr_obj")
         if not is_runnable_definition(statement):
@@ -10781,6 +10787,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # pursuit may attach a decompiled repository-SSA module to the exact Call;
     # give its root an ordinary FunctionTable reference so all later call and
     # module machinery sees the implementation as compiled interior code.
+    compile_substage("topology: declare accepted native call references")
     for node_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
         if not isinstance(expression, ast.Call):
@@ -12074,6 +12081,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 precision_limbs=int(receiver_limbs),
             )
 
+    compile_substage("topology: propagate exact receiver types")
     propagated_graphs = {id(graph.G)}
     propagate_returned_receiver_types(graph.G)
     for entry in function_table:
@@ -12120,6 +12128,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # this graph now that those identities are available.
     propagate_returned_receiver_types(graph.G)
 
+    compile_substage("topology: resolve imports and lexical static bindings")
     contextual_requirements = list(
         graph.G.graph.get("contextual_requirements", ())
     )
@@ -12302,6 +12311,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # Function extraction and structural rewrites can copy an authored Python
     # Attribute after its original ingestion overlay was applied. Reassert the
     # language special case at this AST-to-shared-graph seam.
+    compile_substage("topology: normalize source attributes and operators")
     normalize_python_attribute_special_cases(graph)
 
     for _node_id, data in graph.G.nodes(data=True):
@@ -12823,6 +12833,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 _set_operands(graph, keyword_id, [], cause=_DISSOLVE_WRAPPER)
                 graph.G.remove_node(keyword_id)
 
+    compile_substage("topology: normalize authored loop inputs")
     for node_id, data in list(graph.G.nodes(data=True)):
         statement = data.get("expr_obj")
         if not isinstance(statement, ast.For):
@@ -12880,6 +12891,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 _set_operands(graph, iterator_id, [], cause=_DISSOLVE_WRAPPER)
                 graph.G.remove_node(iterator_id)
 
+    compile_substage("topology: dissolve expression wrappers")
     for node_id, data in list(graph.G.nodes(data=True)):
         if data.get("type") != "Expr":
             continue
@@ -12923,6 +12935,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         ]
         graph.G.remove_node(node_id)
 
+    compile_substage("topology: dissolve return wrappers")
     for node_id, data in list(graph.G.nodes(data=True)):
         if data.get("type") != "Return":
             continue
@@ -12946,6 +12959,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         graph.roots = [root for root in graph.roots if root != node_id]
         graph.G.remove_node(node_id)
 
+    compile_substage("topology: classify recursive call components")
     call_graph = live_digraph()
     call_graph.add_nodes_from(
         reference.address for reference in function_nodes.values()
@@ -12991,7 +13005,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         function_table.entry(owner).recursive = True
 
     lexical_free_names_by_function: dict[int, tuple[str, ...]] = {}
-    for node_id, reference in function_nodes.items():
+    compile_substage("topology: extract lexical function graphs")
+    for node_id, reference in compile_iter(function_nodes.items(),
+            "lexical-functions", label="Lexical function graphs extracted"):
         if node_id not in graph.G:
             continue
         return_values = [
@@ -13832,8 +13848,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # Operators reveal new exact callees; those call edges reveal the
     # concrete type of an unannotated ``self``/``other`` formal.  Settle the
     # two facts together rather than relying on traversal order.
+    compile_substage("topology: settle numeric operator call contracts")
     for _round in range(max(len(tuple(function_table)), 1) + 1):
-        for entry in function_table:
+        for entry in compile_iter(function_table, "numeric-call-contracts",
+                label="Numeric operator call contracts settled"):
             entry_wrapper = getattr(entry, "graph", None)
             if entry_wrapper is not None:
                 propagate_returned_receiver_types(entry_wrapper.G)
@@ -13845,7 +13863,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         if not propagate_call_formal_numeric_types():
             break
 
-    for entry in function_table:
+    compile_substage("topology: finalize extracted graph operators")
+    for entry in compile_iter(function_table, "final-graph-operators",
+            label="Extracted graph operators finalized"):
         entry_wrapper = getattr(entry, "graph", None)
         entry_graph = getattr(entry_wrapper, "G", None)
         if entry_graph is not None:

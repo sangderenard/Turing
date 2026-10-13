@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -43,6 +43,8 @@ class CompilerWorkPolicy:
 
     mode: str = "auto"
     jobs: int | None = None
+    minimum_jobs: int = field(default_factory=lambda: int(
+        os.environ.get("TURING_COMPILER_MINIMUM_WORKERS", "1")))
     memory_bytes: int | None = 10 << 30
     reserve_bytes: int = 2 << 30
     working_bytes: int = field(default_factory=lambda: int(
@@ -54,6 +56,8 @@ class CompilerWorkPolicy:
             raise ValueError("compiler work mode must be auto, serial or parallel")
         if self.jobs is not None and (isinstance(self.jobs, bool) or self.jobs < 1):
             raise ValueError("compiler jobs must be positive")
+        if isinstance(self.minimum_jobs, bool) or self.minimum_jobs < 1:
+            raise ValueError("minimum compiler jobs must be positive")
         if self.working_bytes < 1 or self.reserve_bytes < 0:
             raise ValueError("compiler working reservation must be positive and reserve nonnegative")
         if self.memory_bytes is not None and self.memory_bytes < 1:
@@ -69,6 +73,7 @@ class CompilerWorkPolicy:
             process_room = max(0, self.memory_bytes - process_rss_bytes())
             headroom = process_room if headroom is None else min(headroom, process_room)
         slots = ready if headroom is None else max(1, headroom // self.working_bytes)
+        slots = max(slots, min(ready, self.minimum_jobs))
         return max(1, min(ready, slots, ready if self.jobs is None else self.jobs))
 
 
@@ -107,7 +112,7 @@ def bounded_compiler_work(jobs, work, publish, *, policy=None, label="compiler w
     capacity = policy.capacity(count)
     policy.stats["jobs"] = policy.stats.get("jobs", 0) + count
     policy.stats["admission_peak"] = max(policy.stats.get("admission_peak", 0), capacity)
-    if capacity == 1:
+    if count == 1 or policy.mode == "serial":
         for ordinal, job in enumerate(jobs):
             publish(ordinal, job, work(job))
         return
@@ -124,8 +129,17 @@ def bounded_compiler_work(jobs, work, publish, *, policy=None, label="compiler w
                 queue.append((next_index, job, pending))
                 policy.stats["outstanding_peak"] = max(policy.stats.get("outstanding_peak", 0), len(queue))
                 next_index += 1
-            ordinal, job, pending = queue.popleft()
-            publish(ordinal, job, pending.result())
+            # Retain publication order, but do not make a one-slot admission
+            # decision permanent for the lifetime of a long first job. Wake
+            # periodically to resample RAM and admit more ready work if the
+            # memory window has opened.
+            ordinal, job, pending = queue[0]
+            try:
+                outcome = pending.result(timeout=0.5)
+            except FutureTimeoutError:
+                continue
+            queue.popleft()
+            publish(ordinal, job, outcome)
 
 
 def _retain_codec_source(value, memo):

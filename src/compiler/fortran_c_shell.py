@@ -19350,6 +19350,8 @@ def _class_surface_ssa_program(
         from .glsl_deployment_strategy import release_dispatch_region_copies
         from .memory_regulation import stage_end
 
+        compile_substage("release local dispatch graphs")
+        report("local lowering complete; releasing dispatch graph copies")
         release_dispatch_region_copies(discovered_planned_shells)
         stage_end("ssa-program: dispatch region copies released")
     if not export_symbols:
@@ -19358,6 +19360,7 @@ def _class_surface_ssa_program(
         f"local lowering complete; functions={len(all_functions)} "
         f"pending_calls={len(pending_call_records)}"
     )
+    compile_substage("class symbol and source graph indexing")
     if class_table is not None and function_symbols:
         class_table = replace(
             class_table,
@@ -19494,9 +19497,8 @@ def _class_surface_ssa_program(
         )
         if graph is not None and graph.graph.get("function_name") is not None
     }
-    for repository_symbol, source_graph in tuple(
-        source_graphs_by_symbol.items()
-    ):
+    for repository_symbol, source_graph in compile_iter(tuple(source_graphs_by_symbol.items()),
+            "source-graph-index", label="Source graph spellings indexed"):
         _index_source_graph_spellings(
             source_graphs_by_symbol,
             source_graph,
@@ -19532,6 +19534,7 @@ def _class_surface_ssa_program(
     # region lowerer prune values which the later call-frame linker then cannot
     # bind.  These projections are ordinary local SSA values; callers may
     # remove the hidden name from their final Ret afterward.
+    compile_substage("retain pending call feeds and their source closure")
     pending_call_feed_ids: dict[str, set[int]] = {}
     for caller_symbol, planned_call, _graph, _module, _shell in (
         pending_call_records
@@ -19575,14 +19578,17 @@ def _class_surface_ssa_program(
     # operand closure so every numerical ancestor survives until structural
     # SSA reconstruction; stopping at the public node alone can prune the
     # second comparison in ``a and b`` or a constructor keyword constant.
-    for caller_symbol, seeds in tuple(pending_call_feed_ids.items()):
+    for caller_symbol, seeds in compile_iter(tuple(pending_call_feed_ids.items()),
+            "call-feed-closures", label="Pending call feed closures"):
         graph = source_graphs_by_symbol.get(str(caller_symbol))
         if graph is None:
             continue
         pending_call_feed_ids[str(caller_symbol)] = dependency_closure(
             graph, seeds
         )
-    for caller_name, caller in all_functions.items():
+    compile_substage("publish private numerical region outputs")
+    for caller_name, caller in compile_iter(all_functions.items(),
+            "private-region-outputs", label="Private region output publication"):
         # ``pending_call_feed_ids`` is expanded above to the dependency closure
         # solely so numerical-region DCE retains the private computations which
         # produce a public structural feed.  A region boundary must publish only
@@ -22042,7 +22048,9 @@ def _class_surface_ssa_program(
     # below via ``record_forwarding_edges``.  In particular, a write several
     # calls deep must make every forwarding caller own the same in/out slot;
     # otherwise the mutation lands in private callee storage.
-    for source_symbol, source_graph in source_graphs_by_symbol.items():
+    compile_substage("record field access and mutation survey")
+    for source_symbol, source_graph in compile_iter(source_graphs_by_symbol.items(),
+            "record-access-survey", label="Source record access surveyed"):
         identities = source_graph.graph.get("identity_table") or {}
         declared = dict(
             source_graph.graph.get("parameter_record_abi") or {}
@@ -22300,7 +22308,9 @@ def _class_surface_ssa_program(
     # Without these existing access/parameter rows root(state)->left(state)
     # leased x as uninitialized private scratch instead of a caller ABI field.
     # Seed the normal forwarding graph from the accepted descriptor rows.
-    for native_symbol, native_function in all_functions.items():
+    compile_substage("accepted native record descriptor survey")
+    for native_symbol, native_function in compile_iter(all_functions.items(),
+            "native-record-survey", label="Native record descriptors surveyed"):
         interface = native_function.metadata.get("native_interface")
         if not interface:
             continue
@@ -22342,8 +22352,10 @@ def _class_surface_ssa_program(
     # second object.  Seed that stronger representation from every local view
     # already proven by source lowering.  The exact storage identity is the
     # cross-function key; numeric sequence ids remain frame-local.
+    compile_substage("correlate local record sequence views")
     local_sequence_views: dict[str, list[tuple[Any, ...]]] = {}
-    for source_symbol, table in all_record_tables.items():
+    for source_symbol, table in compile_iter(all_record_tables.items(),
+            "record-sequence-views", label="Record sequence views correlated"):
         sequence_table = all_sequence_tables.get(str(source_symbol))
         if sequence_table is None:
             continue
@@ -22374,7 +22386,8 @@ def _class_surface_ssa_program(
                         int(record_id), int(field.sequence_id),
                     ),),
                 )
-    for storage_identity, receipts in local_sequence_views.items():
+    for storage_identity, receipts in compile_iter(local_sequence_views.items(),
+            "record-sequence-evidence", label="Record sequence evidence selected"):
         candidates = tuple(dict.fromkeys(receipts))
         # ``reference`` fields initially expose one unknown placeholder
         # column.  A complete authored Sequence[Record] annotation is stronger
@@ -22462,6 +22475,7 @@ def _class_surface_ssa_program(
     record_forwarding_edges = access_book.page(
         "record_forwarding_edge"
     ).mapping(access_scope)
+    compile_substage("construct record forwarding edges")
     for caller_symbol, planned_call, caller_graph, _module, caller_shell in (
         pending_call_records
     ):
@@ -22553,10 +22567,12 @@ def _class_surface_ssa_program(
             return None
         return str(field_path)[len(prefix):]
 
+    compile_substage("record forwarding fixed point")
     changed = True
     while changed:
         changed = False
-        for caller_key, callee_key in tuple(record_forwarding_edges):
+        for caller_key, callee_key in compile_iter(tuple(record_forwarding_edges),
+                "record-forwarding-edges", label="Record forwarding edges reconciled"):
             callsites = tuple(record_forwarding_edges[
                 (caller_key, callee_key)
             ])
@@ -27796,17 +27812,24 @@ def _class_surface_ssa_program(
     _debug_loop_carried_operands(
         all_functions, "shell-before-record-materialization",
     )
-    for source_symbol, source_graph in source_graphs_by_symbol.items():
+    for source_symbol, source_graph in compile_iter(source_graphs_by_symbol.items(),
+            "record-abi", label="Parameter record ABI materialized"):
         materialize_parameter_record_abi(source_symbol, source_graph)
 
-    for source_symbol, source_graph in source_graphs_by_symbol.items():
+    compile_substage("resolve keyed mapping iterables")
+    for source_symbol, source_graph in compile_iter(source_graphs_by_symbol.items(),
+            "keyed-iterables", label="Keyed mapping iterables resolved"):
         resolve_keyed_mapping_iterables(source_symbol, source_graph)
 
-    for source_symbol, source_graph in source_graphs_by_symbol.items():
+    compile_substage("materialize record literals and phis")
+    for source_symbol, source_graph in compile_iter(source_graphs_by_symbol.items(),
+            "record-literals", label="Program record literals materialized"):
         materialize_program_abi_record_literals(source_symbol, source_graph)
 
-    for source_symbol in source_graphs_by_symbol:
+    for source_symbol in compile_iter(source_graphs_by_symbol,
+            "record-phis", label="Record phis materialized"):
         materialize_record_phis(source_symbol)
+    compile_substage("bind declared keyed storage")
     bind_declared_keyed_storage(bind_query=False)
     report("record and keyed-sequence ABI materialized")
 
@@ -27816,7 +27839,9 @@ def _class_surface_ssa_program(
     # Ret makes earlier branch uses read uninitialized storage. Hoist every
     # function-local literal to its entry block, where it dominates every CFG
     # path. This changes placement only, never identity or value.
-    for function in all_functions.values():
+    compile_substage("hoist late record constants")
+    for function in compile_iter(all_functions.values(), "record-constant-hoist",
+            label="Late record constants hoisted"):
         if not function.blocks:
             continue
         constants = []
@@ -27842,13 +27867,17 @@ def _class_surface_ssa_program(
         entry = next(iter(function.blocks.values()))
         entry.instrs[0:0] = constants
 
-    for source_symbol, source_graph in source_graphs_by_symbol.items():
+    compile_substage("recover structural source outputs")
+    for source_symbol, source_graph in compile_iter(source_graphs_by_symbol.items(),
+            "structural-outputs", label="Structural source outputs recovered"):
         recover_structural_source_outputs(source_symbol, source_graph)
         function = all_functions.get(source_symbol)
         if function is not None:
             _rebind_recorded_scalar_identities(function, source_graph)
 
-    for function in all_functions.values():
+    compile_substage("settle public return identities")
+    for function in compile_iter(all_functions.values(), "public-return-identities",
+            label="Public return identities settled"):
         source_output_ids = tuple(map(
             int, function.metadata.get("source_output_value_ids", ())
         ))
@@ -27906,7 +27935,9 @@ def _class_surface_ssa_program(
     # with its physical fields. Remove an unconsumed shapeless receiver before
     # call-frame linking; waiting until final cleanup leaves an otherwise
     # complete record-to-record call asking for a nonexistent object handle.
-    for function_name, function in all_functions.items():
+    compile_substage("remove unused conceptual record formals")
+    for function_name, function in compile_iter(all_functions.items(),
+            "record-formals", label="Conceptual record formals reconciled"):
         # Imported _propose_dt_pen has no body here: its missing local uses
         # cannot justify deleting conceptual record formal 3 from the accepted
         # declaration. This cleanup belongs to the function's body owner.
@@ -28109,6 +28140,7 @@ def _class_surface_ssa_program(
                 retained.append(int(loop_id))
         return tuple(retained)
 
+    compile_substage("materialize class constructors and fields")
     if class_table is not None:
         class_definitions = {
             str(record.identity): record for record in class_table.classes
@@ -28930,7 +28962,8 @@ def _class_surface_ssa_program(
             callees_of[str(caller_symbol)].append(str(callee_symbol))
     link_rank: dict[str, int] = {}
     visiting: set[str] = set()
-    for root_symbol in callees_of:
+    compile_substage("source call dependency ordering")
+    for root_symbol in compile_iter(callees_of, "call-order", label="Source call dependencies ordered"):
         stack = [(root_symbol, iter(callees_of.get(root_symbol, ())))]
         visiting.add(root_symbol)
         while stack:
@@ -29108,13 +29141,14 @@ def _class_surface_ssa_program(
             )
 
     linked_symbol: str | None = None
-    for caller_symbol, planned_call, caller_graph, caller_module, caller_shell in (
+    compile_substage("link source call records")
+    for caller_symbol, planned_call, caller_graph, caller_module, caller_shell in compile_iter((
         *sorted(
             pending_call_records,
             key=lambda item: link_rank.get(str(item[0]), len(link_rank)),
         ),
         (None, None, None, None, None),
-    ):
+    ), "source-call-link", label="Source call records linked"):
         if str(caller_symbol) != str(linked_symbol):
             complete_linked_literals(linked_symbol)
             linked_symbol = caller_symbol
@@ -30668,7 +30702,8 @@ def _class_surface_ssa_program(
             str(caller_symbol), int(planned_call.callsite_id)
         )] = min(anchors)[2] if anchors else None
 
-    for record in constructor_calls:
+    compile_substage("merge constructor call records")
+    for record in compile_iter(constructor_calls, "constructor-calls", label="Constructor call records merged"):
         existing = call_records.setdefault(record.caller, [])
         duplicate_index = next((
             index for index, candidate in enumerate(existing)
@@ -30963,13 +30998,15 @@ def _class_surface_ssa_program(
     # still require a tagged ABI.
     from ..transmogrifier.function_table import FunctionReference
 
+    compile_substage("prune unused incoming callee storage")
     incoming_by_callee: dict[str, list[tuple[str, int]]] = {}
     for caller_symbol, records in call_records.items():
         for index, record in enumerate(records):
             incoming_by_callee.setdefault(
                 str(record.callee_symbol), []
             ).append((str(caller_symbol), index))
-    for callee_symbol, incoming in incoming_by_callee.items():
+    for callee_symbol, incoming in compile_iter(incoming_by_callee.items(),
+            "incoming-storage", label="Incoming callee storage reconciled"):
         callee = all_functions.get(callee_symbol)
         if callee is None or not incoming:
             continue
@@ -31409,7 +31446,9 @@ def _class_surface_ssa_program(
         # one-time cleanup either runs too early (the handle is still used by
         # the inner PlanCall) or too late (the outer call has already remained
         # unresolved forever).
-        for callee_symbol, callee in all_functions.items():
+        compile_substage("call frames: settle callee record return layouts")
+        for callee_symbol, callee in compile_iter(all_functions.items(),
+                "frame-callee-returns", label="Callee record returns settled"):
             if (callee.metadata.get("native_interface")
                     or callee.metadata.get("linked_piece_interface")):
                 continue  # No local body/liveness proof for an imported ABI.
@@ -31465,6 +31504,7 @@ def _class_surface_ssa_program(
                     ))
                 call_records[caller_symbol] = refreshed_records
             changed = True
+        compile_substage("call frames: resolve caller operands and storage")
         for caller_symbol, records in compile_iter(
             tuple(call_records.items()), "frame-callers",
             label="call-frame fixed point: linking callers",
@@ -35970,7 +36010,9 @@ def _class_surface_ssa_program(
         # a record-valued public result. Expand that Ret before the next round
         # so callers observe the callee's new aggregate surface as part of the
         # same dependency fixed point.
-        for function_name, record_table in all_record_tables.items():
+        compile_substage("call frames: update record result fields")
+        for function_name, record_table in compile_iter(all_record_tables.items(),
+                "frame-record-results", label="Record result fields updated"):
             function = all_functions.get(function_name)
             if function is None:
                 continue
@@ -36160,7 +36202,9 @@ def _class_surface_ssa_program(
         # physical caller value.  Removing only markers whose exact callsite
         # is already native is deterministic: the native Call is now the
         # occurrence, and every unresolved marker remains untouched.
-        for function_name, function in all_functions.items():
+        compile_substage("call frames: retire resolved plan markers")
+        for function_name, function in compile_iter(all_functions.items(),
+                "frame-plan-markers", label="Resolved plan markers retired"):
             resolved_callsites = {
                 int(record.callsite_id)
                 for record in call_records.get(function_name, ())
@@ -36184,6 +36228,7 @@ def _class_surface_ssa_program(
                     changed = True
 
         if changed:
+            compile_substage("call frames: fingerprint convergence state")
             digest = frame_fixed_point_digest()
             incumbent_round = frame_states.get(digest)
             if incumbent_round is not None:
@@ -36315,9 +36360,11 @@ def _class_surface_ssa_program(
     # Settle those facts across branch/loop cycles before any backend classifies
     # the value. This is representation propagation only: incompatible incoming
     # physical types remain unresolved and are still rejected downstream.
+    compile_substage("post-frame: settle physical phi types")
     unresolved_phi_dtypes = {"", "none", "unknown", "ssa.aggregate"}
     phi_types_changed = True
     while phi_types_changed:
+        compile_count("physical-phi-rounds", label="Physical phi type settlement rounds")
         phi_types_changed = False
         for function in all_functions.values():
             for block in function.blocks.values():
@@ -36370,7 +36417,9 @@ def _class_surface_ssa_program(
     # proves its physical fields. Expand it only when the caller owns an exact
     # same-identity descriptor with the authored row width. This is a checked
     # record ABI transition, not SSA-number coincidence.
-    for function_name, function in tuple(all_functions.items()):
+    compile_substage("post-frame: reconcile record and sequence captures")
+    for function_name, function in compile_iter(tuple(all_functions.items()),
+            "post-frame-captures", label="Record and sequence captures reconciled"):
         record_table = all_record_tables.get(function_name)
         current_values = function_values(function)
         caller_graph = source_graphs_by_symbol.get(function_name)
@@ -37690,7 +37739,9 @@ def _class_surface_ssa_program(
     # this final settlement, controller calls can keep reading an orphaned
     # scalar input even though ordinary arithmetic consumers were rebound to
     # the real Metrics projection.
-    for function in all_functions.values():
+    compile_substage("settle exact post-frame value aliases")
+    for function in compile_iter(all_functions.values(), "post-frame-aliases",
+            label="Post-frame value aliases settled"):
         aliases = _concord_unbound_variant_rows(function)
         if not aliases:
             continue
@@ -37777,7 +37828,9 @@ def _class_surface_ssa_program(
     # freshening the producer would sever the result from the record/call ABI,
     # because those tables intentionally refer to the integer identity rather
     # than to a Python object.
-    for function in all_functions.values():
+    compile_substage("intern writable region output identities")
+    for function in compile_iter(all_functions.values(), "writable-region-outputs",
+            label="Writable region output identities interned"):
         _intern_writable_region_outputs(function, all_tensor_tables.get(function.name))
 
     # Object/call-frame discovery precedes some ordinary SSA-producing passes.
@@ -37790,7 +37843,9 @@ def _class_surface_ssa_program(
     # result objects; every operand holds the object itself, so its edges,
     # ordering, types, and scheduling remain unchanged and no call/record ABI
     # identity needs rewriting.
-    for function_name, function in all_functions.items():
+    compile_substage("freshen synthetic value collisions")
+    for function_name, function in compile_iter(all_functions.items(), "synthetic-collisions",
+            label="Synthetic value collisions reconciled"):
         instructions = [
             instruction
             for block in function.blocks.values()
@@ -37881,10 +37936,13 @@ def _class_surface_ssa_program(
     # A callee whose own linking grew its frame leaves every call into it
     # short by that tail; complete those calls (stamping the propagated
     # identity the harmonizer reads) before anything judges call shapes.
+    compile_substage("complete propagated call frame tails")
     _complete_propagated_frame_tails(all_functions)
+    compile_substage("propagate exact record field demand")
     _propagate_record_field_demand(
         all_functions, call_records, all_record_tables, all_sequence_tables,
     )
+    compile_substage("harmonize call argument shapes")
     _harmonize_call_argument_shapes(all_functions)
     compile_substage("call type settlement")
     report("post-frame cleanup complete; call type settlement start")
@@ -38305,6 +38363,7 @@ def _class_surface_ssa_program(
     # exact aggregate result bindings, then update immediate consumer formals.
     from .ssa_result_type_resolution import settle_call_result_types
 
+    compile_substage("settle exact call result types")
     exact_result_values, type_events, type_conflicts, result_rounds = settle_call_result_types(
         all_functions, emit_outputs, function_values,
     )
@@ -38315,7 +38374,9 @@ def _class_surface_ssa_program(
         report(f"ssa-result-types converged after {result_rounds} rounds; {len(type_conflicts)} incompatible result contracts")
         for conflict in type_conflicts:
             report(f"ssa-result-contract: {conflict}")
-    for caller in all_functions.values():
+    compile_substage("propagate settled call value metadata")
+    for caller in compile_iter(all_functions.values(), "settled-call-values",
+            label="Settled call value metadata propagated"):
         for block in caller.blocks.values():
             for instruction in block.instrs:
                 if instruction.op not in {"Call", "call"}:
@@ -38361,7 +38422,9 @@ def _class_surface_ssa_program(
     # after an incoming native Call was materialized in an earlier fixed-point
     # round. Refresh those already-emitted call operands from the final call
     # records so callsite and callee ABIs cannot drift by dependency order.
-    for caller_symbol, records in call_records.items():
+    compile_substage("refresh final native call frame operands")
+    for caller_symbol, records in compile_iter(call_records.items(), "final-call-operands",
+            label="Final native call operands refreshed"):
         caller = all_functions.get(caller_symbol)
         if caller is None:
             continue
@@ -38504,7 +38567,9 @@ def _class_surface_ssa_program(
     # aggregate-unpack values after the earlier source-output recovery pass.
     # Finalize every such public record now so Ret exposes physical fields,
     # never the conceptual Python record handle.
-    for function_name, function in all_functions.items():
+    compile_substage("finalize constructed record public outputs")
+    for function_name, function in compile_iter(all_functions.items(),
+            "constructed-record-outputs", label="Constructed record outputs finalized"):
         available = set(function_values(function))
         available.update(map(
             int, function.metadata.get("lowered_source_value_ids", ())
@@ -38708,7 +38773,9 @@ def _class_surface_ssa_program(
             function.metadata.pop(
                 "unresolved_required_source_values", None
             )
-    for function_name, record_table in all_record_tables.items():
+    compile_substage("settle physical record return layouts")
+    for function_name, record_table in compile_iter(all_record_tables.items(),
+            "physical-record-returns", label="Physical record returns settled"):
         function = all_functions.get(function_name)
         if function is None:
             continue
@@ -38758,7 +38825,9 @@ def _class_surface_ssa_program(
     # Remove only the shapeless conceptual receiver argument; a sequence
     # capacity or other physical ABI value may legitimately share the same
     # source-local numeric id and must remain.
-    for function_name, function in all_functions.items():
+    compile_substage("remove conceptual record receivers")
+    for function_name, function in compile_iter(all_functions.items(),
+            "conceptual-receivers", label="Conceptual record receivers removed"):
         if (function.metadata.get("native_interface")
                 or function.metadata.get("linked_piece_interface")):
             continue  # Accepted dependency ABI is owned by its native object.
@@ -38929,7 +38998,9 @@ def _class_surface_ssa_program(
     # whose region publishes the matching record field, then make the same
     # column identity an accounted function argument.  The record descriptor
     # remains the authority for its length/capacity/status members.
-    for function_name, function in all_functions.items():
+    compile_substage("promote resident record sequence fields")
+    for function_name, function in compile_iter(all_functions.items(),
+            "resident-record-sequences", label="Resident record sequence fields promoted"):
         sequence_table = all_sequence_tables.get(function_name)
         record_table = all_record_tables.get(function_name)
         if sequence_table is None or record_table is None:
@@ -39064,7 +39135,9 @@ def _class_surface_ssa_program(
     # semantic result bindings select the two same-identity records, and the
     # stable field identity selects the sequence. Provisional frame scratch is
     # replaced; an already exact binding remains the incumbent.
-    for caller_symbol, records in tuple(call_records.items()):
+    compile_substage("reconcile returned record sequence frames")
+    for caller_symbol, records in compile_iter(tuple(call_records.items()),
+            "returned-record-sequences", label="Returned record sequence frames reconciled"):
         caller = all_functions.get(str(caller_symbol))
         if caller is None:
             continue
@@ -39312,6 +39385,7 @@ def _class_surface_ssa_program(
             rebuilt_records.append(record)
         call_records[caller_symbol] = rebuilt_records
 
+    compile_substage("final declared keyed storage binding")
     bind_declared_keyed_storage()
 
     # A local sequence whose producer specialization selected away leaves a
@@ -39336,7 +39410,9 @@ def _class_surface_ssa_program(
     # published on both exact descriptors participate.  In particular, two
     # distinct fields may lawfully share one caller slot (for example an
     # authored constructor passing the same expression to both fields).
-    for caller_symbol, records in tuple(call_records.items()):
+    compile_substage("rebind exact aggregate argument fields")
+    for caller_symbol, records in compile_iter(tuple(call_records.items()),
+            "aggregate-arguments", label="Aggregate argument fields rebound"):
         caller_record_table = all_record_tables.get(str(caller_symbol))
         if caller_record_table is None:
             continue
@@ -39767,7 +39843,9 @@ def _class_surface_ssa_program(
             rebuilt_records.append(record)
         call_records[caller_symbol] = rebuilt_records
 
-    for caller_symbol, records in call_records.items():
+    compile_substage("propagate returned record descriptors and identities")
+    for caller_symbol, records in compile_iter(call_records.items(),
+            "returned-record-descriptors", label="Returned record descriptors propagated"):
         caller = all_functions.get(str(caller_symbol))
         caller_graph = source_graphs_by_symbol.get(str(caller_symbol))
         if caller is None:
@@ -40442,7 +40520,9 @@ def _class_surface_ssa_program(
     # slots is simply unresolved here -- honest, and refusable by a backend --
     # whereas one naming ids this frame never defined would silently address
     # whatever else happens to hold them.
-    for function in all_functions.values():
+    compile_substage("validate frame-local keyed mapping slots")
+    for function in compile_iter(all_functions.values(), "keyed-mapping-slots",
+            label="Frame-local keyed mapping slots validated"):
         frame_values = {int(value.id) for value in function.args}
         frame_values.update(
             int(instruction.res.id)
@@ -40477,8 +40557,10 @@ def _class_surface_ssa_program(
     # ordered vocabulary carried by the physical field.  This is deliberately
     # not ``string_token`` hashing: the receipt is the reversible encoder and
     # its one-based index is collision-free within that declared vocabulary.
+    compile_substage("lower declared schema vocabulary tokens")
     vocabulary_lowerings = []
-    for function_symbol, function in all_functions.items():
+    for function_symbol, function in compile_iter(all_functions.items(),
+            "schema-vocabulary", label="Schema vocabulary tokens lowered"):
         producers = {
             int(instruction.res.id): instruction
             for block in function.blocks.values()
@@ -40543,7 +40625,9 @@ def _class_surface_ssa_program(
     # placeholder does not exist in ``function.args`` until linking finishes.
     # Reuse the exact SSAValue object already held by consumers so every use
     # keeps its deterministic identity while acquiring one real definition.
-    for function_symbol, function in all_functions.items():
+    compile_substage("recover late call feed producers")
+    for function_symbol, function in compile_iter(all_functions.items(),
+            "late-call-feeds", label="Late call feed producers recovered"):
         graph = _source_graph_for_lowered_function(
             source_graphs_by_symbol, str(function_symbol), function,
         )
@@ -40668,8 +40752,10 @@ def _class_surface_ssa_program(
     # its callee), so close that ownership graph to a fixed point before any
     # signature pruning. Each successful edge adds one finite descriptor
     # identity; equal evidence keeps the incumbent descriptor and bound.
+    compile_substage("returned record sequence ownership fixed point")
     sequence_propagation_changed = True
     while sequence_propagation_changed:
+        compile_count("record-sequence-rounds", label="Record sequence ownership rounds")
         sequence_propagation_changed = False
         for caller_symbol, records in call_records.items():
             caller = all_functions.get(str(caller_symbol))
@@ -40831,6 +40917,7 @@ def _class_surface_ssa_program(
     # literals/operations and preserves every instruction on a live path.
     from .ssa_reachability import prune_constant_control_flow
 
+    compile_substage("prune constant control flow")
     control_flow_changes = sum(
         prune_constant_control_flow(function)
         for function in all_functions.values()
@@ -40876,6 +40963,7 @@ def _class_surface_ssa_program(
                 ))
             )
 
+    compile_substage("lower planned record projection captures")
     record_projection_captures = (
         _lower_planned_region_record_projection_captures(
             all_functions, all_record_tables,
@@ -40887,7 +40975,9 @@ def _class_surface_ssa_program(
         )
 
     from .ssa_reachability import prune_unused_phis
-    for symbol, function in all_functions.items():
+    compile_substage("prune unused phis and physical call formals")
+    for symbol, function in compile_iter(all_functions.items(), "unused-phis",
+            label="Unused phis pruned"):
         record_table = all_record_tables.get(symbol)
         protected = {
             int(value_id)
@@ -40916,7 +41006,9 @@ def _class_surface_ssa_program(
         for instruction in block.instrs
         if instruction.op in {"Call", "call"}
     }
-    for function in all_functions.values():
+    compile_substage("retire root-only private sequence arenas")
+    for function in compile_iter(all_functions.values(), "private-sequence-arenas",
+            label="Private sequence arenas retired"):
         # Callee signatures and calls were pruned atomically above. Root-only
         # dead arenas have no call consumers and can now be erased directly.
         if str(function.name) not in called_function_names:
@@ -40998,7 +41090,9 @@ def _class_surface_ssa_program(
     # self-check that validates parity -- reads one authoritative record.
     # ``dynamic`` marks entries whose extent is not compile-time known;
     # those are the heap participants.
-    for function in all_functions.values():
+    compile_substage("declare final physical workspace formals")
+    for function in compile_iter(all_functions.values(), "workspace-formals",
+            label="Physical workspace formals declared"):
         # Every physical member of a resident sequence is an intentional
         # caller-provided frame slot. Local lists/bytearrays need the same
         # declared workspace ABI as storage passed through a linked call; an
@@ -41079,6 +41173,7 @@ def _class_surface_ssa_program(
         reduce_constant_exponent_pow,
     )
 
+    compile_substage("reduce constant powers and dead pure work")
     reduce_constant_exponent_pow(all_functions)
     drop_dead_pure_structural_instructions(all_functions)
     # Catalogue 2.2, completeness-motivated: a pure region whose projected
@@ -41092,7 +41187,9 @@ def _class_surface_ssa_program(
     # with the same deterministic identity but a generic float dtype.  Reconcile
     # every occurrence by identity after linking so backend declarations and
     # call frames cannot disagree with the sequence table.
-    for function_name, function in all_functions.items():
+    compile_substage("reconcile canonical sequence value types")
+    for function_name, function in compile_iter(all_functions.items(),
+            "sequence-value-types", label="Canonical sequence value types reconciled"):
         table = all_sequence_tables.get(function_name)
         if table is None:
             continue
@@ -41127,6 +41224,7 @@ def _class_surface_ssa_program(
     # as its values. Raw ptr alone cannot state pointer-cell storage at the
     # public buffer ABI; the imported formal is that declaration's authority.
     from .ssa_heap_allocation import project_native_heap_call_contexts
+    compile_substage("project native heap call contexts")
     project_native_heap_call_contexts(all_functions)
 
     # Sequence helper calls are physical ABI operations.  Their row argument
@@ -41134,7 +41232,9 @@ def _class_surface_ssa_program(
     # SSAValue occurrence leaves the producer spelling at its provisional
     # integer width.  Correlate by deterministic value identity and apply the
     # helper formal's declared element type to every occurrence in the caller.
-    for function in all_functions.values():
+    compile_substage("correlate physical sequence helper value types")
+    for function in compile_iter(all_functions.values(), "sequence-helper-types",
+            label="Sequence helper value types correlated"):
         occurrences: dict[int, list[SSAValue]] = {}
         for value in function.args:
             occurrences.setdefault(int(value.id), []).append(value)
@@ -41185,7 +41285,9 @@ def _class_surface_ssa_program(
         _canonicalize_non_dominating_loop_result_uses,
     )
 
-    for function in all_functions.values():
+    compile_substage("reconcile final loop result dominance")
+    for function in compile_iter(all_functions.values(), "final-loop-dominance",
+            label="Final loop result dominance reconciled"):
         rebindings = _canonicalize_non_dominating_loop_result_uses(function)
         if rebindings:
             function.metadata["loop_result_use_rebindings"] = tuple((
@@ -41246,6 +41348,7 @@ def _class_surface_ssa_program(
         )
     from .identity_concordance import publish_projected_iterable_layouts
 
+    compile_substage("publish projected iterable layouts")
     publish_projected_iterable_layouts(lowered_module)
     # Whole-program source-call linking above is the first point at which a
     # producer aggregate and a later planned projection adapter coexist in one
@@ -41337,6 +41440,7 @@ def _class_surface_ssa_program(
                 }
                 for item in late_tensor_shortfalls
             )
+    compile_substage("legalize aggregate adapters and output views")
     if legalize_aggregate_adapters(lowered_module):
         propagate_repository_ssa_call_metadata(lowered_module)
     legalize_aggregate_output_views(lowered_module)
@@ -41354,7 +41458,9 @@ def _class_surface_ssa_program(
     )
 
     reconciled = 0
-    for _function in lowered_module.functions.values():
+    compile_substage("post-aggregate loop dominance settlement")
+    for _function in compile_iter(lowered_module.functions.values(), "aggregate-loop-dominance",
+            label="Post-aggregate loop dominance settled"):
         receipts = _reconcile_loop_result_uses(_function)
         if receipts:
             reconciled += len(receipts)
@@ -41378,8 +41484,10 @@ def _class_surface_ssa_program(
     # the first iteration.  Such an operand was already resolved at its
     # position by the callsite, so the receipt abstains rather than
     # overwrite a more specific fact with a less specific one.
+    compile_substage("post-aggregate exact frame operand reconciliation")
     post_aggregate_frame_reconciliations = []
-    for caller_name, records in lowered_module.call_table.items():
+    for caller_name, records in compile_iter(lowered_module.call_table.items(),
+            "aggregate-frame-operands", label="Post-aggregate frame operands reconciled"):
         caller = lowered_module.functions.get(str(caller_name))
         if caller is None:
             continue
@@ -41462,6 +41570,7 @@ def _class_surface_ssa_program(
     # edge-private, effect-free projection closure after proving that all of
     # its external operands dominate the predecessor. Ambiguous/shared cases
     # deliberately remain for the SSA checker/backend to reject.
+    compile_substage("repair phi edge record projections")
     phi_edge_projection_repairs = []
     phi_edge_page = current_identity_book().page(
         "phi_edge_projection_placement_concordance"
@@ -41826,6 +41935,7 @@ def _class_surface_ssa_program(
     _ssa_shape_page = _shape_book_instance.page(
         "ssa_shape_materialization"
     )
+    compile_substage("materialize canonical SSA value shapes")
     _shape_materializations = []
     for _function_name, _function in lowered_module.functions.items():
         _owner = _authored_shape_owner(_function_name)
@@ -41941,7 +42051,9 @@ def _class_surface_ssa_program(
             (str(_receipt["function"]), int(_receipt["value_id"])),
             (tuple(_receipt["prior_shape"]), ()),
         )
+    compile_substage("apply numeric feature pipeline")
     apply_numeric_feature_pipeline(lowered_module)
+    compile_substage("apply precision pipeline")
     apply_precision_pipeline(lowered_module)
 
     # Result typing and aggregate legalization can refine a value after the
@@ -42019,6 +42131,7 @@ def _class_surface_ssa_program(
     # backends receive address primitives, never an orphaned ``Indexed`` op.
     from .ir_indexing import lower_indexing_to_ssa_addressing
 
+    compile_substage("lower final indexed SSA addressing")
     lower_indexing_to_ssa_addressing(lowered_module.functions)
     lowered_module.metadata["final_static_extent_restamp"] = bool(
         settle_repository_ssa_static_extent_operands(lowered_module)
@@ -42645,6 +42758,7 @@ def _lower_ast_source_to_ssa_impl(
         activate_registered_compiler_bootstraps,
     )
 
+    compile_substage("source normalisation: activate accepted compiler versions")
     bootstrap_activations = activate_registered_compiler_bootstraps()
     if progress is not None and bootstrap_activations:
         progress(
@@ -42652,7 +42766,6 @@ def _lower_ast_source_to_ssa_impl(
             f"{len(bootstrap_activations)} registered compiler deployment(s)"
         )
 
-    import contextlib
     from types import SimpleNamespace
 
     from ..common.tensors.accelerator_backends.aot_compile import (
@@ -42731,6 +42844,7 @@ def _lower_ast_source_to_ssa_impl(
         raise TypeError(
             "extraction_contract must be a path or ExtractionContract"
         )
+    compile_substage("source normalisation: loop interchange and AST parsing")
     interchange = interchange_reduction_loops(
         source, licensed=bool(work_contract.inexact_identities),
     )
@@ -43113,6 +43227,7 @@ def _lower_ast_source_to_ssa_impl(
     ] = {}
     static_piece_helper_definitions: list[ast.FunctionDef] = []
     static_piece_receipts: list[dict[str, Any]] = []
+    compile_substage("source normalisation: resolve retained native pieces")
     retained_piece_classes: list[tuple[type, ast.ClassDef]] = []
     for retained_class in retain:
         if not inspect.isclass(retained_class):
@@ -43650,6 +43765,7 @@ def _lower_ast_source_to_ssa_impl(
     # definition, and their configured dependency domains remain eligible.
     from .assignment_normalization import normalize_destructuring_assignments
 
+    compile_substage("source normalisation: authored control and record schemas")
     none_default_receipts = _normalize_none_default_assignments(tree)
     if none_default_receipts:
         report(
@@ -43995,55 +44111,54 @@ def _lower_ast_source_to_ssa_impl(
             f"ssa-source: intercepted {len(layout_type_classes)} laid-out "
             f"type(s) into struct/union rows"
         )
-    # These legacy stdout diagnostics are discarded, never read. StringIO
-    # retained every printed line until the entire source closure finished,
-    # needlessly competing with live graph tiles for the RAM allowance.
-    # The explicit report callback above still carries normal live telemetry.
-    with open(os.devnull, "w", encoding="utf-8") as _discarded_stdout, contextlib.redirect_stdout(_discarded_stdout):
-        graph.build_from_ast(
-            tree,
-            filename=source_module,
-            resolve_unresolved_parents=True,
-            parent_include=(
-                extraction_policy
-                if extraction_policy is not None
-                else _source_dependency_is_not_tensor_primitive
-            ),
-            pursuit_roots=(
-                tuple(dict.fromkeys((
-                    *compile_targets,
-                    *numeric_source_roots,
-                )))
-                if runtime_closure_only and not whole_source else None
-            ),
-            tensor_code_references=source_tensor_references,
-            source_ast_normalizers=(
-                _normalize_none_default_assignments,
-                _normalize_direct_tail_recursion,
-                normalize_discovered_destructuring,
-            ),
-            retained_ast_normalizers=tuple(filter(None, (
-                link_static_record_piece_lookups
-                if (
-                    static_piece_bindings
-                    or static_piece_sequence_bindings
-                ) else None,
-                specialize_same_type_numeric_operators
-                if specialized_operator_methods else None,
-            ))),
-            retain=retain,
-            source_record_classes=source_record_classes,
-            source_parameter_records=tuple(
-                {
-                    **binding.receipt(),
-                    "identity": extraction_policy.program_abi.records[
-                        binding.record
-                    ].identity,
-                }
-                for binding in extraction_policy.program_abi.bindings
-            ),
-            progress=report,
-        )
+    # Parallel law ingestion in profile_memory_n2 restored another worker's
+    # already-closed nul stream, so its post-build PROBE_ELAPSED print failed.
+    # Stdout belongs to the outer terminal compositor, never an ingestion
+    # worker. The graph's verbosity gates and report callback own diagnostics.
+    graph.build_from_ast(
+        tree,
+        filename=source_module,
+        resolve_unresolved_parents=True,
+        parent_include=(
+            extraction_policy
+            if extraction_policy is not None
+            else _source_dependency_is_not_tensor_primitive
+        ),
+        pursuit_roots=(
+            tuple(dict.fromkeys((
+                *compile_targets,
+                *numeric_source_roots,
+            )))
+            if runtime_closure_only and not whole_source else None
+        ),
+        tensor_code_references=source_tensor_references,
+        source_ast_normalizers=(
+            _normalize_none_default_assignments,
+            _normalize_direct_tail_recursion,
+            normalize_discovered_destructuring,
+        ),
+        retained_ast_normalizers=tuple(filter(None, (
+            link_static_record_piece_lookups
+            if (
+                static_piece_bindings
+                or static_piece_sequence_bindings
+            ) else None,
+            specialize_same_type_numeric_operators
+            if specialized_operator_methods else None,
+        ))),
+        retain=retain,
+        source_record_classes=source_record_classes,
+        source_parameter_records=tuple(
+            {
+                **binding.receipt(),
+                "identity": extraction_policy.program_abi.records[
+                    binding.record
+                ].identity,
+            }
+            for binding in extraction_policy.program_abi.bindings
+        ),
+        progress=report,
+    )
     if numeric_specialization_receipts:
         graph.G.graph["numeric_source_specializations"] = tuple(
             dict(receipt) for receipt in numeric_specialization_receipts
@@ -44570,6 +44685,7 @@ def _lower_ast_source_to_ssa_impl(
         progress=progress,
     )
     compile_stage("pre-native-repairs")
+    compile_substage("release selected deployment planning state")
     # The deployment (every planned shell, its callsite copies and dispatch
     # subgraphs) was local to that call and is unreachable now; its shell
     # classes and closures are reference cycles, so say so to the collector
@@ -44607,10 +44723,12 @@ def _lower_ast_source_to_ssa_impl(
         "projections": receipt.projections,
     } for receipt in assignment_receipts)
     module.metadata["compilation_unit_plan"] = compilation_unit_plan.to_mapping()
+    compile_substage("publish closure formal receipts")
     module.metadata["closure_formal_receipts"] = _record_module_closure_formals(
         module, final_source_graphs_by_symbol,
     )
     if extraction_policy is not None:
+        compile_substage("account extraction boundaries and native materializations")
         extraction_boundaries = tuple(
             dict(item)
             for item in graph.G.graph.get("extraction_boundary_calls", ())
@@ -44776,6 +44894,7 @@ def _lower_ast_source_to_ssa_impl(
             "decisions": list(extraction_policy.receipts()),
         }
         if extraction_policy.execution.require_full_native:
+            compile_substage("pre-native: prune final call signatures")
             # Late specialization and aggregate call-frame expansion can add
             # private formals after the ordinary whole-program prune.  Remove
             # only values no instruction references, rewriting every matching
@@ -44817,6 +44936,7 @@ def _lower_ast_source_to_ssa_impl(
             # calls before the signature transaction judges receiver liveness.
             from .ir_identities import drop_dead_pure_region_calls
 
+            compile_substage("pre-native: retire dead pure calls and sequences")
             module.metadata["final_dead_pure_calls"] = (
                 drop_dead_pure_region_calls(module.functions)
             )
@@ -44852,6 +44972,7 @@ def _lower_ast_source_to_ssa_impl(
                 module.metadata["final_pruned_dead_entry_field_aliases"] = int(
                     final_pruned_entry_field_aliases
                 )
+            compile_substage("pre-native: reconcile physical call results")
             frame_result_reindexing = _reindex_frame_aliased_call_results(
                 module.functions
             )
@@ -44877,6 +44998,7 @@ def _lower_ast_source_to_ssa_impl(
                     final_pruned_formals
                 )
             from .ssa_record_return_state import publish_scalar_record_return_fields
+            compile_substage("pre-native: publish scalar record return fields")
             module.metadata["scalar_record_return_publications"] = (
                 publish_scalar_record_return_fields(module)
             )
@@ -44892,6 +45014,7 @@ def _lower_ast_source_to_ssa_impl(
             # use they need exists here (the last installer,
             # ``publish_scalar_record_return_fields``, has run); the gate
             # below then audits the repaired module.
+            compile_substage("pre-native: settle gate dominance")
             (
                 pre_gate_loop_result_rebindings,
                 pre_gate_record_phi_repairs,
@@ -44907,11 +45030,13 @@ def _lower_ast_source_to_ssa_impl(
             )
             from .identity_concordance import concord_compiler_frame_formals
 
+            compile_substage("pre-native: concord physical frame formals")
             frame_formal_receipts = concord_compiler_frame_formals(module)
             if frame_formal_receipts:
                 module.metadata[
                     "pre_native_gate_frame_formal_reconciliations"
                 ] = tuple(frame_formal_receipts)
+            compile_substage("pre-native: retire concorded record and planning aliases")
             retired_record_aliases = _retire_concorded_record_identity_aliases(
                 module.functions,
                 module.record_tables,
@@ -44932,7 +45057,9 @@ def _lower_ast_source_to_ssa_impl(
                 module.metadata[
                     "retired_dead_planning_aliases"
                 ] = int(retired_dead_aliases)
+            compile_substage("pre-native: detect undefined SSA operands")
             undefined_operands = _undefined_repository_ssa_operands(module)
+            compile_substage("pre-native: full native link gate")
             full_native_failures = _full_native_link_failures(
                 extraction_boundaries,
                 unmaterialized_boundaries,
@@ -45265,6 +45392,7 @@ def _lower_ast_source_to_ssa_impl(
             detach_repository_ssa_frontend,
         )
 
+        compile_substage("detach completed source representations")
         detach_repository_ssa_frontend(module)
         gate = dict(module.metadata.get("full_native_link_gate") or {})
         gate["frontend_representations_detached"] = True
@@ -45298,13 +45426,21 @@ def _dump_identity_book_log(
         os.makedirs(directory, exist_ok=True)
         label = str(name or entrypoint or "compile")
         stamp = time.strftime("%Y%m%dT%H%M%S")
-        write_identity_log(
+        written = write_identity_log(
             book, os.path.join(directory, f"{label}.{stamp}"),
             level=resolved, kind="ok" if ok else "failed",
             extra_lines=extra_lines,
         )
-    except Exception:
-        pass
+        if resolved.name != "OFF":
+            from .shell_telemetry import active_compile_progress
+            display = active_compile_progress()
+            if display is not None:
+                display._phase_log(f"identity log checkpoint: {written or 'not written (checkpoint failed)'}")
+    except Exception as error:
+        from .shell_telemetry import active_compile_progress
+        display = active_compile_progress()
+        if display is not None:
+            display._phase_log(f"identity log checkpoint failed: {type(error).__name__}: {error}")
 
 
 def _settle_late_dominance_repairs(module: Any) -> tuple[int, int]:
@@ -45552,11 +45688,6 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
             _bars.inherit_completed_stages(completed_stage_keys)
         for root in live_roots:
             _regulator.register_live_root(root)
-            if _regulator.live_arena is not None:
-                from .live_tiles import TiledObject, adopt_digraph
-                adopt_digraph(root, _regulator.live_arena)
-                if isinstance(root, TiledObject):
-                    _regulator.live_arena.attach(root)
         result = lowering(*args, **kwargs)
         # The late dominance repairs run inside the implementation, before
         # the full-native gate and its first frame-formal concordance (see
@@ -45565,9 +45696,11 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
         # others every substitution is already made and this finds none.
         module = result[0] if isinstance(result, tuple) else result
         if module is not None:
-            compile_stage("pre-native-repairs")
+            compile_stage("compiler-finalization")
+        _bars.substage("native object requirements")
         from .ssa_object_context import publish_native_object_requirements
         publish_native_object_requirements(module)
+        _bars.substage("final dominance settlement")
         reconciled, _record_phi_temporal_repairs = (
             _settle_late_dominance_repairs(module)
         )
@@ -45577,6 +45710,7 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
             concord_program_abi_frame_transitions,
         )
 
+        _bars.substage("final loop and frame concordance")
         _loop_scope_reconciliations = concord_loop_scope_latch_residents(
             module
         )
@@ -45590,10 +45724,13 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
         # made "detector still reports 0" untrue when another concordance
         # invariant was introduced by a late pass.
         _unresolved = ()
+        _bars.substage("final concordance detector")
         try:
             from .identity_concordance import CorrelationTable
 
+            _bars.substage("build final concordance correlation table")
             _table = CorrelationTable.build(module)
+            _bars.substage("final concordance detector")
             _unresolved = tuple(_table.findings(module))
         except Exception as _error:
             _unresolved = (f"detector failed: {_error}",)
@@ -45626,6 +45763,7 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
             )
         ok = True
         if module is not None and _regulator.live_arena is not None:
+            _bars.substage("publish live storage receipts")
             from dataclasses import asdict
             _live_arena = _regulator.live_arena
             module.metadata["live_tiles"] = {
@@ -45639,7 +45777,7 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
         if module is not None and _regulator.graph_pool is not None:
             module.metadata["graph_work"] = _regulator.graph_pool.summary()
             if _progress is not None:
-                _progress(f"graph-work: {_regulator.graph_pool.summary()}")
+                _progress(f"graph-work: {module.metadata['graph_work']}")
         if module is not None and source_compilation == "auto":
             from .graph_work import compiler_work_settings
             module.metadata["source_compilation"] = {
@@ -45658,11 +45796,13 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
             entrypoint = kwargs.get("entrypoint")
             if entrypoint is None and len(args) > 1:
                 entrypoint = args[1]
+            _bars.substage("identity log checkpoint")
             _dump_identity_book_log(
                 book, name=kwargs.get("name"), entrypoint=entrypoint, ok=ok,
                 level=identity_log_level, extra_lines=_log_summary,
             )
             _progress = kwargs.get("progress")
+            _bars.substage("compiler storage release")
             if _progress is not None:
                 _progress("compiler storage: releasing completed planning state")
             end_regulation(

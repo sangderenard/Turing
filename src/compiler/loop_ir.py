@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .hierarchical_plan import PlanClosure
+from .live_tiles import TiledObject
 
 
 class LoopDomainKind(str, Enum):
@@ -173,7 +174,7 @@ class LoopPolicy:
 
 
 @dataclass(frozen=True)
-class SemanticLoop:
+class SemanticLoop(TiledObject):
     loop_id: int
     domain_kind: LoopDomainKind
     domain: LoopDomain

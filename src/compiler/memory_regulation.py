@@ -97,7 +97,7 @@ class MemoryRegulator:
     spill_policy: bool = False
     compress_policy: bool = False
     tile_disk_policy: bool = False
-    elastic_available_percent: int = 25
+    elastic_available_percent: int = 75
     system_reserve_bytes: int = 2 << 30
     _system_available_bytes: int | None = None
     _elastic_adjustment_bytes: int = 0
@@ -154,7 +154,11 @@ class MemoryRegulator:
         if resident <= effective_budget:
             return resident
         if self.compress_policy and self.tile_disk_policy:
-            self._activate_live_storage()
+            already_active = self.live_arena is not None
+            self._activate_live_storage(str(label))
+            if not already_active:
+                # Initial streaming adoption already evicted the cold tail.
+                resident = process_rss_bytes()
             resident = self._climb_storage_ladder(
                 str(label), resident, ceiling=effective_budget,
             )
@@ -207,14 +211,36 @@ class MemoryRegulator:
                 value, lambda _ref, key=identity, roots=self.live_roots: roots.pop(key, None))
         except TypeError:
             pass
+        if self.live_arena is not None:
+            self._adopt_live_root(value)
         return value
 
-    def _activate_live_storage(self):
+    def _adopt_live_root(self, value):
+        """Page the declared root's data without replacing its Python identity."""
+        from .live_tiles import TiledObject, adopt_digraph
+
+        arena = self.live_arena
+        if isinstance(value, type) and issubclass(value, TiledObject):
+            # Selection's generated ProcessGraphGLSLDeployment classes owned
+            # the plans long before any instance existed. Instance attachment
+            # alone left that whole catalogue decoded. Page only attributes
+            # owned by this exact class; never change inherited/shared state.
+            memo = {}
+            for name, member in tuple(vars(value).items()):
+                managed = arena.manage(member, memo)
+                if managed is not member:
+                    setattr(value, name, managed)
+        else:
+            adopt_digraph(value, arena)
+            if isinstance(value, TiledObject):
+                arena.attach(value)
+
+    def _activate_live_storage(self, label=None):
         """Adopt live roots only after the process actually crosses its limit."""
         if self.live_arena is not None or self.live_settings is None:
             return self.live_arena
         from .live_tiles import (
-            LiveTileArena, TiledObject, _ACTIVE_ARENA, adopt_digraph, tile_identity_page,
+            LiveTileArena, _ACTIVE_ARENA, tile_identity_page,
         )
 
         from .concordance_declarations import COMPILE_POLICY, MEMORY_REGULATION, POLICY_DECLARATION
@@ -231,22 +257,39 @@ class MemoryRegulator:
                               decoded_budget_bytes=decoded)
         self.live_arena = arena
         self.live_token = _ACTIVE_ARENA.set(arena)
+        label = self.label if label is None else str(label)
+        started = time.perf_counter()
         try:
-            for page in tuple(dict.values(self.book.pages)):
+            # The 460-function bootstrap reached 19 GiB before first adoption.
+            # Level-zero conversion held every converted payload decoded until
+            # the entire book/catalogue had been copied. Enter the same coarse
+            # cold-tail tier first, so adoption itself streams into backing.
+            arena.offload_cold_tail()
+            print(f"[compiler-memory] {label}: cold-tail-disk adoption begin "
+                  f"roots={len(self.live_roots)}", file=sys.stderr, flush=True)
+            from .shell_telemetry import compile_iter
+            for page in compile_iter(tuple(dict.values(self.book.pages)), "adopt-identity-pages",
+                    label="Identity pages adopted into cold-tail storage"):
                 if not page.__dict__.get("spill") and not page.__dict__.get("_compressed_ram"):
                     tile_identity_page(page, arena)
-            for reference in tuple(self.live_roots.values()):
+            for reference in compile_iter(tuple(self.live_roots.values()), "adopt-compiler-roots",
+                    label="Compiler roots adopted into cold-tail storage"):
                 value = reference()
                 if value is None:
                     continue
-                adopt_digraph(value, arena)
-                if isinstance(value, TiledObject):
-                    arena.attach(value)
+                self._adopt_live_root(value)
             arena.pressure_probe = self.pressure_checkpoint
             # Persist only after adoption succeeds: the returned native module
             # may build after regulation closes, but a failed setup must not
             # masquerade as an activated compressed book.
             self.book.__dict__["_storage_pressure_activated"] = True
+            self._live_receipt(label)
+            stats = arena.stats()
+            print(f"[compiler-memory] {label}: cold-tail-disk adoption end "
+                  f"elapsed={time.perf_counter() - started:.3f}s "
+                  f"decoded={stats.decoded_bytes / 2**20:.2f} MiB "
+                  f"payload_hot={stats.payload_hot_tiles} disk_tiles={stats.disk_tiles}",
+                  file=sys.stderr, flush=True)
         except BaseException:
             _ACTIVE_ARENA.reset(self.live_token)
             self.live_token = None
@@ -459,6 +502,11 @@ class MemoryRegulator:
                 # enter it only when the active stage actually reads them.
                 reserve = max(64 << 20, self.budget_bytes // 20)
                 headroom = max(0, elastic_ceiling - resident - reserve)
+                if available is not None:
+                    # An OS-trimmed working set is not free physical memory.
+                    # The old budget-minus-RSS calculation allowed a 1.375-GiB
+                    # front with only 1 GiB available and a 2-GiB system reserve.
+                    headroom = min(headroom, max(0, available - self.system_reserve_bytes))
                 target = (
                     self.live_arena.base_decoded_budget_bytes
                     + headroom
@@ -483,7 +531,10 @@ class MemoryRegulator:
                             file=sys.stderr, flush=True,
                         )
             return resident
-        self._activate_live_storage()
+        already_active = self.live_arena is not None
+        self._activate_live_storage(label)
+        if not already_active:
+            resident = process_rss_bytes()
         return self._climb_storage_ladder(
             label, resident, ceiling=elastic_ceiling,
         )
@@ -636,6 +687,12 @@ def pressure_checkpoint(label: str) -> None:
         regulator.pressure_checkpoint(label)
 
 
+def register_live_root(value):
+    """Retain a coarse compiler-owned root for current or later compression."""
+    regulator = _ACTIVE.get()
+    return value if regulator is None else regulator.register_live_root(value)
+
+
 def region_topology_pool():
     """The active compile's dispatch cache (legacy non-compile planners stay eager)."""
     regulator = _ACTIVE.get()
@@ -659,6 +716,8 @@ def stage_end(label: str) -> None:
 
     regulator = _ACTIVE.get()
     if regulator is not None:
+        from .shell_telemetry import compile_substage
+        compile_substage(f"storage release: {label}")
         if (regulator.live_arena is not None
                 and regulator.live_arena.pressure_level > 0):
             # Python collection alone cannot see dead records in compressed
@@ -685,7 +744,9 @@ def end_regulation(
     try:
         if releases_book_state:
             from .glsl_deployment_strategy import release_compile_planning_state
+            from .shell_telemetry import compile_substage
 
+            compile_substage("compiler finalization: release planning caches")
             release_compile_planning_state(regulator.book)
             _release_dependency_levels()
             _release_polymorphic_formal_scans()
@@ -698,6 +759,8 @@ def end_regulation(
     finally:
         try:
             if regulator.graph_pool is not None:
+                from .shell_telemetry import compile_substage
+                compile_substage("compiler finalization: close region storage")
                 regulator.graph_pool.close()
         finally:
             if regulator.live_token is not None:

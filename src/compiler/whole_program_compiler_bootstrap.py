@@ -203,6 +203,7 @@ def build_whole_program_compiler(
     directory: str | Path,
     *,
     jobs: int | None = None,
+    minimum_worker_jobs: int = 1,
     source_compilation: str = "auto",
     max_total_resident_bytes: int | None = 10 << 30,
     minimum_total_resident_bytes: int = 2 << 30,
@@ -210,7 +211,7 @@ def build_whole_program_compiler(
     adaptive_memory_ceiling: bool = True,
     worker_resident_reservation_bytes: int = 2 << 30,
     max_worker_memory_bytes: int | None = 10 << 30,
-    worker_elastic_available_percent: int = 25,
+    worker_elastic_available_percent: int = 75,
     progress: Callable[[str], None] | None = None,
 ) -> WholeProgramCompilerProduct:
     """Bootstrap the complete ProcessGraph-to-AOT outer partition.
@@ -245,6 +246,7 @@ def build_whole_program_compiler(
         "worker_elastic_available_percent": (
             worker_elastic_available_percent
         ),
+        "minimum_worker_jobs": minimum_worker_jobs,
     }
     if jobs is not None:
         partitioned_options["jobs"] = jobs

@@ -114,7 +114,8 @@ def test_build_uses_requested_bootstrap_memory_contract_by_default(
     assert observed["worker_resident_reservation_bytes"] == 2 << 30
     assert observed["minimum_total_resident_bytes"] == 2 << 30
     assert observed["system_reserve_bytes"] == 2 << 30
-    assert observed["worker_elastic_available_percent"] == 25
+    assert observed["worker_elastic_available_percent"] == 75
+    assert observed["minimum_worker_jobs"] == 1
     assert observed["adaptive_memory_ceiling"] is True
     assert "jobs" not in observed
 

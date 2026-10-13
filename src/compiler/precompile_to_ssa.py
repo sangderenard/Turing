@@ -15688,6 +15688,8 @@ def lower_control_sections_to_ssa(
         if progress is not None:
             progress(f"ssa-section {control_name}: {message}")
 
+    from .shell_telemetry import compile_substage
+    compile_substage(f"SSA section {control_name}: survey values and sequence operations")
     report(
         f"start; regions={len(tuple(control.region_indices))} "
         f"hierarchy_items={len(tuple(getattr(hierarchy_plan, 'items', ()) or ()))}"
@@ -16205,6 +16207,8 @@ def lower_control_sections_to_ssa(
             region_value_meta[value_id] = Meta(
                 () if current is None else tuple(current.shape), "int64"
             )
+    compile_substage(f"SSA section {control_name}: place table and sequence effects")
+    report("placing table and sequence effects")
     table_region_operations: dict[
         int, list[tuple[str, tuple[Any, ...]]]
     ] = {}
@@ -16656,6 +16660,7 @@ def lower_control_sections_to_ssa(
             planned_region_instructions[planned_index] = planned_instructions
 
     captured_row_loads: set[int] = set()
+    compile_substage(f"SSA section {control_name}: lower planned regions")
     planned_result_ids = {
         int(instruction.res.id)
         for instructions in planned_region_instructions.values()
@@ -17834,6 +17839,8 @@ def lower_control_sections_to_ssa(
                 f"captures={len(effective_captures)} outputs={len(outputs)} "
                 f"instructions={len(instructions)}"
             )
+    compile_substage(f"SSA section {control_name}: settle control dependencies")
+    report("settling control dependencies and lexical lookups")
     table_epilogue_operations: list[tuple[str, tuple[Any, ...]]] = []
     iterable_source_ids = {
         int(binding[0]) for binding in control.iterable_bindings
@@ -18174,6 +18181,7 @@ def lower_control_sections_to_ssa(
                 region_value_ranks[value_id] = max(
                     int(rank), region_value_ranks.get(value_id, 0)
                 )
+    compile_substage(f"SSA section {control_name}: lower control program")
     control_function, control_shortfalls = lower_control_program_to_ssa(
         control,
         function_name=control_name,
@@ -18262,6 +18270,8 @@ def lower_control_sections_to_ssa(
         for sequence_id, source_id in sequence_capacity_sources
     )
     debug_region_output_loads(control_function, "after-control-lowering")
+    compile_substage(f"SSA section {control_name}: materialize constants and sequence helpers")
+    report("materializing constants and sequence helpers")
     control_function = _materialize_control_constants(
         control_function,
         constant_values or {},
@@ -18488,6 +18498,8 @@ def lower_control_sections_to_ssa(
                 *function.metadata.get("loop_result_use_rebindings", ()),
                 *rebindings,
             ))
+    compile_substage(f"SSA section {control_name}: materialize record and reference tables")
+    report("materializing record and reference tables")
     record_tables = {}
     if record_identity is not None and field_names:
         from ..transmogrifier.ssa import (
@@ -18637,6 +18649,8 @@ def lower_control_sections_to_ssa(
     # Make that cell an ordinary ABI operand before tensor lowering.  The
     # sequence descriptor is the authority for the correlation; calls and
     # formals are extended together, so no stage-local ID comparison is used.
+    compile_substage(f"SSA section {control_name}: propagate sequence ABI members")
+    report("propagating sequence ABI members")
     control_sequences = sequence_tables.get(control_function.name)
     if control_sequences is not None:
         for region_function in functions.values():
@@ -18774,6 +18788,7 @@ def lower_control_sections_to_ssa(
     if shape_scope is not None:
         for _stamped in functions.values():
             _stamped.metadata.setdefault("shape_scope", tuple(shape_scope))
+    compile_substage(f"SSA section {control_name}: assemble repository module")
     module = IRModule(
         link_required_ssa_features(functions),
         recursion_table={
@@ -18816,6 +18831,8 @@ def lower_control_sections_to_ssa(
         )
     from .ir_indexing import lower_indexing_to_ssa_addressing
 
+    compile_substage(f"SSA section {control_name}: lower addressing and aggregate adapters")
+    report("lowering addressing and aggregate adapters")
     lower_indexing_to_ssa_addressing(module.functions)
     if tensor_ssa_reference is not None and legalize_aggregate_adapters(module):
         propagate_repository_ssa_call_metadata(module)

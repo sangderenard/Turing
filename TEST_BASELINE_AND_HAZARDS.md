@@ -1,3 +1,53 @@
+2026-10-13 LIVE DEPLOYMENT STORAGE + ELEVEN-STAGE VISIBILITY (CURRENT):
+Deployment plans, loop plans, semantic loops, generated deployment-class
+catalogues, and ordinary NetworkX process graphs now enter the existing live
+tile arena without changing their Python identity. Initial adoption streams
+the cold tail out before retaining the active front. A shared conversion memo
+preserves aliases across fields. Late NetworkX promotion preserves shared edge
+records and cached-view behavior. Empty tiled mappings now invalidate their
+retained route before reinsertion; that was the first wrong writer behind the
+observed missing loop operands.
+
+The progress system now has an eleventh lowering stage, `compiler
+finalization`. It remains live through native-gate accounting, concordance and
+identity-log finalization, storage statistics, and storage release. Previously
+silent compiler passes in source closure, topology reduction, deployment,
+control/SSA lowering, frame and record reconciliation, native-gate checking,
+identity checkpointing, and final storage collection now use the same
+per-worker event stream and terminal compositor. No per-instruction polling
+was added to the normal hot path.
+
+Both user-facing compiler commands now accept `--min-workers` (alias
+`--minimum-workers`) and default it to 12. The supplied-source scheduler and
+each source's auto deployment-region scheduler receive that floor. The floor
+is bounded by ready work and an explicit `--jobs` maximum, but it overrides
+the memory estimate when enough independent work is ready. A parallel pool
+that initially admits only one job no longer becomes permanently serial: it
+resamples admission every 0.5 seconds while that job runs and expands when the
+window opens. Project/bootstrap process admission also honors the same floor.
+The decoded-front elasticity coefficient is now 75 percent everywhere (the
+10-GiB base plus 75 percent of signed available-memory headroom above/below the
+2-GiB reserve), replacing 25 percent.
+
+The deliberately constrained four-source torture run used a 2-GiB aggregate
+and per-source budget with elasticity disabled. It was stopped at the user's
+request because that configuration continuously exercised minimum-footprint
+behavior and was not a throughput benchmark; it produced no completion
+receipt. A separate one-source bounded regression completed with three exact
+LLVM native checks and zero structural concordance findings. Focused storage,
+native call/loop, status, source-schedule, stdout-lifetime, identity-log and
+admission tests passed. The latest admission/default gate passed 24 tests in
+8.80 seconds. The mapping audit remained at zero identity findings; 21
+unsourced facts remain visible. No full bootstrap or orbital compile was run
+by the repair, and the user's running orbital process was not disturbed.
+
+The existing strongest live-arena collection remains one-tile-at-a-time mark
+and compaction. Its conservative worst-case bound is O(V*S + E + B), where V
+is retained roots/values, S is the number of storage tiles scanned per root in
+the current mark organization, E is traversed references, and B is stored
+bytes compressed. This work makes that phase visible; it does not claim to
+have reduced that bound.
+
 2026-10-13 SUPPLIED SOURCE SCHEDULES + IN-COMPILE AUTO (CURRENT):
 `lower_ast_source_to_ssa(source, entry, source_compilation="auto")` now runs
 the whole compiler without a preparatory source partition or unit-worker DAG.
@@ -56,7 +106,7 @@ From C:/dev/Powershell/turing, user-owned runs:
 2026-10-13 ELASTIC DECODED COMPILER FRONT (CURRENT WORKTREE):
 Once live compiler storage enters a compressed tier, its backing tier remains
 monotonic but its decoded working front is now elastic.  Its effective process
-ceiling is the configured ceiling plus 25 percent of signed system headroom
+ceiling is the configured ceiling plus 75 percent of signed system headroom
 (available physical RAM minus the 2-GiB system reserve).  Thus abundant RAM
 lets the temporary decoded cache exceed 10 GiB, while availability below the
 reserve pushes the ceiling below 10 GiB.  The sample is refreshed by the
@@ -66,7 +116,7 @@ escalates.  The authoritative compressed backing, handles, route indexes, and
 concordance identities do not change.  Receipts distinguish the declared
 decoded budget, current working budget, system sample, signed adjustment, and
 effective ceiling.  The percentage is a work-contract/environment value and
-the bootstrap CLI exposes `--worker-elastic-available-percent` (default 25).
+the bootstrap CLI exposes `--worker-elastic-available-percent` (default 75).
 
 Final storage release now completes before the canonical compiler progress
 display closes.  The pre-native row therefore remains present while the final

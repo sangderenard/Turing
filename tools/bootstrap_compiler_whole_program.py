@@ -33,6 +33,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="optional maximum source-list workers; inner auto remains implicit",
     )
     parser.add_argument(
+        "--min-workers", "--minimum-workers", type=int, default=12,
+        help="minimum admitted workers when that many independent jobs are ready (default: 12)",
+    )
+    parser.add_argument(
         "--source-compilation", choices=("auto", "serial", "parallel"), default="auto",
         help="auto inside each submitted source (default); legacy serial/parallel selects the source-list schedule",
     )
@@ -55,11 +59,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--worker-elastic-available-percent", type=int, default=25,
+        "--worker-elastic-available-percent", type=int, default=75,
         help=(
             "percentage of signed system headroom above or below the system "
             "reserve applied to a compressed worker's temporary decoded "
-            "front (default: 25)"
+            "front (default: 75)"
         ),
     )
     arguments = parser.parse_args(argv)
@@ -92,6 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         product = build_whole_program_compiler(
             arguments.output,
             jobs=arguments.jobs,
+            minimum_worker_jobs=arguments.min_workers,
             source_compilation=(arguments.source_schedule if arguments.source_compilation == "auto"
                                 else arguments.source_compilation),
             max_total_resident_bytes=(

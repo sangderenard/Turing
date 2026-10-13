@@ -18,7 +18,7 @@ from typing import Any, Iterable, Mapping
 
 import networkx as nx
 import numpy as np
-from .live_tiles import live_digraph, TiledSet
+from .live_tiles import live_digraph, TiledSet, TiledObject
 
 from ..common.tensors.fused_ir import (
     AXIS_REDUCTION_FOLDS,
@@ -67,7 +67,7 @@ class DispatchRegion:
 
 
 @dataclass(frozen=True)
-class ProcessGraphDispatchPlan:
+class ProcessGraphDispatchPlan(TiledObject):
     """Inspectible fusion result; uncovered nodes remain explicit boundaries."""
 
     backend: str
@@ -103,7 +103,7 @@ class FlatComputeDispatch:
 
 
 @dataclass(frozen=True)
-class ScheduledProcessGraphDispatchPlan:
+class ScheduledProcessGraphDispatchPlan(TiledObject):
     """Flat serialization of the ProcessGraph's existing execution schedule."""
 
     patterns: tuple[ScheduledOperatorPattern, ...]

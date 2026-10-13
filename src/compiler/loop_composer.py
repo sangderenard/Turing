@@ -17,6 +17,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 import networkx as nx
+from .live_tiles import TiledObject
 
 from .control_source import (
     ControlDeploymentLane,
@@ -191,7 +192,7 @@ def _destructure_loop_target(
 
 
 @dataclass(frozen=True)
-class LoopDescriptor:
+class LoopDescriptor(TiledObject):
     node_id: int
     source_type: str
     target: str
@@ -270,7 +271,7 @@ class LoopDescriptor:
 
 
 @dataclass(frozen=True)
-class LoopPlan:
+class LoopPlan(TiledObject):
     loop: LoopDescriptor
     strategy: LoopStrategy
     reason: str
@@ -278,7 +279,7 @@ class LoopPlan:
 
 
 @dataclass(frozen=True)
-class LoopShaderReduction:
+class LoopShaderReduction(TiledObject):
     """Planner verdict for replacing coordinator iterations with one shader."""
 
     loop_node_id: int

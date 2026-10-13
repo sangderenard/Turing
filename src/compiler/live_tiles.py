@@ -531,7 +531,7 @@ class LiveTileArena:
         if isinstance(value, (TiledDict, TiledList, TiledTuple, TiledSet)):
             return value
         if isinstance(value, TiledObject):
-            self.attach(value)
+            self.attach(value, memo=memo)
             return value
         memo = {} if memo is None else memo
         memo.setdefault(_MEMO_SOURCES, []).append(value)
@@ -585,7 +585,7 @@ class LiveTileArena:
             return result
         return value
 
-    def attach(self, value):
+    def attach(self, value, *, memo=None):
         state = object.__getattribute__(value, "__dict__")
         if "_tile_arena" in state:
             return value
@@ -597,8 +597,13 @@ class LiveTileArena:
         state.update(_tile_arena=self, _tile_fields=fields)
         state["_tile_ref"] = self.reference(value)
         try:
+            # A dispatch plan and its generated class share node_locations.
+            # Independent field adoptions made that ONE mutable map into two
+            # equal but divergent writers. Follow all owned fields with the
+            # caller's same adoption memo, including nested compiler objects.
+            memo = {} if memo is None else memo
             for name, member in previous.items():
-                fields[name] = member
+                fields._set(name, self.manage(member, memo))
         except BaseException:
             state.clear()
             state.update(previous)
@@ -798,6 +803,8 @@ class LiveTileArena:
         on every cross-tile visit, making the strict worst case
         O(V*S + E + B).  The sweep and subsequent compaction remain O(B + V).
         """
+        from .shell_telemetry import compile_substage, compile_count, compile_count_close, compile_iter
+
         with self._lock:
             previous_probe, self.pressure_probe = self.pressure_probe, None
             try:
@@ -806,7 +813,9 @@ class LiveTileArena:
                 # retained search pages are eagerly restored after the sweep.
                 retained_pages = tuple(index for index, kind in enumerate(self._page_kinds)
                                        if kind)
+                compile_substage("storage collection: flush decoded generations")
                 self.flush()
+                compile_substage("storage collection: Python cycle collection")
                 gc.collect()
                 roots = tuple(self._refs.keys())
                 leaves = set()
@@ -814,6 +823,9 @@ class LiveTileArena:
                 leaves.update(identity for identity, leaf in self._leaf_refs.items()
                               if isinstance(leaf, type))
                 reclaimed = 0
+                compile_substage("storage collection: trace live handles")
+                traced = 0
+                compile_count("storage-mark", 0, label="Storage handles traced")
                 with _DiskMarks(self.directory) as marked, _DiskFrontier(self.directory) as pending:
                     def edge(handle):
                         if handle != -1 and marked.mark(handle):
@@ -823,6 +835,9 @@ class LiveTileArena:
                     cache_index, cache = -1, None
                     while pending:
                         handle = pending.pop()
+                        traced += 1
+                        if traced % 1024 == 0:
+                            compile_count("storage-mark", traced)
                         index, position = divmod(handle, self.tile_rows)
                         if index != cache_index:
                             encoded = self._tiles[index]
@@ -865,8 +880,12 @@ class LiveTileArena:
                                 work.extend(getattr(value, field.name) for field in dataclass_fields(value))
                     # No mutation until marking succeeds. Sweep one encoded
                     # tile at a time; its surviving rows keep the SAME handles.
+                    compile_count("storage-mark", traced)
+                    compile_count_close("storage-mark")
+                    compile_substage("storage collection: sweep unreachable records")
                     live_route_indexes = set()
-                    for index, encoded in enumerate(self._tiles):
+                    for index, encoded in compile_iter(enumerate(self._tiles), "storage-sweep",
+                            label="Storage tiles swept", total=len(self._tiles)):
                         if encoded is None:
                             continue
                         rows = self._raw_load(encoded.decode())
@@ -900,10 +919,12 @@ class LiveTileArena:
                 }
                 removed = len(self._leaf_refs) - len(leaves)
                 self._leaf_refs = {identity: self._leaf_refs[identity] for identity in leaves}
+                compile_substage("storage collection: release dead object headers")
                 gc.collect()
                 if self.disk_mode:
                     self.compact_disk()
-                for index in retained_pages:
+                compile_substage("storage collection: restore retained search pages")
+                for index in compile_iter(retained_pages, "storage-index-restore", label="Search pages restored"):
                     if index < len(self._tiles) and self._tiles[index] is not None:
                         self._page(index)
                 return {"reclaimed_records": reclaimed, "reclaimed_leaves": removed,
@@ -939,13 +960,17 @@ class LiveTileArena:
         With the fixed codec windows it is O(B + T) time and O(S) arena
         workspace for B live payload bytes, T entries and largest tile S.
         """
+        from .shell_telemetry import compile_substage, compile_iter
+
         with self._lock:
             if self._store is None:
                 return self.stats()
             candidate = DiskTileStore(self.directory)
             replacements = DiskTileDirectory(candidate, self.directory)
             live = 0
-            for index, record in enumerate(self._tiles):
+            compile_substage("storage compaction: compress live tiles")
+            for index, record in compile_iter(enumerate(self._tiles), "storage-compaction",
+                    label="Storage tiles compacted", total=len(self._tiles)):
                 if isinstance(record, DiskTile):
                     record = candidate.write(record.decode(), record.rows)
                     live += record.stored_bytes
@@ -1305,6 +1330,12 @@ class TiledDict(dict, MutableMapping):
         self._version += 1
         if self._count == 0:
             self._root = self._arena.allocate(("leaf", {}))
+            # Removing/rebuilding loop edges empties each adjacency map.
+            # A retained route into its OLD root made reinsertion visible to
+            # lookup but invisible to iteration/ancestry, which then deleted
+            # the still-live Add operands of `for i in range(2): x += 1.0`.
+            # Root replacement retires this map's routes, just as clear does.
+            self._arena.invalidate_routes(self._ref)
             self._order = None
         elif self._order is not None and len(self._order) > 2 * self._count + self._arena.bucket_rows:
             self._compact_order()
@@ -1988,13 +2019,30 @@ def adopt_digraph(graph, arena):
     import networkx as nx
     if not isinstance(graph, nx.DiGraph):
         return graph
+    if type(graph) is nx.DiGraph:
+        # Late adoption previously changed the maps but kept plain factories.
+        # NetworkX.add_node installed an empty dict, our map adopted a COPY,
+        # and its following attr_dict.update wrote only the discarded original.
+        # finalize_graph_with_outputs therefore minted an empty Store node.
+        # Keep this exact NetworkX object and use the existing live factories
+        # for subsequent node/edge births, plus their existing snapshot codec.
+        graph.__class__ = LiveDiGraph
+        graph._tile_owner = arena
+        state = object.__getattribute__(graph, "__dict__")
+        for name in _NETWORKX_CACHED_VIEWS:
+            state.pop(name, None)
     # NetworkX's documented map attributes are the authority. Their setters
     # invalidate cached views, and outer tiled maps adopt all future inner maps.
-    graph.graph = arena.manage(graph.graph)
-    graph._node = arena.manage(graph._node)
-    graph._adj = arena.manage(graph._adj)
+    # Successor and predecessor entries own the SAME mutable edge record.
+    # One memo across both maps must preserve that alias during conversion.
+    memo = {}
+    graph.graph = arena.manage(graph.graph, memo)
+    graph._node = arena.manage(graph._node, memo)
+    graph._adj = arena.manage(graph._adj, memo)
     graph._succ = graph._adj
-    graph._pred = arena.manage(graph._pred)
+    graph._pred = arena.manage(graph._pred, memo)
+    if isinstance(graph, LiveDiGraph):
+        arena.attach(graph)
     arena.categories.add("ProcessGraph.NetworkX")
     return graph
 
@@ -2002,8 +2050,11 @@ def adopt_digraph(graph, arena):
 import networkx as nx
 
 
-class LiveDiGraph(TiledObject, nx.DiGraph):
+class LiveDiGraph(nx.DiGraph, TiledObject):
     """The normal NetworkX graph, with compile-wide writable dict factories."""
+    # DiGraph remains the solid base, allowing an ordinary graph to adopt the
+    # same storage class in place without replacing its identity or layout.
+    __slots__ = ()
     def __init__(self, incoming_graph_data=None, *, arena=None, **attr):
         self._tile_owner = arena or _ACTIVE_ARENA.get()
         super().__init__(incoming_graph_data, **attr)

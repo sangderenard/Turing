@@ -7216,7 +7216,8 @@ def iter_identity_book_lines(
     if not full:
         yield f"log level: {level.name.lower()}"
     _prepare_log(book, level)
-    for page_name in sorted(book.pages):
+    from .shell_telemetry import compile_iter
+    for page_name in compile_iter(sorted(book.pages), "identity-log-pages", label="Identity log pages"):
         page = dict.get(book.pages, page_name)
         rows_level = _page_rows_level(book, page_name)
         withheld = level < rows_level
@@ -7235,9 +7236,14 @@ def iter_identity_book_lines(
     if full:
         return
     yield f"unsourced: latch {book.latch.name}"
+    from .shell_telemetry import compile_substage, compile_count, compile_count_close
+    compile_substage("identity log: unsourced tally")
     tally: Counter = Counter()
-    for page_ref, _row, reason, stage in book.unsourced_rows():
+    for count, (page_ref, _row, reason, stage) in enumerate(book.unsourced_rows(), 1):
         tally[(getattr(page_ref, "name", page_ref), stage.name, reason.name)] += 1
+        if count % 1024 == 0:
+            compile_count("identity-log-tally", count, label="Unsourced facts tallied")
+    compile_count_close("identity-log-tally")
     for (page_name, stage_name, reason_name), count in sorted(tally.items()):
         yield f"  {page_name} stage={stage_name} reason={reason_name}: {count}"
     yield from extra_lines
@@ -7251,7 +7257,8 @@ def _prepare_log(book: IdentityBook, level: IdentityLogLevel) -> None:
         return
     from .identity_spill import PARTITIONED, make_whole
 
-    for part in PARTITIONED:
+    from .shell_telemetry import compile_iter
+    for part in compile_iter(PARTITIONED, "identity-log-prepare", label="Identity log spill pages prepared"):
         page = dict.get(book.pages, part)
         if page is None or not page.__dict__.get("_detached"):
             continue
@@ -7273,15 +7280,25 @@ def _page_lines(page: IdentityPage, page_name: str, full: bool):
     # one undifferentiated list.  A row whose key names no id keeps its
     # place under "unkeyed" instead of being dropped or invented into
     # a group.
+    from .shell_telemetry import compile_substage, compile_count, compile_count_close
+    compile_substage(f"identity log: group {page_name} rows")
     rows = page.rows()
+    grouped = 0
+    compile_count("identity-log-rows", 0, label="Identity log rows grouped")
     by_group: dict[str, list[Any]] = {}
     for row in rows:
+        grouped += 1
+        if grouped % 1024 == 0:
+            compile_count("identity-log-rows", grouped)
         value_id = row_value_id(row)
         group = (
             "unkeyed" if value_id is None
             else (group_by_prefix([value_id])[0].label)
         )
         by_group.setdefault(group, []).append(row)
+    compile_count("identity-log-rows", grouped)
+    compile_count_close("identity-log-rows")
+    compile_substage(f"identity log: write {page_name} histories")
     for group in sorted(by_group):
         group_rows = by_group[group]
         if len(by_group) > 1:
@@ -7333,6 +7350,8 @@ def write_identity_log(
             return None
         final = f"{os.fspath(path_stem)}.{kind}.log.xz"
         temporary = f"{final}.tmp{os.getpid()}"
+        from .shell_telemetry import compile_substage
+        compile_substage(f"identity log: stream {level.name.lower()} checkpoint")
         with lzma.open(
             temporary, "wt", encoding="utf-8", newline="\n",
             preset=identity_log_lzma_preset(),
@@ -7342,6 +7361,7 @@ def write_identity_log(
             ):
                 handle.write(line)
                 handle.write("\n")
+            compile_substage("identity log: finalize compressed stream")
         os.replace(temporary, final)
         temporary = None
         return final

@@ -21,6 +21,54 @@ def arena(tmp_path):
     return owner
 
 
+def test_empty_map_reinsertion_routes_to_its_current_root(tmp_path):
+    owner = arena(tmp_path)
+    values = owner.manage({2: "first"})
+    assert values[2] == "first"  # Retain this hash's route to the old root.
+    del values[2]
+    owner.flush()
+    values[2] = "second"
+    owner.flush()
+    assert list(values) == [2]
+    assert values[2] == "second"
+    assert len(values) == 1
+
+
+def test_rebuilt_graph_edges_remain_visible_to_ancestry(tmp_path):
+    owner = arena(tmp_path)
+    graph = live_digraph(owner)
+    graph.add_edges_from(((1, 2), (2, 3)))
+    graph.remove_edges_from(tuple(graph.edges))
+    owner.flush()
+    graph.add_edges_from(((1, 2), (2, 3)))
+    owner.flush()
+    assert set(graph.edges) == {(1, 2), (2, 3)}
+    assert nx.ancestors(graph, 3) == {1, 2}
+    assert graph.has_edge(1, 2)
+
+
+def test_storage_collection_reports_its_actual_traversal_and_compaction(tmp_path):
+    from types import SimpleNamespace
+    from src.compiler.shell_telemetry import CompileProgress
+    owner = arena(tmp_path)
+    values = owner.manage({i: {"value": i} for i in range(24)})
+    owner.offload_to_disk()
+    messages = []
+    layer = CompileProgress(enabled=False, collect_profile=True, heartbeat=None)
+    layer.owner_display = SimpleNamespace(log=messages.append)
+    with layer:
+        layer.stage("compiler-finalization")
+        owner.collect_unused()
+    for phase in ("trace live handles", "sweep unreachable records", "restore retained search pages"):
+        assert any(f"storage collection: {phase}: begin" in line for line in messages)
+    assert any("storage compaction: compress live tiles: begin" in line for line in messages)
+    work = layer.summary()["work"]["compiler-finalization"]
+    assert work["storage-mark"]["done"] > 0
+    assert work["storage-sweep"]["done"] == work["storage-sweep"]["total"]
+    assert work["storage-compaction"]["done"] == work["storage-compaction"]["total"]
+    assert values[17]["value"] == 17
+
+
 def test_pressure_ladder_stays_fully_decoded_until_explicit_escalation(tmp_path):
     owner = LiveTileArena(tile_rows=2, hot_tiles=1, bucket_rows=1,
                           decoded_budget_bytes=256, directory=tmp_path)

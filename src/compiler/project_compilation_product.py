@@ -4856,7 +4856,7 @@ def compile_source_submissions(submissions, *, mode, options=None, progress_bars
                                    renderer=progress_renderer, state_sink=progress_state_sink)
         allowed = {"max_total_resident_bytes", "max_worker_memory_bytes", "worker_resident_reservation_bytes",
                    "minimum_total_resident_bytes", "system_reserve_bytes", "adaptive_memory_ceiling",
-                   "worker_elastic_available_percent", "thread_working_bytes"}
+                   "worker_elastic_available_percent", "thread_working_bytes", "minimum_worker_jobs"}
         with display:
             manifest = compile_project_product(next(iter(paths)), next(iter(roots)),
                 entries=names, expand_entry_dependencies=False,
@@ -4869,10 +4869,12 @@ def compile_source_submissions(submissions, *, mode, options=None, progress_bars
         return list(manifest["units"])
     contract = active_contract()
     policy = CompilerWorkPolicy(mode=mode, jobs=opts.get("jobs"),
+        minimum_jobs=opts.get("minimum_worker_jobs", 1),
         memory_bytes=opts.get("max_total_resident_bytes", contract.memory_budget_bytes),
         reserve_bytes=opts.get("system_reserve_bytes", contract.memory_system_reserve_bytes),
         working_bytes=opts.get("worker_resident_reservation_bytes", 2 << 30))
-    inner_policy = CompilerWorkPolicy(memory_bytes=policy.memory_bytes,
+    inner_policy = CompilerWorkPolicy(jobs=opts.get("inner_jobs"),
+        minimum_jobs=opts.get("minimum_worker_jobs", 1), memory_bytes=policy.memory_bytes,
         reserve_bytes=policy.reserve_bytes,
         working_bytes=opts.get("thread_working_bytes", 128 << 20))
     results, failures = [None] * len(requests), []
@@ -4895,6 +4897,7 @@ def compile_source_submissions(submissions, *, mode, options=None, progress_bars
         token = _ACTIVE_COMPILE_PROGRESS.set(None)
         child = CompileProgress(enabled=False, collect_profile=True, state_sink=state_sink)
         child.owner_display = display
+        child.owner_label = label
         worker_contract = dataclasses.replace(contract,
             memory_budget_bytes=opts.get("max_worker_memory_bytes", contract.memory_budget_bytes),
             memory_system_reserve_bytes=policy.reserve_bytes,
@@ -4962,7 +4965,7 @@ def compile_partitioned_source(
     system_reserve_bytes: int = 2 << 30,
     adaptive_memory_ceiling: bool = False,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
-    worker_elastic_available_percent: int = 25,
+    worker_elastic_available_percent: int = 75,
     max_unit_source_nodes: int = 4096,
     interface_tiles: bool = False,
     source_options: Mapping[str, Any] | None = None,
@@ -7021,7 +7024,7 @@ def compile_resolved_process_graph_plan(
     adaptive_memory_ceiling: bool = False,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
-    worker_elastic_available_percent: int = 25,
+    worker_elastic_available_percent: int = 75,
     worker_environment: Mapping[str, str] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -7956,13 +7959,14 @@ def compile_project_product(
     schedule_predecessors: Mapping[str, Iterable[str]] | None = None,
     python_executable: str | Path = sys.executable,
     jobs: int | None = None,
+    minimum_worker_jobs: int = 1,
     max_total_resident_bytes: int | None = None,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
     minimum_total_resident_bytes: int = 2 << 30,
     system_reserve_bytes: int = 2 << 30,
     adaptive_memory_ceiling: bool = True,
-    worker_elastic_available_percent: int = 25,
+    worker_elastic_available_percent: int = 75,
     thread_working_bytes: int = 128 << 20,
     extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     emit_native: bool = False,
@@ -8046,6 +8050,9 @@ def compile_project_product(
     worker_limit = int(jobs if jobs is not None else max(1, len(selected_names)))
     if worker_limit < 1:
         raise ValueError("project compilation jobs must be positive")
+    minimum_worker_jobs = int(minimum_worker_jobs)
+    if minimum_worker_jobs < 1:
+        raise ValueError("minimum project workers must be positive")
     memory_ceiling = (
         None
         if max_total_resident_bytes is None
@@ -8145,6 +8152,7 @@ def compile_project_product(
             "schema": "turing.project-compilation-progress.v1",
             "source": source_file.as_posix(),
             "worker_jobs": worker_limit,
+            "minimum_worker_jobs": minimum_worker_jobs,
             "max_total_resident_bytes": memory_ceiling,
             "current_memory_ceiling_bytes": current_memory_ceiling,
             "worker_resident_reservation_bytes": worker_reservation,
@@ -8164,6 +8172,7 @@ def compile_project_product(
             completed_count=sum(record is not None for record in records),
             count=len(selected_names),
             worker_jobs=worker_limit,
+            minimum_worker_jobs=minimum_worker_jobs,
             current_memory_ceiling_bytes=current_memory_ceiling,
             running=running_records,
         )
@@ -8243,6 +8252,7 @@ def compile_project_product(
         worker_environment["TURING_MEMORY_SYSTEM_RESERVE_BYTES"] = str(system_reserve_bytes)
         worker_environment["TURING_MEMORY_ELASTIC_AVAILABLE_PERCENT"] = str(worker_elastic_available_percent)
         worker_environment["TURING_COMPILER_THREAD_WORKING_BYTES"] = str(thread_working_bytes)
+        worker_environment["TURING_COMPILER_MINIMUM_WORKERS"] = str(minimum_worker_jobs)
         if inherited_bootstrap_products:
             from .compiler_bootstrap_runtime import (
                 COMPILER_BOOTSTRAP_PRODUCTS_ENV,
@@ -8472,6 +8482,8 @@ def compile_project_product(
             if adaptive_memory_ceiling else memory_ceiling)
         admitted = False
         while pending and len(running) < worker_limit and (
+            len(running) < minimum_worker_jobs
+            or
             current_memory_ceiling is None
             or not running
             or (
@@ -8729,6 +8741,7 @@ def compile_project_product(
         "authored_source": authored_source_path.name,
         "calls": [by_name[name].to_mapping() for name in selected_names],
         "worker_jobs": worker_limit,
+        "minimum_worker_jobs": minimum_worker_jobs,
         "max_total_resident_bytes": memory_ceiling,
         "worker_resident_reservation_bytes": worker_reservation,
         "max_worker_memory_bytes": worker_memory_budget,
@@ -8838,6 +8851,7 @@ def compile_project_bootstrap_creep(
     expand_entry_dependencies: bool = True,
     python_executable: str | Path = sys.executable,
     jobs: int | None = None,
+    minimum_worker_jobs: int = 1,
     max_total_resident_bytes: int | None = None,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
@@ -8908,6 +8922,7 @@ def compile_project_bootstrap_creep(
             expand_entry_dependencies=expand_entry_dependencies,
             python_executable=python_executable,
             jobs=jobs,
+            minimum_worker_jobs=minimum_worker_jobs,
             max_total_resident_bytes=max_total_resident_bytes,
             worker_resident_reservation_bytes=(
                 worker_resident_reservation_bytes

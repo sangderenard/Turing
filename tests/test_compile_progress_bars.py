@@ -434,7 +434,7 @@ def test_lowering_stage_sequence_is_the_compiler_order():
         "source-normalisation", "source-closure", "topology-reduction",
         "compilation-units", "deployment-select", "deployment-instantiate",
         "call-topology", "graph-planning", "ssa-lowering",
-        "pre-native-repairs",
+        "pre-native-repairs", "compiler-finalization",
     ]
     assert [s.key for s in COMPILE_STAGES][-2:] == ["emission", "build"]
     assert len({stage.key for stage in COMPILE_STAGES}) == len(COMPILE_STAGES)

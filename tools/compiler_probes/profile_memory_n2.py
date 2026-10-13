@@ -7,7 +7,7 @@ TURING_PROBE_EXTERNAL_ROOT can select the original examples/engine_toy roots
 while compiler imports stay in this worktree. Lowers the first N
 pieces of the orbital craft in link mode. Missing or stale laws are supplied
 as a parallel source list; the complete linked system follows. Both use the
-canonical ten-stage display, with auto inside each source. With --trace it
+canonical eleven-stage display, with auto inside each source. With --trace it
 also prints, inline:
 
 * the stage table: every ``memory_regulation`` stage boundary and every
@@ -110,11 +110,14 @@ def _run_profile(argv: list[str], scope) -> int:
     parser.add_argument("--source-compilation", choices=("auto", "serial", "parallel", "units"), default="auto")
     parser.add_argument("--source-schedule", choices=("serial", "parallel"), default="parallel")
     parser.add_argument("--jobs", type=int, default=None, help="optional maximum source-list workers; inner auto remains implicit")
+    parser.add_argument("--min-workers", "--minimum-workers", type=int, default=12,
+                        help="minimum admitted workers when that many independent jobs are ready (default: 12)")
     parser.add_argument("--max-total-gb", type=float, default=10.0)
     parser.add_argument("--max-worker-gb", type=float, default=10.0)
     parser.add_argument("--system-reserve-gb", type=float, default=2.0)
     parser.add_argument("--worker-reserve-gb", type=float, default=2.0)
     parser.add_argument("--thread-working-mib", type=int, default=128)
+    parser.add_argument("--worker-elastic-available-percent", type=int, default=75)
     parser.add_argument("--optimization", choices=("O0", "O1", "O2", "O3"), default="O3")
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--save-ssa", action="store_true", help="retain the public lowerer's SSA before backend emission, for failure analysis")
@@ -128,7 +131,9 @@ def _run_profile(argv: list[str], scope) -> int:
         "max_worker_memory_bytes": int(options.max_worker_gb * (1 << 30)),
         "system_reserve_bytes": int(options.system_reserve_gb * (1 << 30)),
         "worker_resident_reservation_bytes": int(options.worker_reserve_gb * (1 << 30)),
-        "thread_working_bytes": options.thread_working_mib << 20}
+        "thread_working_bytes": options.thread_working_mib << 20,
+        "minimum_worker_jobs": options.min_workers,
+        "worker_elastic_available_percent": options.worker_elastic_available_percent}
     if options.jobs is not None:
         worker_options["jobs"] = options.jobs
     os.chdir(ROOT)

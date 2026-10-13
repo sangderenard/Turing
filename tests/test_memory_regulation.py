@@ -21,6 +21,13 @@ from src.compiler.work_contract import (
 )
 
 
+@pytest.fixture(autouse=True)
+def deterministic_system_headroom(monkeypatch):
+    # These tests use synthetic RSS budgets of a few bytes. Actual system RAM
+    # pressure must not subtract a GiB-scale reserve from those fixtures.
+    monkeypatch.setattr(regulation, "system_available_memory_bytes", lambda: None)
+
+
 def _regulator(book, budget, readings, monkeypatch, items):
     """A regulator whose resident-set reads come from ``readings`` (one per
     call, the last repeated) and whose release order is ``items``."""
@@ -112,7 +119,7 @@ def test_release_ordinals_continue_across_boundaries(monkeypatch):
 def test_work_contract_budget_is_validated_and_defaults_to_automatic_ladder():
     assert all(preset.memory_budget_bytes == 10 << 30 for preset in PRESETS.values())
     assert all(
-        preset.memory_elastic_available_percent == 25
+        preset.memory_elastic_available_percent == 75
         for preset in PRESETS.values()
     )
     assert all(preset.compress_cold_pages for preset in PRESETS.values())
@@ -242,7 +249,7 @@ def test_compressed_front_expands_with_headroom_and_contracts_before_escalation(
     regulator.live_arena = owner
     monkeypatch.setattr(regulation, "process_rss_bytes", lambda: resident)
     monkeypatch.setattr(
-        regulation, "system_available_memory_bytes", lambda: 0,
+        regulation, "system_available_memory_bytes", lambda: 4 << 30,
     )
 
     regulator.pressure_checkpoint("active compressed work")
@@ -295,7 +302,7 @@ def test_compressed_front_borrows_a_fraction_of_available_ram_and_gives_it_back(
     regulator._last_pressure_read = 0.0
     regulator.pressure_checkpoint("temporary active arena")
     assert owner.pressure_level == 2
-    assert owner.decoded_budget_bytes == 132 << 20
+    assert owner.decoded_budget_bytes == owner.base_decoded_budget_bytes
 
 
 def test_resumed_dual_ir_book_reuses_pressure_arena_for_source_storage(monkeypatch):
