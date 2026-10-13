@@ -622,6 +622,24 @@ def reduce_scheduled_shader_regions(
         for node_id in control_node_ids
         if int(node_id) in graph.G
     }
+    executable = {
+        int(node_id)
+        for node_id in executable_node_ids
+        if int(node_id) in graph.G and int(node_id) not in control_nodes
+    }
+    if not executable:
+        # The runtime source catalogue is a map owner, not executable shader
+        # work.  Its authored dependency graph may contain recursive call
+        # backedges, but an empty numerical projection has no edges to
+        # validate or regions to reduce.  Return that exact empty projection
+        # before inspecting unrelated catalogue topology.
+        return ScheduledProcessGraphDispatchPlan(
+            patterns=(),
+            dispatches=(),
+            dependency_columns=(),
+            levels=(),
+            node_locations={},
+        )
     planning_graph = graph.G.copy()
     planning_graph.remove_edges_from(tuple(
         (left, right)
@@ -639,11 +657,6 @@ def reduce_scheduled_shader_regions(
     )
     order_index = {
         node_id: index for index, node_id in enumerate(topological)
-    }
-    executable = {
-        node_id
-        for node_id in executable_node_ids
-        if node_id in graph.G and node_id not in control_nodes
     }
     keys = dict(partition_keys or {})
     fusible = (

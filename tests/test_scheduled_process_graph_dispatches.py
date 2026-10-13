@@ -35,6 +35,23 @@ def _payload(op, parents=()):
     }
 
 
+def test_empty_shader_projection_ignores_unrelated_catalogue_cycle():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(1, **_payload("Call", ((2, "recursive-result"),)))
+    graph.G.add_node(2, **_payload("FunctionDef", ((1, "callee"),)))
+    graph.G.add_edge(1, 2)
+    graph.G.add_edge(2, 1)
+    original_edges = tuple(graph.G.edges)
+
+    plan = reduce_scheduled_shader_regions(graph, executable_node_ids=())
+
+    assert plan.dispatches == ()
+    assert plan.patterns == ()
+    assert plan.levels == ()
+    assert plan.node_locations == {}
+    assert tuple(graph.G.edges) == original_edges
+
+
 def _add(graph, node_id, op, parents=()):
     parent_items = tuple(
         (parent, f"arg{index}")

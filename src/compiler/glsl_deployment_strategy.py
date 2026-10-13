@@ -111,7 +111,6 @@ from .loop_composer import (
     LoopComposer,
     LoopStrategy,
     _destructure_loop_target,
-    _rebuild_graph_edges,
     _retarget_cached_value_ids,
     analyze_shader_loop_reductions,
     bind_control_deployments_to_regions,
@@ -27801,15 +27800,6 @@ def strategize_shell_deployment(
         "resolve-grounded-tensor-operations",
         lambda: _resolve_grounded_tensor_operations(graph),
     )
-    if runtime_catalogue:
-        # Catalogue planning skips loop materialization, which ordinarily
-        # republishes condensation levels and the recursion table after graph
-        # rewrites.  Publish those same canonical graph facts here before any
-        # consumer asks for the cycle-aware dependency order.
-        selection_phase(
-            "publish-recursion-order",
-            lambda: _rebuild_graph_edges(graph),
-        )
     reference_tables = selection_phase(
         "build-shell-reference-tables",
         lambda: build_shell_reference_tables(graph),

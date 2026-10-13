@@ -53,16 +53,61 @@ def _dependency_order(graph: Any) -> tuple[int, ...]:
             dependency_graph, key=lambda value_id: int(value_id)
         ))
     except nx.NetworkXUnfeasible:
-        recursive = G.graph.get("recursion_table")
-        if not recursive or set(graph.levels) != set(G):
+        components = tuple(nx.strongly_connected_components(dependency_graph))
+        recursive_components = tuple(
+            frozenset(map(int, component))
+            for component in components
+            if (
+                len(component) > 1
+                or any(
+                    dependency_graph.has_edge(node_id, node_id)
+                    for node_id in component
+                )
+            )
+        )
+        declared_regions = tuple(
+            frozenset(map(int, record.get("members", ())))
+            for record in (G.graph.get("recursion_table") or {}).values()
+        )
+        undeclared = []
+        for component in recursive_components:
+            if any(component <= region for region in declared_regions):
+                continue
+            backedge_nodes = {
+                node_id
+                for node_id in component
+                if bool((G.nodes[node_id].get("attributes") or {}).get(
+                    "recursive_backedge"
+                ))
+            }
+            # The marker is sufficient only when every cycle in this SCC
+            # crosses an explicitly authored recursive call.  Removing those
+            # exact call nodes must restore a DAG; otherwise an unrelated
+            # dependency cycle merely happens to share an SCC with recursion.
+            if not backedge_nodes or not nx.is_directed_acyclic_graph(
+                dependency_graph.subgraph(component - backedge_nodes)
+            ):
+                undeclared.append(component)
+        if undeclared:
+            # Cycles are legal only when the authored graph already names the
+            # backedge, or retained-loop planning owns the complete region.
+            # Never turn an arbitrary dependency error into recursion merely
+            # because condensation could order it.
             raise
-        order = tuple(sorted(
-            G,
-            key=lambda node_id: (
-                int(graph.levels[node_id]),
-                int(node_id),
-            ),
-        ))
+        condensed = nx.condensation(dependency_graph, scc=components)
+        component_order = nx.lexicographical_topological_sort(
+            condensed,
+            key=lambda component_id: min(map(
+                int, condensed.nodes[component_id]["members"]
+            )),
+        )
+        order = tuple(
+            int(node_id)
+            for component_id in component_order
+            for node_id in sorted(
+                condensed.nodes[component_id]["members"], key=int
+            )
+        )
     G.graph["_dependency_order_cache"] = (fingerprint, order)
     return order
 

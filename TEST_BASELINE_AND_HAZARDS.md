@@ -22,14 +22,21 @@ lexical aggregate kind.  Resolved graph checkpoints now use the existing
 import-owned identity and AOT-checkpoint contracts for cached descriptors,
 context variables, standard streams, and synchronization handles.  Native
 build commands use a short transient working directory while keeping every
-artifact path absolute.  Finally, the runtime catalogue republishes its
-existing recursion table and condensation levels before asking for dependency
-order, so authored backedges do not reach NetworkX as an unclassified cycle.
+artifact path absolute.  Runtime-catalogue dependency ordering recognizes an
+authored `recursive_backedge` on its private semantic dependency projection
+and orders that projection through its condensation graph.  It does not
+rebuild or annotate the shared ProcessGraph.  A catalogue with no executable
+numerical nodes returns the exact empty shader dispatch plan before unrelated
+catalogue topology is validated.
 
 Seven focused identity, checkpoint, progress, and native-path tests pass in
-2.02 seconds.  The persisted 109,611-node failed catalogue graph was also
-loaded directly: rebuilding its existing recursion facts allowed dependency
-ordering to return all 109,611 nodes.  No outer bootstrap was launched.
+2.02 seconds.  The scheduling and loop-composer gate passes 107 tests in 9.06
+seconds, including refusal of an unowned cycle and of a residual cycle merely
+adjacent to a declared backedge.  The persisted 109,621-node failed catalogue
+graph was also loaded directly: dependency ordering returned all 109,621 unique nodes and the
+empty shader projection returned no dispatches while its physical edges,
+recursion metadata, and level table remained unchanged.  No outer bootstrap
+was launched.
 
 2026-10-12 PROJECT SOURCE MODULE IDENTITY (CURRENT WORKTREE):
 Project compilation no longer discards the module identity it already resolved

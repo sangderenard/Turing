@@ -4412,6 +4412,56 @@ def test_dependency_order_includes_canonical_parent_edges_absent_from_networkx()
     assert order.index(9) < order.index(4)
 
 
+def test_dependency_order_condenses_declared_backedge_without_mutating_graph():
+    from src.compiler.glsl_deployment_strategy import _dependency_order
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(
+        1, type="FunctionDef", parents=((3, "recursive-result"),),
+        attributes={},
+    )
+    graph.G.add_node(2, type="Call", parents=((1, "callee"),), attributes={})
+    graph.G.add_node(
+        3, type="Call", parents=((2, "value"),),
+        attributes={"recursive_backedge": True},
+    )
+    original_edges = tuple(graph.G.edges)
+
+    order = _dependency_order(graph)
+
+    assert set(order) == {1, 2, 3}
+    assert tuple(graph.G.edges) == original_edges == ()
+    assert "recursion_table" not in graph.G.graph
+
+
+def test_dependency_order_still_refuses_an_unowned_cycle():
+    from src.compiler.glsl_deployment_strategy import _dependency_order
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(1, type="add", parents=((2, "right"),), attributes={})
+    graph.G.add_node(2, type="add", parents=((1, "left"),), attributes={})
+
+    with pytest.raises(nx.NetworkXUnfeasible):
+        _dependency_order(graph)
+
+
+def test_dependency_order_refuses_residual_cycle_beside_a_backedge():
+    from src.compiler.glsl_deployment_strategy import _dependency_order
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(
+        1, type="Call", parents=((3, "recursive-result"),),
+        attributes={"recursive_backedge": True},
+    )
+    graph.G.add_node(
+        2, type="add", parents=((1, "left"), (3, "right")), attributes={},
+    )
+    graph.G.add_node(3, type="add", parents=((2, "value"),), attributes={})
+
+    with pytest.raises(nx.NetworkXUnfeasible):
+        _dependency_order(graph)
+
+
 def test_declared_record_span_is_a_planner_tensor_descriptor():
     from src.compiler.glsl_deployment_strategy import _tensor_descriptor
 
