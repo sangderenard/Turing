@@ -1,6 +1,7 @@
 """The normal native-program lowering must execute bounded compiler units."""
 from pathlib import Path
 import dataclasses
+import io
 import json
 import pickle
 import subprocess
@@ -185,6 +186,110 @@ def test_partitioned_public_entry_preserves_module_import_identity(
     assert result == {"status": "sealed"}
     assert observed["source_options"]["source_module"] == "package.program"
     assert observed["source_options"]["python_package"] == "package"
+
+
+def test_universal_frontend_parallel_uses_total_graph_partitioning(
+    tmp_path, monkeypatch,
+):
+    import src.compiler.project_compilation_product as products
+
+    observed = {}
+
+    def compile_partitioned(source, directory, **options):
+        observed.update({
+            "source": source,
+            "directory": Path(directory),
+            "options": options,
+        })
+        return {"status": "sealed", "route": "resolved-graph-units"}
+
+    monkeypatch.setattr(products, "compile_partitioned_source", compile_partitioned)
+
+    class Module:
+        metadata = {}
+
+    monkeypatch.setattr(
+        products, "load_partitioned_source_interfaces",
+        lambda manifest: (Module(), {}, ("root",)),
+    )
+    result = lower_ast_source_to_ssa(
+        "def root(value):\n    return value + 1\n",
+        "root",
+        source_compilation="parallel",
+        compilation_directory=tmp_path / "compile",
+        partitioned_options={"jobs": 3},
+    )
+
+    assert result[0].metadata["source_compilation"] == {
+        "schema": "turing.source-compilation-front-end.v1",
+        "mode": "parallel",
+        "partition_point": "resolved-process-graph",
+        "unit_count": 0,
+    }
+    assert observed["directory"] == tmp_path / "compile"
+    assert observed["options"]["jobs"] == 3
+    assert observed["options"]["interface_tiles"] is True
+
+
+def test_universal_frontend_rejects_ambiguous_parallel_directories(tmp_path):
+    with pytest.raises(ValueError, match="both compilation_directory"):
+        lower_ast_source_to_ssa(
+            "def root(value):\n    return value\n",
+            "root",
+            source_compilation="parallel",
+            compilation_directory=tmp_path / "public",
+            partitioned_directory=tmp_path / "legacy",
+        )
+
+
+def test_universal_frontend_serial_uses_the_canonical_whole_graph_compiler():
+    contract = ExtractionContract(
+        "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {},
+        "bindings": [],
+        "values": [{
+            "function": "root", "parameter": "value",
+            "storage": "scalar", "dtype": "float64", "rank": 0,
+            "shape": [], "python_type": "builtins.float",
+        }],
+    })
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def root(value):\n    return value * 2.0 + 1.0\n",
+        "root",
+        source_compilation="serial",
+        extraction_contract=contract,
+        progress=lambda _message: None,
+        progress_bars=False,
+    )
+
+    assert len(exports) == 1
+    assert outputs[exports[0]]
+    assert module.metadata["source_compilation"] == {
+        "schema": "turing.source-compilation-front-end.v1",
+        "mode": "serial",
+        "partition_point": None,
+        "unit_count": 1,
+    }
+
+
+def test_resolved_graph_checkpoint_preserves_code_objects():
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+
+    def authored(value):
+        return value + 1
+
+    stream = io.BytesIO()
+    _dump_resolved_process_graph(
+        {"static_python_binding": authored.__code__}, stream,
+    )
+    restored = pickle.loads(stream.getvalue())["static_python_binding"]
+
+    assert isinstance(restored, type(authored.__code__))
+    assert restored.co_code == authored.__code__.co_code
+    assert restored.co_consts == authored.__code__.co_consts
 
 
 def test_native_tensor_index_is_not_a_tuple_projection(tmp_path):

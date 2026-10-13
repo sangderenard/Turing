@@ -20,6 +20,7 @@ import hashlib
 import importlib
 import io
 import json
+import marshal
 import os
 from pathlib import Path
 import pickle
@@ -4547,6 +4548,41 @@ def _reduce_import_owned_text_stream(
     return _reduce_import_owned_module_slot(stream, "TextIOWrapper")
 
 
+def _restore_code_object(payload: bytes) -> types.CodeType:
+    """Restore an immutable CPython code value in the matching worker runtime."""
+
+    value = marshal.loads(payload)
+    if not isinstance(value, types.CodeType):
+        raise pickle.UnpicklingError("resolved graph code payload is not a code object")
+    return value
+
+
+def _resolved_process_graph_dispatch_table() -> dict[type, Any]:
+    """The single serialization contract used by whole and scoped graph cuts."""
+
+    import threading
+    from ..common.tensors.accelerator_backends.aot_checkpoint import (
+        _new_lock,
+        _new_rlock,
+    )
+
+    dispatch = copyreg.dispatch_table.copy()
+    dispatch[types.ModuleType] = lambda module: (
+        importlib.import_module,
+        (str(module.__name__),),
+    )
+    dispatch[types.CodeType] = lambda code: (
+        _restore_code_object,
+        (marshal.dumps(code),),
+    )
+    dispatch[functools.cached_property] = _reduce_importable_cached_property
+    dispatch[contextvars.ContextVar] = _reduce_import_owned_context_var
+    dispatch[io.TextIOWrapper] = _reduce_import_owned_text_stream
+    dispatch[type(threading.Lock())] = lambda _lock: (_new_lock, ())
+    dispatch[type(threading.RLock())] = lambda _lock: (_new_rlock, ())
+    return dispatch
+
+
 def _dump_resolved_process_graph(graph: Any, stream: Any) -> None:
     """Serialize a reduced graph while preserving importable module bindings.
 
@@ -4557,36 +4593,8 @@ def _dump_resolved_process_graph(graph: Any, stream: Any) -> None:
     the live graph nor changes global pickle behavior.
     """
 
-    import threading
-    from ..common.tensors.accelerator_backends.aot_checkpoint import (
-        _new_lock,
-        _new_rlock,
-    )
-
     pickler = _ResolvedProcessGraphPickler(stream, protocol=5)
-    pickler.dispatch_table = copyreg.dispatch_table.copy()
-    pickler.dispatch_table[types.ModuleType] = lambda module: (
-        importlib.import_module,
-        (str(module.__name__),),
-    )
-    pickler.dispatch_table[functools.cached_property] = (
-        _reduce_importable_cached_property
-    )
-    pickler.dispatch_table[contextvars.ContextVar] = (
-        _reduce_import_owned_context_var
-    )
-    pickler.dispatch_table[io.TextIOWrapper] = (
-        _reduce_import_owned_text_stream
-    )
-    # Resolved graph publication is a process checkpoint.  Synchronization
-    # handles have no transferable ownership state; use the compiler's
-    # existing AOT-checkpoint contract to create fresh worker-local handles.
-    pickler.dispatch_table[type(threading.Lock())] = lambda _lock: (
-        _new_lock, (),
-    )
-    pickler.dispatch_table[type(threading.RLock())] = lambda _lock: (
-        _new_rlock, (),
-    )
+    pickler.dispatch_table = _resolved_process_graph_dispatch_table()
     pickler.dump(graph)
 
 
@@ -4728,10 +4736,7 @@ def _dump_scoped_resolved_process_graph(
             return super().reducer_override(value)
 
     pickler = ScopedPickler(stream, protocol=5)
-    pickler.dispatch_table = copyreg.dispatch_table.copy()
-    pickler.dispatch_table[types.ModuleType] = lambda module: (
-        importlib.import_module, (str(module.__name__),),
-    )
+    pickler.dispatch_table = _resolved_process_graph_dispatch_table()
     pickler.dump(catalogue)
     return receipt
 

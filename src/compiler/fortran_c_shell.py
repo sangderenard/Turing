@@ -45372,12 +45372,56 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     ``progress_renderer=`` (auto/rich/tqdm, or TURING_COMPILE_RENDERER) chooses
     the terminal renderer. Auto prefers an installed Rich Live compositor;
     headless runs do not import it. The measured telemetry is unchanged.
+
+    ``source_compilation="serial"`` lowers the complete resolved graph in the
+    current process. ``source_compilation="parallel"`` requires
+    ``compilation_directory=`` and cuts that same complete resolved graph into
+    dependency-planned worker units. In both modes this function remains the
+    sole source compiler and produces repository SSA.
     """
     _collect_profile = kwargs.pop("compile_profile", True)
     _progress_renderer = kwargs.pop("progress_renderer", None)
     _progress_state_sink = kwargs.pop("compile_progress_state_sink", None)
+    source_compilation = kwargs.pop("source_compilation", None)
+    compilation_directory = kwargs.pop("compilation_directory", None)
     partitioned_directory = kwargs.pop("partitioned_directory", None)
     partitioned_options = kwargs.pop("partitioned_options", {})
+    if source_compilation is not None:
+        source_compilation = str(source_compilation).lower()
+        if source_compilation not in {"serial", "parallel"}:
+            raise ValueError(
+                "source_compilation must be 'serial' or 'parallel'"
+            )
+        if source_compilation == "serial":
+            if (
+                compilation_directory is not None
+                or partitioned_directory is not None
+            ):
+                raise ValueError(
+                    "serial source compilation does not accept a compilation directory"
+                )
+        else:
+            if (
+                compilation_directory is not None
+                and partitioned_directory is not None
+            ):
+                raise ValueError(
+                    "parallel source compilation received both compilation_directory "
+                    "and the legacy partitioned_directory"
+                )
+            partitioned_directory = (
+                compilation_directory
+                if compilation_directory is not None
+                else partitioned_directory
+            )
+            if partitioned_directory is None:
+                raise ValueError(
+                    "parallel source compilation requires compilation_directory"
+                )
+    elif compilation_directory is not None:
+        raise ValueError(
+            "compilation_directory requires source_compilation='parallel'"
+        )
     if partitioned_directory is not None:
         from .project_compilation_product import compile_partitioned_source, load_partitioned_source_interfaces
         options = dict(kwargs)
@@ -45403,7 +45447,16 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             **options, **partitioned_options, interface_tiles=True,
             source_options=source_options,
             progress=None if progress is None else lambda event: progress(f"partitioned-source: {event}"))
-        return load_partitioned_source_interfaces(manifest)
+        result = load_partitioned_source_interfaces(manifest)
+        module = result[0] if isinstance(result, tuple) else result
+        if hasattr(module, "metadata"):
+            module.metadata["source_compilation"] = {
+                "schema": "turing.source-compilation-front-end.v1",
+                "mode": "parallel",
+                "partition_point": "resolved-process-graph",
+                "unit_count": len(manifest.get("units") or ()),
+            }
+        return result
     if partitioned_options:
         raise TypeError("partitioned_options requires partitioned_directory")
     from .identity_concordance import begin_identity_book, end_identity_book
@@ -45522,6 +45575,13 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             module.metadata["graph_work"] = _regulator.graph_pool.summary()
             if _progress is not None:
                 _progress(f"graph-work: {_regulator.graph_pool.summary()}")
+        if source_compilation == "serial":
+            module.metadata["source_compilation"] = {
+                "schema": "turing.source-compilation-front-end.v1",
+                "mode": "serial",
+                "partition_point": None,
+                "unit_count": 1,
+            }
         return result
     finally:
         _bars.close(failed=not ok)
