@@ -7,9 +7,8 @@ for every gain. This module now describes one composition instead:
 
 * the Python coordinator and IdentityBook remain the semantic authority;
 * existing native foundations are named, versioned boundary components;
-* a whole outer compiler stage is the unit offered to bootstrap creep;
-* independently verified inner products may feed the next build of that same
-  outer stage, but they are never confused with completion of the stage.
+* the whole outer compiler stage is submitted through the public partitioned
+  source compiler used by ordinary compiled programs.
 
 Every component version includes its authored source, its declared boundary
 contract and the compiler toolchain fingerprint. Source changes therefore
@@ -145,7 +144,7 @@ BOUNDARIES = (
 
 @dataclass(frozen=True)
 class WholeProgramCompilerProduct:
-    """A bootstrap-creep product for one versioned outer partition."""
+    """A canonical partitioned product for one versioned outer partition."""
 
     boundary: Mapping[str, Any]
     product: Mapping[str, Any]
@@ -204,24 +203,21 @@ def build_whole_program_compiler(
     directory: str | Path,
     *,
     jobs: int | None = None,
-    max_total_resident_bytes: int | None = None,
-    worker_resident_reservation_bytes: int = 8 << 30,
-    max_worker_memory_bytes: int | None = 12 << 30,
-    unit_timeout_seconds: float | None = 1800.0,
-    max_rounds: int = 16,
+    max_total_resident_bytes: int | None = 10 << 30,
+    worker_resident_reservation_bytes: int = 2 << 30,
+    max_worker_memory_bytes: int | None = 10 << 30,
     progress: Callable[[str], None] | None = None,
-    event_progress: Callable[[Mapping[str, Any]], None] | None = None,
-    **_legacy_options: Any,
 ) -> WholeProgramCompilerProduct:
     """Bootstrap the complete ProcessGraph-to-AOT outer partition.
 
-    The existing project bootstrap owns subdivision, native verification,
-    receipt-gated activation and fixed-point iteration. This function merely
-    selects the already-existing outer seam as its root and gives the product
-    a source/toolchain-derived version directory.
+    Bootstrap uses the same public partitioned compiler entry as every other
+    program. This function only selects the existing outer seam and gives the
+    resulting product a source/toolchain-derived version directory; it owns no
+    compilation, memory, timeout, or fallback policy of its own.
     """
 
-    from .project_compilation_product import compile_project_bootstrap_creep
+    from .fortran_c_shell import lower_ast_source_to_ssa
+    from .project_compilation_product import DEFAULT_PROJECT_EXTRACTION_CONTRACT
 
     destination = Path(directory).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -232,33 +228,31 @@ def build_whole_program_compiler(
         destination / "products" / boundary["name"] / boundary["version"]
     )
 
-    def report(event: Mapping[str, Any]) -> None:
-        if event_progress is not None:
-            event_progress(dict(event))
-        elif progress is not None:
-            progress(
-                "compiler-bootstrap: "
-                + str(event.get("stage") or "progress")
-                + " "
-                + json.dumps(dict(event), sort_keys=True, default=str)
-            )
-
-    product = compile_project_bootstrap_creep(
-        repository / boundary["source"],
-        product_root,
-        entries=(boundary["entrypoint"],),
-        expand_entry_dependencies=True,
-        jobs=jobs,
-        max_total_resident_bytes=max_total_resident_bytes,
-        worker_resident_reservation_bytes=worker_resident_reservation_bytes,
-        max_worker_memory_bytes=max_worker_memory_bytes,
-        unit_timeout_seconds=unit_timeout_seconds,
-        max_rounds=max_rounds,
-        progress=report,
+    source_path = repository / boundary["source"]
+    source_module = ".".join(source_path.relative_to(repository).with_suffix("").parts)
+    partitioned_options = {
+        "max_total_resident_bytes": max_total_resident_bytes,
+        "worker_resident_reservation_bytes": worker_resident_reservation_bytes,
+        "max_worker_memory_bytes": max_worker_memory_bytes,
+    }
+    if jobs is not None:
+        partitioned_options["jobs"] = jobs
+    lower_ast_source_to_ssa(
+        source_path.read_text(encoding="utf-8"),
+        boundary["entrypoint"],
+        source_module=source_module,
+        python_package=source_module.rpartition(".")[0],
+        extraction_contract=DEFAULT_PROJECT_EXTRACTION_CONTRACT,
+        name="compiler_bootstrap",
+        partitioned_directory=product_root,
+        partitioned_options=partitioned_options,
+        progress=progress,
     )
+    product_manifest = product_root / "product" / "manifest.json"
+    product = json.loads(product_manifest.read_text(encoding="utf-8"))
     manifest_value = {
         "schema": BOOTSTRAP_SCHEMA,
-        "stage": "built" if product.get("status") == "sealed" else "frontier",
+        "stage": "built",
         "strategy": STRATEGY,
         "boundary": boundary,
         "product": product,

@@ -227,15 +227,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--max-worker-gb", type=float, default=4.0,
         help=(
-            "terminate and record a unit before its committed/private memory "
-            "exceeds this many GiB (default: 4; use 0 to disable)"
-        ),
-    )
-    parser.add_argument(
-        "--unit-timeout-seconds", type=float, default=0.0,
-        help=(
-            "terminate and record a unit after this many seconds "
-            "(default: disabled; use a positive value to opt in)"
+            "per-worker memory-regulation/compression budget in GiB "
+            "(default: 4; use 0 for the work-contract default); this never "
+            "terminates a worker"
         ),
     )
     parser.add_argument(
@@ -374,8 +368,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             worker_resident_reservation_bytes=int(arguments.worker_reserve_gb * 1024 ** 3),
             max_worker_memory_bytes=(None if arguments.max_worker_gb == 0
                                      else int(arguments.max_worker_gb * 1024 ** 3)),
-            unit_timeout_seconds=(None if arguments.unit_timeout_seconds == 0
-                                  else arguments.unit_timeout_seconds),
             progress=lambda event: print(json.dumps(event, sort_keys=True), flush=True),
         )
         print(json.dumps({"counts": manifest["counts"],
@@ -402,10 +394,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_worker_memory_bytes=(
                 None if arguments.max_worker_gb == 0
                 else int(arguments.max_worker_gb * 1024 ** 3)
-            ),
-            unit_timeout_seconds=(
-                None if arguments.unit_timeout_seconds == 0
-                else arguments.unit_timeout_seconds
             ),
             extraction_contract=arguments.extraction_contract,
             bootstrap_products=selected_products,
@@ -452,10 +440,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None if arguments.max_worker_gb == 0
                 else int(arguments.max_worker_gb * 1024 ** 3)
             ),
-            unit_timeout_seconds=(
-                None if arguments.unit_timeout_seconds == 0
-                else arguments.unit_timeout_seconds
-            ),
             max_subdivision_depth=arguments.max_subdivision_depth,
             bootstrap_products=selected_products,
             progress=lambda event: print(
@@ -496,10 +480,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None if arguments.max_worker_gb == 0
                 else int(arguments.max_worker_gb * 1024 ** 3)
             ),
-            unit_timeout_seconds=(
-                None if arguments.unit_timeout_seconds == 0
-                else arguments.unit_timeout_seconds
-            ),
             progress=lambda event: print(
                 json.dumps(event, sort_keys=True), flush=True,
             ),
@@ -530,10 +510,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_worker_memory_bytes=(
                 None if arguments.max_worker_gb == 0
                 else int(arguments.max_worker_gb * 1024 ** 3)
-            ),
-            unit_timeout_seconds=(
-                None if arguments.unit_timeout_seconds == 0
-                else arguments.unit_timeout_seconds
             ),
             progress=lambda event: print(
                 json.dumps(event, sort_keys=True), flush=True,
@@ -815,11 +791,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             None
             if arguments.max_worker_gb == 0
             else int(arguments.max_worker_gb * 1024 ** 3)
-        ),
-        unit_timeout_seconds=(
-            None
-            if arguments.unit_timeout_seconds == 0
-            else arguments.unit_timeout_seconds
         ),
         extraction_contract=arguments.extraction_contract,
         emit_native=arguments.emit_native,

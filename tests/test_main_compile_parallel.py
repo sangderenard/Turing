@@ -65,7 +65,7 @@ def test_main_native_units_use_existing_record_boundaries(tmp_path):
         partitioned_directory=tmp_path / "units",
         partitioned_options={"jobs": 2, "max_unit_source_nodes": 128,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20},
+            "max_worker_memory_bytes": 2 * 1024 ** 3},
         progress=lambda message: None,
     )
     manifest = module.metadata["partitioned_source_product"]
@@ -93,7 +93,7 @@ def test_multi_result_interfaces_use_the_existing_projection_graph(tmp_path, nes
         source, "root", extraction_contract=contract, partitioned_directory=tmp_path / "units",
         partitioned_options={"jobs": 2, "max_unit_source_nodes": 128,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20},
+            "max_worker_memory_bytes": 2 * 1024 ** 3},
         progress=lambda message: None,
     )
     assert module.metadata["partitioned_source_product"]["counts"]["failed"] == 0
@@ -116,7 +116,7 @@ def test_linked_piece_boundary_is_not_recompiled_as_an_empty_body(tmp_path):
         retain_linked_piece_bodies=False, partitioned_directory=tmp_path / "units",
         partitioned_options={"jobs": 2, "max_unit_source_nodes": 128,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20},
+            "max_worker_memory_bytes": 2 * 1024 ** 3},
         progress=lambda message: None,
     )
     manifest = module.metadata["partitioned_source_product"]
@@ -158,6 +158,35 @@ def test_normal_linked_dt_entry_requests_existing_unit_workers(tmp_path, monkeyp
                           **({} if source_compilation is None else {"source_compilation": source_compilation}))
 
 
+def test_partitioned_public_entry_preserves_module_import_identity(
+    tmp_path, monkeypatch,
+):
+    import src.compiler.project_compilation_product as products
+
+    observed = {}
+
+    def compile_partitioned(source, directory, **options):
+        observed.update(options)
+        return {"status": "sealed"}
+
+    monkeypatch.setattr(products, "compile_partitioned_source", compile_partitioned)
+    monkeypatch.setattr(
+        products, "load_partitioned_source_interfaces", lambda manifest: manifest,
+    )
+
+    result = lower_ast_source_to_ssa(
+        "from .helper import leaf\ndef root(value):\n    return leaf(value)\n",
+        "root",
+        source_module="package.program",
+        python_package="package",
+        partitioned_directory=tmp_path / "units",
+    )
+
+    assert result == {"status": "sealed"}
+    assert observed["source_options"]["source_module"] == "package.program"
+    assert observed["source_options"]["python_package"] == "package"
+
+
 def test_native_tensor_index_is_not_a_tuple_projection(tmp_path):
     source = "def leaf(x):\n    return x * 2.0\ndef root(x):\n    return leaf(x)[0] + 1.0\n"
     contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_program_abi({
@@ -170,7 +199,7 @@ def test_native_tensor_index_is_not_a_tuple_projection(tmp_path):
         source, "root", extraction_contract=contract, partitioned_directory=tmp_path / "units",
         partitioned_options={"jobs": 2, "max_unit_source_nodes": 128,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20},
+            "max_worker_memory_bytes": 2 * 1024 ** 3},
         progress=lambda message: None,
     )
     feeds = {int(value.id): np.array([21.0, 22.0, 23.0, 24.0])
@@ -191,7 +220,7 @@ def test_native_call_keeps_authored_order_and_omitted_defaults(tmp_path):
         source, "root", extraction_contract=contract, partitioned_directory=tmp_path / "units",
         partitioned_options={"jobs": 2, "max_unit_source_nodes": 128,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20},
+            "max_worker_memory_bytes": 2 * 1024 ** 3},
         progress=lambda message: None,
     )
     feeds = {int(value.id): np.array(21.0) for value in module.functions[exports[0]].args}
@@ -211,7 +240,7 @@ def test_native_boundary_retains_literal_argument_of_compiled_dependency(tmp_pat
         source, "root", extraction_contract=contract, partitioned_directory=tmp_path / "units",
         partitioned_options={"jobs": 2, "max_unit_source_nodes": 128,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20},
+            "max_worker_memory_bytes": 2 * 1024 ** 3},
         progress=lambda message: None,
     )
     feeds = {int(value.id): np.array(21.0) for value in module.functions[exports[0]].args}
@@ -231,7 +260,7 @@ def test_native_boundary_uses_only_surviving_specialized_formals(tmp_path):
         source, "root", extraction_contract=contract, partitioned_directory=tmp_path / "units",
         partitioned_options={"jobs": 2, "max_unit_source_nodes": 128,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20},
+            "max_worker_memory_bytes": 2 * 1024 ** 3},
         progress=lambda message: None,
     )
     feeds = {int(value.id): np.array(21.0) for value in module.functions[exports[0]].args}
@@ -262,7 +291,7 @@ def test_main_workers_use_graph_size_cuts_and_bounded_instruction_snapshots(tmp_
         source, "root", extraction_contract=contract, partitioned_directory=tmp_path / "units",
         partitioned_options={"jobs": 2, "max_unit_source_nodes": 128,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20},
+            "max_worker_memory_bytes": 2 * 1024 ** 3},
         progress=lambda message: None,
     )
     manifest = module.metadata["partitioned_source_product"]
@@ -318,7 +347,7 @@ def top(state, x):
     options = {"partitioned_directory": tmp_path / "units",
         "partitioned_options": {"jobs": 2, "max_unit_source_nodes": 128,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20}} if partitioned else {}
+            "max_worker_memory_bytes": 2 * 1024 ** 3}} if partitioned else {}
     module, outputs, exports = lower_ast_source_to_ssa(
         source, "top" if nested else "root", extraction_contract=contract, **options, progress=lambda message: None,
     )

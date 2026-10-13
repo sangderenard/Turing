@@ -151,7 +151,6 @@ def build_status(
             "source": source,
             "batch_index": int(record.get("batch_index") or 0),
             "attempts": attempts,
-            "pending_deep_retry": bool(record.get("pending_deep_retry")),
             "dependency_batch_indices": list(
                 record.get("dependency_batch_indices") or ()
             ),

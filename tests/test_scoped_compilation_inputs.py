@@ -188,7 +188,7 @@ def test_real_two_process_source_unit_compilation(tmp_path, monkeypatch):
         worker_resident_reservation_bytes=256 * 1024 ** 2,
         max_total_resident_bytes=512 * 1024 ** 2,
         max_worker_memory_bytes=4 * 1024 ** 3,
-        unit_timeout_seconds=20, progress=observe_progress,
+        progress=observe_progress,
     )
     assert manifest["counts"]["failed"] == 0, manifest
     assert manifest["counts"]["compiled-unverified"] == 3, manifest
@@ -270,7 +270,7 @@ def test_native_interface_tiles_compile_real_caller_without_callee_bodies(tmp_pa
         partitioned_directory=tmp_path / "tiles", extraction_contract=contract,
         partitioned_options={"jobs": 2, "max_unit_source_nodes": 8,
             "worker_resident_reservation_bytes": 256 * 1024 ** 2,
-            "max_worker_memory_bytes": 4 * 1024 ** 3, "unit_timeout_seconds": 30},
+            "max_worker_memory_bytes": 4 * 1024 ** 3},
         progress=lambda message: None,
     )
     manifest = declarations.metadata["partitioned_source_product"]

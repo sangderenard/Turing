@@ -49,183 +49,74 @@ def test_boundary_version_changes_with_source_or_toolchain(tmp_path):
     assert changed_source["version"] != changed_toolchain["version"]
 
 
-def test_build_delegates_the_complete_outer_partition_to_bootstrap_creep(
+def test_build_delegates_outer_partition_to_public_partitioned_compiler(
     tmp_path, monkeypatch,
 ):
-    from src.compiler import project_compilation_product
+    from src.compiler import fortran_c_shell
     from src.compiler.whole_program_compiler_bootstrap import (
         build_whole_program_compiler,
     )
 
     observed = []
 
-    def compile_creep(source, directory, **kwargs):
-        observed.append((Path(source), Path(directory), kwargs))
-        return {"status": "frontier", "rounds": []}
+    def compile_partitioned(source, entrypoint, **kwargs):
+        observed.append((source, entrypoint, kwargs))
+        manifest = (
+            Path(kwargs["partitioned_directory"])
+            / "product" / "manifest.json"
+        )
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({"status": "sealed"}))
+        return object()
 
     monkeypatch.setattr(
-        project_compilation_product,
-        "compile_project_bootstrap_creep",
-        compile_creep,
+        fortran_c_shell, "lower_ast_source_to_ssa", compile_partitioned,
     )
     product = build_whole_program_compiler(
-        tmp_path, jobs=2, unit_timeout_seconds=17, max_rounds=3,
+        tmp_path, jobs=2,
     )
 
     assert len(observed) == 1
-    source, directory, options = observed[0]
-    assert source.name == "aot_compile.py"
-    assert options["entries"] == ("_lower_process_graph_to_compilation",)
-    assert options["expand_entry_dependencies"] is True
-    assert options["jobs"] == 2
-    assert options["unit_timeout_seconds"] == 17
-    assert options["max_rounds"] == 3
-    assert directory.name == product.boundary["version"]
-    assert product.product["status"] == "frontier"
+    source, entrypoint, options = observed[0]
+    assert "def _lower_process_graph_to_compilation(" in source
+    assert entrypoint == "_lower_process_graph_to_compilation"
+    assert options["source_module"].endswith(".aot_compile")
+    assert options["python_package"].endswith(".accelerator_backends")
+    assert options["partitioned_options"]["jobs"] == 2
+    assert Path(options["partitioned_directory"]).name == product.boundary["version"]
+    assert product.product["status"] == "sealed"
     assert product.manifest.is_file()
 
 
-def test_parent_overlay_keeps_sibling_worker_after_one_failure():
-    from tools.bootstrap_compiler_whole_program import _report_bootstrap_event
+def test_build_uses_requested_bootstrap_memory_contract_by_default(
+    tmp_path, monkeypatch,
+):
+    from src.compiler import fortran_c_shell
+    from src.compiler.whole_program_compiler_bootstrap import (
+        build_whole_program_compiler,
+    )
 
-    class Display:
-        def __init__(self):
-            self.counts = []
-            self.closed = []
-            self.logs = []
-            self.substages = []
-            self.workers = {}
+    observed = {}
 
-        def count(self, key, done, **details):
-            self.counts.append((key, done, details))
+    def compile_partitioned(_source, _entrypoint, **kwargs):
+        observed.update(kwargs["partitioned_options"])
+        manifest = (
+            Path(kwargs["partitioned_directory"])
+            / "product" / "manifest.json"
+        )
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({"status": "sealed"}))
+        return object()
 
-        def count_close(self, key):
-            self.closed.append(key)
+    monkeypatch.setattr(
+        fortran_c_shell, "lower_ast_source_to_ssa", compile_partitioned,
+    )
+    build_whole_program_compiler(tmp_path)
 
-        def log(self, message):
-            self.logs.append(message)
-
-        def substage(self, message):
-            self.substages.append(message)
-
-        def worker(self, key, **details):
-            self.workers[key] = details
-
-    display = Display()
-    for index, name in enumerate(("failed", "working")):
-        _report_bootstrap_event(display, {
-            "stage": "bootstrap_creep_worker",
-            "event": {
-                "stage": "unit_start", "qualified_name": name,
-                "index": index, "count": 2,
-            },
-        })
-    _report_bootstrap_event(display, {
-        "stage": "bootstrap_creep_worker",
-        "event": {
-            "stage": "unit_complete", "qualified_name": "failed",
-            "index": 0, "count": 2, "status": "failed",
-            "compiler_stage": {
-                "compiler": {
-                    "stage_number": 9, "stage_count": 10,
-                    "stage_label": "SSA lowering", "stages": [],
-                },
-            },
-        },
-    })
-    _report_bootstrap_event(display, {
-        "stage": "bootstrap_creep_worker",
-        "event": {
-            "stage": "worker_snapshot", "completed_count": 1, "count": 2,
-            "running": [{
-                "qualified_name": "working", "process_id": 22,
-                "resident_bytes": 1 << 30,
-                "stage": {
-                    "message": "still lowering",
-                    "elapsed_seconds": 13,
-                    "compiler": {
-                        "stage_number": 9, "stage_count": 10,
-                        "stage_label": "SSA lowering",
-                        "substage": "lower-functions",
-                    },
-                },
-            }],
-        },
-    })
-
-    assert display.closed == []
-    assert display.workers["catalogue:failed:"]["status"] == "failed"
-    working = display.workers["catalogue:working:"]
-    assert working["stage_number"] == 9
-    assert working["stage_count"] == 10
-    assert working["stage_label"] == "SSA lowering"
-    assert working["substage"] == "lower-functions"
-    assert "failed: failed" in display.logs
-
-
-def test_parent_display_has_the_ten_stage_matrix_at_worker_start():
-    from tools.bootstrap_compiler_whole_program import _report_bootstrap_event
-
-    class Display:
-        def __init__(self):
-            self.workers = {}
-
-        def worker(self, key, **details):
-            self.workers[key] = details
-
-    display = Display()
-    _report_bootstrap_event(display, {
-        "stage": "bootstrap_creep_worker",
-        "event": {
-            "stage": "unit_start",
-            "qualified_name": "compiler.part",
-            "index": 0,
-            "count": 1,
-        },
-    })
-
-    worker = display.workers["catalogue:compiler.part:"]
-    assert worker["stage_number"] == 1
-    assert worker["stage_count"] == 10
-    assert len(worker["stages"]) == 10
-    assert worker["stages"][0]["state"] == "starting"
-    assert all(row["state"] == "pending" for row in worker["stages"][1:])
-
-
-def test_parent_keeps_last_worker_matrix_until_the_next_round_starts():
-    from tools.bootstrap_compiler_whole_program import _report_bootstrap_event
-
-    class Display:
-        def __init__(self):
-            self.clears = 0
-            self.substages = []
-            self.logs = []
-
-        def worker_clear(self):
-            self.clears += 1
-
-        def substage(self, value):
-            self.substages.append(value)
-
-        def count_close(self, _key):
-            pass
-
-        def log(self, value):
-            self.logs.append(value)
-
-    display = Display()
-    _report_bootstrap_event(display, {
-        "stage": "bootstrap_creep_round_finish",
-        "continuation_failures": [],
-    })
-    assert display.clears == 0
-
-    _report_bootstrap_event(display, {
-        "stage": "bootstrap_creep_round_start",
-        "round": 1,
-    })
-    assert display.clears == 1
-    assert display.substages == ["bootstrap round 2"]
+    assert observed["max_total_resident_bytes"] == 10 << 30
+    assert observed["max_worker_memory_bytes"] == 10 << 30
+    assert observed["worker_resident_reservation_bytes"] == 2 << 30
+    assert "jobs" not in observed
 
 
 def test_outer_partition_is_an_authored_project_root():

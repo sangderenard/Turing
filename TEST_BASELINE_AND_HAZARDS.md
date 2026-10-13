@@ -1,3 +1,29 @@
+2026-10-13 CANONICAL PARTITIONED BOOTSTRAP (CURRENT WORKTREE):
+The whole-program bootstrap no longer calls the separate project bootstrap-
+creep coordinator.  It submits the authored
+`_lower_process_graph_to_compilation` source through the sanctioned
+`fortran_c_shell.lower_ast_source_to_ssa` entry with
+`partitioned_directory`, exactly as ordinary partitioned program compilation
+does.  Its versioned wrapper now owns only source/toolchain version selection
+and the final manifest.  The bootstrap-only worker-overlay projector was
+removed; terminal output uses the shared compiler telemetry.
+
+Partitioned source now carries the public compiler's existing `source_module`
+and `python_package` context into source ingestion.  This resolves the
+compiler source's authored relative imports during source pursuit; it does not
+admit Python runtime fallback, and public partitioned compilation still forces
+native interface tiles.  Worker memory settings now feed
+`TURING_MEMORY_BUDGET_BYTES`, the existing WorkContract compression policy.
+No project, resolved-unit, subdivision, creep, or exponential-bootstrap
+coordinator terminates a compiler worker for elapsed time or memory usage.
+The whole-program defaults are 10 GiB aggregate admission, 10 GiB per-worker
+compression budget, and 2 GiB worker reservation.
+
+Focused whole-bootstrap, public-partition routing, memory-contract,
+project-product, and exponential-supervisor gates pass 99 tests.  Syntax and
+diff checks pass.  No bootstrap or all-rules compile was launched, and no
+existing Python process was inspected or disturbed.
+
 2026-10-12 PARENT-OWNED COMPILER PROGRESS (CURRENT WORKTREE):
 The whole-program bootstrap still owns exactly one terminal compositor.  Its
 workers do not create terminal displays.  Each worker now publishes the exact

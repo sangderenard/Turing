@@ -1,13 +1,9 @@
 """Bootstrap the compiler through joined, fresh-process generations.
 
 Each generation compiles one automatically selected compiler source catalogue.
-Its bounded workers all terminate before the generation publishes a result.
+Its bounded workers all finish before the generation publishes a result.
 The supervisor then starts a fresh Python process, which loads the newly
 published verified-product registry before compiling the next catalogue. A
-timed-out unit is not immediately repeated by the subdivision crawler.  Once
-the bounded wave has done the configured minimum amount of work, that unit is
-retried alone, without a time ceiling but with the same memory ceiling, in the
-next fresh process.  It is retried again only after the registry advances.  A
 complete deterministic sweep with no registry, verified-region, or normalized
 frontier change is the terminal fixed point.
 """
@@ -298,9 +294,6 @@ def discover_compiler_catalogues(source_root: str | Path) -> list[dict[str, Any]
             "last_outcome_sha256": None,
             "last_outcomes": {},
             "seed_product": None,
-            "pending_deep_retry": [],
-            "deep_retry_attempted": False,
-            "last_deep_retry_registry_sha256": None,
         })
     records.sort(key=lambda record: (
         int(record["source_bytes"]),
@@ -423,9 +416,6 @@ def discover_compiler_work_batches(
                 "last_outcome_sha256": None,
                 "last_outcomes": {},
                 "seed_product": None,
-                "pending_deep_retry": [],
-                "deep_retry_attempted": False,
-                "last_deep_retry_registry_sha256": None,
             })
         source_batches.append(batch_records)
     return prioritize_compiler_work_batches(
@@ -520,41 +510,15 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
                 None if arguments.max_worker_gb == 0
                 else int(arguments.max_worker_gb * 1024 ** 3)
             ),
-            unit_timeout_seconds=(
-                None if arguments.unit_timeout_seconds == 0
-                else arguments.unit_timeout_seconds
-            ),
             extraction_contract=arguments.extraction_contract,
             bootstrap_products=active_products,
             seed_product=arguments.seed_product,
-            crawl_timed_out_units=False,
             max_rounds=1,
             progress=lambda event: print(
                 json.dumps(event, sort_keys=True), flush=True,
             ),
         )
         registry_after = _sha256(registry) if registry.is_file() else None
-        round_manifest_path = (
-            wave_root / "product" / "round_000" / "manifest.json"
-        )
-        round_manifest = (
-            json.loads(round_manifest_path.read_text(encoding="utf-8"))
-            if round_manifest_path.is_file() else {}
-        )
-        timed_out_entries = sorted({
-            str(unit.get("qualified_name") or "")
-            for unit in round_manifest.get("units") or ()
-            if unit.get("error_type") == "ResourceLimitExceeded"
-            and "elapsed time" in str(unit.get("error") or "")
-            and unit.get("qualified_name")
-        })
-        terminal_timed_out_entries = sorted({
-            str(record.get("qualified_name") or "")
-            for round_record in manifest.get("rounds") or ()
-            for record in round_record.get("process_graph_creeps") or ()
-            if record.get("status") == "deferred-timeout-retry"
-            and record.get("qualified_name")
-        })
         result = {
             "schema": WAVE_SCHEMA,
             "status": "complete",
@@ -565,7 +529,6 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "compiler_implementation_sha256": _compiler_implementation_sha256(),
             "entries": list(arguments.entry),
             "workers_joined": True,
-            "mode": "deep-retry" if arguments.deep_retry else "bounded",
             "elapsed_seconds": time.perf_counter() - started,
             "registry_before_sha256": registry_before,
             "registry_after_sha256": registry_after,
@@ -575,8 +538,6 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "seed_product": (
                 wave_root / "product" / "round_000"
             ).as_posix(),
-            "timed_out_entries": timed_out_entries,
-            "terminal_timed_out_entries": terminal_timed_out_entries,
             "outcome": _normalized_outcome(manifest),
             "outcome_sha256": _outcome_sha256(manifest),
         }
@@ -591,7 +552,6 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "compiler_implementation_sha256": _compiler_implementation_sha256(),
             "entries": list(arguments.entry),
             "workers_joined": True,
-            "mode": "deep-retry" if arguments.deep_retry else "bounded",
             "elapsed_seconds": time.perf_counter() - started,
             "error_type": type(error).__name__,
             "error": str(error),
@@ -1013,7 +973,6 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 "--jobs", str(arguments.jobs),
                 "--worker-reserve-gb", str(arguments.worker_reserve_gb),
                 "--max-worker-gb", str(arguments.max_worker_gb),
-                "--unit-timeout-seconds", str(arguments.unit_timeout_seconds),
                 "--extraction-contract", str(arguments.extraction_contract),
             ]
             if arguments.max_total_gb is not None:
@@ -1022,18 +981,10 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 command.extend((
                     "--seed-product", str(source_record["seed_product"]),
                 ))
-            pending_deep_retry = tuple(map(
-                str, source_record.get("pending_deep_retry") or (),
+            mode = "bounded"
+            selected_entries = tuple(map(
+                str, source_record.get("entries") or (),
             ))
-            mode = "deep-retry" if pending_deep_retry else "bounded"
-            selected_entries = (
-                pending_deep_retry if pending_deep_retry else
-                tuple(map(str, source_record.get("entries") or ()))
-            )
-            if pending_deep_retry:
-                timeout_index = command.index("--unit-timeout-seconds") + 1
-                command[timeout_index] = "0"
-                command.append("--deep-retry")
             for qualified_name in selected_entries:
                 command.extend(("--entry", qualified_name))
             print(json.dumps({
@@ -1086,7 +1037,6 @@ def _supervise(arguments: argparse.Namespace) -> int:
                     "registry_changed": False,
                     "outcome_sha256": None,
                     "mode": mode,
-                    "scheduled_deep_retry": False,
                     "result": result_path.as_posix(),
                 })
                 state["generation"] = generation + 1
@@ -1147,41 +1097,6 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 source_record["last_outcomes"] = last_outcomes
             if result.get("seed_product"):
                 source_record["seed_product"] = str(result["seed_product"])
-            scheduled_deep_retry = False
-            if mode == "deep-retry":
-                source_record["pending_deep_retry"] = []
-                source_record["deep_retry_attempted"] = True
-                source_record["last_deep_retry_registry_sha256"] = (
-                    result.get("registry_before_sha256")
-                )
-            else:
-                timed_out_entries = list(
-                    result.get("timed_out_entries") or ()
-                )
-                terminal_timed_out_entries = set(map(
-                    str, result.get("terminal_timed_out_entries") or (),
-                ))
-                registry_revision = result.get("registry_after_sha256")
-                minimum_reached = (
-                    float(result.get("elapsed_seconds") or 0.0)
-                    >= float(arguments.minimum_compile_seconds_before_widening)
-                )
-                retry_entries = (
-                    timed_out_entries if minimum_reached else
-                    sorted(terminal_timed_out_entries)
-                )
-                if (
-                    retry_entries
-                    and (
-                        not source_record.get("deep_retry_attempted")
-                        or registry_revision
-                        != source_record.get(
-                            "last_deep_retry_registry_sha256"
-                        )
-                    )
-                ):
-                    source_record["pending_deep_retry"] = retry_entries
-                    scheduled_deep_retry = True
             state["waves"].append({
                 "generation": generation,
                 "source": source.as_posix(),
@@ -1192,12 +1107,10 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 "registry_changed": bool(result.get("registry_changed")),
                 "outcome_sha256": current_outcome,
                 "mode": mode,
-                "scheduled_deep_retry": scheduled_deep_retry,
                 "result": result_path.as_posix(),
             })
             state["generation"] = generation + 1
-            if not scheduled_deep_retry:
-                cursor += 1
+            cursor += 1
             if cursor == len(sources):
                 if not state.get("sweep_progress"):
                     state["status"] = "fixed-point"
@@ -1244,27 +1157,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--max-total-gb", type=float, default=None)
     parser.add_argument("--worker-reserve-gb", type=float, default=4.0)
-    parser.add_argument("--max-worker-gb", type=float, default=4.0)
     parser.add_argument(
-        "--unit-timeout-seconds",
-        type=float,
-        default=0.0,
+        "--max-worker-gb", type=float, default=4.0,
         help=(
-            "terminate a compilation unit after this many seconds "
-            "(default: disabled; use a positive value to opt in)"
+            "per-worker memory-regulation/compression budget in GiB; "
+            "crossing it does not terminate the compiler worker"
         ),
     )
     parser.add_argument("--max-generations", type=int, default=32768)
     parser.add_argument("--max-sweeps", type=int, default=8)
-    parser.add_argument(
-        "--minimum-compile-seconds-before-widening",
-        type=float,
-        default=30.0,
-        help=(
-            "minimum completed bounded work before scheduling an unlimited-"
-            "time parent retry (default: 30 seconds)"
-        ),
-    )
     parser.add_argument(
         "--extraction-contract", type=Path,
         default=DEFAULT_PROJECT_EXTRACTION_CONTRACT,
@@ -1274,14 +1175,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--seed-product", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--entry", action="append", default=[], help=argparse.SUPPRESS)
-    parser.add_argument("--deep-retry", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
     if arguments.jobs < 1:
         parser.error("--jobs must be positive")
-    if arguments.minimum_compile_seconds_before_widening < 0:
-        parser.error(
-            "--minimum-compile-seconds-before-widening cannot be negative"
-        )
     if arguments.wave_worker:
         if arguments.source is None:
             parser.error("wave worker requires --source")

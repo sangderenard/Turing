@@ -39,9 +39,6 @@ LINK_TABLE_SCHEMA = "turing.project-compilation-links.v1"
 SOURCE_REGION_INTEGRAL_SCHEMA = "turing.source-region-integral.v1"
 DEFAULT_WORKER_RESERVATION_BYTES = 4 * 1024 ** 3
 DEFAULT_WORKER_LIMIT_BYTES = 4 * 1024 ** 3
-# Compilation time is not a correctness boundary. Large, valid authored units
-# may take longer than five minutes; callers may still opt into a deadline.
-DEFAULT_UNIT_TIMEOUT_SECONDS: float | None = None
 DEFAULT_PROJECT_EXTRACTION_CONTRACT = (
     Path(__file__).resolve().parents[2]
     / "extraction_contracts"
@@ -4792,7 +4789,6 @@ def compile_partitioned_source(
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_total_resident_bytes: int | None = None,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
-    unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
     max_unit_source_nodes: int = 4096,
     interface_tiles: bool = False,
     source_options: Mapping[str, Any] | None = None,
@@ -4882,7 +4878,7 @@ def compile_partitioned_source(
         worker_resident_reservation_bytes=worker_resident_reservation_bytes,
         max_total_resident_bytes=max_total_resident_bytes,
         max_worker_memory_bytes=max_worker_memory_bytes,
-        unit_timeout_seconds=unit_timeout_seconds, progress=progress,
+        progress=progress,
     )
 
 
@@ -6762,7 +6758,6 @@ def compile_resolved_process_graph_plan(
     max_total_resident_bytes: int | None = None,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
-    unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
     worker_environment: Mapping[str, str] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -6813,14 +6808,21 @@ def compile_resolved_process_graph_plan(
     )
     if total_limit is not None and total_limit < reservation:
         raise ValueError("resident ceiling cannot admit one worker reservation")
-    worker_limit_bytes = (
+    worker_memory_budget = (
         None if max_worker_memory_bytes is None
         else int(max_worker_memory_bytes)
     )
-    timeout = (
-        None if unit_timeout_seconds is None
-        else float(unit_timeout_seconds)
+    if worker_memory_budget is not None and worker_memory_budget < 1:
+        raise ValueError("worker memory budget must be positive")
+    effective_worker_environment = (
+        os.environ.copy()
+        if worker_environment is None
+        else dict(worker_environment)
     )
+    if worker_memory_budget is not None:
+        effective_worker_environment["TURING_MEMORY_BUDGET_BYTES"] = str(
+            worker_memory_budget
+        )
     repository_root = Path(__file__).resolve().parents[2]
     records: list[dict[str, Any] | None] = [None] * len(units)
     for index, scoped_input in enumerate(plan.get("scoped_inputs") or ()):
@@ -6913,8 +6915,7 @@ def compile_resolved_process_graph_plan(
             "worker_jobs": worker_limit,
             "max_total_resident_bytes": total_limit,
             "worker_resident_reservation_bytes": reservation,
-            "max_worker_memory_bytes": worker_limit_bytes,
-            "unit_timeout_seconds": timeout,
+            "max_worker_memory_bytes": worker_memory_budget,
             "pending": pending,
             "running": running_records,
             "completed": [record for record in records if record is not None],
@@ -6961,7 +6962,7 @@ def compile_resolved_process_graph_plan(
         process = subprocess.Popen(
             command,
             cwd=repository_root,
-            env=(None if worker_environment is None else dict(worker_environment)),
+            env=effective_worker_environment,
             stdout=worker_log,
             stderr=subprocess.STDOUT,
         )
@@ -6981,54 +6982,6 @@ def compile_resolved_process_graph_plan(
             scoped_input=plan["scoped_inputs"][index],
             linked_verified_units=[] if plan.get("interface_tiles") else linked,
             linked_native_interface_units=linked if plan.get("interface_tiles") else [],
-        )
-
-    def stop_for_resource(index: int, kind: str, detail: str) -> None:
-        state = running[index]
-        process = state["process"]
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-        state["worker_log"].close()
-        destination = unit_root(index)
-        durable_stage = None
-        progress_path = destination / "compile-progress.json"
-        if progress_path.is_file():
-            try:
-                durable_stage = json.loads(
-                    progress_path.read_text(encoding="utf-8")
-                ).get("current")
-            except (OSError, TypeError, ValueError):
-                durable_stage = None
-        failure = {
-            "schema": "turing.resolved-process-graph-unit-failure.v1",
-            "status": "failed",
-            "unit_index": index,
-            "unit": units[index],
-            "error_type": "ResourceLimitExceeded",
-            "resource": kind,
-            "error": detail,
-            "elapsed_seconds": time.perf_counter() - state["started"],
-            "peak_resident_bytes": int(state["resident"]),
-            "peak_private_bytes": int(state["private"]),
-            **({"stage": durable_stage} if durable_stage else {}),
-        }
-        _atomic_json(destination / "failure.json", failure)
-        records[index] = failure
-        del running[index]
-        report(
-            "resolved_unit_resource_failure",
-            unit_index=index,
-            status="failed",
-            resource=kind,
-            error=detail,
-            resource_stage=durable_stage,
-            elapsed_seconds=failure["elapsed_seconds"],
-            peak_resident_bytes=failure["peak_resident_bytes"],
-            peak_private_bytes=failure["peak_private_bytes"],
         )
 
     write_progress()
@@ -7066,23 +7019,6 @@ def compile_resolved_process_graph_plan(
                 resident, private = measured
                 state["resident"] = max(int(state["resident"]), int(resident))
                 state["private"] = max(int(state["private"]), int(private))
-            elapsed = time.perf_counter() - state["started"]
-            if (
-                worker_limit_bytes is not None
-                and int(state["private"]) > worker_limit_bytes
-            ):
-                stop_for_resource(
-                    index, "private-memory",
-                    f"private memory {int(state['private'])} exceeded "
-                    f"{worker_limit_bytes} bytes",
-                )
-                continue
-            if timeout is not None and elapsed > timeout:
-                stop_for_resource(
-                    index, "elapsed-time",
-                    f"elapsed time {elapsed:.3f}s exceeded {timeout:.3f}s",
-                )
-                continue
             return_code = process.poll()
             if return_code is None:
                 continue
@@ -7158,7 +7094,6 @@ def compile_process_graph_subdivision_plan(
     max_total_resident_bytes: int | None = None,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
-    unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
     worker_environment: Mapping[str, str] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -7179,14 +7114,21 @@ def compile_process_graph_subdivision_plan(
         None if max_total_resident_bytes is None
         else int(max_total_resident_bytes)
     )
-    worker_limit_bytes = (
+    worker_memory_budget = (
         None if max_worker_memory_bytes is None
         else int(max_worker_memory_bytes)
     )
-    timeout = (
-        None if unit_timeout_seconds is None
-        else float(unit_timeout_seconds)
+    if worker_memory_budget is not None and worker_memory_budget < 1:
+        raise ValueError("worker memory budget must be positive")
+    effective_worker_environment = (
+        os.environ.copy()
+        if worker_environment is None
+        else dict(worker_environment)
     )
+    if worker_memory_budget is not None:
+        effective_worker_environment["TURING_MEMORY_BUDGET_BYTES"] = str(
+            worker_memory_budget
+        )
     repository_root = Path(__file__).resolve().parents[2]
     pending = list(range(len(integrals)))
     running: dict[int, dict[str, Any]] = {}
@@ -7230,8 +7172,7 @@ def compile_process_graph_subdivision_plan(
             "worker_jobs": worker_limit,
             "max_total_resident_bytes": total_limit,
             "worker_resident_reservation_bytes": reservation,
-            "max_worker_memory_bytes": worker_limit_bytes,
-            "unit_timeout_seconds": timeout,
+            "max_worker_memory_bytes": worker_memory_budget,
             "pending": pending,
             "running": running_records,
             "completed": [record for record in records if record is not None],
@@ -7256,7 +7197,7 @@ def compile_process_graph_subdivision_plan(
             "--subdivision-integral", str(index),
             "--output", str(destination),
         ], cwd=repository_root, stdout=worker_log, stderr=subprocess.STDOUT,
-            env=(None if worker_environment is None else dict(worker_environment)))
+            env=effective_worker_environment)
         running[index] = {
             "process": process,
             "started": time.perf_counter(),
@@ -7269,58 +7210,6 @@ def compile_process_graph_subdivision_plan(
             identity_token_chain=integrals[index].get(
                 "identity_token_chain", (),
             ),
-        )
-
-    def stop_for_resource(index: int, kind: str, detail: str) -> None:
-        state = running[index]
-        process = state["process"]
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-        state["worker_log"].close()
-        destination = integral_root(index)
-        durable_stage = None
-        progress_path = destination / "compile-progress.json"
-        if progress_path.is_file():
-            try:
-                durable_stage = json.loads(
-                    progress_path.read_text(encoding="utf-8")
-                ).get("current")
-            except (OSError, TypeError, ValueError):
-                pass
-        failure = {
-            "schema": "turing.process-graph-subdivision-failure.v1",
-            "status": "failed",
-            "integral_index": index,
-            "integral": integrals[index],
-            "qualified_names": list(
-                integrals[index].get("qualified_names") or ()
-            ),
-            "error_type": "ResourceLimitExceeded",
-            "resource": kind,
-            "error": detail,
-            "elapsed_seconds": time.perf_counter() - state["started"],
-            "peak_resident_bytes": int(state["resident"]),
-            "peak_private_bytes": int(state["private"]),
-            **({"stage": durable_stage} if durable_stage else {}),
-        }
-        _atomic_json(destination / "failure.json", failure)
-        records[index] = failure
-        del running[index]
-        report(
-            "subdivision_integral_resource_failure",
-            integral_index=index,
-            status="failed",
-            qualified_names=failure["qualified_names"],
-            resource=kind,
-            error=detail,
-            resource_stage=durable_stage,
-            elapsed_seconds=failure["elapsed_seconds"],
-            peak_resident_bytes=failure["peak_resident_bytes"],
-            peak_private_bytes=failure["peak_private_bytes"],
         )
 
     write_progress()
@@ -7343,23 +7232,6 @@ def compile_process_graph_subdivision_plan(
                 resident, private = measured
                 state["resident"] = max(int(state["resident"]), int(resident))
                 state["private"] = max(int(state["private"]), int(private))
-            elapsed = time.perf_counter() - state["started"]
-            if (
-                worker_limit_bytes is not None
-                and int(state["private"]) > worker_limit_bytes
-            ):
-                stop_for_resource(
-                    index, "private-memory",
-                    f"private memory {int(state['private'])} exceeded "
-                    f"{worker_limit_bytes} bytes",
-                )
-                continue
-            if timeout is not None and elapsed > timeout:
-                stop_for_resource(
-                    index, "elapsed-time",
-                    f"elapsed time {elapsed:.3f}s exceeded {timeout:.3f}s",
-                )
-                continue
             return_code = process.poll()
             if return_code is None:
                 continue
@@ -7439,7 +7311,6 @@ def compile_process_graph_creep(
     max_total_resident_bytes: int | None = None,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
-    unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
     max_subdivision_depth: int = 32,
     bootstrap_products: Iterable[str | Path] = (),
     progress: Callable[[Mapping[str, Any]], None] | None = None,
@@ -7471,6 +7342,10 @@ def compile_process_graph_creep(
         Path(path).resolve() for path in bootstrap_products
     ))
     worker_environment = os.environ.copy()
+    if max_worker_memory_bytes is not None:
+        worker_environment["TURING_MEMORY_BUDGET_BYTES"] = str(
+            int(max_worker_memory_bytes)
+        )
     if selected_bootstrap_products:
         from .compiler_bootstrap_runtime import COMPILER_BOOTSTRAP_PRODUCTS_ENV
 
@@ -7578,7 +7453,6 @@ def compile_process_graph_creep(
                 worker_resident_reservation_bytes
             ),
             "max_worker_memory_bytes": max_worker_memory_bytes,
-            "unit_timeout_seconds": unit_timeout_seconds,
             "worker_environment": worker_environment,
             "progress": lambda event, round_index=round_index: report(
                 "creep_worker", round=round_index, event=dict(event),
@@ -7742,7 +7616,6 @@ def compile_project_product(
     max_total_resident_bytes: int | None = None,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
-    unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
     extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     emit_native: bool = False,
     seed_product: str | Path | None = None,
@@ -7755,10 +7628,10 @@ def compile_project_product(
     aggregate resident-memory limit is an admission ceiling. Each running
     worker reserves ``worker_resident_reservation_bytes`` before launch;
     observed RSS is also recorded, but is not mistaken for a finished heap's
-    eventual size. A per-worker committed-memory limit prevents page-thrashing
-    compiles from monopolizing the machine; a time limit bounds code integrals
-    whose planning does not converge. Both limits publish durable failures so
-    a later creep pass can divide those exact authored calls more deeply.
+    eventual size. ``max_worker_memory_bytes`` is passed into each worker's
+    existing memory-regulation work contract; crossing it invokes compression
+    policy and never terminates the worker. Compiler workers have no
+    coordinator-imposed memory or elapsed-time termination boundary.
     """
 
     source_file = Path(source_path).resolve()
@@ -7835,16 +7708,11 @@ def compile_project_product(
     worker_reservation = int(worker_resident_reservation_bytes)
     if worker_reservation < 1:
         raise ValueError("project compilation worker reservation must be positive")
-    worker_memory_limit = (
+    worker_memory_budget = (
         None if max_worker_memory_bytes is None else int(max_worker_memory_bytes)
     )
-    if worker_memory_limit is not None and worker_memory_limit < 1:
-        raise ValueError("project compilation worker memory limit must be positive")
-    timeout_seconds = (
-        None if unit_timeout_seconds is None else float(unit_timeout_seconds)
-    )
-    if timeout_seconds is not None and timeout_seconds <= 0:
-        raise ValueError("project compilation unit timeout must be positive")
+    if worker_memory_budget is not None and worker_memory_budget < 1:
+        raise ValueError("project compilation worker memory budget must be positive")
     extraction_contract_path = (
         None
         if extraction_contract is None
@@ -7914,8 +7782,7 @@ def compile_project_product(
             "worker_jobs": worker_limit,
             "max_total_resident_bytes": memory_ceiling,
             "worker_resident_reservation_bytes": worker_reservation,
-            "max_worker_memory_bytes": worker_memory_limit,
-            "unit_timeout_seconds": timeout_seconds,
+            "max_worker_memory_bytes": worker_memory_budget,
             "extraction_contract": (
                 None
                 if extraction_contract_path is None
@@ -8001,6 +7868,10 @@ def compile_project_product(
                 }, sort_keys=True),
             ))
         worker_environment = os.environ.copy()
+        if worker_memory_budget is not None:
+            worker_environment["TURING_MEMORY_BUDGET_BYTES"] = str(
+                worker_memory_budget
+            )
         if inherited_bootstrap_products:
             from .compiler_bootstrap_runtime import (
                 COMPILER_BOOTSTRAP_PRODUCTS_ENV,
@@ -8048,7 +7919,6 @@ def compile_project_product(
             "resident": 0,
             "peak_private": 0,
             "private": 0,
-            "resource_failure": None,
             "output_thread": output_thread,
         }
         write_live_progress()
@@ -8280,44 +8150,6 @@ def compile_project_product(
                 state["peak_private"] = max(
                     int(state["peak_private"]), int(private),
                 )
-            elapsed = time.perf_counter() - float(state["started"])
-            limit_reason = None
-            if (
-                worker_memory_limit is not None
-                and int(state["private"]) > worker_memory_limit
-            ):
-                limit_reason = (
-                    "committed/private memory "
-                    f"{int(state['private'])} exceeded {worker_memory_limit} bytes"
-                )
-            elif timeout_seconds is not None and elapsed > timeout_seconds:
-                limit_reason = (
-                    f"elapsed time {elapsed:.3f}s exceeded "
-                    f"{timeout_seconds:.3f}s"
-                )
-            if limit_reason is not None and process.poll() is None:
-                stage_path = Path(state["root"]) / "compile-progress.json"
-                stage = None
-                if stage_path.is_file():
-                    try:
-                        stage = json.loads(
-                            stage_path.read_text(encoding="utf-8")
-                        ).get("current")
-                    except (OSError, ValueError, TypeError):
-                        stage = None
-                failure = {
-                    "schema": "turing.project-compilation-failure.v1",
-                    "qualified_name": state["qualified_name"],
-                    "error_type": "ResourceLimitExceeded",
-                    "error": limit_reason,
-                    "stage": stage,
-                    "resident_bytes": int(state["resident"]),
-                    "private_bytes": int(state["private"]),
-                    "elapsed_seconds": elapsed,
-                }
-                _atomic_json(Path(state["root"]) / "failure.json", failure)
-                state["resource_failure"] = failure
-                process.terminate()
             if process.poll() is not None:
                 completed.append(index)
         for index in completed:
@@ -8523,8 +8355,7 @@ def compile_project_product(
         "worker_jobs": worker_limit,
         "max_total_resident_bytes": memory_ceiling,
         "worker_resident_reservation_bytes": worker_reservation,
-        "max_worker_memory_bytes": worker_memory_limit,
-        "unit_timeout_seconds": timeout_seconds,
+        "max_worker_memory_bytes": worker_memory_budget,
         "extraction_contract": (
             None
             if extraction_contract_path is None
@@ -8634,11 +8465,9 @@ def compile_project_bootstrap_creep(
     max_total_resident_bytes: int | None = None,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
-    unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
     extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     bootstrap_products: Iterable[str | Path] = (),
     seed_product: str | Path | None = None,
-    crawl_timed_out_units: bool = False,
     max_rounds: int = 16,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -8708,7 +8537,6 @@ def compile_project_bootstrap_creep(
                 worker_resident_reservation_bytes
             ),
             max_worker_memory_bytes=max_worker_memory_bytes,
-            unit_timeout_seconds=unit_timeout_seconds,
             extraction_contract=extraction_contract,
             emit_native=True,
             seed_product=prior_seed,
@@ -8735,21 +8563,15 @@ def compile_project_bootstrap_creep(
             error_type = str(unit.get("error_type") or "")
             error = str(unit.get("error") or "")
             # These are durable continuation frontiers, not terminal compiler
-            # failures.  Let the subdivision/deep-retry pass below consume
+            # failures.  Let the subdivision pass below consume
             # their published ProcessGraph products before enforcing native
             # installation.  Treating them as installation failures here
             # made the creep loop raise before it could reach the code that
             # exists specifically to compile their child integrals.
             if (
-                (
-                    error_type == "CompilationSubdivisionRequired"
-                    and str(unit.get("frontier_kind") or "")
-                    == "compilation-subdivision-required"
-                )
-                or (
-                    error_type == "ResourceLimitExceeded"
-                    and "elapsed time" in error
-                )
+                error_type == "CompilationSubdivisionRequired"
+                and str(unit.get("frontier_kind") or "")
+                == "compilation-subdivision-required"
             ):
                 continue
             reason = ": ".join(part for part in (error_type, error) if part)
@@ -8901,31 +8723,6 @@ def compile_project_bootstrap_creep(
             plan_path = (
                 None if not plan_name else round_root / str(plan_name)
             )
-            strict_child_plan = False
-            if plan_path is not None and plan_path.is_file():
-                try:
-                    strict_child_plan = len(
-                        json.loads(plan_path.read_text(encoding="utf-8")).get(
-                            "units", ()
-                        )
-                    ) > 1
-                except (OSError, TypeError, ValueError):
-                    strict_child_plan = False
-            if (
-                not crawl_timed_out_units
-                and unit.get("error_type") == "ResourceLimitExceeded"
-                and "elapsed time" in str(unit.get("error") or "")
-                and not strict_child_plan
-            ):
-                subdivision_creeps.append({
-                    "qualified_name": str(
-                        unit.get("qualified_name") or "unit"
-                    ),
-                    "status": "deferred-timeout-retry",
-                    "verified_product_count": 0,
-                    "fixed_point_count": 0,
-                })
-                continue
             if not plan_name or not unit_name:
                 continue
             graph_path = (
@@ -8950,7 +8747,6 @@ def compile_project_bootstrap_creep(
                         worker_resident_reservation_bytes
                     ),
                     max_worker_memory_bytes=max_worker_memory_bytes,
-                    unit_timeout_seconds=unit_timeout_seconds,
                     bootstrap_products=active_products,
                     progress=lambda event, round_index=round_index, qualified_name=qualified_name: report(
                         "bootstrap_creep_subdivision", round=round_index,

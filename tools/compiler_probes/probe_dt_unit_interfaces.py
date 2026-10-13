@@ -38,7 +38,7 @@ def main(directory, *, proposal=False, serial=False):
         "partitioned_directory": Path(directory),
         "partitioned_options": {"jobs": 2, "max_unit_source_nodes": 256,
             "worker_resident_reservation_bytes": 512 * 1024 ** 2,
-            "max_worker_memory_bytes": 2 * 1024 ** 3, "unit_timeout_seconds": 20},
+            "max_worker_memory_bytes": 2 * 1024 ** 3},
     }
     module, outputs, exports = lower_ast_source_to_ssa(
         source, "root", extraction_contract=dt_system_contract("root", (), 1, 1),

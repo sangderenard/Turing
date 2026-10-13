@@ -4,216 +4,18 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
 from src.compiler.whole_program_compiler_bootstrap import (
     build_whole_program_compiler,
     plan_whole_program_compiler,
 )
-from src.compiler.shell_telemetry import LOWERING_STAGES
-
-
-def _starting_compiler_state() -> dict[str, Any]:
-    """The source compiler's exact declared matrix before its first receipt."""
-
-    return {
-        "compiler": {
-            "stage_number": 1,
-            "stage_count": len(LOWERING_STAGES),
-            "stage_label": LOWERING_STAGES[0].label,
-            "substage": "",
-            "stages": [
-                {
-                    "key": stage.key,
-                    "label": stage.label,
-                    "state": "starting" if index == 0 else "pending",
-                }
-                for index, stage in enumerate(LOWERING_STAGES)
-            ],
-        },
-    }
-
-
-def _worker_key(prefix: str, qualified_name: str, index: Any = "") -> str:
-    return f"{prefix}:{qualified_name}:{index}"
-
-
-def _show_worker(
-    display,
-    key: str,
-    label: str,
-    current: Mapping[str, Any],
-    *,
-    status: str = "running",
-    rss_bytes: int = 0,
-) -> None:
-    compiler = dict(current.get("compiler") or {})
-    if hasattr(display, "worker"):
-        display.worker(
-            key,
-            label=label,
-            status=status,
-            stage_number=int(compiler.get("stage_number") or 0),
-            stage_count=int(compiler.get("stage_count") or 0),
-            stage_label=str(
-                compiler.get("stage_label")
-                or current.get("message")
-                or "starting"
-            ),
-            substage=str(compiler.get("substage") or ""),
-            elapsed_seconds=float(current.get("elapsed_seconds") or 0.0),
-            rss_bytes=int(
-                rss_bytes or current.get("resident_bytes") or 0
-            ),
-            stages=tuple(compiler.get("stages") or ()),
-        )
-        return
-    display.count(
-        key, 0, total=1, label=label,
-        detail=str(current.get("message") or "starting"),
-    )
-
-
-def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
-    """Project all worker events onto the one parent-owned terminal frame."""
-
-    stage = str(event.get("stage") or "")
-    if stage == "bootstrap_creep_round_start":
-        if hasattr(display, "worker_clear"):
-            display.worker_clear()
-        display.substage(
-            f"bootstrap round {int(event.get('round') or 0) + 1}"
-        )
-        return
-    if stage == "bootstrap_creep_worker":
-        worker = dict(event.get("event") or {})
-        worker_stage = str(worker.get("stage") or "")
-        qualified_name = str(worker.get("qualified_name") or "worker")
-        key = _worker_key("catalogue", qualified_name)
-        if worker_stage == "unit_start":
-            _show_worker(
-                display, key, qualified_name, _starting_compiler_state(),
-                status="starting",
-            )
-        elif worker_stage == "worker_snapshot":
-            display.count(
-                "catalogue-total",
-                int(worker.get("completed_count") or 0),
-                total=int(worker.get("count") or 0),
-                label="authored compiler units",
-                detail=f"{len(worker.get('running') or ())} running",
-            )
-            for row_value in worker.get("running") or ():
-                row = dict(row_value)
-                name = str(row.get("qualified_name") or "worker")
-                row_key = _worker_key("catalogue", name)
-                current = dict(row.get("stage") or {})
-                current["elapsed_seconds"] = float(
-                    row.get("elapsed_seconds") or 0.0
-                )
-                resident = int(row.get("resident_bytes") or 0)
-                _show_worker(
-                    display, row_key, name, current,
-                    status="running", rss_bytes=resident,
-                )
-        elif worker_stage == "worker_output":
-            message = str(worker.get("message") or "")
-            if message:
-                display.log(f"[{qualified_name}] {message}")
-        elif worker_stage == "unit_complete":
-            status = str(worker.get("status") or "unknown")
-            failure_stage = worker.get("failure_stage")
-            current = dict(
-                failure_stage if isinstance(failure_stage, Mapping)
-                else worker.get("compiler_stage")
-                if isinstance(worker.get("compiler_stage"), Mapping)
-                else {}
-            )
-            current.setdefault(
-                "elapsed_seconds", float(worker.get("elapsed_seconds") or 0.0)
-            )
-            _show_worker(
-                display, key, qualified_name, current, status=status,
-                rss_bytes=int(worker.get("peak_resident_bytes") or 0),
-            )
-            display.log(f"{qualified_name}: {status}")
-        return
-    if stage == "bootstrap_creep_subdivision":
-        qualified_name = str(event.get("qualified_name") or "subdivision")
-        nested = dict(event.get("event") or {})
-        if str(nested.get("stage") or "") == "creep_worker":
-            worker = dict(nested.get("event") or {})
-            worker_stage = str(worker.get("stage") or "")
-            unit_index = worker.get(
-                "unit_index", worker.get("integral_index", ""),
-            )
-            key = _worker_key("subdivision", qualified_name, unit_index)
-            if worker_stage in {
-                "resolved_worker_snapshot", "subdivision_worker_snapshot",
-            }:
-                index_field = (
-                    "unit_index" if worker_stage.startswith("resolved")
-                    else "integral_index"
-                )
-                display.count(
-                    f"{key}:total",
-                    int(worker.get("completed_count") or 0),
-                    total=int(worker.get("count") or 0),
-                    label=qualified_name,
-                    detail=f"{len(worker.get('running') or ())} subdivision workers",
-                )
-                for row_value in worker.get("running") or ():
-                    row = dict(row_value)
-                    row_index = row.get(index_field, "")
-                    row_key = _worker_key(
-                        "subdivision", qualified_name, row_index,
-                    )
-                    current = dict(row.get("stage") or {})
-                    detail = str(current.get("message") or "running")
-                    resident = int(row.get("resident_bytes") or 0)
-                    if resident:
-                        detail += f" | rss {resident / (1 << 30):.2f}GB"
-                    display.count(
-                        row_key, 0, total=1, label=qualified_name,
-                        detail=detail,
-                    )
-            elif worker_stage.endswith("_start"):
-                display.count(
-                    key, 0, total=1, label=qualified_name,
-                    detail=f"subdivision unit {unit_index}",
-                )
-            elif worker_stage.endswith(("_finish", "_failure")):
-                status = str(worker.get("status") or "complete")
-                display.count(
-                    key, 1, total=1, label=qualified_name, detail=status,
-                )
-                display.count_close(key)
-        elif str(nested.get("stage") or "") == "creep_round_finish":
-            counts = dict(nested.get("counts") or {})
-            display.count_close(
-                f"{_worker_key('subdivision', qualified_name)}:total"
-            )
-            display.log(f"{qualified_name}: subdivision {counts}")
-        return
-    if stage == "bootstrap_creep_round_finish":
-        display.count_close("catalogue-total")
-        failures = tuple(event.get("continuation_failures") or ())
-        if failures:
-            display.log(
-                "bootstrap round retained Python frontiers: "
-                + ", ".join(
-                    str(item.get("qualified_name") or "<unknown>")
-                    for item in failures
-                )
-            )
-        return
-
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Compose the compiler's existing native boundaries, then offer "
-            "the complete ProcessGraph-to-AOT outer stage to bootstrap creep"
+            "Compile the ProcessGraph-to-AOT stage through the canonical "
+            "partitioned source compiler"
         ),
     )
     parser.add_argument(
@@ -227,11 +29,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="stop after publishing the resolved compilation-unit plan",
     )
     parser.add_argument("--jobs", type=int, default=1)
-    parser.add_argument("--max-total-gb", type=float)
-    parser.add_argument("--worker-reserve-gb", type=float, default=8.0)
-    parser.add_argument("--max-worker-gb", type=float, default=12.0)
-    parser.add_argument("--unit-timeout-seconds", type=float, default=1800.0)
-    parser.add_argument("--max-rounds", type=int, default=16)
+    parser.add_argument("--max-total-gb", type=float, default=10.0)
+    parser.add_argument("--worker-reserve-gb", type=float, default=2.0)
+    parser.add_argument(
+        "--max-worker-gb", type=float, default=10.0,
+        help=(
+            "per-worker memory-regulation/compression budget in GiB; "
+            "crossing it does not terminate the compiler worker"
+        ),
+    )
     arguments = parser.parse_args(argv)
 
     def report(message: str) -> None:
@@ -273,10 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None if arguments.max_worker_gb is None
                 else int(arguments.max_worker_gb * (1 << 30))
             ),
-            unit_timeout_seconds=arguments.unit_timeout_seconds,
-            max_rounds=arguments.max_rounds,
             progress=display.log,
-            event_progress=lambda event: _report_bootstrap_event(display, event),
         )
     print(
         f"outer partition {product.boundary['name']} "

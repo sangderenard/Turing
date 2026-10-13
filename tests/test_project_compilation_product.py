@@ -280,6 +280,61 @@ def test_completed_unit_reports_its_compiler_stage_without_event_name_collision(
     assert manifest["units"][0]["stage"] == complete["compiler_stage"]
 
 
+def test_worker_memory_budget_regulates_worker_without_terminating_it(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "source.py"
+    source.write_text("def target(value):\n    return value\n", encoding="utf-8")
+    observed = {}
+
+    class FinishingWorker:
+        pid = 42
+        stdout = ()
+
+        def __init__(self, command, **kwargs):
+            self.returncode = None
+            self.poll_count = 0
+            observed["environment"] = kwargs["env"]
+            output = Path(command[command.index("--output") + 1])
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "unit.json").write_text(json.dumps({
+                "artifact": "repository-ssa.pkl",
+                "exports": ["target"],
+                "repository_ssa_complete": True,
+                "source_region_integrals": [],
+            }), encoding="utf-8")
+
+        def poll(self):
+            self.poll_count += 1
+            if self.poll_count >= 2:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            raise AssertionError("memory budgets must not terminate workers")
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.subprocess.Popen",
+        FinishingWorker,
+    )
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.process_memory_bytes",
+        lambda _pid: (2, 2),
+    )
+
+    manifest = compile_project_product(
+        source,
+        tmp_path / "product",
+        entries=("target",),
+        extraction_contract=None,
+        jobs=1,
+        max_worker_memory_bytes=1,
+    )
+
+    assert manifest["units"][0]["status"] == "complete"
+    assert observed["environment"]["TURING_MEMORY_BUDGET_BYTES"] == "1"
+
+
 def test_compiler_toolchain_fingerprint_is_deterministic_and_auditable():
     first = compiler_toolchain_fingerprint()
     second = compiler_toolchain_fingerprint()
@@ -897,59 +952,6 @@ def test_project_bootstrap_creep_automatically_crawls_partial_unit_plan(
     }]
 
 
-def test_project_bootstrap_creep_defers_a_timed_out_unit_retry(
-    tmp_path, monkeypatch,
-):
-    source = tmp_path / "compiler_part.py"
-    source.write_text("def root(value):\n    return value\n", encoding="utf-8")
-
-    def compile_round(_source, output, **_kwargs):
-        unit_root = output / "units" / "root"
-        unit_root.mkdir(parents=True)
-        (unit_root / "resolved-process-graph.pkl").write_bytes(b"graph")
-        (unit_root / "process-graph-units.json").write_text(
-            "{}", encoding="utf-8",
-        )
-        return {
-            "units": [{
-                "qualified_name": "root",
-                "status": "partial",
-                "error_type": "ResourceLimitExceeded",
-                "error": "unit exceeded 300.000s elapsed time",
-                "path": "units/root",
-                "process_graph_unit_plan": (
-                    "units/root/process-graph-units.json"
-                ),
-            }],
-            "automatic_native_verification": [],
-            "creep_frontier": [{"qualified_name": "root"}],
-        }
-
-    monkeypatch.setattr(
-        "src.compiler.project_compilation_product.compile_project_product",
-        compile_round,
-    )
-
-    def unexpected_crawl(*_args, **_kwargs):
-        raise AssertionError("a timed-out unit was immediately retried")
-
-    monkeypatch.setattr(
-        "src.compiler.project_compilation_product.compile_process_graph_creep",
-        unexpected_crawl,
-    )
-
-    manifest = compile_project_bootstrap_creep(
-        source, tmp_path / "creep", max_rounds=1,
-    )
-
-    assert manifest["rounds"][0]["process_graph_creeps"] == [{
-        "qualified_name": "root",
-        "status": "deferred-timeout-retry",
-        "verified_product_count": 0,
-        "fixed_point_count": 0,
-    }]
-
-
 def test_project_bootstrap_creep_crawls_strict_children_before_widening(
     tmp_path, monkeypatch,
 ):
@@ -1280,81 +1282,6 @@ def test_resource_bound_scc_divides_into_name_correlated_function_shells(
         ]
         for item in plan["integrals"]
     )
-
-
-def test_repository_ssa_timeout_divides_at_exact_function_reference(tmp_path):
-    graph = tmp_path / "resolved.pkl"
-    unit_plan = tmp_path / "units.json"
-    graph.write_bytes(b"resolved graph")
-    unit_plan.write_text(json.dumps({
-        "schema": "turing.compilation-unit-plan.v1",
-        "units": [{
-            "qualified_names": ["re._compiler._compile"],
-            "function_references": [26],
-            "dependency_units": [],
-        }],
-    }), encoding="utf-8")
-    record = {
-        "status": "failed",
-        "error_type": "ResourceLimitExceeded",
-        "resource": "elapsed-time",
-        "stage": {"phase": "repository-ssa-lowering"},
-        "unit_index": 0,
-        "unit": {
-            "qualified_names": ["re._compiler._compile"],
-            "function_references": [26],
-        },
-    }
-
-    plan = publish_process_graph_subdivision_plan(
-        tmp_path / "product", (record,), graph, unit_plan,
-    )
-
-    integral, = plan["integrals"]
-    assert integral["kind"] == "function-shell"
-    assert integral["function_references"] == [26]
-    assert integral["blockers"] == [
-        "resource:elapsed-time", "phase:repository-ssa-lowering",
-    ]
-
-
-def test_subdivision_timeout_reuses_integral_function_reference(tmp_path):
-    graph = tmp_path / "resolved.pkl"
-    unit_plan = tmp_path / "units.json"
-    graph.write_bytes(b"resolved graph")
-    unit_plan.write_text(json.dumps({
-        "schema": "turing.compilation-unit-plan.v1",
-        "units": [{
-            "qualified_names": ["re._compiler._optimize_charset"],
-            "function_references": [38],
-            "dependency_units": [],
-        }],
-    }), encoding="utf-8")
-    record = {
-        "status": "failed",
-        "error_type": "ResourceLimitExceeded",
-        "resource": "elapsed-time",
-        "stage": {"phase": "repository-ssa-lowering"},
-        "integral_index": 5,
-        "qualified_names": ["re._compiler._optimize_charset"],
-        "integral": {
-            "schema": "turing.process-graph-subdivision-integral.v1",
-            "parent_unit_index": 6,
-            "qualified_names": ["re._compiler._optimize_charset"],
-            "function_references": [38],
-            "kind": "function-shell",
-        },
-    }
-
-    plan = publish_process_graph_subdivision_plan(
-        tmp_path / "product", (record,), graph, unit_plan,
-    )
-
-    integral, = plan["integrals"]
-    assert integral["qualified_names"] == [
-        "re._compiler._optimize_charset",
-    ]
-    assert integral["function_references"] == [38]
 
 
 def test_authored_parameter_contract_distinguishes_used_and_unused_formals():

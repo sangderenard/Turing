@@ -45392,7 +45392,7 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
             "tensor_ssa_reference", "tensor_code_references", "runtime_closure_only",
             "retain_linked_piece_bodies", "dependency_seeds", "retain",
             "external_class_field_aggregate_kinds", "boundary_namespace", "source_language",
-            "identity_book", "identity_log_level",
+            "identity_book", "identity_log_level", "source_module", "python_package",
         ) if key in options}
         allowed = {"extraction_contract", "python_bindings"}
         if set(options) - allowed:
