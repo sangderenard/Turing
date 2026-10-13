@@ -10,6 +10,28 @@ from src.compiler.whole_program_compiler_bootstrap import (
     build_whole_program_compiler,
     plan_whole_program_compiler,
 )
+from src.compiler.shell_telemetry import LOWERING_STAGES
+
+
+def _starting_compiler_state() -> dict[str, Any]:
+    """The source compiler's exact declared matrix before its first receipt."""
+
+    return {
+        "compiler": {
+            "stage_number": 1,
+            "stage_count": len(LOWERING_STAGES),
+            "stage_label": LOWERING_STAGES[0].label,
+            "substage": "",
+            "stages": [
+                {
+                    "key": stage.key,
+                    "label": stage.label,
+                    "state": "starting" if index == 0 else "pending",
+                }
+                for index, stage in enumerate(LOWERING_STAGES)
+            ],
+        },
+    }
 
 
 def _worker_key(prefix: str, qualified_name: str, index: Any = "") -> str:
@@ -67,7 +89,10 @@ def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
         qualified_name = str(worker.get("qualified_name") or "worker")
         key = _worker_key("catalogue", qualified_name)
         if worker_stage == "unit_start":
-            _show_worker(display, key, qualified_name, {}, status="starting")
+            _show_worker(
+                display, key, qualified_name, _starting_compiler_state(),
+                status="starting",
+            )
         elif worker_stage == "worker_snapshot":
             display.count(
                 "catalogue-total",
@@ -98,8 +123,8 @@ def _report_bootstrap_event(display, event: Mapping[str, Any]) -> None:
             failure_stage = worker.get("failure_stage")
             current = dict(
                 failure_stage if isinstance(failure_stage, Mapping)
-                else worker.get("stage")
-                if isinstance(worker.get("stage"), Mapping)
+                else worker.get("compiler_stage")
+                if isinstance(worker.get("compiler_stage"), Mapping)
                 else {}
             )
             current.setdefault(

@@ -7796,9 +7796,9 @@ def compile_project_product(
     ):
         raise FileNotFoundError(extraction_contract_path)
 
-    def report(stage: str, **details: Any) -> None:
+    def report(event_stage: str, **details: Any) -> None:
         if progress is not None:
-            progress({"stage": stage, **details})
+            progress({**details, "stage": event_stage})
 
     records: list[dict[str, Any] | None] = [None] * len(selected_names)
     pending = list(enumerate(selected_names))
@@ -8153,7 +8153,13 @@ def compile_project_product(
                 } if process_graph_plan is not None else {}),
             }
         records[index] = record
-        report("unit_complete", **record, index=index, count=len(selected_names))
+        event_record = dict(record)
+        compiler_stage = event_record.pop("stage", None)
+        report(
+            "unit_complete", **event_record,
+            compiler_stage=compiler_stage,
+            index=index, count=len(selected_names),
+        )
 
     while pending or running:
         drain_worker_output()

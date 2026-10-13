@@ -125,6 +125,12 @@ def test_parent_overlay_keeps_sibling_worker_after_one_failure():
         "event": {
             "stage": "unit_complete", "qualified_name": "failed",
             "index": 0, "count": 2, "status": "failed",
+            "compiler_stage": {
+                "compiler": {
+                    "stage_number": 9, "stage_count": 10,
+                    "stage_label": "SSA lowering", "stages": [],
+                },
+            },
         },
     })
     _report_bootstrap_event(display, {
@@ -155,6 +161,35 @@ def test_parent_overlay_keeps_sibling_worker_after_one_failure():
     assert working["stage_label"] == "SSA lowering"
     assert working["substage"] == "lower-functions"
     assert "failed: failed" in display.logs
+
+
+def test_parent_display_has_the_ten_stage_matrix_at_worker_start():
+    from tools.bootstrap_compiler_whole_program import _report_bootstrap_event
+
+    class Display:
+        def __init__(self):
+            self.workers = {}
+
+        def worker(self, key, **details):
+            self.workers[key] = details
+
+    display = Display()
+    _report_bootstrap_event(display, {
+        "stage": "bootstrap_creep_worker",
+        "event": {
+            "stage": "unit_start",
+            "qualified_name": "compiler.part",
+            "index": 0,
+            "count": 1,
+        },
+    })
+
+    worker = display.workers["catalogue:compiler.part:"]
+    assert worker["stage_number"] == 1
+    assert worker["stage_count"] == 10
+    assert len(worker["stages"]) == 10
+    assert worker["stages"][0]["state"] == "starting"
+    assert all(row["state"] == "pending" for row in worker["stages"][1:])
 
 
 def test_outer_partition_is_an_authored_project_root():

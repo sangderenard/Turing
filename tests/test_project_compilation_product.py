@@ -6,6 +6,7 @@ import importlib
 import inspect
 import json
 import pickle
+from pathlib import Path
 from types import SimpleNamespace
 
 import tools.compile_project_catalogue as compile_project_catalogue
@@ -23,6 +24,7 @@ from src.compiler.project_compilation_product import (
     compilation_creep_frontier,
     compile_project_call,
     compile_project_bootstrap_creep,
+    compile_project_product,
     compile_process_graph_creep,
     compile_process_graph_subdivision_plan,
     compile_resolved_process_graph_unit,
@@ -217,6 +219,65 @@ def test_project_worker_hands_its_resolved_module_context_to_ingestion(
     )["current"]
     assert current["compiler"]["stage_key"] == "topology-reduction"
     assert current["compiler"]["stage_count"] == 10
+
+
+def test_completed_unit_reports_its_compiler_stage_without_event_name_collision(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "source.py"
+    source.write_text("def target(value):\n    return value\n", encoding="utf-8")
+
+    class FinishedWorker:
+        pid = 41
+        returncode = 0
+        stdout = ()
+
+        def __init__(self, command, **_kwargs):
+            output = Path(command[command.index("--output") + 1])
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "unit.json").write_text(json.dumps({
+                "artifact": "repository-ssa.pkl",
+                "exports": ["target"],
+                "repository_ssa_complete": True,
+                "source_region_integrals": [],
+            }), encoding="utf-8")
+            (output / "compile-progress.json").write_text(json.dumps({
+                "current": {
+                    "compiler": {
+                        "stage_number": 10,
+                        "stage_count": 10,
+                        "stage_label": "pre-native repairs",
+                        "stages": [],
+                    },
+                },
+            }), encoding="utf-8")
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.subprocess.Popen",
+        FinishedWorker,
+    )
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.process_memory_bytes",
+        lambda _pid: (0, 0),
+    )
+    events = []
+
+    manifest = compile_project_product(
+        source,
+        tmp_path / "product",
+        entries=("target",),
+        extraction_contract=None,
+        jobs=1,
+        progress=events.append,
+    )
+
+    complete = next(event for event in events if event["stage"] == "unit_complete")
+    assert complete["qualified_name"] == "target"
+    assert complete["compiler_stage"]["compiler"]["stage_count"] == 10
+    assert manifest["units"][0]["stage"] == complete["compiler_stage"]
 
 
 def test_compiler_toolchain_fingerprint_is_deterministic_and_auditable():
