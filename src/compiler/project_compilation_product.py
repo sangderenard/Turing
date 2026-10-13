@@ -4715,7 +4715,7 @@ def _dump_scoped_resolved_process_graph(
     receipt["acceptance_cells"] = sum(page.cell_count() for page in
                                      dict.values(catalogue.G.graph["compilation_unit_identity_book"].pages))
 
-    class ScopedPickler(pickle.Pickler):
+    class ScopedPickler(_ResolvedProcessGraphPickler):
         def reducer_override(self, value):
             if value is table:
                 # Memoize the empty table BEFORE restoring cyclic graph/table
@@ -4728,7 +4728,7 @@ def _dump_scoped_resolved_process_graph(
                     return replacement.__reduce_ex__(5)
                 if id(value) in source_bodies or value is graph:
                     return type(None), ()
-            return NotImplemented
+            return super().reducer_override(value)
 
     pickler = ScopedPickler(stream, protocol=5)
     pickler.dispatch_table = copyreg.dispatch_table.copy()

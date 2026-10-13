@@ -9,6 +9,7 @@ import sys
 import weakref
 from pathlib import Path
 
+import networkx as nx
 import pytest
 
 from src.compiler import project_compilation_product as product
@@ -106,6 +107,26 @@ def test_published_cuts_preserve_exact_nodes_edges_scopes_and_addresses(tmp_path
             assert entry.graph.G.graph["lexical_read_scope"] == source.G.graph["lexical_read_scope"]
         assert item["sha256"] == product._file_sha256(Path(item["path"]))
     assert all(entry.graph is not None for entry in original.function_table)
+
+
+def test_published_cut_retains_cached_property_function_identity(tmp_path):
+    _graph_path, _plan_path, plan, original = _inputs(tmp_path)
+    selected = next(
+        entry.graph for entry in original.function_table
+        if entry.qualified_name == "left"
+    )
+    selected.G.graph["descriptor_function"] = nx.Graph.nodes.func
+
+    published = product.publish_resolved_process_graph_inputs(
+        original, plan, tmp_path / "cuts",
+    )
+    item = next(
+        item for item in published["scoped_inputs"]
+        if "left" in plan["units"][item["unit_index"]]["qualified_names"]
+    )
+    cut = product._load_pickle_artifact(item["path"])
+    restored = cut.function_table.entry("left").graph
+    assert restored.G.graph["descriptor_function"] is nx.Graph.nodes.func
 
 
 def test_scoped_worker_never_reads_complete_archive_and_rejects_drift(tmp_path, monkeypatch):
