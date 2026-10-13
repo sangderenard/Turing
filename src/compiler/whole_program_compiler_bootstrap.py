@@ -210,6 +210,7 @@ def build_whole_program_compiler(
     adaptive_memory_ceiling: bool = True,
     worker_resident_reservation_bytes: int = 2 << 30,
     max_worker_memory_bytes: int | None = 10 << 30,
+    worker_elastic_available_percent: int = 25,
     progress: Callable[[str], None] | None = None,
 ) -> WholeProgramCompilerProduct:
     """Bootstrap the complete ProcessGraph-to-AOT outer partition.
@@ -241,6 +242,9 @@ def build_whole_program_compiler(
         "adaptive_memory_ceiling": adaptive_memory_ceiling,
         "worker_resident_reservation_bytes": worker_resident_reservation_bytes,
         "max_worker_memory_bytes": max_worker_memory_bytes,
+        "worker_elastic_available_percent": (
+            worker_elastic_available_percent
+        ),
     }
     if jobs is not None:
         partitioned_options["jobs"] = jobs

@@ -53,6 +53,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "crossing it does not terminate the compiler worker"
         ),
     )
+    parser.add_argument(
+        "--worker-elastic-available-percent", type=int, default=25,
+        help=(
+            "percentage of signed system headroom above or below the system "
+            "reserve applied to a compressed worker's temporary decoded "
+            "front (default: 25)"
+        ),
+    )
     arguments = parser.parse_args(argv)
 
     def report(message: str) -> None:
@@ -101,6 +109,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_worker_memory_bytes=(
                 None if arguments.max_worker_gb is None
                 else int(arguments.max_worker_gb * (1 << 30))
+            ),
+            worker_elastic_available_percent=(
+                arguments.worker_elastic_available_percent
             ),
             progress=display.log,
         )

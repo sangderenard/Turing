@@ -545,6 +545,45 @@ def process_rss_bytes() -> int:
         return 0
 
 
+def system_available_memory_bytes() -> int | None:
+    """Return immediately available physical memory without another package."""
+
+    import os
+
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.WinDLL(
+            "kernel32", use_last_error=True,
+        ).GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ullAvailPhys)
+    try:
+        with open("/proc/meminfo", "rb") as stream:
+            for line in stream:
+                if line.startswith(b"MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 # --- compile stage progress bars -------------------------------------------
 #
 # The compiler already says everything it is doing, as lines, through one
@@ -2115,6 +2154,7 @@ __all__ = [
     "declare_progress_bars_policy",
     "attach_profiler",
     "process_rss_bytes",
+    "system_available_memory_bytes",
     "progress_bars_default",
     "record_launch_profile",
     "record_shortfalls",

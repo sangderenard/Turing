@@ -1,20 +1,24 @@
 2026-10-13 ELASTIC DECODED COMPILER FRONT (CURRENT WORKTREE):
 Once live compiler storage enters a compressed tier, its backing tier remains
-monotonic but its decoded working front is now elastic.  Pressure checks below
-the worker memory budget lend otherwise unused process headroom to the decoded
-payload cache, with a five-percent/64-MiB reserve; tiles enter that larger front
-only when the active stage reads them.  A later budget crossing contracts the
-front to the work contract's declared tile/byte bounds before the regulator
-escalates storage.  The authoritative compressed backing, handles, route
-indexes, and concordance identities do not change.  Receipts distinguish the
-declared decoded budget from the current working decoded budget.
+monotonic but its decoded working front is now elastic.  Its effective process
+ceiling is the configured ceiling plus 25 percent of signed system headroom
+(available physical RAM minus the 2-GiB system reserve).  Thus abundant RAM
+lets the temporary decoded cache exceed 10 GiB, while availability below the
+reserve pushes the ceiling below 10 GiB.  The sample is refreshed by the
+existing throttled pressure check.  Tiles enter a larger front only when the
+active stage reads them; a falling ceiling contracts that front before storage
+escalates.  The authoritative compressed backing, handles, route indexes, and
+concordance identities do not change.  Receipts distinguish the declared
+decoded budget, current working budget, system sample, signed adjustment, and
+effective ceiling.  The percentage is a work-contract/environment value and
+the bootstrap CLI exposes `--worker-elastic-available-percent` (default 25).
 
 Final storage release now completes before the canonical compiler progress
 display closes.  The pre-native row therefore remains present while the final
 compressed-arena mark/sweep runs, with explicit start/end log lines; “compile
 done” no longer precedes invisible compiler work.  The full live-storage,
-memory-regulation, and progress suites pass 96 tests in 77.47 seconds, and the
-mapping concordance audit reports zero findings.  No bootstrap or orbital
+memory-regulation, progress, and bootstrap suites pass 104 tests in 82.31
+seconds, and the mapping concordance audit reports zero findings.  No bootstrap or orbital
 compile was launched, and no existing Python process was inspected or
 disturbed.
 

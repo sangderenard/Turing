@@ -111,6 +111,10 @@ def test_release_ordinals_continue_across_boundaries(monkeypatch):
 
 def test_work_contract_budget_is_validated_and_defaults_to_automatic_ladder():
     assert all(preset.memory_budget_bytes == 10 << 30 for preset in PRESETS.values())
+    assert all(
+        preset.memory_elastic_available_percent == 25
+        for preset in PRESETS.values()
+    )
     assert all(preset.compress_cold_pages for preset in PRESETS.values())
     assert all(preset.compressed_tile_disk for preset in PRESETS.values())
     assert WorkContract(
@@ -123,6 +127,13 @@ def test_work_contract_budget_is_validated_and_defaults_to_automatic_ladder():
                 "t", register_reuse=False, inexact_identities=False,
                 contract_multiply_add=False, memory_budget_bytes=bad,
             )
+    for bad in (-1, 101, True, "25", 2.5):
+        with pytest.raises(ValueError):
+            WorkContract(
+                "t", register_reuse=False, inexact_identities=False,
+                contract_multiply_add=False,
+                memory_elastic_available_percent=bad,
+            )
 
 
 def test_environment_budget_overrides_without_renaming_the_contract(monkeypatch):
@@ -131,11 +142,16 @@ def test_environment_budget_overrides_without_renaming_the_contract(monkeypatch)
     monkeypatch.delenv("TURING_POW_INEXACT", raising=False)
     monkeypatch.delenv("TURING_FMA_CONTRACT", raising=False)
     monkeypatch.delenv("TURING_MEMORY_BUDGET_BYTES", raising=False)
+    monkeypatch.delenv(
+        "TURING_MEMORY_ELASTIC_AVAILABLE_PERCENT", raising=False,
+    )
     assert active_contract() is PRESETS["develop"]
     monkeypatch.setenv("TURING_MEMORY_BUDGET_BYTES", str(3 << 30))
     contract = active_contract()
     assert contract.memory_budget_bytes == 3 << 30
     assert contract.name == "develop"
+    monkeypatch.setenv("TURING_MEMORY_ELASTIC_AVAILABLE_PERCENT", "40")
+    assert active_contract().memory_elastic_available_percent == 40
 
 
 def test_default_regulation_is_fast_until_pressure_then_climbs_all_tiers(monkeypatch):
@@ -221,9 +237,13 @@ def test_compressed_front_expands_with_headroom_and_contracts_before_escalation(
     regulator = regulation.MemoryRegulator(
         IdentityBook(), budget_bytes=budget,
         compress_policy=True, tile_disk_policy=True,
+        elastic_available_percent=0,
     )
     regulator.live_arena = owner
     monkeypatch.setattr(regulation, "process_rss_bytes", lambda: resident)
+    monkeypatch.setattr(
+        regulation, "system_available_memory_bytes", lambda: 0,
+    )
 
     regulator.pressure_checkpoint("active compressed work")
     assert owner.pressure_level == 2
@@ -242,11 +262,50 @@ def test_compressed_front_expands_with_headroom_and_contracts_before_escalation(
     assert owner.payload_limit == owner.base_payload_limit
 
 
+def test_compressed_front_borrows_a_fraction_of_available_ram_and_gives_it_back(
+    monkeypatch, tmp_path,
+):
+    from src.compiler.live_tiles import LiveTileArena
+
+    gib = 1 << 30
+    owner = LiveTileArena(
+        tile_rows=2, hot_tiles=1, bucket_rows=1,
+        decoded_budget_bytes=128 << 20, directory=tmp_path,
+    )
+    owner.compress_resident_ram()
+    regulator = regulation.MemoryRegulator(
+        IdentityBook(), budget_bytes=gib,
+        compress_policy=True, tile_disk_policy=True,
+        elastic_available_percent=25,
+    )
+    regulator.live_arena = owner
+    resident = [gib]
+    available = [4 * gib]
+    monkeypatch.setattr(regulation, "process_rss_bytes", lambda: resident[0])
+    monkeypatch.setattr(
+        regulation, "system_available_memory_bytes", lambda: available[0],
+    )
+
+    regulator.pressure_checkpoint("temporary active arena")
+    assert owner.pressure_level == 2
+    assert owner.decoded_budget_bytes == 576 << 20
+
+    resident[0] = 700 << 20
+    available[0] = gib
+    regulator._last_pressure_read = 0.0
+    regulator.pressure_checkpoint("temporary active arena")
+    assert owner.pressure_level == 2
+    assert owner.decoded_budget_bytes == 132 << 20
+
+
 def test_resumed_dual_ir_book_reuses_pressure_arena_for_source_storage(monkeypatch):
     from dataclasses import replace
     from src.compiler.live_tiles import LiveDiGraph, _ACTIVE_ARENA, live_digraph
 
     monkeypatch.setattr(regulation, "process_rss_bytes", lambda: 500)
+    monkeypatch.setattr(
+        regulation, "system_available_memory_bytes", lambda: 0,
+    )
     set_active_contract(replace(
         PRESETS["develop"], memory_budget_bytes=100,
         live_tile_rows=2, live_resident_tiles=2,
@@ -270,9 +329,9 @@ def test_resumed_dual_ir_book_reuses_pressure_arena_for_source_storage(monkeypat
         climbed = []
         original_climb = resumed._climb_storage_ladder
 
-        def observed_climb(label, resident):
+        def observed_climb(label, resident, **kwargs):
             climbed.append((label, resident))
-            return original_climb(label, resident)
+            return original_climb(label, resident, **kwargs)
 
         resumed._climb_storage_ladder = observed_climb
         resumed._last_pressure_read = 0.0

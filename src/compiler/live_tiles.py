@@ -665,6 +665,25 @@ class LiveTileArena:
                 )
         return self.stats()
 
+    def resize_decoded_front(self, decoded_budget_bytes):
+        """Resize the disposable decoded cache without changing its backing."""
+
+        with self._lock:
+            if self.pressure_level == 0:
+                return self.stats()
+            self.decoded_budget_bytes = max(
+                self.base_decoded_budget_bytes,
+                int(decoded_budget_bytes),
+            )
+            self.payload_limit = (
+                max(self.base_payload_limit, len(self._tiles))
+                if self.decoded_budget_bytes > self.base_decoded_budget_bytes
+                else (1 if self.pressure_level >= 3
+                      else self.base_payload_limit)
+            )
+            self._trim()
+        return self.stats()
+
     def contract_decoded_front(self):
         """Return an expanded cache to this tier's declared working set."""
 

@@ -4814,9 +4814,10 @@ def compile_partitioned_source(
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_total_resident_bytes: int | None = None,
     minimum_total_resident_bytes: int | None = None,
-    system_reserve_bytes: int = 0,
+    system_reserve_bytes: int = 2 << 30,
     adaptive_memory_ceiling: bool = False,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
+    worker_elastic_available_percent: int = 25,
     max_unit_source_nodes: int = 4096,
     interface_tiles: bool = False,
     source_options: Mapping[str, Any] | None = None,
@@ -4835,6 +4836,12 @@ def compile_partitioned_source(
     from .fortran_c_shell import lower_ast_source_to_ssa
     if isinstance(max_unit_source_nodes, bool) or not isinstance(max_unit_source_nodes, int) or max_unit_source_nodes < 1:
         raise ValueError("partitioned compilation requires a positive source-node tile bound")
+    if (
+        isinstance(worker_elastic_available_percent, bool)
+        or not isinstance(worker_elastic_available_percent, int)
+        or not 0 <= worker_elastic_available_percent <= 100
+    ):
+        raise ValueError("worker elastic available percent must be 0..100")
     root = Path(directory).resolve()
     root.mkdir(parents=True, exist_ok=True)
     graph_path = root / "resolved-process-graph.pkl"
@@ -4910,6 +4917,7 @@ def compile_partitioned_source(
         system_reserve_bytes=system_reserve_bytes,
         adaptive_memory_ceiling=adaptive_memory_ceiling,
         max_worker_memory_bytes=max_worker_memory_bytes,
+        worker_elastic_available_percent=worker_elastic_available_percent,
         progress=progress,
     )
 
@@ -6585,37 +6593,9 @@ def process_memory_bytes(process_id: int) -> tuple[int, int] | None:
 def system_available_memory_bytes() -> int | None:
     """Return immediately available physical memory without another package."""
 
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
+    from .shell_telemetry import system_available_memory_bytes as available
 
-        class MemoryStatusEx(ctypes.Structure):
-            _fields_ = [
-                ("dwLength", wintypes.DWORD),
-                ("dwMemoryLoad", wintypes.DWORD),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
-        status = MemoryStatusEx()
-        status.dwLength = ctypes.sizeof(status)
-        if not ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx(
-            ctypes.byref(status)
-        ):
-            return None
-        return int(status.ullAvailPhys)
-    meminfo = Path("/proc/meminfo")
-    if not meminfo.is_file():
-        return None
-    for line in meminfo.read_text(encoding="ascii", errors="replace").splitlines():
-        if line.startswith("MemAvailable:"):
-            return int(line.split()[1]) * 1024
-    return None
+    return available()
 
 
 def adaptive_worker_memory_ceiling(
@@ -6879,10 +6859,11 @@ def compile_resolved_process_graph_plan(
     schedule_mode: str = "parallel",
     max_total_resident_bytes: int | None = None,
     minimum_total_resident_bytes: int | None = None,
-    system_reserve_bytes: int = 0,
+    system_reserve_bytes: int = 2 << 30,
     adaptive_memory_ceiling: bool = False,
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
+    worker_elastic_available_percent: int = 25,
     worker_environment: Mapping[str, str] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -6963,6 +6944,15 @@ def compile_resolved_process_graph_plan(
         effective_worker_environment["TURING_MEMORY_BUDGET_BYTES"] = str(
             worker_memory_budget
         )
+    elastic_percent = int(worker_elastic_available_percent)
+    if not 0 <= elastic_percent <= 100:
+        raise ValueError("worker elastic available percent must be 0..100")
+    effective_worker_environment[
+        "TURING_MEMORY_ELASTIC_AVAILABLE_PERCENT"
+    ] = str(elastic_percent)
+    effective_worker_environment["TURING_MEMORY_SYSTEM_RESERVE_BYTES"] = str(
+        int(system_reserve_bytes)
+    )
     repository_root = Path(__file__).resolve().parents[2]
     records: list[dict[str, Any] | None] = [None] * len(units)
     for index, scoped_input in enumerate(plan.get("scoped_inputs") or ()):
@@ -7084,6 +7074,7 @@ def compile_resolved_process_graph_plan(
             "adaptive_memory_ceiling": bool(adaptive_memory_ceiling),
             "worker_resident_reservation_bytes": reservation,
             "max_worker_memory_bytes": worker_memory_budget,
+            "worker_elastic_available_percent": elastic_percent,
             "pending": pending,
             "running": running_records,
             "completed": [record for record in records if record is not None],
@@ -7241,6 +7232,7 @@ def compile_resolved_process_graph_plan(
         "plan_parallel_width": plan_parallel_width,
         "adaptive_memory_ceiling": bool(adaptive_memory_ceiling),
         "max_total_resident_bytes": total_limit,
+        "worker_elastic_available_percent": elastic_percent,
         "minimum_total_resident_bytes": minimum_limit,
         "system_reserve_bytes": int(system_reserve_bytes),
         "concurrent_workers_peak": concurrency_peak,

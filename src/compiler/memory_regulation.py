@@ -7,7 +7,7 @@ that is *regulated* rather than hoped for:
   the next begins.  It reads the process resident set
   (``shell_telemetry.process_rss_bytes``, the one shared helper) and, when the
   work contract declares a ``memory_budget_bytes`` and the resident set is
-  above it, releases RECOMPUTABLE items in the declared order of
+  above the signed elastic ceiling, releases RECOMPUTABLE items in the declared order of
   ``RELEASE_ORDER`` until it is under the budget.  Each release is a
   ``memory_release_receipt`` row on the compile's book, DERIVED from the
   ``compile_policy`` ``memory_budget_bytes`` cell (the policy is declared on
@@ -51,7 +51,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .shell_telemetry import process_rss_bytes
+from .shell_telemetry import process_rss_bytes, system_available_memory_bytes
 
 
 def _release_dependency_levels() -> int:
@@ -97,6 +97,11 @@ class MemoryRegulator:
     spill_policy: bool = False
     compress_policy: bool = False
     tile_disk_policy: bool = False
+    elastic_available_percent: int = 25
+    system_reserve_bytes: int = 2 << 30
+    _system_available_bytes: int | None = None
+    _elastic_adjustment_bytes: int = 0
+    _effective_budget_bytes: int | None = None
     _last_pressure_read: float = 0.0
     #: ``(stage label, resident set)`` at every boundary, in order.
     history: list[tuple[str, int]] = field(default_factory=list)
@@ -141,12 +146,19 @@ class MemoryRegulator:
                 file=sys.stderr, flush=True,
             )
         budget = self.budget_bytes
-        if budget is None or resident <= budget:
+        if budget is None:
+            return resident
+        effective_budget, _available, _adjustment = (
+            self._effective_memory_ceiling()
+        )
+        if resident <= effective_budget:
             return resident
         if self.compress_policy and self.tile_disk_policy:
             self._activate_live_storage()
-            resident = self._climb_storage_ladder(str(label), resident)
-            if resident <= budget:
+            resident = self._climb_storage_ladder(
+                str(label), resident, ceiling=effective_budget,
+            )
+            if resident <= effective_budget:
                 return resident
         if self.compress_policy and label == "compile: end":
             # Caches/garbage were released by end_regulation before this call.
@@ -156,10 +168,36 @@ class MemoryRegulator:
             before = process_rss_bytes()
             released = int(release())
             resident = process_rss_bytes()
-            self._post(str(label), item, before, resident, budget, released)
-            if resident <= budget:
+            self._post(
+                str(label), item, before, resident,
+                int(self.budget_bytes), released,
+            )
+            if resident <= effective_budget:
                 break
         return resident
+
+    def _effective_memory_ceiling(self):
+        """Return the signed elastic process ceiling and its system sample."""
+
+        if self.budget_bytes is None:
+            return None, None, 0
+        available = system_available_memory_bytes()
+        adjustment = (
+            0 if available is None else
+            (int(available) - int(self.system_reserve_bytes))
+            * int(self.elastic_available_percent) // 100
+        )
+        if adjustment > 0 and (
+            self.live_arena is None or self.live_arena.pressure_level == 0
+        ):
+            # Surplus RAM enlarges only the disposable decoded cache.  Before
+            # compression activates, the ordinary graph heap is not elastic.
+            adjustment = 0
+        effective = max(1, int(self.budget_bytes) + adjustment)
+        self._system_available_bytes = available
+        self._elastic_adjustment_bytes = adjustment
+        self._effective_budget_bytes = effective
+        return effective, available, adjustment
 
     def register_live_root(self, value):
         """Remember a native fast-path root weakly for possible late adoption."""
@@ -250,8 +288,10 @@ class MemoryRegulator:
             names.extend(PARTITIONED)
         return tuple(names)
 
-    def _climb_storage_ladder(self, label: str, resident: int) -> int:
-        """Escalate only while the measured process remains over budget.
+    def _climb_storage_ladder(
+        self, label: str, resident: int, *, ceiling: int | None = None,
+    ) -> int:
+        """Escalate only while the process remains over its effective ceiling.
 
         0 -> disk-back the cold decoded tail; 1 -> compress the remaining RAM
         contents; 2 -> put all backing on disk and keep one decoded payload
@@ -259,10 +299,13 @@ class MemoryRegulator:
         This ladder is monotonic for one compile and never runs below budget.
         The maximum tier's storage pass is linear for the configured fixed
         tile/codec windows; LiveTileArena.collect_unused documents the stricter
-        parameterized bound of its one-tile traversal cache.
+        parameterized bound of its one-tile traversal cache.  ``ceiling`` is
+        the signed elastic ceiling sampled by the caller; the declared work-
+        contract budget remains unchanged in concordance receipts.
         """
+        ceiling = self.budget_bytes if ceiling is None else int(ceiling)
         if not (self.compress_policy and self.tile_disk_policy
-                and self.budget_bytes is not None and resident > self.budget_bytes
+                and ceiling is not None and resident > ceiling
                 and self.live_arena is not None):
             return resident
         arena = self.live_arena
@@ -287,9 +330,9 @@ class MemoryRegulator:
                 file=sys.stderr, flush=True,
             )
             self._live_receipt(label)
-            if resident <= self.budget_bytes:
+            if resident <= ceiling:
                 return resident
-        while resident > self.budget_bytes and self.live_arena.pressure_level < 3:
+        while resident > ceiling and self.live_arena.pressure_level < 3:
             before = resident
             started = time.perf_counter()
             level = self.live_arena.pressure_level
@@ -299,7 +342,7 @@ class MemoryRegulator:
             elif level == 1:
                 names = self._cold_page_names()
                 if names:
-                    self.book.compress_pages(names, budget_bytes=self.budget_bytes,
+                    self.book.compress_pages(names, budget_bytes=ceiling,
                                              boundary=label)
                 stats = self.live_arena.compress_resident_ram()
                 # Mark/sweep is deliberately deferred until compression is
@@ -307,7 +350,7 @@ class MemoryRegulator:
                 self.live_arena.collect_unused()
                 action = "compressed-ram"
             else:
-                self.offload_tiles(label, resident)
+                self.offload_tiles(label, resident, budget_bytes=ceiling)
                 stats = self.live_arena.stats()
                 action = "minimum-working-set"
             self._live_receipt(label)
@@ -327,13 +370,16 @@ class MemoryRegulator:
                   file=sys.stderr, flush=True)
         return resident
 
-    def offload_tiles(self, label: str, resident: int):
+    def offload_tiles(
+        self, label: str, resident: int, *, budget_bytes: int | None = None,
+    ):
+        budget = self.budget_bytes if budget_bytes is None else int(budget_bytes)
         if not (self.compress_policy and self.tile_disk_policy
-                and self.budget_bytes is not None and resident > self.budget_bytes):
+                and budget is not None and resident > budget):
             return None
         from .identity_compression import offload_book_tiles
 
-        result = offload_book_tiles(self.book, budget_bytes=self.budget_bytes,
+        result = offload_book_tiles(self.book, budget_bytes=budget,
                                    resident_bytes=resident, boundary=label)
         if self.live_arena is not None and self.live_arena.pressure_level < 3:
             stats = self.live_arena.offload_to_disk()
@@ -358,6 +404,11 @@ class MemoryRegulator:
             "bucket_rows": self.live_arena.bucket_rows,
             "decoded_budget_bytes": self.live_arena.base_decoded_budget_bytes,
             "working_decoded_budget_bytes": self.live_arena.decoded_budget_bytes,
+            "elastic_available_percent": self.elastic_available_percent,
+            "system_reserve_bytes": self.system_reserve_bytes,
+            "system_available_bytes": self._system_available_bytes,
+            "elastic_adjustment_bytes": self._elastic_adjustment_bytes,
+            "effective_budget_bytes": self._effective_budget_bytes,
             "decoded_bytes": stats.decoded_bytes,
             "pressure_level": stats.pressure_level,
             # These cumulative counters expose the A*S locality term: a high
@@ -395,7 +446,10 @@ class MemoryRegulator:
             return None
         self._last_pressure_read = now
         resident = process_rss_bytes()
-        if resident <= self.budget_bytes:
+        elastic_ceiling, available, adjustment = (
+            self._effective_memory_ceiling()
+        )
+        if resident <= elastic_ceiling:
             if (
                 self.live_arena is not None
                 and self.live_arena.pressure_level > 0
@@ -404,28 +458,35 @@ class MemoryRegulator:
                 # cache capacity, not an instruction to inflate memory: tiles
                 # enter it only when the active stage actually reads them.
                 reserve = max(64 << 20, self.budget_bytes // 20)
-                headroom = self.budget_bytes - resident - reserve
-                if headroom > 0:
-                    target = (
-                        self.live_arena.base_decoded_budget_bytes
-                        + headroom
-                    )
-                    before = self.live_arena.decoded_budget_bytes
-                    if target > before:
-                        stats = self.live_arena.expand_decoded_front(target)
-                        self._live_receipt(label)
-                        if self._report:
-                            print(
-                                f"[compiler-memory] {label}: expand-decoded-front "
-                                f"level={stats.pressure_level} "
-                                f"limit={before / 2**20:.0f}->"
-                                f"{self.live_arena.decoded_budget_bytes / 2**20:.0f} MiB "
-                                f"rss={resident / 2**20:.0f} MiB",
-                                file=sys.stderr, flush=True,
-                            )
+                headroom = max(0, elastic_ceiling - resident - reserve)
+                target = (
+                    self.live_arena.base_decoded_budget_bytes
+                    + headroom
+                )
+                before = self.live_arena.decoded_budget_bytes
+                # Ignore small availability jitter; a material reduction is
+                # still honored and releases decoded payloads immediately.
+                shrink = target < before - (64 << 20)
+                if target > before or shrink:
+                    stats = self.live_arena.resize_decoded_front(target)
+                    resident = process_rss_bytes()
+                    self._live_receipt(label)
+                    if self._report:
+                        print(
+                            f"[compiler-memory] {label}: resize-decoded-front "
+                            f"level={stats.pressure_level} "
+                            f"limit={before / 2**20:.0f}->"
+                            f"{self.live_arena.decoded_budget_bytes / 2**20:.0f} MiB "
+                            f"available={0 if available is None else available / 2**20:.0f} MiB "
+                            f"elastic_adjustment={adjustment / 2**20:.0f} MiB "
+                            f"rss={resident / 2**20:.0f} MiB",
+                            file=sys.stderr, flush=True,
+                        )
             return resident
         self._activate_live_storage()
-        return self._climb_storage_ladder(label, resident)
+        return self._climb_storage_ladder(
+            label, resident, ceiling=elastic_ceiling,
+        )
 
     def spill_cold(self, trigger: str) -> int:
         """Spill the book's pages that the completed stages made cold; the
@@ -496,6 +557,10 @@ def begin_regulation(
         spill_policy=bool(contract.spill_cold_pages), owns_book=owned_book,
         compress_policy=bool(contract.compress_cold_pages),
         tile_disk_policy=bool(contract.compressed_tile_disk),
+        elastic_available_percent=int(
+            contract.memory_elastic_available_percent
+        ),
+        system_reserve_bytes=int(contract.memory_system_reserve_bytes),
     )
     outermost = _ACTIVE.get() is None
     token = _ACTIVE.set(regulator)
@@ -546,6 +611,12 @@ def _initialize_regulation(regulator, contract):
             "live_resident_tiles": str(contract.live_resident_tiles),
             "live_bucket_rows": str(contract.live_bucket_rows),
             "live_decoded_budget_bytes": str(contract.live_decoded_budget_bytes),
+            "memory_elastic_available_percent": str(
+                contract.memory_elastic_available_percent
+            ),
+            "memory_system_reserve_bytes": str(
+                contract.memory_system_reserve_bytes
+            ),
         }
         if regulator.budget_bytes is not None:
             regulator.live_policy_values["memory_budget_bytes"] = str(regulator.budget_bytes)

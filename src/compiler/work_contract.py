@@ -209,6 +209,12 @@ class WorkContract:
     # it.  Nothing is killed or refused, and the compile's output does not
     # depend on it: a release only drops what a later read recomputes.
     memory_budget_bytes: int | None = 10 << 30
+    # A decoded compiler cache elastically applies this percentage of signed
+    # system headroom (available RAM minus the reserve) to the process budget.
+    # The allowance is resampled, so low availability can lower the ceiling
+    # while the disposable decoded front's compressed backing stays exact.
+    memory_elastic_available_percent: int = 25
+    memory_system_reserve_bytes: int = 2 << 30
     # Cold-page spill (``identity_spill``): at every stage boundary the
     # identity book writes the pages no later stage reads out to its spill
     # file and drops them from RAM, whether or not the process is over
@@ -277,6 +283,24 @@ class WorkContract:
             raise ValueError(
                 "memory_budget_bytes must be a positive int or None, got "
                 f"{self.memory_budget_bytes!r}"
+            )
+        if not (
+            isinstance(self.memory_elastic_available_percent, int)
+            and not isinstance(self.memory_elastic_available_percent, bool)
+            and 0 <= self.memory_elastic_available_percent <= 100
+        ):
+            raise ValueError(
+                "memory_elastic_available_percent must be an int from 0 to "
+                f"100, got {self.memory_elastic_available_percent!r}"
+            )
+        if not (
+            isinstance(self.memory_system_reserve_bytes, int)
+            and not isinstance(self.memory_system_reserve_bytes, bool)
+            and self.memory_system_reserve_bytes >= 0
+        ):
+            raise ValueError(
+                "memory_system_reserve_bytes must be a non-negative int, "
+                f"got {self.memory_system_reserve_bytes!r}"
             )
         if self.callsite_descriptor_reuse not in _HONORED_CALLSITE_DESCRIPTOR_REUSE:
             raise ValueError(
@@ -416,6 +440,16 @@ def active_contract() -> WorkContract:
     if budget:
         contract = dataclasses.replace(
             contract, memory_budget_bytes=int(budget),
+        )
+    elastic = os.environ.get("TURING_MEMORY_ELASTIC_AVAILABLE_PERCENT")
+    if elastic:
+        contract = dataclasses.replace(
+            contract, memory_elastic_available_percent=int(elastic),
+        )
+    system_reserve = os.environ.get("TURING_MEMORY_SYSTEM_RESERVE_BYTES")
+    if system_reserve:
+        contract = dataclasses.replace(
+            contract, memory_system_reserve_bytes=int(system_reserve),
         )
     # Likewise the spill policy: a regulation of this process, not a fidelity
     # choice, so it does not rename the contract.
