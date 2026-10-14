@@ -27953,6 +27953,10 @@ def strategize_shell_deployment(
         ).values()
         if record.get("control_ir", True)
         for node_id in record.get("control_members", ())
+    ) | frozenset(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if bool((data.get("attributes") or {}).get("recursive_backedge"))
     )
     dispatch_plan = selection_phase(
         "reduce-scheduled-shader-regions",

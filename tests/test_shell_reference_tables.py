@@ -5,6 +5,7 @@ import io
 import pytest
 
 from src.common.tensors.topological_reducer import (
+    _append_operand,
     reduce_abstract_tensor_topology,
 )
 from src.compiler.glsl_deployment_strategy import (
@@ -388,6 +389,52 @@ def countdown(value):
         )
     finally:
         deployment.release()
+
+
+def test_recursive_catalogue_backedge_is_not_shader_schedule_topology():
+    module = ast.parse(
+        '''
+def countdown(value):
+    if value <= 0:
+        return 0
+    return countdown(value - 1)
+
+seed = 1 + 2
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    record_compilation_unit_plan(graph)
+
+    definition = next(
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.FunctionDef)
+    )
+    recursive_call = next(
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and bool((data.get("attributes") or {}).get("recursive_backedge"))
+    )
+    # The complete identity_concordance catalogue has both records: the
+    # FunctionDef owns the recursive Call through its body, and the Call names
+    # that exact FunctionDef as its callee.  This is semantic call topology,
+    # not a cyclic numerical shader schedule.  Retain both authored operands;
+    # the existing recursive_backedge identity is the scheduling boundary.
+    _append_operand(graph, recursive_call, definition, "callee")
+    _append_operand(graph, definition, recursive_call, "body")
+    assert (definition, "callee") in graph.G.nodes[recursive_call]["parents"]
+    assert (recursive_call, "body") in graph.G.nodes[definition]["parents"]
+
+    deployment_type = strategize_shell_deployment(
+        graph, runtime_closure_only=False,
+    )
+    assert deployment_type.dispatch_plan.dispatches
+    assert (definition, "callee") in graph.G.nodes[recursive_call]["parents"]
+    assert (recursive_call, "body") in graph.G.nodes[definition]["parents"]
 
 
 def test_repeated_specialized_callsite_plans_one_shared_dag_node():

@@ -376,12 +376,62 @@ def _planner_levels(
     graph: ProcessGraph,
     *,
     fallback_schedule: str,
+    dependency_graph: nx.DiGraph | None = None,
 ) -> Mapping[int, int]:
     """Consume the ProcessGraph planner's schedule without replacing it."""
 
     existing = dict(getattr(graph, "levels", {}) or {})
     if set(existing) == set(graph.G):
         return existing
+    if dependency_graph is not None:
+        # A retained recursive call remains in the semantic ProcessGraph, but
+        # shader scheduling removes its exact backedge node above.  Calling
+        # ProcessGraph.compute_levels here would follow the untouched
+        # ``parents`` rows and recreate that semantic cycle after the
+        # scheduling projection had already excluded it.  Level this exact
+        # projection instead.  The formulas are the incumbent ILPScheduler's
+        # ASAP/ALAP rules, applied to the graph whose edges this reducer uses.
+        topological = tuple(nx.lexicographical_topological_sort(
+            dependency_graph, key=lambda node_id: int(node_id),
+        ))
+        asap: dict[int, int] = {}
+        for node_id in topological:
+            predecessors = tuple(dependency_graph.predecessors(node_id))
+            asap[node_id] = (
+                0 if not predecessors
+                else 1 + max(asap[parent] for parent in predecessors)
+            )
+        schedule = str(fallback_schedule).casefold()
+        if schedule == "asap":
+            return asap
+        alap: dict[int, int] = {}
+        for node_id in reversed(topological):
+            successors = tuple(dependency_graph.successors(node_id))
+            alap[node_id] = (
+                asap[node_id] if not successors
+                else min(alap[child] - 1 for child in successors)
+            )
+        if schedule == "max_local_slack":
+            # This matches ILPScheduler.compute_max_local_slack_levels.  Its
+            # current recurrence starts from ASAP and cannot move a node past
+            # an immediate successor; keeping it here avoids changing the
+            # scheduler preference merely because this caller uses a
+            # projection.
+            slack = dict(asap)
+            changed = True
+            while changed:
+                changed = False
+                for node_id in topological:
+                    successors = tuple(dependency_graph.successors(node_id))
+                    if not successors:
+                        continue
+                    latest = min(slack[child] for child in successors) - 1
+                    if latest > slack[node_id]:
+                        slack[node_id] = latest
+                        changed = True
+            return slack
+        # ILPScheduler defaults unknown schedule names to ALAP.
+        return alap
     computed = graph.compute_levels(
         method=fallback_schedule,
         order="dependency",
@@ -649,7 +699,11 @@ def reduce_scheduled_shader_regions(
     if not nx.is_directed_acyclic_graph(planning_graph):
         raise ValueError("shader-region reduction requires an acyclic graph")
 
-    levels = _planner_levels(graph, fallback_schedule=schedule)
+    levels = _planner_levels(
+        graph,
+        fallback_schedule=schedule,
+        dependency_graph=planning_graph,
+    )
     topological = tuple(
         nx.lexicographical_topological_sort(
             planning_graph, key=lambda node_id: int(node_id)

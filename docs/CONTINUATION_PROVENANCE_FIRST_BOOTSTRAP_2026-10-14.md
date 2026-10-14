@@ -17,13 +17,13 @@ python -m pytest -q tests/test_native_provenance_bootstrap.py tests/test_provena
 
 If the branch is already checked out locally, switch to it and fast-forward instead of creating it again. The final focused gate passed **55 tests, two deselected, in 2.72 seconds**. The excluded broad pursuit cases were not validated by this gate. The full test suite is not a useful handoff smoke test; consult the repository's baseline hazards.
 
-For a fresh, expensive reproduction of the remaining compiler failure:
+For a fresh, expensive continuation from the repaired scheduling frontier:
 
 ```bash
 python -m tools.bootstrap_compiler_concordance --lower-only --output build/provenance-core-reproduction
 ```
 
-It writes `compartment.json` with the failure traceback, `process-graph-units.json`, and the resolved-graph checkpoint when that phase succeeds. `--lower-only` still runs the full source-to-SSA lowering; it does not stop at graph discovery. Expect minutes and substantial RAM. Do not mistake a saved checkpoint for compiled or installed provenance.
+It writes `compartment.json`, `process-graph-units.json`, and the resolved-graph checkpoint when that phase succeeds. `--lower-only` still runs the full source-to-SSA lowering; it does not stop at graph discovery. The latest supported run exceeded 20 minutes after advancing into cold-tail adoption, so give this command a larger external time budget. Expect substantial RAM. Do not mistake a saved checkpoint for compiled or installed provenance.
 
 ## Merge
 
@@ -105,11 +105,15 @@ The next attempt saved a 171 MiB graph checkpoint and stopped after 320.24 secon
 
 A diagnostic replay using the saved graph and its owning identity book then reached the existing shader-region failure after 180.57 seconds, at a measured maximum process RSS of 1,781,840 KiB. This replay is diagnostic only, not an accepted native compilation product.
 
-The concrete source call cycle is:
+The first concrete source call cycle was:
 
 `IdentityBook.post -> IdentityBook._materialise_row -> IdentityBook.post`.
 
-**The function-call edges already exist. No missing-edge repair is indicated.** The catalogue projection has no recursion control members and presents inter-function `callee` edges plus function-body ownership edges to a shader reducer requiring an acyclic graph. `reduce_scheduled_shader_regions` copies the whole graph and checks that copy for acyclicity. Preserve the calls and their termination guards. The next repair must separate function-call topology from executable region scheduling, retain real module initialization, and compile recursion through the appropriate CPU/control path. Deleting recursive edges from the semantic program or suppressing the failure is not acceptable. No scheduling repair has been committed in this handoff.
+The catalogue also has the self-recursive `scope_rows` call component. **The function-call edges already exist. No missing-edge repair is indicated.** The catalogue projection presented inter-function `callee` edges plus function-body ownership edges to a shader reducer requiring an acyclic graph. `reduce_scheduled_shader_regions` copied the whole semantic graph and checked that copy for acyclicity.
+
+The scheduling repair now treats the already-authored `recursive_backedge` call nodes as control boundaries alongside recursion-table control members. It removes only edges incident to those exact nodes from the shader-scheduling projection. The semantic graph, function-body ownership, call edges and termination guards remain untouched. Planner levels are computed against that acyclic projection when the semantic graph cannot provide a complete schedule; ASAP, ALAP, max-local-slack and the incumbent unknown-name fallback retain their existing meanings. A regression constructs the complete definition-body/call-callee cycle and proves ordinary deployment selection succeeds without deleting either authored operand.
+
+A fresh supported public run used the command above with an external 1,200-second bound. The full 58,522-node / 63,437-edge catalogue again converged callsite specialization in three rounds. Root control partitioning took **76.931599 seconds**. Shader-region reduction then passed in **2.70499 seconds**, starting from 3,211 regions and reaching 2,993 after 164 merges. All **2,993/2,993** dispatch subgraphs extracted successfully in **739.856801 seconds** with the resident-region cap holding at eight. The external bound expired during cold-tail identity-page adoption (`roots=497`, `0/72` reported); there was no downstream compiler exception. This is proof that the original scheduling blocker is repaired on the supported whole-module path, but it is not a completed lower-only run and produced no native module.
 
 A subsequent **diagnostic-only** replay selected all 493 function references through the existing `_lower_resolved_process_graph_deployment` selected-function path, with `activation_function_references` equal to those references and `runtime_closure_only=True`. That path uses the existing empty catalogue shell and schedules individual bodies. It passed the catalogue shader check, then failed after **78.768448 seconds**, maximum process RSS **1,541,644 KiB**, on:
 
@@ -130,8 +134,8 @@ The complete native book is therefore still blocked before SSA/native emission. 
 
 ## Remaining work in order
 
-1. Repair the whole-module deployment election using existing function references, dependency closures and per-function scheduling. Preserve authored global initialization (including `REGISTRY`, sentinels, context state, page/stage declarations and method wrapping); an empty catalogue alone does not implement these effects.
-2. Diagnose the specialization refusal on the correct owning history and supported path. Keep full canonical module/definition plus declared-instance identities. Do not reintroduce indexes based on local names, dot suffixes or guessed owners.
+1. Continue the supported whole-module deployment election past cold-tail adoption with a time budget longer than 20 minutes. Preserve authored global initialization (including `REGISTRY`, sentinels, context state, page/stage declarations and method wrapping); an empty catalogue alone does not implement these effects.
+2. If the earlier diagnostic specialization refusal recurs on that supported path, diagnose it on the correct owning history. Keep full canonical module/definition plus declared-instance identities. Do not reintroduce indexes based on local names, dot suffixes or guessed owners. It has not recurred in the root catalogue through dispatch-subgraph extraction.
 3. Complete native SSA/emission for the entire book operator surface, with contiguous native-owned records/indexes and internal searches/formatting. There is **no contiguous native book storage implementation in this branch yet**. The small slotted `Ref` change does not satisfy this requirement.
 4. Produce the whole-module binding and verified receipt consumed by `ensure_native_provenance_core`; the current emitter produces only a raw library if it reaches emission. Prove import, globals, queries, equality/concordance, complete formatting and the designated compiler program with the actual native book. The barrier tests currently exercise controlled build outcomes, not a successful binary installation/restart.
 5. Run the actual bootstrap CLI, verify provenance is installed before outer work, verify restart and automatic native selection in subsequent fresh compiler processes. Compare Python/native memory and wall time on identical workloads, including retained opaque Python leaves and crossing costs. Keep optional unroll/inline/custom-version expansion depths at zero for the initial bootstrap; this must never truncate execution, source discovery or dependency discovery.
@@ -146,5 +150,6 @@ Until these pass, keep this PR draft and do not merge it as a completed native b
 - The short designated program passes with the actual Python-book backend and fully native C program execution.
 - Broader merged extraction tests reached 58 passes before the autograd `_tape` source-pursuit failure; the same case fails on untouched main in this environment. It is not suppressed.
 - Python syntax compilation and diff checks pass. Tests of the barrier use controlled build results; they do not demonstrate successful native module generation.
+- The scheduling/region gate passes 50 tests. The focused handoff gate still passes 55 tests with two broad nested-pursuit cases excluded. Three shader execution tests reach the known worker limitation that `glProgramParameteri` is unavailable; their pre-installation pipeline tests pass.
 
 Keep the PR in draft. Remaining acceptance is actual core compilation, whole-module binding, native semantic verification, restart/use by the compiler, and fresh-process memory/time comparisons against these same workloads.
