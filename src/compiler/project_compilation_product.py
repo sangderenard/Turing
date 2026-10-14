@@ -4581,7 +4581,10 @@ def _reduce_import_owned_module_slot(
     )
     if not candidates:
         raise pickle.PicklingError(
-            f"{kind} has no import-owned module slot"
+            f"{kind} {value!r} "
+            f"({getattr(value, '__module__', None)!r}."
+            f"{getattr(value, '__qualname__', None)!r}) "
+            "has no import-owned module slot"
         )
     module_name, attribute_name = candidates[0]
     return (

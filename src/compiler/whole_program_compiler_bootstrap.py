@@ -230,6 +230,27 @@ def plan_whole_program_compiler(
     return receipt
 
 
+def bootstrap_provenance_core(
+    directory: str | Path,
+    *,
+    expansion_policy: Mapping[str, Any] | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Complete the bootstrap's blocking provenance stage and nothing later."""
+
+    destination = Path(directory).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    plan = plan_whole_program_compiler(destination, progress=progress,
+                                       expansion_policy=expansion_policy)
+    from .compiler_bootstrap_runtime import ensure_native_provenance_core
+    first = plan["next_partition"]
+    core = ensure_native_provenance_core(
+        destination / "products" / first["name"] / first["version"], progress=progress)
+    if core.get("backend") != "native":
+        raise RuntimeError("outer compiler schedule requires native provenance core")
+    return plan, core
+
+
 def build_whole_program_compiler(
     directory: str | Path,
     *,
@@ -259,15 +280,8 @@ def build_whole_program_compiler(
         discover_authored_calls, dependency_ordered_authored_calls)
 
     destination = Path(directory).resolve()
-    destination.mkdir(parents=True, exist_ok=True)
-    plan = plan_whole_program_compiler(destination, progress=progress,
-                                       expansion_policy=expansion_policy)
-    from .compiler_bootstrap_runtime import ensure_native_provenance_core
-    first = plan["next_partition"]
-    core = ensure_native_provenance_core(
-        destination / "products" / first["name"] / first["version"], progress=progress)
-    if core.get("backend") != "native":
-        raise RuntimeError("outer compiler schedule requires native provenance core")
+    plan, _core = bootstrap_provenance_core(
+        destination, progress=progress, expansion_policy=expansion_policy)
     boundary = dict(plan["outer_partition"])
     repository = Path(__file__).resolve().parents[2]
     product_root = (
@@ -339,6 +353,7 @@ __all__ = [
     "CompilerBoundary",
     "STRATEGY",
     "WholeProgramCompilerProduct",
+    "bootstrap_provenance_core",
     "build_whole_program_compiler",
     "compiler_boundary_receipts",
     "plan_whole_program_compiler",

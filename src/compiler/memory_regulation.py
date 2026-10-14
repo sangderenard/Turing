@@ -731,7 +731,7 @@ def stage_end(label: str) -> None:
 
 def end_regulation(
     regulator: MemoryRegulator, token: contextvars.Token, *,
-    releases_book_state: bool,
+    releases_book_state: bool, failed: bool = False,
 ) -> None:
     """Close the compile's regulation.
 
@@ -755,7 +755,13 @@ def end_regulation(
                 regulator.live_arena.collect_unused()
             else:
                 gc.collect()
-        regulator.boundary("compile: end")
+        # A failed pressure transition may have torn down its partial arena.
+        # Starting the ordinary end boundary here would immediately retry the
+        # same expensive transition while an exception (especially Ctrl+C) is
+        # already unwinding. Failure cleanup releases what exists; it must not
+        # begin new compiler work.
+        if not failed:
+            regulator.boundary("compile: end")
     finally:
         try:
             if regulator.graph_pool is not None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def test_boundary_plan_composes_existing_foundations_around_one_outer_target(tmp_path):
@@ -124,6 +125,30 @@ def test_build_uses_requested_bootstrap_memory_contract_by_default(
     assert observed["minimum_worker_jobs"] == 1
     assert observed["adaptive_memory_ceiling"] is True
     assert "jobs" not in observed
+
+
+def test_provenance_only_cli_stops_before_outer_partition(tmp_path, monkeypatch, capsys):
+    import tools.bootstrap_compiler_whole_program as cli
+
+    events = []
+    plan = {"next_partition": {"version": "a" * 64}}
+
+    def provenance_only(directory, **kwargs):
+        events.append((Path(directory), kwargs["expansion_policy"]))
+        return plan, {"backend": "native", "library": "whole-module"}
+
+    monkeypatch.setattr(cli, "bootstrap_provenance_core", provenance_only)
+    monkeypatch.setattr(
+        cli, "build_whole_program_compiler",
+        lambda *args, **kwargs: events.append("outer-build"),
+    )
+    arguments = SimpleNamespace(provenance_only=True, output=tmp_path)
+    display = SimpleNamespace(log=lambda message: None)
+    policy = {"unroll_depth": 0, "inline_depth": 0, "custom_version_depth": 0}
+
+    assert cli._build_and_report(arguments, policy, display) == 0
+    assert events == [(tmp_path, policy)]
+    assert "outer partition not started" in capsys.readouterr().out
 
 
 def test_outer_partition_is_an_authored_project_root():

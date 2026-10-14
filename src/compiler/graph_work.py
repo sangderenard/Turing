@@ -35,6 +35,15 @@ from .live_tiles import TiledSet
 _BOOTSTRAPPING = ContextVar("compiler_graph_foundation_bootstrap", default=False)
 _MEMO_SOURCES = object()
 _COMPILER_SCHEDULE = ContextVar("compiler_deployment_schedule", default=None)
+_COMPILER_CANCELLATION = ContextVar("compiler_work_cancellation", default=None)
+
+
+def raise_if_compiler_work_cancelled() -> None:
+    """Stop an admitted worker after its coordinator received an interrupt."""
+
+    cancellation = _COMPILER_CANCELLATION.get()
+    if cancellation is not None and cancellation.is_set():
+        raise KeyboardInterrupt()
 
 
 @dataclass(frozen=True)
@@ -118,8 +127,13 @@ def bounded_compiler_work(jobs, work, publish, *, policy=None, label="compiler w
         return
     queue = deque()
     next_index = 0
+    # Nested admissions are part of the same compile. Reuse the inherited
+    # signal so Ctrl+C at the outer coordinator reaches every admitted lane.
+    cancellation = _COMPILER_CANCELLATION.get() or threading.Event()
+    token = _COMPILER_CANCELLATION.set(cancellation)
     # No fixed global thread ceiling: this pool creates only admitted workers.
-    with ThreadPoolExecutor(max_workers=count, thread_name_prefix="compiler-deployment") as executor:
+    executor = ThreadPoolExecutor(max_workers=count, thread_name_prefix="compiler-deployment")
+    try:
         while queue or next_index < count:
             capacity = policy.capacity(count - next_index + len(queue))
             while next_index < count and len(queue) < capacity:
@@ -140,6 +154,19 @@ def bounded_compiler_work(jobs, work, publish, *, policy=None, label="compiler w
                 continue
             queue.popleft()
             publish(ordinal, job, outcome)
+    except BaseException:
+        cancellation.set()
+        for _ordinal, _job, pending in queue:
+            pending.cancel()
+        # ThreadPoolExecutor.__exit__ always waits for running jobs. That made
+        # Ctrl+C wait for an entire compiler phase. Workers share the event
+        # above and leave through the normal compiler progress boundaries.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    finally:
+        _COMPILER_CANCELLATION.reset(token)
 
 
 def _retain_codec_source(value, memo):

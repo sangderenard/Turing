@@ -61,8 +61,9 @@ def test_one_live_owns_logs_timing_and_completed_work_then_restores_streams():
         progress.count('fold', 7, label='fold rounds')
         progress.count('functions', 2, total=4, label='functions')
         current = frame_text(progress)
-        assert 'Compiler timings' in current and 'Wall(s)' in current
-        assert 'stage 0' in current and 'done' in current and '3.00' in current
+        assert 'Compiler workers' in current and 'Compiler stage' in current
+        assert 'source compiler' in current
+        assert 'stage 0' in current and 'done' in current
         assert 'stage 1' in current and 'running' in current
         assert '7 completed' in current and '2/4 (50%)' in current
         assert '100%' not in current and 'remaining' not in current
@@ -93,7 +94,7 @@ def test_rule_batch_clock_is_the_top_line_and_bars_remain_at_the_bottom():
                 assert lines[0].startswith(
                     'Rules 1/4 | wall 15s | average 10s | projected total 45s')
                 assert len(lines) <= 18
-                assert current.index('Compiler timings') < current.index('6/10 (60%)')
+                assert current.index('Compiler workers') < current.index('6/10 (60%)')
                 assert '+2 other active counters' in current
     assert active_rule_batch_progress() is None
 
@@ -128,11 +129,11 @@ def test_one_live_renders_concurrent_compilers_as_columns_and_keeps_failure():
             rss_bytes=3 * 1024 ** 3,
             stages=working_stages,
         )
-        current = frame_text(progress, width=160)
+        current = frame_text(progress, width=260)
         assert 'Compiler workers' in current
         assert 'Compiler stage' in current
-        assert 'failed_unit' in current and 'deployment select' in current
-        assert 'working_unit' in current and 'SSA lowering' in current
+        assert 'failed_unit' in current and 'stage 4' in current
+        assert 'working_unit' in current and 'stage 8' in current
         assert 'failed' in current and 'running' in current
         assert 'compile 1/10' not in current
         assert 'compiler workers: 1 running, 0 complete, 1 failed' in current
@@ -150,7 +151,7 @@ def test_resize_keeps_active_stage_visible_without_terminal_overflow(width, heig
         assert len(current.splitlines()) <= height
         assert 'stage 8' in current
         if width >= 55:
-            assert 'Wall(s)' in current
+            assert 'Compiler stage' in current and 'source compiler' in current
         assert len(progress.summary()['stages']) == 10
         progress.bars.heartbeat(force=True)
 

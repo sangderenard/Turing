@@ -9,6 +9,7 @@ import sys
 from typing import Sequence
 
 from src.compiler.whole_program_compiler_bootstrap import (
+    bootstrap_provenance_core,
     build_whole_program_compiler,
     plan_whole_program_compiler,
 )
@@ -25,10 +26,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=Path("build/compiler-whole-program"),
     )
-    parser.add_argument(
+    stopping = parser.add_mutually_exclusive_group()
+    stopping.add_argument(
         "--plan-only",
         action="store_true",
         help="publish versioned boundary metadata without compiling",
+    )
+    stopping.add_argument(
+        "--provenance-only",
+        action="store_true",
+        help=(
+            "build, verify, install and restart into the native provenance core, "
+            "then exit without submitting the outer compiler partition"
+        ),
     )
     parser.add_argument(
         "--jobs", type=int, default=None,
@@ -120,6 +130,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _build_and_report(arguments, expansion_policy, display):
+    if arguments.provenance_only:
+        plan, core = bootstrap_provenance_core(
+            arguments.output,
+            expansion_policy=expansion_policy,
+            progress=display.log,
+        )
+        first = plan["next_partition"]
+        print(
+            f"provenance core {first['version'][:12]} selected from "
+            f"{core.get('library', '<native module>')}; outer partition not started",
+            flush=True,
+        )
+        return 0
+
     product = build_whole_program_compiler(
         arguments.output,
         expansion_policy=expansion_policy,

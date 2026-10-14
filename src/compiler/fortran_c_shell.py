@@ -45876,6 +45876,7 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
             end_regulation(
                 _regulator, _regulation_token,
                 releases_book_state=_releases_book_state,
+                failed=not ok,
             )
             if _progress is not None:
                 _progress("compiler storage: completed planning state released")

@@ -465,6 +465,19 @@ def test_a_compile_resuming_a_callers_book_keeps_that_books_planning_state():
     regulation.end_regulation(regulator, token, releases_book_state=releases)
 
 
+def test_failed_compile_cleanup_does_not_start_an_end_boundary():
+    book = IdentityBook()
+    regulator = regulation.MemoryRegulator(book)
+    token = regulation._ACTIVE.set(regulator)
+
+    regulation.end_regulation(
+        regulator, token, releases_book_state=False, failed=True,
+    )
+
+    assert regulator.history == []
+    assert regulation._ACTIVE.get() is None
+
+
 @pytest.mark.parametrize("cleanup", ["stage", "compile"])
 def test_cleanup_reclaims_tile_garbage_without_a_second_book(cleanup):
     from src.compiler.live_tiles import LiveTileArena

@@ -178,6 +178,21 @@ def test_resolved_graph_pickle_retains_standard_stream_module_slot():
     assert restored["stream"] is sys.__stderr__
 
 
+def test_resolved_graph_pickle_retains_windows_rss_record_type():
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+    from src.compiler.shell_telemetry import _WindowsProcessMemoryCounters
+
+    serialized = io.BytesIO()
+    _dump_resolved_process_graph(
+        {"rss_record_type": _WindowsProcessMemoryCounters}, serialized,
+    )
+
+    restored = pickle.loads(serialized.getvalue())
+    assert restored["rss_record_type"] is _WindowsProcessMemoryCounters
+
+
 def test_tuple_comprehension_publishes_fixed_resident_row_width():
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):

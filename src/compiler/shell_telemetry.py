@@ -30,12 +30,14 @@ timeline.
 from __future__ import annotations
 
 import contextvars
+import ctypes
 import json
 import re
 import sys
 import threading
 import time
 import traceback
+from ctypes import wintypes
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -483,6 +485,23 @@ _WINDOWS_RSS_BINDING = None
 _WINDOWS_RSS_LOCK = threading.Lock()
 
 
+class _WindowsProcessMemoryCounters(ctypes.Structure):
+    """The one import-owned Windows RSS record type used by telemetry."""
+
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
 def _windows_rss_binding():
     # The 16-rule log retained ~67k PyCStructType/PyCPointerType objects.
     # A 1000-read microprobe here (also on untouched HEAD8eb40eae) retained
@@ -491,30 +510,17 @@ def _windows_rss_binding():
     global _WINDOWS_RSS_BINDING
     with _WINDOWS_RSS_LOCK:
         if _WINDOWS_RSS_BINDING is None:
-            import ctypes
-            from ctypes import wintypes
-
-            class _Counters(ctypes.Structure):
-                _fields_ = [
-                    ("cb", wintypes.DWORD),
-                    ("PageFaultCount", wintypes.DWORD),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                ]
-
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             current = kernel32.GetCurrentProcess
             current.restype = wintypes.HANDLE
             query = kernel32.K32GetProcessMemoryInfo
-            query.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Counters), wintypes.DWORD]
+            query.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(_WindowsProcessMemoryCounters),
+                wintypes.DWORD,
+            ]
             query.restype = wintypes.BOOL
-            _WINDOWS_RSS_BINDING = (_Counters, current, query)
+            _WINDOWS_RSS_BINDING = (_WindowsProcessMemoryCounters, current, query)
         return _WINDOWS_RSS_BINDING
 
 
@@ -1187,17 +1193,18 @@ class _CompileLive(_CompileBars):
                 f"projected total {'--' if projected is None else _format_duration(projected)}"
             )
         workers = list(self.owner._workers.values())
+        has_worker_snapshots = bool(workers)
         hidden_workers = 0
-        if workers and self.owner._stage_index > 0:
-            # A single holistic compile is also its workers' coordinator.
-            # Region snapshots cannot replace its later pre-native stages.
-            current_stage = summary["stages"][self.owner._stage_index]
-            workers.insert(0, {"key": "coordinator", "label": "source compiler",
-                "status": "failed" if self.failed else "complete" if self.finished else "running",
-                "stage_number": self.owner._stage_index + 1, "stage_count": len(summary["stages"]),
-                "stage_label": current_stage["label"], "substage": self.substage,
-                "elapsed_seconds": current_stage["seconds"], "rss_bytes": self.last_rss,
-                "stages": summary["stages"]})
+        # The coordinator is always a compiler lane.  The provenance-first
+        # outer stages have no child snapshots, but they must retain the same
+        # stage-by-lane display as compiles that have admitted workers.
+        current_stage = summary["stages"][self.owner._stage_index]
+        workers.insert(0, {"key": "coordinator", "label": "source compiler",
+            "status": "failed" if self.failed else "complete" if self.finished else "running",
+            "stage_number": self.owner._stage_index + 1, "stage_count": len(summary["stages"]),
+            "stage_label": current_stage["label"], "substage": self.substage,
+            "elapsed_seconds": current_stage["seconds"], "rss_bytes": self.last_rss,
+            "stages": summary["stages"]})
         if workers:
             # Keep useful column widths on real terminals. All lanes remain in
             # the owner; prefer active/failed lanes, then later-stage completions.
@@ -1217,9 +1224,7 @@ class _CompileLive(_CompileBars):
                 "compiler workers FAILED" if self.failed
                 else "compiler workers done" if self.finished
                 else self._stage_desc()
-            )
-        else:
-            status = (
+            ) if has_worker_snapshots else (
                 f"compile FAILED in {self.owner.stages[self.stage_index].label}"
                 if self.failed
                 else f"compile done ({len(self.owner._stage_profiles)} timed stages)"
@@ -1235,7 +1240,7 @@ class _CompileLive(_CompileBars):
             active = summary["stages"][self.stage_index]
             compact_status = ("FAILED " if self.failed else "done " if self.finished else "")
             compact_status += active["label"]
-            if workers:
+            if has_worker_snapshots:
                 lane = workers[-1]
                 compact_status = (
                     f"{lane['label']} {lane['status']} "
@@ -1785,6 +1790,8 @@ class CompileProgress:
     def _publish_state(self, status: str) -> None:
         """Publish exact stage state without adding a per-item callback."""
 
+        from .graph_work import raise_if_compiler_work_cancelled
+        raise_if_compiler_work_cancelled()
         if self.state_sink is None or not self.stages:
             return
         current = self.stages[self._stage_index]
@@ -1995,6 +2002,8 @@ class CompileProgress:
         or with the next stage.  ``total=None`` is an open-ended count.
         """
 
+        from .graph_work import raise_if_compiler_work_cancelled
+        raise_if_compiler_work_cancelled()
         if self.channel is None:
             return
         with self._lock:
@@ -2318,6 +2327,8 @@ def compile_substage(name: str) -> None:
 @contextmanager
 def compile_work(key: str, *, label: str):
     """An admitted thread working within its owner's current compiler stage."""
+    from .graph_work import raise_if_compiler_work_cancelled
+    raise_if_compiler_work_cancelled()
     layer = active_compile_progress()
     if layer is None:
         yield

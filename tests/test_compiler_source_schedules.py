@@ -3,6 +3,7 @@ import dataclasses
 import io
 import pickle
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -26,6 +27,36 @@ def test_auto_does_not_call_the_prepartitioner(monkeypatch):
     assert observed[0][1]["source_compilation"] == "auto"
     with pytest.raises(ValueError, match="source list"):
         shell.lower_ast_source_to_ssa("def root():\n    return 1\n", "root", source_compilation="parallel")
+
+
+def test_keyboard_interrupt_cancels_admitted_compiler_threads():
+    from src.compiler.graph_work import (
+        CompilerWorkPolicy, bounded_compiler_work,
+        raise_if_compiler_work_cancelled,
+    )
+
+    entered = threading.Barrier(2)
+    cancelled = threading.Event()
+
+    def work(index):
+        entered.wait(timeout=2)
+        if index == 0:
+            raise KeyboardInterrupt()
+        try:
+            while True:
+                raise_if_compiler_work_cancelled()
+                time.sleep(0.001)
+        except KeyboardInterrupt:
+            cancelled.set()
+            raise
+
+    policy = CompilerWorkPolicy(
+        mode="parallel", jobs=2, minimum_jobs=2,
+        memory_bytes=None, reserve_bytes=0, working_bytes=1,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        bounded_compiler_work((0, 1), work, lambda *_args: None, policy=policy)
+    assert cancelled.wait(timeout=2)
 
 
 @pytest.mark.parametrize("inner_jobs", (3, None))
