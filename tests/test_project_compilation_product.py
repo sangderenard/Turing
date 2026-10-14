@@ -306,7 +306,7 @@ def test_stale_closure_receipt_does_not_explain_another_argument():
     assert product._unexplained_root_argument_ids(function) == (1,)
 
 
-def test_bootstrap_report_capture_is_accounted_but_callback_remains_partial(tmp_path):
+def test_bootstrap_report_declared_callback_is_complete_contract_edge(tmp_path):
     source = (Path(__file__).resolve().parents[1] / "src/common/tensors/"
               "accelerator_backends/aot_compile.py")
     receipt = compile_project_call(
@@ -314,9 +314,43 @@ def test_bootstrap_report_capture_is_accounted_but_callback_remains_partial(tmp_
         tmp_path / "report", progress_bars=False,
     )
     assert receipt["root_parameter_accounting"]["missing_lexical_captures"] == []
-    assert receipt["root_parameter_accounting"]["missing_used_parameters"] == ["message"]
+    assert receipt["root_parameter_accounting"]["missing_used_parameters"] == []
     assert receipt["root_semantic_accounting"]["unexplained_root_argument_ids"] == []
-    assert not receipt["repository_ssa_complete"]
+    accounting = receipt["extraction_boundary_accounting"]
+    assert accounting["unresolved_call_records"] == ()
+    assert len(accounting["contracted_unresolved_call_records"]) == 1
+    assert accounting["contracted_unresolved_call_records"][0]["callee"] == "progress"
+    assert receipt["repository_ssa_complete"]
+
+
+def test_bootstrap_region_feed_closure_uses_declared_nested_table_abi(tmp_path):
+    source = (Path(__file__).resolve().parents[1] / "src/common/tensors/"
+              "accelerator_backends/aot_compile.py")
+    receipt = compile_project_call(
+        source,
+        "_lower_process_graph_to_compilation.<locals>.close_region_feed_set",
+        tmp_path / "region-feeds",
+        progress_bars=False,
+    )
+    assert receipt["root_parameter_accounting"]["missing_used_parameters"] == []
+    assert receipt["root_semantic_accounting"]["unexplained_root_argument_ids"] == []
+    assert receipt["repository_ssa_complete"]
+
+
+def test_bootstrap_aot_boundary_reads_published_hierarchy_records():
+    source = (Path(__file__).resolve().parents[1] / "src/common/tensors/"
+              "accelerator_backends/aot_compile.py").read_text(encoding="utf-8")
+    qualified_names = {
+        call.qualified_name for call in discover_authored_calls(source)
+    }
+    assert (
+        "_lower_process_graph_to_compilation.<locals>.collect_hierarchy_values"
+        not in qualified_names
+    )
+    assert (
+        "_lower_process_graph_to_compilation.<locals>.rooted_attribute_path"
+        not in qualified_names
+    )
 
 
 def test_unplanned_callable_capture_cannot_publish_a_complete_no_argument_body(tmp_path):

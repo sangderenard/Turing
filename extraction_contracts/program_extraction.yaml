@@ -185,6 +185,16 @@ program_abi:
         # tagged specialization payloads remain a later field, so no Python
         # object is smuggled through this table.
         planner_specializations: {storage: keyed, dtype: int64, rank: 1, key_encoding: string_token, mutable: false}
+    CompilerOpStep:
+      identity: src.common.tensors.fused_ir.OpStep
+      fields:
+        input_ids: {storage: span, dtype: int64, rank: 1, mutable: false}
+        result_id: {storage: scalar, dtype: int64, mutable: false}
+    CompilerFusedProgram:
+      identity: src.common.tensors.fused_ir.FusedProgram
+      fields:
+        feeds: {storage: span, dtype: int64, rank: 1, mutable: false}
+        steps: {storage: table, row_record: CompilerOpStep, rank: 1, mutable: false}
   bindings:
     - {function: "*", parameter: state, record: SymbolicFluidGridState}
     - {function: "*", parameter: targets, record: Targets}
@@ -199,11 +209,18 @@ program_abi:
     - {function: _tensor_descriptor, parameter: graph, record: CompilerProcessGraph}
     - {function: _is_ast_metadata_node, parameter: graph, record: CompilerProcessGraph}
     - {function: _semantic_children, parameter: graph, record: CompilerProcessGraph}
+    - {function: close_region_feed_set, parameter: program, record: CompilerFusedProgram}
   # Native scalar entry values have an explicit source-language type.  This
   # makes authored type-preserving guards deterministic during preprocessing;
   # the compiler does not guess whether a float64 slot is still a Python or
   # AbstractTensor object.
   values:
+    # Compiler bootstrap _report keeps the optional progress callback as an
+    # unresolved runtime variable.  Its body is not pursued or resolved by
+    # this compilation; the guarded call remains a contract edge.  Authored
+    # strings cross the compiled boundary as the compiler's int64 token.
+    - {function: _report, parameter: message, storage: scalar, dtype: int64, python_type: builtins.str}
+    - {function: _report, parameter: progress, storage: reference, python_type: typing.Callable}
     - {function: symbolic_fluid_advance, parameter: dt, storage: scalar, dtype: float64, python_type: builtins.float}
     - {function: symbolic_fluid_frame, parameter: frame_duration, storage: scalar, dtype: float64, python_type: builtins.float}
     - {function: symbolic_fluid_frame, parameter: dt_initial, storage: scalar, dtype: float64, python_type: builtins.float}
