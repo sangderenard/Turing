@@ -188,7 +188,6 @@ class LiveTileArena:
         self._lock = RLock()
         self._store = None
         self._live_disk_bytes = 0
-        self.compactions = 0
         self.disk_mode = False
         # 0: fully decoded fast path; 1: LRU tail backed by disk;
         # 2: bounded decoded front with compressed-RAM backing;
@@ -258,26 +257,65 @@ class LiveTileArena:
                 raise ValueError("unknown compiler tile reference")
         return Reader(io.BytesIO(data)).load()
 
-    def _encode(self, index, *, disk=None):
-        if index not in self._dirty and self._tiles[index] is not None:
-            return
-        records = self._hot[index]
-        data = self._dump(records)
-        # Commit the replacement before dropping the decoded generation.
-        # Dirty active tiles use zlib9 on disk (RAM uses zlib1). LZMA belongs
-        # to the cold escalation, not every clock/operand update: forcing it
-        # on every dirty eviction made two-tile micro-compiles minutes long.
-        if disk is None:
-            disk = self.disk_mode or self.pressure_level in (1, 3)
-        record = (self._disk_store().write(data, len(records), heavy=False) if disk
-                  else CompressedTile.encode(data, len(records), 1))
+    def _replace_record(self, index, record):
+        directory = isinstance(self._tiles, DiskTileDirectory)
         previous = self._tiles[index]
         self._tiles[index] = record
-        if isinstance(record, DiskTile):
-            self._live_disk_bytes += record.stored_bytes - (
-                previous.stored_bytes if isinstance(previous, DiskTile) else 0)
-        self._dirty.discard(index)
-        self.compressions += 1
+        if (
+            not directory and isinstance(previous, DiskTile)
+            and (not isinstance(record, DiskTile) or previous.offset != record.offset)
+        ):
+            previous.store.discard(previous)
+        return previous
+
+    def _encode_batch(self, indexes, *, disk=None):
+        """Serialize, compress concurrently, and publish bounded eviction batches."""
+        if disk is None:
+            disk = self.disk_mode or self.pressure_level in (1, 3)
+        candidates = [
+            index for index in dict.fromkeys(indexes)
+            if index in self._dirty or self._tiles[index] is None
+        ]
+        if not candidates:
+            return
+        store = self._disk_store() if disk else None
+
+        def encode(job):
+            index, data, rows = job
+            record = (
+                store.write(data, rows, heavy=False)
+                if store is not None
+                else CompressedTile.encode(data, rows, 1)
+            )
+            return index, record
+
+        started = time.perf_counter()
+        workers = min(self.compression_workers, len(candidates))
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="compiler-compress",
+        ) as pool:
+            for start in range(0, len(candidates), workers):
+                # Serialization discovers semantic leaf identities and remains
+                # ordered under the arena lock. Retain at most one raw tile per
+                # worker, then compress that whole eviction batch together.
+                jobs = []
+                for index in candidates[start:start + workers]:
+                    records = self._hot[index]
+                    jobs.append((index, self._dump(records), len(records)))
+                for index, record in pool.map(encode, jobs):
+                    previous = self._replace_record(index, record)
+                    if isinstance(record, DiskTile):
+                        self._live_disk_bytes += record.stored_bytes - (
+                            previous.stored_bytes if isinstance(previous, DiskTile) else 0
+                        )
+                    self._dirty.discard(index)
+                    self.compressions += 1
+        self.parallel_compression_jobs += len(candidates)
+        self.compression_seconds += time.perf_counter() - started
+
+    def _encode(self, index, *, disk=None):
+        self._encode_batch((index,), disk=disk)
 
     def _disk_store(self):
         if self._store is None:
@@ -373,21 +411,25 @@ class LiveTileArena:
     def _trim(self, except_index=None):
         if self.pressure_level == 0:
             return
-        while (self._payload_hot_count > self.payload_limit
-               or self._payload_decoded_bytes > self.decoded_budget_bytes):
-            # Compact identity-header pages remain decoded. Mutable-map trie
-            # routes are retained separately in _RouteIndex, so preserving the
-            # search index does not preserve bucket payloads.
-            victim = next((i for i in self._hot
-                           if i != except_index and not self._page_kinds[i]), None)
-            if victim is None:
-                break  # the one accessed tile is the current decoding workspace
-            self._encode(victim)
-            self._drop_hot(victim)
-        if (self._store is not None
-                and self._store.bytes_written - self._live_disk_bytes >= 64 << 20
-                and self._store.bytes_written > 2 * self._live_disk_bytes):
-            self.compact_disk()
+        hot_count = self._payload_hot_count
+        decoded_bytes = self._payload_decoded_bytes
+        victims = []
+        for index in self._hot:
+            if index == except_index or self._page_kinds[index]:
+                continue
+            if (
+                hot_count <= self.payload_limit
+                and decoded_bytes <= self.decoded_budget_bytes
+            ):
+                break
+            victims.append(index)
+            hot_count -= 1
+            decoded_bytes -= self._decoded_sizes[index].total
+        if not victims:
+            return
+        self._encode_batch(victims)
+        for index in victims:
+            self._drop_hot(index)
 
     def _page(self, index):
         if index not in self._hot:
@@ -528,7 +570,7 @@ class LiveTileArena:
             self._dirty.add(index)
             self._trim()
 
-    def manage(self, value, memo=None):
+    def manage(self, value, memo=None, *, progress=None):
         # Exact scalar atoms need neither container dispatch nor retention in
         # the conversion memo. Subclasses still follow the ordinary path.
         if type(value) in _PLAIN_ATOM_TYPES:
@@ -545,7 +587,14 @@ class LiveTileArena:
         if type(value) is dict:
             result = TiledDict(self)
             memo[id(value)] = result
-            for key, member in value.items():
+            items = value.items()
+            if progress is not None:
+                from .shell_telemetry import compile_iter
+                key, label = progress
+                items = compile_iter(
+                    items, key, label=label, total=len(value),
+                )
+            for key, member in items:
                 result._set(key, self.manage(member, memo))
             return result
         if type(value) is tuple and len(value) <= self.bucket_rows:
@@ -557,13 +606,27 @@ class LiveTileArena:
             result = TiledList(self)
             view = TiledTuple(result) if type(value) is tuple else result
             memo[id(value)] = view
-            for member in value:
+            members = value
+            if progress is not None:
+                from .shell_telemetry import compile_iter
+                key, label = progress
+                members = compile_iter(
+                    members, key, label=label, total=len(value),
+                )
+            for member in members:
                 result._append(self.manage(member, memo))
             return view
         if type(value) is set:
             result = TiledSet(self)
             memo[id(value)] = result
-            for member in value:
+            members = value
+            if progress is not None:
+                from .shell_telemetry import compile_iter
+                key, label = progress
+                members = compile_iter(
+                    members, key, label=label, total=len(value),
+                )
+            for member in members:
                 result.add(self.manage(member, memo))
             return result
         if _value_fact(type(value)):
@@ -618,8 +681,9 @@ class LiveTileArena:
 
     def flush(self, *, disk=None, preserve_routing=False):
         with self._lock:
-            for index in tuple(self._hot):
-                self._encode(index, disk=disk)
+            indexes = tuple(self._hot)
+            self._encode_batch(indexes, disk=disk)
+            for index in indexes:
                 if not (preserve_routing and self._page_kinds[index]):
                     self._drop_hot(index)
         return self.stats()
@@ -633,16 +697,25 @@ class LiveTileArena:
         """
         with self._lock:
             self.pressure_level = max(self.pressure_level, 1)
-            while self._payload_hot_count > 1:
-                count_over = self._payload_hot_count > self.payload_limit
-                bytes_over = self._payload_decoded_bytes > self.decoded_budget_bytes
-                if not (count_over or bytes_over):
+            hot_count = self._payload_hot_count
+            decoded_bytes = self._payload_decoded_bytes
+            victims = []
+            for index in self._hot:
+                if self._page_kinds[index]:
+                    continue
+                if hot_count <= 1:
                     break
-                victim = next((i for i in self._hot if not self._page_kinds[i]), None)
-                if victim is None:
+                if (
+                    hot_count <= self.payload_limit
+                    and decoded_bytes <= self.decoded_budget_bytes
+                ):
                     break
-                self._encode(victim, disk=True)
-                self._drop_hot(victim)
+                victims.append(index)
+                hot_count -= 1
+                decoded_bytes -= self._decoded_sizes[index].total
+            self._encode_batch(victims, disk=True)
+            for index in victims:
+                self._drop_hot(index)
         return self.stats()
 
     def compress_resident_ram(self):
@@ -757,7 +830,7 @@ class LiveTileArena:
                     # pool.map has only this bounded batch to submit; neither
                     # futures nor raw payload arguments can grow with the arena.
                     for index, record, previous, dirty in pool.map(write, batch):
-                        self._tiles[index] = record
+                        self._replace_record(index, record)
                         self._live_disk_bytes += record.stored_bytes - (
                             previous.stored_bytes if isinstance(previous, DiskTile) else 0)
                         if dirty:
@@ -770,7 +843,9 @@ class LiveTileArena:
                 self.parallel_compression_jobs += job_count
                 self.compression_seconds += time.perf_counter() - started
             if not isinstance(self._tiles, DiskTileDirectory):
-                directory = DiskTileDirectory(store, self.directory)
+                directory = DiskTileDirectory(
+                    store, self.directory, exclusive=True,
+                )
                 for index, record in enumerate(self._tiles):
                     directory.append(record, kind=self._page_kinds[index], rows=self._row_lengths[index])
                 directory.flush()
@@ -806,7 +881,8 @@ class LiveTileArena:
         records and storage edges.  Parameterizing the maximum decoded tile
         size S exposes the locality caveat: the one-tile DFS cache may decode
         on every cross-tile visit, making the strict worst case
-        O(V*S + E + B).  The sweep and subsequent compaction remain O(B + V).
+        O(V*S + E + B). The sweep remains O(B + V); dead and superseded
+        tiles are reclaimed individually without relocating live tiles.
         """
         from .shell_telemetry import compile_substage, compile_count, compile_count_close, compile_iter
 
@@ -906,7 +982,7 @@ class LiveTileArena:
                             continue
                         reclaimed += dead
                         if not any(keep):
-                            self._tiles[index] = None
+                            self._replace_record(index, None)
                             if isinstance(encoded, DiskTile):
                                 self._live_disk_bytes -= encoded.stored_bytes
                             continue
@@ -926,8 +1002,6 @@ class LiveTileArena:
                 self._leaf_refs = {identity: self._leaf_refs[identity] for identity in leaves}
                 compile_substage("storage collection: release dead object headers")
                 gc.collect()
-                if self.disk_mode:
-                    self.compact_disk()
                 compile_substage("storage collection: restore retained search pages")
                 for index in compile_iter(retained_pages, "storage-index-restore", label="Search pages restored"):
                     if index < len(self._tiles) and self._tiles[index] is not None:
@@ -955,44 +1029,6 @@ class LiveTileArena:
                 object.__setattr__(result, field.name, self._restore_raw(getattr(value, field.name)))
             return result
         return value
-
-    def compact_disk(self):
-        """Reclaim superseded disk records, streaming one tile at a time.
-
-        Only this arena's exclusive records move. A failed candidate leaves
-        the original index/file readable; old shared files survive readers.
-        Compaction is also the deeper LZMA/zlib9 cold compression pass.
-        With the fixed codec windows it is O(B + T) time and O(S) arena
-        workspace for B live payload bytes, T entries and largest tile S.
-        """
-        from .shell_telemetry import compile_substage, compile_iter
-
-        with self._lock:
-            if self._store is None:
-                return self.stats()
-            candidate = DiskTileStore(self.directory)
-            replacements = DiskTileDirectory(candidate, self.directory)
-            live = 0
-            compile_substage("storage compaction: compress live tiles")
-            for index, record in compile_iter(enumerate(self._tiles), "storage-compaction",
-                    label="Storage tiles compacted", total=len(self._tiles)):
-                if isinstance(record, DiskTile):
-                    record = (candidate.copy_strong_tile(record)
-                              if record.codec == "lzma"
-                              else candidate.write(record.decode(), record.rows))
-                    live += record.stored_bytes
-                elif record is not None:
-                    record = candidate.write(record.decode(), record.rows)
-                    live += record.stored_bytes
-                replacements.append(record, kind=self._page_kinds[index], rows=self._row_lengths[index])
-            replacements.flush()
-            # Atomic index commit; no whole graph/table is decoded together.
-            self._tiles = replacements
-            self._page_kinds, self._row_lengths = replacements.kinds, replacements.row_lengths
-            self._store = candidate
-            self._live_disk_bytes = live
-            self.compactions += 1
-        return self.stats()
 
     def stats(self):
         encoded = sum(sys.getsizeof(t) + sys.getsizeof(t.payload)
@@ -2132,5 +2168,17 @@ def tile_identity_page(page, arena):
     from .identity_spill import SPILLABLE_ATTRS
     page.__dict__["_live_tile_owner"] = arena
     for name in SPILLABLE_ATTRS:
-        setattr(page, name, getattr(page, name))
+        # A page is only the outer unit.  Its tables can contain millions of
+        # entries, so the page-level 0/N counter can stay unchanged for a long
+        # time. Report the actual existing entry loop through the compiler's
+        # normal nested bar.
+        value = getattr(page, name)
+        managed = arena.manage(
+            value,
+            progress=(
+                "adopt-identity-table-entries",
+                f"Identity page {page.name}: {name} entries",
+            ),
+        )
+        object.__setattr__(page, name, managed)
     arena.categories.add("IdentityBook.writable-tables")

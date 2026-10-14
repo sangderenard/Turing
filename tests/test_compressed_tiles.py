@@ -206,8 +206,7 @@ def test_disk_shared_view_lifetime_and_corruption_detection(tmp_path):
     # Damage only this test-owned tile file, never a compiler/user artifact.
     store = DiskTileStore(str(tmp_path))
     tile = store.write(b"abc" * 1000, 1)
-    with open(store.path, "r+b") as handle:
-        handle.seek(tile.offset)
+    with open(store.tile_path(tile), "r+b") as handle:
         handle.write(b"bad")
     with pytest.raises((ValueError, lzma.LZMAError, zlib.error)):
         tile.decode()

@@ -55,37 +55,43 @@ def test_strong_tile_relocation_validates_bytes_without_recompression(tmp_path, 
     assert copied.decode() == data
     assert (copied.stored_bytes, copied.raw_bytes, copied.rows, copied.checksum) == (
         tile.stored_bytes, tile.raw_bytes, tile.rows, tile.checksum)
-    source._handle.seek(tile.offset)
-    source._handle.write(b"broken")
+    with open(source.tile_path(tile), "r+b") as stream:
+        stream.write(b"broken")
     before = target.bytes_written
     with pytest.raises((lzma.LZMAError, ValueError)):
         target.copy_strong_tile(tile)
     assert target.bytes_written == before
 
 
-def test_compaction_reuses_strong_payloads_and_keeps_mutations(tmp_path, monkeypatch):
-    import random
+def test_tile_replacement_never_relocates_unaffected_tiles(tmp_path, monkeypatch):
+    from pathlib import Path
     from src.compiler.compressed_tiles import DiskTile
-    owner = arena(tmp_path)
-    data = random.Random(12).randbytes(65536) * 16
-    values = owner.manage({"payload": data})
+    owner = LiveTileArena(
+        tile_rows=1, hot_tiles=2, bucket_rows=1, directory=tmp_path,
+    )
+    first = owner.allocate(b"first")
+    second = owner.allocate(b"second")
     owner.offload_to_disk()
-    strong_count = sum(isinstance(tile, DiskTile) and tile.codec == "lzma"
-                       for tile in owner._tiles)
-    assert strong_count > 0
-    copies = []
-    copy = DiskTileStore.copy_strong_tile
-    def observe(store, tile):
-        copies.append(tile)
-        return copy(store, tile)
-    monkeypatch.setattr(DiskTileStore, "copy_strong_tile", observe)
-    owner.compact_disk()
-    assert len(copies) == strong_count
-    assert values["payload"] == data
-    values["payload"] = b"changed" + data
+    before = {
+        tile.offset: owner._store.tile_path(tile)
+        for tile in owner._tiles if isinstance(tile, DiskTile)
+    }
+    monkeypatch.setattr(
+        DiskTileStore, "copy_strong_tile",
+        lambda *_args, **_kwargs: pytest.fail("unaffected tile was relocated"),
+    )
+    owner.write(first, b"changed")
     owner.flush()
-    owner.compact_disk()
-    assert values["payload"] == b"changed" + data
+    assert owner.read(first) == b"changed"
+    assert owner.read(second) == b"second"
+    after = {
+        tile.offset: owner._store.tile_path(tile)
+        for tile in owner._tiles if isinstance(tile, DiskTile)
+    }
+    surviving = set(before).intersection(after)
+    assert surviving == {1}
+    assert Path(before[1]).samefile(after[1])
+    assert all(Path(path).is_file() for path in after.values())
 
 
 def test_empty_map_reinsertion_routes_to_its_current_root(tmp_path):
@@ -114,7 +120,7 @@ def test_rebuilt_graph_edges_remain_visible_to_ancestry(tmp_path):
     assert graph.has_edge(1, 2)
 
 
-def test_storage_collection_reports_its_actual_traversal_and_compaction(tmp_path):
+def test_storage_collection_reports_traversal_without_global_compaction(tmp_path):
     from types import SimpleNamespace
     from src.compiler.shell_telemetry import CompileProgress
     owner = arena(tmp_path)
@@ -128,11 +134,11 @@ def test_storage_collection_reports_its_actual_traversal_and_compaction(tmp_path
         owner.collect_unused()
     for phase in ("trace live handles", "sweep unreachable records", "restore retained search pages"):
         assert any(f"storage collection: {phase}: begin" in line for line in messages)
-    assert any("storage compaction: compress live tiles: begin" in line for line in messages)
+    assert not any("storage compaction" in line for line in messages)
     work = layer.summary()["work"]["compiler-finalization"]
     assert work["storage-mark"]["done"] > 0
     assert work["storage-sweep"]["done"] == work["storage-sweep"]["total"]
-    assert work["storage-compaction"]["done"] == work["storage-compaction"]["total"]
+    assert "storage-compaction" not in work
     assert values[17]["value"] == 17
 
 
@@ -167,6 +173,32 @@ def test_pressure_ladder_stays_fully_decoded_until_explicit_escalation(tmp_path)
     assert minimum.payload_hot_tiles == 0
     assert minimum.hot_tiles == minimum.retained_index_tiles
     assert [value["value"] for value in values] == list(range(8))
+
+
+def test_cold_tail_eviction_compresses_a_bounded_batch_on_workers(
+    tmp_path, monkeypatch,
+):
+    codec_threads = set()
+    write = DiskTileStore.write
+
+    def observed_write(self, data, rows, *, heavy=True):
+        codec_threads.add(current_thread().name)
+        return write(self, data, rows, heavy=heavy)
+
+    monkeypatch.setattr(DiskTileStore, "write", observed_write)
+    owner = LiveTileArena(
+        tile_rows=1, hot_tiles=2, bucket_rows=1, directory=tmp_path,
+        compression_workers=2,
+    )
+    handles = [owner.allocate((index, "payload" * 1000)) for index in range(8)]
+
+    stats = owner.offload_cold_tail()
+
+    assert stats.disk_tiles == 6
+    assert stats.parallel_compression_jobs == 6
+    assert codec_threads
+    assert all(name.startswith("compiler-compress") for name in codec_threads)
+    assert [owner.read(handle)[0] for handle in handles] == list(range(8))
 
 
 def test_compressed_backing_can_expand_and_contract_its_decoded_front(tmp_path):
@@ -845,6 +877,35 @@ def test_writable_book_tiles_preserve_clock_provenance_and_registry(tmp_path):
         _ACTIVE_ARENA.reset(token)
 
 
+def test_identity_page_adoption_reports_each_backing_table_scale(
+    tmp_path, monkeypatch,
+):
+    from src.compiler import shell_telemetry
+    from src.compiler.identity_concordance import IdentityBook, Mode, Novel
+    from src.compiler.live_tiles import tile_identity_page
+
+    book = IdentityBook()
+    page = book.page("adoption_progress")
+    for index in range(3):
+        page.set(("scope", index), 0, index)
+
+    observed = []
+
+    def compile_iter(iterable, key, *, label=None, total=None):
+        observed.append((key, label, total))
+        return iterable
+
+    monkeypatch.setattr(shell_telemetry, "compile_iter", compile_iter)
+    tile_identity_page(page, arena(tmp_path))
+
+    assert [label.rsplit(": ", 1)[-1] for _key, label, _total in observed] == [
+        "cells entries", "stamps entries", "columns entries", "scopes entries",
+        "row_columns entries", "column_positions entries",
+    ]
+    assert all(key == "adopt-identity-table-entries" for key, _label, _total in observed)
+    assert [total for _key, _label, total in observed] == [3, 3, 1, 1, 3, 1]
+
+
 def test_explicit_api_export_handles_tile_backed_metadata(tmp_path):
     import yaml
     from src.compiler.compiled_program_api import CompiledProgramAPI
@@ -856,21 +917,16 @@ def test_explicit_api_export_handles_tile_backed_metadata(tmp_path):
         "requirements": {"requests": [{"optional":False}], "slots": [1,2]}}
 
 
-def test_compaction_reclaims_superseded_records_without_whole_rehydrate(tmp_path):
-    import os
-    import gc
+def test_replacement_reclaims_only_its_superseded_tile_artifact(tmp_path):
+    from pathlib import Path
     owner = arena(tmp_path)
     table = owner.manage({i: "repeat " * 100 for i in range(80)})
     owner.offload_to_disk()
     for version in range(10):
         table[20] = (version, "updated repeated text " * 100)
         owner.flush()
-    old_path = owner._store.path
-    before = os.path.getsize(old_path)
-    owner.compact_disk()
-    gc.collect()
-    assert not os.path.exists(old_path)
-    assert os.path.getsize(owner._store.path) < before
+    artifacts = tuple(Path(owner._store.path).glob("*.tile"))
+    assert len(artifacts) == owner.stats().disk_tiles
     assert table[20] == (9, "updated repeated text " * 100)
     assert table[79] == "repeat " * 100
     assert owner.stats().payload_hot_tiles == 1

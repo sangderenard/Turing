@@ -21,6 +21,7 @@ import io
 import lzma
 import os
 import pickle
+import shutil
 import struct
 import sys
 import tempfile
@@ -30,16 +31,12 @@ from typing import Any, Callable
 import zlib
 
 
-def _close_tile_file(handle, path):
-    handle.close()
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+def _close_tile_directory(path):
+    shutil.rmtree(path, ignore_errors=True)
 
 
 class DiskTileStore:
-    """One append-only file shared by a book's tiles and packed index chunks.
+    """Independently replaceable compressed artifacts owned by one tile set.
 
     Each record is independently compressed. No table/page pickle is rebuilt.
     LZMA2 uses a dictionary bounded to 1 MiB, rather than preset 9's large
@@ -49,11 +46,19 @@ class DiskTileStore:
 
     def __init__(self, directory=None):
         directory = directory or os.environ.get("TURING_IDENTITY_SPILL_DIR") or None
-        descriptor, self.path = tempfile.mkstemp(prefix="identity_tiles_", suffix=".tiles", dir=directory)
-        self._handle = os.fdopen(descriptor, "w+b", buffering=0)
+        self.path = tempfile.mkdtemp(prefix="identity_tiles_", dir=directory)
         self._lock = RLock()
+        self._next_record = 0
         self.reads = self.writes = self.bytes_written = 0
-        self._finalizer = weakref.finalize(self, _close_tile_file, self._handle, self.path)
+        self._finalizer = weakref.finalize(self, _close_tile_directory, self.path)
+
+    def tile_path(self, tile_or_offset):
+        offset = (
+            tile_or_offset.offset
+            if isinstance(tile_or_offset, DiskTile)
+            else int(tile_or_offset)
+        )
+        return os.path.join(self.path, f"{offset:016x}.tile")
 
     def write(self, data, rows, *, heavy=True):
         dictionary = min(1 << 20, max(1 << 16, len(data)))
@@ -70,16 +75,16 @@ class DiskTileStore:
     def copy_strong_tile(self, tile):
         """Relocate an already strong-compressed tile without encoding it again.
 
-        Validate the original decoded bytes before committing its header. Only
-        LZMA records qualify: zlib/raw records may still benefit from the cold
-        compression pass. Workspace remains bounded to one tile.
+        Validate the original decoded bytes before committing its header.
+        This is an explicit single-tile copy operation; storage maintenance
+        never invokes it for unaffected tiles. Workspace is bounded to one tile.
         """
         if tile.codec != "lzma":
             raise ValueError("only an already strong-compressed tile can be copied")
         tile.decode()  # Retain the compaction corruption/length check.
+        with open(tile.store.tile_path(tile), "rb") as stream:
+            payload = stream.read()
         with tile.store._lock:
-            tile.store._handle.seek(tile.offset)
-            payload = tile.store._handle.read(tile.stored_bytes)
             tile.store.reads += 1
         if len(payload) != tile.stored_bytes:
             raise OSError("truncated compressed tile")
@@ -87,24 +92,33 @@ class DiskTileStore:
 
     def _append(self, payload, raw_bytes, rows, codec, checksum):
         with self._lock:
-            self._handle.seek(0, os.SEEK_END)
-            offset = self._handle.tell()
-            try:
-                written = self._handle.write(payload)
+            offset = self._next_record
+            self._next_record += 1
+        path = self.tile_path(offset)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{offset:016x}.", suffix=".tmp", dir=self.path,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", buffering=0) as stream:
+                written = stream.write(payload)
                 if written != len(payload):
                     raise OSError("short write of compressed tile")
-                self._handle.flush()
-            except BaseException:
-                self._handle.truncate(offset)
-                raise
+                stream.flush()
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+        with self._lock:
             self.writes += 1
             self.bytes_written += len(payload)
         return DiskTile(self, offset, len(payload), raw_bytes, rows, codec, checksum)
 
     def read(self, tile):
+        with open(self.tile_path(tile), "rb") as stream:
+            payload = stream.read()
         with self._lock:
-            self._handle.seek(tile.offset)
-            payload = self._handle.read(tile.stored_bytes)
             self.reads += 1
         if len(payload) != tile.stored_bytes:
             raise OSError("truncated compressed tile")
@@ -117,6 +131,15 @@ class DiskTileStore:
         if len(data) != tile.raw_bytes or zlib.crc32(data) != tile.checksum:
             raise ValueError("disk tile checksum/length disagrees with its header")
         return data
+
+    def discard(self, tile):
+        """Release exactly one superseded artifact without moving survivors."""
+        if not isinstance(tile, DiskTile) or tile.store is not self:
+            raise ValueError("cannot discard a tile owned by another store")
+        try:
+            os.remove(self.tile_path(tile))
+        except FileNotFoundError:
+            pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,19 +162,21 @@ class DiskTileDirectory:
     No per-tile Python objects are retained. Fixed-width addresses permit
     random reads/writes without a resident offset table; one 64KiB window is
     cached. Kind/row columns are views of this same entry, not parallel ledgers.
-    Payloads still live in DiskTileStore with its independent compression/CRC.
-    This temporary index, like the payload file, is not a restart format.
+    Payloads live as independent DiskTileStore artifacts with per-tile
+    compression/CRC. This temporary index and its artifacts are not a restart
+    format.
     """
     _entry = struct.Struct("<QQQIBIB6x")
     window_items = (64 << 10) // _entry.size
     _codecs = ("raw", "zlib", "lzma")
 
-    def __init__(self, store, directory=None, *, window_items=None):
+    def __init__(self, store, directory=None, *, window_items=None, exclusive=False):
         if window_items is not None:
             if type(window_items) is not int or not 0 < window_items <= type(self).window_items:
                 raise ValueError("tile-directory window exceeds its fixed RAM allowance")
             self.window_items = window_items
         self.store = store
+        self.exclusive = bool(exclusive)
         self._file = tempfile.TemporaryFile(dir=directory)
         self._count = 0
         self._window_index = -1
@@ -207,6 +232,7 @@ class DiskTileDirectory:
 
     def __setitem__(self, index, record):
         old = self._fields(index)
+        previous = self[index]
         if record is None:
             fields = (0, 0, 0, old[3], 0, 0, old[6])
         else:
@@ -215,6 +241,11 @@ class DiskTileDirectory:
             fields = (record.offset, record.stored_bytes, record.raw_bytes, record.rows,
                       self._codecs.index(record.codec) + 1, record.checksum, old[6])
         self._set_fields(index, fields)
+        if (
+            self.exclusive and previous is not None
+            and (record is None or previous.offset != record.offset)
+        ):
+            self.store.discard(previous)
 
     def append(self, record, *, kind=0, rows=0):
         index = self._count
