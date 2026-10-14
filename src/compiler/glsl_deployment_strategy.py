@@ -1027,12 +1027,8 @@ def _precision_indivisible_node_groups(
     }
     if not executable:
         return ()
-    scope = str(
-        graph.G.graph.get("source_numeric_scope")
-        or graph.G.graph.get("function_name")
-        or graph.G.graph.get("qualified_name")
-        or "<module>"
-    )
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    scope = _source_numeric_scope(graph.G)
     book = current_identity_book()
     class_page = book.page("source_value_class_concordance")
     boundary_page = book.page("source_precision_boundary_concordance")
@@ -1043,7 +1039,7 @@ def _precision_indivisible_node_groups(
         if (
             isinstance(row, tuple)
             and len(row) == 2
-            and str(row[0]) == scope
+            and row[0] == scope
             and int(row[1]) in executable
             and isinstance(fact, tuple)
             and len(fact) >= 2
@@ -1057,7 +1053,7 @@ def _precision_indivisible_node_groups(
         if (
             isinstance(row, tuple)
             and len(row) == 2
-            and str(row[0]) == scope
+            and row[0] == scope
             and int(row[1]) in graph.G
             and isinstance(fact, tuple)
             and len(fact) == 3
@@ -23346,7 +23342,15 @@ def _callsite_specialized_shell_type(
 ) -> type:
     """Plan one literal callsite once, before its shell is instantiated."""
 
+    from .work_contract import active_contract, expansion_policy
+    policy = expansion_policy(active_contract())
+    limit = policy["custom_version_depth"]
     caller = owner.process_graph
+    generation = int(caller.G.graph.get("custom_version_generation", 0))
+    if limit is not None and generation >= limit:
+        # Keep the already planned generic shell. Descriptor/ABI propagation
+        # is independent and remains enabled; this veto only avoids body copies.
+        return fallback
     if int(node_id) not in caller.G:
         return fallback
     function_table = getattr(caller, "function_table", None)
@@ -23567,6 +23571,7 @@ def _callsite_specialized_shell_type(
         return value
 
     key = (
+        tuple(policy.items()), generation,
         id(function_table),
         # A planned shell's rows were posted on the book of the compile that
         # built it; a later compile (a new book) must plan again so its own
@@ -23660,6 +23665,7 @@ def _callsite_specialized_shell_type(
         original,
         original.G,
     )
+    specialized.G.graph["custom_version_generation"] = generation + 1
     # A callsite specialization is a variant of the function: it states
     # shapes in its own shape scope, never in the original's or a sibling
     # specialization's.
@@ -24053,6 +24059,9 @@ class ProcessGraphGLSLDeployment(TiledObject):
                             and entry.metadata.get("host_ssa_module") is None
                             and entry.metadata.get("implementation_kind") != "authored-source-fallback"):
                         function_graph = extract_clean_process_subgraph(entry.graph, entry.graph.G)
+                        function_graph.G.graph["custom_version_generation"] = max(
+                            int(function_graph.G.graph.get("custom_version_generation", 0)),
+                            int(owner.process_graph.G.graph.get("custom_version_generation", 0)))
                         function_graph.G.graph.setdefault("loop_settings", dict(
                             owner.process_graph.G.graph.get("loop_settings") or {}))
                         shell_type = strategize_shell_deployment(
@@ -24214,12 +24223,8 @@ class ProcessGraphGLSLDeployment(TiledObject):
         # storage.
         from .identity_concordance import current_identity_book
 
-        numeric_scope = str(
-            self.process_graph.G.graph.get("source_numeric_scope")
-            or self.process_graph.G.graph.get("function_name")
-            or self.process_graph.G.graph.get("qualified_name")
-            or "<module>"
-        )
+        from ..common.tensors.topological_reducer import _source_numeric_scope
+        numeric_scope = _source_numeric_scope(self.process_graph.G)
         boundary_page = current_identity_book().page(
             "source_precision_boundary_concordance"
         )
@@ -24230,7 +24235,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
             if (
                 isinstance(row, tuple)
                 and len(row) == 2
-                and str(row[0]) == numeric_scope
+                and row[0] == numeric_scope
                 and int(row[1]) in self.process_graph.G
                 and isinstance(fact, tuple)
                 and len(fact) == 3
@@ -28208,6 +28213,9 @@ def strategize_shell_deployment(
             # is what makes unroll_limit/remove_loops mean anything for a
             # callee -- and the callee is where loops usually live, since the
             # entrypoint is a thin wrapper by convention.
+            function_graph.G.graph["custom_version_generation"] = max(
+                int(function_graph.G.graph.get("custom_version_generation", 0)),
+                int(graph.G.graph.get("custom_version_generation", 0)))
             function_graph.G.graph.setdefault(
                 "loop_settings",
                 dict(graph.G.graph.get("loop_settings") or {}),

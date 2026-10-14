@@ -1867,64 +1867,62 @@ def _recover_late_source_pure_expressions(
 
 
 def _index_source_graph_spellings(
-    indexed: dict[str, Any],
+    indexed: dict[Any, Any],
     function_graph: Any,
     *symbols: Any,
 ) -> None:
-    """Index one graph by repository, local, and qualified source spellings."""
+    """Index exact authored identities and explicitly linked compiled symbols.
+
+    Local names are lexical bindings, never provenance keys. In particular,
+    neither function_name nor a suffix of qualified_name is an alias here.
+    """
 
     for symbol in (
         *symbols,
-        function_graph.graph.get("function_name"),
-        function_graph.graph.get("qualified_name"),
+        function_graph.graph.get("authored_function_identity"),
     ):
-        if symbol:
-            indexed.setdefault(str(symbol), function_graph)
+        if not symbol:
+            continue
+        incumbent = indexed.get(symbol)
+        if incumbent is not None and incumbent is not function_graph:
+            raise ValueError(f"conflicting source graphs for exact identity {symbol!r}")
+        indexed[symbol] = function_graph
 
 
-def _resolved_source_graphs_by_symbol(resolved_graph: Any) -> dict[str, Any]:
-    """Index final resolved function graphs by every authored symbol spelling.
+def _resolved_source_graphs_by_symbol(resolved_graph: Any) -> dict[Any, Any]:
+    """Index resolved graphs by their complete authored identities only."""
 
-    The whole-program wrapper owns the resolved project graph, while the
-    deployment helper has its own shell-to-symbol table. Final provenance
-    reconciliation must use the former rather than reaching into a helper's
-    local table. Function-table entries preserve both the local and qualified
-    authored names, so either repository-SSA spelling resolves to the same
-    exact post-reduction graph.
-    """
-
-    indexed: dict[str, Any] = {}
+    indexed: dict[Any, Any] = {}
     for entry in getattr(resolved_graph, "function_table", ()):
         function_graph = getattr(getattr(entry, "graph", None), "G", None)
         if function_graph is None:
             continue
         _index_source_graph_spellings(
-            indexed,
-            function_graph,
-            getattr(entry, "name", None),
-            getattr(entry, "qualified_name", None),
+            indexed, function_graph,
+            (getattr(entry, "qualified_name", None)
+             if function_graph.graph.get("authored_function_identity") is None else None),
         )
     return indexed
 
 
 def _source_graph_for_lowered_function(
-    source_graphs: Mapping[str, Any],
+    source_graphs: Mapping[Any, Any],
     function_symbol: str,
     function: Any,
 ) -> Any | None:
-    """Resolve a specialized SSA function back to its authored graph."""
+    """Resolve exact authored provenance or an explicitly linked SSA symbol."""
 
-    source_symbol = str(
-        (getattr(function, "metadata", None) or {}).get(
-            "source_qualified_name"
-        )
-        or function_symbol
-    )
-    return (
-        source_graphs.get(str(function_symbol))
-        or source_graphs.get(source_symbol)
-        or source_graphs.get(source_symbol.rsplit(".", 1)[-1])
-    )
+    metadata = getattr(function, "metadata", None) or {}
+    for identity in (
+        metadata.get("authored_function_identity"),
+        metadata.get("source_qualified_name"),
+        function_symbol,
+    ):
+        if identity is not None:
+            graph = source_graphs.get(identity)
+            if graph is not None:
+                return graph
+    return None
 
 
 def _settle_nonlive_structural_shortfalls(
@@ -2277,10 +2275,11 @@ def _recover_module_late_source_literals(
         function_graph = _source_graph_for_lowered_function(
             source_graphs, str(function_symbol), function,
         )
-        literal_values = (
-            literal_catalogue.get(source_symbol)
-            or literal_catalogue.get(source_symbol.rsplit(".", 1)[-1])
+        literal_values = literal_catalogue.get(
+            (function.metadata or {}).get("authored_function_identity")
         )
+        if literal_values is None:
+            literal_values = literal_catalogue.get(source_symbol)
         if function_graph is None and literal_values is None:
             continue
         rows = _recover_late_source_literals(
@@ -18103,14 +18102,7 @@ def _class_surface_ssa_program(
             return None
 
         annotation_dtypes: dict[str, str] = {}
-        function_identity = str(
-            graph_obj.graph.get("function_name") or function_name
-        )
-        authored_annotations = dict(
-            (
-                graph_obj.graph.get("function_parameter_annotations") or {}
-            ).get(function_identity, {})
-        )
+        authored_annotations = _current_authored_parameter_annotations(graph_obj)
         for parameter_name, annotation in authored_annotations.items():
             spelling = str(annotation).strip()
             dtype = {
@@ -19045,37 +19037,22 @@ def _class_surface_ssa_program(
                 None if function_reference is None
                 else int(function_reference)
             )
+            lowered_control.metadata["authored_function_identity"] = (
+                graph_obj.graph.get("authored_function_identity")
+            )
             lowered_control.metadata["source_qualified_name"] = (
                 str(qualified_name or function_name)
             )
-            numeric_scope = graph_obj.graph.get("source_numeric_scope")
-            if numeric_scope is not None:
-                lowered_control.metadata["source_numeric_scope"] = str(
-                    numeric_scope
-                )
+            from ..common.tensors.topological_reducer import _source_numeric_scope
+            lowered_control.metadata["source_numeric_scope"] = _source_numeric_scope(graph_obj)
             numeric_by_function = dict(
                 graph_obj.graph.get(
                     "function_parameter_numeric_descriptors"
                 ) or {}
             )
-            numeric_candidates = tuple(
-                dict(numeric_by_function[identity])
-                for identity in (
-                    str(qualified_name or ""), str(function_name),
-                )
-                if identity and identity in numeric_by_function
-            )
-            if numeric_candidates:
-                numeric_parameters = numeric_candidates[0]
-                if any(
-                    candidate != numeric_parameters
-                    for candidate in numeric_candidates[1:]
-                ):
-                    raise ValueError(
-                        "numeric parameter descriptor disagreement between "
-                        f"qualified and local identity for {function_name!r}: "
-                        f"{numeric_candidates!r}"
-                    )
+            authored_identity = graph_obj.graph.get("authored_function_identity")
+            numeric_parameters = numeric_by_function.get(authored_identity)
+            if numeric_parameters:
                 parameter_ids = {
                     str(name): int(value_id)
                     for name, value_id in lowered_control.metadata.get(
@@ -20404,33 +20381,12 @@ def _class_surface_ssa_program(
             if precision_boundary is None:
                 from .identity_concordance import current_identity_book
 
-                scope = str(
-                    graph.graph.get("function_name")
-                    or graph.graph.get("qualified_name")
-                    or symbol
-                )
+                from ..common.tensors.topological_reducer import _source_numeric_scope
+                scope = _source_numeric_scope(graph)
                 boundary_page = current_identity_book().page(
                     "source_precision_boundary_concordance"
                 )
                 boundary_fact = boundary_page.latest((scope, value_id))
-                if boundary_fact is None:
-                    parent_ids = {
-                        int(parent)
-                        for parent, _role in data.get("parents") or ()
-                    }
-                    candidates = tuple(dict.fromkeys(
-                        tuple(candidate)
-                        for row in boundary_page.rows()
-                        for candidate in (boundary_page.latest(row),)
-                        if isinstance(row, tuple)
-                        and len(row) == 2
-                        and int(row[1]) == value_id
-                        and isinstance(candidate, tuple)
-                        and len(candidate) == 3
-                        and int(candidate[1]) in parent_ids
-                    ))
-                    if len(candidates) == 1:
-                        boundary_fact = candidates[0]
                 if (
                     isinstance(boundary_fact, tuple)
                     and len(boundary_fact) == 3
@@ -44338,14 +44294,8 @@ def _lower_ast_source_to_ssa_impl(
         """Read propagated composite identities from exact formal Inputs."""
 
         selected: dict[str, dict[str, Any]] = {}
-        owner = str(function_graph.graph.get("method_owner") or "")
-        local_name = str(
-            function_graph.graph.get("source_numeric_scope")
-            or function_graph.graph.get("qualified_name")
-            or function_graph.graph.get("function_name")
-            or "<function>"
-        )
-        scope = f"{owner}.{local_name}" if owner else local_name
+        from ..common.tensors.topological_reducer import _source_numeric_scope
+        scope = _source_numeric_scope(function_graph)
         page = current_identity_book().page(
             "source_numeric_parameter_record_view_concordance"
         )
@@ -44754,6 +44704,8 @@ def _lower_ast_source_to_ssa_impl(
     # classes and closures are reference cycles, so say so to the collector
     # here rather than leaving them to the repository-SSA tail below.
     stage_end("ssa-source: deployment released")
+    from .work_contract import expansion_policy
+    module.metadata["expansion_policy"] = expansion_policy(work_contract)
     if numeric_specialization_receipts:
         module.metadata["numeric_source_specializations"] = tuple(
             dict(receipt) for receipt in numeric_specialization_receipts

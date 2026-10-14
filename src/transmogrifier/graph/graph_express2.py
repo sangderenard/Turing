@@ -5566,11 +5566,6 @@ class ProcessGraph(TiledObject):
                 else ()
             )
             for function in functions:
-                identity = (
-                    f"{definition.name}.{function.name}"
-                    if isinstance(definition, ast.ClassDef)
-                    else function.name
-                )
                 arguments = function.args
                 parameters = (
                     *arguments.posonlyargs,
@@ -5580,11 +5575,15 @@ class ProcessGraph(TiledObject):
                     *((arguments.kwarg,) if arguments.kwarg else ()),
                 )
                 function_span = post_source_span(function, function)
-                module_name = (
-                    function_span.row[0] if function_span is not None
-                    else tree._turing_source_module
-                )
-                annotation_rows.append((str(identity), ()))
+                if function_span is None:
+                    raise ValueError("parameter annotations require an authored source identity")
+                module_name, identity = function_span.row[:2]
+                # Whole-book compilation pursues IdentityBook.mint_scope as
+                # a lifted top-level definition beside the module mint_scope.
+                # Its AST name is still mint_scope, but its source cell already
+                # owns the full qualified identity. Rebuilding that identity
+                # from the lifted name conflated stage: Any with Stage | None.
+                annotation_rows.append(((module_name, identity), ()))
                 for parameter in parameters:
                     if parameter.annotation is None:
                         continue
@@ -5598,7 +5597,7 @@ class ProcessGraph(TiledObject):
                         stage=INGESTION, provenance=Derived((parameter_span,)),
                         mode=Mode.CONCORD,
                     )
-                    annotation_rows.append((str(identity), row))
+                    annotation_rows.append(((module_name, identity), row))
         annotation_page = book.page(PARAMETER_ANNOTATION)
         function_parameter_annotations = {}
         for identity, row in annotation_rows:

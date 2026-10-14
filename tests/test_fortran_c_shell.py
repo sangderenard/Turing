@@ -314,7 +314,7 @@ def test_scalar_control_item_records_identity_instead_of_a_new_formal():
     assert not any(block.instrs for block in builder.blocks.values())
 
 
-def test_resolved_source_graph_index_uses_local_and_qualified_names():
+def test_resolved_source_graph_index_uses_only_qualified_names():
     function_graph = SimpleNamespace(G=SimpleNamespace(graph={
         "function_name": "step",
     }))
@@ -327,7 +327,7 @@ def test_resolved_source_graph_index_uses_local_and_qualified_names():
 
     indexed = _resolved_source_graphs_by_symbol(resolved)
 
-    assert indexed["step"] is function_graph.G
+    assert "step" not in indexed
     assert indexed["package.controller.step"] is function_graph.G
 
 

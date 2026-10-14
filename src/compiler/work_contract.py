@@ -140,6 +140,23 @@ _HONORED_GLSL_GEMM = ("glslblas_gemm", "source_algorithm")
 _HONORED_CALLSITE_DESCRIPTOR_REUSE = ("signature", "callsite")
 
 
+def _validate_depth(name, value):
+    if value is not None and (type(value) is not int or value < 0):
+        raise ValueError(f"{name} must be a non-negative int or None")
+
+
+@dataclasses.dataclass(frozen=True)
+class FunctionExpansionContract:
+    """Optional body expansion; source discovery and ABI adaptation stay live."""
+
+    inline_depth: int | None = None
+    custom_version_depth: int | None = None
+
+    def __post_init__(self):
+        _validate_depth("inline_depth", self.inline_depth)
+        _validate_depth("custom_version_depth", self.custom_version_depth)
+
+
 @dataclasses.dataclass(frozen=True)
 class LoopOptimizationContract:
     """Priorities and tunable parameters for loop identities."""
@@ -147,10 +164,13 @@ class LoopOptimizationContract:
     # Unrolling is a low-priority representation identity.  Semantic
     # preservation closures (carried recurrence, effects, publication) veto it.
     unroll_limit: int = 8
+    # Optional expansion nesting, separate from trip count. Zero retains loops.
+    unroll_depth: int | None = None
     # Number of adjacent unit-stride outputs held as one recurrence vector.
     register_block_width: int = 4
 
     def __post_init__(self) -> None:
+        _validate_depth("unroll_depth", self.unroll_depth)
         if int(self.unroll_limit) < 1:
             raise ValueError("loop unroll_limit must be positive")
         if int(self.register_block_width) < 1:
@@ -202,6 +222,9 @@ class WorkContract:
     symbolic_arguments: tuple[str, ...] = ()
     # Compile-complementary loop policy.  This is a subcontract so identity
     # parameters have one authority without bloating every work preset.
+    functions: FunctionExpansionContract = dataclasses.field(
+        default_factory=FunctionExpansionContract,
+    )
     loops: LoopOptimizationContract = dataclasses.field(
         default_factory=LoopOptimizationContract,
     )
@@ -354,6 +377,7 @@ class WorkContract:
             f"identities={'inexact' if self.inexact_identities else 'exact-only'}",
             f"fma={'contract' if self.contract_multiply_add else 'none'}",
             f"unroll<={self.loops.unroll_limit}",
+            f"expansion={expansion_policy(self)}",
             f"register-block={self.loops.register_block_width}",
             f"glsl-gemm={self.shaders.blas_gemm}",
             f"deployment={self.deployment}",
@@ -362,6 +386,31 @@ class WorkContract:
             f"graph-workers={self.graph_workers}",
         ]
         return f"{self.name}: " + ", ".join(held)
+
+
+EXPANSION_ENV = {
+    "unroll_depth": "TURING_UNROLL_DEPTH",
+    "inline_depth": "TURING_INLINE_DEPTH",
+    "custom_version_depth": "TURING_CUSTOM_VERSION_DEPTH",
+}
+
+
+def expansion_policy(contract=None):
+    contract = active_contract() if contract is None else contract
+    return {"unroll_depth": contract.loops.unroll_depth,
+            "inline_depth": contract.functions.inline_depth,
+            "custom_version_depth": contract.functions.custom_version_depth}
+
+
+def with_expansion_policy(contract, policy):
+    unknown = set(policy) - set(EXPANSION_ENV)
+    if unknown:
+        raise ValueError(f"unknown expansion policy: {sorted(unknown)}")
+    effective = {**expansion_policy(contract), **policy}
+    return dataclasses.replace(contract,
+        loops=dataclasses.replace(contract.loops, unroll_depth=effective["unroll_depth"]),
+        functions=FunctionExpansionContract(effective["inline_depth"],
+                                            effective["custom_version_depth"]))
 
 
 PRESETS: dict[str, WorkContract] = {
@@ -491,6 +540,11 @@ def active_contract() -> WorkContract:
         raw = os.environ.get(variable)
         if raw:
             contract = dataclasses.replace(contract, **{field: int(raw)})
+
+    depths = {name: int(os.environ[variable]) for name, variable in EXPANSION_ENV.items()
+              if os.environ.get(variable)}
+    if depths:
+        contract = with_expansion_policy(contract, depths)
 
     inexact = _flag("TURING_POW_INEXACT")
     fma = _flag("TURING_FMA_CONTRACT")

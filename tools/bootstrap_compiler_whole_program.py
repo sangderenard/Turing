@@ -66,7 +66,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "front (default: 75)"
         ),
     )
+    for option in ("unroll-depth", "inline-depth", "custom-version-depth"):
+        parser.add_argument("--" + option, type=int, default=0,
+                            help="optional expansion nesting (default: 0, disabled)")
     arguments = parser.parse_args(argv)
+    expansion_policy = {field: getattr(arguments, field) for field in
+                        ("unroll_depth", "inline_depth", "custom_version_depth")}
+    if any(value < 0 for value in expansion_policy.values()):
+        parser.error("expansion depths must be non-negative")
 
     def report(message: str) -> None:
         print(message, flush=True)
@@ -74,6 +81,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.plan_only:
         receipt = plan_whole_program_compiler(
             arguments.output,
+            expansion_policy=expansion_policy,
             progress=report,
         )
         target = receipt["next_partition"]
@@ -95,6 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     with display:
         product = build_whole_program_compiler(
             arguments.output,
+            expansion_policy=expansion_policy,
             jobs=arguments.jobs,
             minimum_worker_jobs=arguments.min_workers,
             source_compilation=(arguments.source_schedule if arguments.source_compilation == "auto"

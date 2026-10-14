@@ -16,20 +16,13 @@ def _current_authored_parameter_annotations(
     )
     if catalogue and all(isinstance(value, str) for value in catalogue.values()):
         return {str(name): str(value) for name, value in catalogue.items()}
-    function_name = str(graph_obj.graph.get("function_name") or "")
-    owner = graph_obj.graph.get("method_owner")
-    candidates = (
-        f"{owner}.{function_name}" if owner else None,
-        str(graph_obj.graph.get("qualified_name") or "") or None,
-        function_name or None,
-    )
-    for identity in candidates:
-        annotations = catalogue.get(identity) if identity is not None else None
-        if isinstance(annotations, Mapping):
-            return {
-                str(name): str(value)
-                for name, value in annotations.items()
-            }
+    # The function graph carries the exact source identity from its owning
+    # definition cell. Never choose an annotation by a local name or a dotted
+    # suffix: imported methods and unrelated modules may share both.
+    identity = graph_obj.graph.get("authored_function_identity")
+    annotations = catalogue.get(identity) if identity is not None else None
+    if isinstance(annotations, Mapping):
+        return {str(name): str(value) for name, value in annotations.items()}
     return {}
 
 

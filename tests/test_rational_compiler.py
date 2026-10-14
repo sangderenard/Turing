@@ -85,7 +85,7 @@ def test_numeric_annotation_descriptors_join_to_the_canonical_feature_union():
 def test_topology_entry_publishes_parameter_method_and_component_contracts():
     graph = nx.DiGraph()
     graph.graph["function_parameter_annotations"] = {
-        "f": {
+        ("fixture", "f"): {
             "value": "ComplexRationalPrecision[3, float64]",
             "count": "int",
         },
@@ -94,8 +94,8 @@ def test_topology_entry_publishes_parameter_method_and_component_contracts():
     _record_numeric_annotation_descriptors(SimpleNamespace(G=graph))
 
     described = graph.graph["function_parameter_numeric_descriptors"]
-    value = described["f"]["value"]
-    assert "count" not in described["f"]
+    value = described[("fixture", "f")]["value"]
+    assert "count" not in described[("fixture", "f")]
     assert value["features"] == ("complex", "precision", "rational")
     assert value["scalar_components"] == 12
     assert value["coefficient_paths"] == (
@@ -215,7 +215,7 @@ def divide(
         assert attributes["result_class_ref"] == "ComplexRationalPrecision"
         assert attributes["precision_limbs"] == 2
         assert tuple(class_page.latest((
-            "_ComplexRationalBase.__truediv__", value_id,
+            dunder.graph.G.graph["authored_function_identity"], value_id,
         )))[:2] == (
             "ComplexRationalPrecision", 2,
         )
@@ -265,7 +265,7 @@ def coefficient(value: ComplexRationalPrecision[7]):
         facts = {
             tuple(page.latest(row)[2]): page.latest(row)
             for row in page.rows()
-            if isinstance(row, tuple) and row[0] == "coefficient"
+            if isinstance(row, tuple) and row[0] == function_graph.graph["authored_function_identity"]
         }
         real_fact = facts[("real",)]
         numerator_fact = facts[("real", "numerator")]
@@ -381,7 +381,7 @@ def coefficient_product(
         page = current_identity_book().page(
             "source_precision_operator_concordance"
         )
-        assert page.latest(("coefficient_product", product_id)) == (
+        assert page.latest((function_graph.graph["authored_function_identity"], product_id)) == (
             "precision_mul", product["parents"][0][0], "Precision", 7,
         )
     finally:
@@ -434,7 +434,7 @@ def multiply(left: RationalPrecision[7], right: RationalPrecision[7]):
         page = current_identity_book().page(
             "source_numeric_operator_specialization_concordance"
         )
-        fact = page.latest(("_RationalBase.__mul__", call_id))
+        fact = page.latest((dunder.graph["authored_function_identity"], call_id))
         assert fact is not None
         assert fact[3]["type_name"] == "RationalPrecision"
         assert fact[3]["limbs"] == 7

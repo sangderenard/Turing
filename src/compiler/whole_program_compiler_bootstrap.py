@@ -32,6 +32,9 @@ from .native_compiler_accelerators import (
 
 BOOTSTRAP_SCHEMA = "turing.partitioned-compiler-bootstrap.v2"
 STRATEGY = "versioned-native-boundary-composition"
+# First Pythonic bootstrap preserves ordinary loops and callable boundaries.
+BOOTSTRAP_EXPANSION_POLICY = {"unroll_depth": 0, "inline_depth": 0,
+                              "custom_version_depth": 0}
 
 
 @dataclass(frozen=True)
@@ -47,7 +50,8 @@ class CompilerBoundary:
     produces: str
     disposition: str = "available"
 
-    def receipt(self, repository: Path, toolchain: Mapping[str, Any]) -> dict[str, Any]:
+    def receipt(self, repository: Path, toolchain: Mapping[str, Any],
+                expansion_policy: Mapping[str, Any] | None = None) -> dict[str, Any]:
         source_path = repository / self.source
         source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
         contract = {
@@ -60,6 +64,8 @@ class CompilerBoundary:
             "produces": self.produces,
             "disposition": self.disposition,
         }
+        if expansion_policy is not None:
+            contract["expansion_policy"] = dict(expansion_policy)
         version = hashlib.sha256(json.dumps({
             "contract": contract,
             "source_sha256": source_sha256,
@@ -151,25 +157,31 @@ class WholeProgramCompilerProduct:
     manifest: Path
 
 
-def compiler_boundary_receipts() -> tuple[dict[str, Any], ...]:
+def compiler_boundary_receipts(expansion_policy=None) -> tuple[dict[str, Any], ...]:
     from .project_compilation_product import compiler_toolchain_fingerprint
 
     repository = Path(__file__).resolve().parents[2]
     toolchain = compiler_toolchain_fingerprint()
-    return tuple(boundary.receipt(repository, toolchain) for boundary in BOUNDARIES)
+    return tuple(boundary.receipt(repository, toolchain, expansion_policy) for boundary in BOUNDARIES)
 
 
 def plan_whole_program_compiler(
     directory: str | Path,
     *,
     progress: Callable[[str], None] | None = None,
+    expansion_policy: Mapping[str, Any] | None = None,
     **_legacy_options: Any,
 ) -> dict[str, Any]:
     """Publish the versioned composition without launching a compiler build."""
 
     destination = Path(directory).resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    boundaries = compiler_boundary_receipts()
+    from .work_contract import active_contract, with_expansion_policy
+    from .work_contract import expansion_policy as describe_expansion
+    policy = describe_expansion(with_expansion_policy(active_contract(),
+        BOOTSTRAP_EXPANSION_POLICY if expansion_policy is None else
+        {**BOOTSTRAP_EXPANSION_POLICY, **expansion_policy}))
+    boundaries = compiler_boundary_receipts(policy)
     target = next(
         boundary for boundary in boundaries
         if boundary["name"] == "process-graph-lowering"
@@ -179,6 +191,7 @@ def plan_whole_program_compiler(
         "stage": "planned",
         "strategy": STRATEGY,
         "semantic_authority": "python-coordinator-and-identity-book",
+        "expansion_policy": policy,
         "boundaries": list(boundaries),
         "next_partition": target,
         "source_update_policy": (
@@ -202,6 +215,7 @@ def plan_whole_program_compiler(
 def build_whole_program_compiler(
     directory: str | Path,
     *,
+    expansion_policy: Mapping[str, Any] | None = None,
     jobs: int | None = None,
     minimum_worker_jobs: int = 1,
     source_compilation: str = "auto",
@@ -228,7 +242,8 @@ def build_whole_program_compiler(
 
     destination = Path(directory).resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    plan = plan_whole_program_compiler(destination, progress=progress)
+    plan = plan_whole_program_compiler(destination, progress=progress,
+                                       expansion_policy=expansion_policy)
     boundary = dict(plan["next_partition"])
     repository = Path(__file__).resolve().parents[2]
     product_root = (
@@ -261,7 +276,8 @@ def build_whole_program_compiler(
     requests = [{"label": name, "entrypoint": name, "source_path": source_path,
                  "product_directory": product_root / "product", "authored_call": True,
                  "after": pieces if name == entry else (),
-                 "extraction_contract": DEFAULT_PROJECT_EXTRACTION_CONTRACT}
+                 "extraction_contract": DEFAULT_PROJECT_EXTRACTION_CONTRACT,
+                 "expansion_policy": plan["expansion_policy"]}
                 for name in schedule]
     lower_ast_source_to_ssa(requests,
         source_compilation="parallel" if source_compilation == "auto" else source_compilation,
@@ -279,6 +295,7 @@ def build_whole_program_compiler(
     manifest_value = {
         "schema": BOOTSTRAP_SCHEMA,
         "stage": "built" if product.get("status") == "sealed" else "incomplete",
+        "expansion_policy": plan["expansion_policy"],
         "strategy": STRATEGY,
         "boundary": boundary,
         "product": product,

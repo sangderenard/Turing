@@ -3763,7 +3763,9 @@ class LoopComposer:
             backpressured_output=bool(publication_nodes),
         )
 
-    def plan(self, loop: LoopDescriptor) -> LoopPlan:
+    def plan(self, loop: LoopDescriptor, *, nesting_depth: int = 0) -> LoopPlan:
+        from .work_contract import active_contract
+        depth_limit = active_contract().loops.unroll_depth
         if loop.trip_count == 0:
             return LoopPlan(
                 loop,
@@ -3771,7 +3773,8 @@ class LoopComposer:
                 "the loop has no iterations",
             )
         if (
-            loop.trip_count is not None
+            (depth_limit is None or nesting_depth < depth_limit)
+            and loop.trip_count is not None
             and loop.trip_count <= self.capabilities.unroll_limit
             and all(
                 effect.mode
@@ -3829,6 +3832,13 @@ class LoopComposer:
             ):
                 descriptor = self.describe(graph, node_id)
                 plans.append(self.plan(descriptor))
+
+        from .work_contract import active_contract
+        depth_limit = active_contract().loops.unroll_depth
+        if depth_limit is not None:
+            plans = [self.plan(plan.loop, nesting_depth=sum(
+                int(plan.loop.node_id) in owner.loop.body_nodes
+                for owner in plans if owner is not plan)) for plan in plans]
 
         # Realization decisions form a hierarchy.  A multi-carried loop is a
         # coordinated recurrence: its whole (initial, updated) vector must
