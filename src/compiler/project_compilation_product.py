@@ -4665,11 +4665,23 @@ def project_process_graph_acceptance(graph, references, book=None):
     import ast
     from dataclasses import fields, is_dataclass
     from .identity_concordance import Ref, current_identity_book
+    from ..transmogrifier.ssa import IRModule
     roots, seen = set(), set()
 
     def visit(value):
         if isinstance(value, Ref):
             roots.add(value)
+            return
+        if isinstance(value, IRModule):
+            # A linked repository-SSA module is an already-accepted compiler
+            # artifact with its own ``metadata['identity_book']``.  It is
+            # attached to the authored definition AST as an implementation
+            # boundary.  Its internal instruction receipts are therefore not
+            # roots in the source ProcessGraph's book: close_region_feed_set
+            # carried its worker-owned return_site_cell here and the parent
+            # incorrectly tried to resolve that exact Ref in a different
+            # worker's book.  The linked-module acceptance checks consume the
+            # module and its own book separately.
             return
         if id(value) in seen:
             return

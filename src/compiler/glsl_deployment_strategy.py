@@ -5695,6 +5695,18 @@ def _build_hierarchical_glsl_artifact(shell: Any):
             return None
         return ".".join((current.id, *reversed(parts)))
 
+    # Keep every rooted attribute spelling on the same hierarchy correlation
+    # that owns its executable value identity.  The AOT boundary later filters
+    # this complete map by the values its composed program actually consumes.
+    # Re-walking ``expr_obj`` there used a second id/path key and, for a read
+    # whose later write was the retained lexical spelling, required two local
+    # compiler closures merely to rediscover this record.
+    shell.hierarchical_root_attribute_value_ids = {
+        path: int(global_id)
+        for closure_id, local_id, global_id in value_table.correlations
+        if int(closure_id) == root_id
+        and (path := attribute_path(local_id)) is not None
+    }
     shell.hierarchical_root_field_value_ids = {
         path: int(global_id)
         for global_id, (closure_id, local_id)
@@ -24313,6 +24325,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
         self.hierarchical_region_correlations = ()
         self.hierarchical_endpoint_details = {}
         self.hierarchical_value_aliases = {}
+        self.hierarchical_root_attribute_value_ids = {}
         self.hierarchical_root_field_value_ids = {}
         self.hierarchical_effective_value_table = None
         self.hierarchical_compose_failure = None

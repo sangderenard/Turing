@@ -47,12 +47,63 @@ from src.compiler.project_compilation_product import (
     open_project_compilation_product,
     publish_process_graph_subdivision_plan,
     process_graph_plan_parallel_width,
+    project_process_graph_acceptance,
     ready_process_graph_unit_indices,
     resident_bytes,
     source_region_integral_accounting,
     verify_structural_resident_table_integral,
     verify_project_scalar_units_automatically,
 )
+
+
+def test_source_acceptance_does_not_import_linked_repository_ssa_cells():
+    import networkx as nx
+
+    from src.compiler.concordance_declarations import (
+        INGESTION,
+        INGESTION_VALUE,
+        INGEST_SOURCE,
+        NodeFact,
+    )
+    from src.compiler.identity_concordance import (
+        IdentityBook,
+        Mode,
+        Novel,
+        Ref,
+    )
+    from src.transmogrifier.ssa import IRModule
+
+    book = IdentityBook()
+    local = book.post(
+        INGESTION_VALUE,
+        (("ingestion:caller", 0), 1),
+        NodeFact("Name", "input", "value"),
+        stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+    linked_module = IRModule(functions={})
+    linked_module.metadata["foreign_return_site"] = Ref(
+        INGESTION_VALUE,
+        (("ingestion:linked-worker", 0), 2),
+        0,
+    )
+    definition = ast.parse("def linked(value):\n    return value\n").body[0]
+    definition._linked_repository_ssa_module = linked_module
+    body_graph = nx.DiGraph()
+    body_graph.add_node(1, source_cell=local, expr_obj=definition)
+    body = SimpleNamespace(G=body_graph)
+    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(graph=body))
+    graph = SimpleNamespace(function_table=table, G=SimpleNamespace(graph={}))
+
+    projected = project_process_graph_acceptance(graph, (0,), book=book)
+
+    assert projected.page(INGESTION_VALUE.name).cell(local.row, 0) == book.page(
+        INGESTION_VALUE.name
+    ).cell(local.row, 0)
+    assert projected.page(INGESTION_VALUE.name).latest(
+        (("ingestion:linked-worker", 0), 2)
+    ) is None
 
 
 def test_public_compiler_preserves_module_context_for_relative_imports(
@@ -306,7 +357,7 @@ def test_stale_closure_receipt_does_not_explain_another_argument():
     assert product._unexplained_root_argument_ids(function) == (1,)
 
 
-def test_bootstrap_report_capture_is_accounted_but_callback_remains_partial(tmp_path):
+def test_bootstrap_report_declared_callback_is_complete_contract_edge(tmp_path):
     source = (Path(__file__).resolve().parents[1] / "src/common/tensors/"
               "accelerator_backends/aot_compile.py")
     receipt = compile_project_call(
@@ -314,9 +365,43 @@ def test_bootstrap_report_capture_is_accounted_but_callback_remains_partial(tmp_
         tmp_path / "report", progress_bars=False,
     )
     assert receipt["root_parameter_accounting"]["missing_lexical_captures"] == []
-    assert receipt["root_parameter_accounting"]["missing_used_parameters"] == ["message"]
+    assert receipt["root_parameter_accounting"]["missing_used_parameters"] == []
     assert receipt["root_semantic_accounting"]["unexplained_root_argument_ids"] == []
-    assert not receipt["repository_ssa_complete"]
+    accounting = receipt["extraction_boundary_accounting"]
+    assert accounting["unresolved_call_records"] == ()
+    assert len(accounting["contracted_unresolved_call_records"]) == 1
+    assert accounting["contracted_unresolved_call_records"][0]["callee"] == "progress"
+    assert receipt["repository_ssa_complete"]
+
+
+def test_bootstrap_region_feed_closure_uses_declared_nested_table_abi(tmp_path):
+    source = (Path(__file__).resolve().parents[1] / "src/common/tensors/"
+              "accelerator_backends/aot_compile.py")
+    receipt = compile_project_call(
+        source,
+        "_lower_process_graph_to_compilation.<locals>.close_region_feed_set",
+        tmp_path / "region-feeds",
+        progress_bars=False,
+    )
+    assert receipt["root_parameter_accounting"]["missing_used_parameters"] == []
+    assert receipt["root_semantic_accounting"]["unexplained_root_argument_ids"] == []
+    assert receipt["repository_ssa_complete"]
+
+
+def test_bootstrap_aot_boundary_reads_published_hierarchy_records():
+    source = (Path(__file__).resolve().parents[1] / "src/common/tensors/"
+              "accelerator_backends/aot_compile.py").read_text(encoding="utf-8")
+    qualified_names = {
+        call.qualified_name for call in discover_authored_calls(source)
+    }
+    assert (
+        "_lower_process_graph_to_compilation.<locals>.collect_hierarchy_values"
+        not in qualified_names
+    )
+    assert (
+        "_lower_process_graph_to_compilation.<locals>.rooted_attribute_path"
+        not in qualified_names
+    )
 
 
 def test_unplanned_callable_capture_cannot_publish_a_complete_no_argument_body(tmp_path):

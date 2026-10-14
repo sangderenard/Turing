@@ -2160,6 +2160,16 @@ def _record_unplanned_callable_inputs(module: Any, source_graphs: Mapping[str, A
             binding = callee.get("attributes") or {}
             if binding.get("binding_kind") not in {"parameter", "closure"}:
                 continue
+            binding_name = str(binding.get("binding_name") or "")
+            value_contract = dict(
+                (graph.graph.get("parameter_value_abi") or {}).get(
+                    binding_name
+                ) or {}
+            )
+            declared_unresolved_callable = bool(
+                value_contract.get("storage") == "reference"
+                and "Callable" in str(value_contract.get("python_type") or "")
+            )
             # outer(callback).inner(): if callback is not None: callback()
             # retains the exact Call/callee edge but produces no PlanCall and
             # no SSA invocation. The call linker only visited PlanCalls, so
@@ -2169,7 +2179,7 @@ def _record_unplanned_callable_inputs(module: Any, source_graphs: Mapping[str, A
             record = SSACallRecord(
                 caller=str(symbol), callsite_id=int(node_id),
                 callee_reference=None, callee_symbol=None,
-                callee_name=str(binding.get("binding_name") or ""),
+                callee_name=binding_name,
             )
             records.append(record)
             sources.extend(_frame_call_cells(graph, int(node_id)))
@@ -2177,12 +2187,31 @@ def _record_unplanned_callable_inputs(module: Any, source_graphs: Mapping[str, A
                 "reason": "callable input has no planned or lowered invocation",
                 "callee_input_value_id": int(callee.get("value_id", callee_node_id)),
                 "binding_kind": str(binding["binding_kind"]),
+                "declared_unresolved_contract": declared_unresolved_callable,
+                **({
+                    "contract": value_contract,
+                } if declared_unresolved_callable else {}),
             }
         if len(records) != existing_count:
             module.call_table.assign(
                 str(symbol), records, sources=tuple(sources),
                 stage=FRAME_BINDING,
             )
+
+
+def _contract_input_binding_names(graph: Any) -> set[str]:
+    """Return authored parameters and closure variables exposed as inputs."""
+
+    names = set(map(str, graph.graph.get("function_parameters") or ()))
+    names.update(
+        str(attributes.get("binding_name"))
+        for _, data in graph.nodes(data=True)
+        for attributes in (data.get("attributes") or {},)
+        if str(data.get("type") or "") == "Input"
+        and attributes.get("binding_kind") in {"parameter", "closure"}
+        and attributes.get("binding_name")
+    )
+    return names
 
 
 def _record_module_closure_formals(
@@ -15739,13 +15768,11 @@ def _class_surface_ssa_program(
                 planned_graph.graph["parameter_record_abi"] = selected
         _lower_optional_record_presence_graph(planned_graph)
         if program_abi and not planned_graph.graph.get("parameter_value_abi"):
-            parameters = set(map(
-                str, planned_graph.graph.get("function_parameters") or ()
-            ))
+            value_bindings = _contract_input_binding_names(planned_graph)
             selected_values = {
                 str(binding.get("parameter")): dict(binding)
                 for binding in tuple(program_abi.get("values") or ())
-                if str(binding.get("parameter") or "") in parameters
+                if str(binding.get("parameter") or "") in value_bindings
                 and fnmatchcase(
                     str(function_name), str(binding.get("function") or "")
                 )
@@ -16613,14 +16640,12 @@ def _class_surface_ssa_program(
         )
         _lower_optional_record_presence_graph(graph_obj)
         if program_abi and not graph_obj.graph.get("parameter_value_abi"):
-            parameters = set(map(
-                str, graph_obj.graph.get("function_parameters") or ()
-            ))
+            value_bindings = _contract_input_binding_names(graph_obj)
             selected_values = {}
             for binding in tuple(program_abi.get("values") or ()):
                 parameter = str(binding.get("parameter") or "")
                 if (
-                    parameter in parameters
+                    parameter in value_bindings
                     and fnmatchcase(
                         str(function_name), str(binding.get("function") or "")
                     )
@@ -44451,6 +44476,7 @@ def _lower_ast_source_to_ssa_impl(
                     function_name
                 )
             )
+            value_bindings = _contract_input_binding_names(function_graph)
             selected_values = {
                 parameter: dict(receipt)
                 for parameter, receipt in
@@ -44462,7 +44488,7 @@ def _lower_ast_source_to_ssa_impl(
             selected_values.update({
                 parameter: binding.receipt()
                 for parameter, binding in values.items()
-                if parameter in parameters
+                if parameter in value_bindings
             })
             if selected_values:
                 function_graph.graph["parameter_value_abi"] = selected_values
@@ -44610,6 +44636,7 @@ def _lower_ast_source_to_ssa_impl(
                     function_name
                 )
             )
+            value_bindings = _contract_input_binding_names(function_graph)
             selected_values = {
                 parameter: dict(receipt)
                 for parameter, receipt in
@@ -44621,7 +44648,7 @@ def _lower_ast_source_to_ssa_impl(
             selected_values.update({
                 parameter: binding.receipt()
                 for parameter, binding in values.items()
-                if parameter in parameters
+                if parameter in value_bindings
             })
             if selected_values:
                 function_graph.graph["parameter_value_abi"] = selected_values
@@ -44874,7 +44901,7 @@ def _lower_ast_source_to_ssa_impl(
                     map(str, context.get("operation_identities", ()))
                 ),
             })
-        unresolved_call_records = tuple(
+        all_unresolved_call_records = tuple(
             {
                 "caller": str(record.caller),
                 "callsite_id": int(record.callsite_id),
@@ -44889,11 +44916,22 @@ def _lower_ast_source_to_ssa_impl(
             for record in records
             if record.resolution == "unresolved"
         )
+        contracted_unresolved_call_records = tuple(
+            record
+            for record in all_unresolved_call_records
+            if record["diagnostic"].get("declared_unresolved_contract")
+        )
+        unresolved_call_records = tuple(
+            record
+            for record in all_unresolved_call_records
+            if not record["diagnostic"].get("declared_unresolved_contract")
+        )
         module.metadata["extraction_boundary_accounting"] = {
             "occurrences": extraction_boundaries,
             "materialized_identity_counts": materialized_identities,
             "boundary_transformations": tuple(boundary_transformations),
             "unmaterialized": tuple(unmaterialized_boundaries),
+            "contracted_unresolved_call_records": contracted_unresolved_call_records,
             "unresolved_call_records": unresolved_call_records,
             "repository_ssa_complete": not (
                 unmaterialized_boundaries or unresolved_call_records

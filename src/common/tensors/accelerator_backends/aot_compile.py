@@ -2061,54 +2061,35 @@ def _lower_process_graph_to_compilation(
             *tuple(program.outputs.values()),
         )
     }
-    def collect_hierarchy_values(closure: Any) -> None:
-        executable_value_ids.update(
-            map(int, getattr(closure, "captures", ()))
-        )
-        for item in getattr(closure, "items", ()):
-            executable_value_ids.update(
-                map(int, getattr(item, "inputs", ()))
-            )
-            executable_value_ids.update(
-                map(int, getattr(item, "outputs", ()))
-            )
-            if hasattr(item, "items"):
-                collect_hierarchy_values(item)
-            callee = getattr(item, "callee", None)
-            if callee is not None:
-                collect_hierarchy_values(callee)
-
-    collect_hierarchy_values(
-        getattr(source_shell, "hierarchy_plan", None)
+    hierarchy_values = getattr(
+        hierarchy_owner, "hierarchical_effective_value_table", None
     )
+    if hierarchy_values is not None:
+        executable_value_ids.update(
+            int(global_id)
+            for _closure_id, _local_id, global_id
+            in hierarchy_values.correlations
+        )
     # A captured region may consume an attribute read whose later write is the
     # only value retained in the lexical identity history (``state.values +=``
     # is the canonical case).  The read and write are two SSA values sharing
     # one authored alias path.  Recover the live read directly from the root
-    # graph expression so the ABI asks the caller for ``state.values`` rather
-    # than an anonymous ``t<ID>`` or a copied top-level ``state`` object.
-    root_graph = source_shell.process_graph.G
-    root_parameters = set(function_parameters)
-
-    def rooted_attribute_path(expression: Any) -> str | None:
-        if not isinstance(expression, ast.Attribute):
-            return None
-        parts = [str(expression.attr)]
-        current = expression.value
-        while isinstance(current, ast.Attribute):
-            parts.append(str(current.attr))
-            current = current.value
-        if not isinstance(current, ast.Name) or current.id not in root_parameters:
-            return None
-        return ".".join((current.id, *reversed(parts)))
-
-    for local_id, data in root_graph.nodes(data=True):
-        global_id = int(root_value_ids.get(int(local_id), int(local_id)))
+    # hierarchy correlation so the ABI asks the caller for ``state.values``
+    # rather than an anonymous ``t<ID>`` or a copied top-level ``state``
+    # object.  Hierarchy composition owns both the rooted spelling and the
+    # global value identity; this boundary only selects the executable rows.
+    for path, global_id in dict(
+        getattr(
+            hierarchy_owner,
+            "hierarchical_root_attribute_value_ids",
+            {},
+        )
+        or {}
+    ).items():
+        global_id = int(global_id)
         if global_id not in executable_value_ids:
             continue
-        path = rooted_attribute_path(data.get("expr_obj"))
-        if path is not None:
-            public_input_value_ids.setdefault(path, global_id)
+        public_input_value_ids.setdefault(str(path), global_id)
     for parameter in function_parameters:
         history = tuple(map(int, identity_table.get(parameter, ())))
         live = tuple(

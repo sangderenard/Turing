@@ -41,6 +41,15 @@ def _contract_outer():
     return _contract_inner()
 
 
+def test_program_abi_table_row_retains_dynamic_span_rank():
+    contract = ExtractionContract(CONTRACT)
+    steps = contract.program_abi.records["CompilerFusedProgram"].fields["steps"]
+    assert steps.table_columns == (
+        {"name": "input_ids", "dtype": "int64", "rank": 1},
+        {"name": "result_id", "dtype": "int64"},
+    )
+
+
 def test_source_availability_is_probed_once_per_exact_definition(monkeypatch):
     import inspect
     contract = ExtractionContract(CONTRACT)
