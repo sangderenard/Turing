@@ -1,3 +1,11 @@
+2026-10-14 BOOTSTRAP CONTINUATION HANDOFF (CURRENT):
+Start with docs/compiler_convergence/12_bootstrap_handoff.md for the user's
+complete goal, retained memory constraints, implementation/review state,
+observed blockers, existing shell channels, prioritized repairs, subdivision
+mechanisms, validation evidence and runnable continuation commands. The work
+is on draft PR #783; full bootstrap remains unverified. No diagnostic worker
+is left running. Earlier timings are component/partial-bootstrap observations.
+
 2026-10-13 NATIVE SHELL CHANNEL CHECK (CURRENT):
 Shell diagnostic facilities already exist: shared log/error/profile/progress/
 trace telemetry and native launch logging/bounded trace storage. The isolated
