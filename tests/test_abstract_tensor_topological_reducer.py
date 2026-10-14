@@ -1164,7 +1164,7 @@ def entry():
     assert "result_class_ref" not in attributes
     assert current_identity_book().page(
         "source_value_class_concordance"
-    ).latest(("receive", formal_id)) is None
+    ).latest((receive.graph["authored_function_identity"], formal_id)) is None
 
 
 def test_field_aggregate_contract_follows_an_authored_method_result():

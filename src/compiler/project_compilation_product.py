@@ -109,6 +109,12 @@ def compiler_toolchain_fingerprint() -> dict[str, Any]:
         "src/compiler/ssa_call_input_adapters.py",
         "src/compiler/project_compilation_product.py",
         "src/compiler/identity_concordance.py",
+        "src/compiler/id_space.py",
+        "src/compiler/monotonic_ids.py",
+        "src/compiler/concordance_declarations.py",
+        "src/compiler/__init__.py",
+        "src/compiler/compiler_bootstrap_runtime.py",
+        "src/compiler/whole_program_compiler_bootstrap.py",
         "src/compiler/work_contract.py",
         "src/compiler/memory_regulation.py",
         "src/compiler/live_tiles.py",
@@ -4665,11 +4671,23 @@ def project_process_graph_acceptance(graph, references, book=None):
     import ast
     from dataclasses import fields, is_dataclass
     from .identity_concordance import Ref, current_identity_book
+    from ..transmogrifier.ssa import IRModule
     roots, seen = set(), set()
 
     def visit(value):
         if isinstance(value, Ref):
             roots.add(value)
+            return
+        if isinstance(value, IRModule):
+            # A linked repository-SSA module is an already-accepted compiler
+            # artifact with its own ``metadata['identity_book']``.  It is
+            # attached to the authored definition AST as an implementation
+            # boundary.  Its internal instruction receipts are therefore not
+            # roots in the source ProcessGraph's book: close_region_feed_set
+            # carried its worker-owned return_site_cell here and the parent
+            # incorrectly tried to resolve that exact Ref in a different
+            # worker's book.  The linked-module acceptance checks consume the
+            # module and its own book separately.
             return
         if id(value) in seen:
             return
@@ -4874,6 +4892,9 @@ def compile_source_submissions(submissions, *, mode, options=None, progress_bars
         allowed = {"max_total_resident_bytes", "max_worker_memory_bytes", "worker_resident_reservation_bytes",
                    "minimum_total_resident_bytes", "system_reserve_bytes", "adaptive_memory_ceiling",
                    "worker_elastic_available_percent", "thread_working_bytes", "minimum_worker_jobs"}
+        expansion = requests[0].get("expansion_policy")
+        if any(request.get("expansion_policy") != expansion for request in requests):
+            raise ValueError("one authored product requires one expansion policy")
         with display:
             manifest = compile_project_product(next(iter(paths)), next(iter(roots)),
                 entries=names, expand_entry_dependencies=False,
@@ -4881,6 +4902,7 @@ def compile_source_submissions(submissions, *, mode, options=None, progress_bars
                                        for name, request in zip(names, requests)},
                 jobs=1 if mode == "serial" else opts.get("jobs"),
                 extraction_contract=requests[0].get("extraction_contract", DEFAULT_PROJECT_EXTRACTION_CONTRACT),
+                expansion_policy=requests[0].get("expansion_policy"),
                 emit_native=True, progress=display.compilation_event,
                 **{key: value for key, value in opts.items() if key in allowed})
         return list(manifest["units"])
@@ -5346,6 +5368,7 @@ def compile_project_call(
 ) -> dict[str, Any]:
     """Worker operation: compile and atomically publish one authored call."""
 
+    from .work_contract import expansion_policy as _effective_expansion_policy
     from ..common.tensors.source_realization import authored_source_realization
     from .fortran_c_shell import lower_ast_source_to_ssa
 
@@ -5541,6 +5564,7 @@ def compile_project_call(
             "source": source_file.as_posix(),
             "source_module": source_module_name,
             "source_sha256": source_sha256,
+            "expansion_policy": _effective_expansion_policy(),
             "authored_source_sha256": authored_source_sha256,
             "compile_source_sha256": compile_source_sha256,
             "compile_source": compile_source_path.name,
@@ -5777,6 +5801,7 @@ def compile_project_call(
         "source": source_file.as_posix(),
         "source_module": source_module_name,
         "source_sha256": source_sha256,
+        "expansion_policy": _effective_expansion_policy(),
         "authored_source_sha256": authored_source_sha256,
         "compile_source_sha256": compile_source_sha256,
         "compile_source": compile_source_path.name,
@@ -7992,6 +8017,7 @@ def compile_project_product(
     worker_elastic_available_percent: int = 75,
     thread_working_bytes: int = 128 << 20,
     extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
+    expansion_policy: Mapping[str, Any] | None = None,
     emit_native: bool = False,
     seed_product: str | Path | None = None,
     bootstrap_products: Iterable[str | Path] = (),
@@ -8008,6 +8034,12 @@ def compile_project_product(
     policy and never terminates the worker. Compiler workers have no
     coordinator-imposed memory or elapsed-time termination boundary.
     """
+
+    from .work_contract import (active_contract, with_expansion_policy,
+                                EXPANSION_ENV)
+    from .work_contract import expansion_policy as describe_expansion
+    effective_expansion = describe_expansion(with_expansion_policy(
+        active_contract(), expansion_policy or {}))
 
     source_file = Path(source_path).resolve()
     root = Path(directory).resolve()
@@ -8268,6 +8300,13 @@ def compile_project_product(
                 }, sort_keys=True),
             ))
         worker_environment = os.environ.copy()
+        for field, variable in EXPANSION_ENV.items():
+            value = effective_expansion[field]
+            if value is None:
+                worker_environment.pop(variable, None)
+            else:
+                worker_environment[variable] = str(value)
+
         if worker_memory_budget is not None:
             worker_environment["TURING_MEMORY_BUDGET_BYTES"] = str(
                 worker_memory_budget
@@ -8759,6 +8798,7 @@ def compile_project_product(
 
     manifest = {
         "schema": PROJECT_PRODUCT_SCHEMA,
+        "expansion_policy": effective_expansion,
         "source": source_file.as_posix(),
         "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "authored_source": authored_source_path.name,

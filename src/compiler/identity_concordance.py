@@ -3448,13 +3448,14 @@ class Reason:
     name: str
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(frozen=True, repr=False, slots=True)
 class Ref:
     """The full vector of one cell's location: page, row, column."""
 
     page: Page
     row: tuple
     column: int
+    _hash: int | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def key(self) -> tuple[str, tuple, int]:
@@ -3468,7 +3469,7 @@ class Ref:
         # Same rule as ``Page.__hash__``: frozen fields, hashed once.  A Ref
         # is a cell key's member wherever a row names a cell (field-state
         # rows, edge and dependents rows), so it is hashed on every stamp.
-        cached = self.__dict__.get("_hash")
+        cached = self._hash
         if cached is None:
             cached = hash((self.page, self.row, self.column))
             object.__setattr__(self, "_hash", cached)
@@ -3477,7 +3478,13 @@ class Ref:
     def __getstate__(self) -> dict:
         # The cached hash is this process's (string hashes are salted per
         # process); a pickled or copied instance recomputes it.
-        return {key: value for key, value in self.__dict__.items() if key != "_hash"}
+        return {"page": self.page, "row": self.row, "column": self.column}
+
+    def __setstate__(self, state):
+        # Old Ref pickles also carried a dict; ignore their process-salted hash.
+        for name in ("page", "row", "column"):
+            object.__setattr__(self, name, state[name])
+        object.__setattr__(self, "_hash", None)
 
 
 @dataclass(frozen=True)

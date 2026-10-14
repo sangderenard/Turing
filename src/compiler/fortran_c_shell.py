@@ -1867,64 +1867,76 @@ def _recover_late_source_pure_expressions(
 
 
 def _index_source_graph_spellings(
-    indexed: dict[str, Any],
+    indexed: dict[Any, Any],
     function_graph: Any,
     *symbols: Any,
 ) -> None:
-    """Index one graph by repository, local, and qualified source spellings."""
+    """Index exact authored identities and explicitly linked compiled symbols.
+
+    Local names are lexical bindings, never provenance keys. In particular,
+    neither function_name nor a suffix of qualified_name is an alias here.
+    """
 
     for symbol in (
         *symbols,
-        function_graph.graph.get("function_name"),
-        function_graph.graph.get("qualified_name"),
+        _source_graph_instance_key(function_graph.graph),
     ):
-        if symbol:
-            indexed.setdefault(str(symbol), function_graph)
+        if not symbol:
+            continue
+        incumbent = indexed.get(symbol)
+        if incumbent is not None and incumbent is not function_graph:
+            raise ValueError(f"conflicting source graphs for exact identity {symbol!r}")
+        indexed[symbol] = function_graph
 
 
-def _resolved_source_graphs_by_symbol(resolved_graph: Any) -> dict[str, Any]:
-    """Index final resolved function graphs by every authored symbol spelling.
+def _source_graph_instance_key(metadata: Mapping[str, Any]) -> Any:
+    """An authored definition plus its exact declared graph instance.
 
-    The whole-program wrapper owns the resolved project graph, while the
-    deployment helper has its own shell-to-symbol table. Final provenance
-    reconciliation must use the former rather than reaching into a helper's
-    local table. Function-table entries preserve both the local and qualified
-    authored names, so either repository-SSA spelling resolves to the same
-    exact post-reduction graph.
+    Pursuit may retain both the submitted definition and an imported view of
+    it. Their source identity agrees while their function-table references
+    and value-id spaces differ. Neither graph may win a source-name lookup.
     """
+    identity = metadata.get("authored_function_identity")
+    reference = metadata.get("source_function_reference", metadata.get("function_ref"))
+    if identity is None:
+        return None
+    return identity if reference is None else ("source-function-instance", identity, int(reference))
 
-    indexed: dict[str, Any] = {}
+
+def _resolved_source_graphs_by_symbol(resolved_graph: Any) -> dict[Any, Any]:
+    """Index resolved graphs by their complete authored identities only."""
+
+    indexed: dict[Any, Any] = {}
     for entry in getattr(resolved_graph, "function_table", ()):
         function_graph = getattr(getattr(entry, "graph", None), "G", None)
         if function_graph is None:
             continue
         _index_source_graph_spellings(
-            indexed,
-            function_graph,
-            getattr(entry, "name", None),
-            getattr(entry, "qualified_name", None),
+            indexed, function_graph,
+            (getattr(entry, "qualified_name", None)
+             if function_graph.graph.get("authored_function_identity") is None else None),
         )
     return indexed
 
 
 def _source_graph_for_lowered_function(
-    source_graphs: Mapping[str, Any],
+    source_graphs: Mapping[Any, Any],
     function_symbol: str,
     function: Any,
 ) -> Any | None:
-    """Resolve a specialized SSA function back to its authored graph."""
+    """Resolve exact authored provenance or an explicitly linked SSA symbol."""
 
-    source_symbol = str(
-        (getattr(function, "metadata", None) or {}).get(
-            "source_qualified_name"
-        )
-        or function_symbol
-    )
-    return (
-        source_graphs.get(str(function_symbol))
-        or source_graphs.get(source_symbol)
-        or source_graphs.get(source_symbol.rsplit(".", 1)[-1])
-    )
+    metadata = getattr(function, "metadata", None) or {}
+    for identity in (
+        _source_graph_instance_key(metadata),
+        metadata.get("source_qualified_name"),
+        function_symbol,
+    ):
+        if identity is not None:
+            graph = source_graphs.get(identity)
+            if graph is not None:
+                return graph
+    return None
 
 
 def _settle_nonlive_structural_shortfalls(
@@ -2162,6 +2174,16 @@ def _record_unplanned_callable_inputs(module: Any, source_graphs: Mapping[str, A
             binding = callee.get("attributes") or {}
             if binding.get("binding_kind") not in {"parameter", "closure"}:
                 continue
+            binding_name = str(binding.get("binding_name") or "")
+            value_contract = dict(
+                (graph.graph.get("parameter_value_abi") or {}).get(
+                    binding_name
+                ) or {}
+            )
+            declared_unresolved_callable = bool(
+                value_contract.get("storage") == "reference"
+                and "Callable" in str(value_contract.get("python_type") or "")
+            )
             # outer(callback).inner(): if callback is not None: callback()
             # retains the exact Call/callee edge but produces no PlanCall and
             # no SSA invocation. The call linker only visited PlanCalls, so
@@ -2171,7 +2193,7 @@ def _record_unplanned_callable_inputs(module: Any, source_graphs: Mapping[str, A
             record = SSACallRecord(
                 caller=str(symbol), callsite_id=int(node_id),
                 callee_reference=None, callee_symbol=None,
-                callee_name=str(binding.get("binding_name") or ""),
+                callee_name=binding_name,
             )
             records.append(record)
             sources.extend(_frame_call_cells(graph, int(node_id)))
@@ -2179,12 +2201,31 @@ def _record_unplanned_callable_inputs(module: Any, source_graphs: Mapping[str, A
                 "reason": "callable input has no planned or lowered invocation",
                 "callee_input_value_id": int(callee.get("value_id", callee_node_id)),
                 "binding_kind": str(binding["binding_kind"]),
+                "declared_unresolved_contract": declared_unresolved_callable,
+                **({
+                    "contract": value_contract,
+                } if declared_unresolved_callable else {}),
             }
         if len(records) != existing_count:
             module.call_table.assign(
                 str(symbol), records, sources=tuple(sources),
                 stage=FRAME_BINDING,
             )
+
+
+def _contract_input_binding_names(graph: Any) -> set[str]:
+    """Return authored parameters and closure variables exposed as inputs."""
+
+    names = set(map(str, graph.graph.get("function_parameters") or ()))
+    names.update(
+        str(attributes.get("binding_name"))
+        for _, data in graph.nodes(data=True)
+        for attributes in (data.get("attributes") or {},)
+        if str(data.get("type") or "") == "Input"
+        and attributes.get("binding_kind") in {"parameter", "closure"}
+        and attributes.get("binding_name")
+    )
+    return names
 
 
 def _record_module_closure_formals(
@@ -2277,10 +2318,11 @@ def _recover_module_late_source_literals(
         function_graph = _source_graph_for_lowered_function(
             source_graphs, str(function_symbol), function,
         )
-        literal_values = (
-            literal_catalogue.get(source_symbol)
-            or literal_catalogue.get(source_symbol.rsplit(".", 1)[-1])
+        literal_values = literal_catalogue.get(
+            _source_graph_instance_key(function.metadata or {})
         )
+        if literal_values is None:
+            literal_values = literal_catalogue.get(source_symbol)
         if function_graph is None and literal_values is None:
             continue
         rows = _recover_late_source_literals(
@@ -15740,13 +15782,11 @@ def _class_surface_ssa_program(
                 planned_graph.graph["parameter_record_abi"] = selected
         _lower_optional_record_presence_graph(planned_graph)
         if program_abi and not planned_graph.graph.get("parameter_value_abi"):
-            parameters = set(map(
-                str, planned_graph.graph.get("function_parameters") or ()
-            ))
+            value_bindings = _contract_input_binding_names(planned_graph)
             selected_values = {
                 str(binding.get("parameter")): dict(binding)
                 for binding in tuple(program_abi.get("values") or ())
-                if str(binding.get("parameter") or "") in parameters
+                if str(binding.get("parameter") or "") in value_bindings
                 and fnmatchcase(
                     str(function_name), str(binding.get("function") or "")
                 )
@@ -16614,14 +16654,12 @@ def _class_surface_ssa_program(
         )
         _lower_optional_record_presence_graph(graph_obj)
         if program_abi and not graph_obj.graph.get("parameter_value_abi"):
-            parameters = set(map(
-                str, graph_obj.graph.get("function_parameters") or ()
-            ))
+            value_bindings = _contract_input_binding_names(graph_obj)
             selected_values = {}
             for binding in tuple(program_abi.get("values") or ()):
                 parameter = str(binding.get("parameter") or "")
                 if (
-                    parameter in parameters
+                    parameter in value_bindings
                     and fnmatchcase(
                         str(function_name), str(binding.get("function") or "")
                     )
@@ -18103,14 +18141,7 @@ def _class_surface_ssa_program(
             return None
 
         annotation_dtypes: dict[str, str] = {}
-        function_identity = str(
-            graph_obj.graph.get("function_name") or function_name
-        )
-        authored_annotations = dict(
-            (
-                graph_obj.graph.get("function_parameter_annotations") or {}
-            ).get(function_identity, {})
-        )
+        authored_annotations = _current_authored_parameter_annotations(graph_obj)
         for parameter_name, annotation in authored_annotations.items():
             spelling = str(annotation).strip()
             dtype = {
@@ -19045,37 +19076,22 @@ def _class_surface_ssa_program(
                 None if function_reference is None
                 else int(function_reference)
             )
+            lowered_control.metadata["authored_function_identity"] = (
+                graph_obj.graph.get("authored_function_identity")
+            )
             lowered_control.metadata["source_qualified_name"] = (
                 str(qualified_name or function_name)
             )
-            numeric_scope = graph_obj.graph.get("source_numeric_scope")
-            if numeric_scope is not None:
-                lowered_control.metadata["source_numeric_scope"] = str(
-                    numeric_scope
-                )
+            from ..common.tensors.topological_reducer import _source_numeric_scope
+            lowered_control.metadata["source_numeric_scope"] = _source_numeric_scope(graph_obj)
             numeric_by_function = dict(
                 graph_obj.graph.get(
                     "function_parameter_numeric_descriptors"
                 ) or {}
             )
-            numeric_candidates = tuple(
-                dict(numeric_by_function[identity])
-                for identity in (
-                    str(qualified_name or ""), str(function_name),
-                )
-                if identity and identity in numeric_by_function
-            )
-            if numeric_candidates:
-                numeric_parameters = numeric_candidates[0]
-                if any(
-                    candidate != numeric_parameters
-                    for candidate in numeric_candidates[1:]
-                ):
-                    raise ValueError(
-                        "numeric parameter descriptor disagreement between "
-                        f"qualified and local identity for {function_name!r}: "
-                        f"{numeric_candidates!r}"
-                    )
+            authored_identity = graph_obj.graph.get("authored_function_identity")
+            numeric_parameters = numeric_by_function.get(authored_identity)
+            if numeric_parameters:
                 parameter_ids = {
                     str(name): int(value_id)
                     for name, value_id in lowered_control.metadata.get(
@@ -20404,33 +20420,12 @@ def _class_surface_ssa_program(
             if precision_boundary is None:
                 from .identity_concordance import current_identity_book
 
-                scope = str(
-                    graph.graph.get("function_name")
-                    or graph.graph.get("qualified_name")
-                    or symbol
-                )
+                from ..common.tensors.topological_reducer import _source_numeric_scope
+                scope = _source_numeric_scope(graph)
                 boundary_page = current_identity_book().page(
                     "source_precision_boundary_concordance"
                 )
                 boundary_fact = boundary_page.latest((scope, value_id))
-                if boundary_fact is None:
-                    parent_ids = {
-                        int(parent)
-                        for parent, _role in data.get("parents") or ()
-                    }
-                    candidates = tuple(dict.fromkeys(
-                        tuple(candidate)
-                        for row in boundary_page.rows()
-                        for candidate in (boundary_page.latest(row),)
-                        if isinstance(row, tuple)
-                        and len(row) == 2
-                        and int(row[1]) == value_id
-                        and isinstance(candidate, tuple)
-                        and len(candidate) == 3
-                        and int(candidate[1]) in parent_ids
-                    ))
-                    if len(candidates) == 1:
-                        boundary_fact = candidates[0]
                 if (
                     isinstance(boundary_fact, tuple)
                     and len(boundary_fact) == 3
@@ -44338,14 +44333,8 @@ def _lower_ast_source_to_ssa_impl(
         """Read propagated composite identities from exact formal Inputs."""
 
         selected: dict[str, dict[str, Any]] = {}
-        owner = str(function_graph.graph.get("method_owner") or "")
-        local_name = str(
-            function_graph.graph.get("source_numeric_scope")
-            or function_graph.graph.get("qualified_name")
-            or function_graph.graph.get("function_name")
-            or "<function>"
-        )
-        scope = f"{owner}.{local_name}" if owner else local_name
+        from ..common.tensors.topological_reducer import _source_numeric_scope
+        scope = _source_numeric_scope(function_graph)
         page = current_identity_book().page(
             "source_numeric_parameter_record_view_concordance"
         )
@@ -44501,6 +44490,7 @@ def _lower_ast_source_to_ssa_impl(
                     function_name
                 )
             )
+            value_bindings = _contract_input_binding_names(function_graph)
             selected_values = {
                 parameter: dict(receipt)
                 for parameter, receipt in
@@ -44512,7 +44502,7 @@ def _lower_ast_source_to_ssa_impl(
             selected_values.update({
                 parameter: binding.receipt()
                 for parameter, binding in values.items()
-                if parameter in parameters
+                if parameter in value_bindings
             })
             if selected_values:
                 function_graph.graph["parameter_value_abi"] = selected_values
@@ -44660,6 +44650,7 @@ def _lower_ast_source_to_ssa_impl(
                     function_name
                 )
             )
+            value_bindings = _contract_input_binding_names(function_graph)
             selected_values = {
                 parameter: dict(receipt)
                 for parameter, receipt in
@@ -44671,7 +44662,7 @@ def _lower_ast_source_to_ssa_impl(
             selected_values.update({
                 parameter: binding.receipt()
                 for parameter, binding in values.items()
-                if parameter in parameters
+                if parameter in value_bindings
             })
             if selected_values:
                 function_graph.graph["parameter_value_abi"] = selected_values
@@ -44754,6 +44745,8 @@ def _lower_ast_source_to_ssa_impl(
     # classes and closures are reference cycles, so say so to the collector
     # here rather than leaving them to the repository-SSA tail below.
     stage_end("ssa-source: deployment released")
+    from .work_contract import expansion_policy
+    module.metadata["expansion_policy"] = expansion_policy(work_contract)
     if numeric_specialization_receipts:
         module.metadata["numeric_source_specializations"] = tuple(
             dict(receipt) for receipt in numeric_specialization_receipts
@@ -44922,7 +44915,7 @@ def _lower_ast_source_to_ssa_impl(
                     map(str, context.get("operation_identities", ()))
                 ),
             })
-        unresolved_call_records = tuple(
+        all_unresolved_call_records = tuple(
             {
                 "caller": str(record.caller),
                 "callsite_id": int(record.callsite_id),
@@ -44937,11 +44930,22 @@ def _lower_ast_source_to_ssa_impl(
             for record in records
             if record.resolution == "unresolved"
         )
+        contracted_unresolved_call_records = tuple(
+            record
+            for record in all_unresolved_call_records
+            if record["diagnostic"].get("declared_unresolved_contract")
+        )
+        unresolved_call_records = tuple(
+            record
+            for record in all_unresolved_call_records
+            if not record["diagnostic"].get("declared_unresolved_contract")
+        )
         module.metadata["extraction_boundary_accounting"] = {
             "occurrences": extraction_boundaries,
             "materialized_identity_counts": materialized_identities,
             "boundary_transformations": tuple(boundary_transformations),
             "unmaterialized": tuple(unmaterialized_boundaries),
+            "contracted_unresolved_call_records": contracted_unresolved_call_records,
             "unresolved_call_records": unresolved_call_records,
             "repository_ssa_complete": not (
                 unmaterialized_boundaries or unresolved_call_records

@@ -41,6 +41,15 @@ def _contract_outer():
     return _contract_inner()
 
 
+def test_program_abi_table_row_retains_dynamic_span_rank():
+    contract = ExtractionContract(CONTRACT)
+    steps = contract.program_abi.records["CompilerFusedProgram"].fields["steps"]
+    assert steps.table_columns == (
+        {"name": "input_ids", "dtype": "int64", "rank": 1},
+        {"name": "result_id", "dtype": "int64"},
+    )
+
+
 def test_source_availability_is_probed_once_per_exact_definition(monkeypatch):
     import inspect
     contract = ExtractionContract(CONTRACT)
@@ -104,7 +113,7 @@ def test_default_contract_draws_python_native_and_decompile_lines():
     assert report.storage == "table"
     assert report.rank == 1
     assert report.mutable is True
-    assert report.table_columns == ({"name": "token", "dtype": "int64"},)
+    assert report.table_columns == ({"name": "token", "dtype": "int64", "rank": 0},)
     targets = contract.program_abi.records["Targets"]
     assert targets.fields["energy_exchange_fraction"].optional is True
     assert targets.fields["shadow_growth_max"].optional is True

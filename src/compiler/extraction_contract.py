@@ -483,9 +483,9 @@ class ProgramABIField:
                 columns.append({
                     "name": name,
                     "dtype": str(column_dtype),
+                    "rank": int(column_rank),
                     **({} if column_shape is None else {
                         "shape": tuple(map(int, column_shape)),
-                        "rank": int(column_rank),
                     }),
                     **({} if column_vocabulary is None else {
                         "token_vocabulary": tuple(map(str, column_vocabulary)),
@@ -830,17 +830,14 @@ class ProgramABIContract:
                     columns.append(column)
                     continue
                 if row_field.storage == "span":
-                    if row_field.shape is None:
-                        raise ExtractionContractError(
-                            "program_abi table row record "
-                            f"{record_name}.{field_name} requires an exact shape"
-                        )
-                    columns.append({
+                    column = {
                         "name": name,
                         "dtype": str(row_field.dtype),
-                        "shape": tuple(map(int, row_field.shape)),
-                        "rank": len(row_field.shape),
-                    })
+                        "rank": int(row_field.rank),
+                    }
+                    if row_field.shape is not None:
+                        column["shape"] = tuple(map(int, row_field.shape))
+                    columns.append(column)
                     continue
                 if row_field.storage == "record":
                     columns.extend(row_columns(

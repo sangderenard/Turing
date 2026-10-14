@@ -15,7 +15,9 @@ def test_boundary_plan_composes_existing_foundations_around_one_outer_target(tmp
     assert receipt["schema"] == BOOTSTRAP_SCHEMA
     assert receipt["strategy"] == STRATEGY
     assert receipt["semantic_authority"] == "python-coordinator-and-identity-book"
-    assert receipt["next_partition"] == by_name["process-graph-lowering"]
+    assert receipt["next_partition"] == by_name["provenance-core"]
+    assert receipt["outer_partition"] == by_name["process-graph-lowering"]
+    assert receipt["bootstrap_schedule"][0]["exclusive"] is True
     assert by_name["process-graph-lowering"]["entrypoint"] == (
         "_lower_process_graph_to_compilation"
     )
@@ -57,6 +59,8 @@ def test_build_submits_authored_pieces_then_whole_to_public_source_scheduler(
         build_whole_program_compiler,
     )
 
+    from src.compiler import compiler_bootstrap_runtime as runtime
+    monkeypatch.setattr(runtime, "ensure_native_provenance_core", lambda *a, **k: {"backend": "native"})
     observed = []
 
     def compile_partitioned(requests, **kwargs):
@@ -95,6 +99,8 @@ def test_build_uses_requested_bootstrap_memory_contract_by_default(
         build_whole_program_compiler,
     )
 
+    from src.compiler import compiler_bootstrap_runtime as runtime
+    monkeypatch.setattr(runtime, "ensure_native_provenance_core", lambda *a, **k: {"backend": "native"})
     observed = {}
 
     def compile_partitioned(requests, **kwargs):

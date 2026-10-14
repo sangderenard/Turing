@@ -373,7 +373,7 @@ def _record_numeric_annotation_descriptors(graph: Any) -> dict[str, Any]:
             if descriptor is not None:
                 described[str(parameter)] = descriptor.receipt()
         if described:
-            normalized[str(function_name)] = described
+            normalized[function_name] = described
     metadata["function_parameter_numeric_descriptors"] = normalized
 
     local = {}
@@ -414,7 +414,7 @@ def _concord_source_value_class(
 
     book = current_identity_book()
     page = book.page(SOURCE_VALUE_CLASS)
-    row = (str(scope), int(value_id))
+    row = (scope, int(value_id))
     proposed = (str(class_identity), max(int(precision_limbs or 1), 1))
     incumbent = page.latest(row)
     if incumbent is not None:
@@ -438,17 +438,26 @@ def _concord_source_value_class(
     return proposed
 
 
-def _source_numeric_scope(graph: Any, fallback: str = "<module>") -> str:
-    """Return the class-qualified identity of one reduced source function."""
+def _source_numeric_scope(graph: Any, fallback: str = "<module>") -> Any:
+    """Return an exact authored identity or a book-minted synthetic scope.
+
+    ``fallback`` is diagnostic text only. Local names and reconstructed
+    owner.name spellings must never identify concordance rows.
+    """
 
     target = getattr(graph, "G", graph)
-    metadata = getattr(target, "graph", {}) or {}
+    metadata = target.graph
     specialized = metadata.get("source_numeric_scope")
     if specialized is not None:
-        return str(specialized)
-    name = str(metadata.get("function_name") or fallback)
-    owner = metadata.get("method_owner")
-    return name if owner is None else f"{owner}.{name}"
+        return specialized
+    identity = metadata.get("authored_function_identity")
+    if identity is not None:
+        return tuple(identity)
+    scope = metadata.get("source_numeric_base_scope")
+    if scope is None:
+        scope = current_identity_book().mint_scope("synthetic numeric graph")
+        metadata["source_numeric_base_scope"] = scope
+    return scope
 
 
 def _post_source_span(node: Any, stage: Any = None) -> Any:
@@ -514,7 +523,7 @@ def post_scalar_parameter(
     if isinstance(statement_row, tuple):
         annotation_cell = book.latest_ref(
             _PARAMETER_ANNOTATION,
-            (statement_row[0], _source_numeric_scope(graph), str(name)),
+            (statement_row[0], statement_row[1], str(name)),
         )
     default_span = (
         None if annotation_cell is not None
@@ -772,14 +781,15 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             return value
         return repr(value)
 
-    authored_scope = str(
-        metadata.get("method_owner") or ""
-    )
-    function_name = str(metadata.get("function_name") or "<module>")
-    authored_scope = (
-        f"{authored_scope}.{function_name}"
-        if authored_scope else function_name
-    )
+    authored_scope = metadata.get("authored_function_identity")
+    if authored_scope is not None:
+        authored_scope = tuple(authored_scope)
+    else:
+        # Synthetic graphs retain their book-minted identity across copies.
+        authored_scope = metadata.get("source_numeric_base_scope")
+        if authored_scope is None:
+            authored_scope = current_identity_book().mint_scope("synthetic numeric graph")
+            metadata["source_numeric_base_scope"] = authored_scope
     parameter_classes = dict(metadata.get("planner_parameter_classes") or {})
     receipt = tuple(sorted(
         (str(name), stable(value))
@@ -789,7 +799,7 @@ def specialize_python_precision_widths(graph: Any) -> bool:
         for name, value in sorted(parameter_classes.items())
     )
     digest = hashlib.sha256(repr(receipt).encode("utf-8")).hexdigest()[:16]
-    scope = f"{authored_scope}#specialization:{digest}"
+    scope = (authored_scope, "specialization", digest)
     identity_page = current_identity_book().page(
         "source_numeric_specialization_concordance"
     )
@@ -841,7 +851,7 @@ def specialize_python_precision_widths(graph: Any) -> bool:
     class_page = current_identity_book().page(
         "source_value_class_concordance"
     )
-    if str(authored_scope) != scope:
+    if authored_scope != scope:
         for row in tuple(class_page.rows()):
             if (
                 isinstance(row, tuple) and len(row) == 2
@@ -1504,7 +1514,7 @@ def _concord_numeric_feature_projection(
     page = current_identity_book().page(
         "source_numeric_component_concordance"
     )
-    row = (str(scope), int(result_id))
+    row = (scope, int(result_id))
     fact = (
         int(receiver_id), str(attribute), tuple(map(str, component_path)),
         None if descriptor is None else descriptor.receipt(),
@@ -1533,7 +1543,7 @@ def _concord_source_precision_boundary(
     page = current_identity_book().page(
         "source_precision_boundary_concordance"
     )
-    row = (str(scope), int(value_id))
+    row = (scope, int(value_id))
     proposed = (
         str(boundary),
         int(operand_id),
@@ -4529,7 +4539,7 @@ def _normalize_lexical_values(
         if isinstance(statement_row, tuple):
             annotation_cell = current_identity_book().latest_ref(
                 _PARAMETER_ANNOTATION,
-                (statement_row[0], str(value_class_scope), str(name)),
+                (statement_row[0], statement_row[1], str(name)),
             )
         if name in scalar_parameters:
             # (i) a scalar annotation: DERIVED from the annotation row;
@@ -13326,7 +13336,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     (bool, bytes, complex, float, int, str),
                 ):
                     scalar_parameter_names.add(name)
+        definition_row = getattr(statement, "_turing_source_span_row", None)
         function_graph.G.graph.update(
+            authored_function_identity=(
+                tuple(definition_row if isinstance(statement, ast.Lambda) else definition_row[:2])
+                if definition_row is not None else None),
             function_ref=reference.address,
             function_name=function_table.entry(reference).name,
             source_pursuit_active=bool(

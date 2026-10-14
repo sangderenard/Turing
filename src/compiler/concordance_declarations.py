@@ -3111,7 +3111,7 @@ CALL_EDGE = declare_page("call_edge", (
 SOURCE_FUNCTION_REACHABILITY = declare_page(
     "source_function_reachability_concordance", (
         RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
-        RowField("callee_scope", K.NAME),
+        RowField("callee_scope", K.SCOPE),
     ), bool,
 )
 #: ``specialize_python_precision_widths``: the numeric scope a callsite

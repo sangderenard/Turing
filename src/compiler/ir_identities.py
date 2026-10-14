@@ -1987,17 +1987,16 @@ def lower_precision_operations(
     for name, function in functions.items():
         metadata = dict(getattr(function, "metadata", {}) or {})
         scopes = {
-            str(name),
-            str(metadata.get("source_qualified_name") or ""),
-            str(metadata.get("source_numeric_scope") or ""),
-        }
+            metadata.get("authored_function_identity"),
+            metadata.get("source_numeric_scope"),
+        } - {None}
         promoted_scalar_formals[str(name)] = {
             int(value_id)
             for row in promotion_page.rows()
             for fact in (promotion_page.latest(row),)
             if isinstance(row, tuple)
             and len(row) == 2
-            and str(row[0]) in scopes
+            and row[0] in scopes
             and isinstance(fact, tuple)
             and len(fact) == 3
             and str(fact[0]) == "promote"
@@ -3460,6 +3459,10 @@ def inline_host_linear_source_regions(functions) -> tuple[dict, tuple[dict, ...]
     exact formal/actual arity match, and no produced-ID collision in the caller.
     Anything less stays a call.  The receipt states every splice explicitly.
     """
+
+    from .work_contract import active_contract
+    if active_contract().functions.inline_depth == 0:
+        return dict(functions), ()
 
     view = dict(functions)
     calls_by_callee: dict[str, list[tuple[str, str, int, object]]] = {}
