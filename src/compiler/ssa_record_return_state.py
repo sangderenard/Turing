@@ -27,6 +27,21 @@ def function_scope_of(function):
     return str(metadata.get("tensor_shape_concordance_scope") or function.name)
 
 
+def accepted_ssa_component(function):
+    """A digest-pinned completed body imported by the SSA unit producer.
+
+    Its internal legalization and provenance belong to its original book;
+    enclosing units settle their own call edges, not this body's internals.
+    """
+    record = (getattr(function, "metadata", None) or {}).get("accepted_ssa_component")
+    if record is None:
+        return False
+    if (record.get("schema") != "turing.accepted-ssa-component.v1"
+            or not record.get("artifact_sha256") or record.get("identity_book") is None):
+        raise ValueError("accepted SSA body lacks its artifact and provenance owner")
+    return True
+
+
 def ssa_value_identity_cell(function, value_id, *, book=None):
     """The latest ``ssa_value`` cell of ``value_id`` in ``function``, or
     None when no pass has posted the value's identity.  ``book``: the book

@@ -39,6 +39,36 @@ def prune_unused_phis(function, protected_value_ids=()) -> tuple[int, ...]:
         removed.extend(sorted(dead))
 
 
+def record_constant_hoists(function, moves):
+    """Record exact old geometry at the constant mover, before mutation."""
+    if not moves:
+        return
+    from .concordance_declarations import CELL_SET, CONTROL_SSA_FINISH, SSA_CONSTANT_HOIST
+    from .identity_concordance import ConcordanceRefusal, Derived, Mode, current_identity_book
+    from .precompile_to_ssa import _post_ssa_block_geometry
+    from .ssa_record_return_state import function_scope_of, ssa_value_identity_cell
+    book = current_identity_book()
+    scope = function_scope_of(function)
+    geometry = _post_ssa_block_geometry(book, scope, function)
+    # One shared proof of the geometry actually scanned by the mover, rather
+    # than a dense all-block edge list for every constant it moves.
+    inputs = tuple(geometry.values())
+    proof_row = ((scope, str(function.name), "constant-hoist-geometry"), 0)
+    proof = book.latest_ref(CELL_SET, proof_row)
+    if proof is None or book.page(CELL_SET).latest(proof_row) != inputs:
+        proof = book.post(CELL_SET, proof_row, inputs,
+                          stage=CONTROL_SSA_FINISH, provenance=Derived(inputs), mode=Mode.REVISE)
+    for from_block, from_index, instruction, to_block, to_index in moves:
+        value_cell = ssa_value_identity_cell(function, instruction.res.id, book=book)
+        if value_cell is None or instruction.args:
+            raise ConcordanceRefusal(f"constant hoist %{instruction.res.id} lacks an operand-free recorded producer")
+        book.post(SSA_CONSTANT_HOIST,
+                  ((scope, str(function.name)), int(instruction.res.id),
+                   str(from_block), int(from_index), str(to_block), geometry[from_block]),
+                  (int(to_index), "operand_free_immutable_definition"),
+                  stage=CONTROL_SSA_FINISH, provenance=Derived((value_cell, proof)), mode=Mode.CONCORD)
+
+
 def hoist_nondominating_constants(function) -> tuple[dict[str, object], ...]:
     """Place unique operand-free constants before every reachable use.
 
@@ -134,6 +164,14 @@ def hoist_nondominating_constants(function) -> tuple[dict[str, object], ...]:
 
     if not candidates:
         return ()
+    insertion_index = 0
+    while (insertion_index < len(blocks[entry_name].instrs)
+           and str(blocks[entry_name].instrs[insertion_index].op).casefold() in {"const", "nonevalue"}
+           and not blocks[entry_name].instrs[insertion_index].args):
+        insertion_index += 1
+    record_constant_hoists(function, tuple(
+        (block_name, index, instruction, entry_name, insertion_index + offset)
+        for offset, (block_name, index, instruction) in enumerate(candidates)))
     for block_name, _index, instruction in candidates:
         blocks[block_name].instrs.remove(instruction)
     entry = blocks[entry_name]

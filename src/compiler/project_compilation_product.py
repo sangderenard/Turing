@@ -114,6 +114,7 @@ def compiler_toolchain_fingerprint() -> dict[str, Any]:
         "src/compiler/concordance_declarations.py",
         "src/compiler/__init__.py",
         "src/compiler/compiler_bootstrap_runtime.py",
+        "src/compiler/compiler_source_tree.py",
         "src/compiler/whole_program_compiler_bootstrap.py",
         "src/compiler/work_contract.py",
         "src/compiler/memory_regulation.py",
@@ -335,7 +336,8 @@ class ProjectCompilationProduct:
         )
         authored = (
             property_descriptor.fget
-            if property_descriptor is not None else getattr(owner, attribute)
+            if property_descriptor is not None else descriptor.__func__
+            if isinstance(descriptor, (staticmethod, classmethod)) else getattr(owner, attribute)
         )
         if authored is None:
             raise ValueError(f"property {name!r} has no authored getter")
@@ -378,6 +380,14 @@ class ProjectCompilationProduct:
                 property_descriptor.fdel,
                 property_descriptor.__doc__,
             ))
+            return installed
+
+        if isinstance(descriptor, (staticmethod, classmethod)):
+            installed = deployed_with_authored_fallback(
+                authored, deployed_callable, identity=name,
+                targeted=bool(targeted_source_fallback),
+            )
+            setattr(owner, attribute, type(descriptor)(installed))
             return installed
 
         return install_authored_deployment(
@@ -607,6 +617,8 @@ class ProjectCompilationProduct:
         deployed.__turing_native_verification__ = verification
         deployed.__turing_native_library__ = library
         deployed.__turing_native_runtime_handles__ = tuple(runtime_handles)
+        deployed.__turing_native_route_counts__ = route_counts
+        _attach_native_interface_piece(self, name, deployed)
         return deployed
 
     def verify_native_sequence_callable(
@@ -2141,6 +2153,129 @@ def open_project_compilation_product(
     )
 
 
+def _attach_native_interface_piece(product, name, deployed):
+    """Expose the same accepted buffer symbol to subsequent source ingestion."""
+    from .compiled_program_api import load_api
+    from .ssa_llvm_backend import LLVMFunctionArtifact
+    link = product.links[name]
+    api = load_api(product.root / link["native_api"])
+    piece = (api.get("metadata") or {}).get("native_piece_interface")
+    if piece is None:
+        return
+    if _file_sha256(product.root / link["artifact"]) != link["artifact_sha256"]:
+        raise ValueError("native callable SSA declaration artifact changed")
+    module, outputs, exports = product.load_repository_ssa(name)
+    root = module.functions[link["native_entrypoint"]]
+    if tuple(exports) != (root.name,):
+        raise ValueError("native callable interface has an ambiguous root export")
+    published = tuple(outputs[root.name])
+    if tuple(piece["argument_ids"]) != tuple(int(value.id) for value in root.args) or tuple(
+            piece["output_ids"]) != tuple(int(value.id) for value in published):
+        raise ValueError("native callable interface drifted from its accepted SSA boundary")
+    artifact = LLVMFunctionArtifact(
+        name=piece["symbol"], llvm_ir=f'declare void @{piece["symbol"]}(ptr, ptr)\n',
+        buffer_order=tuple(piece["buffer_order"]), buffer_shapes=tuple(map(tuple, piece["buffer_shapes"])),
+        buffer_dtypes=tuple(piece["buffer_dtypes"]), extent_order=(), shortfalls=(),
+        linked_objects=((str((product.root / link["native_library"]).resolve()),
+                         _file_sha256(product.root / link["native_library"])),),
+    )
+    deployed.artifact = artifact
+    deployed.argument_names = tuple(piece["argument_names"])
+    deployed.argument_ids = tuple(piece["argument_ids"])
+    deployed.output_names = ("result",)
+    deployed.output_ids = {"result": int(published[0].id)}
+    deployed.constant_outputs = {}
+    deployed.module, deployed.entry, deployed.outputs = module, root.name, outputs
+    deployed.native_return_container_kind = "scalar"
+
+
+def publish_native_interface_product(source_path, source_module, unit_root, directory):
+    """Publish a completed native unit through the ordinary Python callable ABI.
+
+    This is a general source product seam. Provenance bootstrap deliberately
+    does not install these interiors before its complete module is ready.
+    """
+    from dataclasses import replace
+    from .compiled_program_api import CompiledProgramAPI, describe_fortran_function
+    from .ssa_c_backend import emit_ssa_module_to_c
+    source_file, unit_root, root = Path(source_path).resolve(), Path(unit_root).resolve(), Path(directory).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    source = source_file.read_text(encoding="utf-8")
+    receipt = json.loads((unit_root / "unit.json").read_text())
+    interface = receipt.get("native_interface")
+    if not interface or not receipt.get("repository_ssa_complete"):
+        raise ValueError("Python callable publication requires a complete native unit interface")
+    interface_path = unit_root / interface["artifact"]
+    if _file_sha256(interface_path) != interface["sha256"]:
+        raise ValueError("Python callable publication native interface changed")
+    module, outputs, exports = _load_native_unit_interface(interface_path)
+    links, frontiers = [], []
+    for symbol in exports:
+        function = module.functions[symbol]
+        name = function.metadata["source_qualified_name"]
+        try:
+            published = tuple(outputs[symbol])
+            values = (*function.args, *published)
+            if len(published) != 1 or any(value.shape for value in values):
+                raise ValueError("automatic callable publication needs a declared scalar ABI")
+            parameters = {int(value_id): str(parameter) for parameter, value_id
+                          in function.metadata.get("parameter_names", ())}
+            native_name = native_unit_name(name)
+            description = describe_fortran_function(native_name, function, outputs=published, source_names=parameters)
+            if any(parameter.role not in {"input", "output"} for parameter in description.parameters):
+                raise ValueError("native callable boundary has shared storage or workspace formals")
+            artifact = emit_ssa_module_to_c(module, symbol, entry_name=native_name + "_buffers")
+            if artifact.extent_order or not artifact.complete:
+                raise ValueError("native callable buffer interface is incomplete or needs runtime extents")
+            formals = ", ".join(parameter.c_type + (" *" if parameter.passing == "reference" else " ")
+                                + parameter.name for parameter in description.parameters)
+            by_id = {int(value.id): parameter for value, parameter
+                     in zip(values, description.parameters, strict=True)}
+            if set(artifact.buffer_order) != set(by_id):
+                raise ValueError("native callable has unpublished buffer identities")
+            pointers = ", ".join(("(void *)" if by_id[value_id].passing == "reference" else "(void *)&")
+                                 + by_id[value_id].name for value_id in artifact.buffer_order)
+            bridge = (f'\nvoid {native_name}({formals}) {{\n'
+                      f'  void *buffers[] = {{{pointers}}};\n'
+                      f'  int64_t extents[1] = {{0}};\n'
+                      f'  {artifact.name}(buffers, extents);\n}}\n')
+            native_root = root / "native" / native_name
+            artifact = replace(artifact, source=artifact.source + bridge)
+            artifact.compile(native_root)
+            api = CompiledProgramAPI(native_name, "c", native_name, (description,), metadata={
+                "native_piece_interface": {"symbol": artifact.name,
+                    "buffer_order": artifact.buffer_order, "buffer_shapes": artifact.buffer_shapes,
+                    "buffer_dtypes": artifact.buffer_dtypes,
+                    "argument_names": [parameters[int(value.id)] for value in function.args],
+                    "argument_ids": [int(value.id) for value in function.args],
+                    "output_ids": [int(value.id) for value in published]},
+            })
+            api_path = api.write(native_root / "api.yaml")
+            artifact_path = root / (native_name + ".pkl")
+            _dump_pickle_artifact(artifact_path, (module, {symbol: published}, (symbol,)))
+            links.append({"qualified_name": name, "source_module": source_module,
+                          "authored_source_sha256": authored_definition_sha256(source, name),
+                          "artifact": artifact_path.name, "exports": [symbol],
+                          "artifact_sha256": _file_sha256(artifact_path),
+                          "native_entrypoint": symbol, "native_api": str(api_path.relative_to(root)),
+                          "native_library": str(artifact.library_path.relative_to(root))})
+            # API entry identity is the exact repository root; the exported C
+            # symbol is independently carried by its descriptor.
+            api = replace(api, entry=symbol, entry_points=(replace(description, name=symbol),))
+            api.write(api_path)
+        except Exception as error:
+            frontiers.append({"qualified_name": name, "error": f"{type(error).__name__}: {error}"})
+    manifest = {"schema": PROJECT_PRODUCT_SCHEMA, "source": str(source_file),
+                "source_sha256": _file_sha256(source_file), "units": [],
+                "native_publication_frontiers": frontiers,
+                "native_unit_interface": {"path": str(interface_path), "sha256": interface["sha256"]}}
+    _atomic_json(root / "manifest.json", manifest)
+    _atomic_json(root / "links.json", {"schema": LINK_TABLE_SCHEMA, "links": links})
+    manifest["automatic_native_verification"] = list(verify_project_units_automatically(root))
+    _atomic_json(root / "manifest.json", manifest)
+    return manifest
+
+
 def _resolve_product_callable(
     source_module: str,
     qualified_name: str,
@@ -2148,13 +2283,20 @@ def _resolve_product_callable(
     """Resolve an authored module/class callable without executing a project."""
 
     if ".<locals>." in str(qualified_name):
-        raise ValueError("lexically nested callables have no importable owner")
+        from types import SimpleNamespace
+        from .compiler_source_tree import nested_authored_callable
+        module = importlib.import_module(str(source_module))
+        authored = nested_authored_callable(module, str(qualified_name))
+        return SimpleNamespace(**{str(qualified_name).rsplit(".", 1)[-1]: authored}), authored
     module = importlib.import_module(str(source_module))
     parts = str(qualified_name).split(".")
     owner: Any = module
     for component in parts[:-1]:
         owner = getattr(owner, component)
-    callable_value = getattr(owner, parts[-1])
+    import inspect
+    descriptor = inspect.getattr_static(owner, parts[-1])
+    callable_value = (descriptor.__func__ if isinstance(descriptor, (staticmethod, classmethod))
+                      else getattr(owner, parts[-1]))
     if not callable(callable_value):
         raise TypeError(f"authored target {qualified_name!r} is not callable")
     return owner, callable_value
@@ -3175,6 +3317,53 @@ def authored_call_dependencies(
         name: tuple(sorted(dependency_graph.get(name, set()) & selected_set))
         for name in selected
     }
+
+
+def authored_compilation_growth_plan(source: str) -> dict[str, Any]:
+    """Cheap triage before graph ingestion; never an authority for ABI cuts.
+
+    Use the existing authored catalogue and dependency resolver, including
+    exact lexical containment. The resolved FunctionTable later owns the
+    actual cut decisions. AST-node counts expose large source cones without
+    first deploying the very code whose complexity is being diagnosed.
+    """
+    import networkx as nx
+    from .compilation_units import compilation_growth_priorities
+    definitions = _authored_definitions(source)
+    names = tuple(call.qualified_name for call in discover_authored_calls(source))
+    dependencies = authored_call_dependencies(source, names)
+    graph = nx.DiGraph()
+    graph.add_nodes_from(names)
+    graph.add_edges_from((name, dependency) for name, children in dependencies.items()
+                         for dependency in children)
+    for name in names:
+        if ".<locals>." in name:
+            parent = name.rsplit(".<locals>.", 1)[0]
+            if parent in graph:
+                graph.add_edge(parent, name)
+    components = sorted((tuple(sorted(component)) for component in nx.strongly_connected_components(graph)))
+    condensed = nx.condensation(graph, components)
+    order = list(reversed(list(nx.lexicographical_topological_sort(condensed))))
+    positions = {component: index for index, component in enumerate(order)}
+
+    def own_nodes(node):
+        count = 1
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            count += own_nodes(child)
+        return count
+
+    units = [{"qualified_names": list(components[component]),
+              "dependency_units": sorted(positions[child] for child in condensed.successors(component)),
+              "source_nodes": sum(own_nodes(definitions[name].node) for name in components[component]),
+              "recursive": len(components[component]) > 1 or any(graph.has_edge(name, name)
+                                                                  for name in components[component])}
+             for component in order]
+    return {"schema": "turing.authored-compilation-growth-triage.v1",
+            "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "cost_basis": "authored-ast-nodes-estimate", "cut_authority": "resolved-function-table",
+            "units": units, "growth_priorities": list(compilation_growth_priorities(units))}
 
 
 def compilation_creep_frontier(
@@ -4705,20 +4894,51 @@ def project_process_graph_acceptance(graph, references, book=None):
             for declared in fields(value):
                 visit(getattr(value, declared.name))
 
+    owner = book or graph.G.graph.get("compilation_unit_identity_book") or current_identity_book()
+    from .concordance_declarations import CANONICAL_VALUE, INGESTION_VALUE, FUNCTION_ADDRESS, NAME_BINDING, SCOPE_REGISTRY, SCOPE_ORIGIN
+    from ..common.tensors.topological_reducer import node_ingestion_scopes
     for reference in references:
-        body = graph.function_table.entry(int(reference)).graph
+        entry = graph.function_table.entry(int(reference))
+        body = entry.graph
         if body is None:
             continue
         visit(body.G.graph)
         for _node_id, data in body.G.nodes(data=True):
             visit(data)
-    owner = book or graph.G.graph.get("compilation_unit_identity_book") or current_identity_book()
+        # Numeric identity lookups are acceptance roots too. A graph's
+        # canonical IDs and a declaration's function address contain no Ref
+        # object for the generic visitor to discover. Dropping these cells
+        # made workers fabricate unsourced ingestion rows after relabeling.
+        scope = body.G.graph.get("lexical_read_scope")
+        if scope is not None and body.G.graph.get("canonical_value_ids"):
+            for node_id in body.G:
+                cell = owner.latest_ref(CANONICAL_VALUE, (scope, int(node_id)))
+                if cell is not None:
+                    roots.add(cell)
+        for ingestion_scope in node_ingestion_scopes(body):
+            for page, row in ((SCOPE_REGISTRY, ingestion_scope), (SCOPE_ORIGIN, (ingestion_scope,))):
+                cell = owner.latest_ref(page, row)
+                if cell is not None:
+                    roots.add(cell)
+            bindings = owner.pages.get(NAME_BINDING.name)
+            if bindings is not None:
+                for row in bindings.scope_rows(ingestion_scope):
+                    cell = owner.latest_ref(NAME_BINDING, row)
+                    if cell is not None:
+                        roots.add(cell)
+            for node_id in body.G:
+                cell = owner.latest_ref(INGESTION_VALUE, (ingestion_scope, int(node_id)))
+                if cell is not None:
+                    roots.add(cell)
+        address = owner.latest_ref(FUNCTION_ADDRESS, (str(entry.qualified_name),))
+        if address is not None:
+            roots.add(address)
     return owner.project_cells(roots)
 
 
 def _dump_scoped_resolved_process_graph(
     graph: Any, units: Sequence[Mapping[str, Any]], unit_index: int, stream: Any,
-    *, interface_tiles: bool = False,
+    *, interface_tiles: bool = False, ssa_composition: bool = False,
 ) -> dict[str, Any]:
     """Write a worker cut without copying or serializing excluded graph bodies.
 
@@ -4732,7 +4952,7 @@ def _dump_scoped_resolved_process_graph(
     from ..transmogrifier.graph.graph_express2 import ProcessGraph
 
     references = (tuple(map(int, units[unit_index]["function_references"]))
-                  if interface_tiles else _resolved_unit_references(units, unit_index))
+                  if interface_tiles or ssa_composition else _resolved_unit_references(units, unit_index))
     retained = set(references)
     table = graph.function_table
     source_bodies = {id(entry.graph): entry.graph for entry in table
@@ -4767,6 +4987,7 @@ def _dump_scoped_resolved_process_graph(
     receipt = {
         "unit_index": int(unit_index),
         "interface_tiles": bool(interface_tiles),
+        "ssa_composition": bool(ssa_composition),
         "function_references": list(references),
         "source_nodes": sum(len(table.entry(ref).graph.G) for ref in references),
         "project_source_nodes": sum(len(body.G) for body in source_bodies.values()),
@@ -4806,11 +5027,14 @@ def _dump_scoped_resolved_process_graph(
 def publish_resolved_process_graph_inputs(
     graph: Any, plan: Mapping[str, Any], directory: str | Path,
     *, max_unit_source_nodes: int | None = None, interface_tiles: bool = False,
+    ssa_composition: bool = False,
 ) -> dict[str, Any]:
     """Stream one immutable input per SCC; retain no list of graph copies."""
     root = Path(directory).resolve()
+    if interface_tiles and ssa_composition:
+        raise ValueError("choose SSA composition or native interface tiles, not both")
     root.mkdir(parents=True, exist_ok=True)
-    if interface_tiles:
+    if interface_tiles or ssa_composition:
         from .compilation_units import native_interface_coupling_edges, plan_compilation_units
         coupling = native_interface_coupling_edges(graph.function_table)
         if coupling:
@@ -4826,7 +5050,7 @@ def publish_resolved_process_graph_inputs(
     inputs = []
     for index in range(len(units)):
         references = (tuple(map(int, units[index]["function_references"]))
-                      if interface_tiles else _resolved_unit_references(units, index))
+                      if interface_tiles or ssa_composition else _resolved_unit_references(units, index))
         nodes = sum(len(graph.function_table.entry(ref).graph.G) for ref in references)
         if max_unit_source_nodes is not None and nodes > int(max_unit_source_nodes):
             # Do not serialize a giant dependency closure and then discover
@@ -4839,12 +5063,28 @@ def publish_resolved_process_graph_inputs(
         temporary = path.with_suffix(".pkl.tmp")
         with temporary.open("wb") as stream:
             receipt = _dump_scoped_resolved_process_graph(
-                graph, units, index, stream, interface_tiles=interface_tiles)
+                graph, units, index, stream, interface_tiles=interface_tiles, ssa_composition=ssa_composition)
         os.replace(temporary, path)
         inputs.append({**receipt, "path": path.as_posix(),
                        "sha256": _file_sha256(path), "bytes": path.stat().st_size})
     result = {**dict(plan), "scoped_inputs": inputs,
-              "max_unit_source_nodes": max_unit_source_nodes, "interface_tiles": interface_tiles}
+              "max_unit_source_nodes": max_unit_source_nodes, "interface_tiles": interface_tiles,
+              "ssa_composition": bool(ssa_composition)}
+    if ssa_composition:
+        from types import SimpleNamespace
+        # This is the frozen table itself with completed frontend bodies
+        # removed, not a table reconstructed from names or signature slots.
+        table = copy.copy(graph.function_table)
+        table._entries = {}
+        for reference, entry in graph.function_table._entries.items():
+            copied = copy.copy(entry)
+            copied.metadata = dict(entry.metadata)
+            copied.implementations = dict(entry.implementations)
+            table._entries[reference] = copied
+        detach_repository_ssa_frontend(SimpleNamespace(function_table=table, metadata={}))
+        header_path = root / "source-function-table.pkl"
+        _dump_pickle_artifact(header_path, table)
+        result["source_function_table"] = {"path": str(header_path), "sha256": _file_sha256(header_path)}
     _atomic_json(root / "plan.json", result)
     return result
 
@@ -5007,6 +5247,8 @@ def compile_partitioned_source(
     worker_elastic_available_percent: int = 75,
     max_unit_source_nodes: int = 4096,
     interface_tiles: bool = False,
+    ssa_composition: bool = False,
+    plan_only: bool = False,
     source_options: Mapping[str, Any] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -5019,6 +5261,9 @@ def compile_partitioned_source(
     native image. In interface_tiles mode only an SCC body is resident; calls
     import accepted native declarations/objects. Unsupported interfaces refuse.
     The legacy mode retains exact authored dependency closures.
+    ``plan_only`` releases planning state and returns frozen input paths without
+    launching workers. The resolved-plan scheduler can resume those paths in
+    bounded stages via ``max_stage_units``.
     """
     from .fortran_c_shell import lower_ast_source_to_ssa
     if isinstance(max_unit_source_nodes, bool) or not isinstance(max_unit_source_nodes, int) or max_unit_source_nodes < 1:
@@ -5077,6 +5322,7 @@ def compile_partitioned_source(
                     "resolved_process_graph_sha256": _file_sha256(graph_path)}, plan_path.parent,
             max_unit_source_nodes=max_unit_source_nodes,
             interface_tiles=interface_tiles,
+            ssa_composition=ssa_composition,
         )
 
     lower_ast_source_to_ssa(
@@ -5095,6 +5341,10 @@ def compile_partitioned_source(
     gc.collect()
     if progress is not None:
         progress({"stage": "source_plan_released", "unit_count": len(plans[0]["units"])})
+    if plan_only:
+        return {"resolved_process_graph": graph_path.as_posix(),
+                "process_graph_unit_plan": plan_path.as_posix(),
+                "plan": plans[0]}
     return compile_resolved_process_graph_plan(
         graph_path, plan_path, root / "product", jobs=jobs,
         schedule_mode=schedule_mode,
@@ -5107,6 +5357,72 @@ def compile_partitioned_source(
         worker_elastic_available_percent=worker_elastic_available_percent,
         progress=progress,
     )
+
+
+def load_composed_source_units(manifest):
+    """Assemble maximal SSA enclosures with the existing repository composer."""
+    from .precompile_to_ssa import merge_repository_ssa_modules
+    from .identity_concordance import CorrelationTable, _UNSOURCED_KINDS
+    if manifest.get("pending_unit_indices"):
+        raise ValueError("SSA enclosure assembly requires all unit stages to finish")
+    plan_path = Path(manifest["process_graph_unit_plan"])
+    if _file_sha256(plan_path) != manifest["process_graph_unit_plan_sha256"]:
+        raise ValueError("SSA enclosure assembly plan digest changed")
+    plan = json.loads(plan_path.read_text())
+    if not plan.get("ssa_composition"):
+        raise ValueError("source product was not compiled by SSA composition")
+    if changed_compiler_toolchain_files(plan["compiler_toolchain"]):
+        raise ValueError("SSA enclosure assembly compiler toolchain changed")
+    units = plan["units"]
+    records = {record["unit_index"]: record for record in manifest["units"]}
+    if set(records) != set(range(len(units))) or any(not record.get("repository_ssa_complete")
+                                                   for record in records.values()):
+        raise ValueError("SSA enclosure assembly contains an incomplete source unit")
+    interior_units = {int(dependency) for unit in units for dependency in unit["dependency_units"]}
+    enclosures = [index for index in range(len(units)) if index not in interior_units]
+    modules, outputs = [], {}
+    header = plan["source_function_table"]
+    header_path = Path(header["path"])
+    if _file_sha256(header_path) != header["sha256"]:
+        raise ValueError("canonical source function table changed")
+    canonical_table = _load_pickle_artifact(header_path)
+    requested = plan.get("source_entrypoint_reference")
+    export_references = {record["function_reference"]: record["ssa_function"]
+                         for receipt in records.values() for record in receipt["repository_ssa_accounting"]}
+    for index in enclosures:
+        receipt = records[index]
+        if receipt["process_graph_unit_plan_sha256"] != manifest["process_graph_unit_plan_sha256"]:
+            raise ValueError("SSA enclosure belongs to a different source plan")
+        path = plan_path.parent.parent / "product/units" / f"unit_{index:03d}" / receipt["artifact"]
+        if _file_sha256(path) != receipt["artifact_sha256"]:
+            raise ValueError("SSA enclosure artifact digest changed")
+        module, published, _exports = _load_pickle_artifact(path)
+        # Unit copies carry local completion receipts, but their addresses
+        # belong to this one frozen source table. Rebind that exact owner only
+        # after checking every reference's declaration and parameter contract.
+        for entry in module.function_table:
+            original = canonical_table.entry(entry.reference)
+            if (entry.name, entry.qualified_name, entry.parameter_contracts, entry.recursive) != (
+                    original.name, original.qualified_name, original.parameter_contracts, original.recursive):
+                raise ValueError("composed SSA function declaration drifted from its frozen owner")
+        module.function_table = canonical_table
+        modules.append(module)
+        for name, values in published.items():
+            if name in outputs and outputs[name] != values:
+                raise ValueError(f"conflicting composed SSA output identities: {name}")
+            outputs[name] = values
+    if not modules:
+        raise ValueError("SSA enclosure assembly has no complete roots")
+    module = merge_repository_ssa_modules(modules[0], *modules[1:])
+    exports = tuple(export_references.values()) if requested is None else (export_references[int(requested)],)
+    if any(name not in module.functions for name in exports):
+        raise ValueError("SSA composition lost an authored export identity")
+    module.metadata["composed_source_product"] = dict(manifest)
+    findings = [finding for finding in CorrelationTable.build(module).findings(module)
+                if finding.kind not in _UNSOURCED_KINDS]
+    if findings:
+        raise ValueError(f"composed SSA concordance refused: {findings[:3]}")
+    return module, outputs, exports
 
 
 def _publish_native_unit_interface(module, outputs, exports, root, unit_index):
@@ -5933,6 +6249,7 @@ def _compile_resolved_process_graph_unit_impl(
     root.mkdir(parents=True, exist_ok=True)
     plan = json.loads(unit_plan_path.read_text(encoding="utf-8"))
     interface_tiles = bool(plan.get("interface_tiles"))
+    ssa_composition = bool(plan.get("ssa_composition"))
     if plan.get("schema") != "turing.compilation-unit-plan.v1":
         raise ValueError("unsupported ProcessGraph compilation-unit plan")
     pinned_toolchain = plan.get("compiler_toolchain")
@@ -5971,7 +6288,7 @@ def _compile_resolved_process_graph_unit_impl(
         if int(scoped.get("unit_index", -1)) != selected_index:
             raise ValueError("scoped input unit identity disagrees with plan")
         if tuple(map(int, scoped.get("function_references") or ())) != (
-            references if interface_tiles else _resolved_unit_references(units, selected_index)
+            references if interface_tiles or ssa_composition else _resolved_unit_references(units, selected_index)
         ):
             raise ValueError("scoped input dependency closure disagrees with plan")
         input_path = Path(scoped["path"]).resolve()
@@ -6004,6 +6321,9 @@ def _compile_resolved_process_graph_unit_impl(
             interface_tiles and dependency_receipt.get("native_interface")
             and dependency_receipt.get("repository_ssa_complete")
             and dependency_receipt.get("process_graph_unit_plan_sha256") == _file_sha256(unit_plan_path)
+        ) and not (
+            ssa_composition and dependency_receipt.get("repository_ssa_complete")
+            and dependency_receipt.get("process_graph_unit_plan_sha256") == _file_sha256(unit_plan_path)
         ):
             raise ValueError(
                 f"resolved unit {int(dependency_index)} is not verified and "
@@ -6018,11 +6338,36 @@ def _compile_resolved_process_graph_unit_impl(
         ))
         native_interface = dependency_receipt.get("native_interface") if interface_tiles else None
         artifact = dependency_root / str((native_interface or {}).get("artifact") or dependency_receipt["artifact"])
+        if ssa_composition and _file_sha256(artifact) != dependency_receipt["artifact_sha256"]:
+            raise ValueError("composed dependency SSA digest disagrees with receipt")
         if native_interface and _file_sha256(artifact) != native_interface["sha256"]:
             raise ValueError("native interface digest disagrees with receipt")
         dependency_module, dependency_outputs, stored_exports = (
             _load_native_unit_interface(artifact) if native_interface else _load_pickle_artifact(artifact)
         )
+        if ssa_composition:
+            from .identity_concordance import CorrelationTable
+            findings = CorrelationTable.build(dependency_module).findings(dependency_module)
+            if findings:
+                raise ValueError(f"SSA dependency lacks complete provenance: {findings[:3]}")
+            owner_book = dependency_module.metadata.get("identity_book")
+            if owner_book is None:
+                raise ValueError("accepted SSA dependency has no provenance owner")
+            for function in dependency_module.functions.values():
+                function_book = (function.metadata.get("accepted_ssa_component") or {}).get("identity_book", owner_book)
+                from .concordance_declarations import SSA_VALUE
+                from .ssa_record_return_state import function_scope_of
+                missing = [int(value.id) for value in (
+                    *function.args, *(instruction.res for block in function.blocks.values()
+                                      for instruction in block.instrs if instruction.res is not None))
+                    if function_book.latest_ref(SSA_VALUE, (function_scope_of(function), int(value.id))) is None]
+                if missing:
+                    raise ValueError(f"SSA dependency {function.name} lost its value producers: {missing[:3]}")
+                function.metadata.setdefault("accepted_ssa_component", {
+                    "schema": "turing.accepted-ssa-component.v1",
+                    "artifact_sha256": dependency_receipt["artifact_sha256"],
+                    "unit_index": int(dependency_index), "identity_book": owner_book,
+                })
         if native_interface:
             from .identity_concordance import CorrelationTable, _UNSOURCED_KINDS
             findings = [f for f in CorrelationTable.build(dependency_module).findings(dependency_module)
@@ -6075,11 +6420,11 @@ def _compile_resolved_process_graph_unit_impl(
         for reference in units[dependency_index].get("function_references") or ()
         if int(reference) not in linked_repository_ssa
     }))
-    if interface_tiles:
+    if interface_tiles or ssa_composition:
         direct_dependencies = {int(ref) for index in selected.get("dependency_units", ())
                                for ref in units[int(index)]["function_references"]}
         if direct_dependencies - set(linked_repository_ssa):
-            raise ValueError("native tile lacks an accepted dependency interface; authored expansion forbidden")
+            raise ValueError("source enclosure lacks a complete dependency product; authored expansion forbidden")
         authored_dependency_references = ()
     artifact_name = encoded_call_name("__".join(qualified_names))
     tensor_input = plan.get("tensor_repository_input")
@@ -6122,6 +6467,10 @@ def _compile_resolved_process_graph_unit_impl(
         # publishing every specialized copy made a reference -> ABI ambiguous.
         exports = tuple(symbol for symbol in exports
                         if not module.functions[str(symbol)].metadata.get("source_callsite_variant"))
+    if ssa_composition:
+        exports = tuple(symbol for symbol in exports
+                        if module.functions[str(symbol)].metadata.get("source_function_reference") in references
+                        and not module.functions[str(symbol)].metadata.get("source_callsite_variant"))
     unit_accounting = []
     if plan.get("source_concordance"):
         module.metadata["source_concordance_archive"] = dict(plan["source_concordance"])
@@ -6309,7 +6658,7 @@ def _compile_resolved_process_graph_unit_impl(
     compiled_complete = all(
         record["complete"] for record in unit_accounting
     )
-    if interface_tiles:
+    if interface_tiles or ssa_composition:
         from .glsl_deployment_strategy import _authored_output_paths
         for export_name in exports:
             function = module.functions[str(export_name)]
@@ -6353,6 +6702,14 @@ def _compile_resolved_process_graph_unit_impl(
                 raise ValueError(f"native result layout disagrees with accepted SSA: {export_name}: {paths} != {published_ids}")
             function.metadata["native_output_paths"] = tuple(paths.items())
             function.metadata["native_return_container_kind"] = kind
+            if ssa_composition:
+                function.metadata["repository_ssa_signature"] = {
+                    "schema": "turing.repository-ssa-call-signature.v1",
+                    "argument_ids": tuple(int(value.id) for value in function.args),
+                    "output_ids": tuple(int(value.id) for value in outputs[str(export_name)]),
+                    "output_paths": tuple(paths.items()), "return_container_kind": kind,
+                    "source_function_reference": int(reference),
+                }
     detach_repository_ssa_frontend(module)
     artifact_path = root / "repository-ssa.pkl"
     temporary = artifact_path.with_name(artifact_path.name + ".tmp")
@@ -6383,6 +6740,7 @@ def _compile_resolved_process_graph_unit_impl(
         "exports": list(exports),
         "linked_verified_units": [] if interface_tiles else linked_unit_receipts,
         "linked_native_interfaces": linked_unit_receipts if interface_tiles else [],
+        "composed_ssa_units": linked_unit_receipts if ssa_composition else [],
         "native_interface": native_interface,
         "authored_dependency_fallbacks": list({
             (
@@ -7074,11 +7432,15 @@ def compile_resolved_process_graph_plan(
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
     worker_elastic_available_percent: int = 75,
     worker_environment: Mapping[str, str] | None = None,
+    max_stage_units: int | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Crawl a resolved unit plan in isolated, resource-bounded workers.
 
-    Units are launched in the plan's deterministic dependency-first order.
+    Units are dependency-ready, ordered by remaining enclosing source cones
+    and shared-source work avoided. ``max_stage_units`` ends admission after a
+    bounded stage, drains its workers, and leaves terminal receipts for the
+    next process. A stage limit never kills a running compile.
     Verified predecessors are linked when available; incomplete predecessors
     do not prevent exploratory lowering, but can never be linked or mistaken
     for an installable dependency.
@@ -7088,6 +7450,8 @@ def compile_resolved_process_graph_plan(
     unit_plan_path = Path(plan_path).resolve()
     root = Path(directory).resolve()
     root.mkdir(parents=True, exist_ok=True)
+    if max_stage_units is not None and (type(max_stage_units) is not int or max_stage_units < 1):
+        raise ValueError("native growth stage must admit a positive number of units")
     plan = json.loads(unit_plan_path.read_text(encoding="utf-8"))
     if plan.get("schema") != "turing.compilation-unit-plan.v1":
         raise ValueError("unsupported ProcessGraph compilation-unit plan")
@@ -7101,6 +7465,8 @@ def compile_resolved_process_graph_plan(
             "regenerate the frozen plan before crawling its units"
         )
     units = tuple(dict(unit) for unit in plan.get("units") or ())
+    from .compilation_units import compilation_growth_priorities
+    growth_priorities = compilation_growth_priorities(units)
     if not plan.get("scoped_inputs") and units:
         # Partition once in the coordinator, before processes are admitted.
         # A worker must never deserialize every function merely to select one.
@@ -7111,7 +7477,9 @@ def compile_resolved_process_graph_plan(
         del graph
         import gc
         gc.collect()
-    requested_worker_limit = int(jobs or min(4, os.cpu_count() or 1))
+    resolved_digest = _file_sha256(resolved_path)
+    plan_digest = _file_sha256(unit_plan_path)
+    requested_worker_limit = int(12 if jobs is None else jobs)
     selected_schedule_mode = str(schedule_mode).lower()
     if selected_schedule_mode not in {"auto", "serial", "parallel"}:
         raise ValueError("resolved plan schedule must be auto, serial, or parallel")
@@ -7187,6 +7555,8 @@ def compile_resolved_process_graph_plan(
             != resolved_path
             or Path(str(existing_progress.get("process_graph_unit_plan"))).resolve()
             != unit_plan_path
+            or existing_progress.get("resolved_process_graph_sha256") != resolved_digest
+            or existing_progress.get("process_graph_unit_plan_sha256") != plan_digest
         ):
             raise ValueError(
                 "existing resolved-plan product belongs to different pinned inputs"
@@ -7215,6 +7585,7 @@ def compile_resolved_process_graph_plan(
     ]
     running: dict[int, dict[str, Any]] = {}
     concurrency_peak = 0
+    stage_admitted = 0
     active_total_limit = total_limit
     available_memory = None
     last_available_memory_sample = 0.0
@@ -7282,7 +7653,9 @@ def compile_resolved_process_graph_plan(
         _atomic_json(root / "progress.json", {
             "schema": "turing.resolved-process-graph-plan-progress.v1",
             "resolved_process_graph": resolved_path.as_posix(),
+            "resolved_process_graph_sha256": resolved_digest,
             "process_graph_unit_plan": unit_plan_path.as_posix(),
+            "process_graph_unit_plan_sha256": plan_digest,
             "worker_jobs": worker_limit,
             "schedule_mode": selected_schedule_mode,
             "plan_parallel_width": plan_parallel_width,
@@ -7311,7 +7684,8 @@ def compile_resolved_process_graph_plan(
         )
 
     def launch(index: int) -> None:
-        nonlocal concurrency_peak
+        nonlocal concurrency_peak, stage_admitted
+        stage_admitted += 1
         destination = unit_root(index)
         destination.mkdir(parents=True, exist_ok=True)
         command = [
@@ -7327,6 +7701,8 @@ def compile_resolved_process_graph_plan(
             if record is None or (record.get("status") != "verified" and not (
                 plan.get("interface_tiles") and record.get("native_interface")
                 and record.get("repository_ssa_complete")
+            ) and not (
+                plan.get("ssa_composition") and record.get("repository_ssa_complete")
             )):
                 continue
             dependency_root = unit_root(dependency)
@@ -7355,6 +7731,7 @@ def compile_resolved_process_graph_plan(
             "private": 0,
             "linked": linked,
             "worker_log": worker_log,
+            "growth_priority": dict(growth_priorities[index]),
         }
         concurrency_peak = max(concurrency_peak, len(running))
         report(
@@ -7364,15 +7741,20 @@ def compile_resolved_process_graph_plan(
             scoped_input=plan["scoped_inputs"][index],
             linked_verified_units=[] if plan.get("interface_tiles") else linked,
             linked_native_interface_units=linked if plan.get("interface_tiles") else [],
+            growth_priority=growth_priorities[index],
         )
 
     write_progress()
     while pending or running:
+        if not running and max_stage_units is not None and stage_admitted >= max_stage_units:
+            break
         measured_total = sum(
             max(reservation, int(state["resident"])) for state in running.values()
         )
         refresh_admission_ceiling(measured_total)
         while pending and len(running) < worker_limit and (
+            max_stage_units is None or stage_admitted < max_stage_units
+        ) and (
             active_total_limit is None
             or measured_total + reservation <= active_total_limit
         ):
@@ -7390,7 +7772,18 @@ def compile_resolved_process_graph_plan(
                     "ProcessGraph unit plan has no dependency-ready unit; "
                     f"blocked={blocked!r}"
                 )
-            index = int(ready[0])
+            growth_priorities = compilation_growth_priorities(units, accepted_units=(
+                candidate for candidate, record in enumerate(records)
+                if record is not None and (record.get("status") == "verified" or (
+                    plan.get("interface_tiles") and record.get("native_interface")
+                    and record.get("repository_ssa_complete")) or (
+                    plan.get("ssa_composition") and record.get("repository_ssa_complete")))
+            ))
+            index = max(ready, key=lambda candidate: (
+                growth_priorities[candidate]["enclosing_cone_source_nodes"],
+                growth_priorities[candidate]["repeated_source_nodes_avoided"],
+                growth_priorities[candidate]["dependency_cone_source_nodes"],
+                -candidate))
             pending.remove(index)
             launch(index)
             measured_total += reservation
@@ -7425,10 +7818,16 @@ def compile_resolved_process_graph_plan(
                 _atomic_json(failure_path, record)
             record["peak_resident_bytes"] = int(state["resident"])
             record["peak_private_bytes"] = int(state["private"])
+            record["growth_priority"] = state["growth_priority"]
             progress_path = destination / "compile-progress.json"
             if progress_path.is_file():
                 record["stage"] = json.loads(progress_path.read_text(encoding="utf-8")).get("current")
             record["linked_native_interface_units" if plan.get("interface_tiles") else "linked_verified_units"] = list(state["linked"])
+            # The child has exited. Persist the coordinator's admission reason
+            # and measured pressure beside its unchanged semantic/ABI receipt,
+            # so a restart does not discard why this interior was selected.
+            _atomic_json(receipt_path if return_code == 0 and receipt_path.is_file()
+                         else failure_path, record)
             records[index] = record
             del running[index]
             report(
@@ -7439,6 +7838,13 @@ def compile_resolved_process_graph_plan(
         write_progress()
 
     completed_records = [dict(record) for record in records if record is not None]
+    growth_priorities = compilation_growth_priorities(units, accepted_units=(
+        index for index, record in enumerate(records)
+        if record is not None and (record.get("status") == "verified" or (
+            plan.get("interface_tiles") and record.get("native_interface")
+            and record.get("repository_ssa_complete")) or (
+            plan.get("ssa_composition") and record.get("repository_ssa_complete")))
+    ))
     subdivision_plan = publish_process_graph_subdivision_plan(
         root, completed_records, resolved_path, unit_plan_path,
     )
@@ -7462,6 +7868,10 @@ def compile_resolved_process_graph_plan(
         "minimum_total_resident_bytes": minimum_limit,
         "system_reserve_bytes": int(system_reserve_bytes),
         "concurrent_workers_peak": concurrency_peak,
+        "growth_priorities": list(growth_priorities),
+        "stage_admitted_units": stage_admitted,
+        "pending_unit_indices": pending,
+        "status": "growing" if pending else "terminal",
         "scoped_inputs": list(plan.get("scoped_inputs") or ()),
         "units": completed_records,
         "counts": {
@@ -9320,6 +9730,7 @@ __all__ = [
     "compile_process_graph_subdivision_plan",
     "compilation_creep_frontier",
     "authored_call_dependencies",
+    "authored_compilation_growth_plan",
     "authored_control_contract",
     "authored_closure_contract",
     "authored_definition_sha256",
@@ -9334,6 +9745,8 @@ __all__ = [
     "process_graph_plan_parallel_width",
     "partition_authored_source",
     "publish_process_graph_subdivision_plan",
+    "publish_native_interface_product",
+    "load_composed_source_units",
     "ready_process_graph_unit_indices",
     "open_project_compilation_product",
     "resident_bytes",

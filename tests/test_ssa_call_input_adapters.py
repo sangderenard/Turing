@@ -1,10 +1,26 @@
 from src.compiler.ssa_call_input_adapters import (
     _adaptation_state_signature,
-    adapt_physical_call_inputs,
+    adapt_physical_call_inputs as _adapt_physical_call_inputs,
     physical_call_input_conflicts,
 )
 from src.compiler.identity_concordance import begin_identity_book, end_identity_book
 from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock
+from tests.compiler_provenance_inputs import publish_authored_ssa
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def provenance_transaction():
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
+
+
+def adapt_physical_call_inputs(functions):
+    publish_authored_ssa(functions)
+    return _adapt_physical_call_inputs(functions)
 
 
 def fixture():

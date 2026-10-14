@@ -1344,10 +1344,9 @@ def _post_planned_region_identities(
     ``canonical_value`` cell (``graph_cell``, the read-only post-relabel arm
     of ``node_identity_cell``), else
     ``Unsourced(GRAPH_ID_WITHOUT_CANONICAL_CELL)``.  A value that already
-    has a row keeps it.  The formals are not posted here: a formal's id is
-    the feed id it binds in the caller, under the same control scope, so
-    its row IS the feed's (posted by the builder at the call, or the
-    feed's ``control_value_binding``) -- one identity, one key.
+    has a row keeps it. Missing declared formals are published from the exact
+    region signature, canonical feed and control binding: a logical feed can
+    otherwise have only its distinct physical SSA value recorded.
 
     ``ssa_block``: the region's one block, DERIVED from the region's
     ``region_signature`` cell."""
@@ -1357,6 +1356,26 @@ def _post_planned_region_identities(
     )
     from .id_space import MINTED, has_flag
 
+    # A region formal can retain its logical graph id while control lowering
+    # bound that feed to a distinct physical Load/Phi value. In that case the
+    # feed's presumed SSA row does not exist. Publish the actual declared
+    # formal here, where both its signature and binding are available.
+    if isinstance(signature_cell, Ref):
+        for value in function.args:
+            row = (scope, int(value.id))
+            if book.latest_ref(SSA_VALUE, row) is not None:
+                continue
+            sources = tuple(dict.fromkeys(cell for cell in (
+                signature_cell, graph_cell(int(value.id)),
+                book.latest_ref(CONTROL_VALUE_BINDING, row),
+            ) if cell is not None))
+            book.post(
+                SSA_VALUE, row,
+                SSAValueFact(value.dtype, tuple(value.shape or ()),
+                             SSAValueOrigin.ADOPTED_GRAPH_ID),
+                stage=CONTROL_SSA_REGION, provenance=Derived(sources),
+                mode=Mode.CONCORD,
+            )
     for block in function.blocks.values():
         for instruction in block.instrs:
             value = instruction.res
@@ -12680,37 +12699,56 @@ class _ControlSSABuilder(TiledObject):
 def _post_loop_result_reconciliation(
     book: Any, row: tuple, fact: tuple, sources: tuple,
 ) -> None:
-    """``loop_result_reconciliation`` row ``(function, argument)``: REVISE,
-    DERIVED(the cells the pass read -- see ``_note``).
+    """Record one complete per-value analysis, with its actual input cells."""
+    if not sources:
+        raise ConcordanceRefusal(f"loop-result reconciliation {row!r} has no recorded inputs")
+    existing = book.latest_ref(LOOP_RESULT_RECONCILIATION, row)
+    if (existing is not None and book.page(LOOP_RESULT_RECONCILIATION).latest(row) == fact
+            and book.edges_into(existing)):
+        return  # An already justified, unchanged analysis is not a revision.
+    book.post(LOOP_RESULT_RECONCILIATION, row, fact,
+              stage=CONTROL_SSA_FINISH, provenance=Derived(sources), mode=Mode.REVISE)
 
-    A pass that runs again over the same, unchanged cells and states the same
-    thing adds nothing.  One that states something different about unchanged
-    cells (the IR was rewritten between the runs by a pass whose cell is not
-    in hand here) has no cause on the book: the api refuses the derived
-    revision, and the statement is posted ``Unsourced`` with the reason, so
-    the audit lists it instead of the page dropping it.  A value with no
-    cell at all is posted ``Unsourced`` the same way.
+
+def _post_ssa_block_geometry(book, scope, function):
+    """Publish the ordered SSA geometry consumed by dominance analysis.
+
+    A new instruction's recorded values provide the cause for shifted use and
+    definition positions. Same-value reorderings without a producer receipt
+    are refused, rather than given a diagnostic-only root or guessed edge.
     """
-
-    stored = book.pages.get(LOOP_RESULT_RECONCILIATION.name)
-    if sources:
-        try:
-            book.post(
-                LOOP_RESULT_RECONCILIATION, row, fact,
-                stage=CONTROL_SSA_FINISH, provenance=Derived(sources),
-                mode=Mode.REVISE,
-            )
-            return
-        except ConcordanceRefusal:
-            if stored is not None and stored.latest(row) == fact:
-                return
-            reason = REVISION_CAUSE_NOT_ON_BOOK
-    else:
-        reason = SSA_VALUE_NOT_ON_BOOK
-    book.post(
-        LOOP_RESULT_RECONCILIATION, row, fact, stage=CONTROL_SSA_FINISH,
-        provenance=Unsourced(reason), mode=Mode.REVISE,
-    )
+    from .concordance_declarations import SSA_BLOCK_GEOMETRY, SSA_CONSTANT_HOIST
+    result = {}
+    moved = {}
+    for row in book.page(SSA_CONSTANT_HOIST).scope_rows((scope, str(function.name))):
+        cell = book.latest_ref(SSA_CONSTANT_HOIST, row)
+        moved.setdefault(row[2], []).append(cell)
+        moved.setdefault(row[4], []).append(cell)
+    for label, block in function.blocks.items():
+        sources = tuple(dict.fromkeys(cell for cell in (
+            book.latest_ref(SSA_BLOCK, (scope, str(function.name), str(label))),
+            *moved.get(label, ()),
+            *(book.latest_ref(SSA_VALUE, (scope, int(value.id)))
+              for instruction in block.instrs
+              for value in (*instruction.args, *((instruction.res,) if instruction.res is not None else ()))),
+        ) if cell is not None))
+        if not sources:
+            if not block.instrs:
+                continue
+            raise ConcordanceRefusal(f"SSA block geometry {function.name}.{label} has no recorded owner or values")
+        fact = (tuple((str(instruction.op), tuple(int(value.id) for value in instruction.args),
+                       None if instruction.res is None else int(instruction.res.id),
+                       tuple(instruction.attributes.get('incoming_blocks') or ()))
+                      for instruction in block.instrs), tuple(block.successors))
+        row = (scope, str(function.name), str(label))
+        prior = book.latest_ref(SSA_BLOCK_GEOMETRY, row)
+        if prior is not None and book.page(SSA_BLOCK_GEOMETRY).latest(row) == fact:
+            result[label] = prior
+        else:
+            result[label] = book.post(SSA_BLOCK_GEOMETRY, row, fact,
+                                     stage=CONTROL_SSA_FINISH, provenance=Derived(sources),
+                                     mode=Mode.REVISE)
+    return result
 
 
 def _canonicalize_non_dominating_loop_result_uses(
@@ -12728,6 +12766,9 @@ def _canonicalize_non_dominating_loop_result_uses(
     a blanket value-id/SSA-version substitution.
     """
 
+    from .ssa_record_return_state import accepted_ssa_component
+    if accepted_ssa_component(function):
+        return ()
     port_values = dict(
         function.metadata.get("carried_port_values") or {}
     )
@@ -12811,6 +12852,12 @@ def _canonicalize_non_dominating_loop_result_uses(
         )
         return definition_index < target_index
 
+    from .identity_concordance import current_identity_book
+    book = current_identity_book()
+    scope = str(book_scope or function.metadata.get("tensor_shape_concordance_scope") or function.name)
+    geometry = _post_ssa_block_geometry(book, scope, function)
+    observations = {}
+    observation_sources = {}
     receipts = []
     for block_name, block in function.blocks.items():
         for instruction_index, instruction in enumerate(block.instrs):
@@ -12834,71 +12881,21 @@ def _canonicalize_non_dominating_loop_result_uses(
                 ) -> None:
                     """Record this argument's reconciliation decision."""
 
-                    try:
-                        from .identity_concordance import (
-                            current_identity_book,
-                        )
-
-                        book = current_identity_book()
-                        row = (
-                            str(function.name), int(argument.id),
-                        )
-                        # At the builder's finish the function does not yet
-                        # carry its metadata scope; the builder passes the
-                        # scope its own ``ssa_value`` cells were posted under.
-                        scope = str(
-                            book_scope
-                            or function.metadata.get(
-                                "tensor_shape_concordance_scope"
-                            )
-                            or function.name
-                        )
-                        # The rows it read: the argument's own ``ssa_value``
-                        # cell, the consumer's result cell (each use is a
-                        # different consumer, so each use is a different
-                        # cause for the next revision), and the replacement's
-                        # cell when it replaced.
-                        sources = tuple(dict.fromkeys(
-                            cell for cell in (
-                                book.latest_ref(
-                                    CARRIED_PORT_VALUE, (scope, int(argument.id)),
-                                ),
-                                book.latest_ref(
-                                    CONTROL_VALUE_BINDING, (scope, int(argument.id)),
-                                ),
-                                book.latest_ref(
-                                    SSA_VALUE, (scope, int(argument.id)),
-                                ),
-                                *(
-                                    (book.latest_ref(
-                                        SSA_VALUE, (scope, int(instruction.res.id)),
-                                    ),)
-                                    if instruction.res is not None else ()
-                                ),
-                                book.latest_ref(
-                                    SSA_BLOCK,
-                                    (scope, str(function.name), str(block_name)),
-                                ),
-                                *(
-                                    (book.latest_ref(
-                                        SSA_VALUE, (scope, int(candidate.id)),
-                                    ),)
-                                    if candidate is not None else ()
-                                ),
-                            )
-                            if cell is not None
-                        ))
-                        fact = (
-                            outcome,
-                            f"{block_name}#{instruction_index}",
-                            str(instruction.op),
-                            detail,
-                        )
-                        _post_loop_result_reconciliation(
-                            book, row, fact, sources,
-                        )
-                    except Exception:
-                        pass
+                    row = ((scope, str(function.name)), int(argument.id))
+                    sources = tuple(dict.fromkeys(cell for cell in (
+                        book.latest_ref(CARRIED_PORT_VALUE, (scope, int(argument.id))),
+                        book.latest_ref(CONTROL_VALUE_BINDING, (scope, int(argument.id))),
+                        book.latest_ref(SSA_VALUE, (scope, int(argument.id))),
+                        geometry.get(block_name),
+                        *(geometry.get(label) for label, _index in definition_sites.get(int(argument.id), ())),
+                        *((book.latest_ref(SSA_VALUE, (scope, int(instruction.res.id))),)
+                          if instruction.res is not None else ()),
+                        *((book.latest_ref(SSA_VALUE, (scope, int(candidate.id))),)
+                          if candidate is not None else ()),
+                    ) if cell is not None))
+                    observations.setdefault(row, []).append((outcome,
+                        f"{block_name}#{instruction_index}", str(instruction.op), detail))
+                    observation_sources.setdefault(row, {}).update(dict.fromkeys(sources))
 
                 replacement = port_values.get(int(argument.id))
                 if replacement is argument:
@@ -13025,6 +13022,8 @@ def _canonicalize_non_dominating_loop_result_uses(
                     int(replacement.id),
                 ))
             instruction.args = resolved_args
+    for row, facts in observations.items():
+        _post_loop_result_reconciliation(book, row, tuple(facts), tuple(observation_sources[row]))
     return tuple(receipts)
 
 
@@ -19317,9 +19316,40 @@ def merge_repository_ssa_modules(
     function_table = (
         function_tables[0] if function_tables else primary.function_table
     )
+    from .ir_identities import PRECISION_PIPELINE_METADATA
+    metadata = {"identity_book": primary.metadata.get("identity_book"),
+                "ssa_composition_components": modules,
+                "ssa_composition_function_books": {
+                    name: (function.metadata.get("accepted_ssa_component") or {}).get(
+                        "identity_book", (module.metadata or {}).get("identity_book"))
+                    for module in modules for name, function in module.functions.items()
+                    if (module.metadata or {}).get("identity_book") is not None}}
+    # Backend-semantic module records cannot be dropped or arbitrarily chosen
+    # from one enclosure. Equal declarations share a view; differing precision
+    # or shell contracts require explicit reconciliation by their own producer.
+    for key in (PRECISION_PIPELINE_METADATA, "shell_io"):
+        declarations = [module.metadata[key] for module in modules if key in module.metadata]
+        if declarations:
+            if any(value != declarations[0] for value in declarations[1:]):
+                raise ValueError(f"conflicting composed SSA module contract: {key}")
+            metadata[key] = declarations[0]
+    metadata["call_result_type_conflicts"] = tuple(
+        conflict for module in modules for conflict in module.metadata.get("call_result_type_conflicts", ()))
+    outlines = {}
+    for module in modules:
+        for name, outline in module.metadata.get("deployment_outlines", {}).items():
+            if name in outlines and outlines[name] != outline:
+                raise ValueError(f"conflicting composed deployment outline: {name}")
+            outlines[name] = outline
+    if outlines:
+        metadata["deployment_outlines"] = outlines
 
     return IRModule(
         merge_named("functions"),
+        # Independently lowered enclosures retain their original books. Their
+        # policies/history cannot be attributed to the new module's empty
+        # transaction. The audit follows these component owners explicitly.
+        metadata=metadata,
         function_table=function_table,
         class_table=SSAClassTable(tuple(classes.values())),
         recursion_table=merge_named("recursion_table"),

@@ -73,6 +73,70 @@ class CompilationUnitPlan:
         }
 
 
+def compilation_growth_priorities(
+    units: Iterable[Mapping[str, Any]], *, accepted_units: Iterable[int] = (),
+) -> tuple[dict[str, Any], ...]:
+    """Rank ready cuts by the costly enclosing cone they can relieve.
+
+    Source-node counts are a structural estimate, not measured compile time.
+    Walk only the supplied SCC dependency edges. Native scheduling supplies
+    resolved FunctionTable edges; authored-source triage remains advisory.
+    Each cone counts a shared
+    dependency once; cycles must already have been contracted by the planner.
+    The receipt retains the enclosing-to-interior chain that chose each cut.
+    """
+    selected = tuple(units)
+    accepted = set(map(int, accepted_units))
+    if any(not 0 <= index < len(selected) for index in accepted):
+        raise ValueError("accepted compilation growth unit lies outside the plan")
+    cones: dict[int, set[int]] = {}
+    active: set[int] = set()
+
+    def cone(index: int) -> set[int]:
+        if index in active:
+            raise ValueError("compilation growth requires a contracted dependency DAG")
+        if index in cones:
+            return cones[index]
+        active.add(index)
+        members = {index}
+        for dependency in selected[index].get("dependency_units", ()):
+            dependency = int(dependency)
+            if not 0 <= dependency < len(selected):
+                raise ValueError("compilation growth dependency lies outside the plan")
+            members.update(cone(dependency))
+        active.remove(index)
+        cones[index] = members
+        return members
+
+    source_weights = [max(0, int(unit.get("source_nodes", 0))) for unit in selected]
+    weights = [0 if index in accepted else weight for index, weight in enumerate(source_weights)]
+    for index in range(len(selected)):
+        cone(index)
+    costs = [sum(weights[member] for member in cones[index]) for index in range(len(selected))]
+    owners = [max((owner for owner in cones if index in cones[owner]),
+                  key=lambda owner: (costs[owner], weights[owner], -owner))
+              for index in range(len(selected))]
+    receipts = []
+    for index, owner in enumerate(owners):
+        chain = [owner]
+        while chain[-1] != index:
+            candidates = [int(dependency) for dependency in selected[chain[-1]].get("dependency_units", ())
+                          if index in cones[int(dependency)]]
+            chain.append(max(candidates, key=lambda dependency: (costs[dependency], -dependency)))
+        receipts.append({"unit_index": index, "source_nodes": source_weights[index],
+                         "remaining_source_nodes": weights[index],
+                         "dependency_cone_source_nodes": costs[index],
+                         "enclosing_cone_source_nodes": costs[owner],
+                         "enclosing_unit_count": sum(index in members for other, members in cones.items()
+                                                     if other != index and other not in accepted),
+                         "repeated_source_nodes_avoided": costs[index] *
+                             sum(index in members for other, members in cones.items()
+                                 if other != index and other not in accepted),
+                         "enclosing_unit_chain": chain,
+                         "reason": "remaining-dependency-cone-source-nodes"})
+    return tuple(receipts)
+
+
 def _entry_graph(entry: Any) -> Any | None:
     return getattr(getattr(entry, "graph", None), "G", None)
 
@@ -342,6 +406,7 @@ def record_compilation_unit_plan(
 __all__ = [
     "CompilationUnit",
     "CompilationUnitPlan",
+    "compilation_growth_priorities",
     "plan_compilation_units",
     "record_compilation_unit_plan",
     "native_interface_coupling_edges",

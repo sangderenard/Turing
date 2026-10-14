@@ -1,7 +1,9 @@
-"""Compile the complete incumbent book/concordance module as one compartment.
+"""Grow the incumbent book/concordance compartment through SSA composition.
 
-This uses the ordinary whole-source compiler election, never a list of tiny
-accessor accelerators. Calls among book operators remain in the same module.
+The ordinary source compiler resolves the call graph once, then dependency
+units retain SSA bodies for composition into progressively larger enclosures.
+Each invocation persists one stage; the bootstrap coordinator restarts before
+the next. The final library still owns the complete module surface.
 A produced library is not installed until its persistent-state operator ABI
 has passed semantic verification. Failed/partial compilation is not native
 book activation.
@@ -16,12 +18,27 @@ import time
 import traceback
 
 
-def build_compartment(directory, *, lower_only=False, progress=print):
+def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None,
+                      max_stage_units=None, schedule_options=None, progress=print):
+    worker_jobs = 12 if jobs is None else int(jobs)
+    if worker_jobs < 1:
+        raise ValueError('provenance worker count must be positive')
+    stage_units = worker_jobs if max_stage_units is None else max_stage_units
+    scheduling = dict(schedule_options or {})
+    allowed = {'max_total_resident_bytes', 'minimum_total_resident_bytes',
+               'system_reserve_bytes', 'adaptive_memory_ceiling',
+               'worker_resident_reservation_bytes', 'max_worker_memory_bytes',
+               'worker_elastic_available_percent'}
+    if scheduling.keys() - allowed:
+        raise ValueError('unsupported provenance scheduling options')
+    scheduling = {'adaptive_memory_ceiling': True, 'max_total_resident_bytes': 10 << 30,
+                  **scheduling}
     import src.compiler.identity_concordance as incumbent
     from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.project_compilation_product import (
         _dump_pickle_artifact, _dump_resolved_process_graph, compiler_toolchain_fingerprint,
+        authored_compilation_growth_plan,
     )
     from src.compiler.work_contract import (
         active_contract, expansion_policy, scoped_work_contract, with_expansion_policy,
@@ -75,16 +92,65 @@ def build_compartment(directory, *, lower_only=False, progress=print):
         if progress is not None:
             progress(message)
 
+    def growth_report(event):
+        report(json.dumps(event, sort_keys=True))
+
     publish()
     try:
         with scoped_work_contract(policy):
-            module, outputs, exports = lower_ast_source_to_ssa(
-                source, None, source_module=incumbent.__name__,
-                python_package=incumbent.__package__, python_bindings=vars(incumbent),
-                name='compiler_identity_concordance', runtime_closure_only=False,
-                extraction_contract=contract, progress=report, identity_log_level='summary',
-                compilation_unit_plan_sink=plan_sink, resolved_process_graph_sink=graph_sink,
-            )
+            if grow_stage:
+                from src.compiler.project_compilation_product import (
+                    compile_partitioned_source, compile_resolved_process_graph_plan,
+                    load_composed_source_units, changed_compiler_toolchain_files,
+                )
+                growth_root = destination / 'growth'
+                growth_root.mkdir(parents=True, exist_ok=True)
+                triage_path = growth_root / 'source-complexity.json'
+                if not triage_path.exists():
+                    triage = authored_compilation_growth_plan(source)
+                    triage_path.write_text(json.dumps(triage, indent=2, sort_keys=True) + '\n')
+                    growth_report({'stage': 'provenance_complexity_triage',
+                                   'receipt': str(triage_path), 'unit_count': len(triage['units'])})
+                receipt['source_complexity'] = str(triage_path)
+                plan_path = growth_root / 'inputs/plan.json'
+                if not plan_path.exists():
+                    planned = compile_partitioned_source(
+                        source, growth_root, entrypoint=None, extraction_contract=contract,
+                        python_bindings=vars(incumbent), ssa_composition=True, plan_only=True,
+                        source_options={'source_module': incumbent.__name__,
+                                        'python_package': incumbent.__package__,
+                                        'runtime_closure_only': False,
+                                        'identity_log_level': 'summary'},
+                        progress=growth_report,
+                    )
+                    plan = planned['plan']
+                else:
+                    plan = json.loads(plan_path.read_text(encoding='utf-8'))
+                    if changed_compiler_toolchain_files(plan['compiler_toolchain']):
+                        raise ValueError('provenance growth plan is stale; use a fresh output directory')
+                # A completed interior supplies SSA to its larger enclosure.
+                # No Python/native installation occurs until the complete
+                # bootstrap module has been emitted and verified.
+                product = compile_resolved_process_graph_plan(
+                    growth_root / 'resolved-process-graph.pkl', plan_path,
+                    growth_root / 'product', jobs=worker_jobs, max_stage_units=stage_units,
+                    **scheduling,
+                    progress=growth_report,
+                )
+                receipt['native_growth'] = product
+                if product['pending_unit_indices']:
+                    receipt['stage'] = 'native-growth-stage-persisted'
+                    publish()
+                    return receipt
+                module, outputs, exports = load_composed_source_units(product)
+            else:
+                module, outputs, exports = lower_ast_source_to_ssa(
+                    source, None, source_module=incumbent.__name__,
+                    python_package=incumbent.__package__, python_bindings=vars(incumbent),
+                    name='compiler_identity_concordance', runtime_closure_only=False,
+                    extraction_contract=contract, progress=report, identity_log_level='summary',
+                    compilation_unit_plan_sink=plan_sink, resolved_process_graph_sink=graph_sink,
+                )
             receipt.update(stage='repository-ssa', functions=len(module.functions), exports=list(exports))
             _dump_pickle_artifact(destination / 'repository-ssa.pkl', (module, outputs, exports))
             publish()
@@ -114,9 +180,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=Path('build/compiler-concordance'))
     parser.add_argument('--lower-only', action='store_true', help='persist complete repository SSA without native emission')
+    parser.add_argument('--grow-stage', action='store_true',
+                        help='compile a worker stage of complexity-ranked interiors and resume its frozen plan')
+    parser.add_argument('--whole-module', action='store_true',
+                        help='use the original indivisible whole-module lowering')
+    parser.add_argument('--jobs', type=int, default=12, help='maximum concurrent isolated workers (default: 12)')
+    parser.add_argument('--stage-units', type=int, help='units admitted before draining and restarting (default: jobs)')
+    parser.add_argument('--schedule-json', default='{}', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    receipt = build_compartment(args.output, lower_only=args.lower_only,
-                                progress=lambda message: print(message, flush=True))
+    if args.grow_stage and args.whole_module:
+        parser.error('--grow-stage and --whole-module are mutually exclusive')
+    receipt = build_compartment(args.output, lower_only=args.lower_only, grow_stage=not args.whole_module,
+                                jobs=args.jobs, max_stage_units=args.stage_units,
+                                schedule_options=json.loads(args.schedule_json), progress=lambda message: print(message, flush=True))
     print(json.dumps(receipt, sort_keys=True), flush=True)
     return 0
 

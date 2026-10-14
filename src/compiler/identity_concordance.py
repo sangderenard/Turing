@@ -845,7 +845,7 @@ def publish_projected_iterable_layouts(module: Any) -> None:
             ] = tuple(receipts)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Claim:
     """One record's statement about a value's identity."""
 
@@ -853,8 +853,15 @@ class Claim:
     key: str
     source: str
 
+    def __setstate__(self, state):
+        # Accept old dict-backed audit archives as well as slotted pickles.
+        names = ("kind", "key", "source")
+        values = (state[name] for name in names) if isinstance(state, dict) else state
+        for name, value in zip(names, values):
+            object.__setattr__(self, name, value)
 
-@dataclass
+
+@dataclass(slots=True)
 class ValueRow:
     function: str
     value_id: int
@@ -864,13 +871,26 @@ class ValueRow:
     definitions: list[tuple[str, int, str]] = field(default_factory=list)
     uses: list[tuple[str, int, str]] = field(default_factory=list)
 
+    def __setstate__(self, state):
+        # Default slotted state is (None, slot_dict); earlier archives used
+        # the field dict directly. Lists remain the same mutable owners.
+        values = state if isinstance(state, dict) else state[1]
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class Finding:
     kind: str
     function: str
     value_id: int | None
     detail: str
+
+    def __setstate__(self, state):
+        names = ("kind", "function", "value_id", "detail")
+        values = (state[name] for name in names) if isinstance(state, dict) else state
+        for name, value in zip(names, values):
+            object.__setattr__(self, name, value)
 
 
 _INOUT_REDEFINED = ("program_abi_mutable", "program_abi_field_written")
@@ -1079,6 +1099,23 @@ class CorrelationTable:
     # --------------------------------------------------------------- findings
     def findings(self, module: Any) -> list[Finding]:
         found: list[Finding] = []
+        components = (getattr(module, "metadata", {}) or {}).get("ssa_composition_components", ())
+        if components:
+            owners = (module.metadata or {}).get("ssa_composition_function_books", {})
+            expected = {}
+            for component in components:
+                if component.function_table is not module.function_table:
+                    found.append(Finding("ssa-composition-function-owner-disagreement", "?", None,
+                                         "component does not share the canonical source function table"))
+                found.extend(CorrelationTable.build(component).findings(component))
+                book = (component.metadata or {}).get("identity_book")
+                if book is not None:
+                    expected.update({name: (function.metadata.get("accepted_ssa_component") or {}).get(
+                        "identity_book", book) for name, function in component.functions.items()})
+            for name, book in expected.items():
+                if owners.get(name) is not book:
+                    found.append(Finding("ssa-composition-book-owner-disagreement", str(name), None,
+                                         "composed function lost its original provenance book"))
         for name, table in (getattr(module, "record_tables", {}) or {}).items():
             sequences = (getattr(module, "sequence_tables", {}) or {}).get(name)
             for record in table.records.values():
@@ -1089,6 +1126,7 @@ class CorrelationTable:
                             f"field {record_field.storage_identity!r} names absent sequence {record_field.sequence_id}"))
         found.extend(self._native_interface_findings(module))
         found.extend(self._region_instruction_residency_findings(module))
+        found.extend(self._repository_ssa_signature_findings(module))
         for name, function in module.functions.items():
             found.extend(self._function_findings(module, str(name), function))
             found.extend(
@@ -1231,13 +1269,34 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _repository_ssa_signature_findings(module: Any) -> list[Finding]:
+        found = []
+        for name, function in module.functions.items():
+            signature = function.metadata.get("repository_ssa_signature")
+            if signature is None:
+                continue
+            represented = {int(value.id) for value in function.args}
+            represented.update(int(instruction.res.id) for block in function.blocks.values()
+                               for instruction in block.instrs if instruction.res is not None)
+            outputs = tuple(signature.get("output_ids", ()))
+            if (signature.get("schema") != "turing.repository-ssa-call-signature.v1"
+                    or tuple(signature.get("argument_ids", ())) != tuple(int(value.id) for value in function.args)
+                    or signature.get("source_function_reference") != function.metadata.get("source_function_reference")
+                    or set(outputs) != {value for _path, value in signature.get("output_paths", ())}
+                    or function.blocks and not set(outputs).issubset(represented)):
+                found.append(Finding("repository-ssa-signature-disagreement", str(name), None,
+                                     "composition signature disagrees with its owning SSA function"))
+        return found
+
+    @staticmethod
     def _region_instruction_residency_findings(module: Any) -> list[Finding]:
         found = []
-        book = identity_book(module)
+        books = (getattr(module, "metadata", {}) or {}).get("ssa_composition_function_books", {})
         for name, function in module.functions.items():
             record = function.metadata.get("region_instruction_residency")
             if record is None:
                 continue
+            book = books.get(name) or identity_book(module)
             counters = ("limit", "resident_peak", "resident_instructions_peak", "snapshots", "spills", "reloads")
             if (record.get("schema") != "turing.region-instruction-residency.v1"
                     or any(type(record.get(key)) is not int or record[key] < 0 for key in counters)

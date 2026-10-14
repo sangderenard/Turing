@@ -91,7 +91,10 @@ def test_bootstrap_product_environment_is_a_deterministic_path_set(
 ):
     first = tmp_path / "first"
     second = tmp_path / "second"
-    monkeypatch.delenv(runtime.COMPILER_BOOTSTRAP_PRODUCTS_ENV, raising=False)
+    # Register restoration even when initially absent: the setter below writes
+    # os.environ directly. A delenv on an absent key left nonexistent product
+    # paths in later compiler-worker tests on both the baseline and this tree.
+    monkeypatch.setenv(runtime.COMPILER_BOOTSTRAP_PRODUCTS_ENV, "")
 
     selected = runtime.set_compiler_bootstrap_products((
         first, second, first,
@@ -99,6 +102,14 @@ def test_bootstrap_product_environment_is_a_deterministic_path_set(
 
     assert selected == (first.resolve(), second.resolve())
     assert runtime.compiler_bootstrap_product_paths() == selected
+
+
+def test_bootstrap_does_not_install_partial_provenance_products(tmp_path, monkeypatch):
+    class Product:
+        root = tmp_path
+        links = {"inner": {"source_module": runtime.PROVENANCE_CORE_MODULE}}
+    monkeypatch.setattr(project_compilation_product, "open_project_compilation_product", lambda _path: Product())
+    assert runtime.activate_compiler_bootstrap_products([tmp_path]) == ()
 
 
 def test_qualified_scalar_adapter_replays_persisted_probes(

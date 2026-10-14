@@ -184,6 +184,9 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "function_address": PageLifecycle(CLOSURE, LOWERING, LOWERING),
     "function_output": PageLifecycle(FUNCTIONS, EMISSION, EMISSION),
     "function_parameter": PageLifecycle(FUNCTIONS, EMISSION, EMISSION),
+    # Authored ProcessGraph linking posts sockets during ingestion and again
+    # after topology reduction, before planning. No later pass reads the page.
+    "graph_function_socket": PageLifecycle(PLANNING, None, PLANNING),
     "graph_work_publication": PageLifecycle(PLANNING, REPAIRS, REPAIRS),
     "hierarchy_global_value": PageLifecycle(FUNCTIONS, None, FUNCTIONS),
     "hierarchy_value": PageLifecycle(FUNCTIONS, None, FUNCTIONS),
@@ -302,6 +305,8 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "source_span": PageLifecycle(CLOSURE, REPAIRS, REPAIRS),
     "source_value_class_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "ssa_block": PageLifecycle(FUNCTIONS, LOWERING, LOWERING),
+    "ssa_block_geometry": PageLifecycle(FUNCTIONS, REPAIRS, REPAIRS),
+    "ssa_constant_hoist": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
     "ssa_call_shape": PageLifecycle(LOWERING, None, LOWERING),
     "ssa_call_shape_evidence": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "ssa_field_version": PageLifecycle(LOWERING, LOWERING, LOWERING),

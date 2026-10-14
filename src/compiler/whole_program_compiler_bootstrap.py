@@ -265,7 +265,16 @@ def build_whole_program_compiler(
     from .compiler_bootstrap_runtime import ensure_native_provenance_core
     first = plan["next_partition"]
     core = ensure_native_provenance_core(
-        destination / "products" / first["name"] / first["version"], progress=progress)
+        destination / "products" / first["name"] / first["version"], jobs=jobs,
+        schedule_options={
+            "max_total_resident_bytes": max_total_resident_bytes,
+            "minimum_total_resident_bytes": minimum_total_resident_bytes,
+            "system_reserve_bytes": system_reserve_bytes,
+            "adaptive_memory_ceiling": adaptive_memory_ceiling,
+            "worker_resident_reservation_bytes": worker_resident_reservation_bytes,
+            "max_worker_memory_bytes": max_worker_memory_bytes,
+            "worker_elastic_available_percent": worker_elastic_available_percent,
+        }, progress=progress)
     if core.get("backend") != "native":
         raise RuntimeError("outer compiler schedule requires native provenance core")
     boundary = dict(plan["outer_partition"])

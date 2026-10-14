@@ -18,6 +18,7 @@ def _isolated_project_book():
         end_identity_book(token)
 
 from src.compiler.compilation_units import (
+    compilation_growth_priorities,
     plan_compilation_units,
     record_compilation_unit_plan,
 )
@@ -43,6 +44,62 @@ def _table(specification):
             )
         table.resolve_graph(references[name], SimpleNamespace(G=graph))
     return table, references
+
+
+def test_growth_counts_shared_dependencies_once_and_retains_inward_chain():
+    units = [
+        {"source_nodes": 10, "dependency_units": []},
+        {"source_nodes": 20, "dependency_units": [0]},
+        {"source_nodes": 30, "dependency_units": [0]},
+        {"source_nodes": 40, "dependency_units": [1, 2]},
+        {"source_nodes": 95, "dependency_units": []},
+    ]
+    ranks = compilation_growth_priorities(units)
+    assert ranks[3]["dependency_cone_source_nodes"] == 100
+    assert ranks[0]["enclosing_unit_chain"] == [3, 2, 0]
+    assert ranks[0]["enclosing_unit_count"] == 3
+    assert ranks[0]["repeated_source_nodes_avoided"] == 30
+    # Compiling the shared interior makes the unrelated cone the largest.
+    remaining = compilation_growth_priorities(units, accepted_units=[0])
+    assert remaining[0]["remaining_source_nodes"] == 0
+    assert remaining[3]["dependency_cone_source_nodes"] == 90
+    assert remaining[4]["enclosing_cone_source_nodes"] == 95
+    # A partial/failed leaf is not passed as accepted and cannot shrink cost.
+    assert compilation_growth_priorities(units)[3]["dependency_cone_source_nodes"] == 100
+
+
+def test_growth_refuses_uncontracted_cycles_and_invalid_dependencies():
+    with pytest.raises(ValueError, match="contracted"):
+        compilation_growth_priorities([
+            {"source_nodes": 1, "dependency_units": [1]},
+            {"source_nodes": 1, "dependency_units": [0]},
+        ])
+    with pytest.raises(ValueError, match="outside"):
+        compilation_growth_priorities([{"dependency_units": [2]}])
+
+
+def test_authored_growth_triage_keeps_recursive_and_lexical_boundaries():
+    from src.compiler.project_compilation_product import authored_compilation_growth_plan
+    source = '''
+def left(x):
+    return right(x)
+def right(x):
+    return left(x)
+def outer(x):
+    def inner(y):
+        return y + 1
+    return inner(x)
+'''
+    plan = authored_compilation_growth_plan(source)
+    assert plan["cut_authority"] == "resolved-function-table"
+    assert plan["cost_basis"] == "authored-ast-nodes-estimate"
+    recursive = next(unit for unit in plan["units"] if "left" in unit["qualified_names"])
+    assert recursive["qualified_names"] == ["left", "right"]
+    assert recursive["recursive"]
+    owner = next(unit for unit in plan["units"] if unit["qualified_names"] == ["outer"])
+    child = next(index for index, unit in enumerate(plan["units"])
+                 if unit["qualified_names"] == ["outer.<locals>.inner"])
+    assert child in owner["dependency_units"]
 
 
 def test_units_are_one_authored_call_each_and_dependencies_come_first():

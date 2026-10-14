@@ -146,25 +146,19 @@ def _probe_native_provenance_core(registry_path, library):
     environment[COMPILER_BOOTSTRAP_REGISTRY_ENV] = candidate.name
     repository = Path(__file__).resolve().parents[2]
     probe = r'''
-import ast, pathlib, sys
-from src.compiler.compiler_bootstrap_runtime import provenance_core_state
+import pathlib, sys
+from src.compiler.compiler_bootstrap_runtime import provenance_core_state, _provenance_core_surface_findings
 state = provenance_core_state()
 assert state["backend"] == "native", state
 assert pathlib.Path(state["library"]).resolve() == pathlib.Path(sys.argv[1]).resolve()
 import src.compiler.identity_concordance as core
 source = pathlib.Path("src/compiler/identity_concordance.py")
-definitions = ast.parse(source.read_text()).body
-surface = {node.name for node in definitions
-           if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
-assert not (surface - set(dir(core))), sorted(surface - set(dir(core)))
-missing_methods = [node.name + "." + member.name
-                   for node in definitions if isinstance(node, ast.ClassDef)
-                   for member in node.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-                   if not hasattr(getattr(core, node.name), member.name)]
-assert not missing_methods, missing_methods
+findings = _provenance_core_surface_findings(core, source.read_text())
+assert not findings, findings
 import pytest
 raise SystemExit(pytest.main(["-q", "tests/test_copy_on_read_scopes.py",
                              "tests/test_provenance_compartment_operations.py",
+                             "tests/test_provenance_storage_contracts.py",
                              "tests/test_pythonic_control_torture.py::test_pythonic_control_native_effects[c-guarded_splice]"]))
 '''
     try:
@@ -178,11 +172,47 @@ raise SystemExit(pytest.main(["-q", "tests/test_copy_on_read_scopes.py",
                          + completed.stdout + completed.stderr)
 
 
+def _provenance_core_surface_findings(module, source):
+    """Check authored exports without importing a Python copy of the core.
+
+    Constants and class descriptors are part of the module surface too. This
+    is an import-shape check; the operation suites separately prove semantics.
+    """
+    findings = []
+    def names(target):
+        if isinstance(target, ast.Name):
+            return (target.id,)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return tuple(name for child in target.elts for name in names(child))
+        return ()
+    def declarations(body):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                yield node.name, node
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    for name in names(target):
+                        yield name, node
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                for name in names(node.target):
+                    yield name, node
+    for name, node in declarations(ast.parse(source).body):
+        if not hasattr(module, name):
+            findings.append({"kind": "missing-module-symbol", "symbol": name})
+        elif isinstance(node, ast.ClassDef):
+            owner = getattr(module, name)
+            for member, _ in declarations(node.body):
+                if (not hasattr(owner, member)
+                        and member not in getattr(owner, "__dataclass_fields__", {})):
+                    findings.append({"kind": "missing-class-member", "symbol": f"{name}.{member}"})
+    return findings
+
+
 class ProvenanceCoreRestartRequired(RuntimeError):
-    """The link is installed; this coordinator must restart before compiling."""
+    """A stage is persisted; restart before the next compile or activation."""
 
 
-def ensure_native_provenance_core(directory, *, progress=None):
+def ensure_native_provenance_core(directory, *, jobs=None, schedule_options=None, progress=None):
     """Blocking first stage; no outer compiler workers may start before it."""
     import subprocess
     if provenance_core_state()["backend"] == "native":
@@ -209,11 +239,15 @@ def ensure_native_provenance_core(directory, *, progress=None):
                                              "products": []}) + "\n", encoding="utf-8")
     environment[COMPILER_BOOTSTRAP_REGISTRY_ENV] = str(isolated_registry)
     if progress is not None:
-        progress("compiler-bootstrap: exclusively compiling whole provenance core; outer workers blocked")
+        progress("compiler-bootstrap: growing provenance core through SSA enclosures; outer workers blocked")
     subprocess.run([sys.executable, "-m", "tools.bootstrap_compiler_concordance",
+                    "--grow-stage", "--jobs", str(12 if jobs is None else jobs),
+                    "--schedule-json", json.dumps(dict(schedule_options or {})),
                     "--output", str(destination)],
                    cwd=Path(__file__).resolve().parents[2], env=environment, check=True)
     receipt = json.loads((destination / "compartment.json").read_text(encoding="utf-8"))
+    if receipt.get("stage") == "native-growth-stage-persisted":
+        raise ProvenanceCoreRestartRequired("provenance interior stage persisted; restart to grow enclosing units")
     if receipt.get("stage") != "native-module-verified":
         raise RuntimeError("provenance-first bootstrap blocked: whole native module is not verified; "
                            f"stage={receipt.get('stage')!r}; receipt={destination / 'compartment.json'}")
@@ -370,6 +404,7 @@ _ACTIVATION_ADAPTERS: dict[str, Callable[..., tuple[Any, Callable[..., Any]]]] =
 _ACTIVE_DEPLOYMENTS: dict[tuple[str, str], Callable[..., Any]] = {}
 _REGISTRY_ACTIVATION_LOCK = threading.RLock()
 _ACTIVATED_REGISTRY_SHA256: str | None = None
+_INITIALIZING_REGISTRY_SHA256: str | None = None
 _REGISTRY_FAILURES: list[dict[str, str]] = []
 
 
@@ -458,6 +493,8 @@ def publish_compiler_bootstrap_products(
         "schema": COMPILER_BOOTSTRAP_REGISTRY_SCHEMA,
         "products": records,
     }
+    from .compiler_source_tree import deployment_source_trees
+    payload["source_trees"] = deployment_source_trees(record["product"] for record in records)
     if destination.is_file():
         previous = json.loads(destination.read_text(encoding="utf-8"))
         if previous.get("schema") != COMPILER_BOOTSTRAP_REGISTRY_SCHEMA:
@@ -517,7 +554,7 @@ def set_compiler_bootstrap_products(paths) -> tuple[Path, ...]:
     return resolved
 
 
-def activate_compiler_bootstrap_products(paths=None) -> tuple[CompilerBootstrapActivation, ...]:
+def activate_compiler_bootstrap_products(paths=None, *, selected_names=None) -> tuple[CompilerBootstrapActivation, ...]:
     """Re-prove and install every receipt-declared compiler deployment."""
 
     from .project_compilation_product import open_project_compilation_product
@@ -530,7 +567,11 @@ def activate_compiler_bootstrap_products(paths=None) -> tuple[CompilerBootstrapA
     for product_path in selected:
         product = open_project_compilation_product(product_path)
         for qualified_name, link_value in sorted(product.links.items()):
+            if selected_names is not None and (str(product.root), str(qualified_name)) not in selected_names:
+                continue
             link = dict(link_value)
+            if link.get("source_module") == PROVENANCE_CORE_MODULE:
+                continue  # Bootstrap elects this stateful module only as a whole.
             if link.get("kind") == "source-region-integral":
                 continue
             library = product.root / str(link.get("native_library") or "")
@@ -595,6 +636,24 @@ def activate_compiler_bootstrap_products(paths=None) -> tuple[CompilerBootstrapA
 def activate_registered_compiler_bootstraps(
     registry_path: str | Path | None = None,
 ) -> tuple[CompilerBootstrapActivation, ...]:
+    """Initialize once, allowing target imports to re-enter source compilation."""
+    global _INITIALIZING_REGISTRY_SHA256
+    path = compiler_bootstrap_registry_path(registry_path)
+    digest = _file_sha256(path) if path.is_file() else "absent"
+    with _REGISTRY_ACTIVATION_LOCK:
+        if _INITIALIZING_REGISTRY_SHA256 == digest:
+            return ()
+        previous = _INITIALIZING_REGISTRY_SHA256
+        _INITIALIZING_REGISTRY_SHA256 = digest
+        try:
+            return _activate_registered_compiler_bootstraps(registry_path)
+        finally:
+            _INITIALIZING_REGISTRY_SHA256 = previous
+
+
+def _activate_registered_compiler_bootstraps(
+    registry_path: str | Path | None = None,
+) -> tuple[CompilerBootstrapActivation, ...]:
     """Activate the current pinned registry once per registry revision.
 
     A stale or source-incompatible product never prevents compilation. Its
@@ -611,6 +670,7 @@ def activate_registered_compiler_bootstraps(
             return ()
         failures = []
         activations = []
+        registry = {}
         try:
             registry = (
                 {"schema": COMPILER_BOOTSTRAP_REGISTRY_SCHEMA, "products": []}
@@ -627,6 +687,11 @@ def activate_registered_compiler_bootstraps(
                 "error": str(error),
             })
             selected_records = ()
+        tree_products = {cut["product"] for tree in registry.get("source_trees", ())
+                         if tree.get("module") != PROVENANCE_CORE_MODULE
+                         for node in tree.get("nodes", {}).values()
+                         for cut in node.get("available", ())}
+        initialized_paths = []
         for record in selected_records:
             product_path = Path(str(record.get("product") or "")).resolve()
             try:
@@ -640,15 +705,24 @@ def activate_registered_compiler_bootstraps(
                         "registered compiler product changed or vanished: "
                         f"{product_path}"
                     )
-                activations.extend(
-                    activate_compiler_bootstrap_products((product_path,))
-                )
+                if str(product_path) in tree_products:
+                    initialized_paths.append(product_path)
+                else:
+                    activations.extend(activate_compiler_bootstrap_products((product_path,)))
             except Exception as error:
                 failures.append({
                     "product": product_path.as_posix(),
                     "error_type": type(error).__name__,
                     "error": str(error),
                 })
+        if initialized_paths:
+            try:
+                from .compiler_source_tree import initialize_source_tree
+                state = initialize_source_tree(initialized_paths)
+                activations.extend(CompilerBootstrapActivation(**record) for record in state["activations"])
+            except Exception as error:
+                failures.append({"product": ",".join(map(str, initialized_paths)),
+                                 "error_type": type(error).__name__, "error": str(error)})
         _REGISTRY_FAILURES[:] = failures
         _ACTIVATED_REGISTRY_SHA256 = registry_digest
         return tuple(activations)

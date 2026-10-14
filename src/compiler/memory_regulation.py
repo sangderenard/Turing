@@ -137,7 +137,8 @@ class MemoryRegulator:
         from .page_lifecycle import BOUNDARY_COMPLETES
 
         self.completed = BOUNDARY_COMPLETES.get(self.label, self.completed)
-        if self.spill_policy:
+        if self.spill_policy or (self.compress_policy and self.live_settings is None
+                                 and self.live_arena is None):
             self.spill_cold("policy")
             resident = process_rss_bytes()
         if self._report:
@@ -348,9 +349,14 @@ class MemoryRegulator:
         """
         ceiling = self.budget_bytes if ceiling is None else int(ceiling)
         if not (self.compress_policy and self.tile_disk_policy
-                and ceiling is not None and resident > ceiling
-                and self.live_arena is not None):
+                and ceiling is not None and resident > ceiling):
             return resident
+        if self.live_arena is None:
+            # A standalone book can already have compressed tiles without a
+            # compile-wide arena. Escalate those through the same offloader;
+            # absence of live graph storage does not annul its disk policy.
+            self.offload_tiles(label, resident, budget_bytes=ceiling)
+            return process_rss_bytes()
         arena = self.live_arena
         contracted_limit = (
             1 if arena.pressure_level >= 3 else arena.base_payload_limit
@@ -543,8 +549,16 @@ class MemoryRegulator:
         """Spill the book's pages that the completed stages made cold; the
         number of cells dropped.  ``trigger``: ``"policy"`` or ``"budget"``."""
 
-        if self.compress_policy or not self.owns_book or self.completed is None:
+        if not self.owns_book or self.completed is None:
             return 0
+        if self.compress_policy:
+            if self.live_arena is not None or self.live_settings is not None:
+                return 0  # The compile-wide writable arena owns these tables.
+            from .page_lifecycle import cold_pages
+            names = cold_pages(dict.keys(self.book.pages), self.completed)
+            result = self.book.compress_pages(names, budget_bytes=self.budget_bytes,
+                                              boundary=self.label)
+            return int(result.cells_dropped)
         from .page_lifecycle import spill_cold_pages
 
         result = spill_cold_pages(
