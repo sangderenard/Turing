@@ -4429,9 +4429,22 @@ def _load_pickle_artifact(path: str | Path) -> Any:
 
 
 def _dump_pickle_artifact(path: str | Path, value: Any) -> None:
-    """Write a pickle through the same bytes-valued shell/native seam."""
+    """Atomically publish a pickle through the bytes-valued shell/native seam.
 
-    Path(path).write_bytes(pickle.dumps(value, protocol=5))
+    Repository SSA is a restart boundary for long source compilations.  A
+    process interrupted during serialization must leave the preceding complete
+    artifact intact instead of truncating the path named by its receipt.
+    """
+
+    destination = Path(path)
+    temporary = destination.with_name(
+        f"{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temporary.write_bytes(pickle.dumps(value, protocol=5))
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _resolve_qualified_module_attribute(

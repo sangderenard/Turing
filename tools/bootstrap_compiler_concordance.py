@@ -11,17 +11,62 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+import pickle
+import sys
 import time
 import traceback
 
 
+_REPOSITORY_SSA_PHASE = 'provenance-repository-ssa'
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_external_checkpoint(store, phase, implementation, directory, artifact, loader):
+    """Load a checkpoint only while its separately published artifact agrees."""
+    descriptor = store.load(phase, implementation)
+    if not isinstance(descriptor, dict):
+        return None
+    if descriptor.get('artifact') != artifact:
+        store.last_load_status = 'miss: external artifact name mismatch'
+        return None
+    path = Path(directory) / artifact
+    try:
+        actual_sha256 = _file_sha256(path)
+    except OSError as error:
+        store.last_load_status = f'miss: {type(error).__name__}: {error}'
+        return None
+    if actual_sha256 != descriptor.get('sha256'):
+        store.last_load_status = 'miss: external artifact digest mismatch'
+        return None
+    try:
+        return loader(path)
+    except (
+        OSError, ValueError, TypeError, EOFError, ImportError, AttributeError,
+        pickle.UnpicklingError,
+    ) as error:
+        store.last_load_status = f'miss: {type(error).__name__}: {error}'
+        return None
+
+
 def build_compartment(directory, *, lower_only=False, progress=print):
     import src.compiler.identity_concordance as incumbent
+    from src.common.tensors.accelerator_backends.aot_checkpoint import (
+        AOTCheckpointStore, callable_digest,
+    )
     from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.project_compilation_product import (
-        _dump_pickle_artifact, _dump_resolved_process_graph, compiler_toolchain_fingerprint,
+        _atomic_json, _dump_pickle_artifact, _dump_resolved_process_graph,
+        _load_pickle_artifact, compiler_toolchain_fingerprint,
     )
     from src.compiler.work_contract import (
         active_contract, expansion_policy, scoped_work_contract, with_expansion_policy,
@@ -40,6 +85,7 @@ def build_compartment(directory, *, lower_only=False, progress=print):
         'schema': 'turing.compiler-concordance-compartment.v1',
         'source': source_path.as_posix(),
         'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
+        'python_cache_tag': sys.implementation.cache_tag,
         'compiler_toolchain': compiler_toolchain_fingerprint(),
         'scope': 'whole-module', 'entrypoint': None,
         'required_native_work': [
@@ -53,18 +99,35 @@ def build_compartment(directory, *, lower_only=False, progress=print):
     }
     started = time.perf_counter()
 
+    checkpoint_input = {
+        key: value for key, value in receipt.items()
+        if key not in {'stage', 'installed'}
+    }
+    checkpoint_store = AOTCheckpointStore(checkpoint_input, destination)
+    checkpoint_implementation = callable_digest(
+        build_compartment, _load_external_checkpoint, _file_sha256,
+    )
+    receipt['checkpoint_identity'] = checkpoint_store.identity
+
     def publish():
         receipt['elapsed_seconds'] = time.perf_counter() - started
-        path = destination / 'compartment.json'
-        path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n')
+        _atomic_json(destination / 'compartment.json', receipt)
 
     def plan_sink(value):
-        (destination / 'process-graph-units.json').write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+        _atomic_json(destination / 'process-graph-units.json', value)
 
     def graph_sink(value):
         # Existing exact post-reduction checkpoint, before deployment's cost.
-        with (destination / 'resolved-process-graph.pkl').open('wb') as stream:
-            _dump_resolved_process_graph(value, stream)
+        path = destination / 'resolved-process-graph.pkl'
+        temporary = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+        try:
+            with temporary.open('wb') as stream:
+                _dump_resolved_process_graph(value, stream)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        receipt['saved_resolved_process_graph_sha256'] = _file_sha256(path)
+        publish()
 
     def report(message):
         # Keep stage progress visible without per-AST-node terminal rendering.
@@ -75,21 +138,52 @@ def build_compartment(directory, *, lower_only=False, progress=print):
         if progress is not None:
             progress(message)
 
+    repository_artifact = 'repository-ssa.pkl'
+    resumed = _load_external_checkpoint(
+        checkpoint_store, _REPOSITORY_SSA_PHASE, checkpoint_implementation,
+        destination, repository_artifact, _load_pickle_artifact,
+    )
+    if resumed is not None:
+        try:
+            module, outputs, exports = resumed
+            receipt.update(
+                stage='repository-ssa', functions=len(module.functions),
+                exports=list(exports), resumed_from=_REPOSITORY_SSA_PHASE,
+                checkpoint_status=checkpoint_store.last_load_status,
+                resumable_stage='repository-ssa',
+            )
+        except (TypeError, ValueError, AttributeError):
+            resumed = None
+            receipt['checkpoint_status'] = 'miss: invalid repository SSA payload'
+    else:
+        receipt['checkpoint_status'] = checkpoint_store.last_load_status
+    receipt['checkpoint_resume_status'] = receipt['checkpoint_status']
     publish()
     try:
-        with scoped_work_contract(policy):
-            module, outputs, exports = lower_ast_source_to_ssa(
-                source, None, source_module=incumbent.__name__,
-                python_package=incumbent.__package__, python_bindings=vars(incumbent),
-                name='compiler_identity_concordance', runtime_closure_only=False,
-                extraction_contract=contract, progress=report, identity_log_level='summary',
-                compilation_unit_plan_sink=plan_sink, resolved_process_graph_sink=graph_sink,
+        if resumed is None:
+            with scoped_work_contract(policy):
+                module, outputs, exports = lower_ast_source_to_ssa(
+                    source, None, source_module=incumbent.__name__,
+                    python_package=incumbent.__package__, python_bindings=vars(incumbent),
+                    name='compiler_identity_concordance', runtime_closure_only=False,
+                    extraction_contract=contract, progress=report, identity_log_level='summary',
+                    compilation_unit_plan_sink=plan_sink, resolved_process_graph_sink=graph_sink,
+                )
+            artifact_path = destination / repository_artifact
+            _dump_pickle_artifact(artifact_path, (module, outputs, exports))
+            checkpoint_store.store(_REPOSITORY_SSA_PHASE, checkpoint_implementation, {
+                'artifact': repository_artifact,
+                'sha256': _file_sha256(artifact_path),
+            })
+            receipt.update(
+                stage='repository-ssa', functions=len(module.functions),
+                exports=list(exports), checkpoint_status='stored',
+                resumable_stage='repository-ssa',
             )
-            receipt.update(stage='repository-ssa', functions=len(module.functions), exports=list(exports))
-            _dump_pickle_artifact(destination / 'repository-ssa.pkl', (module, outputs, exports))
             publish()
-            if lower_only:
-                return receipt
+        if lower_only:
+            return receipt
+        with scoped_work_contract(policy):
             # This existing emitter exports an entire library surface as bind(C)
             # roots in ONE module; no per-operator library/dispatcher is created.
             from src.compiler.ssa_fortran_backend import emit_module, compile_module
