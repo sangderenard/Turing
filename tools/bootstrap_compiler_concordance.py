@@ -21,7 +21,7 @@ def build_compartment(directory, *, lower_only=False, progress=print):
     from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.project_compilation_product import (
-        _dump_pickle_artifact, compiler_toolchain_fingerprint,
+        _dump_pickle_artifact, _dump_resolved_process_graph, compiler_toolchain_fingerprint,
     )
     from src.compiler.work_contract import (
         active_contract, expansion_policy, scoped_work_contract, with_expansion_policy,
@@ -29,7 +29,7 @@ def build_compartment(directory, *, lower_only=False, progress=print):
     root = Path(__file__).resolve().parents[1]
     destination = Path(directory).resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    source_path = Path(incumbent.__file__)
+    source_path = root / 'src/compiler/identity_concordance.py'
     source = source_path.read_text(encoding='utf-8')
     policy = with_expansion_policy(active_contract(), {
         'unroll_depth': 0, 'inline_depth': 0, 'custom_version_depth': 0,
@@ -42,6 +42,11 @@ def build_compartment(directory, *, lower_only=False, progress=print):
         'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
         'compiler_toolchain': compiler_toolchain_fingerprint(),
         'scope': 'whole-module', 'entrypoint': None,
+        'required_native_work': [
+            'post-concord-revise', 'row-and-scope-search', 'history-search',
+            'forward-and-reverse-provenance', 'correlation-and-audit-search',
+            'complete-log-formatting', 'compressed-log-writing',
+        ],
         'expansion_policy': expansion_policy(policy),
         'execution_contract': contract.execution.receipt(),
         'stage': 'source', 'installed': False,
@@ -58,7 +63,8 @@ def build_compartment(directory, *, lower_only=False, progress=print):
 
     def graph_sink(value):
         # Existing exact post-reduction checkpoint, before deployment's cost.
-        _dump_pickle_artifact(destination / 'resolved-process-graph.pkl', value)
+        with (destination / 'resolved-process-graph.pkl').open('wb') as stream:
+            _dump_resolved_process_graph(value, stream)
 
     def report(message):
         # Keep stage progress visible without per-AST-node terminal rendering.

@@ -1879,7 +1879,7 @@ def _index_source_graph_spellings(
 
     for symbol in (
         *symbols,
-        function_graph.graph.get("authored_function_identity"),
+        _source_graph_instance_key(function_graph.graph),
     ):
         if not symbol:
             continue
@@ -1887,6 +1887,20 @@ def _index_source_graph_spellings(
         if incumbent is not None and incumbent is not function_graph:
             raise ValueError(f"conflicting source graphs for exact identity {symbol!r}")
         indexed[symbol] = function_graph
+
+
+def _source_graph_instance_key(metadata: Mapping[str, Any]) -> Any:
+    """An authored definition plus its exact declared graph instance.
+
+    Pursuit may retain both the submitted definition and an imported view of
+    it. Their source identity agrees while their function-table references
+    and value-id spaces differ. Neither graph may win a source-name lookup.
+    """
+    identity = metadata.get("authored_function_identity")
+    reference = metadata.get("source_function_reference", metadata.get("function_ref"))
+    if identity is None:
+        return None
+    return identity if reference is None else ("source-function-instance", identity, int(reference))
 
 
 def _resolved_source_graphs_by_symbol(resolved_graph: Any) -> dict[Any, Any]:
@@ -1914,7 +1928,7 @@ def _source_graph_for_lowered_function(
 
     metadata = getattr(function, "metadata", None) or {}
     for identity in (
-        metadata.get("authored_function_identity"),
+        _source_graph_instance_key(metadata),
         metadata.get("source_qualified_name"),
         function_symbol,
     ):
@@ -2305,7 +2319,7 @@ def _recover_module_late_source_literals(
             source_graphs, str(function_symbol), function,
         )
         literal_values = literal_catalogue.get(
-            (function.metadata or {}).get("authored_function_identity")
+            _source_graph_instance_key(function.metadata or {})
         )
         if literal_values is None:
             literal_values = literal_catalogue.get(source_symbol)

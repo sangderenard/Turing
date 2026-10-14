@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import threading
 from typing import Any, Callable
 
@@ -23,6 +24,201 @@ from typing import Any, Callable
 COMPILER_BOOTSTRAP_PRODUCTS_ENV = "TURING_COMPILER_BOOTSTRAP_PRODUCTS"
 COMPILER_BOOTSTRAP_REGISTRY_ENV = "TURING_COMPILER_BOOTSTRAP_REGISTRY"
 COMPILER_BOOTSTRAP_REGISTRY_SCHEMA = "turing.compiler-bootstrap-registry.v1"
+PROVENANCE_CORE_MODULE = "src.compiler.identity_concordance"
+PROVENANCE_SOURCE_ONLY_ENV = "TURING_PROVENANCE_SOURCE_ONLY"
+_PROVENANCE_CORE_STATE = {"backend": "python", "reason": "no installed native core"}
+
+
+def provenance_core_state() -> dict[str, Any]:
+    """The whole module selected at process startup; never per-access routing."""
+    return dict(_PROVENANCE_CORE_STATE)
+
+
+def _verified_provenance_core(record):
+    """Check a whole-module link without importing compiler implementation."""
+    source = Path(__file__).with_name("identity_concordance.py")
+    library = Path(record["native_module"]).resolve()
+    receipt_path = Path(record["verification_receipt"]).resolve()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    repository = Path(__file__).resolve().parents[2]
+    ledger = {item["path"]: item["sha256"]
+              for item in (receipt.get("compiler_toolchain") or {}).get("files", ())}
+    required = {"src/compiler/identity_concordance.py", "src/compiler/id_space.py",
+                "src/compiler/monotonic_ids.py", "src/compiler/concordance_declarations.py"}
+    if (receipt.get("schema") != "turing.native-provenance-core-verification.v1"
+            or receipt.get("status") != "verified"
+            or receipt.get("scope") != "whole-module"
+            or receipt.get("module") != PROVENANCE_CORE_MODULE
+            or receipt.get("python_cache_tag") != sys.implementation.cache_tag
+            or receipt.get("source_sha256") != _file_sha256(source)
+            or receipt.get("library_sha256") != _file_sha256(library)
+            or record.get("verification_sha256") != _file_sha256(receipt_path)
+            or receipt.get("fallback_probe_count") != 0
+            or type(receipt.get("native_probe_count")) is not int
+            or receipt["native_probe_count"] < 1
+            or not required.issubset(ledger)
+            or any(_file_sha256(repository / path) != digest for path, digest in ledger.items())):
+        raise ValueError("native provenance core does not have a matching whole-module verification")
+    return library, receipt
+
+
+def activate_native_provenance_core(registry_path=None) -> bool:
+    """Select the complete native module before any book imports exist.
+
+    The native artifact must implement Python's module initialization ABI for
+    the canonical module, including its complete operator/query/formatting
+    surface. A raw bind(C) library or a set of accessor wrappers cannot enter
+    this route. Existing processes never mix Python and native book state.
+    """
+    if os.environ.get(PROVENANCE_SOURCE_ONLY_ENV) == "1":
+        _PROVENANCE_CORE_STATE.update(backend="python", reason="isolated provenance bootstrap")
+        return False
+    if PROVENANCE_CORE_MODULE in sys.modules:
+        return _PROVENANCE_CORE_STATE["backend"] == "native"
+    path = compiler_bootstrap_registry_path(registry_path)
+    if not path.is_file():
+        return False
+    try:
+        registry = json.loads(path.read_text(encoding="utf-8"))
+        if registry.get("schema") != COMPILER_BOOTSTRAP_REGISTRY_SCHEMA:
+            raise ValueError("unsupported compiler bootstrap registry schema")
+        record = registry.get("provenance_core")
+        if not record:
+            return False
+        library, receipt = _verified_provenance_core(record)
+        from importlib.machinery import ExtensionFileLoader
+        from importlib.util import module_from_spec, spec_from_file_location
+        loader = ExtensionFileLoader(PROVENANCE_CORE_MODULE, str(library))
+        spec = spec_from_file_location(PROVENANCE_CORE_MODULE, library, loader=loader)
+        module = module_from_spec(spec)
+        sys.modules[PROVENANCE_CORE_MODULE] = module
+        try:
+            loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(PROVENANCE_CORE_MODULE, None)
+            raise
+        setattr(sys.modules[__package__], "identity_concordance", module)
+        _PROVENANCE_CORE_STATE.update(backend="native", reason="verified whole-module link",
+                                      library=str(library), verification=receipt)
+        return True
+    except Exception as error:
+        sys.modules.pop(PROVENANCE_CORE_MODULE, None)
+        _PROVENANCE_CORE_STATE.update(backend="python", reason=str(error))
+        return False
+
+
+def publish_native_provenance_core(native_module, verification_receipt, *, registry_path=None):
+    """Atomically install one verified coarse module for fresh compiler workers."""
+    library = Path(native_module).resolve()
+    verification = Path(verification_receipt).resolve()
+    record = {"native_module": str(library), "verification_receipt": str(verification),
+              "verification_sha256": _file_sha256(verification)}
+    _verified_provenance_core(record)
+    destination = compiler_bootstrap_registry_path(registry_path)
+    registry = (json.loads(destination.read_text(encoding="utf-8")) if destination.is_file()
+                else {"schema": COMPILER_BOOTSTRAP_REGISTRY_SCHEMA, "products": []})
+    if registry.get("schema") != COMPILER_BOOTSTRAP_REGISTRY_SCHEMA:
+        raise ValueError("unsupported compiler bootstrap registry schema")
+    registry["provenance_core"] = record
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        _probe_native_provenance_core(temporary, library)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def _probe_native_provenance_core(registry_path, library):
+    """Re-prove import, complete surface and book semantics in a fresh process."""
+    import subprocess
+    import tempfile
+    environment = os.environ.copy()
+    environment.pop(PROVENANCE_SOURCE_ONLY_ENV, None)
+    environment.pop(COMPILER_BOOTSTRAP_PRODUCTS_ENV, None)
+    registry = json.loads(Path(registry_path).read_text(encoding="utf-8"))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False,
+                                     dir=Path(registry_path).parent, encoding="utf-8") as candidate:
+        json.dump({"schema": COMPILER_BOOTSTRAP_REGISTRY_SCHEMA, "products": [],
+                   "provenance_core": registry["provenance_core"]}, candidate)
+    environment[COMPILER_BOOTSTRAP_REGISTRY_ENV] = candidate.name
+    repository = Path(__file__).resolve().parents[2]
+    probe = r'''
+import ast, pathlib, sys
+from src.compiler.compiler_bootstrap_runtime import provenance_core_state
+state = provenance_core_state()
+assert state["backend"] == "native", state
+assert pathlib.Path(state["library"]).resolve() == pathlib.Path(sys.argv[1]).resolve()
+import src.compiler.identity_concordance as core
+source = pathlib.Path("src/compiler/identity_concordance.py")
+definitions = ast.parse(source.read_text()).body
+surface = {node.name for node in definitions
+           if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+assert not (surface - set(dir(core))), sorted(surface - set(dir(core)))
+missing_methods = [node.name + "." + member.name
+                   for node in definitions if isinstance(node, ast.ClassDef)
+                   for member in node.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   if not hasattr(getattr(core, node.name), member.name)]
+assert not missing_methods, missing_methods
+import pytest
+raise SystemExit(pytest.main(["-q", "tests/test_copy_on_read_scopes.py",
+                             "tests/test_provenance_compartment_operations.py",
+                             "tests/test_pythonic_control_torture.py::test_pythonic_control_native_effects[c-guarded_splice]"]))
+'''
+    try:
+        completed = subprocess.run([sys.executable, "-c", probe, str(library)],
+                                   cwd=repository, env=environment,
+                                   capture_output=True, text=True)
+    finally:
+        Path(candidate.name).unlink(missing_ok=True)
+    if completed.returncode:
+        raise ValueError("native provenance module failed fresh-process verification:\n"
+                         + completed.stdout + completed.stderr)
+
+
+class ProvenanceCoreRestartRequired(RuntimeError):
+    """The link is installed; this coordinator must restart before compiling."""
+
+
+def ensure_native_provenance_core(directory, *, progress=None):
+    """Blocking first stage; no outer compiler workers may start before it."""
+    import subprocess
+    if provenance_core_state()["backend"] == "native":
+        return provenance_core_state()
+    registry_path = compiler_bootstrap_registry_path()
+    if registry_path.is_file():
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        record = registry.get("provenance_core")
+        if record:
+            try:
+                library, _ = _verified_provenance_core(record)
+            except (ValueError, OSError, KeyError):
+                pass  # An obsolete product is rebuilt from the current source.
+            else:
+                _probe_native_provenance_core(registry_path, library)
+                raise ProvenanceCoreRestartRequired("restart to select installed native provenance core")
+    destination = Path(directory).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment[PROVENANCE_SOURCE_ONLY_ENV] = "1"
+    environment.pop(COMPILER_BOOTSTRAP_PRODUCTS_ENV, None)
+    isolated_registry = destination / "source-compiler-registry.json"
+    isolated_registry.write_text(json.dumps({"schema": COMPILER_BOOTSTRAP_REGISTRY_SCHEMA,
+                                             "products": []}) + "\n", encoding="utf-8")
+    environment[COMPILER_BOOTSTRAP_REGISTRY_ENV] = str(isolated_registry)
+    if progress is not None:
+        progress("compiler-bootstrap: exclusively compiling whole provenance core; outer workers blocked")
+    subprocess.run([sys.executable, "-m", "tools.bootstrap_compiler_concordance",
+                    "--output", str(destination)],
+                   cwd=Path(__file__).resolve().parents[2], env=environment, check=True)
+    receipt = json.loads((destination / "compartment.json").read_text(encoding="utf-8"))
+    if receipt.get("stage") != "native-module-verified":
+        raise RuntimeError("provenance-first bootstrap blocked: whole native module is not verified; "
+                           f"stage={receipt.get('stage')!r}; receipt={destination / 'compartment.json'}")
+    publish_native_provenance_core(receipt["native_module"], receipt["verification_receipt"])
+    raise ProvenanceCoreRestartRequired("native provenance installed; restart before compiling outer units")
 
 
 @dataclass(frozen=True)
@@ -262,6 +458,12 @@ def publish_compiler_bootstrap_products(
         "schema": COMPILER_BOOTSTRAP_REGISTRY_SCHEMA,
         "products": records,
     }
+    if destination.is_file():
+        previous = json.loads(destination.read_text(encoding="utf-8"))
+        if previous.get("schema") != COMPILER_BOOTSTRAP_REGISTRY_SCHEMA:
+            raise ValueError("unsupported compiler bootstrap registry schema")
+        if previous.get("provenance_core"):
+            payload["provenance_core"] = previous["provenance_core"]
     temporary = destination.with_name(destination.name + ".tmp")
     temporary.write_text(
         json.dumps(payload, indent=2, sort_keys=True),
@@ -506,6 +708,12 @@ def compiler_bootstrap_runtime_state() -> tuple[dict[str, Any], ...]:
 
 
 __all__ = [
+    "PROVENANCE_CORE_MODULE",
+    "ProvenanceCoreRestartRequired",
+    "activate_native_provenance_core",
+    "ensure_native_provenance_core",
+    "provenance_core_state",
+    "publish_native_provenance_core",
     "COMPILER_BOOTSTRAP_REGISTRY_ENV",
     "COMPILER_BOOTSTRAP_REGISTRY_SCHEMA",
     "COMPILER_BOOTSTRAP_PRODUCTS_ENV",

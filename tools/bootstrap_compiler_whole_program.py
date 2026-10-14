@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import sys
 from typing import Sequence
 
 from src.compiler.whole_program_compiler_bootstrap import (
@@ -87,7 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         target = receipt["next_partition"]
         print(
             f"planned {len(receipt['boundaries'])} versioned boundaries; "
-            f"next outer partition: {target['name']} "
+            f"first unit: {target['name']} "
             f"{target['version'][:12]}; "
             f"receipt: {(arguments.output / 'plan.json').resolve()}",
             flush=True,
@@ -100,43 +102,60 @@ def main(argv: Sequence[str] | None = None) -> int:
         None,
         prefix="compiler-bootstrap: ",
     )
+    from src.compiler.compiler_bootstrap_runtime import (
+        PROVENANCE_SOURCE_ONLY_ENV, ProvenanceCoreRestartRequired,
+    )
     with display:
-        product = build_whole_program_compiler(
-            arguments.output,
-            expansion_policy=expansion_policy,
-            jobs=arguments.jobs,
-            minimum_worker_jobs=arguments.min_workers,
-            source_compilation=(arguments.source_schedule if arguments.source_compilation == "auto"
-                                else arguments.source_compilation),
-            max_total_resident_bytes=(
-                None if arguments.max_total_gb is None
-                else int(arguments.max_total_gb * (1 << 30))
-            ),
-            minimum_total_resident_bytes=int(
-                arguments.min_total_gb * (1 << 30)
-            ),
-            system_reserve_bytes=int(
-                arguments.system_reserve_gb * (1 << 30)
-            ),
-            adaptive_memory_ceiling=True,
-            worker_resident_reservation_bytes=int(
-                arguments.worker_reserve_gb * (1 << 30)
-            ),
-            max_worker_memory_bytes=(
-                None if arguments.max_worker_gb is None
-                else int(arguments.max_worker_gb * (1 << 30))
-            ),
-            worker_elastic_available_percent=(
-                arguments.worker_elastic_available_percent
-            ),
-            progress=display.log,
-        )
-        if product.product.get("status") != "sealed":
-            for record in product.product.get("units", ()):
-                if record.get("native_verification_status") != "verified":
-                    display.log(f"FAILED {record['qualified_name']}: "
-                        f"{record.get('error') or record.get('native_verification_reason') or record.get('native_failure') or record['status']}")
-            display.close(failed=True)
+        try:
+            return _build_and_report(arguments, expansion_policy, display)
+        except ProvenanceCoreRestartRequired:
+            display.close()
+            # A new interpreter imports the complete native module before any
+            # book or compiler worker exists; never replace a live Python book.
+            environment = os.environ.copy()
+            environment.pop(PROVENANCE_SOURCE_ONLY_ENV, None)
+            os.execve(sys.executable, [sys.executable, "-m",
+                      "tools.bootstrap_compiler_whole_program",
+                      *(argv if argv is not None else sys.argv[1:])], environment)
+
+
+def _build_and_report(arguments, expansion_policy, display):
+    product = build_whole_program_compiler(
+        arguments.output,
+        expansion_policy=expansion_policy,
+        jobs=arguments.jobs,
+        minimum_worker_jobs=arguments.min_workers,
+        source_compilation=(arguments.source_schedule if arguments.source_compilation == "auto"
+                            else arguments.source_compilation),
+        max_total_resident_bytes=(
+            None if arguments.max_total_gb is None
+            else int(arguments.max_total_gb * (1 << 30))
+        ),
+        minimum_total_resident_bytes=int(
+            arguments.min_total_gb * (1 << 30)
+        ),
+        system_reserve_bytes=int(
+            arguments.system_reserve_gb * (1 << 30)
+        ),
+        adaptive_memory_ceiling=True,
+        worker_resident_reservation_bytes=int(
+            arguments.worker_reserve_gb * (1 << 30)
+        ),
+        max_worker_memory_bytes=(
+            None if arguments.max_worker_gb is None
+            else int(arguments.max_worker_gb * (1 << 30))
+        ),
+        worker_elastic_available_percent=(
+            arguments.worker_elastic_available_percent
+        ),
+        progress=display.log,
+    )
+    if product.product.get("status") != "sealed":
+        for record in product.product.get("units", ()):
+            if record.get("native_verification_status") != "verified":
+                display.log(f"FAILED {record['qualified_name']}: "
+                    f"{record.get('error') or record.get('native_verification_reason') or record.get('native_failure') or record['status']}")
+        display.close(failed=True)
     print(
         f"outer partition {product.boundary['name']} "
         f"ended at {product.product.get('status')}; "

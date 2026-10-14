@@ -1,6 +1,8 @@
 # Native book implementation continuation — 2026-10-14
 
 Branch: `codex/dense-storage-bootstrap-depth-2026-10-14`.
+
+Follow-up: [provenance-first bootstrap and designated short acceptance program](CONTINUATION_PROVENANCE_FIRST_BOOTSTRAP_2026-10-14.md) supersedes the scheduling/installation status below; the native binary remains unbuilt.
 Read with [the architecture audit](CONTINUATION_DENSE_STORAGE_BOOTSTRAP_DEPTH_2026-10-14.md). This receipt supersedes its original interpretation of depth: limits stop optional expansion, never source discovery, call execution, loop iterations, or dependency retention.
 
 ## Required architecture

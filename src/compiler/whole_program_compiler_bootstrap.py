@@ -5,7 +5,8 @@ at ``compile_program``. That erased the useful boundaries already proved by
 the compiler and made one enormous Python-object interface the prerequisite
 for every gain. This module now describes one composition instead:
 
-* the Python coordinator and IdentityBook remain the semantic authority;
+* the complete provenance core compiles and installs before any outer unit;
+* a fresh interpreter selects the whole native book module once;
 * existing native foundations are named, versioned boundary components;
 * authored pieces, followed by the whole outer compiler stage, are submitted
   as a source list through the public compiler used by ordinary programs.
@@ -84,6 +85,14 @@ class CompilerBoundary:
 # retained as negative evidence: it is versioned, but it is not an admitted
 # component because its frequently crossed object boundary lost decisively.
 BOUNDARIES = (
+    CompilerBoundary(
+        "provenance-core", "blocking-first-unit",
+        "src/compiler/identity_concordance.py", "<whole-module>",
+        "compiler.provenance.whole_module",
+        "book operators, scopes, queries, provenance traversal and audit inputs",
+        "native books, complete query results, findings and formatted logs",
+        disposition="must-install-before-other-compiles",
+    ),
     CompilerBoundary(
         "graph-topology", "native-foundation",
         "src/compiler/graph_refinement_kernels.py", "topological_order",
@@ -184,8 +193,10 @@ def plan_whole_program_compiler(
     boundaries = compiler_boundary_receipts(policy)
     target = next(
         boundary for boundary in boundaries
-        if boundary["name"] == "process-graph-lowering"
+        if boundary["name"] == "provenance-core"
     )
+    outer = next(boundary for boundary in boundaries
+                 if boundary["name"] == "process-graph-lowering")
     receipt = {
         "schema": BOOTSTRAP_SCHEMA,
         "stage": "planned",
@@ -194,6 +205,13 @@ def plan_whole_program_compiler(
         "expansion_policy": policy,
         "boundaries": list(boundaries),
         "next_partition": target,
+        "outer_partition": outer,
+        "bootstrap_schedule": [
+            {"boundary": "provenance-core", "exclusive": True,
+             "must_complete": ["compile", "verify", "install", "restart"]},
+            {"boundary": "process-graph-lowering", "after": "provenance-core",
+             "requires_backend": "native-provenance"},
+        ],
         "source_update_policy": (
             "source-or-toolchain changes select a new versioned product; "
             "only receipt-verified matching products may activate"
@@ -244,7 +262,13 @@ def build_whole_program_compiler(
     destination.mkdir(parents=True, exist_ok=True)
     plan = plan_whole_program_compiler(destination, progress=progress,
                                        expansion_policy=expansion_policy)
-    boundary = dict(plan["next_partition"])
+    from .compiler_bootstrap_runtime import ensure_native_provenance_core
+    first = plan["next_partition"]
+    core = ensure_native_provenance_core(
+        destination / "products" / first["name"] / first["version"], progress=progress)
+    if core.get("backend") != "native":
+        raise RuntimeError("outer compiler schedule requires native provenance core")
+    boundary = dict(plan["outer_partition"])
     repository = Path(__file__).resolve().parents[2]
     product_root = (
         destination / "products" / boundary["name"] / boundary["version"]

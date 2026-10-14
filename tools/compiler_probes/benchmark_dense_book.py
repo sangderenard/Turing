@@ -24,8 +24,12 @@ def main():
     sys.path.insert(0, str(args.root.resolve()))
     from src.compiler.identity_concordance import (
         IdentityBook, Registry, RowField, RowFieldKind, Novel, Derived, Mode, Ref,
+        render_identity_book,
     )
     from src.compiler.work_contract import active_contract, scoped_work_contract
+    from src.compiler import compiler_bootstrap_runtime
+    describe_backend = getattr(compiler_bootstrap_runtime, 'provenance_core_state', None)
+    backend = describe_backend() if describe_backend is not None else {'backend': 'python'}
     contract = active_contract()
 
     def populate():
@@ -70,8 +74,17 @@ def main():
             wall = time.perf_counter()
             sum(map(hash, hashed))
             hash_times.append(time.perf_counter() - wall)
+        # One coarse operation: all provenance/history searches, ordering,
+        # row rendering and string assembly stay inside the module boundary.
+        format_times = []
+        for _ in range(args.repeats):
+            wall = time.perf_counter()
+            formatted = render_identity_book(book)
+            format_times.append(time.perf_counter() - wall)
+        formatted_bytes = len(formatted.encode('utf-8'))
+        del formatted
         print(json.dumps({
-            'root': str(args.root.resolve()), 'storage': 'incumbent-python-book',
+            'root': str(args.root.resolve()), 'storage': backend['backend'],
             'facts': args.cells, 'materialized_cells': sum(p.cell_count() for p in book.pages.values()),
             'repeats': args.repeats, 'post_wall_median_s': statistics.median(walls),
             'post_cpu_median_s': statistics.median(cpus),
@@ -79,6 +92,8 @@ def main():
             'traced_retained_bytes': current, 'traced_peak_bytes': peak,
             'reference_bytes_each_including_dict': ref_bytes,
             'cached_hash_wall_median_s': statistics.median(hash_times),
+            'whole_book_format_wall_median_s': statistics.median(format_times),
+            'formatted_bytes': formatted_bytes,
         }, sort_keys=True))
 
 

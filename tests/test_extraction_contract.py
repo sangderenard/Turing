@@ -113,7 +113,7 @@ def test_default_contract_draws_python_native_and_decompile_lines():
     assert report.storage == "table"
     assert report.rank == 1
     assert report.mutable is True
-    assert report.table_columns == ({"name": "token", "dtype": "int64"},)
+    assert report.table_columns == ({"name": "token", "dtype": "int64", "rank": 0},)
     targets = contract.program_abi.records["Targets"]
     assert targets.fields["energy_exchange_fraction"].optional is True
     assert targets.fields["shadow_growth_max"].optional is True

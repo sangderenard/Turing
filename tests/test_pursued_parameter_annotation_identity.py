@@ -137,6 +137,27 @@ def test_lambdas_retain_their_full_authored_source_paths():
         assert all(len(identity) == 3 and identity[2] for identity in identities)
         indexed = _resolved_source_graphs_by_symbol(graph)
         for identity, item in zip(identities, lambdas):
-            assert indexed[identity] is item
+            assert indexed[("source-function-instance", identity, item.graph["function_ref"])] is item
     finally:
         end_identity_book(token)
+
+
+def test_imported_views_of_one_definition_keep_exact_function_instances():
+    from types import SimpleNamespace
+    from src.compiler.fortran_c_shell import (
+        _resolved_source_graphs_by_symbol, _source_graph_for_lowered_function,
+    )
+    identity = ("books", "Registry.__init__")
+    entries = [SimpleNamespace(
+        name="__init__", qualified_name=spelling,
+        graph=SimpleNamespace(G=SimpleNamespace(graph={
+            "authored_function_identity": identity, "function_ref": reference})))
+        for spelling, reference in (("Registry.__init__", 69), ("books.Registry.__init__", 235))]
+    indexed = _resolved_source_graphs_by_symbol(SimpleNamespace(function_table=entries))
+    assert identity not in indexed
+    for entry in entries:
+        metadata = {"authored_function_identity": identity,
+                    "source_function_reference": entry.graph.G.graph["function_ref"]}
+        assert _source_graph_for_lowered_function(indexed, "compiled", SimpleNamespace(metadata=metadata)) is entry.graph.G
+    assert _source_graph_for_lowered_function(indexed, "compiled", SimpleNamespace(
+        metadata={"authored_function_identity": identity})) is None
