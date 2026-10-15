@@ -142,6 +142,7 @@ def test_provenance_stage_plans_once_and_resumes_ssa_enclosures(tmp_path, monkey
     def stage(graph, plan, directory, **kwargs):
         stages.append((graph, plan, directory, kwargs))
         assert kwargs["max_stage_units"] == stage_units
+        assert kwargs["stop_after_failure"] is True
         assert kwargs["jobs"] == (12 if jobs is None else jobs)
         assert kwargs["worker_resident_reservation_bytes"] == 256 << 20
         return {"pending_unit_indices": [1], "units": [], "status": "growing"}
@@ -159,6 +160,33 @@ def test_provenance_stage_plans_once_and_resumes_ssa_enclosures(tmp_path, monkey
     assert stages[0][:3] == stages[1][:3]
     triage = json.loads((tmp_path / "core/growth/source-complexity.json").read_text())
     assert triage["cut_authority"] == "resolved-function-table"
+
+
+def test_provenance_failure_is_terminal_before_repository_assembly(tmp_path, monkeypatch):
+    from tools.bootstrap_compiler_concordance import build_compartment
+    from src.compiler import project_compilation_product as products
+
+    def plan(source, directory, **kwargs):
+        destination = directory / "inputs/plan.json"
+        destination.parent.mkdir(parents=True)
+        value = {"compiler_toolchain": products.compiler_toolchain_fingerprint(), "units": []}
+        destination.write_text(json.dumps(value))
+        return {"plan": value}
+
+    monkeypatch.setattr(products, "compile_partitioned_source", plan)
+    monkeypatch.setattr(products, "compile_resolved_process_graph_plan", lambda *args, **kwargs: {
+        "pending_unit_indices": [], "units": [{"unit_index": 4, "status": "failed"}],
+        "counts": {"failed": 1}, "stopped_after_failure": True,
+        "blocking_failure_unit_indices": [4],
+    })
+    monkeypatch.setattr(
+        products, "load_composed_source_units",
+        lambda *args: pytest.fail("assembled a failed provenance stage"),
+    )
+
+    receipt = build_compartment(tmp_path / "core", progress=None)
+
+    assert receipt["stage"] == "native-growth-failed"
 
 
 def test_surface_contract_includes_constants_and_class_declarations():

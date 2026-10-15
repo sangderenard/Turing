@@ -99,6 +99,30 @@ def test_rule_batch_clock_is_the_top_line_and_bars_remain_at_the_bottom():
     assert active_rule_batch_progress() is None
 
 
+def test_resolved_input_checkpoint_progress_is_visible_before_workers_start():
+    progress, output, _ = layer()
+    with progress:
+        progress.compilation_event({
+            "stage": "source_plan",
+            "message": "ssa-source: persisting 466 scoped unit inputs",
+        })
+        progress.compilation_event({
+            "stage": "resolved_input_snapshot", "completed_count": 459,
+            "count": 466, "qualified_names": ["package.function"],
+        })
+        current = frame_text(progress, width=160)
+        assert "459/466" in current
+        state = progress._counts["resolved-unit-inputs"]
+        assert state["label"] == "Scoped unit inputs"
+        assert state["detail"] == "package.function"
+        assert "persisting 466 scoped unit inputs" in output.getvalue()
+        progress.compilation_event({
+            "stage": "resolved_input_complete", "count": 466,
+        })
+        assert "resolved-unit-inputs" not in progress._counts
+        assert progress._substage == "resolved unit inputs persisted"
+
+
 def test_one_live_renders_concurrent_compilers_as_columns_and_keeps_failure():
     progress, _, _ = layer()
     failed_stages = [

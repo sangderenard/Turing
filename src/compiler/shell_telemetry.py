@@ -2124,7 +2124,9 @@ class CompileProgress:
     def compilation_event(self, event: Mapping[str, Any]) -> None:
         """Consume scheduler events from the universal source frontend."""
         kind = event.get("stage")
-        if kind in {"worker_output", "unit_failed", "native_failed"}:
+        if kind == "source_plan":
+            self.log(str(event.get("message", "")))
+        elif kind in {"worker_output", "unit_failed", "native_failed"}:
             self.log(f"[{event.get('qualified_name', '')}] {event.get('message', event.get('error', ''))}")
         elif kind == "worker_snapshot":
             for record in event.get("running", ()):
@@ -2175,6 +2177,21 @@ class CompileProgress:
         elif kind == "resolved_worker_log":
             label = ", ".join(event.get("qualified_names") or ())
             self.log(f"[{label}] {event.get('message', '')}")
+        elif kind == "resolved_input_snapshot":
+            names = ", ".join(event.get("qualified_names") or ())
+            self.count(
+                "resolved-unit-inputs",
+                int(event.get("completed_count", 0)),
+                total=int(event.get("count", 0)),
+                label="Scoped unit inputs",
+                detail=names,
+            )
+        elif kind == "resolved_input_function_table":
+            self.count_close("resolved-unit-inputs")
+            self.substage("persist source function table")
+        elif kind == "resolved_input_complete":
+            self.count_close("resolved-unit-inputs")
+            self.substage("resolved unit inputs persisted")
 
     def iterate(
         self,

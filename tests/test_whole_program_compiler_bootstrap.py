@@ -151,6 +151,42 @@ def test_provenance_only_cli_stops_before_outer_partition(tmp_path, monkeypatch,
     assert "outer partition not started" in capsys.readouterr().out
 
 
+def test_provenance_cli_does_not_open_outer_display_while_child_owns_terminal(
+    tmp_path, monkeypatch, capsys,
+):
+    import tools.bootstrap_compiler_whole_program as cli
+    from src.compiler import shell_telemetry
+
+    plan = {"next_partition": {"version": "b" * 64}}
+    monkeypatch.setattr(
+        cli, "bootstrap_provenance_core",
+        lambda *args, **kwargs: (
+            plan, {"backend": "native", "library": "whole-module"},
+        ),
+    )
+    monkeypatch.setattr(
+        shell_telemetry, "compile_progress",
+        lambda *args, **kwargs: pytest.fail("outer display opened"),
+    )
+
+    assert cli.main(["--provenance-only", "--output", str(tmp_path)]) == 0
+    assert "outer partition not started" in capsys.readouterr().out
+
+
+def test_provenance_child_failure_returns_its_status_without_parent_traceback(
+    tmp_path, monkeypatch,
+):
+    import subprocess
+    import tools.bootstrap_compiler_whole_program as cli
+
+    def failed_child(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["provenance-child"])
+
+    monkeypatch.setattr(cli, "bootstrap_provenance_core", failed_child)
+
+    assert cli.main(["--provenance-only", "--output", str(tmp_path)]) == 1
+
+
 def test_outer_partition_is_an_authored_project_root():
     from src.compiler.project_compilation_product import discover_authored_calls
 

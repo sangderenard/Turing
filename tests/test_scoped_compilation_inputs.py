@@ -56,6 +56,14 @@ def test_native_growth_resumes_one_cut_per_stage_and_executes_binary_calls(tmp_p
             max_worker_memory_bytes=4 * 1024 ** 3, progress=events.append,
         )
         assert manifest["stage_admitted_units"] == 1
+        assert len(manifest["stage_admitted_unit_indices"]) == 1
+        assert manifest["stage_admitted_unit_indices"][0] in {
+            unit["unit_index"] for unit in manifest["units"]
+        }
+        if products:
+            assert manifest["stage_admitted_unit_indices"][0] not in {
+                unit["unit_index"] for unit in products[-1]["units"]
+            }
         assert len(manifest["units"]) == stage + 1
         assert manifest["counts"]["failed"] == manifest["counts"]["partial"] == 0
         products.append(manifest)
@@ -122,6 +130,7 @@ def test_ssa_growth_composes_interiors_before_one_native_emission(tmp_path):
         stages.append(manifest)
     assert stages[0]["concurrent_workers_peak"] == 2
     assert all(stage["stage_admitted_units"] == 2 for stage in stages)
+    assert all(len(stage["stage_admitted_unit_indices"]) == 2 for stage in stages)
     starts = [event for event in events if event["stage"] == "resolved_unit_start"]
     assert {event["qualified_names"][0] for event in starts[:2]} == {"left", "right"}
     assert manifest["status"] == "terminal"
@@ -236,7 +245,18 @@ def test_unit_worker_does_not_load_unrelated_function_bodies(tmp_path, monkeypat
 
 def test_published_cuts_preserve_exact_nodes_edges_scopes_and_addresses(tmp_path):
     _graph_path, _plan_path, plan, original = _inputs(tmp_path)
-    published = product.publish_resolved_process_graph_inputs(original, plan, tmp_path / "cuts")
+    events = []
+    published = product.publish_resolved_process_graph_inputs(
+        original, plan, tmp_path / "cuts", progress=events.append,
+    )
+    snapshots = [event for event in events
+                 if event["stage"] == "resolved_input_snapshot"]
+    assert [event["completed_count"] for event in snapshots] == list(
+        range(len(plan["units"]) + 1)
+    )
+    assert all(event["count"] == len(plan["units"]) for event in snapshots)
+    assert events[-1] == {"stage": "resolved_input_complete",
+                          "count": len(plan["units"])}
     for item in published["scoped_inputs"]:
         cut = product._load_pickle_artifact(item["path"])
         expected = set(product._resolved_unit_references(plan["units"], item["unit_index"]))
@@ -399,8 +419,11 @@ def test_oversized_dependency_closure_is_not_serialized_or_admitted(tmp_path, mo
     monkeypatch.setattr(product.subprocess, "Popen", forbidden)
     manifest = product.compile_resolved_process_graph_plan(
         graph_path, tmp_path / "cuts/plan.json", tmp_path / "product", jobs=2,
+        stop_after_failure=True,
     )
     assert manifest["concurrent_workers_peak"] == 0
+    assert manifest["stopped_after_failure"] is True
+    assert manifest["blocking_failure_unit_indices"] == list(range(len(plan["units"])))
     assert manifest["counts"]["failed"] == len(plan["units"])
     assert all(unit["resource"] == "source-node-tile" for unit in manifest["units"])
     assert manifest["subdivision_integral_count"] == len(plan["units"])

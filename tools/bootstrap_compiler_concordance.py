@@ -11,6 +11,7 @@ book activation.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -156,7 +157,8 @@ def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None
             progress(message)
 
     def growth_report(event):
-        report(json.dumps(event, sort_keys=True))
+        if progress is not None:
+            progress(event)
 
     repository_artifact = 'repository-ssa.pkl'
     resumed = _load_external_checkpoint(
@@ -217,10 +219,15 @@ def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None
                     product = compile_resolved_process_graph_plan(
                         growth_root / 'resolved-process-graph.pkl', plan_path,
                         growth_root / 'product', jobs=worker_jobs, max_stage_units=stage_units,
+                        stop_after_failure=True,
                         **scheduling,
                         progress=growth_report,
                     )
                     receipt['native_growth'] = product
+                    if product.get('stopped_after_failure'):
+                        receipt['stage'] = 'native-growth-failed'
+                        publish()
+                        return receipt
                     if product['pending_unit_indices']:
                         receipt['stage'] = 'native-growth-stage-persisted'
                         publish()
@@ -269,6 +276,84 @@ def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None
         raise
 
 
+def _one_line(value, *, limit=320):
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1].rstrip() + "…"
+
+
+def _stage_failure_rows(receipt, directory):
+    growth = receipt.get('native_growth') or {}
+    admitted = (
+        growth.get('blocking_failure_unit_indices')
+        if growth.get('stopped_after_failure')
+        else growth.get('stage_admitted_unit_indices')
+    )
+    admitted = None if admitted is None else {int(index) for index in admitted}
+    root = Path(directory).resolve() / 'growth' / 'product' / 'units'
+    rows = []
+    for record in growth.get('units') or ():
+        index = int(record.get('unit_index', -1))
+        if admitted is not None and index not in admitted:
+            continue
+        if record.get('status') not in {'failed', 'partial'}:
+            continue
+        unit = record.get('unit') or {}
+        names = record.get('qualified_names') or unit.get('qualified_names') or ()
+        stage = record.get('stage') or {}
+        compiler = stage.get('compiler') or {}
+        phase = (stage.get('phase') or compiler.get('stage_label')
+                 or compiler.get('stage_key') or 'worker')
+        unit_root = root / f'unit_{index:03d}'
+        detail = next((path for path in (
+            unit_root / 'failure.json', unit_root / 'unit.json',
+        ) if path.is_file()), unit_root / 'failure.json')
+        rows.append({
+            'unit_index': index,
+            'qualified_name': ', '.join(map(str, names)) or '<unnamed>',
+            'phase': str(phase),
+            'error_type': str(record.get('error_type') or record.get('status')),
+            'reason': _one_line(record.get('error') or record.get('message')
+                                or record.get('status')),
+            'receipt': detail,
+        })
+    return sorted(rows, key=lambda row: row['unit_index'])
+
+
+def _print_outcome(receipt, directory, *, emit=print):
+    path = Path(directory).resolve() / 'compartment.json'
+    growth = receipt.get('native_growth') or {}
+    if not growth:
+        emit(f"provenance stage {receipt.get('stage', 'unknown')}; receipt: {path}")
+        return
+    counts = growth.get('counts') or {}
+    completed = len(growth.get('units') or ())
+    pending = len(growth.get('pending_unit_indices') or ())
+    total = completed + pending
+    count_text = ', '.join(
+        f"{name}={int(counts.get(name, 0))}"
+        for name in ('verified', 'compiled-unverified', 'partial', 'failed')
+    )
+    emit(
+        f"provenance stage complete: admitted={growth.get('stage_admitted_units', 0)}, "
+        f"peak-workers={growth.get('concurrent_workers_peak', 0)}, "
+        f"cumulative={completed}/{total}, pending={pending}; {count_text}"
+    )
+    failures = _stage_failure_rows(receipt, directory)
+    if failures:
+        label = ('blocking failures' if growth.get('stopped_after_failure')
+                 else 'failures from this stage')
+        emit(f"{label} ({len(failures)}):")
+        for row in failures:
+            emit(
+                f"  - unit {row['unit_index']:03d} | {row['qualified_name']} | "
+                f"{row['phase']} | {row['error_type']}: {row['reason']}"
+            )
+            emit(f"    receipt: {row['receipt']}")
+    emit(f"stage receipt: {path}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=Path('build/compiler-concordance'))
@@ -283,11 +368,29 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.grow_stage and args.whole_module:
         parser.error('--grow-stage and --whole-module are mutually exclusive')
-    receipt = build_compartment(args.output, lower_only=args.lower_only, grow_stage=not args.whole_module,
-                                jobs=args.jobs, max_stage_units=args.stage_units,
-                                schedule_options=json.loads(args.schedule_json), progress=lambda message: print(message, flush=True))
-    print(json.dumps(receipt, sort_keys=True), flush=True)
-    return 0
+    from src.compiler.shell_telemetry import compile_progress
+    display = compile_progress(None, prefix='provenance-core: ')
+
+    def present(message):
+        if isinstance(message, Mapping):
+            if message.get('stage') == 'resolved_worker_log':
+                # Worker stdout contains complete JSON receipts and tracebacks.
+                # They remain in worker.log/failure.json; snapshots drive the
+                # live lanes and the compact rollup reports failures afterward.
+                return
+            display.compilation_event(message)
+        else:
+            display.log(str(message))
+
+    with display:
+        receipt = build_compartment(
+            args.output, lower_only=args.lower_only,
+            grow_stage=not args.whole_module, jobs=args.jobs,
+            max_stage_units=args.stage_units,
+            schedule_options=json.loads(args.schedule_json), progress=present,
+        )
+    _print_outcome(receipt, args.output, emit=lambda message: print(message, flush=True))
+    return 1 if (receipt.get('native_growth') or {}).get('stopped_after_failure') else 0
 
 
 if __name__ == '__main__':

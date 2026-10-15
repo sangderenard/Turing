@@ -1,3 +1,31 @@
+2026-10-14 PROVENANCE BOOTSTRAP TERMINAL OWNERSHIP + FAILURE ROLLUP (CURRENT):
+The provenance child now exclusively owns the terminal while it is active;
+the outer bootstrap opens its compositor only after provenance returns. Resolved
+worker events stay structured, worker JSON/traceback stdout remains in each
+unit's durable log/receipt, and a completed stage prints a deterministic list
+of blocking unit, qualified function, compiler phase, exception type, concise
+reason and receipt path. Provenance growth is fail-fast by default: after the
+first failed/partial receipt it admits no more units, drains already-running
+children, publishes every simultaneous blocking failure and exits nonzero.
+The outer process propagates that status without a second traceback.
+
+The long apparent pause at `compilation units` was observed, not inferred: the
+coordinator had already divided 466 units and was serially writing roughly
+10.8-MiB scoped input checkpoints. It had reached unit 459 before dispatch.
+That existing durable checkpoint boundary is unchanged. It now emits source
+plan messages plus a `Scoped unit inputs N/466` counter, followed by the real
+child source-compiler columns only when dispatch begins. A live run correctly
+refused dispatch because compiler source was edited after its plan fingerprint;
+that was a toolchain-integrity refusal, not a unit semantic failure. No worker
+from that run remains active. Targeted terminal/checkpoint/fail-fast checks pass;
+the final directly affected gate passed 12 tests. The broader focused gate completed
+with 133 passed, 2 skipped and 5 failed. Four failures reproduced unchanged in
+a detached pre-change baseline (source-acceptance fixture, two existing SSA
+geometry/concordance cases and the renderer work-contract case). The fifth was
+the new checkpoint-progress test under suite order and passed immediately in
+isolation; it does not reproduce in the directly affected gate. The detached
+baseline worktree was removed after comparison.
+
 2026-10-14 BOOTSTRAP CONTINUATION HANDOFF (CURRENT):
 Start with docs/compiler_convergence/12_bootstrap_handoff.md for the user's
 complete goal, retained memory constraints, implementation/review state,

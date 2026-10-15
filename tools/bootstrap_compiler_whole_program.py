@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import subprocess
 import sys
 from typing import Sequence
 
@@ -13,6 +14,31 @@ from src.compiler.whole_program_compiler_bootstrap import (
     build_whole_program_compiler,
     plan_whole_program_compiler,
 )
+
+
+def _provenance_schedule_options(arguments):
+    max_total_gb = getattr(arguments, "max_total_gb", 10.0)
+    max_worker_gb = getattr(arguments, "max_worker_gb", 10.0)
+    return {
+        "max_total_resident_bytes": (
+            None if max_total_gb is None else int(max_total_gb * (1 << 30))
+        ),
+        "minimum_total_resident_bytes": int(
+            getattr(arguments, "min_total_gb", 2.0) * (1 << 30)
+        ),
+        "system_reserve_bytes": int(
+            getattr(arguments, "system_reserve_gb", 2.0) * (1 << 30)
+        ),
+        "worker_resident_reservation_bytes": int(
+            getattr(arguments, "worker_reserve_gb", 2.0) * (1 << 30)
+        ),
+        "max_worker_memory_bytes": (
+            None if max_worker_gb is None else int(max_worker_gb * (1 << 30))
+        ),
+        "worker_elastic_available_percent": getattr(
+            arguments, "worker_elastic_available_percent", 75,
+        ),
+    }
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
@@ -106,57 +132,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    from src.compiler.shell_telemetry import compile_progress
-
-    display = compile_progress(
-        None,
-        prefix="compiler-bootstrap: ",
-    )
     from src.compiler.compiler_bootstrap_runtime import (
         PROVENANCE_SOURCE_ONLY_ENV, ProvenanceCoreRestartRequired,
     )
+    try:
+        # The provenance subprocess inherits this terminal and owns its live
+        # compositor.  Do not open the outer compositor until it has returned.
+        plan, core = bootstrap_provenance_core(
+            arguments.output,
+            expansion_policy=expansion_policy,
+            jobs=arguments.jobs,
+            schedule_options=_provenance_schedule_options(arguments),
+            progress=None,
+        )
+    except ProvenanceCoreRestartRequired:
+        # A new interpreter imports the complete native module before any
+        # book or compiler worker exists; never replace a live Python book.
+        environment = os.environ.copy()
+        environment.pop(PROVENANCE_SOURCE_ONLY_ENV, None)
+        os.execve(sys.executable, [sys.executable, "-m",
+                  "tools.bootstrap_compiler_whole_program",
+                  *(argv if argv is not None else sys.argv[1:])], environment)
+    except subprocess.CalledProcessError as error:
+        # The child already closed its display and printed the durable failure
+        # rollup.  Preserve its status without adding a parent traceback.
+        return int(error.returncode or 1)
+
+    if arguments.provenance_only:
+        first = plan["next_partition"]
+        print(
+            f"provenance core {first['version'][:12]} selected from "
+            f"{core.get('library', '<native module>')}; outer partition not started",
+            flush=True,
+        )
+        return 0
+
+    from src.compiler.shell_telemetry import compile_progress
+    display = compile_progress(None, prefix="compiler-bootstrap: ")
     with display:
-        try:
-            return _build_and_report(arguments, expansion_policy, display)
-        except ProvenanceCoreRestartRequired:
-            display.close()
-            # A new interpreter imports the complete native module before any
-            # book or compiler worker exists; never replace a live Python book.
-            environment = os.environ.copy()
-            environment.pop(PROVENANCE_SOURCE_ONLY_ENV, None)
-            os.execve(sys.executable, [sys.executable, "-m",
-                      "tools.bootstrap_compiler_whole_program",
-                      *(argv if argv is not None else sys.argv[1:])], environment)
+        return _build_and_report(arguments, expansion_policy, display)
 
 
 def _build_and_report(arguments, expansion_policy, display):
     if arguments.provenance_only:
-        max_total_gb = getattr(arguments, "max_total_gb", 10.0)
         plan, core = bootstrap_provenance_core(
             arguments.output,
             expansion_policy=expansion_policy,
             jobs=getattr(arguments, "jobs", None),
-            schedule_options={
-                "max_total_resident_bytes": (
-                    None if max_total_gb is None
-                    else int(max_total_gb * (1 << 30))
-                ),
-                "minimum_total_resident_bytes": int(
-                    getattr(arguments, "min_total_gb", 2.0) * (1 << 30)
-                ),
-                "system_reserve_bytes": int(
-                    getattr(arguments, "system_reserve_gb", 2.0) * (1 << 30)
-                ),
-                "worker_resident_reservation_bytes": int(
-                    getattr(arguments, "worker_reserve_gb", 2.0) * (1 << 30)
-                ),
-                "max_worker_memory_bytes": int(
-                    getattr(arguments, "max_worker_gb", 10.0) * (1 << 30)
-                ),
-                "worker_elastic_available_percent": getattr(
-                    arguments, "worker_elastic_available_percent", 75,
-                ),
-            },
+            schedule_options=_provenance_schedule_options(arguments),
             progress=display.log,
         )
         first = plan["next_partition"]

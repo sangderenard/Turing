@@ -5044,6 +5044,7 @@ def publish_resolved_process_graph_inputs(
     graph: Any, plan: Mapping[str, Any], directory: str | Path,
     *, max_unit_source_nodes: int | None = None, interface_tiles: bool = False,
     ssa_composition: bool = False,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Stream one immutable input per SCC; retain no list of graph copies."""
     root = Path(directory).resolve()
@@ -5064,6 +5065,9 @@ def publish_resolved_process_graph_inputs(
     ):
         raise ValueError("compilation tile node bound must be positive")
     inputs = []
+    if progress is not None:
+        progress({"stage": "resolved_input_snapshot", "completed_count": 0,
+                  "count": len(units)})
     for index in range(len(units)):
         references = (tuple(map(int, units[index]["function_references"]))
                       if interface_tiles or ssa_composition else _resolved_unit_references(units, index))
@@ -5074,6 +5078,11 @@ def publish_resolved_process_graph_inputs(
             inputs.append({"unit_index": index, "function_references": list(references),
                            "source_nodes": nodes, "max_source_nodes": int(max_unit_source_nodes),
                            "status": "requires-smaller-cut"})
+            if progress is not None:
+                progress({"stage": "resolved_input_snapshot",
+                          "completed_count": index + 1, "count": len(units),
+                          "unit_index": index,
+                          "qualified_names": units[index].get("qualified_names", ())})
             continue
         path = root / f"unit_{index:03d}.pkl"
         temporary = path.with_suffix(".pkl.tmp")
@@ -5083,10 +5092,18 @@ def publish_resolved_process_graph_inputs(
         os.replace(temporary, path)
         inputs.append({**receipt, "path": path.as_posix(),
                        "sha256": _file_sha256(path), "bytes": path.stat().st_size})
+        if progress is not None:
+            progress({"stage": "resolved_input_snapshot",
+                      "completed_count": index + 1, "count": len(units),
+                      "unit_index": index,
+                      "qualified_names": units[index].get("qualified_names", ()),
+                      "bytes": int(path.stat().st_size)})
     result = {**dict(plan), "scoped_inputs": inputs,
               "max_unit_source_nodes": max_unit_source_nodes, "interface_tiles": interface_tiles,
               "ssa_composition": bool(ssa_composition)}
     if ssa_composition:
+        if progress is not None:
+            progress({"stage": "resolved_input_function_table"})
         from types import SimpleNamespace
         # This is the frozen table itself with completed frontend bodies
         # removed, not a table reconstructed from names or signature slots.
@@ -5102,6 +5119,8 @@ def publish_resolved_process_graph_inputs(
         _dump_pickle_artifact(header_path, table)
         result["source_function_table"] = {"path": str(header_path), "sha256": _file_sha256(header_path)}
     _atomic_json(root / "plan.json", result)
+    if progress is not None:
+        progress({"stage": "resolved_input_complete", "count": len(units)})
     return result
 
 
@@ -5305,6 +5324,7 @@ def compile_partitioned_source(
     def publish(graph: Any) -> None:
         # Preserve the original resolved input for later exact subdivision;
         # execution reads the small cuts, never this complete backup.
+        report("ssa-source: persisting resolved ProcessGraph checkpoint")
         temporary = graph_path.with_suffix(".pkl.tmp")
         with temporary.open("wb") as stream:
             _dump_resolved_process_graph(graph, stream)
@@ -5313,6 +5333,7 @@ def compile_partitioned_source(
         # worker's mandatory live heap. Stow it intact once, with a digest;
         # later diagnostics can reload it without re-ingesting the program.
         from .identity_concordance import current_identity_book
+        report("ssa-source: persisting source concordance checkpoint")
         book = current_identity_book()
         book_path = root / "source-concordance.pkl"
         temporary_book = book_path.with_suffix(".pkl.tmp")
@@ -5330,6 +5351,9 @@ def compile_partitioned_source(
             tensor_path = root / "tensor-repository-input.pkl"
             _dump_pickle_artifact(tensor_path, tensor_reference)
             tensor_input = {"path": tensor_path.as_posix(), "sha256": _file_sha256(tensor_path)}
+        report(
+            f"ssa-source: persisting {len(plans[0]['units'])} scoped unit inputs"
+        )
         plans[0] = publish_resolved_process_graph_inputs(
             graph, {**plans[0], "source_concordance": source_concordance,
                     "tensor_repository_input": tensor_input,
@@ -5339,6 +5363,7 @@ def compile_partitioned_source(
             max_unit_source_nodes=max_unit_source_nodes,
             interface_tiles=interface_tiles,
             ssa_composition=ssa_composition,
+            progress=progress,
         )
 
     lower_ast_source_to_ssa(
@@ -7449,6 +7474,7 @@ def compile_resolved_process_graph_plan(
     worker_elastic_available_percent: int = 75,
     worker_environment: Mapping[str, str] | None = None,
     max_stage_units: int | None = None,
+    stop_after_failure: bool = False,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Crawl a resolved unit plan in isolated, resource-bounded workers.
@@ -7456,7 +7482,9 @@ def compile_resolved_process_graph_plan(
     Units are dependency-ready, ordered by remaining enclosing source cones
     and shared-source work avoided. ``max_stage_units`` ends admission after a
     bounded stage, drains its workers, and leaves terminal receipts for the
-    next process. A stage limit never kills a running compile.
+    next process. A stage limit never kills a running compile. When
+    ``stop_after_failure`` is selected, the first observed failed/partial
+    receipt stops further admission while already-running workers drain.
     Verified predecessors are linked when available; incomplete predecessors
     do not prevent exploratory lowering, but can never be linked or mistaken
     for an installable dependency.
@@ -7488,7 +7516,8 @@ def compile_resolved_process_graph_plan(
         # A worker must never deserialize every function merely to select one.
         graph = _load_pickle_artifact(resolved_path)
         plan = publish_resolved_process_graph_inputs(graph,
-            {**plan, "resolved_process_graph_sha256": _file_sha256(resolved_path)}, root / "inputs")
+            {**plan, "resolved_process_graph_sha256": _file_sha256(resolved_path)},
+            root / "inputs", progress=progress)
         unit_plan_path = root / "inputs" / "plan.json"
         del graph
         import gc
@@ -7599,9 +7628,14 @@ def compile_resolved_process_graph_plan(
     pending = [
         index for index, record in enumerate(records) if record is None
     ]
+    failure_seen = bool(stop_after_failure and any(
+        record is not None and record.get("status") in {"failed", "partial"}
+        for record in records
+    ))
     running: dict[int, dict[str, Any]] = {}
     concurrency_peak = 0
     stage_admitted = 0
+    stage_admitted_indices: list[int] = []
     active_total_limit = total_limit
     available_memory = None
     last_available_memory_sample = 0.0
@@ -7702,6 +7736,7 @@ def compile_resolved_process_graph_plan(
     def launch(index: int) -> None:
         nonlocal concurrency_peak, stage_admitted
         stage_admitted += 1
+        stage_admitted_indices.append(index)
         destination = unit_root(index)
         destination.mkdir(parents=True, exist_ok=True)
         command = [
@@ -7762,13 +7797,15 @@ def compile_resolved_process_graph_plan(
 
     write_progress()
     while pending or running:
+        if failure_seen and not running:
+            break
         if not running and max_stage_units is not None and stage_admitted >= max_stage_units:
             break
         measured_total = sum(
             max(reservation, int(state["resident"])) for state in running.values()
         )
         refresh_admission_ceiling(measured_total)
-        while pending and len(running) < worker_limit and (
+        while pending and not failure_seen and len(running) < worker_limit and (
             max_stage_units is None or stage_admitted < max_stage_units
         ) and (
             active_total_limit is None
@@ -7845,6 +7882,8 @@ def compile_resolved_process_graph_plan(
             _atomic_json(receipt_path if return_code == 0 and receipt_path.is_file()
                          else failure_path, record)
             records[index] = record
+            if stop_after_failure and record.get("status") in {"failed", "partial"}:
+                failure_seen = True
             del running[index]
             report(
                 "resolved_unit_finish", unit_index=index,
@@ -7886,6 +7925,14 @@ def compile_resolved_process_graph_plan(
         "concurrent_workers_peak": concurrency_peak,
         "growth_priorities": list(growth_priorities),
         "stage_admitted_units": stage_admitted,
+        "stage_admitted_unit_indices": stage_admitted_indices,
+        "stop_after_failure": bool(stop_after_failure),
+        "stopped_after_failure": bool(failure_seen),
+        "blocking_failure_unit_indices": [
+            int(record["unit_index"])
+            for record in completed_records
+            if record.get("status") in {"failed", "partial"}
+        ],
         "pending_unit_indices": pending,
         "status": "growing" if pending else "terminal",
         "scoped_inputs": list(plan.get("scoped_inputs") or ()),
