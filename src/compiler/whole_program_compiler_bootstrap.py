@@ -234,6 +234,8 @@ def bootstrap_provenance_core(
     directory: str | Path,
     *,
     expansion_policy: Mapping[str, Any] | None = None,
+    jobs: int | None = None,
+    schedule_options: Mapping[str, Any] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Complete the bootstrap's blocking provenance stage and nothing later."""
@@ -245,7 +247,8 @@ def bootstrap_provenance_core(
     from .compiler_bootstrap_runtime import ensure_native_provenance_core
     first = plan["next_partition"]
     core = ensure_native_provenance_core(
-        destination / "products" / first["name"] / first["version"], progress=progress)
+        destination / "products" / first["name"] / first["version"], jobs=jobs,
+        schedule_options=dict(schedule_options or {}), progress=progress)
     if core.get("backend") != "native":
         raise RuntimeError("outer compiler schedule requires native provenance core")
     return plan, core
@@ -281,7 +284,16 @@ def build_whole_program_compiler(
 
     destination = Path(directory).resolve()
     plan, _core = bootstrap_provenance_core(
-        destination, progress=progress, expansion_policy=expansion_policy)
+        destination, progress=progress, expansion_policy=expansion_policy, jobs=jobs,
+        schedule_options={
+            "max_total_resident_bytes": max_total_resident_bytes,
+            "minimum_total_resident_bytes": minimum_total_resident_bytes,
+            "system_reserve_bytes": system_reserve_bytes,
+            "adaptive_memory_ceiling": adaptive_memory_ceiling,
+            "worker_resident_reservation_bytes": worker_resident_reservation_bytes,
+            "max_worker_memory_bytes": max_worker_memory_bytes,
+            "worker_elastic_available_percent": worker_elastic_available_percent,
+        })
     boundary = dict(plan["outer_partition"])
     repository = Path(__file__).resolve().parents[2]
     product_root = (

@@ -580,7 +580,7 @@ SOURCE_CONTROL_SPECIALIZATION = declare_page(
 )
 STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(
     "structural_specialization_fixed_point", (
-        RowField("function", K.NAME), RowField("round", K.INDEX),
+        RowField("invocation", K.SCOPE), RowField("round", K.INDEX),
     ), tuple,                          # (digest, changed, mutations); REVISE
 )
 #: A compile policy the work contract declares and a pass reads
@@ -1023,6 +1023,16 @@ CALLSITE_ARGUMENT = declare_page("callsite_argument", (
 LOOP_RESULT_RECONCILIATION = declare_page("loop_result_reconciliation", (
     RowField("function", K.SCOPE), RowField("argument", K.VALUE_ID),
 ), tuple)                              # mode REVISE
+SSA_BLOCK_GEOMETRY = declare_page("ssa_block_geometry", (
+    RowField("scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("block", K.NAME),
+), tuple)                              # ordered instructions/CFG; REVISE
+SSA_CONSTANT_HOIST = declare_page("ssa_constant_hoist", (
+    RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
+    RowField("from_block", K.NAME), RowField("from_index", K.INDEX),
+    RowField("to_block", K.NAME),
+    RowField("from_geometry", K.PAGE_REF),
+), tuple)                              # exact geometry/value inputs; CONCORD
 #: ``Unsourced`` reasons of ``_post_loop_result_reconciliation``: a pass that
 #: states something different about the same unchanged cells (the IR was
 #: rewritten between two runs by a pass whose cell is not in hand), and a

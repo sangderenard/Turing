@@ -1508,8 +1508,9 @@ def _build_shell_hierarchy_plan(
         host = entry.metadata.get("host_ssa_module")
         root = entry.metadata.get("host_ssa_root")
         declaration = None if host is None else host.functions.get(str(root))
-        if declaration is not None and declaration.metadata.get("native_interface"):
-            contract = declaration.metadata["native_interface"]
+        contract = None if declaration is None else (declaration.metadata.get("native_interface")
+                                                     or declaration.metadata.get("repository_ssa_signature"))
+        if contract is not None:
             # leaf(x)[0] over one tensor result is a numerical element read,
             # not tuple unpacking. Its region must still own that Indexed node.
             if len(contract["output_ids"]) > 1 or contract.get("return_container_kind") in {"tuple", "list"}:
@@ -1607,11 +1608,16 @@ def _build_shell_hierarchy_plan(
         host = None if entry is None else entry.metadata.get("host_ssa_module")
         root = None if entry is None else entry.metadata.get("host_ssa_root")
         declaration = None if host is None else host.functions.get(str(root))
-        if child is None and declaration is not None and declaration.metadata.get("native_interface"):
+        contract = None if declaration is None else (declaration.metadata.get("native_interface")
+                                                     or declaration.metadata.get("repository_ssa_signature"))
+        if child is None and contract is not None:
             # root(x) = left(x) + right(x): omitting authored callee bodies
             # used to omit BOTH PlanCalls. Derive call frames from accepted
             # declarations and the same authoritative argument edges instead.
-            contract = declaration.metadata["native_interface"]
+            # The same exact SSA formal/result identities also schedule a
+            # retained SSA body. Previously only a binary declaration entered
+            # this seam: root(left(x)+right(x)) imported both bodies but emitted
+            # neither invocation, then read their undefined result IDs 1/2.
             outputs = tuple(contract["output_ids"])
             output_paths = dict(contract.get("output_paths", ()))
             if not output_paths:
@@ -18519,9 +18525,11 @@ def _tensor_descriptor_rule(
         host = entry.metadata.get("host_ssa_module")
         root = entry.metadata.get("host_ssa_root")
         declaration = None if host is None else host.functions.get(str(root))
-        if declaration is not None and declaration.metadata.get("native_interface"):
-            outputs = tuple(declaration.metadata["declared_native_outputs"])
-            contract = declaration.metadata["native_interface"]
+        contract = None if declaration is None else (declaration.metadata.get("native_interface")
+                                                     or declaration.metadata.get("repository_ssa_signature"))
+        if contract is not None:
+            outputs = tuple(declaration.metadata.get("declared_native_outputs") or
+                            entry.metadata["host_ssa_outputs"][str(root)])
             if len(outputs) != 1 or contract.get("return_container_kind") in {"tuple", "list"}:
                 by_id = {int(value.id): value for value in outputs}
                 paths = dict(contract.get("output_paths", ()))
@@ -18548,8 +18556,8 @@ def _tensor_descriptor_rule(
             value = outputs[0]
             return {"shape": tuple(value.shape or ()), "dtype": str(value.dtype),
                     "rank": int((value.accounting or {}).get("program_abi_rank", len(value.shape or ()))),
-                    "native_interface_source": (int(reference), int(value.id),
-                        declaration.metadata["native_interface"]["ssa_artifact_sha256"])}
+                    "repository_ssa_source": (int(reference), int(value.id),
+                        contract.get("ssa_artifact_sha256", contract.get("source_function_reference")))}
 
     def authored_rectangular_shape(expression: ast.AST) -> tuple[int, ...] | None:
         """Return extents proved solely by nested aggregate syntax.
@@ -19976,6 +19984,18 @@ def _fold_callsite_structural_values(
     structural builtins used to express shapes and source control.  It never
     invokes a retained Python callable or reads a runtime tensor payload.
     """
+
+    if not graph.G:
+        return  # A catalogue envelope has no structural values to fold.
+    from .concordance_declarations import PLANNER_STRUCTURAL_FOLD
+    from .identity_concordance import current_identity_book
+    fold_book = current_identity_book()
+    # Round numbers restart at each invocation. Authored function names do
+    # not identify an invocation or a specialized graph copy.
+    fold_scope = fold_book.mint_scope(
+        ("structural-specialization", graph.G.graph.get("lexical_read_scope")),
+        PLANNER_STRUCTURAL_FOLD,
+    )
 
     # Source conditionals are authored control, not disposable dataflow.
     # Preserve their AST identity and predicate correlation before this pass
@@ -22471,15 +22491,20 @@ def _fold_callsite_structural_values(
             PLANNER_STRUCTURAL_FOLD, STRUCTURAL_SPECIALIZATION_FIXED_POINT,
         )
         from .identity_concordance import (
-            Derived, Mode, RAW_PRIMITIVE, Unsourced, current_identity_book,
+            ConcordanceRefusal, Derived, Mode, current_identity_book,
         )
 
         fixed_point_book = current_identity_book()
         fixed_point_row = (
-            str(graph.G.graph.get("function_name") or ""),
+            fold_scope,
             int(fixed_point_iteration),
         )
-        fixed_point_sources = tuple(dict.fromkeys(round_cells))
+        from ..common.tensors.topological_reducer import _posted_node_identity_cell
+        fixed_point_sources = tuple(dict.fromkeys(cell for cell in (
+            *round_cells,
+            *(_posted_node_identity_cell(graph, int(node_id))
+              for node_id, data in graph.G.nodes(data=True)),
+        ) if cell is not None))
         if not fixed_point_sources and fixed_point_iteration > 1:
             previous_round = fixed_point_book.latest_ref(
                 STRUCTURAL_SPECIALIZATION_FIXED_POINT,
@@ -22510,36 +22535,13 @@ def _fold_callsite_structural_values(
             bool(changed),
             tuple(net_tensor_mutations),
         )
-        previous_record = fixed_point_book.latest_ref(
-            STRUCTURAL_SPECIALIZATION_FIXED_POINT, fixed_point_row,
+        if not fixed_point_sources:
+            raise ConcordanceRefusal("structural specialization has no recorded graph inputs")
+        fixed_point_book.post(
+            STRUCTURAL_SPECIALIZATION_FIXED_POINT, fixed_point_row, fixed_point_fact,
+            stage=PLANNER_STRUCTURAL_FOLD, provenance=Derived(fixed_point_sources),
+            mode=Mode.CONCORD,
         )
-        if previous_record is not None and fixed_point_sources:
-            previous_sources = {
-                source.key
-                for source, _stage in fixed_point_book.edges_into(previous_record)
-            }
-            if previous_sources == {cell.key for cell in fixed_point_sources}:
-                # The fold ran again on this graph.  The same digest from the
-                # same cells is not a new record; a different digest from the
-                # same cells (node data changed with no cell of its own --
-                # a raw tensor annotation) has no cause the book can name and
-                # is recorded under the latch.
-                fixed_point_sources = ()
-                if fixed_point_book.pages[
-                    STRUCTURAL_SPECIALIZATION_FIXED_POINT.name
-                ].latest(fixed_point_row) == fixed_point_fact:
-                    previous_record = False
-        if previous_record is not False:
-            fixed_point_book.post(
-                STRUCTURAL_SPECIALIZATION_FIXED_POINT, fixed_point_row,
-                fixed_point_fact,
-                stage=PLANNER_STRUCTURAL_FOLD,
-                provenance=(
-                    Derived(fixed_point_sources) if fixed_point_sources
-                    else Unsourced(RAW_PRIMITIVE)
-                ),
-                mode=Mode.REVISE,
-            )
         if _progress is not None and (
             fixed_point_iteration <= 3
             or repeated_iteration is not None

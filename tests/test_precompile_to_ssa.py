@@ -1056,6 +1056,19 @@ def test_repository_module_merge_retains_numerical_and_object_surfaces():
     assert merged.record_tables["Thing__run"].records[10] == record
 
 
+def test_repository_module_merge_preserves_and_checks_backend_contracts():
+    from src.compiler.ir_identities import PRECISION_PIPELINE_METADATA
+    primary, dependency = IRModule({}), IRModule({})
+    primary.metadata[PRECISION_PIPELINE_METADATA] = {"precision": "float64"}
+    dependency.metadata["shell_io"] = {"inputs": ()}
+    merged = merge_repository_ssa_modules(primary, dependency)
+    assert merged.metadata[PRECISION_PIPELINE_METADATA] == {"precision": "float64"}
+    assert merged.metadata["shell_io"] == {"inputs": ()}
+    dependency.metadata[PRECISION_PIPELINE_METADATA] = {"precision": "float32"}
+    with pytest.raises(ValueError, match="conflicting composed SSA module contract"):
+        merge_repository_ssa_modules(primary, dependency)
+
+
 def test_combined_lowering_uses_graph_region_without_fused_kernel():
     from src.compiler.hierarchical_plan import PlanClosure, PlanLine
 
@@ -2712,6 +2725,8 @@ def test_stale_inner_loop_result_is_rebound_only_when_outer_phi_dominates():
         metadata={"carried_port_values": {30: outer_result, 40: outer_result}},
     )
 
+    from tests.compiler_provenance_inputs import publish_authored_ssa
+    publish_authored_ssa({function.name: function})
     receipts = _canonicalize_non_dominating_loop_result_uses(function)
 
     assert receipts == (("exit", 1, 0, 30, 40),)

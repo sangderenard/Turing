@@ -706,7 +706,7 @@ def test_begin_regulation_reads_the_contract_policy():
 
     base = active_contract()
     assert base.spill_cold_pages is False
-    set_active_contract(dataclasses.replace(base, spill_cold_pages=True))
+    set_active_contract(dataclasses.replace(base, spill_cold_pages=True, compress_cold_pages=False))
     try:
         book = IdentityBook()
         regulator, token, _ = regulation.begin_regulation(book)
@@ -730,10 +730,11 @@ def test_environment_policy_overrides_without_renaming_the_contract(monkeypatch)
     set_active_contract(None)
     for variable in ("TURING_WORK_CONTRACT", "TURING_POW_INEXACT",
                      "TURING_FMA_CONTRACT", "TURING_MEMORY_BUDGET_BYTES",
-                     "TURING_SPILL_COLD_PAGES"):
+                     "TURING_SPILL_COLD_PAGES", "TURING_COMPRESS_COLD_PAGES"):
         monkeypatch.delenv(variable, raising=False)
     assert active_contract() is PRESETS["develop"]
     monkeypatch.setenv("TURING_SPILL_COLD_PAGES", "1")
+    monkeypatch.setenv("TURING_COMPRESS_COLD_PAGES", "0")
     contract = active_contract()
     assert contract.spill_cold_pages is True and contract.name == "develop"
     monkeypatch.setenv("TURING_SPILL_COLD_PAGES", "0")
@@ -878,7 +879,7 @@ def test_the_build_hook_spills_what_no_stage_reads_after_it(monkeypatch):
     fortran_c_shell._spill_book_after_build(module)           # no policy
     assert book.spilled_pages() == ()
     set_active_contract(
-        dataclasses.replace(active_contract(), spill_cold_pages=True))
+        dataclasses.replace(active_contract(), spill_cold_pages=True, compress_cold_pages=False))
     try:
         fortran_c_shell._spill_book_after_build(module)
         assert set(book.spilled_pages()) == {COLD, COLD2, HOT}

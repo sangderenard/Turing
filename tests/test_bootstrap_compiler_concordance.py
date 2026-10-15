@@ -20,18 +20,24 @@ def test_completed_repository_ssa_resumes_and_changed_artifact_rebuilds(
 
     monkeypatch.setattr(fortran_c_shell, "lower_ast_source_to_ssa", lower)
 
-    first = build_compartment(tmp_path, lower_only=True, progress=None)
+    first = build_compartment(
+        tmp_path, lower_only=True, grow_stage=False, progress=None,
+    )
     assert first["stage"] == "repository-ssa"
     assert calls == ["lower"]
 
-    second = build_compartment(tmp_path, lower_only=True, progress=None)
+    second = build_compartment(
+        tmp_path, lower_only=True, grow_stage=False, progress=None,
+    )
     assert second["stage"] == "repository-ssa"
     assert second["resumed_from"] == "provenance-repository-ssa"
     assert second["checkpoint_status"] == "hit"
     assert calls == ["lower"]
 
     (tmp_path / "repository-ssa.pkl").write_bytes(b"changed")
-    third = build_compartment(tmp_path, lower_only=True, progress=None)
+    third = build_compartment(
+        tmp_path, lower_only=True, grow_stage=False, progress=None,
+    )
     assert third["stage"] == "repository-ssa"
     assert third["checkpoint_resume_status"] == "miss: external artifact digest mismatch"
     assert third["checkpoint_status"] == "stored"

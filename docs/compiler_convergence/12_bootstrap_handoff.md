@@ -1,5 +1,10 @@
 # Compiler bootstrap handoff
 
+The topology-guided SSA growth continuation is documented in
+[13_native_compilation_growth.md](13_native_compilation_growth.md), including
+provenance interior candidates, stage/restart APIs, SSA composition and native execution evidence
+and the remaining whole-module activation frontier.
+
 This is the continuation brief for the user's work on `sangderenard/Turing`.
 The goal is to make a practical, trustworthy self-bootstrap: remove avoidable
 compiler overhead, repair incomplete lowering, use resource-aware compilation

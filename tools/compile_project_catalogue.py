@@ -200,6 +200,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--interface-tiles", action="store_true",
                         help="partitioned-source: compile native objects and import bodyless callee interfaces")
+    parser.add_argument("--compose-ssa", action="store_true",
+                        help="partitioned-source: grow enclosures by composing completed SSA interiors")
     parser.add_argument("--max-tile-nodes", type=int, default=4096,
                         help="source nodes per SCC/dependency cut in partitioned-source mode (default: 4096)")
     parser.add_argument(
@@ -303,6 +305,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--stage-units", type=int,
+        help="admit this many new units, persist native interfaces, then return for restart/resume",
+    )
+    parser.add_argument(
         "--creep-resolved-plan", action="store_true",
         help=(
             "autonomously crawl a resolved plan and every strictly deeper "
@@ -330,6 +336,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
+    if arguments.stage_units is not None and (
+        not arguments.compile_resolved_plan or arguments.stage_units < 1
+    ):
+        parser.error('--stage-units requires --compile-resolved-plan and a positive count')
 
     usage_profiler = None
     usage_root = os.environ.get(COMPILER_USAGE_TRACE_ROOT_ENV)
@@ -376,6 +386,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments.interface_tiles and not arguments.partitioned_source:
         parser.error("--interface-tiles requires --partitioned-source")
+    if arguments.compose_ssa and (not arguments.partitioned_source or arguments.interface_tiles):
+        parser.error("--compose-ssa requires --partitioned-source and excludes --interface-tiles")
     if arguments.partitioned_source:
         if arguments.source is None or len(arguments.entry) > 1:
             parser.error("--partitioned-source requires --source and at most one --entry")
@@ -389,6 +401,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             schedule_mode=arguments.source_schedule,
             max_unit_source_nodes=arguments.max_tile_nodes,
             interface_tiles=arguments.interface_tiles,
+            ssa_composition=arguments.compose_ssa,
             max_total_resident_bytes=(
                 10 * 1024 ** 3 if arguments.max_total_gb is None
                 else int(arguments.max_total_gb * 1024 ** 3)
@@ -500,6 +513,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.process_graph_plan,
             arguments.output,
             jobs=arguments.jobs,
+            max_stage_units=arguments.stage_units,
             max_total_resident_bytes=(
                 None if arguments.max_total_gb is None
                 else int(arguments.max_total_gb * 1024 ** 3)

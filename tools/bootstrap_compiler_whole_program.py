@@ -131,9 +131,32 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _build_and_report(arguments, expansion_policy, display):
     if arguments.provenance_only:
+        max_total_gb = getattr(arguments, "max_total_gb", 10.0)
         plan, core = bootstrap_provenance_core(
             arguments.output,
             expansion_policy=expansion_policy,
+            jobs=getattr(arguments, "jobs", None),
+            schedule_options={
+                "max_total_resident_bytes": (
+                    None if max_total_gb is None
+                    else int(max_total_gb * (1 << 30))
+                ),
+                "minimum_total_resident_bytes": int(
+                    getattr(arguments, "min_total_gb", 2.0) * (1 << 30)
+                ),
+                "system_reserve_bytes": int(
+                    getattr(arguments, "system_reserve_gb", 2.0) * (1 << 30)
+                ),
+                "worker_resident_reservation_bytes": int(
+                    getattr(arguments, "worker_reserve_gb", 2.0) * (1 << 30)
+                ),
+                "max_worker_memory_bytes": int(
+                    getattr(arguments, "max_worker_gb", 10.0) * (1 << 30)
+                ),
+                "worker_elastic_available_percent": getattr(
+                    arguments, "worker_elastic_available_percent", 75,
+                ),
+            },
             progress=display.log,
         )
         first = plan["next_partition"]

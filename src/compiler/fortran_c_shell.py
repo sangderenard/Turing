@@ -15479,11 +15479,17 @@ def _class_surface_ssa_program(
     # callee. These facts come only from explicit ABI declarations and exact
     # PlanCall argument bindings; no extent is inferred or guessed here.
     linked_value_abi_by_graph: dict[int, dict[int, dict[str, Any]]] = {}
-    graph_wrappers = {
-        id(planned_shell.process_graph.G): planned_shell.process_graph
+    # Keep the exact graph headers alive while the settlement uses id-keyed
+    # tables. A tiled wrapper's cold G header can otherwise be released and
+    # reloaded between this index and planned_graphs_by_shell below, leaving
+    # an integer key for an object that no longer exists. Pinning headers does
+    # not pin their tiled node/edge payloads or disable pressure regulation.
+    settlement_graph_owners = tuple(
+        (planned_shell.process_graph.G, planned_shell.process_graph)
         for planned_shell in planned_shells
         if getattr(planned_shell, "process_graph", None) is not None
-    }
+    )
+    graph_wrappers = {id(graph): wrapper for graph, wrapper in settlement_graph_owners}
     # The concordance is where a shape becomes readable across stages, so
     # every fact this phase settles is written there as it is settled: the
     # declared contract, each propagation over a call edge, and each formal
@@ -27904,26 +27910,31 @@ def _class_surface_ssa_program(
             continue
         constants = []
         seen_constant_ids = set()
-        for block in function.blocks.values():
+        retained_by_block = {}
+        moves = []
+        entry_name = next(iter(function.blocks))
+        for block_name, block in function.blocks.items():
             retained = []
-            for instruction in block.instrs:
-                if (
-                    str(instruction.op).casefold() in {"const", "constant"}
-                    and instruction.res is not None
-                ):
+            for index, instruction in enumerate(block.instrs):
+                if (str(instruction.op).casefold() in {"const", "constant"}
+                        and instruction.res is not None):
                     value_id = int(instruction.res.id)
                     if value_id in seen_constant_ids:
-                        raise ValueError(
-                            "one SSA constant identity is produced more than "
-                            f"once in {function.name!r}: value={value_id}"
-                        )
+                        raise ValueError("one SSA constant identity is produced more than "
+                                         f"once in {function.name!r}: value={value_id}")
                     seen_constant_ids.add(value_id)
+                    to_index = len(constants)
+                    if block_name != entry_name or index != to_index:
+                        moves.append((block_name, index, instruction, entry_name, to_index))
                     constants.append(instruction)
                 else:
                     retained.append(instruction)
-            block.instrs[:] = retained
-        entry = next(iter(function.blocks.values()))
-        entry.instrs[0:0] = constants
+            retained_by_block[block_name] = retained
+        from .ssa_reachability import record_constant_hoists
+        record_constant_hoists(function, tuple(moves))
+        for block_name, retained in retained_by_block.items():
+            function.blocks[block_name].instrs[:] = retained
+        function.blocks[entry_name].instrs[0:0] = constants
 
     compile_substage("recover structural source outputs")
     for source_symbol, source_graph in compile_iter(source_graphs_by_symbol.items(),
@@ -42628,7 +42639,8 @@ def _lower_resolved_process_graph_unit_to_ssa_impl(
     # Do not accept an arbitrary multi-function selection or guess field ABI
     # compatibility at the linker. Ordinary non-interface SCC plans stay as-is.
     coupling = (native_interface_coupling_edges(graph.function_table)
-                if (graph.G.graph.get("compilation_unit_input") or {}).get("interface_tiles") else ())
+                if any((graph.G.graph.get("compilation_unit_input") or {}).get(key)
+                       for key in ("interface_tiles", "ssa_composition")) else ())
     plan = record_compilation_unit_plan(graph, indivisible_edges=(
         (row["caller_reference"], row["callee_reference"]) for row in coupling))
     matching = tuple(
@@ -42818,6 +42830,11 @@ def _lower_ast_source_to_ssa_impl(
 
     compile_substage("source normalisation: activate accepted compiler versions")
     bootstrap_activations = activate_registered_compiler_bootstraps()
+    if source_module is not None:
+        from .compiler_source_tree import splice_source
+        source, python_bindings = splice_source(
+            source, source_module, entrypoint=entrypoint, bindings=python_bindings,
+        )
     if progress is not None and bootstrap_activations:
         progress(
             "bootstrap: activated "
@@ -45635,7 +45652,10 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     elif compilation_directory is not None:
         raise ValueError("compilation_directory is not used by holistic auto; supply source-list output directories")
     if partitioned_directory is not None:
-        from .project_compilation_product import compile_partitioned_source, load_partitioned_source_interfaces
+        from .project_compilation_product import (
+            compile_partitioned_source, load_partitioned_source_interfaces,
+            load_composed_source_units,
+        )
         options = dict(kwargs)
         source = args[0] if args else options.pop("source")
         entrypoint = args[1] if len(args) > 1 else options.pop("entrypoint", None)
@@ -45654,7 +45674,8 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
         if set(options) - allowed:
             raise TypeError(f"partitioned source does not support these source options: {sorted(set(options) - allowed)}")
         if "interface_tiles" in partitioned_options:
-            raise TypeError("public partitioned source requires native interface tiles")
+            raise TypeError("select SSA composition with ssa_composition; interface_tiles is managed by the public entry point")
+        compose_ssa = bool(partitioned_options.get("ssa_composition", False))
         display = compile_progress(progress_bars, collect_profile=_collect_profile,
                                    renderer=_progress_renderer,
                                    state_sink=_progress_state_sink)
@@ -45664,9 +45685,10 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
                 if event.get("stage") == "source_plan" and progress is not None:
                     progress(str(event["message"]))
             manifest = compile_partitioned_source(source, partitioned_directory, entrypoint=entrypoint,
-                **options, **partitioned_options, interface_tiles=True,
+                **options, **partitioned_options, interface_tiles=not compose_ssa,
                 source_options=source_options, progress=report_partitioned)
-            result = load_partitioned_source_interfaces(manifest)
+            result = (load_composed_source_units(manifest) if compose_ssa
+                      else load_partitioned_source_interfaces(manifest))
         module = result[0] if isinstance(result, tuple) else result
         if hasattr(module, "metadata"):
             module.metadata["source_compilation"] = {

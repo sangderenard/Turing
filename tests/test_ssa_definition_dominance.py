@@ -55,6 +55,8 @@ def test_operand_free_constant_is_hoisted_from_late_exit_with_provenance():
     result = module(function.blocks)
 
     assert len(check_definition_dominance(result)) == 2
+    from tests.compiler_provenance_inputs import publish_authored_ssa
+    publish_authored_ssa({function.name: function})
     receipts = hoist_nondominating_constants(function)
 
     assert check_definition_dominance(result) == []

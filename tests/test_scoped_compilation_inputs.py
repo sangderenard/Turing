@@ -31,6 +31,158 @@ def unrelated(x):
 '''
 
 
+def test_native_growth_resumes_one_cut_per_stage_and_executes_binary_calls(tmp_path):
+    import ctypes
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+    contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_program_abi({
+        "values": [{"function": name, "parameter": "x", "storage": "scalar",
+                    "dtype": "float64", "rank": 0, "shape": [], "python_type": "builtins.float"}
+                   for name in ("left", "right", "root", "unrelated")],
+        "records": {}, "bindings": [],
+    })
+    planned = product.compile_partitioned_source(
+        SOURCE, tmp_path / "growth", extraction_contract=contract,
+        interface_tiles=True, plan_only=True, max_unit_source_nodes=8,
+    )
+    assert not (tmp_path / "growth/product").exists()
+    products = []
+    events = []
+    for stage in range(4):
+        manifest = product.compile_resolved_process_graph_plan(
+            planned["resolved_process_graph"], planned["process_graph_unit_plan"],
+            tmp_path / "growth/product", jobs=2, max_stage_units=1,
+            worker_resident_reservation_bytes=256 * 1024 ** 2,
+            max_worker_memory_bytes=4 * 1024 ** 3, progress=events.append,
+        )
+        assert manifest["stage_admitted_units"] == 1
+        assert len(manifest["units"]) == stage + 1
+        assert manifest["counts"]["failed"] == manifest["counts"]["partial"] == 0
+        products.append(manifest)
+    assert [event["qualified_names"][0] for event in events
+            if event["stage"] == "resolved_unit_start"][:3] in (
+                ["left", "right", "root"], ["right", "left", "root"])
+    assert products[-1]["status"] == "terminal"
+    assert len({unit["worker_process_id"] for unit in products[-1]["units"]}) == 4
+    # Resumption retained the accepted leaf artifact rather than recompiling it.
+    first = products[0]["units"][0]
+    retained = next(unit for unit in products[-1]["units"] if unit["unit_index"] == first["unit_index"])
+    assert retained["artifact_sha256"] == first["artifact_sha256"]
+    assert retained["worker_process_id"] == first["worker_process_id"]
+    assert retained["growth_priority"] == first["growth_priority"]
+    assert all(row["remaining_source_nodes"] == 0 for row in products[-1]["growth_priorities"])
+    module, outputs, _exports = product.load_partitioned_source_interfaces(products[-1])
+    assert all(not function.blocks for function in module.functions.values())
+    root = next(function for function in module.functions.values()
+                if function.metadata.get("source_qualified_name") == "root")
+    proxy = emit_ssa_module_to_c(module, root.name, entry_name="growth_check")
+    assert proxy.complete and len(proxy.linked_objects) == 3
+    built = proxy.compile(tmp_path / "check")
+    library = ctypes.CDLL(str(built.library_path))
+    entry = library.growth_check
+    entry.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_longlong)]
+    for value in (-3.0, 0.0, 21.0):
+        incoming, outgoing = ctypes.c_double(value), ctypes.c_double()
+        pointers = (ctypes.c_void_p * 2)(ctypes.addressof(incoming), ctypes.addressof(outgoing))
+        entry(pointers, (ctypes.c_longlong * 1)(0))
+        assert outgoing.value == value * 5.0
+    # A same-path modified graph cannot be mistaken for the frozen input.
+    Path(planned["resolved_process_graph"]).write_bytes(b"changed input")
+    with pytest.raises(ValueError, match="pinned inputs"):
+        product.compile_resolved_process_graph_plan(
+            planned["resolved_process_graph"], planned["process_graph_unit_plan"],
+            tmp_path / "growth/product", max_stage_units=1,
+        )
+
+
+def test_ssa_growth_composes_interiors_before_one_native_emission(tmp_path):
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+    import ctypes
+    contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_program_abi({
+        "values": [{"function": name, "parameter": "x", "storage": "scalar", "dtype": "float64",
+                    "rank": 0, "shape": [], "python_type": "builtins.float"}
+                   for name in ("left", "right", "root", "unrelated")],
+        "records": {}, "bindings": [],
+    })
+    planned = product.compile_partitioned_source(
+        SOURCE, tmp_path / "ssa-growth", extraction_contract=contract,
+        ssa_composition=True, plan_only=True, max_unit_source_nodes=32,
+    )
+    events = []
+    stages = []
+    for _stage in range(2):
+        manifest = product.compile_resolved_process_graph_plan(
+            planned["resolved_process_graph"], planned["process_graph_unit_plan"],
+            tmp_path / "ssa-growth/product", max_stage_units=2, jobs=2,
+            worker_resident_reservation_bytes=256 << 20, progress=events.append,
+        )
+        assert manifest["counts"]["failed"] == manifest["counts"]["partial"] == 0, manifest
+        assert all(unit["native_interface"] is None for unit in manifest["units"])
+        stages.append(manifest)
+    assert stages[0]["concurrent_workers_peak"] == 2
+    assert all(stage["stage_admitted_units"] == 2 for stage in stages)
+    starts = [event for event in events if event["stage"] == "resolved_unit_start"]
+    assert {event["qualified_names"][0] for event in starts[:2]} == {"left", "right"}
+    assert manifest["status"] == "terminal"
+    caller = next(unit for unit in manifest["units"] if unit["qualified_names"] == ["root"])
+    assert len(caller["composed_ssa_units"]) == 2
+    caller_path = tmp_path / "ssa-growth/product/units" / f'unit_{caller["unit_index"]:03d}' / caller["artifact"]
+    enclosure, published, roots = product._load_pickle_artifact(caller_path)
+    assert len(enclosure.functions) >= 3
+    assert all(function.blocks for function in enclosure.functions.values())
+    module, outputs, exports = product.load_composed_source_units(manifest)
+    from src.compiler.identity_concordance import CorrelationTable, _UNSOURCED_KINDS
+    assert not [finding for finding in CorrelationTable.build(module).findings(module)
+                if finding.kind not in _UNSOURCED_KINDS]
+    # The composition audit consumes exact component owners and signatures.
+    original_owners = module.metadata["ssa_composition_function_books"]
+    module.metadata["ssa_composition_function_books"] = {}
+    assert any(finding.kind == "ssa-composition-book-owner-disagreement"
+               for finding in CorrelationTable.build(module).findings(module))
+    module.metadata["ssa_composition_function_books"] = original_owners
+    signature = module.functions[roots[0]].metadata["repository_ssa_signature"]
+    original_arguments = signature["argument_ids"]
+    signature["argument_ids"] = (999999,)
+    assert any(finding.kind == "repository-ssa-signature-disagreement"
+               for finding in CorrelationTable.build(module).findings(module))
+    signature["argument_ids"] = original_arguments
+    entry = roots[0]
+    assert entry in exports
+    artifact = emit_ssa_module_to_c(module, entry, entry_name="composed_check")
+    assert artifact.complete and not artifact.linked_objects
+    artifact.compile(tmp_path / "one-native-unit")
+    library = ctypes.CDLL(str(artifact.library_path))
+    call = library.composed_check
+    call.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_longlong)]
+    for value in (-3.0, 0.0, 21.0):
+        incoming, outgoing = ctypes.c_double(value), ctypes.c_double()
+        pointers = (ctypes.c_void_p * 2)(ctypes.addressof(incoming), ctypes.addressof(outgoing))
+        call(pointers, (ctypes.c_longlong * 1)(0))
+        assert outgoing.value == value * 5.0
+
+
+def test_public_partitioned_source_accepts_ssa_composition(tmp_path):
+    from src.compiler.extraction_contract import ExtractionContract
+    contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_program_abi({
+        "values": [{"function": name, "parameter": "x", "storage": "scalar",
+                    "dtype": "float64", "rank": 0, "shape": [],
+                    "python_type": "builtins.float"}
+                   for name in ("left", "right", "root", "unrelated")],
+        "records": {}, "bindings": [],
+    })
+    module, outputs, exports = lower_ast_source_to_ssa(
+        SOURCE, partitioned_directory=tmp_path / "public-ssa",
+        extraction_contract=contract,
+        partitioned_options={"ssa_composition": True, "jobs": 1,
+                             "max_unit_source_nodes": 32},
+        progress=lambda message: None,
+    )
+    assert module.metadata["composed_source_product"]["counts"]["compiled-unverified"] == 4
+    assert all(function.blocks for function in module.functions.values())
+    assert exports and outputs
+
+
 def _inputs(tmp_path):
     from src.compiler.extraction_contract import ExtractionContract
     contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_program_abi({

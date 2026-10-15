@@ -57,13 +57,16 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
     from .concordance_declarations import (
         EXACT_REGION_FEED_DTYPE, PHYSICAL_CALL_INPUT_ADAPTATION,
     )
-    from .identity_concordance import Derived, Mode
+    from .identity_concordance import ConcordanceRefusal, Derived, Mode
     from .ssa_record_return_state import ssa_value_identity_cell
 
     book = current_identity_book()
     page = book.page('exact_region_feed_dtype')
     changed = 0
+    from .ssa_record_return_state import accepted_ssa_component
     for caller in functions.values():
+        if accepted_ssa_component(caller):
+            continue
         # A call occurrence is not the storage authority. In the compiler's
         # Kahn-frontier micro-test, a loop-result Phi produced int64, while
         # the earlier region cut expected float64. Retyping the same-ID call
@@ -110,7 +113,7 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                     facts = (
                         (
                             (str(caller.name), int(feed_id)),
-                            (exact_dtype,), caller, int(feed_id),
+                            (exact_dtype,), caller, int(actual.id),
                         ),
                         (
                             (str(callee.name), int(formal.id)),
@@ -130,12 +133,19 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                                 owner, owner_value_id, book=book,
                             )
                             if value_cell is None:
-                                page.set(row, 0, proposed)
+                                raise ConcordanceRefusal(
+                                    f"exact region feed {row!r} has no published SSA identity"
+                                )
                             else:
                                 book.post(
                                     EXACT_REGION_FEED_DTYPE, row, proposed,
                                     stage=PHYSICAL_CALL_INPUT_ADAPTATION,
-                                    provenance=Derived((value_cell,)),
+                                    provenance=Derived(tuple(dict.fromkeys(cell for cell in (
+                                        value_cell,
+                                        ssa_value_identity_cell(caller, int(actual.id), book=book),
+                                        ssa_value_identity_cell(caller, instruction.res.id, book=book)
+                                        if instruction.res is not None else None,
+                                    ) if cell is not None))),
                                     mode=Mode.CONCORD,
                                 )
 
@@ -621,6 +631,9 @@ def _adapt_physical_call_inputs_round(
         return _read_only_feed(function, value_id, functions, diagnostics=diagnostics)
 
     for caller in functions.values():
+        from .ssa_record_return_state import accepted_ssa_component
+        if accepted_ssa_component(caller):
+            continue
         caller_formals = {int(value.id): value for value in caller.args}
         for block_name, block in caller.blocks.items():
             rewritten = []
@@ -993,11 +1006,44 @@ def adapt_physical_call_inputs(functions, *, progress=None) -> int:
     # function order an acyclic dependency needs at most one round per
     # function. Cycles are rejected by semantic-state recurrence below.
     round_bound = max(1, len(functions) + 1)
-    total = 0
-    row = ('whole-program', tuple(sorted(map(str, functions))))
-    page = current_identity_book().page(
-        'physical_call_input_adaptation_fixed_point'
+    from .concordance_declarations import (
+        EXACT_FORMAL_DTYPE, EXACT_REGION_FEED_DTYPE,
+        PHYSICAL_CALL_INPUT_ADAPTATION_ROUND,
     )
+    from .identity_concordance import ConcordanceRefusal, Derived, Mode
+    from .ssa_record_return_state import accepted_ssa_component, ssa_block_identity_cell
+    calls = [(caller, block, instruction)
+             for caller in functions.values() for block in caller.blocks.values()
+             for instruction in block.instrs if instruction.op in {'Call', 'call'}
+             and not accepted_ssa_component(caller)]
+    if not calls:
+        return 0
+    book = current_identity_book()
+    round_scope = book.mint_scope(
+        ('physical-call-input-adaptation', tuple(sorted(map(str, functions)))),
+        PHYSICAL_CALL_INPUT_ADAPTATION,
+    )
+    total = 0
+
+    def round_sources(previous_edges=()):
+        sources = []
+        for caller, block, instruction in calls:
+            sources.append(ssa_block_identity_cell(caller, block.name, book=book))
+            callee = functions.get(str(instruction.attributes.get('callee', '')))
+            for owner, values in ((caller, instruction.args),
+                                  (callee, () if callee is None else callee.args)):
+                if owner is None:
+                    continue
+                for value in values:
+                    sources.append(ssa_value_identity_cell(owner, int(value.id), book=book))
+                    for declaration in (EXACT_REGION_FEED_DTYPE, EXACT_FORMAL_DTYPE):
+                        sources.append(book.latest_ref(declaration, (str(owner.name), int(value.id))))
+            if callee is not None:
+                for value, formal in zip(instruction.args, callee.args):
+                    sources.append(book.latest_ref(CALL_INPUT_CONVERSION,
+                        (str(caller.name), int(value.id), str(callee.name), int(formal.id))))
+        sources.extend(book.latest_ref(CALL_INPUT_CONVERSION, edge) for edge in previous_edges)
+        return tuple(dict.fromkeys(cell for cell in sources if cell is not None))
     report = progress or (lambda _message: None)
     report(
         'physical-call adaptation fixed point start: '
@@ -1007,10 +1053,22 @@ def adapt_physical_call_inputs(functions, *, progress=None) -> int:
     state = _adaptation_state_signature(functions)
     seen_states = {state: -1}
     for round_index in range(round_bound):
+        sources = round_sources()
+        if not sources:
+            raise ConcordanceRefusal("physical call-input adaptation has no recorded call inputs")
+        previous_edges = tuple(
+            (str(caller.name), int(value.id), str(callee.name), int(formal.id))
+            for caller, _block, instruction in calls
+            if (callee := functions.get(str(instruction.attributes.get('callee', '')))) is not None
+            for value, formal in zip(instruction.args, callee.args)
+        )
         changed = _adapt_physical_call_inputs_round(
             functions, progress=progress, round_index=round_index,
         )
-        page.set(row, round_index, int(changed))
+        book.post(PHYSICAL_CALL_INPUT_ADAPTATION_ROUND, (round_scope, round_index),
+                  int(changed), stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                  provenance=Derived(tuple(dict.fromkeys((*sources, *round_sources(previous_edges))))),
+                  mode=Mode.CONCORD)
         total += changed
         if changed == 0:
             report(
