@@ -30,6 +30,7 @@ def test_boundary_plan_composes_existing_foundations_around_one_outer_target(tmp
     assert by_name["sympy-ingestion"]["disposition"] == (
         "candidate-after-process-graph-lowering"
     )
+    assert "keep the active fingerprint" in receipt["product_retention_policy"]
     assert all(len(boundary["version"]) == 64 for boundary in by_name.values())
     assert json.loads((tmp_path / "plan.json").read_text()) == receipt
 
@@ -50,6 +51,37 @@ def test_boundary_version_changes_with_source_or_toolchain(tmp_path):
 
     assert first["version"] != changed_source["version"]
     assert changed_source["version"] != changed_toolchain["version"]
+
+
+def test_bootstrap_retention_keeps_active_failure_receipt_and_unrelated_paths(
+    tmp_path, monkeypatch,
+):
+    from src.compiler import compiler_bootstrap_runtime as runtime
+    from src.compiler.whole_program_compiler_bootstrap import (
+        bootstrap_provenance_core, plan_whole_program_compiler,
+    )
+
+    plan = plan_whole_program_compiler(tmp_path)
+    boundary = plan["next_partition"]
+    root = tmp_path / "products" / boundary["name"]
+    active = root / boundary["version"]
+    active_failure = active / "product" / "units" / "unit_029" / "failure.json"
+    active_failure.parent.mkdir(parents=True)
+    active_failure.write_text('{"status": "failed"}')
+    stale = root / ("0" * 64)
+    (stale / "temporary-tiles").mkdir(parents=True)
+    unrelated = root / "manually-named-diagnostic"
+    unrelated.mkdir()
+    monkeypatch.setattr(
+        runtime, "ensure_native_provenance_core",
+        lambda *args, **kwargs: {"backend": "native"},
+    )
+
+    bootstrap_provenance_core(tmp_path)
+
+    assert active_failure.is_file()
+    assert not stale.exists()
+    assert unrelated.is_dir()
 
 
 def test_build_submits_authored_pieces_then_whole_to_public_source_scheduler(

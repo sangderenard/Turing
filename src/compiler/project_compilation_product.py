@@ -1073,6 +1073,12 @@ class ProjectCompilationProduct:
                             source_name
                         ]
                     source_value = len(materialized_sources[source_name])
+                elif source_transform.startswith("dict_truth:"):
+                    key = source_transform.split(":", 1)[1]
+                    namespace = getattr(source_value, "__dict__", None)
+                    if not isinstance(namespace, Mapping):
+                        return fallback()
+                    source_value = bool(namespace.get(key))
                 elif source_transform:
                     return fallback()
                 if str(parameter.get("passing")) == "reference":
@@ -3810,7 +3816,7 @@ def source_region_integral_accounting(
         unresolved_types = tuple(
             int(value.id) for value in boundary_values
             if str(value.dtype or "").casefold() in {
-                "", "none", "unknown", "opaque", "opaque_ref",
+                "", "none", "unknown", "opaque",
             }
         )
         if unresolved_types:
@@ -4924,7 +4930,8 @@ def project_process_graph_acceptance(graph, references, book=None):
         CANONICAL_VALUE, FUNCTION_ADDRESS, INGESTION_VALUE,
         LEXICAL_READ_BINDING, NAME_BINDING, SCOPE_ORIGIN, SCOPE_REGISTRY,
         SOURCE_AGGREGATE_LAYOUT, SOURCE_GLYPH_SEQUENCE,
-        SOURCE_SORT_CONTRACT, SOURCE_VALUE_CLASS,
+        SOURCE_PYTHON_IDENTITY, SOURCE_SORT_CONTRACT, SOURCE_VALUE_CLASS,
+        VALUE_TYPE_ABI,
     )
     from ..common.tensors.topological_reducer import (
         _source_numeric_scope, node_ingestion_scopes,
@@ -4989,6 +4996,21 @@ def project_process_graph_acceptance(graph, references, book=None):
             )
             if cell is not None:
                 roots.add(cell)
+            python_identity_row = (data.get("attributes") or {}).get(
+                "source_python_identity_row"
+            )
+            if python_identity_row is not None:
+                python_identity_cell = owner.latest_ref(
+                    SOURCE_PYTHON_IDENTITY, tuple(python_identity_row),
+                )
+                if python_identity_cell is not None:
+                    roots.add(python_identity_cell)
+            if scope is not None:
+                type_abi_cell = owner.latest_ref(
+                    VALUE_TYPE_ABI, (tuple(scope), value_id),
+                )
+                if type_abi_cell is not None:
+                    roots.add(type_abi_cell)
             # Aggregate layouts are semantic source facts keyed by the exact
             # function scope and retained value identity.  Root the page cell
             # directly; projected graphs are allowed to drop every debug
@@ -5073,8 +5095,8 @@ def _dump_scoped_resolved_process_graph(
     graph payloads. The project catalogue is already a non-executable shell at
     the resolved-unit boundary; do not serialize its full topology again.
     """
-    import networkx as nx
     from ..transmogrifier.graph.graph_express2 import ProcessGraph
+    from ..transmogrifier.graph.memory_graph import BitTensorMemoryGraph
 
     references = (tuple(map(int, units[unit_index]["function_references"]))
                   if interface_tiles or ssa_composition else _resolved_unit_references(units, unit_index))
@@ -5104,7 +5126,13 @@ def _dump_scoped_resolved_process_graph(
         entries[entry.reference] = copied
     table_state = {**table.__dict__, "_entries": entries}
     catalogue = copy.copy(graph)
-    catalogue.G = nx.DiGraph()
+    # The scoped catalogue deliberately has no source nodes, but it is still
+    # the canonical ProcessGraph crossing the worker boundary. Keep its empty
+    # topology in the same physical graph implementation as every retained
+    # function body; substituting a NetworkX graph here silently reinstated
+    # the legacy storage bypass after source ingestion had materialized memory.
+    catalogue.MG = BitTensorMemoryGraph(size=0)
+    catalogue.G = catalogue.MG.G
     catalogue.G.graph.update(graph.G.graph)
     catalogue.levels, catalogue.roots, catalogue.node_map = {}, [], {}
     catalogue.scheduler = copy.copy(graph.scheduler)
@@ -6738,7 +6766,7 @@ def _compile_resolved_process_graph_unit_impl(
             int(value.id)
             for value in (*function.args, *published_outputs)
             if str(value.dtype or "").casefold() in {
-                "", "none", "unknown", "opaque", "opaque_ref",
+                "", "none", "unknown", "opaque",
             }
             and int(value.id) not in conceptual_aggregate_ids
         }))

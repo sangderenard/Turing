@@ -23,8 +23,6 @@ from src.transmogrifier.ssa import (
     IRModule,
     Instr,
     SSAValue,
-    SSASequenceDescriptor,
-    SSASequenceTable,
     SSATensorDescriptor,
     SSATensorTable,
 )
@@ -55,55 +53,6 @@ exit:
   ret void
 }
 """
-
-
-def test_external_repr_utf8_result_uses_exact_resident_sequence_descriptor():
-    operand = SSAValue(1, "opaque_ref")
-    result = SSAValue(10, "utf8_sequence")
-    data = SSAValue(11, "int64", (32,))
-    length = SSAValue(12, "int64")
-    capacity = SSAValue(13, "int64")
-    status = SSAValue(14, "int64")
-    call = Instr("Call", [operand], result, attributes={
-        "callee": "turing_external_reference_call",
-        "external_reference": True,
-        "external_identity": "builtins.repr",
-        "external_callsite_id": 10,
-        "external_result_sequence": "utf8",
-        "shell_abi": "turing-shell-io-abi.external_references",
-        "external_domain": "host_system",
-    })
-    function = Function("repr_utf8", [
-        operand, data, length, capacity, status,
-    ], {
-        "entry": BasicBlock("entry", [call, Instr("Ret", [], None)]),
-    })
-    descriptor = SSASequenceDescriptor(
-        sequence_id=10,
-        column_value_ids=(11,),
-        length_address_id=12,
-        capacity_value_id=13,
-        status_address_id=14,
-        column_dtypes=("int64",),
-    )
-    module = IRModule(
-        {function.name: function},
-        sequence_tables={
-            function.name: SSASequenceTable({10: descriptor}),
-        },
-    )
-
-    emitted = emit_module(
-        module, name="repr_utf8", extra_roots=(function.name,),
-        progress=lambda _message: None,
-    )
-
-    assert "call turing_external_reference_" in emitted.source
-    assert "t11, t12, t13, t14)" in emitted.source
-    assert "integer(c_int64_t) :: result_data(*)" in emitted.source
-    thunk, = emitted.api.metadata["external_reference_thunks"]
-    assert thunk["identity"] == "builtins.repr"
-    assert thunk["result_dtype"] == "utf8_sequence"
 
 
 def test_storage_requirement_uses_tensor_table_and_preserves_views():

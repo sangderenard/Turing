@@ -42,6 +42,8 @@ def _value_cells(*pairs):
 
 
 def settle_call_result_types(functions, emit_outputs, function_values):
+    from .ssa_record_return_state import accepted_ssa_component
+
     ledger = TransformationLedger((
         TransformationRule('provisional', 1),
         TransformationRule('callee_output', 2),
@@ -50,6 +52,14 @@ def settle_call_result_types(functions, emit_outputs, function_values):
     ), {'provisional': ('callee_output', 'physical_storage', 'addressed_element'),
         'callee_output': ('physical_storage', 'addressed_element')})
     for function in functions.values():
+        # Accepted dependency bodies retain the book that proved their
+        # internal values.  They are immutable sources for this unit's call
+        # edges, never targets of a second settlement on the ambient book.
+        # Posting provisional decisions for them here produced raw rows for
+        # every imported planned-region value because their exact cells live
+        # on the accepted component book.
+        if accepted_ssa_component(function):
+            continue
         for value in function_values(function).values():
             accounting = value.accounting or {}
             physical = (accounting.get('physical_dtype') or accounting.get('program_abi_storage')) and value.dtype not in {None, '', 'unknown'}
@@ -60,6 +70,8 @@ def settle_call_result_types(functions, emit_outputs, function_values):
 
     def bindings():
         for caller in functions.values():
+            if accepted_ssa_component(caller):
+                continue
             values = function_values(caller)
             instructions = [item for block in caller.blocks.values() for item in block.instrs]
             # Repeated region calls can retain semantic output_ids while the
@@ -157,6 +169,8 @@ def settle_call_result_types(functions, emit_outputs, function_values):
         # type across this recorded capture edge so the region formal and its
         # consumers do not retain the provisional float default.
         for region in functions.values():
+            if accepted_ssa_component(region):
+                continue
             integral = dict(
                 (region.metadata or {}).get("source_region_integral") or {}
             )
@@ -189,6 +203,8 @@ def settle_call_result_types(functions, emit_outputs, function_values):
         # edges carry the strengthened proof into the caller in this same
         # fixed point. Raw opaque-pointer Loads keep their declared type.
         for owner in functions.values():
+            if accepted_ssa_component(owner):
+                continue
             instructions = [item for block in owner.blocks.values() for item in block.instrs]
             addresses = {
                 int(item.res.id): item.args[0]
@@ -222,6 +238,14 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                         'physical_dtype_provenance': ('addressed_element', owner.name, int(base.id))}
         for caller, target, callee, source in bindings():
             if source.dtype in {None, '', 'unknown'} and not source.shape and source.device is None:
+                continue
+            # An accepted dependency's value fact belongs to its retained
+            # identity book.  This ambient ledger has no sanctioned
+            # cross-book receipt from which to revise the caller.  Preserve
+            # the caller's already-concorded type; the conflict report below
+            # exposes any disagreement instead of re-deriving the foreign
+            # fact from a Python object or from the call's mere existence.
+            if accepted_ssa_component(callee):
                 continue
             identity = (caller.name, int(target.id))
             source_priority = ledger.incumbent_priority((callee.name, int(source.id))) or 1

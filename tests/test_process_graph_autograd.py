@@ -185,6 +185,7 @@ def test_abstract_tensor_ingestion_retains_a_complete_multi_output_surface():
         (added, multiplied), bindings={"left": left, "right": right},
     )
 
+    assert graph.MG is graph.G.bit_tensor_memory_graph
     assert graph.roots == [added.data.value.id, multiplied.data.value.id]
     assert {graph.G.nodes[root]["op"] for root in graph.roots} == {"add", "mul"}
 
@@ -891,6 +892,10 @@ def test_program_adjoint_regions_preserve_source_graph_and_publish_boundaries():
     assert forward_one.graph.G.nodes[3]["attributes"]["source_value_id"] == 3
     assert all(
         region.graph.G.graph["fused_program_semantic_authority"] is False
+        for region in regions
+    )
+    assert all(
+        region.graph.MG is region.graph.G.bit_tensor_memory_graph
         for region in regions
     )
     assert source_snapshot == {

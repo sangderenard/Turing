@@ -101,7 +101,16 @@ def record_constant_hoists(function, moves):
     from .identity_concordance import ConcordanceRefusal, Derived, Mode, current_identity_book
     from .precompile_to_ssa import _post_ssa_block_geometry
     from .ssa_record_return_state import function_scope_of, ssa_value_identity_cell
-    book = current_identity_book()
+    # A digest-accepted dependency retains the identity book that owns its
+    # SSA values and blocks. Whole-program composition may revisit that body
+    # while another unit's book is active; this remains a revision of the
+    # accepted function's exact geometry, not a fact owned by the caller.
+    accepted = dict(
+        (getattr(function, "metadata", None) or {}).get(
+            "accepted_ssa_component"
+        ) or {}
+    )
+    book = accepted.get("identity_book") or current_identity_book()
     scope = function_scope_of(function)
     geometry = _post_ssa_block_geometry(book, scope, function)
     # One shared proof of the geometry actually scanned by the mover, rather

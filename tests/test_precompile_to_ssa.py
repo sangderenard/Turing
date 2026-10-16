@@ -23,6 +23,7 @@ from src.compiler.control_source import (
     ScalarFieldWriteBlock,
     StatementBlock,
     StateMachineTick,
+    StreamPublishBlock,
     WhileBlock,
     overlay_scheduled_control,
 )
@@ -1794,6 +1795,37 @@ def test_mapping_update_lowers_to_existing_table_store_identity():
     )
 
 
+def test_table_store_operands_refine_provisional_row_dtypes():
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            20,
+            "update",
+            (21, 22),
+            23,
+            policy="unique",
+            argument_kind="mapping_items",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="mapping_update_refined",
+        first_value_id=1000,
+        region_value_meta={
+            21: Meta((), "int64", "cpu"),
+            22: Meta((), "opaque_ref", "cpu"),
+        },
+        sequence_declarations=((20, "unique", 2, True),),
+        sequence_column_dtypes={20: ("unknown", "unknown")},
+    )
+
+    assert shortfalls == ()
+    assert function.metadata["sequence_table"].by_id(
+        20
+    ).column_dtypes == ("int64", "opaque_ref")
+
+
 def test_mapping_setdefault_returns_initialized_child_table_handle():
     control = ControlProgram(LoopBlock(
         "item", "0", "1", "1", SequenceBlock(()),
@@ -2375,6 +2407,60 @@ def test_optional_physical_slot_keeps_following_named_output_alignment():
     assert function.metadata["aggregate_return_layouts"] == (
         (10, (10, 30)),
     )
+
+
+def test_sequence_row_load_resolves_an_earlier_provisional_argument():
+    program = ControlProgram(SequenceBlock(()))
+    builder = _ControlSSABuilder(
+        program,
+        function_name="late_row_load",
+        first_value_id=100,
+        region_callees=None,
+        region_signatures=None,
+        sequence_declarations=((1, "duplicates", 1, False),),
+        sequence_column_dtypes={1: ("int64",)},
+    )
+    provisional = builder.external_value(14)
+
+    builder._emit_sequence_row_load(14, 1, 7, 0, 0, 14)
+
+    assert provisional not in builder.arguments
+    load = next(
+        instruction
+        for instruction in builder.current.instrs
+        if instruction.attributes.get("binding") == "ssa_sequence_row_load"
+        and instruction.op == "Load"
+    )
+    assert load.res is provisional
+    assert load.res.dtype == "int64"
+
+
+def test_stream_publication_uses_retained_aggregate_members_not_tuple_formal():
+    control = ControlProgram(StreamPublishBlock(
+        stream_id=0,
+        value_id=23,
+        payload_value_ids=(18, 3, 2, 22),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_value_meta={
+            18: Meta((), "int64"),
+            3: Meta((), "opaque_ref"),
+            2: Meta((), "opaque_ref"),
+            22: Meta((), "int64"),
+        },
+    )
+
+    assert shortfalls == ()
+    publication = next(
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.attributes.get("callee") == "turing_stream_publish"
+    )
+    assert tuple(value.id for value in publication.args) == (18, 3, 2, 22)
+    assert publication.attributes["source_payload_value_id"] == 23
+    assert 23 not in {value.id for value in function.args}
 
 
 def test_control_ssa_names_authored_parameter_used_by_structured_predicate():

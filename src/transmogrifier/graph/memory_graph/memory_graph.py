@@ -143,6 +143,14 @@ class BitTensorMemoryGraph:
         self.region_layout = self.compute_region_boundaries()
         self.encapsidate_capsid()
 
+    def __setstate__(self, state):
+        """Reconnect process-local arena helpers after spore rehydration."""
+
+        self.__dict__.update(state)
+        self.hard_memory.graph = self
+        self.hard_memory.allocator._on_grow = self.hard_memory._grow_data
+        self.G.bit_tensor_memory_graph = self
+
     # -- Dynamic flag synchronisation ---------------------------------
     @property
     def dynamic(self):
@@ -357,8 +365,7 @@ class BitTensorMemoryGraph:
     def add_edge(self, src, dst, **kwargs):
         result = self._add_edge_record(src, dst, **kwargs)
         if not self.G.has_edge(src, dst):
-            import networkx as nx
-            nx.DiGraph.add_edge(self.G, src, dst, **kwargs)
+            self.G._add_edge_topology(src, dst, kwargs)
         return result
 
     def _add_edge_record(self, src, dst, **kwargs):
@@ -507,31 +514,23 @@ class BitTensorMemoryGraph:
         # of the object, as it is when instantiated, in preparation
         # for sporulation or bifurcation.
 
-        print(f"Debugging: Encapsidating capsid with size {self.hard_memory_size} and header size {self.header_size}.")
-
         dirty = False
         if self.n_start >= self.header_size:     
-            print(f"Debugging: n_start {self.n_start} is greater than header size {self.header_size}.")      
             self.hard_memory.write(0, self.serialize_header())
         else:
-            print(f"Debugging: n_start {self.n_start} is less than header size {self.header_size}. Checking for dirty memory.")
             bitmask = self.hard_memory.bitmap_expanded()
             for i in range((self.header_size + self.hard_memory.granular_size - 1) // self.hard_memory.granular_size):
                 if i in bitmask:
                     dirty = True
                     break
             if not dirty:
-                print(f"Debugging: No dirty memory found, writing header at start.")
                 self.hard_memory.write(0, self.serialize_header())
                 self.start_n = ((self.header_size + self.hard_memory.granular_size - 1) // self.hard_memory.granular_size) * self.hard_memory.granular_size
             else:
-                print(f"Debugging: Dirty memory found, reallocating hard memory.")
                 header_size = self.header_size
                 free_space = self.hard_memory.find_free_space("header", header_size)
-                print(f"Debugging: Free space for header serialization: {free_space}")
                 if free_space is None:
                     raise MemoryError("currently unhandled lack of memory for header after balancing")
-                print(f"Debugging: Found free space at {free_space} for header serialization.")
                 self.hard_memory.write(free_space, self.serialize_header())
                 self.n_start = free_space + header_size
 
@@ -1023,11 +1022,9 @@ class BitTensorMemoryGraph:
         return self.region_layout
 
     def process_active_regions(self, active_regions):
-        # ── 0.  Book-keeping & old debug — keep whatever you still need
-        print(f"Debugging: Processing active regions: {active_regions}")
+        # ── 0.  Book-keeping
         if not active_regions:
             active_regions = self.initialize_regions()
-        print(f"Debugging: Active regions found: {len(active_regions)}")
 
         # Convert ``Cell`` objects (from the region manager) into 4-tuples so the
         # rest of the code can treat them uniformly.
@@ -1320,41 +1317,29 @@ class BitTensorMemoryGraph:
             # for now we'll take the best scores first for single move relaxation of edge distances
             # by summing the differences in distances
     def get_node(self, node_id):
-        print(f"Retrieving node with ID: {node_id} from memory graph.")
         """
         Retrieve a NodeEntry by its node_id.
         Returns None if the node is not found.
         """
         nodes = self.find_in_span((self.n_start, self.c_start), ctypes.sizeof(NodeEntry), return_objects=True)
-        print(f"Found {len(nodes)} nodes in the memory graph.")
-        
         if nodes == BitTensorMemoryGraph.NOTHING_TO_FLY:
-            print(f"Node with ID: {node_id} not found.")
             return None
-        
-        print(f"Found {len(nodes)} nodes in the memory graph.")
         
         for node in nodes:
             node_entry = NodeEntry.from_buffer_copy(node)
-            print(f"node: {node}, node_entry: {node_entry}")
             if node_entry.node_id == node_id:
-                print(f"Node with ID: {node_id} found in memory graph.")
                 return node_entry
-        print(f"Node with ID: {node_id} not found in the memory graph.")
         return None
     
     def add_node(self, node_entry=None, node_id=None, *args, **kwargs):
         result = self._add_node_record(node_id, node_entry, *args, **kwargs)
         if result not in self.G:
-            import networkx as nx
-            nx.DiGraph.add_node(self.G, result, **kwargs)
+            self.G._add_node_topology(result, kwargs)
         return result
 
     def _add_node_record(self, node_id=None, node_entry=None, *args, **kwargs):
         if node_id is not None and node_id in self._node_record_offsets:
             return node_id
-        print(f"Adding node with args: {args}, kwargs: {kwargs}, node_entry: {node_entry}, node_id: {node_id}")
-
         # Prepare a byte string from any positional/keyword arguments to store
         # in ``node_data`` when a struct isn't explicitly provided.
         bytes_args = b"".join(bytes(arg) for arg in args)

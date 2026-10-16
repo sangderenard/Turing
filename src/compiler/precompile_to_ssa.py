@@ -30,6 +30,7 @@ from .identity_concordance import (
     committed_sequence_row_layout,
     concord_sequence_row_dtypes,
     proven_shape_contract_of,
+    record_shape_transformation,
 )
 from .concordance_declarations import (
     PARAMETER_ABI_DECLARATION,
@@ -117,6 +118,8 @@ from .concordance_declarations import (
     TABLE_LOOKUP,
     TENSOR_SHAPE_CONCORDANCE,
     VERSIONED_WRITE,
+    VALUE_TYPE_ABI,
+    VALUE_TYPE_TAG,
     WHILE_CARRIED_TEST,
     WHILE_TEST_NO_READ_EXPRESSION,
     AliasFact,
@@ -129,6 +132,12 @@ from .concordance_declarations import (
     SSAValueFact,
     SSAValueOrigin,
     SSABlockKind,
+    ValueTypeTagFact,
+    UnionAlternativeStateFact,
+    UNION_ALTERNATIVE_STATE,
+    UNION_INJECTION,
+    UNION_PROJECTION,
+    canonical_python_subtype_identities,
 )
 from .control_source import (
     CallBlock,
@@ -196,6 +205,10 @@ from ..transmogrifier.ssa import (
     SSASequenceCapacityPolicy,
     SSASequenceDescriptor,
     SSASequenceTable,
+    SSAValueUnionAlternative,
+    SSAValueUnionDescriptor,
+    SSAValueUnionStorage,
+    SSAValueUnionTable,
     SSAValue,
 )
 from ..transmogrifier.ssa_registry import Handler
@@ -1475,7 +1488,9 @@ class _ControlSSABuilder(TiledObject):
             int, tuple[tuple[int, str, int], ...]
         ] | None = None,
         source_sequence_ids: tuple[int, ...] = (),
-        sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
+        sequence_memberships: tuple[
+            tuple[int, int | tuple[int, ...], int, bool], ...
+        ] = (),
         table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
         lexical_table_lookup_result_ids: tuple[int, ...] = (),
         table_lookup_defaults: dict[int, int | float] | None = None,
@@ -1505,6 +1520,8 @@ class _ControlSSABuilder(TiledObject):
         native_object_value_ids: Iterable[int] = (),
         native_object_collections: Mapping[int, Mapping[str, Any]] | None = None,
         native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+        native_value_type_abi: Mapping[int, Any] | None = None,
+        native_value_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
     ):
         TiledObject.__post_init__(self)
         from .evolution_metagraph import (
@@ -1771,6 +1788,17 @@ class _ControlSSABuilder(TiledObject):
         self.native_object_context_used = False
         self.native_object_source_ids = set()
         self.native_object_type_tests = dict(native_object_type_tests or {})
+        self.native_value_type_abi = dict(native_value_type_abi or {})
+        self.native_value_type_tests = dict(native_value_type_tests or {})
+        self.native_value_type_tags: dict[int, SSAValue] = {}
+        self.native_type_tag_phi_by_payload: dict[int, Instr] = {}
+        self.native_value_union_payloads: dict[
+            int, dict[str, tuple[SSAValue, ...]]
+        ] = {}
+        self.native_value_union_sequence_ids: dict[
+            int, dict[str, int]
+        ] = {}
+        self.value_union_table = SSAValueUnionTable(owner=function_name)
         self.native_object_type_test_receipts = []
         self.native_object_requires_member_storage = False
         if native_object_context is not None:
@@ -1817,6 +1845,16 @@ class _ControlSSABuilder(TiledObject):
         )
         self.variant_row_values: dict[int, SSAValue] = {}
         self.variant_handle_columns: dict[tuple[int, int], SSAValue] = {}
+        # A heterogeneous sequence keeps its semantic payload column and its
+        # authoritative VALUE_TYPE_ABI discriminant in parallel arenas.  The
+        # key is the same exact (resident sequence, authored projection) used
+        # by ``projected_row_columns``/``variant_handle_columns``.
+        self.variant_type_tag_columns: dict[
+            tuple[int, int], SSAValue
+        ] = {}
+        self.variant_type_payload_columns: dict[
+            tuple[int, int, str], SSAValue
+        ] = {}
         # An iterable element (or one projected field of a destructured row)
         # may itself be a sequence/record.  Its outer column stores an integer
         # child handle; caller-owned flattened arenas and strides turn that
@@ -1953,11 +1991,116 @@ class _ControlSSABuilder(TiledObject):
                 )
             )
             self._bind(value_id, value, BindingKind.PARAMETER_SEED, binding_cell)
-            self.arguments.append(value)
             self.declared_parameter_only_ids.add(value_id)
             self._declare_parameter(
                 value_id, ParameterDeclaration.CALL_ONLY, binding_cell,
             )
+            type_fact = self.native_value_type_abi.get(value_id)
+            alternatives = tuple(
+                type_fact.get("alternatives", ())
+                if isinstance(type_fact, Mapping)
+                else getattr(type_fact, "alternatives", ())
+            )
+            if len(alternatives) > 1:
+                physical_alternatives = tuple(
+                    type_fact.get("physical_alternatives", ())
+                    if isinstance(type_fact, Mapping)
+                    else getattr(type_fact, "physical_alternatives", ())
+                )
+                if tuple(
+                    getattr(arm, "identity", None)
+                    for arm in physical_alternatives
+                ) != alternatives:
+                    raise ValueError(
+                        "native union parameter has no exact ordered physical "
+                        f"arms: {name!r} {physical_alternatives!r}"
+                    )
+                arm_payloads = {}
+                arm_sequences = {}
+                deferred_union_publication = False
+                for arm in physical_alternatives:
+                    if str(arm.storage) == "none":
+                        arm_payloads[str(arm.identity)] = ()
+                        continue
+                    if str(arm.storage) == "sequence":
+                        # The descriptor is materialized by the ordinary
+                        # sequence-declaration pass below.  Retain the exact
+                        # arm correlation now and publish the union after that
+                        # pass, never as the parameter's shared scalar value.
+                        arm_payloads[str(arm.identity)] = ()
+                        arm_sequences[str(arm.identity)] = value_id
+                        deferred_union_publication = True
+                        continue
+                    if str(arm.storage) == "record":
+                        raise ValueError(
+                            "native union parameter record arm lacks its "
+                            "descriptor-backed side-by-side frame: "
+                            f"{name!r} arm {arm.identity!r}"
+                        )
+                    payload = self.fresh_value(
+                        dtype=str(arm.dtype or "unknown"),
+                        shape=tuple(arm.shape or ()),
+                        transform=CONTROL_UNIFORM,
+                        operands=(value, binding_cell, *arm.source_cells),
+                    )
+                    payload.accounting.update({
+                        "native_value_union_parameter": str(name),
+                        "native_value_union_source_id": value_id,
+                        "native_value_union_alternative": str(arm.identity),
+                        "program_abi_storage": str(arm.storage),
+                    })
+                    self.arguments.append(payload)
+                    arm_payloads[str(arm.identity)] = (payload,)
+                self.native_value_union_payloads[value_id] = arm_payloads
+                if arm_sequences:
+                    self.native_value_union_sequence_ids[value_id] = (
+                        arm_sequences
+                    )
+                tag = self.fresh_value(
+                    dtype="int64", transform=CONTROL_UNIFORM,
+                    operands=(value, binding_cell),
+                )
+                tag.accounting.update({
+                    "native_type_tag_for_value_id": value_id,
+                    "native_type_tag_parameter": str(name),
+                    "native_type_alternatives": alternatives,
+                    "native_type_tags": tuple(
+                        type_fact.get("tags", ())
+                        if isinstance(type_fact, Mapping)
+                        else getattr(type_fact, "tags", ())
+                    ),
+                })
+                self.arguments.append(tag)
+                self.native_value_type_tags[value_id] = tag
+                value.accounting.update({
+                    "native_type_tag_value_id": int(tag.id),
+                    "native_type_alternatives": alternatives,
+                })
+                type_abi_cell = (
+                    None if self.lexical_read_scope is None
+                    else self._book().latest_ref(
+                        VALUE_TYPE_ABI,
+                        (self.lexical_read_scope, value_id),
+                    )
+                )
+                tag_cell = self._book().latest_ref(
+                    SSA_VALUE, (self._scope(), int(tag.id)),
+                )
+                sources = self._cells(type_abi_cell, tag_cell, binding_cell)
+                self._book().post(
+                    VALUE_TYPE_TAG,
+                    (self._scope(), value_id, int(tag.id)),
+                    ValueTypeTagFact(
+                        int(tag.id), alternatives,
+                        tuple(tag.accounting["native_type_tags"]),
+                    ),
+                    stage=CONTROL_SSA_ENTRY,
+                    provenance=Derived(sources), mode=Mode.CONCORD,
+                )
+                if not deferred_union_publication:
+                    self.publish_native_value_union(value_id, tag, type_fact)
+            else:
+                self.arguments.append(value)
         signature_ids = {
             value_id
             for feeds, outputs in self.region_signatures.values()
@@ -2252,6 +2395,53 @@ class _ControlSSABuilder(TiledObject):
                 column_dtypes=tuple(column_dtypes),
                 column_shapes=tuple(column_shapes),
             )
+        # Sequence arms were correlated when their semantic parameter was
+        # declared, but their authoritative descriptor rows only exist after
+        # the ordinary sequence-declaration pass above.  Publish those unions
+        # now from that descriptor-backed storage.
+        for value_id, arm_sequences in tuple(
+            self.native_value_union_sequence_ids.items()
+        ):
+            if self.value_union_table.by_id(int(value_id)) is not None:
+                continue
+            if any(
+                int(sequence_id) not in self.sequence_descriptors
+                for sequence_id in arm_sequences.values()
+            ):
+                raise ValueError(
+                    "native union sequence parameter has no exact resident "
+                    f"descriptor: value={int(value_id)}, arms={arm_sequences!r}"
+                )
+            tag = self.native_value_type_tags.get(int(value_id))
+            fact = self.native_value_type_abi.get(int(value_id))
+            if tag is None or fact is None:
+                raise ValueError(
+                    "native union sequence parameter lost its ABI/tag "
+                    f"correlation: value={int(value_id)}"
+                )
+            for identity, sequence_id in arm_sequences.items():
+                descriptor = self.sequence_descriptors[int(sequence_id)]
+                signature = self._native_union_sequence_signature(descriptor)
+                for member_position, member in enumerate(
+                    self._native_union_sequence_values(int(sequence_id))
+                ):
+                    if all(
+                        int(argument.id) != int(member.id)
+                        for argument in self.arguments
+                    ):
+                        self.arguments.append(member)
+                    member.accounting = {
+                        **dict(member.accounting or {}),
+                        "native_value_union_alternative": str(identity),
+                        "native_value_union_source_id": int(value_id),
+                        "native_value_union_sequence_id": int(sequence_id),
+                        "native_value_union_sequence_member": int(
+                            member_position
+                        ),
+                        "native_value_union_sequence_signature": signature,
+                    }
+            self.publish_native_value_union(int(value_id), tag, fact)
+
         # Caller-provided arrays are the physical frame for both authored
         # inputs and compiler locals.  Their logical lifetimes are different:
         # retained source sequences arrive populated, while a writable local
@@ -2525,12 +2715,136 @@ class _ControlSSABuilder(TiledObject):
                 )
         for result_id, query_id, sequence_id, negate in sequence_memberships:
             descriptor = self.sequence_descriptors.get(int(sequence_id))
-            if descriptor is None or not descriptor.key_columns:
+            query_ids = (
+                tuple(map(int, query_id))
+                if isinstance(query_id, tuple)
+                else (int(query_id),)
+            )
+            logical_query_values = tuple(self._table_query_values(query_id))
+            query_values = list(logical_query_values)
+            tag_columns = self.sequence_native_type_tag_columns(
+                int(sequence_id)
+            ) if descriptor is not None else {}
+            physical_descriptor = descriptor
+            physical_columns = []
+            if descriptor is not None and tag_columns:
+                union_columns = self.sequence_native_value_union_columns(
+                    int(sequence_id)
+                )
+                physical_dtypes = []
+                physical_shapes = []
+                physical_keys = []
+                physical_queries = []
+                key_ordinal = {
+                    int(column): ordinal for ordinal, column in enumerate(
+                        descriptor.key_columns or (
+                            (0,)
+                            if len(descriptor.column_value_ids) == 1 else ()
+                        )
+                    )
+                }
+                logical_shapes = tuple(descriptor.column_shapes or (
+                    () for _value in descriptor.column_value_ids
+                ))
+                for column, (column_id, dtype, shape) in enumerate(zip(
+                    descriptor.column_value_ids,
+                    descriptor.column_dtypes,
+                    logical_shapes,
+                    strict=True,
+                )):
+                    tagged = tag_columns.get(int(column))
+                    if tagged is None:
+                        physical_index = len(physical_columns)
+                        physical_columns.append(
+                            self.sequence_storage_values[int(sequence_id)][
+                                int(column)
+                            ]
+                        )
+                        physical_dtypes.append(str(dtype))
+                        physical_shapes.append(tuple(shape))
+                        if int(column) in key_ordinal:
+                            ordinal = key_ordinal[int(column)]
+                            physical_keys.append(physical_index)
+                            physical_queries.append(
+                                logical_query_values[ordinal]
+                            )
+                        continue
+                    tag_column, _target_id, fact = tagged
+                    query_arm_values = ()
+                    query_tag = None
+                    if int(column) in key_ordinal:
+                        ordinal = key_ordinal[int(column)]
+                        if ordinal >= len(query_ids):
+                            raise ValueError(
+                                "native sequence membership tag has no "
+                                "matching authored query component: "
+                                f"sequence={int(sequence_id)}, "
+                                f"column={column}, query={query_ids!r}"
+                            )
+                        authored_query_id = int(query_ids[ordinal])
+                        query_arm_values = (
+                            self._native_value_union_row_payloads(
+                                authored_query_id,
+                                logical_query_values[ordinal], fact,
+                            )
+                        )
+                        query_tag = self.native_type_tag_for(
+                            authored_query_id, fact,
+                        )
+                        if query_tag is None:
+                            raise ValueError(
+                                "native sequence membership query has no "
+                                "exact type evidence: "
+                                f"sequence={int(sequence_id)}, "
+                                f"column={column}, value={authored_query_id}"
+                            )
+                    for arm_index, (arm, arm_column) in enumerate(
+                        union_columns[int(column)]
+                    ):
+                        physical_index = len(physical_columns)
+                        physical_columns.append(arm_column)
+                        physical_dtypes.append(str(arm.dtype or "unknown"))
+                        physical_shapes.append(tuple(arm.shape or ()))
+                        if int(column) in key_ordinal:
+                            physical_keys.append(physical_index)
+                            physical_queries.append(
+                                query_arm_values[arm_index]
+                            )
+                    physical_index = len(physical_columns)
+                    physical_columns.append(tag_column)
+                    physical_dtypes.append("int64")
+                    physical_shapes.append(())
+                    if int(column) in key_ordinal:
+                        physical_keys.append(physical_index)
+                        physical_queries.append(query_tag)
+                physical_descriptor = replace(
+                    descriptor,
+                    column_value_ids=tuple(
+                        int(value.id) for value in physical_columns
+                    ),
+                    column_dtypes=tuple(physical_dtypes),
+                    column_shapes=tuple(physical_shapes),
+                    key_columns=tuple(physical_keys),
+                )
+                query_values = physical_queries
+            membership_columns = (
+                () if physical_descriptor is None else
+                tuple(physical_descriptor.key_columns) or (
+                    (0,)
+                    if len(physical_descriptor.column_value_ids) == 1 else ()
+                )
+            )
+            if (
+                physical_descriptor is None
+                or not membership_columns
+                or len(query_values) != len(membership_columns)
+            ):
                 self.shortfalls.append(SSALoweringShortfall(
                     "ssa-sequence",
                     "contains",
                     f"{function_name}.sequence_membership[{result_id}]",
-                    "membership requires a declared key-column table",
+                    "membership requires one exact query component per "
+                    "key/value membership column",
                 ))
                 continue
             from .ir_sequence_tables import lower_sequence_contains
@@ -2539,28 +2853,36 @@ class _ControlSSABuilder(TiledObject):
                 int(sequence_id), "contains",
             )
             lowering = lower_sequence_contains(
-                descriptor,
+                physical_descriptor,
                 function_name=helper_name,
                 first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
             )
             self._register_sequence_lowering(lowering)
-            query = self.external_value(int(query_id))
             contract_cell = self._sequence_contract_cell(int(sequence_id))
             call_result = (
                 self.fresh_value(
                     dtype="bool", transform=CONTROL_PREDICATE,
-                    operands=(query, contract_cell),
+                    operands=(*query_values, contract_cell),
                 )
                 if negate else SSAValue(int(result_id), dtype="bool")
             )
             if not negate:
                 self._bind(
                     int(result_id), call_result, BindingKind.SEQUENCE_RESULT,
-                    query, contract_cell,
+                    *query_values, contract_cell,
                 )
             self.emit(
                 Handler.Call,
-                [*self.sequence_storage_values[int(sequence_id)], query],
+                [
+                    *(physical_columns if tag_columns else
+                      self.sequence_storage_values[int(sequence_id)][
+                          :len(descriptor.column_value_ids)
+                      ]),
+                    *self.sequence_storage_values[int(sequence_id)][
+                        len(descriptor.column_value_ids):
+                    ],
+                    *query_values,
+                ],
                 call_result,
                 attributes={
                     "callee": helper_name,
@@ -2935,6 +3257,40 @@ class _ControlSSABuilder(TiledObject):
                 f"table {sequence_id} has no sequence descriptor",
             ))
             return
+        query_values = self._table_query_values(key_id)
+        stored_value = self.external_value(int(value_id))
+        actual_dtypes = tuple(
+            str(_canonical_sequence_dtype(value.dtype) or "unknown")
+            for value in (*query_values, stored_value)
+        )
+        if len(actual_dtypes) == len(descriptor.column_dtypes):
+            concorded_dtypes = concord_sequence_row_dtypes(
+                self.function_name,
+                {int(sequence_id): actual_dtypes},
+                source=f"{self.function_name}: table store operands",
+                sources=self._cells(
+                    self._sequence_contract_cell(int(sequence_id)),
+                    *query_values,
+                    stored_value,
+                    *self.sequence_storage_values.get(
+                        int(sequence_id), ()
+                    ),
+                ) or (self._function_root(),),
+                stage=self._stage(),
+            )
+            if tuple(descriptor.column_dtypes) != concorded_dtypes:
+                descriptor = replace(
+                    descriptor, column_dtypes=concorded_dtypes,
+                )
+                self.sequence_descriptors[int(sequence_id)] = descriptor
+            for value, dtype in zip(
+                self.sequence_storage_values[int(sequence_id)],
+                concorded_dtypes,
+            ):
+                if str(value.dtype or "unknown") in {
+                    "", "None", "unknown",
+                }:
+                    value.dtype = str(dtype)
         from .ir_sequence_tables import lower_table_store
 
         helper_name = self._sequence_helper_name(int(sequence_id), "store")
@@ -2949,8 +3305,8 @@ class _ControlSSABuilder(TiledObject):
             [
                 *self.sequence_storage_values[int(sequence_id)],
                 self.sequence_status_values[int(sequence_id)],
-                *self._table_query_values(key_id),
-                self.external_value(int(value_id)),
+                *query_values,
+                stored_value,
             ],
             None,
             attributes={
@@ -3021,6 +3377,12 @@ class _ControlSSABuilder(TiledObject):
                 "sequence_id": int(sequence_id),
                 "column": int(column),
             },
+            # Control construction is not lexical execution order.  A while
+            # predicate can ask for this graph id before its exact resident
+            # row-load block is emitted.  The load is the producer already
+            # named by the sequence contract, so it must resolve that
+            # provisional argument rather than mint a second SSA identity.
+            claim_provisional_definition=True,
         )
 
     def _emit_sequence_row_store(
@@ -3835,6 +4197,8 @@ class _ControlSSABuilder(TiledObject):
         follow_aliases: bool = True,
     ) -> SSAValue:
         value_id = int(value_id)
+        if value_id in self.native_value_type_tests and value_id not in self.external_values:
+            self._emit_native_value_type_test(value_id)
         if value_id in self.native_object_type_tests and value_id not in self.external_values:
             self._emit_native_object_type_test(value_id)
         field_effect = self.scalar_field_effect_destinations.get(value_id)
@@ -4147,6 +4511,450 @@ class _ControlSSABuilder(TiledObject):
         )
         self.emit(Handler.Load, [address], result, attributes=attributes)
         return result
+
+    def _native_type_tag_sequence_column(
+        self, iterable_id: int, column_projection: int, target_id: int,
+    ) -> tuple[SSAValue, object] | None:
+        """Return the resident tag arena for an exact projected value.
+
+        The projected value's VALUE_TYPE_ABI cell owns the alternative table.
+        This parallel int64 column is only its physical sequence view; a later
+        predicate is never allowed to define or widen that table.
+        """
+        fact = self.native_value_type_abi.get(int(target_id))
+        alternatives = tuple(
+            fact.get("alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "alternatives", ())
+        )
+        if len(alternatives) <= 1:
+            return None
+        physical = tuple(
+            fact.get("physical_alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "physical_alternatives", ())
+        )
+        if tuple(getattr(arm, "identity", None) for arm in physical) != alternatives:
+            raise ValueError(
+                "native union merge has no exact ordered physical arms: "
+                f"{physical!r}"
+            )
+        tags = tuple(
+            fact.get("tags", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "tags", ())
+        )
+        key = (int(iterable_id), int(column_projection))
+        source = self.variant_type_tag_columns.get(key)
+        if source is None:
+            source = self.fresh_value(
+                dtype="int64", transform=ROW_COLUMN_PROJECTION,
+                operands=(int(iterable_id), int(target_id)),
+            )
+            parameter_name = next((
+                str(name) for name, history in self.value_name_histories.items()
+                if int(iterable_id) in tuple(map(int, history))
+            ), None)
+            source.accounting.update({
+                "native_type_tag_sequence_for_value_id": int(iterable_id),
+                "native_type_tag_projection": int(column_projection),
+                "native_type_alternatives": alternatives,
+                "native_type_tags": tags,
+                **({
+                    "native_type_tag_sequence_parameter": parameter_name,
+                } if parameter_name is not None else {}),
+                "program_abi_storage": "span",
+                "program_abi_rank": 1,
+            })
+            self.arguments.append(source)
+            self.variant_type_tag_columns[key] = source
+            payload_columns = {}
+            for arm in physical:
+                identity = str(arm.identity)
+                storage = str(arm.storage)
+                if storage == "none":
+                    continue
+                if storage in {"sequence", "record", "reference"}:
+                    raise ValueError(
+                        "heterogeneous resident sequence arm requires an "
+                        "exact nested descriptor-backed payload column: "
+                        f"sequence={int(iterable_id)}, projection="
+                        f"{int(column_projection)}, arm={identity!r}, "
+                        f"storage={storage!r}"
+                    )
+                payload = self.fresh_value(
+                    dtype=str(arm.dtype or "unknown"),
+                    shape=tuple(arm.shape or ()),
+                    transform=ROW_COLUMN_PROJECTION,
+                    operands=(int(iterable_id), int(target_id), identity),
+                )
+                payload.accounting.update({
+                    "native_value_union_sequence_for_value_id": int(
+                        iterable_id
+                    ),
+                    "native_value_union_projection": int(column_projection),
+                    "native_value_union_alternative": identity,
+                    "native_value_union_storage_identity": tuple(
+                        arm.storage_identity
+                    ),
+                    "program_abi_storage": "span",
+                    "program_abi_rank": 1,
+                    "sequence_row_shape": tuple(arm.shape or ()),
+                })
+                self.arguments.append(payload)
+                self.variant_type_payload_columns[
+                    (int(iterable_id), int(column_projection), identity)
+                ] = payload
+                payload_columns[identity] = int(payload.id)
+            subject = self.external_values.get(int(iterable_id))
+            if subject is not None and payload_columns:
+                subject.accounting = {
+                    **dict(subject.accounting or {}),
+                    "native_value_union_sequence_columns": tuple(sorted(
+                        (
+                            int(column_projection), str(identity),
+                            int(value_id),
+                        )
+                        for identity, value_id in payload_columns.items()
+                    )),
+                }
+            owner = self.external_value(int(iterable_id))
+            columns = dict((owner.accounting or {}).get(
+                "native_type_tag_sequence_columns", ()
+            ))
+            columns[int(column_projection)] = int(source.id)
+            owner.accounting = {
+                **dict(owner.accounting or {}),
+                "native_type_tag_sequence_columns": tuple(sorted(
+                    (int(column), int(value_id))
+                    for column, value_id in columns.items()
+                )),
+            }
+        return source, fact
+
+    def projected_native_type_tag(
+        self, iterable_id: int, column_projection: int,
+        projection_index: SSAValue, target_id: int,
+    ) -> SSAValue | None:
+        """Load a projected element's parallel native type discriminant."""
+
+        resident = self._native_type_tag_sequence_column(
+            int(iterable_id), int(column_projection), int(target_id),
+        )
+        if resident is None:
+            return None
+        source, fact = resident
+        alternatives = tuple(
+            fact.get("alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "alternatives", ())
+        )
+        tags = tuple(
+            fact.get("tags", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "tags", ())
+        )
+        physical = tuple(
+            fact.get("physical_alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "physical_alternatives", ())
+        )
+        address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS,
+            operands=(source, projection_index),
+        )
+        self.emit(
+            Handler.GetElementPtr, [source, projection_index], address,
+            attributes={
+                "binding": "projected_native_type_tag_address",
+                "iterable_id": int(iterable_id),
+                "projection": int(column_projection),
+                "target_value_id": int(target_id),
+            },
+        )
+        tag = self.fresh_value(
+            dtype="int64", transform=LOAD, operands=(address,),
+        )
+        tag.accounting.update({
+            "native_type_tag_for_value_id": int(target_id),
+            "native_type_alternatives": alternatives,
+            "native_type_tags": tags,
+        })
+        self.emit(
+            Handler.Load, [address], tag,
+            attributes={
+                "binding": "projected_native_type_tag",
+                "iterable_id": int(iterable_id),
+                "projection": int(column_projection),
+                "target_value_id": int(target_id),
+            },
+        )
+        self.native_value_type_tags[int(target_id)] = tag
+        type_abi_cell = (
+            None if self.lexical_read_scope is None else
+            self._book().latest_ref(
+                VALUE_TYPE_ABI,
+                (self.lexical_read_scope, int(target_id)),
+            )
+        )
+        tag_cell = self._book().latest_ref(
+            SSA_VALUE, (self._scope(), int(tag.id)),
+        )
+        if type_abi_cell is None or tag_cell is None:
+            raise ValueError(
+                "projected native type tag has no ABI/value provenance: "
+                f"{self.function_name} value {int(target_id)}"
+            )
+        self._book().post(
+            VALUE_TYPE_TAG,
+            (self._scope(), int(target_id), int(tag.id)),
+            ValueTypeTagFact(int(tag.id), alternatives, tags),
+            stage=self._stage(),
+            provenance=Derived(self._cells(type_abi_cell, tag_cell, source)),
+            mode=Mode.CONCORD,
+        )
+        payloads = {}
+        for arm in physical:
+            identity = str(arm.identity)
+            if str(arm.storage) == "none":
+                payloads[identity] = ()
+                continue
+            column = self.variant_type_payload_columns.get((
+                int(iterable_id), int(column_projection), identity,
+            ))
+            if column is None:
+                raise ValueError(
+                    "projected native union has no exact alternative payload "
+                    f"column: sequence={int(iterable_id)}, arm={identity!r}"
+                )
+            row_shape = tuple(arm.shape or ())
+            row_index = projection_index
+            if row_shape and math.prod(row_shape) != 1:
+                row_index = self.fresh_value(
+                    dtype="int64", transform=CONTROL_EXPRESSION,
+                    operands=(projection_index, column),
+                )
+                self.emit(
+                    Handler.Mul,
+                    [projection_index, self.constant_value(
+                        int(math.prod(row_shape)), column,
+                    )],
+                    row_index,
+                    attributes={
+                        "binding": "projected_native_value_union_arm_offset",
+                        "alternative": identity,
+                    },
+                )
+            payload_address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS,
+                operands=(column, row_index),
+            )
+            self.emit(
+                Handler.GetElementPtr, [column, row_index], payload_address,
+                attributes={
+                    "binding": "projected_native_value_union_arm_address",
+                    "iterable_id": int(iterable_id),
+                    "projection": int(column_projection),
+                    "alternative": identity,
+                },
+            )
+            payload = (
+                payload_address if row_shape else self.fresh_value(
+                    dtype=str(arm.dtype or "unknown"), transform=LOAD,
+                    operands=(payload_address,),
+                )
+            )
+            if row_shape:
+                payload.dtype = str(arm.dtype or "unknown")
+                payload.shape = row_shape
+            payload.accounting.update({
+                "native_value_union_alternative": identity,
+                "native_value_union_source_id": int(target_id),
+            })
+            if not row_shape:
+                self.emit(
+                    Handler.Load, [payload_address], payload,
+                    attributes={
+                        "binding": "projected_native_value_union_arm",
+                        "iterable_id": int(iterable_id),
+                        "projection": int(column_projection),
+                        "alternative": identity,
+                    },
+                )
+            payloads[identity] = (payload,)
+        self.native_value_union_payloads[int(target_id)] = payloads
+        self.publish_native_value_union(int(target_id), tag, fact)
+        return tag
+
+    def sequence_native_type_tag_columns(
+        self, sequence_id: int,
+    ) -> dict[int, tuple[SSAValue, int, object]]:
+        """Materialize every declared union companion for ``sequence_id``.
+
+        Projected-iterable bindings are the reducer's exact edges from the
+        sequence row to the loop value.  They are therefore the declaration
+        authority for a heterogeneous row.  Equal repeated consumers share
+        one arena; disagreeing consumers are concordance failure, not an
+        opportunity to choose a table locally.
+        """
+
+        declared: dict[int, tuple[tuple, int, object]] = {}
+        for iterable_id, target_id, _induction, projection in (
+            self.program.projected_iterable_bindings
+        ):
+            if int(iterable_id) != int(sequence_id) or projection is None:
+                continue
+            if (
+                isinstance(projection, tuple)
+                and len(projection) == 3
+                and projection[0] == "column_at_value"
+            ):
+                column = int(projection[1])
+            elif isinstance(projection, int):
+                column = int(projection)
+            else:
+                continue
+            fact = self.native_value_type_abi.get(int(target_id))
+            alternatives = tuple(
+                fact.get("alternatives", ())
+                if isinstance(fact, Mapping)
+                else getattr(fact, "alternatives", ())
+            )
+            if len(alternatives) <= 1:
+                continue
+            tags = tuple(
+                fact.get("tags", ())
+                if isinstance(fact, Mapping)
+                else getattr(fact, "tags", ())
+            )
+            signature = (alternatives, tags)
+            incumbent = declared.get(column)
+            if incumbent is not None and incumbent[0] != signature:
+                raise ValueError(
+                    "sequence projection consumers disagree on the linked "
+                    f"native type ABI: function={self.function_name!r}, "
+                    f"sequence={int(sequence_id)}, column={column}, "
+                    f"first={incumbent[0]!r}, incoming={signature!r}"
+                )
+            declared[column] = (signature, int(target_id), fact)
+        result = {}
+        for column, (_signature, target_id, fact) in declared.items():
+            resident = self._native_type_tag_sequence_column(
+                int(sequence_id), int(column), int(target_id),
+            )
+            if resident is not None:
+                result[int(column)] = (resident[0], int(target_id), fact)
+        return result
+
+    def sequence_native_value_union_columns(
+        self, sequence_id: int,
+    ) -> dict[int, tuple[tuple[object, SSAValue], ...]]:
+        """Return each heterogeneous logical column's physical arm arenas.
+
+        Calling :meth:`sequence_native_type_tag_columns` first is
+        intentional: it materializes the tag and all arm arenas from the
+        same authoritative VALUE_TYPE_ABI row.  Writers and copies consume
+        this view instead of treating the logical column as a shared union
+        payload.
+        """
+
+        tags = self.sequence_native_type_tag_columns(int(sequence_id))
+        result: dict[int, tuple[tuple[object, SSAValue], ...]] = {}
+        for column, (_tag, _target_id, fact) in tags.items():
+            physical = tuple(
+                fact.get("physical_alternatives", ())
+                if isinstance(fact, Mapping)
+                else getattr(fact, "physical_alternatives", ())
+            )
+            arms = []
+            for arm in physical:
+                if str(arm.storage) == "none":
+                    continue
+                payload = self.variant_type_payload_columns.get((
+                    int(sequence_id), int(column), str(arm.identity),
+                ))
+                if payload is None:
+                    raise ValueError(
+                        "heterogeneous sequence has no exact physical arm "
+                        f"column: sequence={int(sequence_id)}, "
+                        f"column={int(column)}, arm={str(arm.identity)!r}"
+                    )
+                arms.append((arm, payload))
+            result[int(column)] = tuple(arms)
+        return result
+
+    def _native_value_union_row_payloads(
+        self,
+        value_id: int,
+        value: SSAValue,
+        fact: object,
+    ) -> tuple[SSAValue, ...]:
+        """Inject one authored value into an authoritative physical row."""
+
+        physical = tuple(
+            fact.get("physical_alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "physical_alternatives", ())
+        )
+        source_fact = self.native_value_type_abi.get(int(value_id))
+        source_alternatives = tuple(
+            source_fact.get("alternatives", ())
+            if isinstance(source_fact, Mapping)
+            else getattr(source_fact, "alternatives", ())
+        )
+        if not source_alternatives:
+            exact = dict(value.accounting or {}).get("native_exact_type")
+            if exact is not None:
+                source_alternatives = (str(exact),)
+        retained = self.native_value_union_payloads.get(int(value_id), {})
+        result = []
+        for arm in physical:
+            identity = str(arm.identity)
+            storage = str(arm.storage)
+            if storage == "none":
+                continue
+            if storage in {"sequence", "record", "reference"}:
+                # Aggregate arms are expanded by their authoritative
+                # descriptor, never coerced into one logical payload cell.
+                continue
+            payloads = retained.get(identity)
+            if payloads is None and source_alternatives == (identity,):
+                payloads = (value,)
+            if payloads is None:
+                inactive = self.fresh_value(
+                    dtype=str(arm.dtype or "unknown"),
+                    shape=tuple(arm.shape or ()),
+                    transform=CONTROL_CONST,
+                    operands=(self._canonical_cell(int(value_id)),),
+                )
+                self.emit(
+                    Handler.Const, [], inactive,
+                    attributes={
+                        "value": 0,
+                        "native_value_union_inactive_arm": identity,
+                        "native_value_union_source_id": int(value_id),
+                    },
+                )
+                payloads = (inactive,)
+            if len(payloads) != 1:
+                raise ValueError(
+                    "heterogeneous sequence row arm is not one exact "
+                    f"scalar/span payload: value={int(value_id)}, "
+                    f"arm={identity!r}, payloads={payloads!r}"
+                )
+            payload = payloads[0]
+            if (
+                str(payload.dtype or "unknown") != str(arm.dtype or "unknown")
+                or tuple(payload.shape or ()) != tuple(arm.shape or ())
+            ):
+                raise ValueError(
+                    "heterogeneous sequence row arm changes its physical "
+                    f"ABI: value={int(value_id)}, arm={identity!r}, "
+                    f"payload={(payload.dtype, payload.shape)!r}, "
+                    f"declared={(arm.dtype, arm.shape)!r}"
+                )
+            result.append(payload)
+        return tuple(result)
 
     def bind_nested_row(
         self,
@@ -4706,6 +5514,22 @@ class _ControlSSABuilder(TiledObject):
         self.external_values[graph_id] = value
         if value is None:
             return None
+        type_fact = self.native_value_type_abi.get(graph_id)
+        alternatives = tuple(
+            type_fact.get("alternatives", ())
+            if isinstance(type_fact, Mapping)
+            else getattr(type_fact, "alternatives", ())
+        )
+        if len(alternatives) == 1:
+            value.accounting = {
+                **dict(value.accounting or {}),
+                "native_exact_type": str(alternatives[0]),
+            }
+        tag_id = (value.accounting or {}).get("native_type_tag_value_id")
+        if tag_id is not None:
+            tag = self.ssa_value_objects.get(int(tag_id))
+            if tag is not None:
+                self.native_value_type_tags[graph_id] = tag
         book = self._book()
         value_cell = self._value_cell(value, stage=stage)
         row = (self._scope(), graph_id)
@@ -6122,6 +6946,33 @@ class _ControlSSABuilder(TiledObject):
             len(self.current.instrs),
         )
         self.current.instrs.insert(phi_end, emitted)
+        type_source_id = next((
+            value_id for value_id in (
+                int(updated_value_id), int(initial_value_id)
+            )
+            if value_id in self.native_value_type_abi
+        ), None)
+        if type_source_id is not None:
+            completed_tag = self.merge_native_type_tags(
+                int(type_source_id), completed,
+                tuple(int(value.id) for value in incoming_values),
+                incoming_blocks,
+                binding="loop_continue_carried_native_type_tag",
+            )
+            if completed_tag is not None:
+                # Companion Phis are block-entry definitions beside their
+                # payload Phi.  A continue-site join must not leave its tag
+                # after ordinary merge-block instructions.
+                emitted_tag = self.current.instrs.pop()
+                tag_phi_end = next(
+                    (
+                        index for index, instruction
+                        in enumerate(self.current.instrs)
+                        if str(instruction.op).casefold() != "phi"
+                    ),
+                    len(self.current.instrs),
+                )
+                self.current.instrs.insert(tag_phi_end, emitted_tag)
         return completed
 
     def _complete_loop_latch_carried(
@@ -6213,6 +7064,55 @@ class _ControlSSABuilder(TiledObject):
                 )
             carried_phis[index].args[1] = completed
             carried_updates[index] = completed
+            type_source_id = next((
+                value_id for value_id in (int(updated_id), int(initial_id))
+                if value_id in self.native_value_type_abi
+            ), None)
+            if type_source_id is not None:
+                fact = self.native_value_type_abi[int(type_source_id)]
+                alternatives = tuple(
+                    fact.get("alternatives", ())
+                    if isinstance(fact, Mapping)
+                    else getattr(fact, "alternatives", ())
+                )
+                if len(alternatives) > 1:
+                    if len(incoming_values) > 1 and not all(
+                        value is incoming_values[0]
+                        for value in incoming_values[1:]
+                    ):
+                        completed_tag = self.merge_native_type_tags(
+                            int(type_source_id), completed,
+                            tuple(int(value.id) for value in incoming_values),
+                            incoming_blocks,
+                            binding="loop_latch_carried_native_type_tag",
+                        )
+                    else:
+                        completed_tag = self.native_type_tag_for(
+                            int(completed.id), fact,
+                        )
+                        if completed_tag is not None:
+                            self.post_native_type_tag(
+                                int(type_source_id), completed_tag, fact,
+                                completed, candidate, incumbent,
+                            )
+                    header_tag_phi = self.native_type_tag_phi_by_payload.get(
+                        int(carried_phis[index].res.id)
+                    )
+                    if completed_tag is None or header_tag_phi is None:
+                        raise ValueError(
+                            "loop-carried native union lost its companion "
+                            "Phi: "
+                            f"function={self.function_name!r}, "
+                            f"initial={int(initial_id)}, "
+                            f"updated={int(updated_id)}"
+                        )
+                    header_tag_phi.args[1] = completed_tag
+                    header_tag = header_tag_phi.res
+                    self.native_value_type_tags[int(initial_id)] = header_tag
+                    self.native_value_type_tags[int(updated_id)] = header_tag
+                    self.native_value_type_tags[int(completed.id)] = (
+                        completed_tag
+                    )
             source_loop_node_id = carried_phis[index].attributes.get(
                 "source_loop_node_id"
             )
@@ -6671,6 +7571,24 @@ class _ControlSSABuilder(TiledObject):
                 "physical_dtype_tie_policy": "incumbent",
             }
             return value
+        if expression.op == "native_type_identity":
+            if expression.value_id is None:
+                raise ValueError("native type identity requires a value id")
+            identities = tuple(map(str, expression.literal or ()))
+            if not identities:
+                raise ValueError(
+                    "native type identity requires canonical alternatives"
+                )
+            return self._native_value_type_predicate(
+                int(expression.value_id), identities,
+                result_override=result_override,
+                subtype=False,
+                receipt={
+                    "control_expression": "native_type_identity",
+                    "subject_value_id": int(expression.value_id),
+                    "accepted_types": identities,
+                },
+            )
         if expression.op == "const":
             if isinstance(expression.literal, (tuple, list)):
                 # Data-context aggregate constants use ordinary typed SSA
@@ -7362,6 +8280,15 @@ class _ControlSSABuilder(TiledObject):
                         name for name, _value_id
                         in block.keyword_argument_value_ids
                     ),
+                    "external_argument_sequences": tuple(
+                        {
+                            "position": int(position),
+                            "sequence_id": int(sequence_id),
+                            "encoding": str(encoding),
+                        }
+                        for position, sequence_id, encoding
+                        in block.argument_sequence_ids
+                    ),
                     "argument_frame": "turing.external-reference-arguments.v1",
                     "result_frame": "turing.external-reference-value.v1",
                     "object_policy": "shell-owned-opaque-handles",
@@ -7493,7 +8420,12 @@ class _ControlSSABuilder(TiledObject):
             self.lower_sequence_query(block, path=path)
             return
         if isinstance(block, StreamPublishBlock):
-            args = [self.external_value(block.value_id)]
+            payload_ids = (
+                tuple(map(int, block.payload_value_ids))
+                if block.payload_value_ids
+                else (int(block.value_id),)
+            )
+            args = [self.external_value(value_id) for value_id in payload_ids]
             if block.count_value_id is not None:
                 args.append(self.external_value(block.count_value_id))
             if block.predicate_value_id is not None:
@@ -7510,6 +8442,8 @@ class _ControlSSABuilder(TiledObject):
                     "callee": "turing_stream_publish",
                     "stream_id": int(block.stream_id),
                     "final": bool(block.final),
+                    "source_payload_value_id": int(block.value_id),
+                    "aggregate_payload_value_ids": tuple(payload_ids),
                 },
             )
             return
@@ -8405,6 +9339,804 @@ class _ControlSSABuilder(TiledObject):
         self.emit(Handler.Ne, [selected, zero], result, attributes={'source_object_type_test': receipt})
         self.native_object_type_test_receipts.append(receipt)
 
+    def _native_value_type_predicate(
+        self, subject_id, accepted, *, result_override=None,
+        subtype=False, receipt=None,
+    ):
+        """Return the native predicate for one authoritative type ABI row.
+
+        ``native_type_identity`` control expressions use exact identity.
+        Authored ``isinstance`` tests opt into the separately stated subtype
+        relation.  Both consume the same linked tag table and therefore can
+        own branch-local work without executing a Python predicate or
+        minting an independent discriminant.
+        """
+
+        subject_id = int(subject_id)
+        fact = self.native_value_type_abi.get(subject_id)
+        if fact is None:
+            raise ValueError(
+                "native type predicate has no authoritative value_type_abi "
+                f"for {self.function_name} value {subject_id}"
+            )
+        alternatives = tuple(
+            fact.get("alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "alternatives", ())
+        )
+        tags = dict(
+            fact.get("tags", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "tags", ())
+        )
+        accepted = set(map(str, accepted))
+        admitted_identities = set(accepted)
+        if subtype:
+            admitted_identities = {
+                identity
+                for base in accepted
+                for identity in canonical_python_subtype_identities(
+                    base, book=self._book(),
+                )
+            }
+
+        def admitted(identity: str) -> bool:
+            return identity in admitted_identities
+
+        matching = tuple(
+            identity for identity in alternatives if admitted(str(identity))
+        )
+        if len(alternatives) == 1:
+            result = result_override or self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(
+                    self._book().latest_ref(
+                        VALUE_TYPE_ABI,
+                        (self.lexical_read_scope, subject_id),
+                    ),
+                ),
+            )
+            self.emit(
+                Handler.Const, [], result,
+                attributes={
+                    "value": bool(matching),
+                    "source_native_type_test": dict(receipt or {}),
+                },
+            )
+            return result
+        evidence = self.native_value_type_tags.get(subject_id)
+        if evidence is None:
+            # PlanCall results are linked after control SSA construction.  As
+            # with their payload placeholder, retain a typed formal now; the
+            # exact call-result binding replaces this SAME companion during
+            # frame linking.  It is not a Python/runtime fallback.
+            evidence = self.fresh_value(
+                dtype="int64", transform=CONTROL_UNIFORM,
+                operands=(self._canonical_cell(subject_id),),
+            )
+            evidence.accounting.update({
+                "native_type_tag_pending_for_value_id": subject_id,
+                "native_type_alternatives": alternatives,
+                "native_type_tags": tuple(tags.items()),
+            })
+            self.arguments.append(evidence)
+            self.native_value_type_tags[subject_id] = evidence
+            payload = self.external_value(subject_id)
+            payload.accounting = {
+                **dict(payload.accounting or {}),
+                "native_type_tag_value_id": int(evidence.id),
+                "native_type_alternatives": alternatives,
+            }
+            self.post_native_type_tag(
+                subject_id, evidence, fact, payload,
+            )
+        comparisons = []
+        for identity in matching:
+            token = self.fresh_value(
+                dtype="int64", transform=CONTROL_CONST,
+                operands=(evidence,),
+            )
+            self.emit(
+                Handler.Const, [], token,
+                attributes={"value": int(tags[str(identity)])},
+            )
+            comparison = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(evidence, token),
+            )
+            self.emit(Handler.Eq, [evidence, token], comparison)
+            comparisons.append(comparison)
+        if not comparisons:
+            result = result_override or self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(evidence,),
+            )
+            self.emit(
+                Handler.Const, [], result,
+                attributes={
+                    "value": False,
+                    "source_native_type_test": dict(receipt or {}),
+                },
+            )
+            return result
+        selected = comparisons[0]
+        for comparison in comparisons[1:]:
+            combined = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(selected, comparison),
+            )
+            self.emit(Handler.Or, [selected, comparison], combined)
+            selected = combined
+        result = result_override or self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(evidence, *comparisons),
+        )
+        # A final identity copy is ordinary boolean SSA; no callable or
+        # interpreter escape remains in the repository module.
+        self.emit(
+            Handler.Or, [selected, selected], result,
+            attributes={
+                "source_native_type_test": {
+                    **dict(receipt or {}),
+                    "type_abi": fact,
+                    "tag_value_id": int(evidence.id),
+                },
+            },
+        )
+        return result
+
+    def native_type_tag_for(
+        self, value_id: int, authoritative_fact: Any,
+    ) -> SSAValue | None:
+        """Return ``value_id``'s tag in ``authoritative_fact``'s table.
+
+        Exact values become constants.  A union already using the table is
+        forwarded.  A different accepted union is explicitly remapped with
+        integer comparisons and Selects; independently minted dense integers
+        are never compared as though they shared an identity space.
+        """
+
+        target_alternatives = tuple(
+            authoritative_fact.get("alternatives", ())
+            if isinstance(authoritative_fact, Mapping)
+            else getattr(authoritative_fact, "alternatives", ())
+        )
+        if len(target_alternatives) <= 1:
+            return None
+        target_tags = dict(
+            authoritative_fact.get("tags", ())
+            if isinstance(authoritative_fact, Mapping)
+            else getattr(authoritative_fact, "tags", ())
+        )
+        source_fact = self.native_value_type_abi.get(int(value_id))
+        source_value = (
+            self.external_values.get(int(value_id))
+            or self.ssa_value_objects.get(int(value_id))
+        )
+        source_accounting = dict(
+            () if source_value is None else source_value.accounting or {}
+        )
+        source_alternatives = tuple(
+            source_fact.get("alternatives", ())
+            if isinstance(source_fact, Mapping)
+            else getattr(source_fact, "alternatives", ())
+        ) or tuple(source_accounting.get("native_type_alternatives", ()))
+        if not source_alternatives and source_accounting.get(
+            "native_exact_type"
+        ) is not None:
+            source_alternatives = (
+                str(source_accounting["native_exact_type"]),
+            )
+        if not source_alternatives:
+            return None
+        if any(identity not in target_tags for identity in source_alternatives):
+            raise ValueError(
+                "native type tag remap loses an exact alternative: "
+                f"source={source_alternatives!r}, "
+                f"target={target_alternatives!r}"
+            )
+        if len(source_alternatives) == 1:
+            tag = self.fresh_value(
+                dtype="int64", transform=CONTROL_CONST,
+                operands=(self._canonical_cell(int(value_id)),),
+            )
+            self.emit(
+                Handler.Const, [], tag,
+                attributes={
+                    "value": int(target_tags[source_alternatives[0]]),
+                    "native_type_tag_constant_for": int(value_id),
+                },
+            )
+            return tag
+        source_tag = self.native_value_type_tags.get(int(value_id))
+        if source_tag is None and source_accounting.get(
+            "native_type_tag_value_id"
+        ) is not None:
+            source_tag = (
+                self.external_values.get(int(source_accounting[
+                    "native_type_tag_value_id"
+                ]))
+                or self.ssa_value_objects.get(int(source_accounting[
+                    "native_type_tag_value_id"
+                ]))
+            )
+        if source_tag is None:
+            return None
+        source_tags = dict(
+            source_fact.get("tags", ())
+            if isinstance(source_fact, Mapping)
+            else getattr(source_fact, "tags", ())
+        ) or dict(source_accounting.get("native_type_tags", ()))
+        if (
+            source_alternatives == target_alternatives
+            and source_tags == target_tags
+        ):
+            return source_tag
+        remapped = None
+        for identity in source_alternatives:
+            source_token = self.constant_value(
+                int(source_tags[identity]), source_tag,
+            )
+            target_token = self.constant_value(
+                int(target_tags[identity]), source_tag,
+            )
+            matches = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(source_tag, source_token),
+            )
+            self.emit(Handler.Eq, [source_tag, source_token], matches)
+            if remapped is None:
+                remapped = target_token
+                continue
+            selected = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(matches, target_token, remapped),
+            )
+            self.emit(
+                Handler.Select, [matches, target_token, remapped], selected,
+                attributes={"binding": "native_type_tag_remap"},
+            )
+            remapped = selected
+        return remapped
+
+    def post_native_type_tag(
+        self, value_id: int, tag: SSAValue, type_fact: Any, *sources: Any,
+    ) -> Ref:
+        """Publish one companion writer with its exact ABI/value causes."""
+
+        alternatives = tuple(
+            type_fact.get("alternatives", ())
+            if isinstance(type_fact, Mapping)
+            else getattr(type_fact, "alternatives", ())
+        )
+        tags = tuple(
+            type_fact.get("tags", ())
+            if isinstance(type_fact, Mapping)
+            else getattr(type_fact, "tags", ())
+        )
+        abi_cell = (
+            None if self.lexical_read_scope is None else
+            self._book().latest_ref(
+                VALUE_TYPE_ABI,
+                (self.lexical_read_scope, int(value_id)),
+            )
+        )
+        tag_cell = self._book().latest_ref(
+            SSA_VALUE, (self._scope(), int(tag.id)),
+        )
+        if abi_cell is None or tag_cell is None:
+            raise ValueError(
+                "native type tag has no ABI/value provenance: "
+                f"{self.function_name} value {int(value_id)}"
+            )
+        return self._book().post(
+            VALUE_TYPE_TAG,
+            (self._scope(), int(value_id), int(tag.id)),
+            ValueTypeTagFact(int(tag.id), alternatives, tags),
+            stage=self._stage(),
+            provenance=Derived(self._cells(
+                abi_cell, tag_cell, *sources,
+            )),
+            mode=Mode.CONCORD,
+        )
+
+    def _native_union_sequence_values(
+        self, sequence_id: int,
+    ) -> tuple[SSAValue, ...]:
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        if descriptor is None:
+            return ()
+        child = descriptor.child_table_pool
+        member_ids = tuple(dict.fromkeys((
+            *descriptor.column_value_ids,
+            int(descriptor.length_address_id),
+            int(descriptor.capacity_value_id),
+            *(() if descriptor.status_address_id is None else (
+                int(descriptor.status_address_id),
+            )),
+            *(() if descriptor.live_flags_value_id is None else (
+                int(descriptor.live_flags_value_id),
+            )),
+            *(() if descriptor.heap_owner_value_id is None else (
+                int(descriptor.heap_owner_value_id),
+            )),
+            *(() if child is None else (
+                *map(int, child.column_value_ids),
+                int(child.length_value_id), int(child.capacity_value_id),
+                int(child.row_stride_value_id),
+                *(() if child.shape_value_id is None else (
+                    int(child.shape_value_id),
+                )),
+                *(() if child.rank_value_id is None else (
+                    int(child.rank_value_id),
+                )),
+                *(() if child.shape_stride_value_id is None else (
+                    int(child.shape_stride_value_id),
+                )),
+                *(() if child.status_value_id is None else (
+                    int(child.status_value_id),
+                )),
+                *(() if child.live_flags_value_id is None else (
+                    int(child.live_flags_value_id),
+                )),
+            )),
+        )))
+        values = tuple(
+            self.ssa_value_objects.get(value_id)
+            or self.external_values.get(value_id)
+            for value_id in member_ids
+        )
+        if any(value is None for value in values):
+            raise ValueError(
+                "native union sequence descriptor names an absent physical "
+                f"cell: sequence={int(sequence_id)}, members={member_ids!r}"
+            )
+        return values
+
+    @staticmethod
+    def _native_union_sequence_signature(
+        descriptor: SSASequenceDescriptor,
+    ) -> tuple:
+        child = descriptor.child_table_pool
+        return (
+            tuple(descriptor.column_dtypes),
+            tuple(tuple(shape) for shape in descriptor.column_shapes),
+            tuple(descriptor.key_columns), bool(descriptor.writable),
+            descriptor.status_address_id is not None,
+            descriptor.live_flags_value_id is not None,
+            descriptor.heap_owner_value_id is not None,
+            None if child is None else (
+                tuple(child.column_dtypes), tuple(child.key_columns),
+                bool(child.writable), child.shape_value_id is not None,
+                child.rank_value_id is not None,
+                child.shape_stride_value_id is not None,
+                child.status_value_id is not None,
+                child.live_flags_value_id is not None,
+            ),
+        )
+
+    def publish_native_value_union(
+        self, value_id: int, tag: SSAValue, type_fact: Any,
+    ) -> SSAValueUnionDescriptor:
+        """Publish the physical side-by-side row for one semantic union."""
+
+        physical = tuple(
+            type_fact.get("physical_alternatives", ())
+            if isinstance(type_fact, Mapping)
+            else getattr(type_fact, "physical_alternatives", ())
+        )
+        payloads = self.native_value_union_payloads.get(int(value_id), {})
+        sequence_arms = self.native_value_union_sequence_ids.get(
+            int(value_id), {}
+        )
+        alternatives = []
+        for arm in physical:
+            identity = str(arm.identity)
+            storage = SSAValueUnionStorage(str(arm.storage))
+            values = tuple(payloads.get(identity, ()))
+            sequence_id = sequence_arms.get(identity)
+            if storage is SSAValueUnionStorage.SEQUENCE:
+                descriptor = (
+                    None if sequence_id is None else
+                    self.sequence_descriptors.get(int(sequence_id))
+                )
+                if descriptor is None:
+                    raise ValueError(
+                        "native value union sequence arm has not retained its "
+                        f"descriptor: value={int(value_id)}, arm={identity!r}"
+                    )
+                values = ()
+            elif storage is not SSAValueUnionStorage.NONE and not values:
+                raise ValueError(
+                    "native value union arm has no materialized payload "
+                    f"cells: value={int(value_id)}, arm={identity!r}"
+                )
+            if storage is SSAValueUnionStorage.RECORD:
+                raise ValueError(
+                    "native value union aggregate arm has not retained its "
+                    f"descriptor: value={int(value_id)}, arm={identity!r}"
+                )
+            if storage is SSAValueUnionStorage.REFERENCE and any(
+                not any(
+                    instruction.res is not None
+                    and int(instruction.res.id) == int(value.id)
+                    and instruction.op in {"StaticRef", "static_ref"}
+                    and not bool(instruction.attributes.get(
+                        "host_resident", True
+                    ))
+                    for block in self.blocks.values()
+                    for instruction in block.instrs
+                )
+                for value in values
+            ):
+                raise ValueError(
+                    "native value union reference arm lacks an exact native, "
+                    "non-host-resident reference descriptor: "
+                    f"{identity!r}"
+                )
+            alternatives.append(SSAValueUnionAlternative(
+                name=identity,
+                storage=storage,
+                dtype=str(arm.dtype or ""),
+                shape=tuple(arm.shape or ()),
+                value_ids=tuple(value.id for value in values),
+                sequence_id=(
+                    int(sequence_id)
+                    if storage is SSAValueUnionStorage.SEQUENCE else None
+                ),
+                storage_identity=(
+                    None if not arm.storage_identity
+                    else repr(tuple(arm.storage_identity))
+                ),
+            ))
+        descriptor = SSAValueUnionDescriptor(
+            union_id=int(value_id),
+            identity=" | ".join(arm.name for arm in alternatives),
+            tag_value_id=int(tag.id),
+            alternatives=tuple(alternatives),
+            metadata_state="dynamic",
+        )
+        abi_cell = (
+            None if self.lexical_read_scope is None else
+            self._book().latest_ref(
+                VALUE_TYPE_ABI,
+                (self.lexical_read_scope, int(value_id)),
+            )
+        )
+        type_tag_cell = self._book().latest_ref(
+            VALUE_TYPE_TAG, (self._scope(), int(value_id), int(tag.id)),
+        )
+        if abi_cell is None or type_tag_cell is None:
+            raise ValueError(
+                "native value union has no exact ABI/tag concordance cells: "
+                f"{self.function_name} value {int(value_id)}"
+            )
+        self.value_union_table.register(
+            descriptor,
+            sources=self._cells(
+                abi_cell, tag,
+                *(value for values in payloads.values() for value in values),
+                *(
+                    value
+                    for sequence_id in sequence_arms.values()
+                    for value in self._native_union_sequence_values(
+                        int(sequence_id)
+                    )
+                ),
+            ),
+            stage=self._stage(),
+        )
+        states = tuple((
+            tuple(arm.shape), str(arm.dtype), int(arm.rank),
+            str(arm.metadata_state),
+            None if arm.row_shape is None else tuple(arm.row_shape),
+        ) for arm in physical)
+        union_sources = self._cells(
+            abi_cell, type_tag_cell, tag,
+            *(cell for arm in physical for cell in arm.source_cells),
+            *(value for values in payloads.values() for value in values),
+            *(
+                value
+                for sequence_id in sequence_arms.values()
+                for value in self._native_union_sequence_values(
+                    int(sequence_id)
+                )
+            ),
+        )
+        if not union_sources:
+            raise ValueError(
+                "native value union state has no exact ABI/tag provenance: "
+                f"{self.function_name} value {int(value_id)}"
+            )
+        self._book().post(
+            UNION_ALTERNATIVE_STATE,
+            (self._scope(), int(value_id)),
+            UnionAlternativeStateFact(
+                tuple(arm.name for arm in alternatives), int(tag.id), states,
+            ),
+            stage=self._stage(), provenance=Derived(union_sources),
+            mode=Mode.REVISE,
+        )
+        for position, (physical_arm, descriptor_arm) in enumerate(zip(
+            physical, alternatives, strict=True,
+        )):
+            arm_state = (
+                tuple(physical_arm.shape), str(physical_arm.dtype),
+                int(physical_arm.rank), str(physical_arm.metadata_state),
+                None if physical_arm.row_shape is None
+                else tuple(physical_arm.row_shape),
+            )
+            arm_scope = (
+                *tuple(self.shape_scope), "value_union",
+                int(value_id), str(descriptor_arm.name),
+            )
+            for payload_id in descriptor_arm.value_ids:
+                payload = self.ssa_value_objects.get(int(payload_id))
+                record_shape_transformation(
+                    arm_scope, int(value_id), self.shape_scope,
+                    int(payload_id), stage=UNION_PROJECTION,
+                    operation="value_union_projection",
+                    source_state=arm_state, target_state=arm_state,
+                    role=f"alternative:{position}",
+                    source_cells=self._cells(
+                        abi_cell, tag, payload,
+                        *physical_arm.source_cells,
+                    ),
+                )
+            if descriptor_arm.sequence_id is not None:
+                sequence_id = int(descriptor_arm.sequence_id)
+                record_shape_transformation(
+                    arm_scope, int(value_id), self.shape_scope, sequence_id,
+                    stage=UNION_PROJECTION,
+                    operation="value_union_sequence_projection",
+                    source_state=arm_state, target_state=arm_state,
+                    role=f"alternative:{position}",
+                    source_cells=self._cells(
+                        abi_cell, tag,
+                        *self._native_union_sequence_values(sequence_id),
+                        *physical_arm.source_cells,
+                    ),
+                )
+        return descriptor
+
+    def merge_native_type_tags(
+        self,
+        result_source_id: int,
+        result: SSAValue,
+        incoming_source_ids: tuple[int, ...],
+        incoming_blocks: tuple[str, ...],
+        *,
+        binding: str,
+    ) -> SSAValue | None:
+        """Emit the companion Phi for one authored payload Phi.
+
+        The result's VALUE_TYPE_ABI row supplies the only accepted table.
+        Each incoming tag is forwarded, folded, or explicitly remapped by
+        :meth:`native_type_tag_for`; thus loops and N-way state joins preserve
+        the same identity evidence as ordinary two-arm conditionals.
+        """
+
+        fact = self.native_value_type_abi.get(int(result_source_id))
+        alternatives = tuple(
+            fact.get("alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "alternatives", ())
+        )
+        if len(alternatives) <= 1:
+            return None
+        incoming_tags = tuple(
+            self.native_type_tag_for(int(value_id), fact)
+            for value_id in incoming_source_ids
+        )
+        if any(value is None for value in incoming_tags):
+            raise ValueError(
+                "native union Phi has an incoming value without exact type "
+                f"evidence: result={int(result_source_id)}, "
+                f"incoming={incoming_source_ids!r}, binding={binding!r}"
+            )
+        tags = tuple(
+            fact.get("tags", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "tags", ())
+        )
+        physical = tuple(
+            fact.get("physical_alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "physical_alternatives", ())
+        )
+        if tuple(str(arm.identity) for arm in physical) != alternatives:
+            raise ValueError(
+                "native union Phi has no exact per-alternative physical ABI: "
+                f"result={int(result_source_id)}, alternatives={alternatives!r}, "
+                f"physical={tuple(str(arm.identity) for arm in physical)!r}"
+            )
+        merged = self.fresh_value(
+            dtype="int64", transform=PHI_CONDITIONAL,
+            operands=tuple(incoming_tags),
+        )
+        merged.accounting.update({
+            "native_type_tag_for_value_id": int(result_source_id),
+            "native_type_alternatives": alternatives,
+            "native_type_tags": tags,
+        })
+        self.emit(
+            Handler.Phi, list(incoming_tags), merged,
+            attributes={
+                "incoming_blocks": tuple(incoming_blocks),
+                "binding": str(binding),
+                "native_type_tag_phi": True,
+                "payload_value_id": int(result.id),
+                "source_value_id": int(result_source_id),
+            },
+        )
+        self.native_type_tag_phi_by_payload[int(result.id)] = (
+            self.current.instrs[-1]
+        )
+        merged_payloads: dict[str, tuple[SSAValue, ...]] = {}
+        for arm in physical:
+            identity = str(arm.identity)
+            if str(arm.storage) == "none":
+                merged_payloads[identity] = ()
+                continue
+            if str(arm.storage) in {"sequence", "record"}:
+                raise ValueError(
+                    "native union aggregate Phi requires descriptor-backed "
+                    f"arm transport: value={int(result_source_id)}, "
+                    f"arm={identity!r}"
+                )
+            incoming_payloads = []
+            for source_id, block_name in zip(
+                incoming_source_ids, incoming_blocks,
+            ):
+                source_payloads = self.native_value_union_payloads.get(
+                    int(source_id), {}
+                ).get(identity)
+                if source_payloads is None:
+                    source_fact = self.native_value_type_abi.get(int(source_id))
+                    source_alternatives = tuple(
+                        source_fact.get("alternatives", ())
+                        if isinstance(source_fact, Mapping)
+                        else getattr(source_fact, "alternatives", ())
+                    )
+                    if source_alternatives == (identity,):
+                        source_value = (
+                            self.external_values.get(int(source_id))
+                            or self.ssa_value_objects.get(int(source_id))
+                        )
+                        if source_value is None:
+                            source_value = self.external_value(int(source_id))
+                        source_payloads = (source_value,)
+                    else:
+                        prior = self.current
+                        self.current = self.blocks[str(block_name)]
+                        inactive = self.fresh_value(
+                            dtype=str(arm.dtype or "unknown"),
+                            shape=tuple(arm.shape or ()),
+                            transform=CONTROL_CONST,
+                            operands=(self._canonical_cell(int(source_id)),),
+                        )
+                        self.emit(
+                            Handler.Const, [], inactive,
+                            attributes={
+                                "value": 0,
+                                "native_value_union_inactive_arm": identity,
+                            },
+                        )
+                        self.current = prior
+                        source_payloads = (inactive,)
+                if len(source_payloads) != 1:
+                    raise ValueError(
+                        "native scalar/span union arm has non-scalar payload "
+                        f"cells: {identity!r} -> {source_payloads!r}"
+                    )
+                incoming_payloads.append(source_payloads[0])
+            merged_arm = self.fresh_value(
+                dtype=str(arm.dtype or incoming_payloads[0].dtype or "unknown"),
+                shape=tuple(arm.shape or incoming_payloads[0].shape or ()),
+                transform=PHI_CONDITIONAL,
+                operands=tuple(incoming_payloads),
+            )
+            self.emit(
+                Handler.Phi, incoming_payloads, merged_arm,
+                attributes={
+                    "incoming_blocks": tuple(incoming_blocks),
+                    "binding": f"{binding}_native_value_union_{identity}",
+                    "native_value_union_alternative": identity,
+                    "source_value_id": int(result_source_id),
+                },
+            )
+            merged_payloads[identity] = (merged_arm,)
+        for source_id, source_tag in zip(
+            incoming_source_ids, incoming_tags, strict=True,
+        ):
+            source_fact = self.native_value_type_abi.get(int(source_id))
+            source_physical = tuple(
+                source_fact.get("physical_alternatives", ())
+                if isinstance(source_fact, Mapping)
+                else getattr(source_fact, "physical_alternatives", ())
+            )
+            target_by_identity = {
+                str(arm.identity): arm for arm in physical
+            }
+            target_position = {
+                str(arm.identity): position
+                for position, arm in enumerate(physical)
+            }
+            for source_arm in source_physical:
+                identity = str(source_arm.identity)
+                target_arm = target_by_identity.get(identity)
+                if target_arm is None:
+                    raise ValueError(
+                        "native union injection loses an exact source arm: "
+                        f"result={int(result_source_id)}, source={int(source_id)}, "
+                        f"arm={identity!r}"
+                    )
+                source_state = (
+                    tuple(source_arm.shape), str(source_arm.dtype),
+                    int(source_arm.rank), str(source_arm.metadata_state),
+                    None if source_arm.row_shape is None
+                    else tuple(source_arm.row_shape),
+                )
+                target_state = (
+                    tuple(target_arm.shape), str(target_arm.dtype),
+                    int(target_arm.rank), str(target_arm.metadata_state),
+                    None if target_arm.row_shape is None
+                    else tuple(target_arm.row_shape),
+                )
+                if source_state != target_state:
+                    raise ValueError(
+                        "native union injection changes an alternative's "
+                        f"physical shape state: {identity!r}: "
+                        f"{source_state!r} != {target_state!r}"
+                    )
+                arm_scope = (
+                    *tuple(self.shape_scope), "value_union",
+                    int(result_source_id), identity,
+                )
+                record_shape_transformation(
+                    self.shape_scope, int(source_id), arm_scope,
+                    int(result_source_id), stage=UNION_INJECTION,
+                    operation="value_union_injection",
+                    source_state=source_state, target_state=target_state,
+                    role=f"alternative:{target_position[identity]}",
+                    source_cells=self._cells(
+                        source_tag, *source_arm.source_cells,
+                    ),
+                )
+        self.native_value_union_payloads[int(result_source_id)] = merged_payloads
+        self.native_value_union_payloads[int(result.id)] = merged_payloads
+        result.accounting = {
+            **dict(result.accounting or {}),
+            "native_type_tag_value_id": int(merged.id),
+            "native_type_alternatives": alternatives,
+        }
+        self.native_value_type_tags[int(result_source_id)] = merged
+        self.native_value_type_tags[int(result.id)] = merged
+        self.post_native_type_tag(
+            int(result_source_id), merged, fact, result, *incoming_tags,
+        )
+        self.publish_native_value_union(int(result_source_id), merged, fact)
+        return merged
+
+    def _emit_native_value_type_test(self, value_id):
+        """Lower a concorded authored ``isinstance`` to integer SSA only."""
+
+        source = self.native_value_type_tests[int(value_id)]
+        result = self.produced_value(
+            int(value_id), dtype="bool",
+            claim_provisional_definition=True,
+            cause=(
+                source.get("intrinsic_cell"),
+                source.get("target_definition_cell"),
+            ),
+        )
+        self._native_value_type_predicate(
+            int(source["subject_value_id"]), source["accepted_types"],
+            result_override=result,
+            subtype=str(source.get("predicate_kind")) == "subtype",
+            receipt=dict(source),
+        )
+
     def _emit_native_object_constructor(self, mutation, *, location):
         from .ssa_object_operations import object_call
         context = self.native_object_context
@@ -8600,6 +10332,25 @@ class _ControlSSABuilder(TiledObject):
                     for component in all_components
                     if component.projection_components
                 }
+                union_destinations = {
+                    int(component.component_value_id): (
+                        int(component.operand_value_id),
+                        tuple(
+                            (
+                                str(arm.identity),
+                                int(arm.sequence_value_id),
+                                tuple(arm.source_cells),
+                            )
+                            for arm in component.union_alternatives
+                        ),
+                    )
+                    for component in all_components
+                    if component.union_alternatives
+                    and component.operand_value_id is not None
+                }
+                union_contract = union_destinations.get(
+                    int(mutation.sequence_value_id)
+                )
                 admitted = (
                     operation == "clear"
                     and int(mutation.sequence_value_id) == destination_id
@@ -8626,6 +10377,28 @@ class _ControlSSABuilder(TiledObject):
                         int(mutation.sequence_value_id),
                         int(mutation.argument_value_ids[0]),
                     ) in token_components
+                    or operation == "glyph_union_select"
+                    and str(mutation.argument_kind)
+                    == "value_union_glyph_projection"
+                    and union_contract is not None
+                    and tuple(map(int, mutation.argument_value_ids)) == (
+                        int(union_contract[0]),
+                        *(
+                            int(sequence_id)
+                            for _identity, sequence_id, _sources
+                            in union_contract[1]
+                        ),
+                    )
+                    or operation == "replace"
+                    and str(mutation.argument_kind)
+                    == "value_union_glyph_arm"
+                    and union_contract is not None
+                    and len(mutation.argument_value_ids) == 1
+                    and int(mutation.argument_value_ids[0]) in {
+                        int(sequence_id)
+                        for _identity, sequence_id, _sources
+                        in union_contract[1]
+                    }
                 )
             elif isinstance(fact, SourceOptionalGlyphCarry):
                 destination_id = int(fact.payload_sequence_value_id)
@@ -8658,12 +10431,27 @@ class _ControlSSABuilder(TiledObject):
             from .concordance_declarations import STRING_GLYPH_VOCABULARY
 
             vocabulary_cell = mutation.vocabulary_contract_cell
+            vocabulary_row = (
+                None if vocabulary_cell is None
+                else tuple(vocabulary_cell.row)
+            )
+            # Control blocks can cross the live-tile/pickle boundary after
+            # this Ref is minted.  Page objects are schema values there, so
+            # object identity is not the cell identity.  Resolve the retained
+            # row through the active book and require the complete canonical
+            # key (page name, row, column) to agree.  Unit 038 carried the
+            # exact vocabulary fact but the old ``is`` test rejected its
+            # rehydrated Page instance before consulting that fact.
+            canonical_vocabulary_cell = (
+                None if vocabulary_row is None
+                else self._book().latest_ref(
+                    STRING_GLYPH_VOCABULARY, vocabulary_row,
+                )
+            )
             if (
                 vocabulary_cell is None
-                or getattr(vocabulary_cell, "page", None)
-                is not self._book().registry.pages.get(
-                    STRING_GLYPH_VOCABULARY.name
-                )
+                or canonical_vocabulary_cell is None
+                or vocabulary_cell.key != canonical_vocabulary_cell.key
                 or len(mutation.argument_value_ids) != 2
                 or int(vocabulary_cell.row[1])
                 != int(mutation.argument_value_ids[1])
@@ -8695,6 +10483,108 @@ class _ControlSSABuilder(TiledObject):
                 raise ValueError(f'{location}: update differs from its authoritative concordance cell')
             self._emit_native_object_operation(accepted['operation'], mutation.sequence_value_id, mutation.argument_value_ids, None)
             self.current.instrs[-1].attributes['source_object_update'] = {'contract_cell': mutation.object_contract_cell}
+            return
+        if operation == "glyph_union_select":
+            from .concordance_declarations import (
+                SOURCE_GLYPH_SEQUENCE,
+                SourceGlyphSequence,
+            )
+
+            cell = mutation.source_contract_cell
+            fact = self._book().page(SOURCE_GLYPH_SEQUENCE).cell(
+                cell.row, cell.column,
+            )
+
+            def glyph_tree(component):
+                yield component
+                for child in component.projection_components:
+                    yield from glyph_tree(child)
+
+            selected = tuple(
+                component
+                for root in fact.components
+                for component in glyph_tree(root)
+                if int(component.component_value_id)
+                == int(mutation.sequence_value_id)
+                and component.union_alternatives
+            )
+            if len(selected) != 1:
+                raise ValueError(
+                    f"{location}: value-union glyph destination does not "
+                    "name exactly one source component"
+                )
+            component = selected[0]
+            subject_id = int(component.operand_value_id)
+            descriptor = self.value_union_table.by_id(subject_id)
+            type_fact = self.native_value_type_abi.get(subject_id)
+            if descriptor is None or type_fact is None:
+                raise ValueError(
+                    f"{location}: value-union glyph projection has no exact "
+                    f"native descriptor for value {subject_id}"
+                )
+            tags = dict(getattr(type_fact, "tags", ()))
+            physical = {
+                str(arm.identity): arm
+                for arm in getattr(type_fact, "physical_alternatives", ())
+            }
+            recipes = tuple(component.union_alternatives)
+            identities = tuple(str(arm.identity) for arm in recipes)
+            if (
+                identities != tuple(arm.name for arm in descriptor.alternatives)
+                or set(tags) != set(identities)
+                or set(physical) != set(identities)
+            ):
+                raise ValueError(
+                    f"{location}: glyph alternatives disagree with the "
+                    "concorded value-union descriptor"
+                )
+            for arm in recipes:
+                exact_sources = set(physical[str(arm.identity)].source_cells)
+                if not arm.source_cells or not set(arm.source_cells) <= exact_sources:
+                    raise ValueError(
+                        f"{location}: glyph arm {arm.identity!r} lacks its "
+                        "exact VALUE_TYPE_ABI source cells"
+                    )
+            tag = self.external_value(
+                int(descriptor.tag_value_id), dtype="int64"
+            )
+            merge = self.new_block("glyph_union_merge")
+            for ordinal, arm in enumerate(recipes):
+                arm_block = self.new_block("glyph_union_arm")
+                if ordinal + 1 == len(recipes):
+                    self.branch(arm_block)
+                else:
+                    next_test = self.new_block("glyph_union_test")
+                    tag_token = self.constant_value(int(tags[arm.identity]), tag)
+                    matches = self.fresh_value(
+                        dtype="bool", transform=CONTROL_PREDICATE,
+                        operands=(tag, tag_token, *tuple(arm.source_cells)),
+                    )
+                    self.emit(
+                        Handler.Eq, [tag, tag_token], matches,
+                        attributes={
+                            "binding": "value_union_glyph_arm",
+                            "source_value_id": subject_id,
+                            "alternative": str(arm.identity),
+                        },
+                    )
+                    self.conditional_branch(matches, arm_block, next_test)
+                self.current = arm_block
+                self._lower_sequence_mutation_body(
+                    ControlSequenceMutation(
+                        int(mutation.sequence_value_id), "replace",
+                        (int(arm.sequence_value_id),),
+                        int(mutation.effect_node_id), policy=mutation.policy,
+                        argument_kind="value_union_glyph_arm",
+                        source_contract_cell=cell,
+                    ),
+                    path=f"{path}.value_union[{arm.identity}]",
+                )
+                if not self.current.successors:
+                    self.branch(merge)
+                if ordinal + 1 != len(recipes):
+                    self.current = next_test
+            self.current = merge
             return
         if int(mutation.sequence_value_id) in self.native_object_source_ids:
             workspace = self.native_object_collection_rows.get(int(mutation.sequence_value_id))
@@ -9791,6 +11681,7 @@ class _ControlSSABuilder(TiledObject):
         deferred_record_row: tuple[int, str, int] | None = None
         deferred_record_slots: tuple[tuple[int, int, str, int], ...] = ()
         indexed_record_row_source: tuple[int, int, str] | None = None
+        native_type_tag_sequence_receipt: tuple = ()
         if operation in {"append", "add"}:
             expected_columns = len(destination.column_value_ids)
             record_slots = self.sequence_row_record_slots.get(
@@ -10040,22 +11931,6 @@ class _ControlSSABuilder(TiledObject):
                         attributes={"binding": "ssa_sequence_status"},
                     )
                 return
-            function_name = self._sequence_helper_name(
-                int(destination.sequence_id), str(operation),
-            )
-            lowering = (
-                lower_sequence_append(
-                    destination,
-                    function_name=function_name,
-                    first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
-                )
-                if operation == "append"
-                else lower_sequence_add(
-                    destination,
-                    function_name=function_name,
-                    first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
-                )
-            )
             mutation_values = tuple(
                 (
                     self.lower_control_expression(expression)
@@ -10154,9 +12029,126 @@ class _ControlSSABuilder(TiledObject):
                             mutation_value.dtype = str(element_dtype)
                     column_index += 1
                 del slot_positions
+            physical_destination = destination
+            tag_columns = (
+                {}
+                if deferred_record_row is not None or deferred_record_slots
+                else self.sequence_native_type_tag_columns(
+                    int(destination.sequence_id)
+                )
+            )
+            union_columns = (
+                {}
+                if not tag_columns else
+                self.sequence_native_value_union_columns(
+                    int(destination.sequence_id)
+                )
+            )
+            physical_column_ids = []
+            physical_column_dtypes = []
+            physical_column_shapes = []
+            physical_column_values = []
+            physical_row_values = []
+            sequence_receipt = []
+            logical_shapes = tuple(destination.column_shapes or (
+                () for _value in destination.column_value_ids
+            ))
+            for column, (logical_column_id, logical_dtype, logical_shape,
+                         mutation_value) in enumerate(zip(
+                destination.column_value_ids,
+                destination.column_dtypes,
+                logical_shapes,
+                mutation_values,
+                strict=True,
+            )):
+                tagged = tag_columns.get(int(column))
+                if tagged is None:
+                    physical_column_ids.append(int(logical_column_id))
+                    physical_column_dtypes.append(str(logical_dtype))
+                    physical_column_shapes.append(tuple(logical_shape))
+                    physical_column_values.append(
+                        self.sequence_storage_values[
+                            int(destination.sequence_id)
+                        ][int(column)]
+                    )
+                    physical_row_values.append(mutation_value)
+                    continue
+                tag_column, target_id, fact = tagged
+                authored_value_id = int(
+                    mutation.argument_value_ids[int(column)]
+                )
+                tag_value = self.native_type_tag_for(
+                    authored_value_id, fact,
+                )
+                if tag_value is None:
+                    raise ValueError(
+                        "authored heterogeneous sequence row has no exact "
+                        "native type evidence: "
+                        f"sequence={int(destination.sequence_id)}, "
+                        f"column={int(column)}, value={authored_value_id}"
+                    )
+                arm_values = self._native_value_union_row_payloads(
+                    authored_value_id, mutation_value, fact,
+                )
+                arms = union_columns[int(column)]
+                if len(arms) != len(arm_values):
+                    raise ValueError(
+                        "heterogeneous sequence writer arm count differs "
+                        "from its authoritative ABI"
+                    )
+                for (arm, arm_column), arm_value in zip(
+                    arms, arm_values, strict=True,
+                ):
+                    physical_column_ids.append(int(arm_column.id))
+                    physical_column_dtypes.append(str(arm.dtype or "unknown"))
+                    physical_column_shapes.append(tuple(arm.shape or ()))
+                    physical_column_values.append(arm_column)
+                    physical_row_values.append(arm_value)
+                physical_column_ids.append(int(tag_column.id))
+                physical_column_dtypes.append("int64")
+                physical_column_shapes.append(())
+                physical_column_values.append(tag_column)
+                physical_row_values.append(tag_value)
+                sequence_receipt.append((
+                    int(column),
+                    tuple((str(arm.identity), int(arm_column.id),
+                           int(arm_value.id)) for (arm, arm_column), arm_value
+                          in zip(arms, arm_values, strict=True)),
+                    int(tag_column.id), int(tag_value.id), int(target_id),
+                ))
+            if tag_columns:
+                physical_destination = replace(
+                    destination,
+                    column_value_ids=tuple(physical_column_ids),
+                    column_dtypes=tuple(physical_column_dtypes),
+                    column_shapes=tuple(physical_column_shapes),
+                )
+                native_type_tag_sequence_receipt = tuple(sequence_receipt)
+            function_name = self._sequence_helper_name(
+                int(destination.sequence_id), str(operation),
+            )
+            lowering = (
+                lower_sequence_append(
+                    physical_destination,
+                    function_name=function_name,
+                    first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+                )
+                if operation == "append"
+                else lower_sequence_add(
+                    physical_destination,
+                    function_name=function_name,
+                    first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+                )
+            )
+            destination_storage = self.sequence_storage_values[
+                destination.sequence_id
+            ]
+            payload_width = len(destination.column_value_ids)
             call_arguments = (
-                *self.sequence_storage_values[destination.sequence_id],
-                *mutation_values,
+                *(physical_column_values if tag_columns else
+                  destination_storage[:payload_width]),
+                *destination_storage[payload_width:],
+                *(physical_row_values if tag_columns else mutation_values),
             )
         elif operation in {"extend", "replace"}:
             if mutation.argument_kind == "generator":
@@ -10235,21 +12227,203 @@ class _ControlSSABuilder(TiledObject):
                         "", "None", "unknown",
                     }:
                         value.dtype = str(dtype)
+            destination_tags = self.sequence_native_type_tag_columns(
+                int(destination.sequence_id)
+            )
+            source_tags = self.sequence_native_type_tag_columns(
+                int(source.sequence_id)
+            )
+            if set(destination_tags) != set(source_tags):
+                raise ValueError(
+                    "sequence copy changes its declared heterogeneous "
+                    "columns: "
+                    f"destination={tuple(sorted(destination_tags))!r}, "
+                    f"source={tuple(sorted(source_tags))!r}"
+                )
+            destination_union_columns = (
+                self.sequence_native_value_union_columns(
+                    int(destination.sequence_id)
+                ) if destination_tags else {}
+            )
+            source_union_columns = (
+                self.sequence_native_value_union_columns(
+                    int(source.sequence_id)
+                ) if source_tags else {}
+            )
+            column_value_maps = {}
+            for column in sorted(destination_tags):
+                destination_fact = destination_tags[column][2]
+                source_fact = source_tags[column][2]
+                destination_alternatives = tuple(
+                    destination_fact.get("alternatives", ())
+                    if isinstance(destination_fact, Mapping)
+                    else getattr(destination_fact, "alternatives", ())
+                )
+                destination_table = dict(
+                    destination_fact.get("tags", ())
+                    if isinstance(destination_fact, Mapping)
+                    else getattr(destination_fact, "tags", ())
+                )
+                source_alternatives = tuple(
+                    source_fact.get("alternatives", ())
+                    if isinstance(source_fact, Mapping)
+                    else getattr(source_fact, "alternatives", ())
+                )
+                source_table = dict(
+                    source_fact.get("tags", ())
+                    if isinstance(source_fact, Mapping)
+                    else getattr(source_fact, "tags", ())
+                )
+                if (
+                    source_alternatives != destination_alternatives
+                    or source_table != destination_table
+                ):
+                    raise ValueError(
+                        "sequence copy requires the authoritative linked "
+                        "native union table on both sides; no independently "
+                        "minted dense tag or implicit subset remap is "
+                        f"admissible in column {int(column)}: "
+                        f"source={source_alternatives!r}, "
+                        f"destination={destination_alternatives!r}"
+                    )
+            physical_destination = destination
+            physical_source = source
+            destination_physical_columns = []
+            source_physical_columns = []
+            physical_dtypes = []
+            physical_shapes = []
+            receipt = []
+            destination_shapes = tuple(destination.column_shapes or (
+                () for _value in destination.column_value_ids
+            ))
+            source_shapes = tuple(source.column_shapes or (
+                () for _value in source.column_value_ids
+            ))
+            for column, (
+                destination_column_id, source_column_id,
+                destination_dtype, source_dtype,
+                destination_shape, source_shape,
+            ) in enumerate(zip(
+                destination.column_value_ids, source.column_value_ids,
+                destination.column_dtypes, source.column_dtypes,
+                destination_shapes, source_shapes,
+                strict=True,
+            )):
+                if column not in destination_tags:
+                    if (
+                        str(destination_dtype) != str(source_dtype)
+                        or tuple(destination_shape) != tuple(source_shape)
+                    ):
+                        raise ValueError(
+                            "sequence copy changes a physical column ABI: "
+                            f"column={column}"
+                        )
+                    destination_physical_columns.append(
+                        self.sequence_storage_values[
+                            int(destination.sequence_id)
+                        ][column]
+                    )
+                    source_physical_columns.append(
+                        self.sequence_storage_values[
+                            int(source.sequence_id)
+                        ][column]
+                    )
+                    physical_dtypes.append(str(destination_dtype))
+                    physical_shapes.append(tuple(destination_shape))
+                    continue
+                destination_arms = destination_union_columns[column]
+                source_arms = source_union_columns[column]
+                if len(destination_arms) != len(source_arms):
+                    raise ValueError(
+                        "sequence copy changes its physical union arm count"
+                    )
+                arm_receipt = []
+                for (destination_arm, destination_column), (
+                    source_arm, source_column,
+                ) in zip(destination_arms, source_arms, strict=True):
+                    destination_state = (
+                        str(destination_arm.identity),
+                        str(destination_arm.storage),
+                        str(destination_arm.dtype or "unknown"),
+                        tuple(destination_arm.shape or ()),
+                        tuple(destination_arm.storage_identity),
+                    )
+                    source_state = (
+                        str(source_arm.identity),
+                        str(source_arm.storage),
+                        str(source_arm.dtype or "unknown"),
+                        tuple(source_arm.shape or ()),
+                        tuple(source_arm.storage_identity),
+                    )
+                    if destination_state != source_state:
+                        raise ValueError(
+                            "sequence copy changes an exact value-union arm "
+                            f"ABI: column={column}, "
+                            f"destination={destination_state!r}, "
+                            f"source={source_state!r}"
+                        )
+                    destination_physical_columns.append(destination_column)
+                    source_physical_columns.append(source_column)
+                    physical_dtypes.append(destination_state[2])
+                    physical_shapes.append(destination_state[3])
+                    arm_receipt.append((
+                        destination_state[0], int(destination_column.id),
+                        int(source_column.id),
+                    ))
+                destination_tag = destination_tags[column][0]
+                source_tag = source_tags[column][0]
+                destination_physical_columns.append(destination_tag)
+                source_physical_columns.append(source_tag)
+                physical_dtypes.append("int64")
+                physical_shapes.append(())
+                receipt.append((
+                    int(column), tuple(arm_receipt),
+                    int(destination_tag.id), int(source_tag.id), (),
+                ))
+            if destination_tags:
+                physical_destination = replace(
+                    destination,
+                    column_value_ids=tuple(
+                        int(value.id) for value in destination_physical_columns
+                    ),
+                    column_dtypes=tuple(physical_dtypes),
+                    column_shapes=tuple(physical_shapes),
+                )
+                physical_source = replace(
+                    source,
+                    column_value_ids=tuple(
+                        int(value.id) for value in source_physical_columns
+                    ),
+                    column_dtypes=tuple(physical_dtypes),
+                    column_shapes=tuple(physical_shapes),
+                )
+                native_type_tag_sequence_receipt = tuple(receipt)
             function_name = self._sequence_helper_name(
                 int(destination.sequence_id), str(operation),
                 int(source.sequence_id),
             )
             lowering = (lower_sequence_replace if operation == "replace" else lower_sequence_extend)(
-                destination,
-                source,
+                physical_destination,
+                physical_source,
                 function_name=function_name,
                 first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+                column_value_maps=column_value_maps,
             )
+            destination_storage = self.sequence_storage_values[
+                destination.sequence_id
+            ]
+            source_storage = self.sequence_storage_values[source.sequence_id]
+            destination_width = len(destination.column_value_ids)
+            source_width = len(source.column_value_ids)
             call_arguments = tuple({
                 value.id: value
                 for value in (
-                    *self.sequence_storage_values[destination.sequence_id],
-                    *self.sequence_storage_values[source.sequence_id],
+                    *(destination_physical_columns if destination_tags else
+                      destination_storage[:destination_width]),
+                    *destination_storage[destination_width:],
+                    *(source_physical_columns if source_tags else
+                      source_storage[:source_width]),
+                    *source_storage[source_width:],
                 )
             }.values())
         else:
@@ -10286,6 +12460,7 @@ class _ControlSSABuilder(TiledObject):
                 "ssa_sequence_operation": operation,
                 "sequence_id": int(destination.sequence_id),
                 "source_effect_node_id": int(mutation.effect_node_id),
+                "native_type_tag_sequence": native_type_tag_sequence_receipt,
                 **({
                     "ssa_deferred_record_row": deferred_record_row,
                 } if deferred_record_row is not None else {}),
@@ -10846,6 +13021,12 @@ class _ControlSSABuilder(TiledObject):
                     "binding": "conditional_result",
                 },
             )
+            self.merge_native_type_tags(
+                int(result_id), merged,
+                (int(_true_id), int(_false_id)),
+                (true_exit.name, false_exit.name),
+                binding="conditional_native_type_tag",
+            )
         for (
             true_value_id, false_value_id, initial_value_id, merged_value_id,
         ), field_cells in zip(conditional.carried_aliases, carried_field_cells):
@@ -10922,8 +13103,14 @@ class _ControlSSABuilder(TiledObject):
                     "preserved_name_binding_value_ids": tuple(sorted(preserved_binding_sources)),
                     **({"preserved_name_binding_scope": self.lexical_read_scope,
                         "preserved_name_binding_merge_id": int(merged_value_id)}
-                       if preserved_binding_sources else {}),
+                    if preserved_binding_sources else {}),
                 },
+            )
+            merged_type_tag = self.merge_native_type_tags(
+                int(merged_value_id), merged,
+                (int(true_value_id), int(false_value_id)),
+                (true_exit.name, false_exit.name),
+                binding="conditional_carried_native_type_tag",
             )
             # The merge IS the reducer's MERGED cell: publish the Phi as that
             # cell's SSA version, derived from the two arm sources (each arm's
@@ -10986,6 +13173,11 @@ class _ControlSSABuilder(TiledObject):
             self._rebind_view(
                 published, BindingKind.CONDITIONAL_MERGE, merged, conditional_cell,
             )
+            if merged_type_tag is not None:
+                for published_id in published:
+                    self.native_value_type_tags[int(published_id)] = (
+                        merged_type_tag
+                    )
         for _true_id, _false_id, initial_id, merged_id in (
             conditional.carried_sequence_aliases
         ):
@@ -11644,6 +13836,19 @@ class _ControlSSABuilder(TiledObject):
                 },
             )
             carried_phis[entry] = self.current.instrs[-1]
+            type_source_id = next((
+                value_id for value_id in (int(initial_id), int(updated_id))
+                if value_id in self.native_value_type_abi
+            ), int(initial_id))
+            carried_tag = self.merge_native_type_tags(
+                type_source_id, current_value,
+                (int(initial_value.id), int(updated_value.id)),
+                (preheader.name, latch.name),
+                binding="loop_carried_native_type_tag",
+            )
+            if carried_tag is not None:
+                self.native_value_type_tags[int(initial_id)] = carried_tag
+                self.native_value_type_tags[int(updated_id)] = carried_tag
             if initial_id not in bound_initial_ids:
                 # LOOP_HEADER: the header Phi is the body's value of the
                 # initial; its cause is the Phi cell and the loop construct.
@@ -11872,6 +14077,14 @@ class _ControlSSABuilder(TiledObject):
                     target_dtype = (
                         None if target_meta is None else str(target_meta.dtype)
                     )
+                    if target_dtype is None and int(column_projection) > 0:
+                        # A destructured Python row column with no numerical
+                        # descriptor is still a concrete value transport: an
+                        # opaque reference arena.  This is the exact fallback
+                        # representation for arbitrary objects, not a guessed
+                        # scalar dtype.  Column zero keeps the iterable's own
+                        # identity; later physical columns need their own ABI.
+                        target_dtype = "opaque_ref"
                     target_shape = (
                         () if target_meta is None
                         else tuple(map(int, target_meta.shape or ()))
@@ -11965,6 +14178,20 @@ class _ControlSSABuilder(TiledObject):
                             "projection": projection,
                         },
                     )
+                    type_tag = self.projected_native_type_tag(
+                        int(iterable_id), int(column_projection),
+                        projection_index, int(target_id),
+                    )
+                    if type_tag is not None:
+                        scalar_value.accounting = {
+                            **dict(scalar_value.accounting or {}),
+                            "native_type_tag_value_id": int(type_tag.id),
+                            "native_type_alternatives": tuple(
+                                type_tag.accounting.get(
+                                    "native_type_alternatives", ()
+                                )
+                            ),
+                        }
                     self.bind_nested_row(
                         handle_source,
                         projection_index,
@@ -12005,7 +14232,7 @@ class _ControlSSABuilder(TiledObject):
                     },
                 )
                 continue
-            self.indexed_load(
+            projected_value = self.indexed_load(
                 source,
                 projection_index,
                 target_id,
@@ -12017,6 +14244,20 @@ class _ControlSSABuilder(TiledObject):
                 },
                 claim_provisional_definition=True,
             )
+            type_tag = self.projected_native_type_tag(
+                int(iterable_id), int(column_projection),
+                projection_index, int(target_id),
+            )
+            if type_tag is not None:
+                projected_value.accounting = {
+                    **dict(projected_value.accounting or {}),
+                    "native_type_tag_value_id": int(type_tag.id),
+                    "native_type_alternatives": tuple(
+                        type_tag.accounting.get(
+                            "native_type_alternatives", ()
+                        )
+                    ),
+                }
         for base_id, column, result_id, induction_name in (
             self.nested_row_projections
         ):
@@ -12588,6 +14829,19 @@ class _ControlSSABuilder(TiledObject):
                 },
             )
             carried_phis[entry] = self.current.instrs[-1]
+            type_source_id = next((
+                value_id for value_id in (int(initial_id), int(updated_id))
+                if value_id in self.native_value_type_abi
+            ), int(initial_id))
+            carried_tag = self.merge_native_type_tags(
+                type_source_id, current,
+                (int(initial.id), int(updated.id)),
+                (preheader.name, latch.name),
+                binding="while_carried_native_type_tag",
+            )
+            if carried_tag is not None:
+                self.native_value_type_tags[int(initial_id)] = carried_tag
+                self.native_value_type_tags[int(updated_id)] = carried_tag
             if initial_id not in bound_initial_ids:
                 # LOOP_HEADER: the header Phi is the body's value.
                 self._bind(
@@ -13157,6 +15411,17 @@ class _ControlSSABuilder(TiledObject):
                 "initial_value_id": initial_id,
             },
         )
+        merged_type_tag = self.merge_native_type_tags(
+            int(merged_id), merged,
+            tuple(int(value.id) for value in incoming_values),
+            tuple(block.name for block, _ in reaching),
+            binding="state_carried_native_type_tag",
+        )
+        if merged_type_tag is not None:
+            for value_id in (
+                int(merged_id), initial_id, int(default_id), *map(int, arm_ids),
+            ):
+                self.native_value_type_tags[int(value_id)] = merged_type_tag
         protected_sources = frozenset().union(
             *self.protected_loop_alias_sources
         ) if self.protected_loop_alias_sources else frozenset()
@@ -13570,6 +15835,153 @@ class _ControlSSABuilder(TiledObject):
             logical_to_physical_return_slot = {
                 int(slot): int(slot) for slot in range(len(returned))
             }
+        native_type_return_slots = []
+        native_value_union_return_layouts = []
+        typed_logical_returns = []
+        for logical_slot, physical_slot in sorted(
+            logical_to_physical_return_slot.items()
+        ):
+            if physical_slot >= len(returned):
+                continue
+            declared_id = (
+                int(named_returns[logical_slot][1])
+                if logical_slot < len(named_returns) else
+                int(returned[physical_slot].id)
+            )
+            type_fact = self.native_value_type_abi.get(declared_id)
+            alternatives = tuple(
+                type_fact.get("alternatives", ())
+                if isinstance(type_fact, Mapping)
+                else getattr(type_fact, "alternatives", ())
+            )
+            if len(alternatives) > 1:
+                typed_logical_returns.append((
+                    int(logical_slot), int(physical_slot),
+                    int(declared_id), type_fact,
+                ))
+        if typed_logical_returns:
+            typed_by_physical = {
+                int(physical_slot): (
+                    int(logical_slot), int(declared_id), type_fact,
+                )
+                for logical_slot, physical_slot, declared_id, type_fact
+                in typed_logical_returns
+            }
+
+            def union_result_frame(
+                source_id: int, source_value: SSAValue, type_fact: object,
+            ) -> tuple[tuple[SSAValue, ...], tuple[tuple, ...]]:
+                physical = tuple(
+                    type_fact.get("physical_alternatives", ())
+                    if isinstance(type_fact, Mapping)
+                    else getattr(type_fact, "physical_alternatives", ())
+                )
+                payloads = self._native_value_union_row_payloads(
+                    int(source_id), source_value, type_fact,
+                )
+                payload_iter = iter(payloads)
+                values = []
+                roles = []
+                sequence_arms = self.native_value_union_sequence_ids.get(
+                    int(source_id), {}
+                )
+                for arm in physical:
+                    identity = str(arm.identity)
+                    storage = str(arm.storage)
+                    if storage == "none":
+                        continue
+                    if storage == "sequence":
+                        sequence_id = sequence_arms.get(identity)
+                        if sequence_id is None:
+                            raise ValueError(
+                                "native union result sequence arm has no "
+                                "exact descriptor-backed payload: "
+                                f"value={int(source_id)}, arm={identity!r}"
+                            )
+                        arm_values = self._native_union_sequence_values(
+                            int(sequence_id)
+                        )
+                    elif storage in {"record", "reference"}:
+                        raise ValueError(
+                            "native union result aggregate/reference arm "
+                            "requires its exact descriptor-backed frame: "
+                            f"value={int(source_id)}, arm={identity!r}"
+                        )
+                    else:
+                        arm_values = (next(payload_iter),)
+                    for position, arm_value in enumerate(arm_values):
+                        values.append(arm_value)
+                        roles.append(("alternative", identity, position))
+                tag = self.native_type_tag_for(int(source_id), type_fact)
+                if tag is None:
+                    raise ValueError(
+                        "native union result has no exact type tag: "
+                        f"value={int(source_id)}"
+                    )
+                values.append(tag)
+                roles.append(("tag",))
+                return tuple(values), tuple(roles)
+
+            expanded_returns = []
+            expanded_mapping = {}
+            layouts_by_logical = {}
+            for physical_slot, value in enumerate(returned):
+                typed = typed_by_physical.get(int(physical_slot))
+                if typed is None:
+                    expanded_returns.append(value)
+                    continue
+                logical_slot, declared_id, type_fact = typed
+                expanded_mapping[int(logical_slot)] = len(expanded_returns)
+                frame, roles = union_result_frame(
+                    int(declared_id), value, type_fact,
+                )
+                start = len(expanded_returns)
+                expanded_returns.extend(frame)
+                layouts_by_logical[int(logical_slot)] = (
+                    int(declared_id), tuple(
+                        (role, start + offset)
+                        for offset, role in enumerate(roles)
+                    ),
+                )
+            for logical_slot, physical_slot in (
+                logical_to_physical_return_slot.items()
+            ):
+                expanded_mapping.setdefault(
+                    int(logical_slot), int(physical_slot)
+                )
+            returned = expanded_returns
+            logical_to_physical_return_slot = expanded_mapping
+            native_value_union_return_layouts = [
+                layouts_by_logical[logical_slot]
+                for logical_slot in sorted(layouts_by_logical)
+            ]
+            if self.function_return_edges:
+                expanded_edges = []
+                for block, values in self.function_return_edges:
+                    prior = self.current
+                    self.current = block
+                    terminator = (
+                        block.instrs.pop()
+                        if block.instrs and block.instrs[-1].op
+                        in {Handler.Br.value, Handler.CondBr.value}
+                        else None
+                    )
+                    physical_values = []
+                    for physical_slot, value in enumerate(values):
+                        typed = typed_by_physical.get(int(physical_slot))
+                        if typed is None or value is None:
+                            physical_values.append(value)
+                            continue
+                        _logical_slot, declared_id, type_fact = typed
+                        frame, _roles = union_result_frame(
+                            int(value.id), value, type_fact,
+                        )
+                        physical_values.extend(frame)
+                    if terminator is not None:
+                        block.instrs.append(terminator)
+                    self.current = prior
+                    expanded_edges.append((block, tuple(physical_values)))
+                self.function_return_edges = expanded_edges
         fallthrough_open = not self.current.successors and (
             not self.current.instrs
             or self.current.instrs[-1].op
@@ -13692,6 +16104,18 @@ class _ControlSSABuilder(TiledObject):
             for semantic_payload_id, payload_slot, presence_slot
             in optional_glyph_return_slots
         ]
+        aggregate_return_layouts = dict(optional_glyph_return_layouts)
+        for semantic_payload_id, payload_slot, tag_slot in (
+            native_type_return_slots
+        ):
+            physical = tuple(dict.fromkeys((
+                *aggregate_return_layouts.get(
+                    int(semantic_payload_id), ()
+                ),
+                int(returned[payload_slot].id),
+                int(returned[tag_slot].id),
+            )))
+            aggregate_return_layouts[int(semantic_payload_id)] = physical
         page_metadata = self._finish_pages(
             tuple(named_returns), tuple(parameter_value_names), tuple(returned),
         )
@@ -13736,6 +16160,23 @@ class _ControlSSABuilder(TiledObject):
                     "parameter_names": page_metadata["parameter_names"],
                     "validation_contracts": tuple(self.validation_contracts),
                     "native_object_collections": tuple(self.native_object_collections.values()),
+                    "native_value_type_abi": dict(self.native_value_type_abi),
+                    "native_value_type_tags": tuple(
+                        (int(value_id), int(tag.id))
+                        for value_id, tag in sorted(
+                            self.native_value_type_tags.items()
+                        )
+                        if int(value_id) in self.native_value_type_abi
+                    ),
+                    "native_value_type_tests": tuple(
+                        self.native_value_type_tests.values()
+                    ),
+                    "native_type_return_layouts": tuple(
+                        native_type_return_slots
+                    ),
+                    "native_value_union_return_layouts": tuple(
+                        native_value_union_return_layouts
+                    ),
                     "control_identity_receipts": tuple(dict.fromkeys(
                         self.control_identity_receipts
                     )),
@@ -13745,8 +16186,9 @@ class _ControlSSABuilder(TiledObject):
                     "control_ir": True,
                     "deployment_regions": tuple(deployment_regions),
                     "sequence_table": sequence_table,
+                    "value_union_table": self.value_union_table,
                     "aggregate_return_layouts": tuple(
-                        optional_glyph_return_layouts
+                        aggregate_return_layouts.items()
                     ),
                     "sequence_static_capacity_bounds": tuple(sorted(
                         self.static_sequence_capacities.items()
@@ -13761,6 +16203,12 @@ class _ControlSSABuilder(TiledObject):
                         ] + [
                             int(value.id)
                             for value in self.variant_row_values.values()
+                        ] + [
+                            int(value.id)
+                            for value in self.variant_type_tag_columns.values()
+                        ] + [
+                            int(value.id)
+                            for value in self.variant_type_payload_columns.values()
                         ] + [
                         int(value_id)
                         for descriptor in self.sequence_descriptors.values()
@@ -14301,7 +16749,9 @@ def lower_control_program_to_ssa(
         int, tuple[tuple[int, str, int], ...]
     ] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
-    sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
+    sequence_memberships: tuple[
+        tuple[int, int | tuple[int, ...], int, bool], ...
+    ] = (),
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
     lexical_table_lookup_result_ids: tuple[int, ...] = (),
     table_lookup_defaults: dict[int, int | float] | None = None,
@@ -14331,6 +16781,8 @@ def lower_control_program_to_ssa(
     native_object_value_ids: Iterable[int] = (),
     native_object_collections: Mapping[int, Mapping[str, Any]] | None = None,
     native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+    native_value_type_abi: Mapping[int, Any] | None = None,
+    native_value_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
     builder = _ControlSSABuilder(
         program,
@@ -14384,6 +16836,8 @@ def lower_control_program_to_ssa(
         native_object_value_ids=native_object_value_ids,
         native_object_collections=native_object_collections,
         native_object_type_tests=native_object_type_tests,
+        native_value_type_abi=native_value_type_abi,
+        native_value_type_tests=native_value_type_tests,
     )
     builder.lower(program.root)
     for kind, arguments in builder.table_epilogue_operations:
@@ -16148,6 +18602,7 @@ def _schedule_loop_callsites(
                 last_access: dict[int, int] = {}
                 last_write: dict[int, int] = {}
                 last_terminal = None
+                terminal_guard_candidates: list[tuple[int, int]] = []
                 for position, child in enumerate(run):
                     reads, writes = sequence_accesses(child)
                     for arena in reads:
@@ -16186,7 +18641,36 @@ def _schedule_loop_callsites(
                             and int(match.group(1)) in placed_callsites
                             for line in child.lines
                         ):
-                            require(position, last_terminal, ("terminal_guard",))
+                            terminal_guard_candidates.append((
+                                position, last_terminal,
+                            ))
+
+                def depends_on(current: int, prerequisite: int) -> bool:
+                    """Whether exact value/effect edges already order these."""
+
+                    pending = list(dependencies[current])
+                    visited: set[int] = set()
+                    while pending:
+                        candidate = pending.pop()
+                        if candidate == prerequisite:
+                            return True
+                        if candidate in visited:
+                            continue
+                        visited.add(candidate)
+                        pending.extend(dependencies[candidate])
+                    return False
+
+                for position, terminal in terminal_guard_candidates:
+                    # ``if self.excludes(node): return False`` retained its
+                    # predicate PlanCall marker after the ConditionalBlock.
+                    # The call is nevertheless in the guard's exact value
+                    # dependency cone, so it is evaluation of that guard,
+                    # not fallthrough work that must remain after its return.
+                    # Preserve the terminal edge for every call outside that
+                    # cone; never add its reverse on top of an authoritative
+                    # value/effect path.
+                    if not depends_on(terminal, position):
+                        require(position, terminal, ("terminal_guard",))
 
                 placed, active = set(), set()
 
@@ -16919,7 +19403,9 @@ def lower_control_sections_to_ssa(
     ] | None = None,
     callsite_projection_ids: Mapping[int, tuple[int, ...]] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
-    sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
+    sequence_memberships: tuple[
+        tuple[int, int | tuple[int, ...], int, bool], ...
+    ] = (),
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
     table_lookup_loop_owners: Mapping[int, int] | None = None,
     table_lookup_defaults: dict[int, int | float] | None = None,
@@ -16969,6 +19455,8 @@ def lower_control_sections_to_ssa(
     native_object_value_ids: Iterable[int] = (),
     native_object_collections: Mapping[int, Mapping[str, Any]] | None = None,
     native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+    native_value_type_abi: Mapping[int, Any] | None = None,
+    native_value_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> tuple[
     IRModule,
     tuple[SSALoweringShortfall, ...],
@@ -19558,6 +22046,8 @@ def lower_control_sections_to_ssa(
         native_object_value_ids=native_object_value_ids,
         native_object_collections=native_object_collections,
         native_object_type_tests=native_object_type_tests,
+        native_value_type_abi=native_value_type_abi,
+        native_value_type_tests=native_value_type_tests,
     )
     report(
         f"control lowering complete; blocks={len(control_function.blocks)} "
@@ -19936,14 +22426,54 @@ def lower_control_sections_to_ssa(
                     writable=bool(declared_mutability.get(name, False)),
                 ))
         if record_fields:
-            record_tables[control_function.name] = SSARecordTable({
-                int(self_value_id if self_value_id is not None else max(graph_value_ids) + 1):
-                    SSARecordDescriptor(
-                        int(self_value_id if self_value_id is not None else max(graph_value_ids) + 1),
-                        record_identity,
-                        tuple(record_fields),
-                    )
-            }, owner=control_function.name)
+            from .concordance_declarations import CLASS_FIELD_DECLARATION
+            from .identity_concordance import current_identity_book
+
+            record_id = int(
+                self_value_id
+                if self_value_id is not None
+                else max(graph_value_ids) + 1
+            )
+            descriptor = SSARecordDescriptor(
+                record_id, record_identity, tuple(record_fields),
+            )
+            book = current_identity_book()
+            declared_record = next((
+                dict(receipt)
+                for receipt in dict(parameter_record_abi or {}).values()
+                if str(receipt.get("identity") or "")
+                == str(record_identity or "")
+            ), {})
+            schema_row = declared_record.get("source_record_view_schema")
+            declaration_cells = tuple(
+                book.latest_ref(
+                    CLASS_FIELD_DECLARATION,
+                    (*tuple(schema_row), str(field.name)),
+                )
+                for field in record_fields
+                if isinstance(schema_row, (tuple, list))
+                and len(schema_row) == 2
+            )
+            value_scope = control_function.metadata.get(
+                "tensor_shape_concordance_scope"
+            )
+            member_cells = tuple(
+                book.latest_ref(SSA_VALUE, (str(value_scope), int(value_id)))
+                for field in record_fields
+                for value_id in field.value_ids
+                if value_scope is not None
+            )
+            sources = tuple(dict.fromkeys(
+                cell for cell in (*declaration_cells, *member_cells)
+                if cell is not None
+            ))
+            table = SSARecordTable(owner=control_function.name)
+            table.register(
+                descriptor,
+                sources=sources,
+                stage=CONTROL_SSA_FINISH,
+            )
+            record_tables[control_function.name] = table
     from ..transmogrifier.ssa import (
         SSAReferenceDescriptor,
         SSAReferenceKind,
@@ -20119,6 +22649,12 @@ def lower_control_sections_to_ssa(
         },
         sequence_tables=sequence_tables,
         record_tables=record_tables,
+        value_union_tables={
+            name: table
+            for name, function in functions.items()
+            for table in (function.metadata.get("value_union_table"),)
+            if table is not None and dict(table.unions)
+        },
         reference_tables=(
             {control_function.name: reference_table}
             if reference_table.references else {}
@@ -20202,7 +22738,8 @@ def link_verified_source_region_integrals(
 
     scoped_tables = (
         "recursion_table", "deployment_table", "tensor_tables",
-        "sequence_tables", "record_tables", "reference_tables", "call_table",
+        "sequence_tables", "record_tables", "value_union_tables",
+        "reference_tables", "call_table",
     )
     for function_name, current in tuple(module.functions.items()):
         provenance = dict(current.metadata.get("source_region_integral") or {})
@@ -20679,6 +23216,7 @@ def merge_repository_ssa_modules(
         tensor_tables=merge_named("tensor_tables"),
         sequence_tables=merge_named("sequence_tables"),
         record_tables=merge_named("record_tables"),
+        value_union_tables=merge_named("value_union_tables"),
         reference_tables=merge_named("reference_tables"),
         call_table=merge_named("call_table"),
         machine_control_table=SSAMachineControlTable(tuple(

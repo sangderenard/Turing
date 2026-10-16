@@ -1,3 +1,21 @@
+2026-10-16 MEMORY GRAPH TAKEOVER + PROVENANCE BLOCKERS (CURRENT):
+See docs/compiler_convergence/17_memory_graph_bootstrap_repairs_continuation.md.
+The public source compiler now owns canonical topology through the independent
+BitTensorMemoryGraph NetworkX-shaped protocol; relabel, extraction, scoped
+catalogues and checkpoint rehydration preserve MG/G pairing without embedding
+an nx.DiGraph. Explicitly linked NetworkX remains a valid target, not a hidden
+self-hosting store. Consecutive materialized runs have confirmed the unit
+026/031 and unit 002/028/043 repairs. The latest run had no partials and advanced
+unit 045 through normalization to SSA. Its two SSA blockers are repaired: a
+rehydrated glyph-vocabulary reference is now validated by its exact active-book
+key rather than Python Page object identity, and `_replace_cells` retains its
+authored `IdentityPage` receiver so `page.name` uses the existing resident
+string-token path. All declared source/glyph pages now have spill lifecycle
+classifications. Final combined focused gate: 345 passed. Memory-graph storage
+authority is established, but compression relative to the prior 1.68 GB
+nonmaterialized observation is not. The full bootstrap remains unverified; run
+a fresh provenance bootstrap next.
+
 2026-10-16 FAILURE NEIGHBORHOODS + PURSUIT DEDUPE + BATCH SORT (CURRENT):
 See docs/compiler_convergence/16_failure_neighborhood_dedupe_continuation.md.
 Refused posts now carry a diffused local neighborhood of the concordance in

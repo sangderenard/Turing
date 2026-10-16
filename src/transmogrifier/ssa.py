@@ -795,6 +795,250 @@ class SSARecordTable:
         return descriptor
 
 
+def value_union_member_claims(
+    descriptor: "SSAValueUnionDescriptor | None",
+) -> dict[int, set]:
+    claims: dict[int, set] = {}
+    if descriptor is None:
+        return claims
+    union_id = int(descriptor.union_id)
+    claims.setdefault(int(descriptor.tag_value_id), set()).add(
+        (union_id, "tag", ("tag",))
+    )
+    for arm in descriptor.alternatives:
+        for position, value_id in enumerate(arm.value_ids):
+            claims.setdefault(int(value_id), set()).add(
+                (union_id, arm.name, ("value", position))
+            )
+        if arm.sequence_id is not None:
+            claims.setdefault(int(arm.sequence_id), set()).add(
+                (union_id, arm.name, ("sequence",))
+            )
+        if arm.record_id is not None:
+            claims.setdefault(int(arm.record_id), set()).add(
+                (union_id, arm.name, ("record",))
+            )
+    return claims
+
+
+class SSAValueUnionTable:
+    """Function-scoped physical rows for semantic value unions."""
+
+    def __init__(
+        self,
+        unions: Dict[int, SSAValueUnionDescriptor] | None = None,
+        *,
+        owner: Any = None,
+        book: Any = None,
+    ) -> None:
+        from ..compiler.identity_concordance import current_identity_book
+
+        self.book = current_identity_book() if book is None else book
+        self.owner = (
+            owner if isinstance(owner, tuple)
+            else _mint_table_owner(self.book, owner)
+        )
+        member_page = self.book.page("value_union_member")
+        self.unions = _BookRows(
+            self.book, "value_union_descriptor", self.owner,
+            lambda old, new, cell=None, stage=None: _revise_member_claims(
+                member_page, self.owner,
+                value_union_member_claims(old),
+                value_union_member_claims(new),
+                cell, stage,
+            ),
+        )
+        for union_id, descriptor in dict(unions or {}).items():
+            self.unions[int(union_id)] = descriptor
+
+    def register(
+        self,
+        descriptor: SSAValueUnionDescriptor,
+        *,
+        sources: tuple = (),
+        stage: Any = None,
+    ) -> SSAValueUnionDescriptor:
+        existing = self.unions.get(int(descriptor.union_id))
+        if existing is not None and existing != descriptor:
+            raise ValueError(
+                f"conflicting SSA value-union descriptor {descriptor.union_id}: "
+                f"{existing!r} != {descriptor!r}"
+            )
+        if existing is None:
+            if sources:
+                self.unions.assign(
+                    int(descriptor.union_id), descriptor,
+                    sources=tuple(sources), stage=stage,
+                )
+            else:
+                self.unions[int(descriptor.union_id)] = descriptor
+        return descriptor
+
+    def by_id(self, union_id: int) -> SSAValueUnionDescriptor | None:
+        return self.unions.get(int(union_id))
+
+    def member_claims(self, value_id: int) -> tuple:
+        return tuple(
+            self.book.page("value_union_member").latest(
+                (self.owner, int(value_id))
+            ) or ()
+        )
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SSAValueUnionTable) and dict(
+            self.unions
+        ) == dict(other.unions)
+
+    def __deepcopy__(self, memo: dict) -> "SSAValueUnionTable":
+        return SSAValueUnionTable(
+            dict(self.unions), owner=self.owner[0], book=self.book,
+        )
+
+
+@dataclass(frozen=True)
+class SSAValueUnionFrameMember:
+    """One exact physical cell in a restorable semantic-union frame."""
+
+    alternative: str
+    role: tuple[Any, ...]
+    value_id: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "alternative", str(self.alternative))
+        object.__setattr__(self, "role", tuple(self.role))
+        object.__setattr__(self, "value_id", int(self.value_id))
+
+
+def value_union_frame_members(
+    descriptor: SSAValueUnionDescriptor,
+    *,
+    sequence_table: "SSASequenceTable | None" = None,
+    record_table: "SSARecordTable | None" = None,
+    reference_table: "SSAReferenceTable | None" = None,
+) -> tuple[SSAValueUnionFrameMember, ...]:
+    """Expand a value union into its exact native multi-cell frame.
+
+    This is the shared physical API for call frames, state generations and
+    restorable tokens.  It follows descriptor identities only; no dtype,
+    class spelling or host object is used to reconstruct an aggregate.
+    """
+
+    members = [SSAValueUnionFrameMember(
+        "", ("tag",), int(descriptor.tag_value_id),
+    )]
+    active_records: set[int] = set()
+
+    def sequence_members(alternative: str, sequence_id: int, prefix: tuple):
+        sequence = (
+            None if sequence_table is None else
+            sequence_table.by_id(int(sequence_id))
+        )
+        if sequence is None:
+            raise ValueError(
+                "value-union sequence arm has no exact descriptor: "
+                f"{alternative!r}/{int(sequence_id)}"
+            )
+        child = sequence.child_table_pool
+        values = (
+            *((int(value_id), ("column", position))
+              for position, value_id in enumerate(sequence.column_value_ids)),
+            (int(sequence.length_address_id), ("length",)),
+            (int(sequence.capacity_value_id), ("capacity",)),
+            *((int(sequence.status_address_id), ("status",))
+              if sequence.status_address_id is not None else ()),
+            *((int(sequence.live_flags_value_id), ("live_flags",))
+              if sequence.live_flags_value_id is not None else ()),
+            *((int(sequence.heap_owner_value_id), ("heap_owner",))
+              if sequence.heap_owner_value_id is not None else ()),
+            *(() if child is None else (
+                *((int(value_id), ("child", "column", position))
+                  for position, value_id in enumerate(child.column_value_ids)),
+                (int(child.length_value_id), ("child", "length")),
+                (int(child.capacity_value_id), ("child", "capacity")),
+                (int(child.row_stride_value_id), ("child", "row_stride")),
+                *((int(child.shape_value_id), ("child", "shape"))
+                  if child.shape_value_id is not None else ()),
+                *((int(child.rank_value_id), ("child", "rank"))
+                  if child.rank_value_id is not None else ()),
+                *((int(child.shape_stride_value_id),
+                   ("child", "shape_stride"))
+                  if child.shape_stride_value_id is not None else ()),
+                *((int(child.status_value_id), ("child", "status"))
+                  if child.status_value_id is not None else ()),
+                *((int(child.live_flags_value_id), ("child", "live_flags"))
+                  if child.live_flags_value_id is not None else ()),
+            )),
+        )
+        for value_id, role in values:
+            members.append(SSAValueUnionFrameMember(
+                alternative, (*prefix, *role), value_id,
+            ))
+
+    def record_members(alternative: str, record_id: int, prefix: tuple):
+        if int(record_id) in active_records:
+            raise ValueError(
+                "recursive value-union record frame requires an explicit "
+                f"reference edge: {alternative!r}/{int(record_id)}"
+            )
+        record = (
+            None if record_table is None else
+            record_table.records.get(int(record_id))
+        )
+        if record is None:
+            raise ValueError(
+                "value-union record arm has no exact descriptor: "
+                f"{alternative!r}/{int(record_id)}"
+            )
+        active_records.add(int(record_id))
+        try:
+            for field in record.fields:
+                field_prefix = (*prefix, "field", field.name)
+                if field.storage is SSARecordFieldStorage.SEQUENCE:
+                    sequence_members(
+                        alternative, int(field.sequence_id), field_prefix,
+                    )
+                elif field.storage is SSARecordFieldStorage.RECORD:
+                    record_members(
+                        alternative, int(field.record_id), field_prefix,
+                    )
+                else:
+                    for position, value_id in enumerate(field.value_ids):
+                        members.append(SSAValueUnionFrameMember(
+                            alternative,
+                            (*field_prefix, "value", int(position)),
+                            int(value_id),
+                        ))
+        finally:
+            active_records.remove(int(record_id))
+
+    for arm in descriptor.alternatives:
+        prefix = ("alternative", arm.name)
+        if arm.storage is SSAValueUnionStorage.NONE:
+            continue
+        if arm.storage is SSAValueUnionStorage.SEQUENCE:
+            sequence_members(arm.name, int(arm.sequence_id), prefix)
+        elif arm.storage is SSAValueUnionStorage.RECORD:
+            record_members(arm.name, int(arm.record_id), prefix)
+        else:
+            for position, value_id in enumerate(arm.value_ids):
+                if arm.storage is SSAValueUnionStorage.REFERENCE:
+                    reference = (
+                        None if reference_table is None else
+                        reference_table.references.get(int(value_id))
+                    )
+                    if reference is None or reference.host_resident:
+                        raise ValueError(
+                            "value-union reference arm is not an exact "
+                            "native/non-host descriptor: "
+                            f"{arm.name!r}/{int(value_id)}"
+                        )
+                members.append(SSAValueUnionFrameMember(
+                    arm.name, (*prefix, "value", int(position)),
+                    int(value_id),
+                ))
+    return tuple(members)
+
+
 # ---------------------------------------------------------------------------
 # Struct and union types: layouts recorded once, spelled per backend.
 #
@@ -1855,6 +2099,119 @@ class SSAChildTablePoolDescriptor:
         }
 
 
+class SSAValueUnionStorage(str, Enum):
+    """Physical storage used by one semantic value-union alternative."""
+
+    NONE = "none"
+    SCALAR = "scalar"
+    SPAN = "span"
+    SEQUENCE = "sequence"
+    RECORD = "record"
+    REFERENCE = "reference"
+
+
+@dataclass(frozen=True)
+class SSAValueUnionAlternative:
+    """One arm of a source-language sum value.
+
+    This is deliberately not :class:`SSAUnionDescriptor`, which is the
+    ctypes byte-layout table.  A value union follows the existing optional
+    precedent: independently stored arm cells plus an ordinary int64 tag.
+    Sequence and record arms refer to their authoritative function-scoped
+    descriptor rows instead of pretending those payloads are scalar bytes.
+    """
+
+    name: str
+    storage: SSAValueUnionStorage
+    dtype: str = ""
+    shape: tuple[int, ...] = ()
+    value_ids: tuple[int, ...] = ()
+    sequence_id: int | None = None
+    record_id: int | None = None
+    storage_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", str(self.name))
+        object.__setattr__(self, "storage", SSAValueUnionStorage(self.storage))
+        object.__setattr__(self, "dtype", str(self.dtype))
+        object.__setattr__(self, "shape", tuple(map(int, self.shape)))
+        object.__setattr__(self, "value_ids", tuple(map(int, self.value_ids)))
+        if self.sequence_id is not None:
+            object.__setattr__(self, "sequence_id", int(self.sequence_id))
+        if self.record_id is not None:
+            object.__setattr__(self, "record_id", int(self.record_id))
+        if self.storage_identity is not None:
+            object.__setattr__(self, "storage_identity", str(self.storage_identity))
+        if self.storage is SSAValueUnionStorage.NONE:
+            if self.dtype or self.shape or self.value_ids or self.sequence_id is not None or self.record_id is not None:
+                raise ValueError("None value-union arm cannot own payload storage")
+        elif self.storage is SSAValueUnionStorage.SEQUENCE:
+            if self.sequence_id is None:
+                raise ValueError("sequence value-union arm requires sequence_id")
+        elif self.storage is SSAValueUnionStorage.RECORD:
+            if self.record_id is None:
+                raise ValueError("record value-union arm requires record_id")
+        elif not self.value_ids:
+            raise ValueError(
+                f"{self.storage.value} value-union arm requires payload value ids"
+            )
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "storage": self.storage.value,
+            "dtype": self.dtype,
+            "shape": list(self.shape),
+            "value_ids": list(self.value_ids),
+            "sequence_id": self.sequence_id,
+            "record_id": self.record_id,
+            "storage_identity": self.storage_identity,
+        }
+
+
+@dataclass(frozen=True)
+class SSAValueUnionDescriptor:
+    """Function-scoped side-by-side value union and its native tag."""
+
+    union_id: int
+    identity: str
+    tag_value_id: int
+    alternatives: tuple[SSAValueUnionAlternative, ...]
+    tag_dtype: str = "int64"
+    metadata_state: str = "dynamic"
+    writable: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "union_id", int(self.union_id))
+        object.__setattr__(self, "identity", str(self.identity))
+        object.__setattr__(self, "tag_value_id", int(self.tag_value_id))
+        object.__setattr__(self, "alternatives", tuple(self.alternatives))
+        names = tuple(arm.name for arm in self.alternatives)
+        if not names or len(names) != len(set(names)):
+            raise ValueError("value-union alternatives must be non-empty and unique")
+        if self.tag_dtype != "int64":
+            raise ValueError("value-union tag must use the native int64 tag ABI")
+        if self.metadata_state not in {"static", "dynamic", "unresolved"}:
+            raise ValueError(f"unknown value-union metadata state {self.metadata_state!r}")
+
+    @property
+    def tag_vocabulary(self) -> tuple[str, ...]:
+        return tuple(arm.name for arm in self.alternatives)
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "union_id": self.union_id,
+            "identity": self.identity,
+            "tag_value_id": self.tag_value_id,
+            "tag_dtype": self.tag_dtype,
+            "tag_vocabulary": list(self.tag_vocabulary),
+            "alternatives": [arm.to_mapping() for arm in self.alternatives],
+            "layout": "side-by-side",
+            "metadata_state": self.metadata_state,
+            "writable": bool(self.writable),
+        }
+
+
 def sequence_member_roles(
     descriptor: "SSASequenceDescriptor | None",
 ) -> dict[int, set]:
@@ -2203,7 +2560,16 @@ class _BookCallList(__import__("collections.abc").abc.MutableSequence):
         return self._commit(records, sources=sources, stage=stage)
 
     def sort(self, *, key: Any = None, reverse: bool = False) -> None:
-        self._commit(sorted(self._records(), key=key, reverse=reverse))
+        # Sorting changes only the presentation order of the exact records
+        # already resident in this row.  Preserve that causal input instead
+        # of publishing a new raw table generation.
+        from ..compiler.concordance_declarations import CALL_RECORD
+
+        incumbent = self._page.book.latest_ref(CALL_RECORD, self._row)
+        self._commit(
+            sorted(self._records(), key=key, reverse=reverse),
+            sources=(() if incumbent is None else (incumbent,)),
+        )
 
     def copy(self) -> list:
         return list(self._records())
@@ -2246,8 +2612,22 @@ class SSACallTable(__import__("collections.abc").abc.MutableMapping):
         )
         self.mutable = bool(mutable)
         self._page = self.book.page("call_record")
+        source_table = records if isinstance(records, SSACallTable) else None
+        if source_table is not None:
+            from ..compiler.concordance_declarations import CALL_RECORD
         for caller, caller_records in dict(records or {}).items():
-            self[caller] = caller_records
+            source = (
+                None if source_table is None
+                or source_table.book is not self.book
+                else source_table.book.latest_ref(
+                    CALL_RECORD,
+                    (source_table.owner, str(caller)),
+                )
+            )
+            self.assign(
+                caller, caller_records,
+                sources=(() if source is None else (source,)),
+            )
 
     def __getitem__(self, caller: Any) -> Any:
         row = (self.owner, str(caller))
@@ -2473,6 +2853,12 @@ class IRModule(TiledObject):
     # Function-scoped typed record correlations. Record fields point only to
     # ordinary SSA values or other published descriptor tables.
     record_tables: Dict[str, SSARecordTable] = field(default_factory=dict)
+    # Function-scoped source-language sum values.  Unlike ``union_table``
+    # (ctypes overlapping layouts), these rows use optional-style
+    # side-by-side arm cells plus one ordinary int64 tag.
+    value_union_tables: Dict[str, SSAValueUnionTable] = field(
+        default_factory=dict
+    )
     # Opaque program-object identities. Their signed i64 handles can be
     # copied, compared, and stored by native backends; ``host_resident``
     # records the explicit boundary at which dereference remains Python-owned.
@@ -2545,6 +2931,25 @@ class IRModule(TiledObject):
                 for name, function in self.functions.items()
                 if function.metadata.get("deployment_regions")
             }
+
+    def value_union_frame_members(
+        self, function_name: str, union_id: int,
+    ) -> tuple[SSAValueUnionFrameMember, ...]:
+        """Return the exact restorable physical frame of one value union."""
+
+        owner = str(function_name)
+        table = self.value_union_tables.get(owner)
+        descriptor = None if table is None else table.by_id(int(union_id))
+        if descriptor is None:
+            raise ValueError(
+                f"function {owner!r} has no value union {int(union_id)}"
+            )
+        return value_union_frame_members(
+            descriptor,
+            sequence_table=self.sequence_tables.get(owner),
+            record_table=self.record_tables.get(owner),
+            reference_table=self.reference_tables.get(owner),
+        )
 
     # -- named byte-layout types ---------------------------------------------
 

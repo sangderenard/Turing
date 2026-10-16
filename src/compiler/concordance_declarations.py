@@ -99,6 +99,21 @@ class BindingFact:
 
 
 @dataclass(frozen=True)
+class SourceGlyphUnionAlternative:
+    """One exact semantic-union arm's resident representation.
+
+    ``identity`` is the canonical identity used by ``VALUE_TYPE_ABI`` and
+    ``sequence_value_id`` is the already-authored resident recipe for that
+    arm.  The identity/source relation is validated against the value-union
+    descriptor during SSA lowering; no dtype or spelling chooses an arm.
+    """
+
+    identity: str
+    sequence_value_id: int
+    source_cells: tuple[Ref, ...]
+
+
+@dataclass(frozen=True)
 class SourceGlyphComponent:
     """One ordered source component of a resident glyph-token sequence.
 
@@ -129,6 +144,9 @@ class SourceGlyphComponent:
     #: The table's module identity must not be reconstructed from the glyph
     #: recipe row: dynamic recipes live in copy-local lexical-read scopes.
     enum_table_cell: Ref | None = None
+    #: Exact per-arm recipes for a semantic value union.  The component's
+    #: ``operand_value_id`` names the union whose native tag selects one.
+    union_alternatives: tuple[SourceGlyphUnionAlternative, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -224,6 +242,13 @@ class SourceOptionalGlyphCarry:
     false_arm: SourceOptionalGlyphArm
     initial_arm: SourceOptionalGlyphArm | None
     payload_sequence_value_id: int
+    # A linked-stage optional formatter can use the same carry without an
+    # authored Phi. These ids are the exact blocks that must remain inside
+    # its present arm; empty tuples retain the original authored-Phi shape.
+    present_callsite_ids: tuple[int, ...] = ()
+    present_projection_sequence_ids: tuple[int, ...] = ()
+    predicate_expect_true: bool = True
+    owner_conditional_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -305,6 +330,10 @@ NAME_BINDING_CAPTURE = declare_page("name_binding_capture", (
 CLASS_DECLARATION = declare_page("class_declaration", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
 ), ClassFact)
+CLASS_SUBTYPE = declare_page("class_subtype", (
+    RowField("derived_identity", K.NAME),
+    RowField("base_identity", K.NAME),
+), tuple)                              # DERIVED(class declarations) or declared builtin topology; CONCORD
 CLASS_FIELD_DECLARATION = declare_page("class_field_declaration", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
     RowField("field", K.NAME),
@@ -889,6 +918,8 @@ CONTROL_SSA_CONDITIONAL = declare_stage("control_ssa_conditional")
 CONTROL_SSA_LOOP = declare_stage("control_ssa_loop")
 CONTROL_SSA_REGION = declare_stage("control_ssa_region")
 CONTROL_SSA_FINISH = declare_stage("control_ssa_finish")
+UNION_INJECTION = declare_stage("union_injection")
+UNION_PROJECTION = declare_stage("union_projection")
 REDUCER_READ = declare_stage("reducer_read")
 
 # -- transforms (what a ``fresh_value`` mint did to its operand) --------------
@@ -1427,6 +1458,12 @@ RECORD_DESCRIPTOR = declare_page("record_descriptor", (
 RECORD_MEMBER = declare_page("record_member", (
     RowField("owner", K.SCOPE), RowField("member", K.VALUE_ID),
 ), tuple)                              # (record id, field, storage identity, role)...; REVISE
+VALUE_UNION_DESCRIPTOR = declare_page("value_union_descriptor", (
+    RowField("owner", K.SCOPE), RowField("union", K.VALUE_ID),
+), object)                             # SSAValueUnionDescriptor | None; REVISE
+VALUE_UNION_MEMBER = declare_page("value_union_member", (
+    RowField("owner", K.SCOPE), RowField("member", K.VALUE_ID),
+), tuple)                              # (union id, alternative, role)...; REVISE
 SEQUENCE_DESCRIPTOR = declare_page("sequence_descriptor", (
     RowField("owner", K.SCOPE), RowField("sequence", K.VALUE_ID),
 ), object)                             # SSASequenceDescriptor | None; REVISE
@@ -1840,6 +1877,25 @@ RECORD_STORAGE_ALIAS = declare_page("record_storage_alias", (
 RECORD_PARAMETER_VALUE = declare_page("record_parameter_value", (
     RowField("access_scope", K.SCOPE), RowField("symbol_value", K.LABEL),
 ), tuple)
+#: The accumulated roles (read/write/layout/sequence) required of one exact
+#: declared record field.  REVISE, DERIVED(the parameter-record declaration,
+#: the field access/descriptor cells, and the incumbent role cell).
+RECORD_FIELD_ACCESS = declare_page("record_field_access", (
+    RowField("access_scope", K.SCOPE), RowField("field_key", K.LABEL),
+), frozenset)
+#: The retained semantic witness for one role in ``RECORD_FIELD_ACCESS``.
+#: CONCORD, DERIVED(the same exact cells that proved the role).
+RECORD_FIELD_ACCESS_PATH = declare_page("record_field_access_path", (
+    RowField("access_scope", K.SCOPE), RowField("field_key", K.LABEL),
+    RowField("role", K.NAME),
+), tuple)
+#: The identity-independent physical sequence ABI selected for a declared
+#: record field.  CONCORD, DERIVED(the record and sequence descriptor cells
+#: of every agreeing local view).
+RECORD_FIELD_SEQUENCE_VIEW = declare_page("record_field_sequence_view", (
+    RowField("access_scope", K.SCOPE),
+    RowField("storage_identity", K.NAME),
+), tuple)
 #: ((symbol, parameter), path prefix, row identity) or
 #: Unresolved(ROW_IDENTITY_FROM_SCHEMA_NAME); CONCORD.
 RECORD_PARAMETER_ROW_HANDLE = declare_page("record_parameter_row_handle", (
@@ -2005,6 +2061,7 @@ class ControlBlockKind(Enum):
     DISPATCH = "dispatch"
     RESOURCE_SCOPE = "resource_scope"
     EXTERNAL_REFERENCE_CALL = "external_reference_call"
+    NATIVE_TRY = "native_try"
     VALIDATION = "validation"
     SEQUENCE_MUTATION = "sequence_mutation"
     SEQUENCE_QUERY = "sequence_query"
@@ -2021,6 +2078,8 @@ class Arm(Enum):
     CONDITION = "condition"
     CALLEE = "callee"
     CLEANUP = "cleanup"
+    HANDLER = "handler"
+    FINALBODY = "finalbody"
     CASE = "case"
     DEFAULT = "default"
     LANE = "lane"
@@ -2949,6 +3008,113 @@ class CopyShapeFact:
 
 
 @dataclass(frozen=True)
+class ValueTypeABIAlternative:
+    """One semantic arm and its exact physical ProgramABI view.
+
+    The source value cell is retained in ``source_cells`` so two equal
+    spellings never erase which compiled storage established the arm.
+    ``storage_identity`` is the authored ProgramABI/record identity, not a
+    reconstructed dtype label.  Absence is the sole arm with storage
+    ``"none"`` and no payload.
+    """
+
+    identity: str
+    storage: str
+    dtype: str
+    shape: tuple[int, ...]
+    rank: int
+    storage_identity: tuple
+    source_cells: tuple[Ref, ...]
+    metadata_state: str = "static"
+    row_shape: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity", str(self.identity))
+        object.__setattr__(self, "storage", str(self.storage))
+        object.__setattr__(self, "dtype", str(self.dtype))
+        object.__setattr__(self, "shape", tuple(map(int, self.shape)))
+        object.__setattr__(self, "rank", int(self.rank))
+        object.__setattr__(self, "storage_identity", tuple(self.storage_identity))
+        object.__setattr__(self, "source_cells", tuple(self.source_cells))
+        object.__setattr__(self, "metadata_state", str(self.metadata_state))
+        if self.row_shape is not None:
+            object.__setattr__(self, "row_shape", tuple(map(int, self.row_shape)))
+        if not self.identity or not self.source_cells:
+            raise ValueError("type ABI alternative requires identity source cells")
+        if self.identity == "builtins.NoneType":
+            if self.storage != "none" or self.dtype or self.shape:
+                raise ValueError("None type ABI alternative cannot own payload storage")
+        elif not self.storage:
+            raise ValueError("type ABI alternative requires physical storage")
+        elif self.storage not in {
+            "scalar", "span", "sequence", "record", "reference",
+        }:
+            raise ValueError(
+                "type ABI alternative has no native physical storage kind: "
+                f"{self.storage!r}"
+            )
+        if self.metadata_state not in {"static", "dynamic", "unresolved"}:
+            raise ValueError(
+                "type ABI alternative has invalid metadata state: "
+                f"{self.metadata_state!r}"
+            )
+
+
+@dataclass(frozen=True)
+class ValueTypeABIFact:
+    """Source-language type alternatives admitted by one physical value.
+
+    ``alternatives`` contains canonical qualified identities, not live class
+    objects. A singleton is an exact static fact and needs no runtime
+    evidence. A multi-member row declares the native discriminant mapping
+    that SSA transports as an ordinary ``int64`` companion value.
+    """
+
+    alternatives: tuple[str, ...]
+    tags: tuple[tuple[str, int], ...]
+    physical_alternatives: tuple[ValueTypeABIAlternative, ...]
+
+
+VALUE_TYPE_ABI = declare_page("value_type_abi", (
+    RowField("copy_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), ValueTypeABIFact)                   # DERIVED(the value identity / incoming value_type_abi); REVISE
+
+
+@dataclass(frozen=True)
+class UnionAlternativeStateFact:
+    """Concorded semantic-union arms and their exact shape states.
+
+    The state tuple for each arm is the existing shape-concordance five-tuple:
+    ``(shape, dtype, rank, metadata_state, row_shape)``.  The ordinary int64
+    tag remains a separate SSA value and is named here only by identity.
+    """
+
+    alternatives: tuple[str, ...]
+    tag_value_id: int
+    states: tuple[tuple, ...]
+
+
+UNION_ALTERNATIVE_STATE = declare_page("union_alternative_state", (
+    RowField("scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), UnionAlternativeStateFact)          # DERIVED(value_type_abi, value_type_tag); REVISE
+
+
+@dataclass(frozen=True)
+class ValueTypeTagFact:
+    tag_value_id: int
+    alternatives: tuple[str, ...]
+    tags: tuple[tuple[str, int], ...]
+
+
+VALUE_TYPE_TAG = declare_page("value_type_tag", (
+    RowField("function_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    # Header, latch and conditional merges are distinct control-owned SSA
+    # generations of one authored value.  Retain every physical writer.
+    RowField("tag_value_id", K.VALUE_ID),
+), ValueTypeTagFact)                   # DERIVED(value_type_abi, tag ssa_value); CONCORD
+
+
+@dataclass(frozen=True)
 class ShapePolymorphismFact:
     #: The disagreeing shapes, one per statement cell the row derives from.
     shapes: tuple
@@ -3428,3 +3594,73 @@ CALLSITE_TENSOR_RESULT_SPECIALIZATION = declare_page(
 TENSOR_SHAPE_SETTLEMENT = declare_page("tensor_shape_settlement_concordance", (
     RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
 ), tuple)
+# Canonical source-language class identities are concordance data.  Writers
+# normalize before publication so readers never repair aliases while making a
+# semantic decision.
+def canonical_python_type_identity(identity: object) -> str:
+    text = str(identity)
+    builtin = {
+        "bool", "bytearray", "bytes", "complex", "dict", "float",
+        "frozenset", "int", "list", "object", "set", "str", "tuple",
+        "NoneType",
+    }
+    if text in builtin:
+        return f"builtins.{text}"
+    if text.startswith("<class '") and text.endswith("'>"):
+        class_name = text[8:-2]
+        if class_name in builtin:
+            return f"builtins.{class_name}"
+    return text
+
+
+def ensure_builtin_class_topology(book: object) -> None:
+    """Publish Python's builtin class edges once as concordance facts."""
+
+    from .identity_concordance import Mode, Unsourced
+
+    declarations = (
+        ("builtins.bool", "builtins.int"),
+        ("builtins.bytearray", "builtins.object"),
+        ("builtins.bytes", "builtins.object"),
+        ("builtins.complex", "builtins.object"),
+        ("builtins.dict", "builtins.object"),
+        ("builtins.float", "builtins.object"),
+        ("builtins.frozenset", "builtins.object"),
+        ("builtins.int", "builtins.object"),
+        ("builtins.list", "builtins.object"),
+        ("builtins.NoneType", "builtins.object"),
+        ("builtins.set", "builtins.object"),
+        ("builtins.str", "builtins.object"),
+        ("builtins.tuple", "builtins.object"),
+    )
+    page = book.page(CLASS_SUBTYPE)
+    for derived, base in declarations:
+        row = (derived, base)
+        if page.latest(row) is None:
+            book.post(
+                CLASS_SUBTYPE, row, row, stage=INGESTION,
+                provenance=Unsourced(EXTERNAL_DECLARATION),
+                mode=Mode.CONCORD,
+            )
+
+
+def canonical_python_subtype_identities(
+    identity: object, *, book: object,
+) -> tuple[str, ...]:
+    """Exact alternatives admitted by the concorded class topology."""
+
+    canonical = canonical_python_type_identity(identity)
+    ensure_builtin_class_topology(book)
+    admitted = {canonical}
+    changed = True
+    page = book.page(CLASS_SUBTYPE)
+    while changed:
+        changed = False
+        for row in page.rows():
+            if not isinstance(row, tuple) or len(row) != 2:
+                continue
+            derived, base = map(canonical_python_type_identity, row)
+            if base in admitted and derived not in admitted:
+                admitted.add(derived)
+                changed = True
+    return tuple(sorted(admitted))

@@ -251,6 +251,154 @@ def source_object_type_tests(graph, admitted, context):
     return tests
 
 
+def source_native_type_tests(graph):
+    """Source type predicates from exact definition/concordance cells.
+
+    ``isinstance`` records subtype admission. ``type(value) is T`` records
+    exact identity.  The two never share inference rules.  Callable and
+    target identities are already concordance cells produced by source
+    reduction; ``static_call_values`` is deliberately ignored because a live
+    class object is neither a native ABI nor durable compiler evidence.
+    """
+
+    from .concordance_declarations import (
+        canonical_python_subtype_identities,
+        canonical_python_type_identity,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    identity_page = book.page("source_python_identity_concordance")
+    tests = {}
+    for node_id, data in graph.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        identity_row = attributes.get("source_python_identity_row")
+        if identity_row is None:
+            continue
+        identity = identity_page.latest(tuple(identity_row))
+        if not identity or str(identity[0]) != "builtins.isinstance":
+            continue
+        definition_cells = dict(
+            attributes.get("static_call_definition_cells") or {}
+        )
+        target_cell = definition_cells.get("arg:1")
+        if target_cell is None:
+            continue
+        definition_page = book.pages.get(target_cell.page.name)
+        if definition_page is None:
+            continue
+        definition = definition_page.cells.get(
+            (target_cell.row, target_cell.column)
+        )
+        if getattr(definition, "kind", None) is None or str(
+            getattr(definition.kind, "value", definition.kind)
+        ) != "class":
+            continue
+        module, qualname, _receiver = target_cell.row
+        accepted = canonical_python_type_identity(f"{module}.{qualname}")
+        operands = [
+            int(graph.nodes[parent].get("value_id", parent))
+            for parent, role in data.get("parents") or ()
+            if str(role) == "arg:0" and parent in graph
+        ]
+        if len(operands) != 1:
+            continue
+        value_id = int(data.get("value_id", node_id))
+        tests[value_id] = {
+            "source_value_id": value_id,
+            "subject_value_id": operands[0],
+            "accepted_types": canonical_python_subtype_identities(
+                accepted, book=book,
+            ),
+            "intrinsic": "builtins.isinstance",
+            "intrinsic_cell": book.latest_ref(
+                "source_python_identity_concordance", tuple(identity_row),
+            ),
+            "target_definition_cell": target_cell,
+            "predicate_kind": "subtype",
+        }
+
+    # Exact ``type(value) is T`` uses the StaticReference use edge of T.  The
+    # target's spelling is not consulted: the definition cell is the same
+    # canonical identity used by VALUE_TYPE_ABI.
+    import ast
+
+    static_use_page = book.pages.get("static_reference_use")
+
+    def definition_for_reference(reference_node_id):
+        if static_use_page is None:
+            return None
+        cells = []
+        for row in static_use_page.rows():
+            if (
+                isinstance(row, tuple) and len(row) == 3
+                and int(row[2]) == int(reference_node_id)
+            ):
+                use_cell = book.latest_ref("static_reference_use", row)
+                cells.extend(
+                    source for source, _stage in book.edges_into(use_cell)
+                    if source.page.name == "static_symbol_definition"
+                )
+        cells = tuple(dict.fromkeys(cells))
+        return cells[0] if len(cells) == 1 else None
+
+    for node_id, data in graph.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Compare)
+            and len(expression.ops) == 1
+            and isinstance(expression.ops[0], ast.Is)
+        ):
+            continue
+        parents = [
+            int(parent) for parent, _role in data.get("parents") or ()
+            if parent in graph
+        ]
+        type_calls = []
+        for parent in parents:
+            call_attributes = graph.nodes[parent].get("attributes") or {}
+            row = call_attributes.get("source_python_identity_row")
+            identity = (
+                None if row is None else identity_page.latest(tuple(row))
+            )
+            if identity and str(identity[0]) == "builtins.type":
+                type_calls.append((parent, tuple(row)))
+        if len(type_calls) != 1:
+            continue
+        type_call, intrinsic_row = type_calls[0]
+        subjects = [
+            int(graph.nodes[parent].get("value_id", parent))
+            for parent, role in graph.nodes[type_call].get("parents") or ()
+            if str(role) == "arg:0" and parent in graph
+        ]
+        targets = []
+        for parent in parents:
+            if parent == type_call:
+                continue
+            definition_cell = definition_for_reference(parent)
+            if definition_cell is not None:
+                targets.append(definition_cell)
+        if len(subjects) != 1 or len(targets) != 1:
+            continue
+        target_cell = targets[0]
+        module, qualname, _receiver = target_cell.row
+        value_id = int(data.get("value_id", node_id))
+        tests[value_id] = {
+            "source_value_id": value_id,
+            "subject_value_id": subjects[0],
+            "accepted_types": (
+                canonical_python_type_identity(f"{module}.{qualname}"),
+            ),
+            "intrinsic": "builtins.type",
+            "intrinsic_cell": book.latest_ref(
+                "source_python_identity_concordance", intrinsic_row,
+            ),
+            "target_definition_cell": target_cell,
+            "predicate_kind": "exact",
+        }
+    return tests
+
+
 def source_object_identity_reductions(graph, admitted):
     """Fuse the exact pure all(map(is, zip(a,b))) causal island.
 

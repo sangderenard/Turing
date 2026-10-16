@@ -25,6 +25,8 @@ def kernel(x, y):
     lowered = expand_bitops_process_graph(source, bit_width=4)
     ops = _ops(lowered)
 
+    assert lowered.MG is lowered.G.bit_tensor_memory_graph
+    assert lowered.MG is not source.MG
     assert "bitxor" not in ops
     assert "nand" in ops
     assert "return" in ops

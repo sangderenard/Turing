@@ -620,6 +620,7 @@ def compose_hierarchical_control(
                         else value(block.predicate_value_id)
                     ),
                     block.final,
+                    tuple(value(value_id) for value_id in block.payload_value_ids),
                 )
                 if remaining_calls_after:
                     # A call may be the final numerical action in a lexical

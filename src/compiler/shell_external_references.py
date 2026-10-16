@@ -433,6 +433,279 @@ class PythonShellExternalReferenceResolver:
         return self.host.values.decode(result)
 
 
+def emit_native_external_reference_adapter(
+    thunks: Sequence[Mapping[str, Any]],
+) -> str:
+    """Emit typed C thunks for compiler-owned non-Python native ABIs.
+
+    Sequence arguments use the physical descriptor declared by repository
+    SSA: a resident int64 codepoint/byte column followed by its int64 length.
+    The adapter neither receives nor reconstructs a Python object.
+    """
+
+    records = tuple(dict(thunk) for thunk in thunks)
+    supported = {
+        "turing-file-broker-v1", "turing-system-v1",
+        "turing-liblzma-v1",
+    }
+    unknown = sorted({
+        str(record.get("native_abi") or "")
+        for record in records
+        if str(record.get("native_abi") or "") not in supported
+    })
+    if unknown:
+        raise ValueError(
+            "no compiler-owned native external adapter for ABI(s): "
+            + ", ".join(map(repr, unknown))
+        )
+    needs_liblzma = any(
+        str(record.get("native_abi") or "") == "turing-liblzma-v1"
+        for record in records
+    )
+    lines = [
+        f"#define TURING_NATIVE_HAS_LIBLZMA {int(needs_liblzma)}",
+        r'''
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#if TURING_NATIVE_HAS_LIBLZMA
+#include <lzma.h>
+#endif
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
+static char *turing_native_utf8(
+    const int64_t *codepoints, const int64_t *length_address
+) {
+    int64_t length = length_address == NULL ? -1 : *length_address;
+    size_t capacity;
+    size_t cursor = 0;
+    char *text;
+    int64_t index;
+    if (codepoints == NULL || length < 0 || (uint64_t)length > (SIZE_MAX - 1) / 4)
+        return NULL;
+    capacity = (size_t)length * 4 + 1;
+    text = (char *)malloc(capacity);
+    if (text == NULL) return NULL;
+    for (index = 0; index < length; ++index) {
+        uint32_t value = (uint32_t)codepoints[index];
+        if (codepoints[index] < 0 || value > 0x10FFFFu
+            || (value >= 0xD800u && value <= 0xDFFFu)) {
+            free(text);
+            return NULL;
+        }
+        if (value <= 0x7Fu) text[cursor++] = (char)value;
+        else if (value <= 0x7FFu) {
+            text[cursor++] = (char)(0xC0u | (value >> 6));
+            text[cursor++] = (char)(0x80u | (value & 0x3Fu));
+        } else if (value <= 0xFFFFu) {
+            text[cursor++] = (char)(0xE0u | (value >> 12));
+            text[cursor++] = (char)(0x80u | ((value >> 6) & 0x3Fu));
+            text[cursor++] = (char)(0x80u | (value & 0x3Fu));
+        } else {
+            text[cursor++] = (char)(0xF0u | (value >> 18));
+            text[cursor++] = (char)(0x80u | ((value >> 12) & 0x3Fu));
+            text[cursor++] = (char)(0x80u | ((value >> 6) & 0x3Fu));
+            text[cursor++] = (char)(0x80u | (value & 0x3Fu));
+        }
+    }
+    text[cursor] = '\0';
+    return text;
+}
+
+static int turing_native_decode_utf8(
+    const char *text, int64_t *result_data, int64_t *result_length,
+    const int64_t *result_capacity, int64_t *result_status
+) {
+    const unsigned char *cursor = (const unsigned char *)text;
+    int64_t length = 0;
+    int64_t capacity = result_capacity == NULL ? 0 : *result_capacity;
+    if (text == NULL || result_data == NULL || result_length == NULL
+        || result_status == NULL || capacity < 0) return 0;
+    while (*cursor != 0) {
+        uint32_t value;
+        size_t width;
+        if (*cursor < 0x80u) { value = *cursor; width = 1; }
+        else if ((*cursor & 0xE0u) == 0xC0u) {
+            value = (uint32_t)(*cursor & 0x1Fu); width = 2;
+        } else if ((*cursor & 0xF0u) == 0xE0u) {
+            value = (uint32_t)(*cursor & 0x0Fu); width = 3;
+        } else if ((*cursor & 0xF8u) == 0xF0u) {
+            value = (uint32_t)(*cursor & 0x07u); width = 4;
+        } else return 0;
+        for (size_t index = 1; index < width; ++index) {
+            if ((cursor[index] & 0xC0u) != 0x80u) return 0;
+            value = (value << 6) | (uint32_t)(cursor[index] & 0x3Fu);
+        }
+        if (length >= capacity || value > 0x10FFFFu
+            || (value >= 0xD800u && value <= 0xDFFFu)) return 0;
+        result_data[length++] = (int64_t)value;
+        cursor += width;
+    }
+    *result_length = length;
+    *result_status = 1;
+    return 1;
+}
+
+#if TURING_NATIVE_HAS_LIBLZMA
+#define TURING_XZ_CAPACITY 64
+typedef struct {
+    FILE *file;
+    lzma_stream stream;
+} turing_xz_writer;
+static turing_xz_writer turing_xz_writers[TURING_XZ_CAPACITY];
+
+static int turing_xz_emit(turing_xz_writer *writer, lzma_action action) {
+    uint8_t output[65536];
+    lzma_ret status;
+    do {
+        writer->stream.next_out = output;
+        writer->stream.avail_out = sizeof(output);
+        status = lzma_code(&writer->stream, action);
+        size_t produced = sizeof(output) - writer->stream.avail_out;
+        if (produced != 0 && fwrite(output, 1, produced, writer->file) != produced)
+            return 0;
+        if (status != LZMA_OK && status != LZMA_STREAM_END) return 0;
+    } while (writer->stream.avail_in != 0
+             || (action == LZMA_FINISH && status != LZMA_STREAM_END));
+    return 1;
+}
+#endif
+''']
+    for record in records:
+        symbol = str(record["symbol"])
+        identity = str(record["identity"])
+        sequences = {
+            int(item["position"]): str(item["encoding"])
+            for item in record.get("argument_sequences") or ()
+        }
+        dtypes = tuple(map(str, record.get("argument_dtypes") or ()))
+        arguments = []
+        for position, _dtype in enumerate(dtypes):
+            if position in sequences:
+                arguments.extend((
+                    f"const int64_t *a{position}_data",
+                    f"const int64_t *a{position}_length",
+                ))
+            else:
+                arguments.append(f"const int64_t *a{position}")
+        result_dtype = str(record.get("result_dtype") or "")
+        if result_dtype == "utf8_sequence":
+            arguments.extend((
+                "int64_t *result_data", "int64_t *result_length",
+                "const int64_t *result_capacity", "int64_t *result_status",
+            ))
+        else:
+            arguments.append("int64_t *result")
+        lines.append(f"void {symbol}({', '.join(arguments)}) {{")
+        if identity == "turing.native.files.remove" and sequences == {0: "unicode-codepoints"}:
+            lines.extend((
+                "    char *path = turing_native_utf8(a0_data, a0_length);",
+                "    *result = path != NULL && remove(path) == 0;",
+                "    free(path);",
+            ))
+        elif identity == "turing.native.files.rename" and sequences == {
+            0: "unicode-codepoints", 1: "unicode-codepoints",
+        }:
+            lines.extend((
+                "    char *source = turing_native_utf8(a0_data, a0_length);",
+                "    char *destination = turing_native_utf8(a1_data, a1_length);",
+                "    *result = source != NULL && destination != NULL && rename(source, destination) == 0;",
+                "    free(source);",
+                "    free(destination);",
+            ))
+        elif identity in {"nt.getpid", "posix.getpid"} and not dtypes:
+            lines.extend((
+                "#if defined(_WIN32)",
+                "    *result = (int64_t)_getpid();",
+                "#else",
+                "    *result = (int64_t)getpid();",
+                "#endif",
+            ))
+        elif (
+            identity == "turing.native.system.getenv"
+            and sequences == {
+                0: "unicode-codepoints", 1: "unicode-codepoints",
+            }
+            and result_dtype == "utf8_sequence"
+        ):
+            lines.extend((
+                "    char *key = turing_native_utf8(a0_data, a0_length);",
+                "    char *fallback = turing_native_utf8(a1_data, a1_length);",
+                "    const char *value = key == NULL ? NULL : getenv(key);",
+                "    *result_status = 0;",
+                "    *result_length = 0;",
+                "    if (value == NULL) value = fallback;",
+                "    (void)turing_native_decode_utf8(value, result_data, result_length, result_capacity, result_status);",
+                "    free(key);",
+                "    free(fallback);",
+            ))
+        elif (
+            identity == "turing.native.liblzma.open"
+            and sequences == {0: "unicode-codepoints"}
+            and len(dtypes) == 2
+        ):
+            lines.extend((
+                "    char *path = turing_native_utf8(a0_data, a0_length);",
+                "    uint32_t preset = a1 == NULL ? 3u : (uint32_t)*a1;",
+                "    int64_t handle;",
+                "    *result = 0;",
+                "    for (handle = 1; handle < TURING_XZ_CAPACITY; ++handle) {",
+                "        turing_xz_writer *writer = &turing_xz_writers[handle];",
+                "        if (writer->file != NULL) continue;",
+                "        writer->file = path == NULL ? NULL : fopen(path, \"wb\");",
+                "        writer->stream = (lzma_stream)LZMA_STREAM_INIT;",
+                "        if (writer->file != NULL && lzma_easy_encoder(&writer->stream, preset, LZMA_CHECK_CRC64) == LZMA_OK) *result = handle;",
+                "        else { if (writer->file != NULL) fclose(writer->file); writer->file = NULL; }",
+                "        break;",
+                "    }",
+                "    free(path);",
+            ))
+        elif (
+            identity == "turing.native.liblzma.write"
+            and sequences == {1: "unicode-codepoints"}
+            and len(dtypes) == 2
+        ):
+            lines.extend((
+                "    int64_t handle = a0 == NULL ? 0 : *a0;",
+                "    char *text = turing_native_utf8(a1_data, a1_length);",
+                "    turing_xz_writer *writer = (handle > 0 && handle < TURING_XZ_CAPACITY) ? &turing_xz_writers[handle] : NULL;",
+                "    *result = 0;",
+                "    if (writer != NULL && writer->file != NULL && text != NULL) {",
+                "        writer->stream.next_in = (const uint8_t *)text;",
+                "        writer->stream.avail_in = strlen(text);",
+                "        if (turing_xz_emit(writer, LZMA_RUN)) *result = (int64_t)writer->stream.avail_in == 0;",
+                "    }",
+                "    free(text);",
+            ))
+        elif (
+            identity == "turing.native.liblzma.close"
+            and not sequences and len(dtypes) == 1
+        ):
+            lines.extend((
+                "    int64_t handle = a0 == NULL ? 0 : *a0;",
+                "    turing_xz_writer *writer = (handle > 0 && handle < TURING_XZ_CAPACITY) ? &turing_xz_writers[handle] : NULL;",
+                "    *result = 0;",
+                "    if (writer != NULL && writer->file != NULL) {",
+                "        writer->stream.next_in = NULL; writer->stream.avail_in = 0;",
+                "        *result = turing_xz_emit(writer, LZMA_FINISH) && fclose(writer->file) == 0;",
+                "        lzma_end(&writer->stream); writer->file = NULL;",
+                "    }",
+            ))
+        else:
+            raise ValueError(
+                "native external identity has no exact typed adapter: "
+                f"{identity!r}"
+            )
+        lines.append("}")
+    return "\n".join(lines)
+
+
 __all__ = [
     "EXTERNAL_CALL", "EXTERNAL_OK", "EXTERNAL_RELEASE", "EXTERNAL_RESOLVE",
     "EXTERNAL_RESULT_FLOAT64", "EXTERNAL_RESULT_OPAQUE_HANDLE",
@@ -441,4 +714,5 @@ __all__ = [
     "PythonShellExternalReferenceResolver",
     "PythonModuleExternalReferenceHost",
     "external_reference_thunk_symbol",
+    "emit_native_external_reference_adapter",
 ]

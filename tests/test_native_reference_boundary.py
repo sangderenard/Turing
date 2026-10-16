@@ -87,6 +87,37 @@ def test_object_annotation_proves_handle_slots_not_object_payload():
         'unique', 2, True, ('int64', 'opaque_ref'))
     assert _authored_sequence_annotation_contract('list[object]') == (
         'duplicates', 1, True, ('opaque_ref',))
+    assert _authored_sequence_annotation_contract(
+        'Iterable[tuple[Any, Any, Any]]'
+    ) == (
+        'duplicates', 3, False,
+        ('opaque_ref', 'opaque_ref', 'opaque_ref'),
+    )
+
+
+def test_typed_parameter_selects_its_retained_program_abi_record():
+    import networkx as nx
+
+    from src.compiler.fortran_c_shell import (
+        _typed_parameter_record_receipts,
+    )
+
+    graph = nx.DiGraph()
+    graph.add_node(3, type='Input', attributes={
+        'binding_name': 'page',
+        'binding_kind': 'parameter',
+        'result_class_ref': 'IdentityPage',
+    })
+    record = {
+        'identity': 'IdentityPage',
+        'fields': {'name': {
+            'storage': 'span', 'dtype': 'int64', 'rank': 1,
+        }},
+    }
+
+    assert _typed_parameter_record_receipts(
+        {'records': {'IdentityPage': record}}, graph,
+    ) == {'page': record}
 
 
 def test_fixed_tuple_element_annotation_declares_every_sequence_column():

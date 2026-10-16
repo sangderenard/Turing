@@ -522,7 +522,13 @@ def abstract_tensor_program_to_process_graph(
     reachable: set[int] = set()
     for root_id in root_ids:
         reachable |= nx.ancestors(graph.G, root_id) | {root_id}
-    graph.G = graph.G.subgraph(reachable).copy()
+    if not hasattr(graph.G, "_induced_copy"):
+        raise ProcessGraphAutogradError(
+            "semantic ProcessGraph topology is not backed by "
+            "BitTensorMemoryGraph"
+        )
+    graph.G = graph.G._induced_copy(reachable)
+    graph.MG = graph.G.bit_tensor_memory_graph
     graph.roots = list(dict.fromkeys(root_ids))
     for node_id in sorted(graph.G.nodes):
         data = graph.G.nodes[node_id]
@@ -1106,7 +1112,13 @@ def _isolate_process_graph_region(
         )
     if not selected:
         isolated = copy.copy(graph)
-        isolated.G = nx.DiGraph()
+        if not hasattr(graph.G, "_induced_copy"):
+            raise ProcessGraphAutogradError(
+                "adjoint region source is not backed by "
+                "BitTensorMemoryGraph"
+            )
+        isolated.G = graph.G._induced_copy(())
+        isolated.MG = isolated.G.bit_tensor_memory_graph
         isolated.G.graph.update({
             "graph_kind": "process_graph_adjoint_region",
             "semantic_authority": "ProcessGraph",
@@ -1151,8 +1163,21 @@ def _isolate_process_graph_region(
     }
     included = selected | boundary
     isolated = copy.copy(graph)
-    isolated.G = copy.deepcopy(graph.G.subgraph(included).copy())
-    isolated.G.graph = copy.deepcopy(dict(graph.G.graph))
+    if not hasattr(graph.G, "_induced_copy"):
+        raise ProcessGraphAutogradError(
+            "adjoint region source is not backed by "
+            "BitTensorMemoryGraph"
+        )
+    isolated.G = graph.G._induced_copy(included)
+    isolated.MG = isolated.G.bit_tensor_memory_graph
+    isolated.G.graph.clear()
+    isolated.G.graph.update(copy.deepcopy(dict(graph.G.graph)))
+    for _node_id, attributes in isolated.G.nodes(data=True):
+        for name, value in tuple(attributes.items()):
+            attributes[name] = copy.deepcopy(value)
+    for _left, _right, attributes in isolated.G.edges(data=True):
+        for name, value in tuple(attributes.items()):
+            attributes[name] = copy.deepcopy(value)
     isolated.scheduler = copy.copy(graph.scheduler)
     isolated.scheduler.G = isolated.G
 

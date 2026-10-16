@@ -333,12 +333,6 @@ def _observe_process_graph_node(
             for primitive_id, slot in primitive.parents
             if int(primitive_id) == int(capture_id)
         )
-        graph = context.get("graph")
-        graph_node = (
-            graph.G.nodes[int(node_id)]
-            if graph is not None and int(node_id) in graph.G
-            else {}
-        )
         if (
             self_parent_slots
             and len(parent_ids) == 1
@@ -1618,7 +1612,18 @@ def _build_shell_hierarchy_plan(
         declaration = None if host is None else host.functions.get(str(root))
         contract = None if declaration is None else (declaration.metadata.get("native_interface")
                                                      or declaration.metadata.get("repository_ssa_signature"))
-        if child is None and contract is not None:
+        # ``self.excludes(node)`` retains the accepted method reference on
+        # both its detached GetAttr selector and its Call.  The selector's
+        # exact receiver edge is ``value`` because it performs attribute
+        # access; only the Call owns the native-interface ``self``/``node``
+        # argument roles.  Treating every node with ``method_ref`` as an
+        # invocation tried to bind the selector through the callee ABI and
+        # invented a second call boundary for one authored call.
+        if (
+            child is None
+            and contract is not None
+            and attributes.get("bound_method_ref") is None
+        ):
             # root(x) = left(x) + right(x): omitting authored callee bodies
             # used to omit BOTH PlanCalls. Derive call frames from accepted
             # declarations and the same authoritative argument edges instead.
@@ -7079,10 +7084,11 @@ def _dispatch_subgraph(
             "dispatch schedule preference must be 'asap' or 'alap'"
         )
     if _defer_schedule:
-        if subgraph.materialize_memory:
-            raise ValueError("dependency-only worker scheduling requires a non-materialized ProcessGraph")
         # Finalization may mint nodes/rows. Do it here, on the coordinator,
         # before the sealed scheduler input crosses the worker boundary.
+        # The sealed dependency snapshot is representation-independent.  A
+        # materialized ProcessGraph stays materialized; scheduling it never
+        # authorizes a second NetworkX topology or a non-materialized bypass.
         subgraph.finalize_graph_with_outputs()
     else:
         computed_levels = subgraph.compute_levels(
@@ -16121,6 +16127,7 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
 
 def _invalidate_tensor_descriptor_dependents(
     graph: Any, source_ids: Any, reason: str, *, _dependents=None,
+    source_cells: tuple = (),
 ) -> None:
     """Invalidate every cached descriptor derived from changed exact values."""
 
@@ -16153,10 +16160,16 @@ def _invalidate_tensor_descriptor_dependents(
         try:
             from .identity_concordance import invalidate_proven_shape, shape_scope_of
 
-            invalidate_proven_shape(
+            arguments = (
                 shape_scope_of(graph), int(data.get("value_id", node_id)),
                 int(causes[0]), str(reason),
             )
+            if source_cells:
+                invalidate_proven_shape(
+                    *arguments, source_cells=source_cells,
+                )
+            else:
+                invalidate_proven_shape(*arguments)
         except Exception:
             pass
 
@@ -20158,6 +20171,11 @@ def _fold_callsite_structural_values(
     from .concordance_declarations import PLANNER_STRUCTURAL_FOLD
     from .identity_concordance import current_identity_book
     fold_book = current_identity_book()
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    source_value_class_scope = _source_numeric_scope(graph.G)
+    source_value_class_page = fold_book.page(
+        "source_value_class_concordance"
+    )
     # Round numbers restart at each invocation. Authored function names do
     # not identify an invocation or a specialized graph copy.
     fold_scope = fold_book.mint_scope(
@@ -20564,6 +20582,18 @@ def _fold_callsite_structural_values(
                 for identity in type_identities(item)
             )
         return ()
+
+    def source_value_class_identity(value_id: int | None) -> str | None:
+        """Read one exact authored class from the reducer concordance."""
+
+        if value_id is None:
+            return None
+        fact = source_value_class_page.latest((
+            source_value_class_scope, int(value_id),
+        ))
+        if not (isinstance(fact, tuple) and fact):
+            return None
+        return str(fact[0])
 
     def declared_record_field(
         owner_fact: Any, attribute: str,
@@ -21111,9 +21141,15 @@ def _fold_callsite_structural_values(
                     graph.G.nodes.get(lhs_id, {})
                     if lhs_id is not None else {}
                 )
-                if (lhs.get("attributes") or {}).get(
-                    "extraction_identity"
-                ) == "builtins.type":
+                lhs_attributes = lhs.get("attributes") or {}
+                type_program_identities = tuple(dict(
+                    lhs_attributes.get("python_identity_program") or {}
+                ).get("identities") or ())
+                if (
+                    lhs_attributes.get("extraction_identity")
+                    == "builtins.type"
+                    or type_program_identities == ("builtins.type",)
+                ):
                     subject_id = next((
                         int(parent)
                         for parent, role in (lhs.get("parents") or ())
@@ -21133,6 +21169,17 @@ def _fold_callsite_structural_values(
                     }
                     if aggregate_kind in exact_kinds and target_kind in exact_kinds:
                         matched = aggregate_kind == target_kind
+                        return (
+                            not matched
+                            if isinstance(expression.ops[0], ast.IsNot)
+                            else matched
+                        )
+                    subject_class = source_value_class_identity(subject_id)
+                    if subject_class is not None:
+                        matched = (
+                            subject_class == target_kind
+                            or subject_class.endswith("." + target_kind)
+                        )
                         return (
                             not matched
                             if isinstance(expression.ops[0], ast.IsNot)
@@ -21340,6 +21387,17 @@ def _fold_callsite_structural_values(
                 return values[2]
         if name == "isinstance" and values:
             if values[0] is unresolved and arguments:
+                source_class = source_value_class_identity(arguments[0])
+                accepted_identities = type_identities(
+                    expression.args[1]
+                    if len(expression.args) > 1 else None
+                )
+                if source_class is not None and any(
+                    source_class == identity
+                    or source_class.endswith("." + identity)
+                    for identity in accepted_identities
+                ):
+                    return True
                 # ``value={}; isinstance(value,dict)`` retained Dict0, but
                 # Dict has no foldable payload in this evaluator: Call2 saw
                 # an unresolved value and lost the constructor's known type.

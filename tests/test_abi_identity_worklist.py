@@ -119,6 +119,53 @@ def test_span_shape_publication_is_the_same_book_fact():
     assert old_shapes, "the original pass must publish the span's shape"
 
 
+def test_record_constructor_append_publishes_exact_sequence_row_identity():
+    graph = nx.DiGraph()
+    graph.graph.update(
+        function_name="record_append",
+        parameter_record_abi={},
+        identity_table={},
+        program_abi={"records": {"Finding": {
+            "identity": "Finding",
+            "fields": {
+                "kind": {"storage": "span", "dtype": "int64"},
+                "value_id": {
+                    "storage": "scalar", "dtype": "int64",
+                    "optional": True,
+                },
+            },
+        }}},
+    )
+    graph.add_node(
+        0, value_id=0, type="List", parents=[],
+        attributes={"aggregate_kind": "list"},
+        expr_obj=ast.parse("[]", mode="eval").body,
+    )
+    graph.add_node(
+        1, value_id=1, type="Call", op="Call", parents=[],
+        attributes={"class_ref": "Finding"},
+        expr_obj=ast.parse("Finding('bad', None)", mode="eval").body,
+    )
+    graph.add_node(
+        2, value_id=2, type="append", op="append",
+        parents=[(0, "operand"), (1, "arg:0")], attributes={},
+        expr_obj=ast.parse(
+            "found.append(Finding('bad', None))", mode="eval",
+        ).body,
+    )
+
+    published, _, _ = run(
+        concordance.publish_program_abi_graph_identities, graph,
+    )
+
+    assert published[1]["attributes"][
+        "program_abi_record_identity"
+    ] == "Finding"
+    assert published[0]["attributes"][
+        "program_abi_sequence_row_identity"
+    ] == "Finding"
+
+
 @pytest.mark.parametrize("seed", range(40))
 def test_mixed_identity_rules_match_original_round_order(seed):
     rng = random.Random(seed)

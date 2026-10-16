@@ -1942,6 +1942,36 @@ def test_source_region_accounting_accepts_only_a_complete_physical_abi():
     ]
 
 
+def test_source_region_accounting_accepts_concrete_opaque_reference_abi():
+    from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
+
+    reference = SSAValue(2, dtype="opaque_ref")
+    function = Function(
+        "identity__planned_region_1",
+        [reference],
+        {"entry": BasicBlock("entry", [Instr("Ret", [reference], None)])},
+        metadata={
+            "source_region_integral": {
+                "schema": "turing.source-region-integral.v1",
+                "owner": "identity",
+                "plan_name": "region_1",
+                "region_index": 1,
+                "closure_id": 4,
+                "identity_token_chain": (
+                    "source-region", "identity", "closure:4", "region_1",
+                ),
+            },
+        },
+    )
+
+    record = source_region_integral_accounting(
+        IRModule({function.name: function}), {function.name: (reference,)},
+    )[0]
+
+    assert record["complete"] is True
+    assert record["shortfalls"] == []
+
+
 def test_source_region_accounting_rejects_an_unranked_address_base():
     from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
 

@@ -227,6 +227,20 @@ def _run_profile(argv: list[str], scope) -> int:
     (ROOT / "build").mkdir(exist_ok=True)
     build = Path(tempfile.mkdtemp(prefix=f"profile_rules_{len(selected)}_{options.backend}_", dir=ROOT / "build"))
     print("RULE_BUILD_DIRECTORY=" + str(build), flush=True)
+    from src.compiler.build_product_retention import (
+        compiler_product_lease,
+        prune_stale_orbital_profile_products,
+    )
+    scope.enter_context(compiler_product_lease(build))
+    removed_products = prune_stale_orbital_profile_products(
+        ROOT / "build", build,
+    )
+    if removed_products:
+        print(
+            "RULE_BUILD_RETENTION removed="
+            f"{len(removed_products)} active={build.name}",
+            flush=True,
+        )
     paths = compile_rule_pieces(selected, build, source_compilation=schedule,
                                jobs=options.jobs, optimization=options.optimization, progress=progress,
                                partitioned_options=worker_options)

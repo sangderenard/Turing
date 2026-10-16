@@ -246,7 +246,17 @@ def extract_clean_process_subgraph(
     # so source and extraction cannot each mint their own.
     shape_scope_of(graph)
 
-    extracted.G = graph.G.subgraph(included).copy()
+    if hasattr(graph.G, "_induced_copy"):
+        # The memory-backed NetworkX protocol returns an owned induced graph;
+        # do not allocate that physical arena twice through the usual
+        # NetworkX ``subgraph(...).copy()`` view idiom.
+        induced = graph.G._induced_copy(included)
+    else:
+        raise ValueError(
+            "ProcessGraph topology is not backed by BitTensorMemoryGraph"
+        )
+    extracted.MG = induced.bit_tensor_memory_graph
+    extracted.G = induced
     metadata = dict(graph.G.graph)
     shared_metadata: dict[str, object] = {}
     if included and len(included) < len(graph.G):

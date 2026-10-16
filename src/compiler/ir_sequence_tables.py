@@ -2435,16 +2435,27 @@ def lower_sequence_contains(
     function_name: str | None = None,
     first_value_id: int | None = None,
 ) -> SSASequenceLowering:
-    """Build a key-column membership scan returning one boolean value."""
+    """Build a resident membership scan returning one boolean value.
 
-    if not descriptor.key_columns:
-        raise ValueError("sequence membership requires at least one key column")
+    Keyed tables compare their declared key tuple.  A one-column duplicate
+    sequence compares its sole value column, which is Python's membership
+    contract for strings, bytes, tuples, and lists.  Wider unkeyed rows have
+    no scalar-query contract and remain inadmissible.
+    """
+
+    membership_columns = tuple(descriptor.key_columns) or (
+        (0,) if len(descriptor.column_value_ids) == 1 else ()
+    )
+    if not membership_columns:
+        raise ValueError(
+            "sequence membership requires keyed columns or one value column"
+        )
     storage = _storage_values(descriptor)
     builder = _Builder(_first_fresh_identity(
         descriptor, values=storage, minimum=first_value_id
     ))
     key_dtypes = tuple(
-        descriptor.column_dtypes[column] for column in descriptor.key_columns
+        descriptor.column_dtypes[column] for column in membership_columns
     )
     queries = tuple(builder.fresh(dtype) for dtype in key_dtypes)
     entry = builder.block("entry")
@@ -2480,7 +2491,7 @@ def lower_sequence_contains(
     builder.cond(header, continues, body, absent)
     matches = None
     for key_column, key_dtype, query in zip(
-        descriptor.key_columns, key_dtypes, queries
+        membership_columns, key_dtypes, queries
     ):
         address = builder.fresh("ptr")
         existing = builder.fresh(key_dtype)
@@ -2538,6 +2549,7 @@ def lower_sequence_contains(
             "ssa_sequence_operation": "contains",
             "sequence_id": descriptor.sequence_id,
             "key_columns": descriptor.key_columns,
+            "membership_columns": membership_columns,
             "sequence_array_argument_ids": tuple((
                 *map(int, descriptor.column_value_ids),
                 int(descriptor.length_address_id),
@@ -2546,6 +2558,144 @@ def lower_sequence_contains(
             "named_outputs": (("contains", int(result.id)),),
         },
     )
+    return SSASequenceLowering((function,))
+
+
+def lower_sequence_equal(
+    left: SSASequenceDescriptor,
+    right: SSASequenceDescriptor,
+    *,
+    function_name: str | None = None,
+    first_value_id: int | None = None,
+) -> SSASequenceLowering:
+    """Compare two resident sequences by complete logical contents.
+
+    This is the native, collision-free equality used by resident strings: the
+    lengths must agree and every stored glyph/component in every column must
+    agree in order.  A content hash may be a useful accelerator, but it is not
+    evidence of equality and therefore is deliberately absent from the truth
+    path here.
+
+    Tombstoned keyed tables need a logical-row walk rather than this dense-row
+    operation.  They are rejected instead of accidentally comparing physical
+    arena debris.  Strings and formatted glyph sequences are dense duplicate
+    sequences and take this path directly.
+    """
+
+    if left.live_flags_value_id is not None or right.live_flags_value_id is not None:
+        raise ValueError("sequence equality requires dense resident sequences")
+    left_dtypes = tuple(left.column_dtypes) or (
+        "unknown",
+    ) * len(left.column_value_ids)
+    right_dtypes = tuple(right.column_dtypes) or (
+        "unknown",
+    ) * len(right.column_value_ids)
+    left_shapes = tuple(left.column_shapes) or (
+        (),
+    ) * len(left.column_value_ids)
+    right_shapes = tuple(right.column_shapes) or (
+        (),
+    ) * len(right.column_value_ids)
+    if not left.column_value_ids or (
+        len(left.column_value_ids) != len(right.column_value_ids)
+        or left_dtypes != right_dtypes
+        or left_shapes != right_shapes
+    ):
+        raise ValueError(
+            "sequence equality requires identical non-empty row schemas"
+        )
+
+    storage = tuple({
+        value.id: value
+        for value in (*_storage_values(left), *_storage_values(right))
+    }.values())
+    builder = _Builder(_first_fresh_identity(
+        left, right, values=storage, minimum=first_value_id,
+    ))
+    entry = builder.block("entry")
+    header = builder.block("equal_header")
+    body = builder.block("equal_body")
+    latch = builder.block("equal_latch")
+    equal = builder.block("equal")
+    unequal = builder.block("unequal")
+    result_block = builder.block("result")
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
+
+    def load_length(descriptor: SSASequenceDescriptor):
+        slot = builder.fresh("ptr")
+        length = builder.fresh("int64")
+        builder.emit(entry, "GetElementPtr", [SSAValue(
+            descriptor.length_address_id, dtype="int64", shape=(1,),
+        ), zero], slot)
+        builder.emit(entry, "Load", [slot], length)
+        return length
+
+    left_length = load_length(left)
+    right_length = load_length(right)
+    same_length = builder.fresh("bool")
+    builder.emit(entry, "Eq", [left_length, right_length], same_length)
+    builder.cond(entry, same_length, header, unequal)
+
+    index = builder.fresh("int64")
+    next_index = builder.fresh("int64")
+    builder.emit(
+        header, "Phi", [zero, next_index], index,
+        attributes={"incoming_blocks": (entry.name, latch.name)},
+    )
+    continues = builder.fresh("bool")
+    builder.emit(header, "Lt", [index, left_length], continues)
+    builder.cond(header, continues, body, equal)
+
+    row_matches = None
+    for left_column, right_column, dtype in zip(
+        left.column_value_ids, right.column_value_ids, left_dtypes,
+    ):
+        left_address = builder.fresh("ptr")
+        right_address = builder.fresh("ptr")
+        left_value = builder.fresh(dtype)
+        right_value = builder.fresh(dtype)
+        component_match = builder.fresh("bool")
+        builder.emit(body, "GetElementPtr", [
+            SSAValue(left_column, dtype=dtype), index,
+        ], left_address)
+        builder.emit(body, "GetElementPtr", [
+            SSAValue(right_column, dtype=dtype), index,
+        ], right_address)
+        builder.emit(body, "Load", [left_address], left_value)
+        builder.emit(body, "Load", [right_address], right_value)
+        builder.emit(body, "Eq", [left_value, right_value], component_match)
+        if row_matches is None:
+            row_matches = component_match
+        else:
+            combined = builder.fresh("bool")
+            builder.emit(body, "LAnd", [row_matches, component_match], combined)
+            row_matches = combined
+    assert row_matches is not None
+    builder.cond(body, row_matches, latch, unequal)
+    builder.emit(latch, "Add", [index, one], next_index)
+    builder.branch(latch, header)
+
+    true_value = builder.const(equal, True, dtype="bool")
+    builder.branch(equal, result_block)
+    false_value = builder.const(unequal, False, dtype="bool")
+    builder.branch(unequal, result_block)
+    result = builder.fresh("bool")
+    builder.emit(
+        result_block, "Phi", [true_value, false_value], result,
+        attributes={"incoming_blocks": (equal.name, unequal.name)},
+    )
+    builder.emit(result_block, "Ret", [result])
+    name = function_name or (
+        f"ssa_sequence_{left.sequence_id}_equal_{right.sequence_id}"
+    )
+    function = Function(name, list(storage), builder.blocks, metadata={
+        "ssa_sequence_operation": "equal",
+        "left_sequence_id": int(left.sequence_id),
+        "right_sequence_id": int(right.sequence_id),
+        "sequence_array_argument_ids": tuple(value.id for value in storage),
+        "named_outputs": (("equal", int(result.id)),),
+    })
     return SSASequenceLowering((function,))
 
 
@@ -3334,6 +3484,7 @@ def lower_sequence_replace(
     *,
     function_name: str | None = None,
     first_value_id: int | None = None,
+    column_value_maps: dict[int, tuple[tuple[int, int], ...]] | None = None,
 ) -> SSASequenceLowering:
     """Copy a compatible resident arena, publishing its length last.
 
@@ -3397,11 +3548,33 @@ def lower_sequence_replace(
     continues = builder.fresh("bool")
     builder.emit(header, "Lt", [index, length], continues)
     builder.cond(header, continues, body, complete)
-    for (dst, dtype), (src, _) in zip(dst_columns, src_columns):
+    column_value_maps = dict(column_value_maps or {})
+    for column_index, ((dst, dtype), (src, _)) in enumerate(zip(
+        dst_columns, src_columns
+    )):
         src_address, dst_address = builder.fresh("ptr"), builder.fresh("ptr")
         value = builder.fresh(dtype)
         builder.emit(body, "GetElementPtr", [SSAValue(src, dtype=dtype), index], src_address)
         builder.emit(body, "Load", [src_address], value)
+        value_map = tuple(column_value_maps.get(int(column_index), ()))
+        if value_map:
+            remapped = builder.const(body, int(value_map[0][1]), dtype=dtype)
+            for source_token, target_token in value_map[1:]:
+                matches = builder.fresh("bool")
+                selected = builder.fresh(dtype)
+                builder.emit(body, "Eq", [
+                    value, builder.const(body, int(source_token), dtype=dtype),
+                ], matches)
+                builder.emit(body, "Select", [
+                    matches,
+                    builder.const(body, int(target_token), dtype=dtype),
+                    remapped,
+                ], selected, attributes={
+                    "binding": "sequence_column_value_remap",
+                    "column": int(column_index),
+                })
+                remapped = selected
+            value = remapped
         builder.emit(body, "GetElementPtr", [SSAValue(dst, dtype=dtype), index], dst_address)
         builder.emit(body, "Store", [value, dst_address])
     builder.branch(body, latch)
@@ -3421,6 +3594,7 @@ def lower_sequence_replace(
         "ssa_sequence_operation": "replace",
         "destination_sequence_id": destination.sequence_id,
         "source_sequence_id": source.sequence_id,
+        "sequence_column_value_maps": tuple(sorted(column_value_maps.items())),
         "sequence_array_argument_ids": tuple(dict.fromkeys((
             *(column for column, _ in dst_columns), destination.length_address_id,
             *(column for column, _ in src_columns), source.length_address_id,
@@ -3436,6 +3610,7 @@ def lower_sequence_extend(
     *,
     function_name: str | None = None,
     first_value_id: int | None = None,
+    column_value_maps: dict[int, tuple[tuple[int, int], ...]] | None = None,
 ) -> SSASequenceLowering:
     """Lower extend to source iteration plus the destination's insert policy."""
 
@@ -3527,15 +3702,35 @@ def lower_sequence_extend(
     builder.emit(header, "Lt", [index, source_length], continues)
     builder.cond(header, continues, body, complete)
 
+    column_value_maps = dict(column_value_maps or {})
     row_values: list[SSAValue] = []
-    for column_id, dtype in zip(
+    for column_index, (column_id, dtype) in enumerate(zip(
         source.column_value_ids,
         source.column_dtypes or ("unknown",) * len(source.column_value_ids),
-    ):
+    )):
         address = builder.fresh("ptr")
         value = builder.fresh(dtype)
         builder.emit(body, "GetElementPtr", [SSAValue(column_id, dtype=dtype), index], address)
         builder.emit(body, "Load", [address], value)
+        value_map = tuple(column_value_maps.get(int(column_index), ()))
+        if value_map:
+            remapped = builder.const(body, int(value_map[0][1]), dtype=dtype)
+            for source_token, target_token in value_map[1:]:
+                matches = builder.fresh("bool")
+                selected = builder.fresh(dtype)
+                builder.emit(body, "Eq", [
+                    value, builder.const(body, int(source_token), dtype=dtype),
+                ], matches)
+                builder.emit(body, "Select", [
+                    matches,
+                    builder.const(body, int(target_token), dtype=dtype),
+                    remapped,
+                ], selected, attributes={
+                    "binding": "sequence_column_value_remap",
+                    "column": int(column_index),
+                })
+                remapped = selected
+            value = remapped
         row_values.append(value)
     if source.live_flags_value_id is not None:
         live_address = builder.fresh("ptr")
@@ -3593,6 +3788,7 @@ def lower_sequence_extend(
             "destination_key_columns": destination.key_columns,
             "destination_allows_duplicates": destination.allows_duplicates,
             "insert_callee": insert_name,
+            "sequence_column_value_maps": tuple(sorted(column_value_maps.items())),
             "sequence_array_argument_ids": tuple((
                 *map(int, destination.column_value_ids),
                 int(destination.length_address_id),

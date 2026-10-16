@@ -1459,20 +1459,37 @@ class ExtractionContract:
             rule_id = "execution:python_callbacks_reject"
         if (
             self.execution.require_full_native
-            and subject.classification == "native_extension"
             and action is ExtractionAction.USE_NATIVE
-            and str(parameters.get("native_abi") or "") in {"", "cpython-c-api"}
+            and (
+                str(parameters.get("native_abi") or "") == "cpython-c-api"
+                or any(
+                    str(profile) in {"python", "cpython-c"}
+                    for profile in parameters.get("shell_profiles") or ()
+                )
+            )
         ):
-            # An extension module's Python-callable entry is not proof of a
-            # linkable, Python-free ABI. Require a declared adapter rather than
-            # carrying an existing_module Python object into native execution.
+            # A CPython call ABI is never a full-native dependency, regardless
+            # of whether the Python callable happens to be classified as a
+            # native extension or as a Python/stdlib definition by source
+            # discovery.  The ordinary extraction sheet keeps this explicit
+            # product capability; only a full-native execution contract refuses
+            # it and requires a separately declared non-Python ABI.
             action = ExtractionAction.REJECT
+            native_extension = subject.classification == "native_extension"
             parameters = {
                 **dict(parameters),
-                "reason": "native_extension_requires_non_python_abi",
+                "reason": (
+                    "native_extension_requires_non_python_abi"
+                    if native_extension else
+                    "full_native_requires_non_python_abi"
+                ),
                 "rejected_extraction_rule": rule_id,
             }
-            rule_id = "execution:native_extension_abi_required"
+            rule_id = (
+                "execution:native_extension_abi_required"
+                if native_extension else
+                "execution:non_python_abi_required"
+            )
         decision = ExtractionDecision(subject, action, rule_id, parameters)
         with self._lock:
             if action is ExtractionAction.INGEST_PYTHON and subject.origin:

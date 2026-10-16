@@ -1173,17 +1173,34 @@ def _post_hierarchy_values(
     book = current_identity_book()
     scope = book.mint_scope("hierarchy", PLANNER_SCOPE)
     graphs = _closure_graphs(planned, shell)
+    class_cells: dict[tuple[int, int], list] = {}
+    local_cells: dict[tuple[int, int], Any] = {}
+    # A call binding makes caller and callee locals one equivalence class.
+    # Some planner projections deliberately have no graph node of their own;
+    # retain the exact identity cells of the other members before publishing
+    # any row so those projections derive from the binding class rather than
+    # becoming synthetic roots.
+    for closure_id, local_id, _global_id in correlations:
+        key = (int(closure_id), int(local_id))
+        graph = graphs.get(key[0])
+        cell = None
+        if graph is not None and key[1] in graph.G:
+            try:
+                cell = node_identity_cell(graph, key[1])
+            except ValueError:
+                cell = None
+        local_cells[key] = cell
+        if cell is not None:
+            class_cells.setdefault(find(key), []).append(cell)
     members: dict[int, list] = {}
     for closure_id, local_id, global_id in correlations:
         row = (scope, int(closure_id), int(local_id))
-        graph = graphs.get(int(closure_id))
-        cell = None
-        if graph is not None and int(local_id) in graph.G:
-            try:
-                cell = node_identity_cell(graph, int(local_id))
-            except ValueError:
-                cell = None
-        if cell is None:
+        key = (int(closure_id), int(local_id))
+        sources = tuple(dict.fromkeys(
+            (() if local_cells.get(key) is None else (local_cells[key],))
+            or class_cells.get(find(key), ())
+        ))
+        if not sources:
             # A planner-minted value with no row of its own (a projection
             # leaf, an expanded identity body): the correlation is recorded
             # and the audit lists which writer still mints without a row
@@ -1195,7 +1212,7 @@ def _post_hierarchy_values(
         else:
             ref = book.post(
                 HIERARCHY_VALUE, row, int(global_id), stage=PLANNER_HIERARCHY,
-                provenance=Derived((cell,)), mode=Mode.CONCORD,
+                provenance=Derived(sources), mode=Mode.CONCORD,
             )
         members.setdefault(int(global_id), []).append(ref)
     for global_id, refs in members.items():

@@ -216,6 +216,11 @@ def plan_whole_program_compiler(
             "source-or-toolchain changes select a new versioned product; "
             "only receipt-verified matching products may activate"
         ),
+        "product_retention_policy": (
+            "keep the active fingerprint for every declared boundary; prune "
+            "only inactive sibling directories named by 64 lowercase hex "
+            "digits; preserve locked products for a later invocation"
+        ),
     }
     path = destination / "plan.json"
     path.write_text(
@@ -245,12 +250,43 @@ def bootstrap_provenance_core(
     destination.mkdir(parents=True, exist_ok=True)
     plan = plan_whole_program_compiler(destination, progress=progress,
                                        expansion_policy=expansion_policy)
-    from .compiler_bootstrap_runtime import ensure_native_provenance_core
+    from .build_product_retention import (
+        compiler_product_lease,
+        prune_abandoned_product_temporaries,
+        prune_stale_fingerprint_products,
+    )
+    for boundary in plan["boundaries"]:
+        removed = prune_stale_fingerprint_products(
+            destination / "products" / boundary["name"],
+            boundary["version"],
+        )
+        if removed and progress is not None:
+            progress(
+                "compiler-bootstrap: pruned "
+                f"{len(removed)} stale {boundary['name']} fingerprint "
+                f"product{'s' if len(removed) != 1 else ''}; "
+                f"active={boundary['version'][:12]}"
+            )
     first = plan["next_partition"]
-    core = ensure_native_provenance_core(
-        destination / "products" / first["name"] / first["version"], jobs=jobs,
-        schedule_options=dict(schedule_options or {}),
-        stop_after_failure=bool(stop_after_failure), progress=progress)
+    active_product = (
+        destination / "products" / first["name"] / first["version"]
+    )
+    from .compiler_bootstrap_runtime import ensure_native_provenance_core
+    with compiler_product_lease(active_product):
+        removed_temporaries = prune_abandoned_product_temporaries(
+            active_product
+        )
+        if removed_temporaries and progress is not None:
+            progress(
+                "compiler-bootstrap: pruned "
+                f"{len(removed_temporaries)} abandoned temporary "
+                f"artifact{'s' if len(removed_temporaries) != 1 else ''} "
+                "inside the active fingerprint"
+            )
+        core = ensure_native_provenance_core(
+            active_product, jobs=jobs,
+            schedule_options=dict(schedule_options or {}),
+            stop_after_failure=bool(stop_after_failure), progress=progress)
     if core.get("backend") != "native":
         raise RuntimeError("outer compiler schedule requires native provenance core")
     return plan, core
@@ -331,12 +367,24 @@ def build_whole_program_compiler(
                  "extraction_contract": DEFAULT_PROJECT_EXTRACTION_CONTRACT,
                  "expansion_policy": plan["expansion_policy"]}
                 for name in schedule]
-    lower_ast_source_to_ssa(requests,
-        source_compilation="parallel" if source_compilation == "auto" else source_compilation,
-        partitioned_options=partitioned_options,
+    from .build_product_retention import (
+        compiler_product_lease, prune_abandoned_product_temporaries,
     )
-    product_manifest = product_root / "product" / "manifest.json"
-    product = json.loads(product_manifest.read_text(encoding="utf-8"))
+    with compiler_product_lease(product_root):
+        removed_temporaries = prune_abandoned_product_temporaries(product_root)
+        if removed_temporaries and progress is not None:
+            progress(
+                "compiler-bootstrap: pruned "
+                f"{len(removed_temporaries)} abandoned outer-product "
+                f"temporary artifact"
+                f"{'s' if len(removed_temporaries) != 1 else ''}"
+            )
+        lower_ast_source_to_ssa(requests,
+            source_compilation="parallel" if source_compilation == "auto" else source_compilation,
+            partitioned_options=partitioned_options,
+        )
+        product_manifest = product_root / "product" / "manifest.json"
+        product = json.loads(product_manifest.read_text(encoding="utf-8"))
     records = product.get("units", ())
     if records:
         complete = all(record.get("status") == "complete"

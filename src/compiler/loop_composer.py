@@ -2081,6 +2081,7 @@ def materialize_retained_loop_ports(
             read_page = book.registry.pages.get("lexical_read_binding")
             transition_page = book.registry.pages.get("identity_transition")
             port_row = port_rows.get(int(new_value_id))
+            rewire_cells = []
             for consumer, role, ordinal in rewired_reads:
                 fact = (int(old_value_id), int(new_value_id), binding)
                 if read_scope is None or rewire_page is None:
@@ -2108,14 +2109,15 @@ def materialize_retained_loop_ports(
                         cells.append(cell)
                 row = (read_scope, int(consumer), role, int(ordinal))
                 if cells:
-                    book.post(
+                    rewire_cells.append(book.post(
                         rewire_page, row, fact, stage=_REWIRE_STAGE,
                         provenance=Derived(tuple(cells)), mode=Mode.REVISE,
-                    )
+                    ))
                 else:
                     book.page(rewire_page).revise(row, fact)
             _invalidate_tensor_descriptor_dependents(
                 graph, (int(new_value_id),), "loop-continuation-rewired",
+                source_cells=tuple(rewire_cells),
             )
         graph.roots = [
             new_value_id
@@ -5831,6 +5833,11 @@ def analyze_shader_loop_reductions(
                 StreamPublishBlock(
                     stream_id=0,
                     value_id=publish_value_id,
+                    payload_value_ids=tuple(map(int, (
+                        graph.G.nodes[publish_value_id].get(
+                            "attributes", {}
+                        ).get("aggregate_leaf_value_ids", ())
+                    ))),
                     count_value_id=publish_count_id,
                     predicate_value_id=predicate,
                 ),

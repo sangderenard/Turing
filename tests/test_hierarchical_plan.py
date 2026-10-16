@@ -196,6 +196,79 @@ def test_direct_aggregate_return_binds_call_from_source_span_and_backing_storage
     assert call.result_bindings == ((1, 5),)
 
 
+def test_native_bound_method_selector_is_not_a_call_boundary():
+    """Only the Call consumes an accepted native method interface.
+
+    ``self.excludes(node)`` has a detached GetAttr node whose exact receiver
+    edge is ``value``.  That selector carries ``bound_method_ref`` so the
+    following Call can retain the method identity, but it is not itself an
+    invocation and therefore has no native-interface argument roles.
+    """
+    from src.transmogrifier.ssa import Function, IRModule, SSAValue
+
+    process = nx.DiGraph()
+    process.add_node(0, type="Input", attributes={"binding_name": "node"})
+    process.add_node(1, type="Input", attributes={"binding_name": "self"})
+    selector = ast.parse("self.excludes", mode="eval").body
+    process.add_node(
+        2,
+        type="GetAttr",
+        op="GetAttr",
+        parents=((1, "value"),),
+        attributes={
+            "method_ref": 62,
+            "bound_method_ref": 62,
+            "bound_receiver_id": 1,
+        },
+        expr_obj=selector,
+    )
+    invocation = ast.parse("self.excludes(node)", mode="eval").body
+    process.add_node(
+        3,
+        type="excludes",
+        op="excludes",
+        parents=((1, "operand"), (2, "callee"), (0, "arg:0")),
+        attributes={"method_ref": 62},
+        expr_obj=invocation,
+    )
+    process.add_edges_from(((1, 2), (1, 3), (2, 3), (0, 3)))
+
+    declaration = Function(
+        "excludes",
+        [SSAValue(10, "opaque_ref"), SSAValue(11, "opaque_ref")],
+        {},
+        metadata={
+            "native_interface": {
+                "argument_ids": (10, 11),
+                "output_ids": (12,),
+            },
+            "parameter_names": (("self", 10), ("node", 11)),
+            "authored_parameters": ("self", "node"),
+            "method_binding": "instance",
+            "positional_parameters": ("self", "node"),
+        },
+    )
+    host = IRModule({"excludes": declaration})
+    entry = SimpleNamespace(metadata={
+        "host_ssa_module": host,
+        "host_ssa_root": "excludes",
+    })
+    function_table = SimpleNamespace(entry=lambda _reference: entry)
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process, function_table=function_table),
+        dispatch_subgraphs=(),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    plan = _build_shell_hierarchy_plan(shell)
+
+    calls = tuple(item for item in plan.items if isinstance(item, PlanCall))
+    assert tuple(call.callsite_id for call in calls) == (3,)
+    assert set(calls[0].argument_bindings) == {(1, 10), (0, 11)}
+
+
 def test_exact_peer_descriptor_folds_shape_with_unsettled_parameter():
     process = nx.DiGraph()
     process.graph["function_name"] = "reshape_peer"

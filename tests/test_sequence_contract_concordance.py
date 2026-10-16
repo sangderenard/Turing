@@ -12,6 +12,10 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     c_backend_repository_ssa_reference,
 )
 from src.compiler.fortran_c_shell import (
+    _accepted_record_access_entries,
+    _accepted_record_parameter_receipt,
+    _accepted_record_sequence_members,
+    _accepted_record_sequence_view,
     _authored_complete_record_schemas,
     _concordant_function_aliases,
     _concordant_function_resident,
@@ -34,6 +38,10 @@ from src.compiler.identity_concordance import (
     end_identity_book,
     resolved_concordant_alias_bindings,
 )
+from src.compiler.ir_sequence_tables import (
+    lower_sequence_contains,
+    lower_sequence_equal,
+)
 from src.compiler.concordance_declarations import (
     SOURCE_SORT_CONTRACT, SourceSortContract,
 )
@@ -41,6 +49,7 @@ from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.transmogrifier.ssa import (
     Function,
+    SSAValue,
     SSARecordDescriptor,
     SSARecordFieldDescriptor,
     SSARecordFieldStorage,
@@ -48,6 +57,69 @@ from src.transmogrifier.ssa import (
     SSASequenceDescriptor,
     SSASequenceTable,
 )
+
+
+def test_single_column_resident_membership_scans_the_value_column():
+    descriptor = SSASequenceDescriptor(
+        10, (11,), 12, 13, column_dtypes=("int64",), key_columns=(),
+    )
+
+    lowering = lower_sequence_contains(
+        descriptor, function_name="resident_string_contains",
+        first_value_id=20,
+    )
+
+    function = lowering.functions[0]
+    assert function.metadata["key_columns"] == ()
+    assert function.metadata["membership_columns"] == (0,)
+    assert len(function.args) == 4
+    assert function.args[-1].dtype == "int64"
+
+
+def test_keyed_membership_accepts_every_declared_key_component():
+    descriptor = SSASequenceDescriptor(
+        30, (31, 32, 33), 34, 35,
+        column_dtypes=("int64", "bool", "float64"),
+        key_columns=(0, 2),
+    )
+
+    lowering = lower_sequence_contains(
+        descriptor, function_name="compound_key_contains",
+        first_value_id=40,
+    )
+
+    function = lowering.functions[0]
+    assert function.metadata["membership_columns"] == (0, 2)
+    assert tuple(value.dtype for value in function.args[-2:]) == (
+        "int64", "float64",
+    )
+
+
+def test_resident_sequence_equality_compares_length_and_contents():
+    left = SSASequenceDescriptor(
+        50, (51,), 52, 53, column_dtypes=("int64",), key_columns=(),
+    )
+    right = SSASequenceDescriptor(
+        60, (61,), 62, 63, column_dtypes=("int64",), key_columns=(),
+    )
+
+    lowering = lower_sequence_equal(
+        left, right, function_name="resident_string_equal",
+        first_value_id=70,
+    )
+
+    function = lowering.functions[0]
+    assert function.metadata["ssa_sequence_operation"] == "equal"
+    assert function.metadata["left_sequence_id"] == 50
+    assert function.metadata["right_sequence_id"] == 60
+    operations = tuple(
+        instruction.op
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+    assert operations.count("Load") == 4
+    assert operations.count("Eq") == 2
+    assert "LAnd" not in operations
 
 
 def test_sort_policy_is_published_at_source_and_carried_through_relabel():
@@ -328,6 +400,129 @@ def test_imported_function_aliases_use_the_accepted_component_book():
         end_identity_book(ambient_token)
 
 
+def test_imported_record_demand_reads_only_the_accepted_owner_book():
+    from src.compiler.identity_concordance import IdentityBook
+
+    owner = IdentityBook()
+    scope = ("record_field_access", 0)
+    symbol = "LiveScopeProjection_excludes__excludes"
+    parameter_key = (symbol, "self")
+    field_key = (
+        parameter_key, "excluded", "LiveScopeProjection.excluded",
+    )
+    read_path = (("source-node", 4),)
+    sequence_path = ((
+        "local-sequence-view", symbol, 1, 4,
+    ),)
+    sequence_view = (("opaque_ref",), 1, (0,), False, "fixed", False)
+    owner.page("record_parameter_value").concord(
+        (scope, (symbol, 1)), parameter_key,
+    )
+    owner.page("record_field_access").concord(
+        (scope, field_key), frozenset({"read", "sequence"}),
+    )
+    owner.page("record_field_access_path").concord(
+        (scope, field_key, "read"), read_path,
+    )
+    owner.page("record_field_access_path").concord(
+        (scope, field_key, "sequence"), sequence_path,
+    )
+    owner.page("record_field_sequence_view").concord(
+        (scope, "LiveScopeProjection.excluded"), sequence_view,
+    )
+    sequence_scope = (symbol, 0)
+    owner.page("sequence_descriptor").concord(
+        (sequence_scope, 4), ("accepted-descriptor", 4),
+    )
+    for value_id, roles in {
+        4: ((4, ("column", 0)), (4, ("handle",))),
+        10: ((4, ("length_address_id",)),),
+        11: ((4, ("capacity_value_id",)),),
+        12: ((4, ("status_address_id",)),),
+        13: ((4, ("live_flags_value_id",)),),
+    }.items():
+        owner.page("sequence_member").concord(
+            (sequence_scope, value_id), roles,
+        )
+    function = Function(
+        symbol, [
+            SSAValue(4, "opaque_ref", shape=()),
+            SSAValue(10, "int64", shape=(1,)),
+            SSAValue(11, "int64", shape=()),
+            SSAValue(12, "int", shape=(1,)),
+            SSAValue(13, "bool", shape=(1,)),
+        ], {},
+        metadata={"accepted_ssa_component": {"identity_book": owner}},
+    )
+
+    ambient, ambient_token = begin_identity_book()
+    try:
+        key, parameter_owner, parameter_scope = (
+            _accepted_record_parameter_receipt(function, symbol, 1)
+        )
+        assert (key, parameter_owner, parameter_scope) == (
+            parameter_key, owner, scope,
+        )
+        assert _accepted_record_access_entries(function) == ((
+            field_key, frozenset({"read", "sequence"}), owner, scope,
+        ),)
+        assert parameter_owner.page("record_field_access_path").latest(
+            (parameter_scope, field_key, "read")
+        ) == read_path
+        assert parameter_owner.page("record_field_access_path").latest(
+            (parameter_scope, field_key, "sequence")
+        ) == sequence_path
+        assert _accepted_record_sequence_view(
+            function, "LiveScopeProjection.excluded",
+        ) == sequence_view
+        assert _accepted_record_sequence_members(
+            function, "LiveScopeProjection.excluded",
+        ) == (
+            (("capacity_value_id",), 11, "int64", ()),
+            (("column", 0), 4, "opaque_ref", ()),
+            (("handle",), 4, "opaque_ref", ()),
+            (("length_address_id",), 10, "int64", (1,)),
+            (("live_flags_value_id",), 13, "bool", (1,)),
+            (("status_address_id",), 12, "int", (1,)),
+        )
+        assert all(
+            not ambient.page(page_name).rows()
+            for page_name in (
+                "record_parameter_value", "record_field_access",
+                "record_field_access_path", "record_field_sequence_view",
+                "sequence_descriptor", "sequence_member",
+            )
+        )
+    finally:
+        end_identity_book(ambient_token)
+
+
+def test_imported_output_alias_audit_uses_accepted_component_book():
+    from src.compiler.identity_concordance import CorrelationTable, IdentityBook
+    from src.transmogrifier.ssa import IRModule
+
+    owner = IdentityBook()
+    owner.page("output_identity_concordance").bind_alias(
+        "imported", 40, 2305843010213693979,
+    )
+    function = Function(
+        "imported", [], {},
+        metadata={
+            "output_identity_aliases": ((40, 2305843010213693979),),
+            "accepted_ssa_component": {"identity_book": owner},
+        },
+    )
+    module = IRModule({"imported": function})
+    module.metadata["identity_book"] = IdentityBook()
+
+    findings = CorrelationTable.build(module).findings(module)
+
+    assert not tuple(
+        finding for finding in findings
+        if finding.kind == "alias-not-concorded"
+    )
+
+
 def test_sequence_alias_with_live_length_reads_rebinds_all_descriptor_members(tmp_path):
     from src.transmogrifier.ssa import SSAValue, BasicBlock, Instr
     from src.compiler.ssa_llvm_backend import compile_artifact, prepare_artifact_execution
@@ -528,6 +723,436 @@ class Reading:
         "mutable": False,
         "python_type": "AbstractTensor",
     }
+
+
+def test_frozenset_and_nested_set_membership_keep_authored_resident_contracts():
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        """
+from dataclasses import dataclass, field
+
+READ_THROUGH_EXCLUDED_PAGES: frozenset[str] = frozenset({
+    "scope_origin", "planner_specialization",
+})
+
+@dataclass
+class Registry:
+    private_pages: set[str] = field(default_factory=set)
+
+@dataclass
+class Book:
+    registry: Registry
+
+def excluded(book: Book, name: str):
+    return (
+        name in READ_THROUGH_EXCLUDED_PAGES
+        or name in book.registry.private_pages
+    )
+""",
+        "excluded",
+        name="nested_set_membership_contract",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _message: None,
+    )
+
+    assert exports == ("nested_set_membership_contract__excluded",)
+    root = module.functions[exports[0]]
+    contains = tuple(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "contains"
+    )
+    assert len(contains) == 2
+    table = module.sequence_tables[root.name]
+    for instruction in contains:
+        descriptor = table.by_id(int(instruction.attributes["sequence_id"]))
+        assert descriptor.column_dtypes == ("int64",)
+        assert descriptor.key_columns == (0,)
+
+
+def test_record_frozenset_any_membership_keeps_reference_key_contract():
+    from src.compiler.identity_concordance import CorrelationTable
+
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        """
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass(frozen=True)
+class Projection:
+    excluded: frozenset[Any] = frozenset()
+    universe: frozenset[Any] = frozenset()
+    held: frozenset[Any] = frozenset()
+
+    def excludes(self, node: Any) -> bool:
+        return node in self.excluded or (
+            node in self.universe and node not in self.held
+        )
+""",
+        name="record_frozenset_reference_key_contract",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _message: None,
+    )
+
+    root = module.functions[exports[0]]
+    record = root.metadata["parameter_record_abi"]["self"]
+    assert {
+        name: (field["storage"], field["dtype"], field["aggregate_kind"])
+        for name, field in record["fields"].items()
+    } == {
+        "excluded": ("span", "opaque_ref", "frozenset"),
+        "universe": ("span", "opaque_ref", "frozenset"),
+        "held": ("span", "opaque_ref", "frozenset"),
+    }
+    assert len(module.sequence_tables[root.name].sequences) == 3
+    assert {
+        int(sequence_id): (
+            descriptor.column_dtypes, descriptor.key_columns,
+        )
+        for sequence_id, descriptor
+        in module.sequence_tables[root.name].sequences.items()
+    } == {
+        # The sequence arena and the queried node retain the same fixed-width
+        # opaque identity-handle ABI.
+        int(sequence_id): (("opaque_ref",), (0,))
+        for sequence_id
+        in module.sequence_tables[root.name].sequences
+    }
+    record_table = module.record_tables[root.name]
+    descriptor = next(
+        descriptor
+        for descriptor in record_table.records.values()
+        if descriptor.identity == "Projection"
+    )
+    physical_members = {
+        int(value_id)
+        for field in descriptor.fields
+        for value_id in field.value_ids
+    }
+    arguments = {int(value.id): value for value in root.args}
+    assert physical_members
+    assert physical_members <= set(arguments)
+    assert all(
+        (arguments[value_id].accounting or {}).get(
+            "program_abi_parameter"
+        ) == "self"
+        for value_id in physical_members
+    )
+    owned = {
+        int(value.id)
+        for value in root.args
+        if (value.accounting or {}).get("program_abi_parameter") == "self"
+    }
+    exact_record_bindings = [
+        int(record_id)
+        for record_id, candidate in record_table.records.items()
+        if candidate.identity == record["identity"]
+        and {
+            int(value_id)
+            for field in candidate.fields
+            for value_id in field.value_ids
+        }
+        and {
+            int(value_id)
+            for field in candidate.fields
+            for value_id in field.value_ids
+        } <= owned
+    ]
+    assert exact_record_bindings == [int(descriptor.record_id)]
+    findings = CorrelationTable.build(module).findings(module)
+    assert not [
+        finding
+        for finding in findings
+        if finding.kind == "key-column-not-integral"
+    ]
+    unsourced_record_findings = [
+        finding
+        for finding in findings
+        if finding.kind == "unsourced-fact"
+        and finding.function in {
+            "record_descriptor",
+            "record_member",
+            "record_field_access",
+            "record_field_access_path",
+            "record_field_sequence_view",
+        }
+    ]
+    assert not unsourced_record_findings, unsourced_record_findings
+
+
+def test_any_scalar_parameter_keeps_concrete_reference_transport():
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        """
+from typing import Any
+
+def same(left: Any, right: Any):
+    return left == right
+""",
+        "same",
+        name="any_reference_transport",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _message: None,
+    )
+
+    root = module.functions[exports[0]]
+    authored = {
+        int(value.id): str(value.dtype)
+        for value in root.args
+        if int(value.id) in {0, 1}
+    }
+    assert authored == {0: "opaque_ref", 1: "opaque_ref"}
+
+
+def test_authored_nested_mapping_value_sort_keeps_projected_target_dtype():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        """
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass
+class Page:
+    column_positions: dict[int, int] = field(default_factory=dict)
+    row_columns: dict[Any, list[int]] = field(default_factory=dict)
+
+    def reorder(self):
+        for resident in self.row_columns.values():
+            resident.sort(key=self.column_positions.__getitem__)
+""",
+        name="nested_value_sort_contract",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _message: None,
+    )
+
+    root = next(
+        function for function in module.functions.values()
+        if any(
+            instruction.attributes.get("ssa_sequence_operation") == "sort"
+            for block in function.blocks.values()
+            for instruction in block.instrs
+        )
+    )
+    sort_call = next(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "sort"
+    )
+    sorted_sequence = module.sequence_tables[root.name].by_id(
+        int(sort_call.attributes["sequence_id"])
+    )
+    assert sorted_sequence.column_dtypes == ("int64",)
+
+
+def test_mapping_values_generator_retains_record_and_nested_span_contracts():
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        """
+from dataclasses import dataclass
+from itertools import chain
+from typing import Any, Iterable
+
+@dataclass(frozen=True)
+class Segment:
+    kind: str
+    owner: str
+    offset: int
+    stored: int
+    raw: int
+    cells: int
+    rows: int
+    ordinals: Iterable[int] | None = None
+
+def detached_ordinals(page: Any) -> list:
+    detached: dict[str, Segment] | None = page.__dict__.get("_detached")
+    if not detached:
+        return []
+    return sorted(chain.from_iterable(
+        segment.ordinals for segment in detached.values()
+    ))
+""",
+        "detached_ordinals",
+        name="mapping_value_record_generator",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _message: None,
+    )
+
+    root = module.functions[exports[0]]
+    table = module.sequence_tables[root.name]
+    values = table.by_id(11)
+    ordinals = table.by_id(9)
+    assert values is not None
+    assert values.column_dtypes == (
+        "int64", "int64", "int64", "int64", "int64", "int64", "int64",
+        "bool", "int64",
+    )
+    assert ordinals is not None
+    assert ordinals.column_dtypes == ("int64",)
+    assert not ordinals.writable
+
+
+def test_authored_tuple_loop_row_remains_integer_table_key_handle():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        """
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass
+class IdentityPage:
+    cells: dict[tuple[Any, int], Any] = field(default_factory=dict)
+    row_columns: dict[tuple, list[int]] = field(default_factory=dict)
+    scopes: dict[Any, dict[tuple, None]] = field(default_factory=dict)
+
+def reindex(page: Any):
+    state = page.__dict__
+    row_columns: dict[tuple, list[int]] = state["row_columns"]
+    scopes: dict[Any, dict[tuple, None]] = state["scopes"]
+    row: tuple
+    column: int
+    for row, column in state["cells"]:
+        row_columns.setdefault(row, []).append(column)
+        scopes.setdefault(row[0], {}).setdefault(row, None)
+
+def replace(page: IdentityPage):
+    reindex(page)
+""",
+        "replace",
+        name="tuple_loop_row_handle_contract",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _message: None,
+    )
+
+    root = next(
+        function for function in module.functions.values()
+        if function.name.endswith("__reindex")
+    )
+    table_store = next(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation")
+        == "table_store"
+        and module.sequence_tables[root.name].by_id(
+            int(instruction.attributes["sequence_id"])
+        ).column_dtypes == ("int64", "int64")
+    )
+    descriptor = module.sequence_tables[root.name].by_id(
+        int(table_store.attributes["sequence_id"])
+    )
+    assert descriptor.column_dtypes == ("int64", "int64")
+    assert tuple(value.dtype for value in table_store.args[-2:]) == (
+        "int64", "int64",
+    )
+
+
+def test_reassigned_keyed_field_rebinds_to_declared_parts_and_dict_predicate():
+    from src.compiler.project_compilation_product import (
+        _unexplained_root_argument_ids,
+    )
+
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        """
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass
+class Page:
+    columns: list[int] = field(default_factory=list)
+    cells: dict[tuple[Any, int], Any] = field(default_factory=dict)
+    column_positions: dict[int, int] = field(default_factory=dict)
+    row_columns: dict[Any, list[int]] = field(default_factory=dict)
+
+    def reindex(self):
+        if self.__dict__.get("_compressed_ram"):
+            self.columns.append(0)
+        self.column_positions = {
+            column: position for position, column in enumerate(self.columns)
+        }
+        self.row_columns = {}
+        for row, column in self.cells:
+            if column not in self.column_positions:
+                self.column_positions[column] = len(self.columns)
+                self.columns.append(column)
+            self.row_columns.setdefault(row, []).append(column)
+        for resident in self.row_columns.values():
+            resident.sort(key=self.column_positions.__getitem__)
+""",
+        name="reassigned_keyed_field_contract",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _message: None,
+    )
+
+    root = module.functions[exports[0]]
+    assert _unexplained_root_argument_ids(root) == ()
+    truth_id, source_name, transform = next(
+        row for row in root.metadata["scalar_source_transforms"]
+        if row[2] == "dict_truth:_compressed_ram"
+    )
+    assert source_name == "self"
+    assert next(
+        value for value in root.args if int(value.id) == int(truth_id)
+    ).dtype == "bool"
+    keyed_parts = {
+        str((value.accounting or {}).get("program_abi_keyed_part")): int(value.id)
+        for value in root.args
+        if (value.accounting or {}).get("program_abi_keyed_owner")
+        == "column_positions"
+    }
+    assert set(keyed_parts) >= {"length", "keys", "values"}
+    keyed_calls = tuple(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation")
+        in {"contains", "table_store"}
+        and instruction.args
+        and int(instruction.args[0].id) == keyed_parts["keys"]
+    )
+    assert keyed_calls
+    for instruction in keyed_calls:
+        assert tuple(int(value.id) for value in instruction.args[:4]) == (
+            keyed_parts["keys"],
+            keyed_parts["values"],
+            keyed_parts["length"],
+            keyed_parts["length"],
+        )
+    assert not any(
+        str(value.dtype or "unknown") == "unknown"
+        for value in root.args
+    )
 
 
 def test_keyed_tensor_field_commits_nested_span_sequence_contract():

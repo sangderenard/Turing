@@ -108,6 +108,34 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
             source_contract_cell=cell,
         ))
         def materialize_component(component):
+            if component.union_alternatives:
+                if component.operand_value_id is None:
+                    raise ValueError(
+                        "value-union glyph component has no semantic operand: "
+                        f"value={int(component.component_value_id)}"
+                    )
+                destination_id = int(component.component_value_id)
+                arm_sequence_ids = tuple(
+                    int(arm.sequence_value_id)
+                    for arm in component.union_alternatives
+                )
+                if len(arm_sequence_ids) != len(set(arm_sequence_ids)):
+                    raise ValueError(
+                        "value-union glyph alternatives share an arm recipe: "
+                        f"value={destination_id}"
+                    )
+                declarations.append((destination_id, "duplicates", 1, True))
+                initializations.append((destination_id, "duplicates", 1))
+                mutations.append(ControlSequenceMutation(
+                    destination_id,
+                    "glyph_union_select",
+                    (int(component.operand_value_id), *arm_sequence_ids),
+                    destination_id,
+                    policy="duplicates",
+                    argument_kind="value_union_glyph_projection",
+                    source_contract_cell=cell,
+                ))
+                return destination_id
             if component.projection_components:
                 destination_id = int(component.component_value_id)
                 declarations.append((destination_id, "duplicates", 1, True))
@@ -144,54 +172,6 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
                 if component.formatted_sequence_value_id is not None
                 else component.component_value_id
             )
-            component_node = nodes_by_value.get(component_id)
-            component_attributes = (
-                {} if component_node is None
-                else component_node[1].get("attributes") or {}
-            )
-            source_utf8_id = component_attributes.get(
-                "source_utf8_sequence_value_id"
-            )
-            if source_utf8_id is not None:
-                source_utf8_id = int(source_utf8_id)
-                utf8_node = nodes_by_value.get(source_utf8_id)
-                if utf8_node is None:
-                    raise ValueError(
-                        "runtime repr glyph decoder has no exact UTF-8 "
-                        f"sequence producer: value={source_utf8_id}"
-                    )
-                utf8_attributes = utf8_node[1].get("attributes") or {}
-                decoder_component = component_attributes.get(
-                    "source_glyph_component"
-                )
-                utf8_component = utf8_attributes.get(
-                    "source_glyph_component"
-                )
-                contract = dict(
-                    utf8_attributes.get("extraction_contract") or {}
-                )
-                if (
-                    decoder_component != utf8_component
-                    or not isinstance(decoder_component, tuple)
-                    or len(decoder_component) != 2
-                    or tuple(decoder_component[0]) != tuple(row)
-                    or contract.get("action") != "use_native"
-                    or dict(contract.get("parameters") or {}).get(
-                        "result_dtype"
-                    ) != "utf8_sequence"
-                ):
-                    raise ValueError(
-                        "runtime repr UTF-8 producer disagrees with its "
-                        "exact source glyph component contract"
-                    )
-                # The external writer and decoder are two different resident
-                # representations.  Declare the intermediate byte sequence
-                # from their shared SOURCE_GLYPH_SEQUENCE occurrence before
-                # control lowering creates its physical status cell; only the
-                # decoder's glyph-token result is extended into JoinedStr.
-                declarations.append((
-                    source_utf8_id, "duplicates", 1, True,
-                ))
             declarations.append((
                 component_id, "duplicates", 1,
                 str(component.kind) != "literal",
@@ -235,6 +215,7 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
     from .identity_concordance import Derived, Mode, current_identity_book
     from .monotonic_ids import GLOBAL_MONOTONIC_IDS
     from .string_table import string_token
+    from .glyph_sequence_format import quoted_string_glyph_tokens
 
     book = current_identity_book()
     recipes = []
@@ -303,8 +284,11 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
                     f"StringTable concordance entry is not text: {row!r}"
                 )
             entry_cells.append(entry_cell)
-            spelling = repr(word) if mode == "repr" else str(word)
-            glyphs = tuple(string_token(character) for character in spelling)
+            glyphs = (
+                tuple(quoted_string_glyph_tokens(word))
+                if mode == "repr"
+                else tuple(string_token(character) for character in word)
+            )
             vocabulary_rows.append((int(token), -1, len(glyphs)))
             vocabulary_rows.extend(
                 (int(token), int(ordinal), int(glyph))
@@ -377,11 +361,12 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
             )
         vocabulary_rows = []
         for member in enum_fact.members:
-            spelling = (
-                repr(str(member.member_identity))
-                if mode == "repr" else str(member.member_identity)
+            member_name = str(member.member_identity)
+            glyphs = (
+                tuple(quoted_string_glyph_tokens(member_name))
+                if mode == "repr"
+                else tuple(string_token(character) for character in member_name)
             )
-            glyphs = tuple(string_token(character) for character in spelling)
             vocabulary_rows.append((
                 int(member.runtime_value), -1, len(glyphs),
             ))

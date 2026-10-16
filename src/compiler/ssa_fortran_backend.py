@@ -2657,7 +2657,16 @@ class _FunctionEmitter:
             and instr.res is not None
         ):
             return None
-        if any(_is_array(self._typed(argument)) for argument in instr.args):
+        sequence_arguments = {
+            int(item["position"]): dict(item)
+            for item in instr.attributes.get(
+                "external_argument_sequences", ()
+            )
+        }
+        if any(
+            _is_array(self._typed(argument)) and position not in sequence_arguments
+            for position, argument in enumerate(instr.args)
+        ):
             return None
         from .shell_external_references import external_reference_thunk_symbol
 
@@ -2682,7 +2691,30 @@ class _FunctionEmitter:
                     f"sequence descriptor with status: value={instr.res.id}"
                 )
             self.array_base_ids.add(int(descriptor.column_value_ids[0]))
-            operands = [self._operand(argument) for argument in instr.args]
+            operands = []
+            for position, argument in enumerate(instr.args):
+                sequence = sequence_arguments.get(position)
+                if sequence is None:
+                    operands.append(self._operand(argument))
+                    continue
+                argument_descriptor = self.sequence_table.by_id(
+                    int(sequence["sequence_id"])
+                )
+                if (
+                    argument_descriptor is None
+                    or len(argument_descriptor.column_value_ids) != 1
+                    or tuple(argument_descriptor.column_dtypes) != ("int64",)
+                ):
+                    raise FortranEmissionError(
+                        "UTF-8 external result call has an unrepresented "
+                        f"sequence argument at position {position}"
+                    )
+                data_id = int(argument_descriptor.column_value_ids[0])
+                self.array_base_ids.add(data_id)
+                operands.extend((
+                    f"t{data_id}",
+                    f"t{int(argument_descriptor.length_address_id)}",
+                ))
             operands.extend((
                 f"t{int(descriptor.column_value_ids[0])}",
                 f"t{int(descriptor.length_address_id)}",
@@ -2691,7 +2723,33 @@ class _FunctionEmitter:
             ))
             return [f"    call {symbol}({', '.join(operands)})"]
         self._locals[int(instr.res.id)] = self._typed(instr.res)
-        operands = [self._operand(argument) for argument in instr.args]
+        operands = []
+        for position, argument in enumerate(instr.args):
+            sequence = sequence_arguments.get(position)
+            if sequence is None:
+                operands.append(self._operand(argument))
+                continue
+            descriptor = (
+                None if self.sequence_table is None
+                else self.sequence_table.by_id(int(sequence["sequence_id"]))
+            )
+            if descriptor is None or len(descriptor.column_value_ids) != 1:
+                raise FortranEmissionError(
+                    "external sequence argument requires one exact resident "
+                    f"column: position={position} value={int(argument.id)}"
+                )
+            if tuple(descriptor.column_dtypes) != ("int64",):
+                raise FortranEmissionError(
+                    "external text/bytes argument requires an exact int64 "
+                    f"resident column: sequence={descriptor.sequence_id} "
+                    f"dtypes={tuple(descriptor.column_dtypes)!r}"
+                )
+            data_id = int(descriptor.column_value_ids[0])
+            self.array_base_ids.add(data_id)
+            operands.extend((
+                f"t{data_id}",
+                f"t{int(descriptor.length_address_id)}",
+            ))
         return [
             f"    call {symbol}({', '.join((*operands, _name(instr.res)))})"
         ]
@@ -2718,6 +2776,12 @@ class _FunctionEmitter:
                     continue
                 seen.add(symbol)
                 values = (*instr.args, instr.res)
+                sequence_arguments = {
+                    int(item["position"]): dict(item)
+                    for item in instr.attributes.get(
+                        "external_argument_sequences", ()
+                    )
+                }
                 if instr.attributes.get("external_result_sequence") == "utf8":
                     descriptor = (
                         None if self.sequence_table is None
@@ -2733,18 +2797,44 @@ class _FunctionEmitter:
                             "UTF-8 external interface has no exact resident "
                             f"sequence descriptor: value={instr.res.id}"
                         )
-                    argument_names = tuple(
-                        f"a{index}" for index in range(len(instr.args))
-                    )
+                    argument_names = []
+                    argument_declarations = []
+                    for position, value in enumerate(instr.args):
+                        sequence = sequence_arguments.get(position)
+                        if sequence is None:
+                            name = f"a{position}"
+                            argument_names.append(name)
+                            argument_declarations.append(
+                                f"        {_DTYPE_KIND.get(str(self._typed(value).dtype or self.dtype), 'real(c_double)')} :: {name}"
+                            )
+                            continue
+                        argument_descriptor = self.sequence_table.by_id(
+                            int(sequence["sequence_id"])
+                        )
+                        if (
+                            argument_descriptor is None
+                            or len(argument_descriptor.column_value_ids) != 1
+                            or tuple(argument_descriptor.column_dtypes)
+                            != ("int64",)
+                        ):
+                            raise FortranEmissionError(
+                                "UTF-8 external result interface has an "
+                                "unrepresented sequence argument at position "
+                                f"{position}"
+                            )
+                        data_name = f"a{position}_data"
+                        length_name = f"a{position}_length"
+                        argument_names.extend((data_name, length_name))
+                        argument_declarations.extend((
+                            f"        integer(c_int64_t) :: {data_name}(*)",
+                            f"        integer(c_int64_t) :: {length_name}",
+                        ))
                     interfaces.extend((
                         "    interface",
                         f"      subroutine {symbol}({', '.join((*argument_names, 'result_data', 'result_length', 'result_capacity', 'result_status'))}) "
                         f"bind(C, name=\"{symbol}\")",
                         "        use, intrinsic :: iso_c_binding",
-                        *(
-                            f"        {_DTYPE_KIND.get(str(self._typed(value).dtype or self.dtype), 'real(c_double)')} :: {name}"
-                            for name, value in zip(argument_names, instr.args)
-                        ),
+                        *argument_declarations,
                         "        integer(c_int64_t) :: result_data(*)",
                         "        integer(c_int64_t) :: result_length",
                         "        integer(c_int64_t) :: result_capacity",
@@ -2753,18 +2843,50 @@ class _FunctionEmitter:
                         "    end interface",
                     ))
                     continue
-                if any(_is_array(self._typed(value)) for value in values):
+                if any(
+                    _is_array(self._typed(value))
+                    and position not in sequence_arguments
+                    for position, value in enumerate(instr.args)
+                ) or _is_array(self._typed(instr.res)):
                     continue
-                names = tuple(f"a{index}" for index in range(len(values)))
+                argument_names = []
+                argument_declarations = []
+                for position, value in enumerate(instr.args):
+                    sequence = sequence_arguments.get(position)
+                    if sequence is None:
+                        name = f"a{position}"
+                        argument_names.append(name)
+                        argument_declarations.append(
+                            f"        {_DTYPE_KIND.get(str(self._typed(value).dtype or self.dtype), 'real(c_double)')} :: {name}"
+                        )
+                        continue
+                    descriptor = (
+                        None if self.sequence_table is None
+                        else self.sequence_table.by_id(
+                            int(sequence["sequence_id"])
+                        )
+                    )
+                    if descriptor is None or len(descriptor.column_value_ids) != 1:
+                        raise FortranEmissionError(
+                            "external sequence interface lacks one exact "
+                            f"resident column: position={position}"
+                        )
+                    data_name = f"a{position}_data"
+                    length_name = f"a{position}_length"
+                    argument_names.extend((data_name, length_name))
+                    argument_declarations.extend((
+                        f"        integer(c_int64_t) :: {data_name}(*)",
+                        f"        integer(c_int64_t) :: {length_name}",
+                    ))
+                result_name = f"a{len(instr.args)}"
+                names = (*argument_names, result_name)
                 interfaces.extend((
                     "    interface",
                     f"      subroutine {symbol}({', '.join(names)}) "
                     f"bind(C, name=\"{symbol}\")",
                     "        use, intrinsic :: iso_c_binding",
-                    *(
-                        f"        {_DTYPE_KIND.get(str(self._typed(value).dtype or self.dtype), 'real(c_double)')} :: {name}"
-                        for name, value in zip(names, values)
-                    ),
+                    *argument_declarations,
+                    f"        {_DTYPE_KIND.get(str(self._typed(instr.res).dtype or self.dtype), 'real(c_double)')} :: {result_name}",
                     f"      end subroutine {symbol}",
                     "    end interface",
                 ))
@@ -4593,6 +4715,11 @@ def emit_module(
         if isinstance(module, IRModule)
         else {}
     )
+    module_value_union_tables = (
+        dict(getattr(module, "value_union_tables", {}))
+        if isinstance(module, IRModule)
+        else {}
+    )
     functions = (
         module.functions if isinstance(module, IRModule) else dict(module)
     )
@@ -6209,6 +6336,16 @@ def emit_module(
                         )
                         for argument in instruction.args
                     ],
+                    "argument_sequences": [
+                        {
+                            "position": int(item["position"]),
+                            "sequence_id": int(item["sequence_id"]),
+                            "encoding": str(item["encoding"]),
+                        }
+                        for item in instruction.attributes.get(
+                            "external_argument_sequences", ()
+                        )
+                    ],
                     "keyword_names": list(map(
                         str,
                         instruction.attributes.get("keyword_names") or (),
@@ -6374,6 +6511,17 @@ def emit_module(
                 for function_name, table in module_record_tables.items()
                 if function_name in functions and table.records
             },
+            "value_union_table_schema": (
+                "turing.repository-ssa-value-union-table.v1"
+            ),
+            "value_union_tables": {
+                function_name: [
+                    descriptor.to_mapping()
+                    for descriptor in table.unions.values()
+                ]
+                for function_name, table in module_value_union_tables.items()
+                if function_name in functions and table.unions
+            },
         },
     )
     _phase("Fortran source generation done")
@@ -6464,6 +6612,47 @@ def compile_module(
     shim_sources = standalone_runtime_shim_sources(
         compiler, workdir, standalone
     )
+    external_thunks = tuple(
+        (getattr(module, "api", None).metadata or {}).get(
+            "external_reference_thunks", ()
+        )
+        if getattr(module, "api", None) is not None else ()
+    )
+    native_external_sources: tuple[str, ...] = ()
+    native_external_libraries: tuple[str, ...] = ()
+    native_thunks = tuple(
+        thunk for thunk in external_thunks
+        if str(thunk.get("native_abi") or "") != "cpython-c-api"
+    )
+    if native_thunks:
+        from .shell_external_references import (
+            emit_native_external_reference_adapter,
+        )
+
+        adapter_path = workdir / f"{module.name}.native-external.c"
+        adapter_path.write_text(
+            emit_native_external_reference_adapter(native_thunks),
+            encoding="utf-8",
+        )
+        native_external_sources = (str(adapter_path),)
+        if any(
+            str(thunk.get("native_abi") or "") == "turing-liblzma-v1"
+            for thunk in native_thunks
+        ):
+            toolchain = Path(compiler).parent.parent
+            liblzma = next((
+                candidate for candidate in (
+                    toolchain / "lib" / "liblzma.a",
+                    toolchain / "lib" / "liblzma.dll.a",
+                )
+                if candidate.is_file()
+            ), None)
+            if liblzma is None:
+                raise FortranEmissionError(
+                    "turing-liblzma-v1 requires the selected native "
+                    "toolchain's declared liblzma import/static library"
+                )
+            native_external_libraries = (str(liblzma),)
     if shim_sources and os.name == "nt":
         # GCC's LTO plugin publishes the shim's weak PE symbol as a different
         # symbol type from the archive reference.  Compile this small static
@@ -6476,9 +6665,11 @@ def compile_module(
         *(() if sys.platform == "win32" else ("-fPIC",)),
         *compile_flags,
         str(source),
+        *native_external_sources,
         *shim_sources,
         "-o",
         str(library),
+        *native_external_libraries,
         *link_flags,
     ]
 

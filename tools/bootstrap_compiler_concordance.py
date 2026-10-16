@@ -85,7 +85,6 @@ def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None
         raise ValueError('unsupported provenance scheduling options')
     scheduling = {'adaptive_memory_ceiling': True, 'max_total_resident_bytes': 10 << 30,
                   **scheduling}
-    import src.compiler.identity_concordance as incumbent
     from src.common.tensors.accelerator_backends.aot_checkpoint import (
         AOTCheckpointStore, callable_digest,
     )
@@ -104,11 +103,23 @@ def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None
     destination.mkdir(parents=True, exist_ok=True)
     source_path = root / 'src/compiler/identity_concordance.py'
     source = source_path.read_text(encoding='utf-8')
+    source_module = 'src.compiler.identity_concordance'
+    python_package = 'src.compiler'
     policy = with_expansion_policy(active_contract(), {
         'unroll_depth': 0, 'inline_depth': 0, 'custom_version_depth': 0,
     })
-    contract = ExtractionContract(root / 'extraction_contracts/program_extraction.yaml').with_execution_file(
-        root / 'extraction_contracts/vehicle_full_native_execution.yaml')
+    contract = (
+        ExtractionContract(
+            root / 'extraction_contracts/program_extraction.yaml'
+        )
+        .with_execution_file(
+            root / 'extraction_contracts/vehicle_full_native_execution.yaml'
+        )
+        .with_sources(((
+            'src.compiler.concordance_declarations',
+            root / 'src/compiler/concordance_declarations.py',
+        ),))
+    )
     receipt = {
         'schema': 'turing.compiler-concordance-compartment.v1',
         'source': source_path.as_posix(),
@@ -212,9 +223,9 @@ def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None
                     if not plan_path.exists():
                         planned = compile_partitioned_source(
                             source, growth_root, entrypoint=None, extraction_contract=contract,
-                            python_bindings=vars(incumbent), ssa_composition=True, plan_only=True,
-                            source_options={'source_module': incumbent.__name__,
-                                            'python_package': incumbent.__package__,
+                            ssa_composition=True, plan_only=True,
+                            source_options={'source_module': source_module,
+                                            'python_package': python_package,
                                             'runtime_closure_only': False,
                                             'identity_log_level': 'summary'},
                             progress=growth_report,
@@ -245,8 +256,8 @@ def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None
                     module, outputs, exports = load_composed_source_units(product)
                 else:
                     module, outputs, exports = lower_ast_source_to_ssa(
-                        source, None, source_module=incumbent.__name__,
-                        python_package=incumbent.__package__, python_bindings=vars(incumbent),
+                        source, None, source_module=source_module,
+                        python_package=python_package,
                         name='compiler_identity_concordance', runtime_closure_only=False,
                         extraction_contract=contract, progress=report, identity_log_level='summary',
                         compilation_unit_plan_sink=plan_sink, resolved_process_graph_sink=graph_sink,

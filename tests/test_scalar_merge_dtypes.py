@@ -44,6 +44,33 @@ def test_mixed_representation_phi_is_not_implicitly_reinterpreted():
     assert backedge.dtype == 'int64'
 
 
+def test_accepted_component_keeps_its_owner_settlement_off_ambient_book():
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    value = SSAValue(1, 'int32')
+    function = Function('accepted', [], {'entry': BasicBlock('entry', [
+        Instr('Const', [], value, attributes={'value': 1}),
+        Instr('Ret', [value], None),
+    ])})
+    owner, owner_token = begin_identity_book()
+    try:
+        function.metadata['accepted_ssa_component'] = {
+            'schema': 'turing.accepted-ssa-component.v1',
+            'artifact_sha256': 'accepted-fixture',
+            'identity_book': owner,
+        }
+    finally:
+        end_identity_book(owner_token)
+
+    ambient, ambient_token = begin_identity_book()
+    try:
+        _propagate_scalar_dtypes({function.name: function})
+        assert value.dtype == 'int32'
+        assert not ambient.page('scalar_integer_width').rows()
+    finally:
+        end_identity_book(ambient_token)
+
+
 @pytest.mark.parametrize('literal,dtype', [(0, 'int64'), (False, 'bool'), (0.0, 'float64')])
 def test_folded_while_seed_retains_authored_literal_representation(literal, dtype):
     from src.compiler.control_source import ControlProgram, ControlExpression, SequenceBlock, WhileBlock

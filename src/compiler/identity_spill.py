@@ -79,7 +79,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from itertools import chain
 from operator import itemgetter
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
+
+if TYPE_CHECKING:
+    from .identity_concordance import IdentityPage
 
 #: The six tables of an ``IdentityPage`` that a spill deletes from the
 #: instance; reading any of them reloads the page.
@@ -136,7 +139,7 @@ class Segment:
     raw: int              # bytes of the pickle stream (uncompressed)
     cells: int
     rows: int
-    ordinals: Any = None
+    ordinals: Iterable[int] | None = None
 
 
 # ------------------------------------------------------------------ pickling
@@ -394,7 +397,11 @@ def _post_receipt(
 
 # --------------------------------------------------------- private partitions
 def _detached_ordinals(page: Any) -> list:
-    detached = page.__dict__.get("_detached")
+    # ``_detached`` is deliberately private dynamic page state.  State its
+    # physical value-record contract at the read boundary so the compiler can
+    # carry the exact Segment identity through ``values()``; the eager value
+    # and storage representation are unchanged.
+    detached: dict[str, Segment] | None = page.__dict__.get("_detached")
     if not detached:
         return []
     return sorted(chain.from_iterable(
@@ -455,7 +462,9 @@ def _reindex_in_place(page: Any) -> None:
             columns.sort(key=positions.__getitem__)
 
 
-def _replace_cells(page: Any, items: Iterable[tuple[Any, Any, Any]]) -> None:
+def _replace_cells(
+    page: IdentityPage, items: Iterable[tuple[Any, Any, Any]],
+) -> None:
     """Make a private page hold exactly ``items`` (key, fact, stamp), in that
     order, in its existing dicts."""
 

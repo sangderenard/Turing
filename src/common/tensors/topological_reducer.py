@@ -41,7 +41,9 @@ from ...compiler.concordance_declarations import (
     BindingFact as _BindingFact,
     CALLABLE_IDENTITY as _CALLABLE_IDENTITY,
     CLASS_DECLARATION as _CLASS_DECLARATION,
+    CLASS_SUBTYPE as _CLASS_SUBTYPE,
     CLASS_FIELD_DECLARATION as _CLASS_FIELD_DECLARATION,
+    CLASS_METHOD_DECLARATION as _CLASS_METHOD_DECLARATION,
     FUNCTION_ADDRESS as _FUNCTION_ADDRESS,
     FUNCTION_SUBGRAPH as _FUNCTION_SUBGRAPH,
     HELPER_CALLER_UNROUTED as _HELPER_CALLER_UNROUTED,
@@ -60,12 +62,17 @@ from ...compiler.concordance_declarations import (
     SOURCE_ENUM_GLYPH_TABLE as _SOURCE_ENUM_GLYPH_TABLE,
     SOURCE_PAGE_FACT_CLASS as _SOURCE_PAGE_FACT_CLASS,
     SOURCE_PYTHON_IDENTITY as _SOURCE_PYTHON_IDENTITY,
+    SOURCE_SPAN as _SOURCE_SPAN,
     SourceGlyphComponent as _SourceGlyphComponent,
+    SourceGlyphUnionAlternative as _SourceGlyphUnionAlternative,
     SourceGlyphSequence as _SourceGlyphSequence,
     SourceAggregateLayout as _SourceAggregateLayout,
     SourceAggregateMember as _SourceAggregateMember,
     SourcePageFactClass as _SourcePageFactClass,
     SOURCE_VALUE_CLASS as _SOURCE_VALUE_CLASS,
+    STATIC_SYMBOL_DEFINITION as _STATIC_SYMBOL_DEFINITION,
+    StaticSymbolFact as _StaticSymbolFact,
+    StaticSymbolKind as _StaticSymbolKind,
     SYNTHESIZED_NO_SOURCE as _SYNTHESIZED_NO_SOURCE,
     ValueKind as _ValueKind,
 )
@@ -411,18 +418,11 @@ def _record_numeric_annotation_descriptors(graph: Any) -> dict[str, Any]:
 
 def _canonical_source_class_identity(class_identity: Any) -> str:
     """One concordance identity for the primitive classes Python aliases."""
+    from ...compiler.concordance_declarations import (
+        canonical_python_type_identity,
+    )
 
-    identity = str(class_identity)
-    return {
-        "builtins.bool": "bool",
-        "<class 'bool'>": "bool",
-        "builtins.float": "float",
-        "<class 'float'>": "float",
-        "builtins.int": "int",
-        "<class 'int'>": "int",
-        "builtins.str": "str",
-        "<class 'str'>": "str",
-    }.get(identity, identity)
+    return canonical_python_type_identity(class_identity)
 
 
 def _concord_source_value_class(
@@ -4120,12 +4120,40 @@ def _normalize_lexical_values(
     # rows``.  The module-level page declaration fact owns both the fact
     # class and the ordered row-key ABI; calls below retain its cell instead
     # of rebuilding either from a local variable name.
-    borrowed_page_bindings: dict[
-        str, tuple[str, _Ref, tuple[tuple[str, str], ...]]
-    ] = {}
+    borrowed_page_bindings: dict[str, _Ref] = {}
+    # An aggregate field can acquire its tuple layout from the exact Page key
+    # position that consumes it. Keep the receiver/field identity so a later
+    # occurrence (including a repr projection synthesized below) reads the
+    # same declaration cell instead of copying a guessed tuple schema.
+    page_key_field_schemas: dict[tuple[int, str], _Ref] = {}
     declared_pages = dict(
         graph.G.graph.get("declared_page_fact_classes") or {}
     )
+    declared_page_bindings = dict(
+        graph.G.graph.get("declared_page_bindings") or {}
+    )
+
+    def source_page_declaration(cell: Any) -> _SourcePageFactClass | None:
+        """Resolve one Page value through its authoritative source cell."""
+
+        if not isinstance(cell, _Ref) or cell.page != _SOURCE_PAGE_FACT_CLASS:
+            return None
+        book = current_identity_book()
+        if book.latest_ref(_SOURCE_PAGE_FACT_CLASS, cell.row) != cell:
+            return None
+        fact = book.page(_SOURCE_PAGE_FACT_CLASS).cell(
+            cell.row, cell.column,
+        )
+        if not isinstance(fact, _SourcePageFactClass):
+            return None
+        if (
+            len(cell.row) != 2
+            or str(cell.row[1]) != str(fact.page_name)
+            or not str(fact.class_identity)
+            or not isinstance(fact.row_fields, tuple)
+        ):
+            return None
+        return fact
     for owner in ast.walk(statement):
         if not isinstance(owner, (ast.With, ast.AsyncWith)):
             continue
@@ -4143,7 +4171,41 @@ def _normalize_lexical_values(
                 continue
             declared = declared_pages.get(str(context.args[0].value))
             if declared is not None:
-                borrowed_page_bindings[str(item.optional_vars.id)] = declared
+                declaration_cell = declared[1]
+                if source_page_declaration(declaration_cell) is not None:
+                    borrowed_page_bindings[str(item.optional_vars.id)] = (
+                        declaration_cell
+                    )
+    page_key_binding_field_schemas: dict[tuple[str, str], _Ref] = {}
+    ambiguous_page_key_binding_fields: set[tuple[str, str]] = set()
+    for candidate in ast.walk(statement):
+        if not (
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Attribute)
+            and candidate.func.attr == "latest"
+            and isinstance(candidate.func.value, ast.Name)
+            and len(candidate.args) == 1
+            and isinstance(candidate.args[0], ast.Attribute)
+            and isinstance(candidate.args[0].value, ast.Name)
+        ):
+            continue
+        declaration_cell = borrowed_page_bindings.get(
+            candidate.func.value.id
+        )
+        if source_page_declaration(declaration_cell) is None:
+            continue
+        field_key = (
+            str(candidate.args[0].value.id),
+            str(candidate.args[0].attr),
+        )
+        incumbent = page_key_binding_field_schemas.get(field_key)
+        if field_key in ambiguous_page_key_binding_fields:
+            continue
+        if incumbent is not None and incumbent != declaration_cell:
+            page_key_binding_field_schemas.pop(field_key, None)
+            ambiguous_page_key_binding_fields.add(field_key)
+        else:
+            page_key_binding_field_schemas[field_key] = declaration_cell
 
     def post_source_literal_glyph_sequence(node_id: int) -> Any:
         """Publish one authored string literal before graph rewriting.
@@ -5008,6 +5070,20 @@ def _normalize_lexical_values(
             "binding_name": name,
             "binding_kind": binding_kind,
         }
+        source_page_cell = declared_page_bindings.get(str(name))
+        page_declaration = source_page_declaration(source_page_cell)
+        if page_declaration is not None:
+            # This free name is not an unexplained host object.  It is the
+            # value authored by the exact module-level ``declare_page`` call
+            # whose concordance cell is retained here.  ``Page`` is already
+            # a ProgramABI record; name it as such so ordinary call/record
+            # propagation carries the source declaration through every
+            # function/SCC cut without reading the live Python object.
+            attributes.update({
+                "result_class_ref": "Page",
+                "program_abi_record_identity": "Page",
+                "source_page_declaration_cell": source_page_cell,
+            })
         class_identity = parameter_class_names.get(name)
         numeric_descriptor = parameter_numeric_descriptors.get(name)
         annotation_cell = current_identity_book().latest_ref(
@@ -5083,6 +5159,8 @@ def _normalize_lexical_values(
             attributes=attributes,
             source_cell=(
                 argument_span if argument_span is not None
+                else source_page_cell
+                if page_declaration is not None
                 else _occurrence_cell(graph, occurrence)
             ),
         )
@@ -5117,6 +5195,16 @@ def _normalize_lexical_values(
                     cell for cell in (annotation_cell, input_cell, argument_span)
                     if cell is not None
                 )),
+            )
+        if page_declaration is not None:
+            _concord_source_value_class(
+                value_class_scope,
+                value,
+                "Page",
+                source="authored source page declaration",
+                provenance=_Derived(tuple(filter(None, (
+                    source_page_cell, input_cell,
+                )))),
             )
         return value
 
@@ -5662,6 +5750,47 @@ def _normalize_lexical_values(
             )
         return ()
 
+    def iterated_record_identities(
+        iterator_value: int | None,
+    ) -> tuple[str | None, str | None]:
+        """Records retained on the exact iterable ancestry."""
+
+        mapping_value_record = None
+        sequence_value_record = None
+        pending = (
+            [int(iterator_value)]
+            if isinstance(iterator_value, int) else []
+        )
+        visited: set[int] = set()
+        while pending and (
+            mapping_value_record is None
+            and sequence_value_record is None
+        ):
+            candidate = pending.pop()
+            if candidate in visited or candidate not in graph.G:
+                continue
+            visited.add(candidate)
+            candidate_data = graph.G.nodes[candidate]
+            candidate_attributes = candidate_data.get("attributes") or {}
+            mapping_value_record = candidate_attributes.get(
+                "mapping_value_record"
+            )
+            sequence_value_record = candidate_attributes.get(
+                "sequence_value_record"
+            )
+            if (
+                mapping_value_record is None
+                and sequence_value_record is None
+            ):
+                pending.extend(
+                    int(parent)
+                    for parent, role in candidate_data.get("parents", ())
+                    if str(role) in {
+                        "operand", "value", "base", "object", "receiver",
+                    }
+                )
+        return mapping_value_record, sequence_value_record
+
     restored_literal_nodes: dict[int, int] = {}
 
     def post_source_sort_contract(call_id: int, call: ast.Call) -> None:
@@ -5871,6 +6000,33 @@ def _normalize_lexical_values(
         def contains(root: ast.AST, sought: ast.AST) -> bool:
             return any(member is sought for member in ast.walk(root))
 
+        receiver_attributes = (
+            graph.G.nodes[int(receiver_id)].get("attributes") or {}
+            if int(receiver_id) in graph.G else {}
+        )
+        optional_class = receiver_attributes.get(
+            "optional_result_class_ref"
+        )
+        declaration_cell = receiver_attributes.get(
+            "source_page_declaration_cell"
+        )
+        declaration = source_page_declaration(declaration_cell)
+        if declaration is None:
+            optional_class = None
+
+        def rejects_optional_absence(test: ast.AST) -> bool:
+            return (
+                optional_class is not None
+                and isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == binding
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Is)
+                and len(test.comparators) == 1
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value is None
+            )
+
         def guard(test: ast.AST):
             positive = True
             if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
@@ -5918,6 +6074,16 @@ def _normalize_lexical_values(
                                     ),
                                 )))),
                             )
+                        elif rejects_optional_absence(member.test):
+                            carried = (
+                                str(optional_class),
+                                tuple(dict.fromkeys(filter(None, (
+                                    node_identity_cell(
+                                        graph, id(member.test),
+                                    ),
+                                    declaration_cell,
+                                )))),
+                            )
                     continue
                 if isinstance(member, ast.If):
                     matched = guard(member.test)
@@ -5962,39 +6128,36 @@ def _normalize_lexical_values(
         if refined[0] is not None:
             return refined
 
-        receiver_attributes = (
-            graph.G.nodes[int(receiver_id)].get("attributes") or {}
-            if int(receiver_id) in graph.G else {}
-        )
-        optional_class = receiver_attributes.get(
-            "optional_result_class_ref"
-        )
         if optional_class is None:
             return None, ()
         for candidate in ast.walk(statement):
             if not isinstance(candidate, ast.BoolOp) or not isinstance(
-                candidate.op, ast.Or,
+                candidate.op, (ast.And, ast.Or),
             ):
                 continue
             for ordinal, value in enumerate(candidate.values):
                 if ordinal == 0 or not contains(value, target):
                     continue
                 earlier = candidate.values[:ordinal]
-                none_test = next((
+                none_comparison = next((
                     item for item in earlier
                     if isinstance(item, ast.Compare)
                     and isinstance(item.left, ast.Name)
                     and item.left.id == binding
                     and len(item.ops) == 1
-                    and isinstance(item.ops[0], ast.Is)
+                    and isinstance(
+                        item.ops[0],
+                        ast.IsNot if isinstance(candidate.op, ast.And)
+                        else ast.Is,
+                    )
                     and len(item.comparators) == 1
                     and isinstance(item.comparators[0], ast.Constant)
                     and item.comparators[0].value is None
                 ), None)
-                if none_test is None:
+                if none_comparison is None:
                     continue
                 return str(optional_class), tuple(dict.fromkeys(filter(None, (
-                    node_identity_cell(graph, id(none_test)),
+                    node_identity_cell(graph, id(none_comparison)),
                     receiver_attributes.get("source_page_declaration_cell"),
                 ))))
         return None, ()
@@ -6428,7 +6591,7 @@ def _normalize_lexical_values(
                     })
             return node_id if node_id in graph.G else None
         if isinstance(expression, ast.comprehension):
-            resolve_expression(expression.iter)
+            iterator_value = resolve_expression(expression.iter)
             bind_loop_target(expression.target)
             node_id = id(expression)
             if node_id in graph.G:
@@ -6438,6 +6601,30 @@ def _normalize_lexical_values(
                     name: environment[name]
                     for name in loop_target_names(expression.target)
                 }
+            mapping_value_record, sequence_value_record = (
+                iterated_record_identities(iterator_value)
+            )
+            target_value = (
+                loop_target_bindings_by_ast.get(id(expression.target))
+                if isinstance(expression.target, ast.Name) else None
+            )
+            if target_value is not None and target_value in graph.G:
+                target_attributes = graph.G.nodes[target_value].setdefault(
+                    "attributes", {}
+                )
+                if (
+                    mapping_value_record is not None
+                    and isinstance(expression.iter, ast.Call)
+                    and isinstance(expression.iter.func, ast.Attribute)
+                    and expression.iter.func.attr == "values"
+                ):
+                    target_attributes["result_class_ref"] = str(
+                        mapping_value_record
+                    )
+                elif sequence_value_record is not None:
+                    target_attributes["result_class_ref"] = str(
+                        sequence_value_record
+                    )
             for condition in expression.ifs:
                 resolve_expression(condition)
             return node_id if node_id in graph.G else None
@@ -7031,6 +7218,50 @@ def _normalize_lexical_values(
                 refined_annotation = str(getattr(
                     refined_field_fact, "annotation", "",
                 )).rsplit(".", 1)[-1]
+                declared_field_class = None
+                if declared_receiver_field is not None:
+                    declared_aggregate = str(
+                        declared_receiver_field.get("aggregate_kind") or ""
+                    ).casefold()
+                    declared_dtype = str(
+                        declared_receiver_field.get("dtype") or ""
+                    ).casefold()
+                    declared_field_class = {
+                        "str": "builtins.str",
+                        "bool": "builtins.bool",
+                        "int": "builtins.int",
+                        "int32": "builtins.int",
+                        "int64": "builtins.int",
+                        "float": "builtins.float",
+                        "float32": "builtins.float",
+                        "float64": "builtins.float",
+                    }.get(declared_aggregate) or {
+                        "bool": "builtins.bool",
+                        "int": "builtins.int",
+                        "int32": "builtins.int",
+                        "int64": "builtins.int",
+                        "float": "builtins.float",
+                        "float32": "builtins.float",
+                        "float64": "builtins.float",
+                    }.get(declared_dtype)
+                if declared_field_class is not None:
+                    field_class_sources = tuple(dict.fromkeys(filter(None, (
+                        node_identity_cell(graph, int(attribute_id)),
+                        *tuple(refinement_cells),
+                    ))))
+                    graph.G.nodes[attribute_id].setdefault(
+                        "attributes", {}
+                    )["result_class_ref"] = declared_field_class
+                    _concord_source_value_class(
+                        value_class_scope,
+                        int(attribute_id),
+                        declared_field_class,
+                        source="source Page fact field ABI",
+                        provenance=(
+                            _Derived(field_class_sources)
+                            if field_class_sources else None
+                        ),
+                    )
                 if refined_annotation == "str":
                     # A declared string field is a runtime string-token value,
                     # even though its physical column is int64.  Publish the
@@ -7142,9 +7373,14 @@ def _normalize_lexical_values(
                         "sequence_column_count": (
                             2 if field_kind == "dict" else 1
                         ),
-                        "sequence_writable": field_kind not in {
-                            "tuple", "frozenset", "bytes",
-                        },
+                        "sequence_writable": (
+                            bool(declared_receiver_field.get("mutable", False))
+                            if declared_receiver_field is not None
+                            and "mutable" in declared_receiver_field
+                            else field_kind not in {
+                                "tuple", "frozenset", "bytes", "str",
+                            }
+                        ),
                         "record_field": (
                             str(receiver_class), str(expression.attr)
                         ),
@@ -7155,6 +7391,31 @@ def _normalize_lexical_values(
                             "sequence_value_record": str(sequence_record),
                         } if sequence_record is not None else {}),
                         **mapping_contract,
+                    })
+                page_key_cell = page_key_field_schemas.get((
+                    int(receiver), str(expression.attr),
+                ))
+                if (
+                    page_key_cell is None
+                    and isinstance(expression.value, ast.Name)
+                ):
+                    page_key_cell = page_key_binding_field_schemas.get((
+                        str(expression.value.id), str(expression.attr),
+                    ))
+                page_key_declaration = source_page_declaration(page_key_cell)
+                if page_key_declaration is not None:
+                    # This field was consumed earlier as the exact key of the
+                    # declared Page. Every later read of the same field-state
+                    # row therefore has that Page's key tuple layout. The Ref,
+                    # not this graph view, remains the schema authority.
+                    graph.G.nodes[attribute_id].setdefault(
+                        "attributes", {}
+                    ).update({
+                        "aggregate_kind": "tuple",
+                        "source_tuple_row_fields": tuple(
+                            page_key_declaration.row_fields
+                        ),
+                        "source_page_declaration_cell": page_key_cell,
                     })
                 # An ordinary attribute access on a resolved receiver is a
                 # real reference-operator node -- ``_replace_inputs`` above
@@ -7308,6 +7569,9 @@ def _normalize_lexical_values(
                         "source_python_identity_concordance"
                     )
                     identity_row = (value_class_scope, int(node_id))
+                    call_attributes[
+                        "source_python_identity_row"
+                    ] = identity_row
                     identity_incumbent = identity_page.latest(identity_row)
                     if (
                         identity_incumbent is not None
@@ -7497,10 +7761,18 @@ def _normalize_lexical_values(
                 for index, argument in enumerate(expression.args):
                     resolved = resolve_expression(argument)
                     if isinstance(resolved, _StaticPythonReference):
-                        static_arguments[f"arg:{index}"] = resolved.path
+                        role = f"arg:{index}"
+                        static_arguments[role] = resolved.path
                         attributes.setdefault(
                             "static_call_values", {}
-                        )[f"arg:{index}"] = resolved.value
+                        )[role] = resolved.value
+                        definition_cell = _static_symbol_definition_cell(
+                            resolved.value
+                        )
+                        if definition_cell is not None:
+                            attributes.setdefault(
+                                "static_call_definition_cells", {}
+                            )[role] = definition_cell
                         graph.G.graph.setdefault(
                             "static_python_values", {}
                         )[resolved.path] = resolved.value
@@ -7518,10 +7790,18 @@ def _normalize_lexical_values(
                         continue
                     resolved = resolve_expression(keyword.value)
                     if isinstance(resolved, _StaticPythonReference):
-                        static_arguments[f"kw:{keyword.arg}"] = resolved.path
+                        role = f"kw:{keyword.arg}"
+                        static_arguments[role] = resolved.path
                         attributes.setdefault(
                             "static_call_values", {}
-                        )[f"kw:{keyword.arg}"] = resolved.value
+                        )[role] = resolved.value
+                        definition_cell = _static_symbol_definition_cell(
+                            resolved.value
+                        )
+                        if definition_cell is not None:
+                            attributes.setdefault(
+                                "static_call_definition_cells", {}
+                            )[role] = definition_cell
                         graph.G.graph.setdefault(
                             "static_python_values", {}
                         )[resolved.path] = resolved.value
@@ -7566,12 +7846,20 @@ def _normalize_lexical_values(
                         )
                     ):
                         static_arguments[role] = argument.id
+                        static_type = getattr(builtins, argument.id)
                         attributes.setdefault(
                             "static_call_values", {}
-                        )[role] = getattr(builtins, argument.id)
+                        )[role] = static_type
+                        definition_cell = _static_symbol_definition_cell(
+                            static_type
+                        )
+                        if definition_cell is not None:
+                            attributes.setdefault(
+                                "static_call_definition_cells", {}
+                            )[role] = definition_cell
                         graph.G.graph.setdefault(
                             "static_python_values", {}
-                        )[argument.id] = getattr(builtins, argument.id)
+                        )[argument.id] = static_type
                 if static_arguments:
                     attributes["static_call_arguments"] = static_arguments
                 for role, argument in (
@@ -7695,23 +7983,65 @@ def _normalize_lexical_values(
                     graph, node_id, tuple(resolved_inputs),
                     fork_from=receiver_fork or None,
                 )
+                if call_attributes.get("extraction_identity") == "builtins.len":
+                    # The extraction contract identifies this operation as
+                    # Python's resident leading-dimension intrinsic.  Its
+                    # result is therefore the authored integer consumed by
+                    # both scalar control and glyph formatting.  Publish the
+                    # class at the call while the exact intrinsic node still
+                    # owns that identity; waiting for SSA scalar lowering is
+                    # too late for JoinedStr recipe construction.
+                    call_attributes["result_class_ref"] = "int"
+                    graph.G.nodes[node_id]["tensor"] = {
+                        "shape": (), "dtype": "int64",
+                    }
+                    call_sources = tuple(filter(None, (
+                        node_identity_cell(graph, int(node_id)),
+                    )))
+                    _concord_source_value_class(
+                        value_class_scope,
+                        int(node_id),
+                        "int",
+                        source="builtins.len intrinsic result",
+                        provenance=(
+                            _Derived(call_sources) if call_sources else None
+                        ),
+                    )
+                page_declaration_cell = None
+                if isinstance(expression.func, ast.Attribute):
+                    if (
+                        isinstance(expression.func.value, ast.Name)
+                        and expression.func.value.id in borrowed_page_bindings
+                    ):
+                        page_declaration_cell = borrowed_page_bindings[
+                            expression.func.value.id
+                        ]
+                    if page_declaration_cell is None:
+                        receiver_id = next((
+                            int(parent)
+                            for parent, role in resolved_inputs
+                            if str(role) == "operand" and int(parent) in graph.G
+                        ), None)
+                        if receiver_id is not None:
+                            page_declaration_cell = (
+                                graph.G.nodes[receiver_id].get("attributes")
+                                or {}
+                            ).get("source_page_declaration_cell")
+                page_declaration = source_page_declaration(
+                    page_declaration_cell
+                )
                 if (
-                    isinstance(expression.func, ast.Attribute)
-                    and isinstance(expression.func.value, ast.Name)
-                    and expression.func.value.id in borrowed_page_bindings
+                    page_declaration is not None
                     and expression.func.attr in {"rows", "latest"}
                 ):
-                    (
-                        page_fact_class, page_declaration_cell,
-                        page_row_fields,
-                    ) = borrowed_page_bindings[expression.func.value.id]
+                    page_fact_class = str(page_declaration.class_identity)
+                    page_row_fields = tuple(page_declaration.row_fields)
                     page_attributes = graph.G.nodes[node_id].setdefault(
                         "attributes", {}
                     )
-                    page_attributes.update({
-                        "source_page_declaration_cell": page_declaration_cell,
-                        "source_page_row_fields": tuple(page_row_fields),
-                    })
+                    page_attributes[
+                        "source_page_declaration_cell"
+                    ] = page_declaration_cell
                     if expression.func.attr == "rows":
                         page_attributes.update({
                             "producer_kind": "page_rows",
@@ -7731,6 +8061,40 @@ def _normalize_lexical_values(
                         page_attributes["optional_result_class_ref"] = str(
                             page_fact_class
                         )
+                        key_value_id = next((
+                            int(parent)
+                            for parent, role in resolved_inputs
+                            if str(role) == "arg:0" and int(parent) in graph.G
+                        ), None)
+                        if key_value_id is not None:
+                            key_attributes = graph.G.nodes[
+                                key_value_id
+                            ].setdefault("attributes", {})
+                            key_attributes.update({
+                                "aggregate_kind": "tuple",
+                                "source_tuple_row_fields": tuple(
+                                    page_row_fields
+                                ),
+                                "source_page_declaration_cell": (
+                                    page_declaration_cell
+                                ),
+                            })
+                            key_receiver_id = next((
+                                int(parent)
+                                for parent, role in graph.G.nodes[
+                                    key_value_id
+                                ].get("parents") or ()
+                                if str(role) == "value" and int(parent) in graph.G
+                            ), None)
+                            key_field = key_attributes.get("record_field")
+                            if (
+                                key_receiver_id is not None
+                                and isinstance(key_field, tuple)
+                                and len(key_field) == 2
+                            ):
+                                page_key_field_schemas[(
+                                    int(key_receiver_id), str(key_field[1]),
+                                )] = page_declaration_cell
                 if (
                     isinstance(expression.func, ast.Attribute)
                     and expression.func.attr == "sort"
@@ -7957,6 +8321,56 @@ def _normalize_lexical_values(
                 graph.G.nodes[base_id].get("attributes") or {}
                 if isinstance(base_id, int) and base_id in graph.G else {}
             )
+            base_class_cell = (
+                current_identity_book().latest_ref(
+                    _SOURCE_VALUE_CLASS,
+                    (value_class_scope, int(base_id)),
+                )
+                if isinstance(base_id, int) else None
+            )
+            base_class_fact = (
+                None if base_class_cell is None else
+                current_identity_book().page(_SOURCE_VALUE_CLASS).cell(
+                    base_class_cell.row, base_class_cell.column,
+                )
+            )
+            if (
+                isinstance(expression.slice, ast.Slice)
+                and isinstance(base_class_fact, tuple)
+                and base_class_fact
+                and str(base_class_fact[0]) == "str"
+            ):
+                # Slicing an authored string produces another resident string
+                # sequence.  Carry the exact source-value class across the
+                # existing base/index edges so f-string materialization can
+                # extend from the slice itself instead of inventing a scalar
+                # formatter or rejecting it as producerless.
+                projected = graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                )
+                projected.update({
+                    "result_class_ref": "str",
+                    "producer_kind": "string_slice",
+                    "aggregate_kind": "list",
+                    "sequence_key_columns": (),
+                    "sequence_column_count": 1,
+                    "sequence_writable": True,
+                    "sequence_element_dtypes": ("int64",),
+                    "resident_string_sequence": True,
+                })
+                slice_sources = tuple(filter(None, (
+                    node_identity_cell(graph, int(node_id)),
+                    base_class_cell,
+                )))
+                _concord_source_value_class(
+                    value_class_scope,
+                    int(node_id),
+                    "str",
+                    source="authored string slice",
+                    provenance=(
+                        _Derived(slice_sources) if slice_sources else None
+                    ),
+                )
             partition_index = (
                 int(expression.slice.value)
                 if isinstance(expression.slice, ast.Constant)
@@ -7971,8 +8385,15 @@ def _normalize_lexical_values(
             mapping_value_record = base_attributes.get(
                 "mapping_value_record"
             )
-            page_row_fields = tuple(
-                base_attributes.get("source_page_row_fields", ())
+            page_declaration_cell = base_attributes.get(
+                "source_page_declaration_cell"
+            )
+            page_declaration = source_page_declaration(
+                page_declaration_cell
+            )
+            page_row_fields = (
+                () if page_declaration is None
+                else tuple(page_declaration.row_fields)
             )
             page_column = (
                 int(expression.slice.value)
@@ -7994,21 +8415,9 @@ def _normalize_lexical_values(
                     "source_page_row_field": (
                         str(field_name), str(field_kind), int(page_column),
                     ),
-                    "source_page_declaration_cell": base_attributes.get(
-                        "source_page_declaration_cell"
-                    ),
+                    "source_page_declaration_cell": page_declaration_cell,
                 })
-                if str(field_kind) == "SCOPE":
-                    projected.update({
-                        "aggregate_kind": "tuple",
-                        "sequence_key_columns": (),
-                        "sequence_column_count": 2,
-                        "sequence_writable": False,
-                        "source_tuple_row_fields": (
-                            ("label", "LABEL"), ("serial", "INDEX"),
-                        ),
-                    })
-                elif str(field_kind) in {"INDEX", "VALUE_ID"}:
+                if str(field_kind) in {"INDEX", "VALUE_ID"}:
                     graph.G.nodes[node_id]["tensor"] = {
                         "shape": (), "dtype": "int64",
                     }
@@ -8225,8 +8634,41 @@ def _normalize_lexical_values(
 
             def branch_class_refinement(
                 target: ast.AST, binding: str,
+                *, optional_identity: str | None = None,
+                optional_declaration_cell: _Ref | None = None,
             ) -> tuple[str | None, tuple[_Ref, ...]]:
                 """Exact class proof owned by the target's control arm."""
+
+                def none_test(
+                    test: ast.AST,
+                ) -> tuple[bool | None, ast.Compare | None]:
+                    """Whether ``binding`` is proven present by ``test``.
+
+                    The bool is true for ``is not None`` and false for
+                    ``is None``. A leading conjunct owns the same proof for
+                    the body because later conjuncts execute only after it.
+                    """
+
+                    candidates = (
+                        tuple(test.values)
+                        if isinstance(test, ast.BoolOp)
+                        and isinstance(test.op, ast.And)
+                        else (test,)
+                    )
+                    for candidate in candidates:
+                        if not (
+                            isinstance(candidate, ast.Compare)
+                            and isinstance(candidate.left, ast.Name)
+                            and candidate.left.id == binding
+                            and len(candidate.ops) == 1
+                            and isinstance(candidate.ops[0], (ast.Is, ast.IsNot))
+                            and len(candidate.comparators) == 1
+                            and isinstance(candidate.comparators[0], ast.Constant)
+                            and candidate.comparators[0].value is None
+                        ):
+                            continue
+                        return isinstance(candidate.ops[0], ast.IsNot), candidate
+                    return None, None
 
                 def terminating(block: list[ast.stmt]) -> bool:
                     return bool(block) and isinstance(
@@ -8269,6 +8711,40 @@ def _normalize_lexical_values(
                                     return class_identity, tuple(
                                         dict.fromkeys(filter(None, (
                                             condition_cell, class_cell,
+                                        )))
+                                    )
+                                present, condition = none_test(member.test)
+                                if (
+                                    optional_identity is not None
+                                    and condition is not None
+                                    and (
+                                        in_body and present is True
+                                        or in_else and present is False
+                                    )
+                                ):
+                                    return str(optional_identity), tuple(
+                                        dict.fromkeys(filter(None, (
+                                            node_identity_cell(
+                                                graph, id(condition),
+                                            ),
+                                            optional_declaration_cell,
+                                        )))
+                                    )
+                                if (
+                                    optional_identity is not None
+                                    and class_identity == optional_identity
+                                    and in_body and not positive
+                                ):
+                                    # Page.latest admits exactly its declared
+                                    # fact class or absence. Its negative
+                                    # isinstance arm is therefore the literal
+                                    # None arm, not an open runtime union.
+                                    return "builtins.NoneType", tuple(
+                                        dict.fromkeys(filter(None, (
+                                            node_identity_cell(
+                                                graph, id(member.test),
+                                            ),
+                                            optional_declaration_cell,
                                         )))
                                     )
                                 nested = walk_block(
@@ -8436,6 +8912,46 @@ def _normalize_lexical_values(
                     record_identity=None,
                 )
 
+            def optional_or_absence_owner(
+                target: ast.AST, binding: str,
+            ) -> tuple[ast.If, ast.Compare] | None:
+                """The exact short-circuit absence edge owning ``target``.
+
+                In ``if value is None or mismatch(value):`` the body does not
+                prove ``value`` present.  A repr in that body therefore needs
+                a nested resident-sequence conditional.  Retain the authored
+                comparison itself as the predicate; do not turn the enclosing
+                OR into a class assertion.
+                """
+
+                for candidate in ast.walk(statement):
+                    if not (
+                        isinstance(candidate, ast.If)
+                        and isinstance(candidate.test, ast.BoolOp)
+                        and isinstance(candidate.test.op, ast.Or)
+                        and any(
+                            contains_source(member, target)
+                            for member in candidate.body
+                        )
+                    ):
+                        continue
+                    for predicate in candidate.test.values:
+                        if (
+                            isinstance(predicate, ast.Compare)
+                            and isinstance(predicate.left, ast.Name)
+                            and predicate.left.id == binding
+                            and len(predicate.ops) == 1
+                            and isinstance(predicate.ops[0], ast.Is)
+                            and len(predicate.comparators) == 1
+                            and isinstance(
+                                predicate.comparators[0], ast.Constant,
+                            )
+                            and predicate.comparators[0].value is None
+                            and id(predicate) in graph.G
+                        ):
+                            return candidate, predicate
+                return None
+
             source_components = (
                 tuple(expression.values)
                 if isinstance(expression, ast.JoinedStr)
@@ -8597,31 +9113,34 @@ def _normalize_lexical_values(
                     expression.args[0]
                     if lone_string_projection else component.value
                 )
-                # A source constant has an exact Python repr at reduction
-                # time.  Publish that spelling directly in the authored
-                # component recipe; the runtime boundary below is reserved
-                # for values whose representation is genuinely unresolved.
+                # Closed source literals use the compiler's authored glyph
+                # formatter.  Never ask the host interpreter for ``repr``:
+                # an unsupported literal remains on the ordinary resident
+                # value path and is refused unless that path has a producer.
                 if (
                     isinstance(component, ast.FormattedValue)
                     and int(component.conversion) == ord("r")
                     and component.format_spec is None
                     and isinstance(source_operand, ast.Constant)
                 ):
-                    spelling = repr(source_operand.value)
-                    components.append(_SourceGlyphComponent(
-                        kind="literal",
-                        component_value_id=component_value_id,
-                        operand_value_id=operand_value_id,
-                        glyph_tokens=tuple(
-                            int(string_token(character))
-                            for character in spelling
-                        ),
-                        conversion=ord("r"),
-                        format_spec_value_id=None,
-                        projection_kind="literal",
-                        record_identity=None,
-                    ))
-                    continue
+                    from ...compiler.glyph_sequence_format import (
+                        static_literal_repr_glyph_tokens,
+                    )
+                    literal_glyphs = static_literal_repr_glyph_tokens(
+                        source_operand.value
+                    )
+                    if literal_glyphs is not None:
+                        components.append(_SourceGlyphComponent(
+                            kind="literal",
+                            component_value_id=component_value_id,
+                            operand_value_id=operand_value_id,
+                            glyph_tokens=tuple(map(int, literal_glyphs)),
+                            conversion=ord("r"),
+                            format_spec_value_id=None,
+                            projection_kind="literal",
+                            record_identity=None,
+                        ))
+                        continue
                 enum_name_cell = None
                 enum_name_value_id = None
                 enum_name_identity = None
@@ -8700,7 +9219,21 @@ def _normalize_lexical_values(
                 if refinement_binding is not None:
                     refinement_identity, refinement_cells = (
                         branch_class_refinement(
-                            component, str(refinement_binding),
+                            component,
+                            str(refinement_binding),
+                            optional_identity=(
+                                str(operand_attributes[
+                                    "optional_result_class_ref"
+                                ])
+                                if operand_attributes.get(
+                                    "optional_result_class_ref"
+                                ) is not None else None
+                            ),
+                            optional_declaration_cell=(
+                                operand_attributes.get(
+                                    "source_page_declaration_cell"
+                                )
+                            ),
                         )
                     )
                     if refinement_identity is None:
@@ -8770,6 +9303,12 @@ def _normalize_lexical_values(
                     source_operand, ast.Name,
                 ):
                     declared_identity = refinement_identity
+                if declared_identity == "builtins.NoneType":
+                    components.append(projected_literal_component(
+                        "None", *refinement_cells,
+                    ))
+                    component_sources.extend(refinement_cells)
+                    continue
                 field_annotation = None
                 if (
                     isinstance(source_operand, ast.Attribute)
@@ -8796,6 +9335,14 @@ def _normalize_lexical_values(
                         field_annotation = str(getattr(
                             field_fact, "annotation", "",
                         ))
+                        field_is_tuple = any(
+                            part in {
+                                "tuple", "builtins.tuple", "<class'tuple'>",
+                            }
+                            for part in field_annotation.replace(
+                                " ", ""
+                            ).split("|")
+                        )
                         component_sources.append(field_cell)
                         if field_annotation in {
                             "str", "builtins.str", "<class 'str'>",
@@ -8858,6 +9405,123 @@ def _normalize_lexical_values(
                 projection_names = ()
                 projection_value_ids = ()
                 projection_components = ()
+
+                def declared_page_tuple_projection(
+                    tuple_value_id: int,
+                    tuple_value_cell: _Ref,
+                    declaration_cell: _Ref,
+                    row_fields: tuple[tuple[str, str], ...],
+                ) -> tuple[tuple[int, ...], tuple[_SourceGlyphComponent, ...]]:
+                    """Project one Page key only through its declaration Ref."""
+
+                    declaration = source_page_declaration(declaration_cell)
+                    if (
+                        declaration is None
+                        or tuple(declaration.row_fields) != tuple(row_fields)
+                    ):
+                        raise ValueError(
+                            "Page tuple glyph projection lacks its exact "
+                            "declaration-owned row schema"
+                        )
+                    values = []
+                    recipe = [projected_literal_component(
+                        "(", tuple_value_cell, declaration_cell,
+                    )]
+                    for ordinal, (field_name, field_kind) in enumerate(
+                        row_fields
+                    ):
+                        if ordinal:
+                            recipe.append(projected_literal_component(
+                                ", ", declaration_cell,
+                            ))
+                        index_id = new_node(
+                            "Const", "tuple projection index",
+                            attributes={
+                                "value": int(ordinal),
+                                "value_kind": "scalar",
+                            },
+                            source_cell=(declaration_cell,),
+                        )
+                        graph.G.nodes[int(index_id)]["tensor"] = {
+                            "shape": (), "dtype": "int64",
+                        }
+                        field_id = new_node(
+                            "Indexed", f"tuple[{ordinal}]",
+                            attributes={
+                                "source_type": "Subscript",
+                                "producer_kind": "page_scope_projection",
+                                "source_tuple_row_field": (
+                                    str(field_name), str(field_kind),
+                                    int(ordinal),
+                                ),
+                                "value_kind": "scalar",
+                            },
+                            parents=(
+                                (int(tuple_value_id), "base"),
+                                (int(index_id), "index"),
+                            ),
+                            source_cell=(tuple_value_cell, declaration_cell),
+                        )
+                        graph.G.nodes[int(field_id)]["tensor"] = {
+                            "shape": (), "dtype": "int64",
+                        }
+                        values.append(int(field_id))
+                        kind = (
+                            "string_token"
+                            if str(field_kind) in {"LABEL", "NAME"}
+                            else "scalar"
+                        )
+                        formatter_id = None
+                        if kind == "scalar" and str(field_kind) in {
+                            "INDEX", "VALUE_ID",
+                        }:
+                            formatter = next((
+                                entry for entry in function_table
+                                if str(entry.qualified_name) == (
+                                    "src.compiler.glyph_sequence_format."
+                                    "decimal_integer_glyph_tokens"
+                                )
+                            ), None)
+                            if formatter is not None:
+                                formatter_id = new_node(
+                                    "Call", "decimal_integer_glyph_tokens",
+                                    attributes={
+                                        "callee_ref": int(
+                                            formatter.reference.address
+                                        ),
+                                        "callee_resolution": (
+                                            "source-glyph-formatter"
+                                        ),
+                                        "producer_kind": (
+                                            "formatted_glyph_sequence"
+                                        ),
+                                        "aggregate_kind": "list",
+                                        "sequence_key_columns": (),
+                                        "sequence_column_count": 1,
+                                        "sequence_writable": True,
+                                        "sequence_element_dtypes": ("int64",),
+                                    },
+                                    parents=((int(field_id), "arg:0"),),
+                                    source=component,
+                                    source_cell=(declaration_cell,),
+                                )
+                        recipe.append(_SourceGlyphComponent(
+                            kind="formatted",
+                            component_value_id=int(field_id),
+                            operand_value_id=int(field_id), glyph_tokens=(),
+                            conversion=ord("r"), format_spec_value_id=None,
+                            projection_kind=kind, record_identity=None,
+                            formatted_sequence_value_id=formatter_id,
+                        ))
+                    if len(row_fields) == 1:
+                        recipe.append(projected_literal_component(
+                            ",", declaration_cell,
+                        ))
+                    recipe.append(projected_literal_component(
+                        ")", tuple_value_cell, declaration_cell,
+                    ))
+                    return tuple(values), tuple(recipe)
+
                 if projection_kind == "record":
                     record = class_table.get(str(record_identity)) or {}
                     projection_names = tuple(map(str, record.get(
@@ -8898,6 +9562,14 @@ def _normalize_lexical_values(
                         field_annotation = str(getattr(
                             field_fact, "annotation", "",
                         ))
+                        field_is_tuple = any(
+                            part in {
+                                "tuple", "builtins.tuple", "<class'tuple'>",
+                            }
+                            for part in field_annotation.replace(
+                                " ", ""
+                            ).split("|")
+                        )
                         field_id = new_node(
                             "GetAttr", f"getattr[{field_name}]",
                             attributes={
@@ -8914,8 +9586,37 @@ def _normalize_lexical_values(
                                 else {}),
                             },
                             parents=((int(operand_value_id), "value"),),
+                            source=component,
                             source_cell=(operand_cell, field_cell),
                         )
+                        page_key_cell = page_key_field_schemas.get((
+                            int(operand_value_id), str(field_name),
+                        ))
+                        if (
+                            page_key_cell is None
+                            and refinement_binding is not None
+                        ):
+                            page_key_cell = (
+                                page_key_binding_field_schemas.get((
+                                    str(refinement_binding), str(field_name),
+                                ))
+                            )
+                        page_key_declaration = source_page_declaration(
+                            page_key_cell
+                        )
+                        if (
+                            page_key_declaration is not None
+                            and field_is_tuple
+                        ):
+                            graph.G.nodes[int(field_id)].setdefault(
+                                "attributes", {}
+                            ).update({
+                                "aggregate_kind": "tuple",
+                                "source_tuple_row_fields": tuple(
+                                    page_key_declaration.row_fields
+                                ),
+                                "source_page_declaration_cell": page_key_cell,
+                            })
                         if field_annotation in {"int", "builtins.int"}:
                             graph.G.nodes[int(field_id)]["tensor"] = {
                                 "shape": (), "dtype": "int64",
@@ -8934,9 +9635,7 @@ def _normalize_lexical_values(
                             "string_token" if field_annotation in {
                                 "str", "builtins.str", "<class 'str'>",
                             }
-                            else "tuple" if field_annotation in {
-                                "tuple", "builtins.tuple", "<class 'tuple'>",
-                            }
+                            else "tuple" if field_is_tuple
                             else "record" if field_annotation in class_table
                             else "scalar"
                         )
@@ -8969,6 +9668,7 @@ def _normalize_lexical_values(
                                         "sequence_element_dtypes": ("int64",),
                                     },
                                     parents=((int(field_id), "arg:0"),),
+                                    source=component,
                                     source_cell=(field_cell,),
                                 )
                         projected_components.append(_SourceGlyphComponent(
@@ -9005,50 +9705,33 @@ def _normalize_lexical_values(
                     runtime_projection = bool(
                         not projection_value_ids and runtime_row_fields
                     )
+                    runtime_projection_components = ()
+                    authored_empty_tuple = (
+                        isinstance(operand_expression, ast.Tuple)
+                        and not operand_expression.elts
+                    )
+                    structured_projection = bool(
+                        projection_value_ids
+                        or runtime_row_fields
+                        or authored_empty_tuple
+                    )
                     if runtime_projection:
                         declaration_cell = operand_attributes.get(
                             "source_page_declaration_cell"
                         )
-                        if declaration_cell is None:
+                        # This tuple shape came from a Page row.  The Ref is
+                        # the authority that survived the graph cut; a copied
+                        # attribute is never enough to authorize projections.
+                        if source_page_declaration(declaration_cell) is None:
                             valid = False
                             break
-                        projected_values = []
-                        for field_ordinal, (field_name, field_kind) in enumerate(
-                            runtime_row_fields
-                        ):
-                            index_id = new_node(
-                                "Const", "tuple projection index",
-                                attributes={
-                                    "value": int(field_ordinal),
-                                    "value_kind": "scalar",
-                                },
-                                source_cell=(declaration_cell,),
-                            )
-                            graph.G.nodes[int(index_id)]["tensor"] = {
-                                "shape": (), "dtype": "int64",
-                            }
-                            field_id = new_node(
-                                "Indexed", f"tuple[{field_ordinal}]",
-                                attributes={
-                                    "source_type": "Subscript",
-                                    "producer_kind": "page_scope_projection",
-                                    "source_tuple_row_field": (
-                                        str(field_name), str(field_kind),
-                                        int(field_ordinal),
-                                    ),
-                                    "value_kind": "scalar",
-                                },
-                                parents=(
-                                    (int(operand_value_id), "base"),
-                                    (int(index_id), "index"),
-                                ),
-                                source_cell=(operand_cell, declaration_cell),
-                            )
-                            graph.G.nodes[int(field_id)]["tensor"] = {
-                                "shape": (), "dtype": "int64",
-                            }
-                            projected_values.append(int(field_id))
-                        projection_value_ids = tuple(projected_values)
+                        (
+                            projection_value_ids,
+                            runtime_projection_components,
+                        ) = declared_page_tuple_projection(
+                            int(operand_value_id), operand_cell,
+                            declaration_cell, runtime_row_fields,
+                        )
                     component_sources.extend(
                         cell
                         for value_id in projection_value_ids
@@ -9064,7 +9747,7 @@ def _normalize_lexical_values(
                             "elts", "elt", "element", "item", "value",
                         }
                     )
-                    if not runtime_projection and (
+                    if structured_projection and not runtime_projection and (
                         len(leaf_positions) != len(projection_value_ids)
                         or any(
                             parent_id != value_id
@@ -9089,11 +9772,14 @@ def _normalize_lexical_values(
                         component_sources.append(position_cell)
                     if not valid:
                         break
-                    projected_components = [
-                        projected_literal_component("(", operand_cell)
-                    ]
+                    projected_components = (
+                        list(runtime_projection_components)
+                        if runtime_projection else
+                        [projected_literal_component("(", operand_cell)]
+                        if structured_projection else []
+                    )
                     for leaf_ordinal, value_id in enumerate(
-                        projection_value_ids
+                        () if runtime_projection else projection_value_ids
                     ):
                         if leaf_ordinal:
                             projected_components.append(
@@ -9194,15 +9880,19 @@ def _normalize_lexical_values(
                                 else int(leaf_sequence_id)
                             ),
                         ))
-                    if len(projection_value_ids) == 1:
+                    if (
+                        structured_projection and not runtime_projection
+                        and len(projection_value_ids) == 1
+                    ):
                         projected_components.append(
                             projected_literal_component(",", operand_cell)
                         )
-                    projected_components.append(
-                        projected_literal_component(")", operand_cell)
-                    )
+                    if structured_projection and not runtime_projection:
+                        projected_components.append(
+                            projected_literal_component(")", operand_cell)
+                        )
                     projection_components = tuple(projected_components)
-                components.append(_SourceGlyphComponent(
+                formatted_component = _SourceGlyphComponent(
                     kind="formatted",
                     component_value_id=component_value_id,
                     operand_value_id=(
@@ -9226,6 +9916,164 @@ def _normalize_lexical_values(
                     projection_value_ids=projection_value_ids,
                     projection_components=projection_components,
                     enum_table_cell=enum_name_cell,
+                )
+                optional_dispatch = (
+                    optional_or_absence_owner(
+                        component, str(refinement_binding),
+                    )
+                    if (
+                        projection_kind == "record"
+                        and refinement_identity is None
+                        and refinement_binding is not None
+                        and isinstance(component, ast.FormattedValue)
+                        and int(component.conversion) == ord("r")
+                        and component.format_spec is None
+                        and operand_attributes.get(
+                            "optional_result_class_ref"
+                        ) == record_identity
+                        and source_page_declaration(
+                            operand_attributes.get(
+                                "source_page_declaration_cell"
+                            )
+                        ) is not None
+                    ) else None
+                )
+                if optional_dispatch is None:
+                    components.append(formatted_component)
+                    continue
+
+                owner_if, absence_test = optional_dispatch
+                declaration_cell = operand_attributes[
+                    "source_page_declaration_cell"
+                ]
+                absence_cell = node_identity_cell(graph, id(absence_test))
+                present_id = new_node(
+                    "FormattedGlyphSequence",
+                    "optional present glyph sequence",
+                    attributes={
+                        "producer_kind": "glyph_sequence",
+                        "aggregate_kind": "list",
+                        "sequence_key_columns": (),
+                        "sequence_column_count": 1,
+                        "sequence_writable": True,
+                        "sequence_element_dtypes": ("int64",),
+                    },
+                    source=component,
+                    source_cell=tuple(dict.fromkeys(filter(None, (
+                        component_cell, operand_cell, declaration_cell,
+                        absence_cell,
+                    )))),
+                )
+                present_fact = _SourceGlyphSequence(tuple(
+                    formatted_component.projection_components
+                ))
+                present_row = (ingestion_read_scope, int(present_id))
+                book.post(
+                    _SOURCE_GLYPH_SEQUENCE, present_row, present_fact,
+                    stage=_REDUCTION,
+                    provenance=_Derived(tuple(dict.fromkeys(filter(None, (
+                        node_identity_cell(graph, present_id),
+                        component_cell, operand_cell, declaration_cell,
+                        absence_cell,
+                    ))))),
+                    mode=_Mode.CONCORD,
+                )
+                graph.G.nodes[int(present_id)]["attributes"].update({
+                    "source_glyph_sequence_row": present_row,
+                })
+
+                absent_id = new_node(
+                    "FormattedGlyphSequence",
+                    "optional absent glyph sequence",
+                    attributes={
+                        "producer_kind": "literal_glyph_sequence",
+                        "aggregate_kind": "list",
+                        "sequence_key_columns": (),
+                        "sequence_column_count": 1,
+                        "sequence_writable": False,
+                        "sequence_element_dtypes": ("int64",),
+                    },
+                    source=component,
+                    source_cell=(declaration_cell, absence_cell),
+                )
+                absent_fact = _SourceGlyphSequence((_SourceGlyphComponent(
+                    kind="literal", component_value_id=int(absent_id),
+                    operand_value_id=None,
+                    glyph_tokens=tuple(
+                        int(string_token(character)) for character in "None"
+                    ),
+                    conversion=-1, format_spec_value_id=None,
+                    projection_kind="literal", record_identity=None,
+                ),))
+                absent_row = (ingestion_read_scope, int(absent_id))
+                book.post(
+                    _SOURCE_GLYPH_SEQUENCE, absent_row, absent_fact,
+                    stage=_REDUCTION,
+                    provenance=_Derived(tuple(dict.fromkeys(filter(None, (
+                        node_identity_cell(graph, absent_id), declaration_cell,
+                        absence_cell,
+                    ))))),
+                    mode=_Mode.CONCORD,
+                )
+                graph.G.nodes[int(absent_id)]["attributes"].update({
+                    "source_literal_glyph_sequence_row": absent_row,
+                })
+
+                def projection_tree(root):
+                    yield root
+                    for child in root.projection_components:
+                        yield from projection_tree(child)
+
+                present_components = tuple(
+                    item
+                    for root in formatted_component.projection_components
+                    for item in projection_tree(root)
+                )
+                present_callsites = tuple(dict.fromkeys(
+                    int(item.formatted_sequence_value_id)
+                    for item in present_components
+                    if item.formatted_sequence_value_id is not None
+                    and int(item.formatted_sequence_value_id) in graph.G
+                    and str((graph.G.nodes[
+                        int(item.formatted_sequence_value_id)
+                    ].get("attributes") or {}).get(
+                        "callee_resolution", ""
+                    )) == "source-glyph-formatter"
+                ))
+                present_projection_sequences = tuple(dict.fromkeys((
+                    int(present_id),
+                    *(
+                        int(item.component_value_id)
+                        for item in present_components
+                        if item.projection_components
+                        or (
+                            item.kind == "formatted"
+                            and item.projection_kind in {
+                                "string_token", "enum_name",
+                            }
+                        )
+                    ),
+                )))
+                graph.G.nodes[int(component_value_id)].setdefault(
+                    "attributes", {}
+                )["source_optional_glyph_dispatch"] = {
+                    "owner_conditional_id": int(id(owner_if)),
+                    "conditional_value_id": int(id(absence_test)),
+                    "present_value_id": int(present_id),
+                    "absent_value_id": int(absent_id),
+                    "present_callsite_ids": present_callsites,
+                    "present_projection_sequence_ids": (
+                        present_projection_sequences
+                    ),
+                    "predicate_expect_true": False,
+                    "source_page_declaration_cell": declaration_cell,
+                }
+                components.append(_dataclass_replace(
+                    formatted_component,
+                    projection_kind="optional_glyph_sequence",
+                    projection_names=(), projection_value_ids=(),
+                    projection_components=(),
+                    formatted_sequence_value_id=int(component_value_id),
                 ))
             if lone_string_projection and valid:
                 # ``str(aggregate)`` is itself the destination resident
@@ -9289,19 +10137,6 @@ def _normalize_lexical_values(
                         "prefixed_lower_hex_integer_glyph_tokens"
                     )
                 ), None)
-                utf8_decoder_entry = next((
-                    entry
-                    for entry in function_table
-                    if str(entry.qualified_name) == (
-                        "src.compiler.glyph_sequence_format."
-                        "utf8_repr_bytes_to_glyph_tokens"
-                    )
-                ), None)
-                runtime_repr_contract = dict(
-                    graph.G.graph.get(
-                        "runtime_repr_utf8_extraction_contract"
-                    ) or {}
-                )
                 rewritten_components = list(components)
                 if glyph_cell is not None:
                     for ordinal, component in enumerate(components):
@@ -9435,147 +10270,16 @@ def _normalize_lexical_values(
                                     format_spec_cell,
                                 )))),
                             )
-                        elif (
-                            component.projection_kind == "scalar"
-                            and component.format_spec_value_id is None
-                            and component.conversion == ord("r")
-                            and utf8_decoder_entry is not None
-                            and runtime_repr_contract.get("action")
-                            == "use_native"
-                            and dict(runtime_repr_contract.get(
-                                "parameters"
-                            ) or {}).get("result_dtype") == "utf8_sequence"
-                        ):
-                            source_expression = graph.G.nodes[
-                                int(component.component_value_id)
-                            ].get("expr_obj")
-                            synthetic_call = ast.Call(
-                                func=ast.Name(
-                                    id="runtime_repr_utf8", ctx=ast.Load(),
-                                ),
-                                args=[ast.Name(id="value", ctx=ast.Load())],
-                                keywords=[],
-                            )
-                            if source_expression is not None:
-                                ast.copy_location(
-                                    synthetic_call, source_expression,
-                                )
-                            synthetic_call._extraction_contract = dict(
-                                runtime_repr_contract
-                            )
-                            repr_bytes_id = new_node(
-                                "Call", "runtime_repr_utf8",
-                                attributes={
-                                    "extraction_action": "use_native",
-                                    "extraction_identity": str(
-                                        runtime_repr_contract["identity"]
-                                    ),
-                                    "extraction_contract": dict(
-                                        runtime_repr_contract
-                                    ),
-                                    "producer_kind": (
-                                        "aggregate_materialization"
-                                    ),
-                                    "aggregate_kind": "bytes",
-                                    "sequence_key_columns": (),
-                                    "sequence_column_count": 1,
-                                    "sequence_writable": True,
-                                    "sequence_element_dtypes": ("int64",),
-                                    "sequence_column_dtypes": ("int64",),
-                                    "source_glyph_component": (
-                                        row, int(ordinal),
-                                    ),
-                                },
-                                parents=((
-                                    int(component.operand_value_id), "arg:0",
-                                ),),
-                                source=source_expression,
-                                source_cell=tuple(dict.fromkeys(filter(None, (
-                                    glyph_cell,
-                                    node_identity_cell(
-                                        graph,
-                                        int(component.operand_value_id),
-                                    ),
-                                )))),
-                            )
-                            graph.G.nodes[int(repr_bytes_id)][
-                                "expr_obj"
-                            ] = synthetic_call
-                            graph.G.nodes[int(repr_bytes_id)][
-                                "extraction_contract"
-                            ] = dict(runtime_repr_contract)
-                            boundary = {
-                                "name": "runtime_repr_utf8",
-                                "line": getattr(
-                                    source_expression, "lineno", None,
-                                ),
-                                "column": getattr(
-                                    source_expression, "col_offset", None,
-                                ),
-                                "reason": "declared_boundary",
-                                "target_module": str(
-                                    runtime_repr_contract.get("module") or ""
-                                ),
-                                "target_qualname": str(
-                                    runtime_repr_contract.get("qualname") or ""
-                                ),
-                                "owner_name": graph.G.graph.get(
-                                    "function_name"
-                                ),
-                                "owner_source_identity": graph.G.graph.get(
-                                    "authored_function_identity"
-                                ),
-                                "extraction_contract": dict(
-                                    runtime_repr_contract
-                                ),
-                                "source_glyph_component": (
-                                    row, int(ordinal),
-                                ),
-                            }
-                            graph.G.graph[
-                                "extraction_boundary_calls"
-                            ] = tuple((
-                                *graph.G.graph.get(
-                                    "extraction_boundary_calls", ()
-                                ),
-                                boundary,
-                            ))
-                            repr_bytes_cell = node_identity_cell(
-                                graph, int(repr_bytes_id),
-                            )
-                            call_id = new_node(
-                                "Call",
-                                "utf8_repr_bytes_to_glyph_tokens",
-                                attributes={
-                                    "callee_ref": int(
-                                        utf8_decoder_entry.reference.address
-                                    ),
-                                    "callee_resolution": (
-                                        "source-glyph-utf8-decoder"
-                                    ),
-                                    "producer_kind": (
-                                        "formatted_glyph_sequence"
-                                    ),
-                                    "aggregate_kind": "list",
-                                    "sequence_key_columns": (),
-                                    "sequence_column_count": 1,
-                                    "sequence_writable": True,
-                                    "sequence_element_dtypes": ("int64",),
-                                    "sequence_column_dtypes": ("int64",),
-                                    "source_glyph_component": (
-                                        row, int(ordinal),
-                                    ),
-                                    "source_utf8_sequence_value_id": int(
-                                        repr_bytes_id
-                                    ),
-                                },
-                                parents=((int(repr_bytes_id), "arg:0"),),
-                                source=source_expression,
-                                source_cell=tuple(dict.fromkeys(filter(None, (
-                                    glyph_cell, repr_bytes_cell,
-                                )))),
-                            )
                         if call_id is None:
+                            # The recipe already has the only lossless native
+                            # representations admitted here: exact record and
+                            # tuple projections, resident StringTable tokens,
+                            # and the authored integer formatter.  An unknown
+                            # scalar ``!r`` has no representation fact.  Keep
+                            # it unresolved; calling a host interpreter would
+                            # replace the missing concordance edge with a
+                            # different runtime and make the product Python-
+                            # dependent.
                             continue
                         rewritten_components[ordinal] = _dataclass_replace(
                             component,
@@ -11481,9 +12185,19 @@ def _normalize_lexical_values(
                     if isinstance(iterator_value, int)
                     and int(iterator_value) in graph.G else {}
                 )
-                element_row_fields = tuple(
-                    iterator_attributes.get(
-                        "sequence_element_row_fields", ()
+                iterator_page_cell = iterator_attributes.get(
+                    "source_page_declaration_cell"
+                )
+                iterator_page_declaration = source_page_declaration(
+                    iterator_page_cell
+                )
+                element_row_fields = (
+                    tuple(iterator_page_declaration.row_fields)
+                    if iterator_page_declaration is not None
+                    else () if iterator_page_cell is not None else tuple(
+                        iterator_attributes.get(
+                            "sequence_element_row_fields", ()
+                        )
                     )
                 )
                 if (
@@ -11505,56 +12219,15 @@ def _normalize_lexical_values(
                             "sequence_key_columns": (),
                             "sequence_column_count": len(element_row_fields),
                             "sequence_writable": False,
-                            "source_page_row_fields": element_row_fields,
-                            "source_page_declaration_cell": (
-                                iterator_attributes.get(
-                                    "source_page_declaration_cell"
-                                )
-                            ),
+                            "source_page_declaration_cell": iterator_page_cell,
                         })
                 # ``for key, row in mapping.items()`` carries the mapping's
                 # declared value-record identity onto the exact row binding.
                 # The mapping field annotation is the authority; neither the
                 # loop variable's spelling nor a runtime sample is used.
-                mapping_value_record = None
-                sequence_value_record = None
-                pending_iterator_values = (
-                    [int(iterator_value)]
-                    if isinstance(iterator_value, int) else []
+                mapping_value_record, sequence_value_record = (
+                    iterated_record_identities(iterator_value)
                 )
-                visited_iterator_values: set[int] = set()
-                while pending_iterator_values and (
-                    mapping_value_record is None
-                    and sequence_value_record is None
-                ):
-                    candidate = pending_iterator_values.pop()
-                    if (
-                        candidate in visited_iterator_values
-                        or candidate not in graph.G
-                    ):
-                        continue
-                    visited_iterator_values.add(candidate)
-                    candidate_data = graph.G.nodes[candidate]
-                    mapping_value_record = (
-                        candidate_data.get("attributes") or {}
-                    ).get("mapping_value_record")
-                    sequence_value_record = (
-                        candidate_data.get("attributes") or {}
-                    ).get("sequence_value_record")
-                    if (
-                        mapping_value_record is None
-                        and sequence_value_record is None
-                    ):
-                        pending_iterator_values.extend(
-                            int(parent)
-                            for parent, role in candidate_data.get(
-                                "parents", ()
-                            )
-                            if str(role) in {
-                                "operand", "value", "base", "object",
-                                "receiver",
-                            }
-                        )
                 # ``IndexedStore`` publishes the mapping entry's ordered
                 # key operands and stored value as one immutable source
                 # aggregate fact.  Project that exact fact through
@@ -11696,6 +12369,26 @@ def _normalize_lexical_values(
                 ):
                     row_target = body_statement.target.elts[1]
                     row_value = loop_target_bindings_by_ast.get(id(row_target))
+                    if row_value is not None and row_value in graph.G:
+                        graph.G.nodes[row_value].setdefault(
+                            "attributes", {}
+                        )["result_class_ref"] = str(mapping_value_record)
+                if (
+                    mapping_value_record is not None
+                    and isinstance(body_statement.target, ast.Name)
+                    and isinstance(body_statement.iter, ast.Call)
+                    and isinstance(body_statement.iter.func, ast.Attribute)
+                    and body_statement.iter.func.attr == "values"
+                ):
+                    # ``for row in mapping.values()`` projects the same
+                    # declared value-record edge as the value member of
+                    # ``mapping.items()``.  The annotated mapping node is the
+                    # authority and the ``values`` call is the exact
+                    # projection; the target spelling contributes no type
+                    # information.
+                    row_value = loop_target_bindings_by_ast.get(
+                        id(body_statement.target)
+                    )
                     if row_value is not None and row_value in graph.G:
                         graph.G.nodes[row_value].setdefault(
                             "attributes", {}
@@ -12594,9 +13287,16 @@ def _normalize_lexical_values(
     mapping = {
         node_id: value_id for value_id, node_id in enumerate(ordered)
     }
-    relabeled = nx.relabel_nodes(graph.G, mapping, copy=True)
-    ordered_graph = live_digraph()
-    ordered_graph.graph.update(relabeled.graph)
+    # Canonical relabeling changes identities, so it necessarily builds a new
+    # topology. ``materialize_memory`` defers later layout products; it does
+    # not select the ProcessGraph topology implementation. Keep the relabeled
+    # authority in the same AbstractTensor memory-graph substrate in both
+    # modes instead of reopening the historical NetworkX storage bypass.
+    from ...transmogrifier.graph.memory_graph import BitTensorMemoryGraph
+
+    ordered_memory_graph = BitTensorMemoryGraph(size=0)
+    ordered_graph = ordered_memory_graph.G
+    ordered_graph.graph.update(graph.G.graph)
     ordered_graph.graph["canonical_value_ids"] = True
     # Renumbering changes the id space; a watermark from the AST-id
     # ingestion graph must not leak into canonical allocation.  Seed a new
@@ -12718,10 +13418,46 @@ def _normalize_lexical_values(
             provenance=_Derived((book.latest_ref(_CALLABLE_IDENTITY, row),)),
             mode=_Mode.REVISE,
         )
-    for value_id in range(len(mapping)):
-        ordered_graph.add_node(value_id, **relabeled.nodes[value_id])
-    ordered_graph.add_edges_from(relabeled.edges(data=True))
+    # ``source_python_identity_concordance`` is the exact resolved identity
+    # of a source call.  Its ingestion-id row must cross the same canonical
+    # rename as the call node; retaining only the copied node attributes
+    # isolates consumers from the concordance fact that authorized them.
+    python_identity_page = book.page(_SOURCE_PYTHON_IDENTITY)
+    canonical_python_identity_rows: dict[int, tuple[Any, int]] = {}
+    for row in tuple(python_identity_page.scope_rows(numeric_scope)):
+        source_node_id = int(row[1])
+        if source_node_id not in mapping:
+            continue
+        target_row = (numeric_scope, int(mapping[source_node_id]))
+        book.post(
+            _SOURCE_PYTHON_IDENTITY,
+            target_row,
+            python_identity_page.latest(row),
+            stage=_CANONICAL_RELABEL_STAGE,
+            provenance=_Derived((
+                book.latest_ref(_SOURCE_PYTHON_IDENTITY, row),
+                canonical_cells[source_node_id],
+            )),
+            mode=_Mode.REVISE,
+        )
+        canonical_python_identity_rows[source_node_id] = target_row
+    for node_id in ordered:
+        ordered_graph.add_node(
+            mapping[node_id], **graph.G.nodes[node_id].copy()
+        )
+        identity_row = canonical_python_identity_rows.get(node_id)
+        if identity_row is not None:
+            ordered_graph.nodes[mapping[node_id]].setdefault(
+                "attributes", {}
+            )["source_python_identity_row"] = identity_row
+    ordered_graph.add_edges_from(
+        (
+            mapping[source], mapping[target], attributes.copy()
+        )
+        for source, target, attributes in graph.G.edges(data=True)
+    )
     graph.G = ordered_graph
+    graph.MG = ordered_memory_graph
     graph.roots = [
         mapping[root] for root in graph.roots if root in mapping
     ]
@@ -12834,7 +13570,7 @@ def _normalize_lexical_values(
         if target_row == row and all(
             int(mapping[value_id]) == value_id for value_id in member_ids
         ):
-            relabeled.nodes[int(target_row[1])].setdefault(
+            ordered_graph.nodes[int(target_row[1])].setdefault(
                 "attributes", {}
             )["source_aggregate_layout_row"] = target_row
             continue
@@ -12865,7 +13601,7 @@ def _normalize_lexical_values(
             )))),
             mode=_Mode.CONCORD,
         )
-        relabeled.nodes[int(target_row[1])].setdefault(
+        ordered_graph.nodes[int(target_row[1])].setdefault(
             "attributes", {}
         )["source_aggregate_layout_row"] = target_row
     # Dynamic-string recipes are source facts over graph identities.  Carry
@@ -12898,31 +13634,20 @@ def _normalize_lexical_values(
                 component.format_spec_value_id,
                 *component.projection_value_ids,
                 component.formatted_sequence_value_id,
+                *(
+                    arm.sequence_value_id
+                    for arm in component.union_alternatives
+                ),
             ):
                 if value_id is not None:
                     yield int(value_id)
             for child in component.projection_components:
                 yield from glyph_component_value_ids(child)
 
-        def glyph_component_utf8_source_ids(component):
-            formatted_id = component.formatted_sequence_value_id
-            if formatted_id is not None and int(formatted_id) in mapping:
-                attributes = relabeled.nodes[
-                    int(mapping[int(formatted_id)])
-                ].get("attributes") or {}
-                source_id = attributes.get("source_utf8_sequence_value_id")
-                if source_id is not None:
-                    yield int(source_id)
-            for child in component.projection_components:
-                yield from glyph_component_utf8_source_ids(child)
-
         carried_value_ids = tuple(dict.fromkeys(
             value_id
             for component in source_fact.components
-            for value_id in (
-                *glyph_component_value_ids(component),
-                *glyph_component_utf8_source_ids(component),
-            )
+            for value_id in glyph_component_value_ids(component)
         ))
         missing_value_ids = tuple(
             value_id for value_id in carried_value_ids
@@ -12968,6 +13693,16 @@ def _normalize_lexical_values(
                     )])
                 ),
                 enum_table_cell=component.enum_table_cell,
+                union_alternatives=tuple(
+                    _SourceGlyphUnionAlternative(
+                        identity=str(arm.identity),
+                        sequence_value_id=int(mapping[int(
+                            arm.sequence_value_id
+                        )]),
+                        source_cells=tuple(arm.source_cells),
+                    )
+                    for arm in component.union_alternatives
+                ),
             )
         canonical_components = tuple(
             canonical_glyph_component(component)
@@ -12999,11 +13734,6 @@ def _normalize_lexical_values(
             )
             if value_id is not None and int(value_id) in canonical_cells
         )
-        provenance.extend(
-            canonical_cells[value_id]
-            for component in source_fact.components
-            for value_id in glyph_component_utf8_source_ids(component)
-        )
         book.post(
             _SOURCE_GLYPH_SEQUENCE,
             target_row,
@@ -13019,7 +13749,7 @@ def _normalize_lexical_values(
             and int(source_fact.components[0].component_value_id)
             == int(row[1])
         )
-        relabeled.nodes[int(mapping[row[1]])].setdefault(
+        ordered_graph.nodes[int(mapping[row[1]])].setdefault(
             "attributes", {}
         )[
             "source_literal_glyph_sequence_row"
@@ -13031,72 +13761,16 @@ def _normalize_lexical_values(
                 continue
             source_component = (row, int(ordinal))
             canonical_component = (target_row, int(ordinal))
-            relabeled.nodes[int(component.component_value_id)].setdefault(
+            ordered_graph.nodes[int(component.component_value_id)].setdefault(
                 "attributes", {}
             )["source_glyph_component"] = canonical_component
-            # External extraction is an occurrence contract.  Carry its
-            # exact component cell through the same canonical relabel as the
-            # producer nodes; leaving the ingestion row in this ledger would
-            # split one source occurrence across two identities.
-            boundaries = tuple(
-                graph.G.graph.get("extraction_boundary_calls", ())
-            )
-            if any(
-                boundary.get("source_glyph_component") == source_component
-                for boundary in boundaries
-            ):
-                graph.G.graph["extraction_boundary_calls"] = tuple(
-                    {
-                        **boundary,
-                        "source_glyph_component": canonical_component,
-                    }
-                    if boundary.get("source_glyph_component")
-                    == source_component
-                    else boundary
-                    for boundary in boundaries
-                )
             if component.formatted_sequence_value_id is not None:
-                formatted_attributes = relabeled.nodes[
+                formatted_attributes = ordered_graph.nodes[
                     int(component.formatted_sequence_value_id)
                 ].setdefault("attributes", {})
                 formatted_attributes[
                     "source_glyph_component"
                 ] = canonical_component
-                source_utf8_id = formatted_attributes.get(
-                    "source_utf8_sequence_value_id"
-                )
-                if source_utf8_id is not None:
-                    canonical_utf8_id = int(mapping[int(source_utf8_id)])
-                    formatted_attributes[
-                        "source_utf8_sequence_value_id"
-                    ] = canonical_utf8_id
-                    relabeled.nodes[canonical_utf8_id].setdefault(
-                        "attributes", {}
-                    )["source_glyph_component"] = canonical_component
-    # The extraction-boundary ledger is copied before node canonicalization.
-    # Its occurrence cell must therefore cross the final value-id map too;
-    # node attributes alone are not the boundary receipt consumed by the
-    # compilation-unit projection.
-    canonical_boundaries = []
-    for boundary in graph.G.graph.get("extraction_boundary_calls", ()):
-        source_component = boundary.get("source_glyph_component")
-        if source_component is None:
-            canonical_boundaries.append(boundary)
-            continue
-        source_row, ordinal = source_component
-        source_value_id = int(source_row[1])
-        if source_value_id not in mapping:
-            canonical_boundaries.append(boundary)
-            continue
-        canonical_boundaries.append({
-            **boundary,
-            "source_glyph_component": (
-                (read_scope, int(mapping[source_value_id])), int(ordinal),
-            ),
-        })
-    graph.G.graph["extraction_boundary_calls"] = tuple(
-        canonical_boundaries
-    )
     from ...compiler.concordance_declarations import (
         SOURCE_LITERAL_VALUE, SOURCE_SEQUENCE_MUTATION,
         SOURCE_SORT_CONTRACT, SourceSortContract,
@@ -13195,7 +13869,7 @@ def _normalize_lexical_values(
             provenance=_Derived(tuple(dict.fromkeys(provenance))),
             mode=_Mode.CONCORD,
         )
-        relabeled.nodes[int(mapping[int(row[1])])].setdefault(
+        ordered_graph.nodes[int(mapping[int(row[1])])].setdefault(
             "attributes", {}
         )["source_sort_contract_row"] = target_row
     # The reducer field-state and return-site pages (plan 70) follow the
@@ -13295,7 +13969,6 @@ def _normalize_lexical_values(
         call_attributes = call_data.get("attributes") or {}
         if call_attributes.get("callee_resolution") not in {
             "source-glyph-formatter",
-            "source-glyph-utf8-decoder",
         }:
             continue
         formatter_reference = int(call_attributes["callee_ref"])
@@ -13357,6 +14030,30 @@ def _normalize_lexical_values(
     for value_id, data in graph.G.nodes(data=True):
         data["value_id"] = value_id
         attributes = data.get("attributes") or {}
+        if "source_optional_glyph_dispatch" in attributes:
+            dispatch = dict(attributes["source_optional_glyph_dispatch"])
+            scalar_ids = (
+                "owner_conditional_id", "conditional_value_id",
+                "present_value_id", "absent_value_id",
+            )
+            if all(int(dispatch[key]) in mapping for key in scalar_ids):
+                for key in scalar_ids:
+                    dispatch[key] = int(mapping[int(dispatch[key])])
+                dispatch["present_callsite_ids"] = tuple(
+                    int(mapping[int(item)])
+                    for item in dispatch.get("present_callsite_ids", ())
+                    if int(item) in mapping
+                )
+                dispatch["present_projection_sequence_ids"] = tuple(
+                    int(mapping[int(item)])
+                    for item in dispatch.get(
+                        "present_projection_sequence_ids", ()
+                    )
+                    if int(item) in mapping
+                )
+                attributes["source_optional_glyph_dispatch"] = dispatch
+            else:
+                attributes.pop("source_optional_glyph_dispatch", None)
         if "loop_carried_bindings" in attributes:
             attributes["loop_carried_bindings"] = {
                 name: (mapping[initial], mapping[updated])
@@ -13565,6 +14262,75 @@ def _normalize_lexical_values(
                 int(value_id), None, inherited, int(value_id),
             )
         return None
+
+    # A Page.latest value used under ``value is None or ...`` has no authored
+    # Phi: the f-string exists wholly inside the outer true arm.  The reducer
+    # retained that exact comparison and the Page declaration on the merged
+    # formatted-value node.  Publish the same optional payload/presence
+    # contract used by ordinary Phis, with distinct present and literal-None
+    # resident sequences.  Control assembly will place the present recipe's
+    # calls and mutations inside a nested conditional owned by this cell.
+    for merged_id, merged_data in graph.G.nodes(data=True):
+        dispatch = (merged_data.get("attributes") or {}).get(
+            "source_optional_glyph_dispatch"
+        )
+        if not isinstance(dispatch, dict):
+            continue
+        present_id = int(dispatch["present_value_id"])
+        absent_id = int(dispatch["absent_value_id"])
+        control_id = int(dispatch["conditional_value_id"])
+        present_arm = optional_arm(present_id)
+        absent_arm = optional_arm(absent_id)
+        if present_arm is None or absent_arm is None:
+            raise ValueError(
+                "Page optional glyph dispatch lost an arm recipe: "
+                f"merged={merged_id} present={present_id} absent={absent_id}"
+            )
+        row = (glyph_canonical_scope, int(merged_id))
+        fact = SourceOptionalGlyphCarry(
+            conditional_value_id=control_id,
+            true_value_id=present_id,
+            false_value_id=absent_id,
+            initial_value_id=None,
+            merged_value_id=int(merged_id),
+            true_arm=present_arm,
+            false_arm=absent_arm,
+            initial_arm=None,
+            payload_sequence_value_id=int(merged_id),
+            present_callsite_ids=tuple(map(
+                int, dispatch.get("present_callsite_ids", ()),
+            )),
+            present_projection_sequence_ids=tuple(map(
+                int, dispatch.get("present_projection_sequence_ids", ()),
+            )),
+            predicate_expect_true=bool(dispatch.get(
+                "predicate_expect_true", True,
+            )),
+            owner_conditional_id=int(dispatch["owner_conditional_id"]),
+        )
+        sources = tuple(dict.fromkeys(filter(None, (
+            present_arm.presence_source,
+            absent_arm.presence_source,
+            node_identity_cell(graph, int(merged_id)),
+            node_identity_cell(graph, control_id),
+            dispatch.get("source_page_declaration_cell"),
+        ))))
+        cell = book.post(
+            SOURCE_OPTIONAL_GLYPH_CARRY, row, fact,
+            stage=_CANONICAL_RELABEL_STAGE,
+            provenance=_Derived(sources),
+            mode=_Mode.CONCORD,
+        )
+        optional_cells[int(merged_id)] = cell
+        merged_data.setdefault("attributes", {}).update({
+            "producer_kind": "optional_glyph_sequence",
+            "aggregate_kind": "list",
+            "sequence_key_columns": (),
+            "sequence_column_count": 1,
+            "sequence_writable": True,
+            "sequence_element_dtypes": ("int64",),
+            "source_optional_glyph_carry_row": row,
+        })
 
     pending_optional = []
     for phi_id, phi_data in graph.G.nodes(data=True):
@@ -14061,12 +14827,31 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     declared_class_field_contracts = dict(
         graph.G.graph.get("declared_class_field_contracts") or {}
     )
+    # ProgramABI is the retained declaration authority when source pursuit
+    # carries a method without every nested record's ClassDef.  In
+    # IdentityPage._fork_of_scope the method graph retains
+    # IdentityPage.book -> IdentityBook -> Registry, but the intermediate
+    # GetAttr reads cannot recover those classes from the method owner's AST.
+    # Index the exact record receipts once so every downstream field view uses
+    # the same authored identity rather than requiring a duplicate ClassDef.
+    program_abi_field_contracts = {
+        (str(record.get("identity") or record_name), str(field_name)): dict(field)
+        for record_name, record in dict(
+            (graph.G.graph.get("program_abi") or {}).get("records") or {}
+        ).items()
+        for field_name, field in dict(record.get("fields") or {}).items()
+        if isinstance(field, Mapping)
+    }
     for key, receipt in declared_class_field_contracts.items():
         aggregate_kind = receipt.get("aggregate_kind")
         if aggregate_kind is not None:
             class_field_aggregate_kinds.setdefault(
                 (str(key[0]), str(key[1])), str(aggregate_kind),
             )
+    for key, receipt in program_abi_field_contracts.items():
+        aggregate_kind = receipt.get("aggregate_kind")
+        if aggregate_kind is not None:
+            class_field_aggregate_kinds.setdefault(key, str(aggregate_kind))
     # (owner, field) -> the source-local class an instance field HOLDS.
     # ``self.ordnance = OrdnanceField()`` in a method of the owner, or
     # ``ordnance: OrdnanceField`` declared on the class, states it. A field
@@ -14090,6 +14875,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         elif known != str(class_name):
             del class_field_classes[key]
             contested_field_classes.add(key)
+
+    for (owner_name, field_name), receipt in (
+        program_abi_field_contracts.items()
+    ):
+        if (
+            str(receipt.get("storage") or "") == "record"
+            and receipt.get("record") is not None
+        ):
+            note_field_class(
+                owner_name, field_name, str(receipt["record"]),
+            )
 
     def declared_field_class(annotation: ast.AST | None) -> str | None:
         """The one source-local class named by a field annotation.
@@ -14217,7 +15013,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     }
     class_field_sequence_dtypes: dict[
         tuple[str, str], tuple[str, ...]
-    ] = {}
+    ] = {
+        key: (str(receipt["dtype"]),)
+        for key, receipt in program_abi_field_contracts.items()
+        if (
+            receipt.get("aggregate_kind") is not None
+            and receipt.get("dtype") is not None
+        )
+    }
 
     def _annotation_storage(annotation: ast.AST) -> dict[str, Any]:
         """Return the exact scalar/record handle stated by one annotation."""
@@ -14296,7 +15099,18 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
 
     class_field_storage_contracts: dict[
         tuple[str, str], dict[str, Any]
-    ] = {}
+    ] = {
+        key: {
+            name: receipt[name]
+            for name in (
+                "dtype", "record", "aggregate_kind", "tensor",
+                "python_type", "optional",
+            )
+            if receipt.get(name) is not None
+        }
+        for key, receipt in program_abi_field_contracts.items()
+        if receipt.get("dtype") is not None or receipt.get("record") is not None
+    }
 
     def _mapping_annotation(annotation: ast.AST | None) -> dict[str, Any]:
         if isinstance(annotation, ast.BinOp) and isinstance(
@@ -15463,69 +16277,593 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     declared_page_fact_classes: dict[
         str, tuple[str, _Ref, tuple[tuple[str, str], ...]]
     ] = {}
+    declared_page_bindings: dict[str, _Ref] = {}
     declaration_book = current_identity_book()
+    row_field_class_cell = declaration_book.latest_ref(
+        _CLASS_DECLARATION,
+        ("src.compiler.identity_concordance", "RowField"),
+    )
+    row_kind_class_cell = declaration_book.latest_ref(
+        _CLASS_DECLARATION,
+        ("src.compiler.identity_concordance", "RowFieldKind"),
+    )
+    row_kind_enum_cell = declaration_book.latest_ref(
+        _SOURCE_ENUM_GLYPH_TABLE,
+        ("src.compiler.identity_concordance", "RowFieldKind"),
+    )
+    builtin_fact_types = frozenset({
+        "bool", "bytearray", "bytes", "complex", "dict", "float",
+        "frozenset", "int", "list", "object", "set", "str", "tuple",
+    })
+
+    page_factory_identity = (
+        "src.compiler.identity_concordance",
+        "Registry.declare_page",
+        "src.compiler.identity_concordance.Registry",
+    )
+
+    def exact_page_factory_method_cell() -> _Ref | None:
+        """The authored signature behind the exported bound page factory."""
+
+        return declaration_book.latest_ref(
+            _CLASS_METHOD_DECLARATION,
+            (
+                "src.compiler.identity_concordance",
+                "Registry", "declare_page",
+            ),
+        )
+
+    def exact_page_factory_definition_cell() -> _Ref | None:
+        """Return/post the canonical callable identity from its method cell."""
+
+        method_cell = exact_page_factory_method_cell()
+        if method_cell is None:
+            return None
+        incumbent = declaration_book.latest_ref(
+            _STATIC_SYMBOL_DEFINITION, page_factory_identity,
+        )
+        if incumbent is not None:
+            fact = declaration_book.page(
+                _STATIC_SYMBOL_DEFINITION
+            ).cell(incumbent.row, incumbent.column)
+            return declaration_book.post(
+                _STATIC_SYMBOL_DEFINITION,
+                page_factory_identity, fact,
+                stage=_REDUCTION,
+                provenance=_Derived((method_cell,)),
+                mode=_Mode.CONCORD,
+            )
+        return declaration_book.post(
+            _STATIC_SYMBOL_DEFINITION,
+            page_factory_identity,
+            _StaticSymbolFact(_StaticSymbolKind.BOUND_METHOD, None),
+            stage=_REDUCTION,
+            provenance=_Derived((method_cell,)),
+            mode=_Mode.CONCORD,
+        )
+
+    def page_factory_parameters(
+        definition_cell: _Ref | None,
+    ) -> tuple[str, ...]:
+        """Read the exact source method signature for a proven factory."""
+
+        if (
+            not isinstance(definition_cell, _Ref)
+            or definition_cell.page != _STATIC_SYMBOL_DEFINITION
+            or tuple(definition_cell.row) != page_factory_identity
+            or declaration_book.latest_ref(
+                _STATIC_SYMBOL_DEFINITION, definition_cell.row,
+            ) != definition_cell
+        ):
+            return ()
+        method_cell = exact_page_factory_method_cell()
+        if method_cell is None:
+            return ()
+        method = declaration_book.page(
+            _CLASS_METHOD_DECLARATION
+        ).cell(method_cell.row, method_cell.column)
+        parameters = tuple(getattr(method, "parameters", ()) or ())
+        return tuple(map(str, parameters[1:])) if parameters else ()
+
+    def bind_page_factory_arguments(
+        declaration: ast.Call, parameters: tuple[str, ...],
+    ) -> dict[str, ast.AST]:
+        """Bind syntax through the factory's authored parameter ABI."""
+
+        if not parameters:
+            return {}
+        bound: dict[str, ast.AST] = {}
+        for index, argument in enumerate(declaration.args):
+            if index >= len(parameters):
+                return {}
+            bound[parameters[index]] = argument
+        for keyword in declaration.keywords:
+            if keyword.arg is None or keyword.arg not in parameters:
+                return {}
+            if keyword.arg in bound:
+                return {}
+            bound[str(keyword.arg)] = keyword.value
+        return bound
+
+    def graph_call_definition_cell(
+        declaration_node_id: int,
+    ) -> _Ref | None:
+        """Follow the exact callee node's concordance edge to its symbol."""
+
+        call_data = graph.G.nodes[int(declaration_node_id)]
+        callee_ids = tuple(
+            int(parent) for parent, role in call_data.get("parents") or ()
+            if str(role) == "callee" and int(parent) in graph.G
+        )
+        if len(callee_ids) != 1:
+            return None
+        callee_cell = node_identity_cell(graph, callee_ids[0])
+        if callee_cell is None:
+            return None
+        direct = tuple(
+            source for source, _stage in declaration_book.edges_into(
+                callee_cell
+            )
+            if source.page == _STATIC_SYMBOL_DEFINITION
+            and tuple(source.row) == page_factory_identity
+        )
+        return direct[0] if len(direct) == 1 else None
+
+    def exact_fact_class(
+        expression: ast.AST, module_identity: str,
+        *, local_classes: Mapping[str, ast.ClassDef],
+        imported_owner: Callable[[str], tuple[str, str] | None] | None = None,
+    ) -> tuple[str, _Ref] | None:
+        """Resolve one Page fact class to its exact definition cell."""
+
+        spelling = authored_page_fact_identity(expression)
+        if spelling is None:
+            return None
+        if isinstance(expression, ast.Name) and expression.id in builtin_fact_types:
+            identity = f"builtins.{expression.id}"
+            span = _post_source_span(expression)
+            if span is None:
+                return None
+            row = ("builtins", str(expression.id), "")
+            cell = declaration_book.latest_ref(
+                _STATIC_SYMBOL_DEFINITION, row,
+            )
+            if cell is None:
+                cell = declaration_book.post(
+                    _STATIC_SYMBOL_DEFINITION, row,
+                    _StaticSymbolFact(_StaticSymbolKind.CLASS, None),
+                    stage=_REDUCTION,
+                    provenance=_Derived((span,)), mode=_Mode.CONCORD,
+                )
+            else:
+                fact = declaration_book.page(
+                    _STATIC_SYMBOL_DEFINITION
+                ).cell(cell.row, cell.column)
+                cell = declaration_book.post(
+                    _STATIC_SYMBOL_DEFINITION, row, fact,
+                    stage=_REDUCTION,
+                    provenance=_Derived((span,)), mode=_Mode.CONCORD,
+                )
+            return identity, cell
+        owner = None
+        if isinstance(expression, ast.Name) and expression.id in local_classes:
+            owner = (module_identity, str(expression.id))
+        elif imported_owner is not None:
+            owner = imported_owner(str(spelling))
+        if owner is None:
+            return None
+        cell = declaration_book.latest_ref(_CLASS_DECLARATION, tuple(owner))
+        return (
+            (".".join(map(str, owner)), cell)
+            if cell is not None else None
+        )
+
+    def authored_page_fact_identity(expression: ast.AST) -> str | None:
+        """Canonical fact identity stated by a ``declare_page`` call.
+
+        Builtin fact types have no source-local ``ClassDef`` to cite, but the
+        authored AST still names their canonical definition.  This allowlist
+        is the language's builtin namespace, not inspection of a live object.
+        User/imported types retain their source spelling until their exact
+        CLASS_DECLARATION edge resolves the definition owner.
+        """
+
+        if isinstance(expression, ast.Name):
+            return (
+                f"builtins.{expression.id}"
+                if expression.id in builtin_fact_types
+                else str(expression.id)
+            )
+        if isinstance(expression, ast.Attribute):
+            owner = authored_page_fact_identity(expression.value)
+            return (
+                str(expression.attr)
+                if owner is None else f"{owner}.{expression.attr}"
+            )
+        return None
+
+    def exact_import_identity(
+        statements: Iterable[ast.AST], module_identity: str, binding: str,
+    ) -> tuple[str, str] | None:
+        """Resolve one lexical import without loading its Python object."""
+
+        head, dot, tail = str(binding).partition(".")
+        for statement in statements:
+            if isinstance(statement, ast.ImportFrom):
+                alias = next((
+                    item for item in statement.names
+                    if str(item.asname or item.name) == head
+                ), None)
+                if alias is None:
+                    continue
+                module_parts = str(module_identity).split(".")
+                level = int(statement.level or 0)
+                owner_parts = module_parts[:-level] if level else []
+                if statement.module:
+                    owner_parts.extend(str(statement.module).split("."))
+                identity = str(alias.name)
+                if dot:
+                    identity = f"{identity}.{tail}"
+                return ".".join(owner_parts), identity
+            if isinstance(statement, ast.Import):
+                alias = next((
+                    item for item in statement.names
+                    if str(item.asname or item.name.split(".")[0]) == head
+                ), None)
+                if alias is None:
+                    continue
+                return str(alias.name), str(tail or alias.name.rsplit(".", 1)[-1])
+        return None
+
+    def authored_row_kind_aliases(
+        statements: Iterable[ast.AST], module_identity: str,
+    ) -> dict[str, str]:
+        """RowFieldKind aliases proven by the exact imported enum."""
+
+        statements = tuple(statements)
+        aliases: dict[str, str] = {}
+        for statement in statements:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = (
+                tuple(statement.targets)
+                if isinstance(statement, ast.Assign)
+                else (statement.target,)
+            )
+            value = statement.value
+            if not isinstance(value, ast.Attribute):
+                continue
+            owner = authored_page_fact_identity(value.value)
+            if owner is None or exact_import_identity(
+                statements, module_identity, owner,
+            ) != (
+                "src.compiler.identity_concordance", "RowFieldKind",
+            ):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    aliases[str(target.id)] = str(value.attr)
+        return aliases
+
+    def authored_row_kind(
+        expression: ast.AST, aliases: Mapping[str, str],
+        statements: Iterable[ast.AST], module_identity: str,
+    ) -> str | None:
+        def admitted(member: str) -> str | None:
+            if row_kind_enum_cell is None:
+                return None
+            table = declaration_book.page(
+                _SOURCE_ENUM_GLYPH_TABLE
+            ).cell(row_kind_enum_cell.row, row_kind_enum_cell.column)
+            return (
+                str(member)
+                if any(
+                    str(getattr(item, "member_identity", ""))
+                    == str(member)
+                    for item in getattr(table, "members", ())
+                ) else None
+            )
+
+        if isinstance(expression, ast.Attribute):
+            owner = authored_page_fact_identity(expression.value)
+            if owner is not None and exact_import_identity(
+                statements, module_identity, owner,
+            ) == (
+                "src.compiler.identity_concordance", "RowFieldKind",
+            ):
+                return admitted(str(expression.attr))
+        if isinstance(expression, ast.Name):
+            member = aliases.get(str(expression.id))
+            return None if member is None else admitted(str(member))
+        return None
+
+    def is_exact_row_field_constructor(
+        expression: ast.AST,
+        statements: Iterable[ast.AST], module_identity: str,
+    ) -> bool:
+        if not isinstance(expression, ast.Call):
+            return False
+        binding = authored_page_fact_identity(expression.func)
+        return binding is not None and exact_import_identity(
+            statements, module_identity, binding,
+        ) == ("src.compiler.identity_concordance", "RowField")
+
+    local_statements = tuple(
+        statement_data.get("expr_obj")
+        for _statement_id, statement_data in graph.G.nodes(data=True)
+        if isinstance(statement_data.get("expr_obj"), ast.AST)
+    )
+    local_source_modules = tuple(dict.fromkeys(
+        str(row[0]) for statement in local_statements
+        for row in (getattr(statement, "_turing_source_span_row", None),)
+        if isinstance(row, tuple) and row
+    ))
+    local_module_identity = (
+        local_source_modules[0] if len(local_source_modules) == 1 else ""
+    )
+    # Publish authored inheritance once, beside the class declarations that
+    # establish both identities.  Native ``isinstance`` consumes this page;
+    # it must never reproduce Python's hierarchy in a predicate helper.
+    if local_module_identity:
+        from ...compiler.concordance_declarations import (
+            ensure_builtin_class_topology as _ensure_builtin_class_topology,
+        )
+
+        _ensure_builtin_class_topology(declaration_book)
+        builtin_names = {
+            "bool", "bytearray", "bytes", "complex", "dict", "float",
+            "frozenset", "int", "list", "object", "set", "str", "tuple",
+        }
+        for class_name, authored_bases in class_bases.items():
+            derived_identity = f"{local_module_identity}.{class_name}"
+            derived_cell = declaration_book.latest_ref(
+                _CLASS_DECLARATION,
+                (local_module_identity, str(class_name)),
+            )
+            if derived_cell is None:
+                continue
+            bases = tuple(authored_bases) or ("object",)
+            for base_name in bases:
+                local_base_cell = declaration_book.latest_ref(
+                    _CLASS_DECLARATION,
+                    (local_module_identity, str(base_name)),
+                )
+                builtin_base_cell = declaration_book.latest_ref(
+                    _STATIC_SYMBOL_DEFINITION,
+                    ("builtins", str(base_name), ""),
+                )
+                if local_base_cell is not None:
+                    base_identity = (
+                        f"{local_module_identity}.{base_name}"
+                    )
+                    sources = (derived_cell, local_base_cell)
+                elif (
+                    str(base_name) in builtin_names
+                    and builtin_base_cell is not None
+                ):
+                    base_identity = f"builtins.{base_name}"
+                    sources = (derived_cell, builtin_base_cell)
+                else:
+                    # Imported/qualified bases require their exact resolved
+                    # declaration edge.  A bare spelling is not identity
+                    # evidence and is intentionally not published.
+                    continue
+                row = (derived_identity, base_identity)
+                declaration_book.post(
+                    _CLASS_SUBTYPE, row, row, stage=_REDUCTION,
+                    provenance=_Derived(sources), mode=_Mode.CONCORD,
+                )
+    def exact_class_field_order(
+        class_cell: _Ref | None,
+    ) -> tuple[str, ...]:
+        """Read dataclass field order through declaration provenance edges."""
+
+        if (
+            not isinstance(class_cell, _Ref)
+            or class_cell.page != _CLASS_DECLARATION
+            or declaration_book.latest_ref(
+                _CLASS_DECLARATION, class_cell.row,
+            ) != class_cell
+        ):
+            return ()
+        field_cells = tuple(
+            source for source, _stage in declaration_book.edges_into(
+                class_cell
+            )
+            if source.page == _CLASS_FIELD_DECLARATION
+            and tuple(source.row[:2]) == tuple(class_cell.row)
+            and declaration_book.latest_ref(
+                _CLASS_FIELD_DECLARATION, source.row,
+            ) == source
+        )
+        ordered: list[tuple[tuple[tuple[int, object], ...], str]] = []
+        for field_cell in field_cells:
+            spans = tuple(
+                source for source, _stage in declaration_book.edges_into(
+                    field_cell
+                )
+                if source.page == _SOURCE_SPAN
+                and tuple(source.row[:2]) == tuple(class_cell.row)
+            )
+            if len(spans) != 1:
+                return ()
+            path = tuple(spans[0].row[2])
+            order_key = tuple(
+                (0, int(component))
+                if isinstance(component, int) and not isinstance(component, bool)
+                else (1, str(component))
+                for component in path
+            )
+            ordered.append((order_key, str(field_cell.row[2])))
+        ordered.sort(key=lambda item: item[0])
+        return tuple(field_name for _path, field_name in ordered)
+
+    row_field_parameter_names = exact_class_field_order(
+        row_field_class_cell
+    )
+
+    def bind_row_field_arguments(
+        expression: ast.Call,
+    ) -> dict[str, ast.AST]:
+        bound: dict[str, ast.AST] = {}
+        for index, argument in enumerate(expression.args):
+            if index >= len(row_field_parameter_names):
+                return {}
+            bound[row_field_parameter_names[index]] = argument
+        for keyword in expression.keywords:
+            if (
+                keyword.arg is None
+                or keyword.arg not in row_field_parameter_names
+                or keyword.arg in bound
+            ):
+                return {}
+            bound[str(keyword.arg)] = keyword.value
+        return bound
+
+    local_row_kind_aliases = authored_row_kind_aliases(
+        local_statements, local_module_identity,
+    )
+
+    graph_page_bindings = {
+        id(statement.value): str(target.id)
+        for _statement_id, statement_data in graph.G.nodes(data=True)
+        for statement in (statement_data.get("expr_obj"),)
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and statement.value is not None
+        for target in (
+            tuple(statement.targets)
+            if isinstance(statement, ast.Assign)
+            else (statement.target,)
+        )
+        if isinstance(target, ast.Name)
+    }
     for declaration_node_id, declaration_data in graph.G.nodes(data=True):
         declaration = declaration_data.get("expr_obj")
+        definition_cell = (
+            graph_call_definition_cell(int(declaration_node_id))
+            if isinstance(declaration, ast.Call) else None
+        )
+        semantic_arguments = (
+            bind_page_factory_arguments(
+                declaration, page_factory_parameters(definition_cell),
+            )
+            if isinstance(declaration, ast.Call) else {}
+        )
+        page_name_expression = semantic_arguments.get("name")
+        row_field_expression = semantic_arguments.get("row_fields")
+        fact_type_expression = semantic_arguments.get("fact_type")
         if not (
             isinstance(declaration, ast.Call)
-            and (
-                isinstance(declaration.func, ast.Name)
-                and declaration.func.id == "declare_page"
-                or isinstance(declaration.func, ast.Attribute)
-                and declaration.func.attr == "declare_page"
-            )
-            and len(declaration.args) >= 3
-            and isinstance(declaration.args[0], ast.Constant)
-            and isinstance(declaration.args[0].value, str)
-            and isinstance(declaration.args[2], ast.Name)
-            and declaration.args[2].id in class_definitions
+            and definition_cell is not None
+            and isinstance(page_name_expression, ast.Constant)
+            and isinstance(page_name_expression.value, str)
+            and isinstance(row_field_expression, (ast.Tuple, ast.List))
+            and fact_type_expression is not None
         ):
             continue
-        page_name = str(declaration.args[0].value)
-        class_identity = str(declaration.args[2].id)
+        source_span_row = getattr(
+            declaration, "_turing_source_span_row", None,
+        )
+        module_identity = str(
+            source_span_row[0]
+            if isinstance(source_span_row, tuple) and source_span_row
+            else getattr(declaration, "_turing_source_module", "")
+        )
+        class_resolution = exact_fact_class(
+            fact_type_expression, module_identity,
+            local_classes=class_definitions,
+            imported_owner=lambda binding: exact_import_identity(
+                local_statements, module_identity, binding,
+            ),
+        )
+        if class_resolution is None:
+            continue
+        class_identity, class_cell = class_resolution
+        page_name = str(page_name_expression.value)
         row_fields: list[tuple[str, str]] = []
         row_field_cells: list[_Ref] = []
-        row_field_expression = declaration.args[1]
         for field_declaration in (
             row_field_expression.elts
             if isinstance(row_field_expression, (ast.Tuple, ast.List))
             else ()
         ):
+            field_arguments = (
+                bind_row_field_arguments(field_declaration)
+                if isinstance(field_declaration, ast.Call) else {}
+            )
+            field_name_expression = field_arguments.get("name")
+            field_kind_expression = field_arguments.get("kind")
             if not (
                 isinstance(field_declaration, ast.Call)
-                and isinstance(field_declaration.func, ast.Name)
-                and field_declaration.func.id == "RowField"
-                and len(field_declaration.args) >= 2
-                and isinstance(field_declaration.args[0], ast.Constant)
-                and isinstance(field_declaration.args[0].value, str)
-                and isinstance(field_declaration.args[1], ast.Attribute)
-                and isinstance(field_declaration.args[1].value, ast.Name)
-                and field_declaration.args[1].value.id == "K"
+                and row_field_class_cell is not None
+                and row_kind_class_cell is not None
+                and row_kind_enum_cell is not None
+                and is_exact_row_field_constructor(
+                    field_declaration,
+                    local_statements, module_identity,
+                )
+                and isinstance(field_name_expression, ast.Constant)
+                and isinstance(field_name_expression.value, str)
+                and field_kind_expression is not None
+                and authored_row_kind(
+                    field_kind_expression, local_row_kind_aliases,
+                    local_statements, module_identity,
+                ) is not None
             ):
                 row_fields = []
                 row_field_cells = []
                 break
             row_fields.append((
-                str(field_declaration.args[0].value),
-                str(field_declaration.args[1].attr),
+                str(field_name_expression.value),
+                str(authored_row_kind(
+                    field_kind_expression, local_row_kind_aliases,
+                    local_statements, module_identity,
+                )),
             ))
             row_field_cells.extend(filter(None, (
+                row_field_class_cell,
+                row_kind_class_cell,
+                row_kind_enum_cell,
                 node_identity_cell(graph, id(field_declaration)),
-                node_identity_cell(graph, id(field_declaration.args[0])),
-                node_identity_cell(graph, id(field_declaration.args[1])),
+                node_identity_cell(graph, id(field_name_expression)),
+                node_identity_cell(graph, id(field_kind_expression)),
             )))
-        module_identity = str(getattr(
-            declaration, "_turing_source_module", "",
-        ))
-        class_cell = declaration_book.latest_ref(
-            _CLASS_DECLARATION, (module_identity, class_identity),
-        )
+        if not row_fields:
+            continue
         call_cell = node_identity_cell(graph, int(declaration_node_id))
         page_name_cell = node_identity_cell(
-            graph, id(declaration.args[0]),
+            graph, id(page_name_expression),
         )
+        fact_type_cell = node_identity_cell(
+            graph, id(fact_type_expression),
+        )
+        source_ast_nodes: list[ast.AST] = [
+            declaration, page_name_expression, fact_type_expression,
+        ]
+        for field_declaration in (
+            row_field_expression.elts
+            if isinstance(row_field_expression, (ast.Tuple, ast.List))
+            else ()
+        ):
+            field_arguments = (
+                bind_row_field_arguments(field_declaration)
+                if isinstance(field_declaration, ast.Call) else {}
+            )
+            source_ast_nodes.extend((
+                field_declaration,
+                *tuple(filter(None, (
+                    field_arguments.get("name"),
+                    field_arguments.get("kind"),
+                ))),
+            ))
+        source_span_cells = tuple(dict.fromkeys(filter(None, (
+            _post_source_span(source_node)
+            for source_node in source_ast_nodes
+        ))))
         sources = tuple(dict.fromkeys(filter(None, (
-            class_cell, page_name_cell, call_cell, *row_field_cells,
+            definition_cell, class_cell, fact_type_cell,
+            page_name_cell, call_cell,
+            *row_field_cells, *source_span_cells,
         ))))
         if not sources:
             continue
@@ -15542,9 +16880,313 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         declared_page_fact_classes[page_name] = (
             class_identity, page_cell, tuple(row_fields),
         )
+        binding_name = graph_page_bindings.get(id(declaration))
+        if binding_name is not None:
+            declared_page_bindings[binding_name] = page_cell
+
+    # An ExtractionContract ``with_sources`` entry is authored source even
+    # when source pursuit needs none of its executable function bodies.  Page
+    # constants are module-level declarations, so callable-only pursuit could
+    # never discover them and their imported uses degraded to live-Python
+    # external Inputs.  Publish those exact declarations from their admitted
+    # ASTs into the same IdentityBook.  The fact derives from the class,
+    # declaration call, page-name, and RowField source spans; no live Page is
+    # inspected and no schema is reconstructed from a runtime value.
+    from ...transmogrifier.graph.graph_express2 import (
+        _annotate_visual_source_owners,
+        _map_ir_from_ast,
+    )
+
+    for declared_module, declared_tree in tuple(
+        graph.G.graph.pop("declared_source_modules", ()) or ()
+    ):
+        _annotate_visual_source_owners(
+            declared_tree, module_name=str(declared_module),
+        )
+        # ``with_sources`` admits this complete authored module. Publish its
+        # class/method/field declaration cells through the same source mapper
+        # used for the executable tree before Page declarations cite them.
+        # The returned descriptive view is intentionally discarded: the
+        # concordance cells and their source edges are the authority.
+        _map_ir_from_ast(declared_tree)
+        external_classes = {
+            statement.name: statement
+            for statement in declared_tree.body
+            if isinstance(statement, ast.ClassDef)
+        }
+        external_row_kind_aliases = authored_row_kind_aliases(
+            declared_tree.body, str(declared_module),
+        )
+
+        def imported_class_owner(
+            binding: str,
+        ) -> tuple[str, str] | None:
+            """Resolve an authored import spelling to its declaration row.
+
+            This reads only the admitted module AST.  It does not import the
+            module or inspect the live class; the resulting row is useful
+            only when ingestion has already published that exact class
+            declaration into the shared concordance.
+            """
+
+            head, dot, tail = str(binding).partition(".")
+            for import_statement in declared_tree.body:
+                if isinstance(import_statement, ast.ImportFrom):
+                    imported = next((
+                        alias for alias in import_statement.names
+                        if str(alias.asname or alias.name) == head
+                    ), None)
+                    if imported is None:
+                        continue
+                    module_parts = str(declared_module).split(".")
+                    level = int(import_statement.level or 0)
+                    owner_parts = (
+                        module_parts[:-level]
+                        if level else []
+                    )
+                    if import_statement.module:
+                        owner_parts.extend(
+                            str(import_statement.module).split(".")
+                        )
+                    owner_module = ".".join(owner_parts)
+                    owner_name = str(imported.name)
+                    if dot:
+                        owner_name = f"{owner_name}.{tail}"
+                    return owner_module, owner_name
+                if isinstance(import_statement, ast.Import):
+                    imported = next((
+                        alias for alias in import_statement.names
+                        if str(alias.asname or alias.name.split(".")[0])
+                        == head
+                    ), None)
+                    if imported is None:
+                        continue
+                    owner_module = str(imported.name)
+                    if not dot:
+                        return owner_module, owner_module.rsplit(".", 1)[-1]
+                    return owner_module, str(tail)
+            return None
+
+        def external_page_factory_cell(
+            expression: ast.AST,
+        ) -> tuple[_Ref, _Ref] | None:
+            """Resolve the factory use through this module's import edge."""
+
+            imported_binding = None
+            import_statement = None
+            if isinstance(expression, ast.Name):
+                imported_binding = str(expression.id)
+            elif (
+                isinstance(expression, ast.Attribute)
+                and isinstance(expression.value, ast.Name)
+            ):
+                imported_binding = str(expression.value.id)
+            if imported_binding is None:
+                return None
+            for candidate in declared_tree.body:
+                if isinstance(candidate, ast.ImportFrom):
+                    owner_parts = str(declared_module).split(".")
+                    level = int(candidate.level or 0)
+                    resolved_parts = owner_parts[:-level] if level else []
+                    if candidate.module:
+                        resolved_parts.extend(str(candidate.module).split("."))
+                    resolved_module = ".".join(resolved_parts)
+                    alias = next((
+                        item for item in candidate.names
+                        if str(item.asname or item.name) == imported_binding
+                    ), None)
+                    if (
+                        alias is not None
+                        and resolved_module
+                        == "src.compiler.identity_concordance"
+                        and (
+                            isinstance(expression, ast.Name)
+                            and str(alias.name) == "declare_page"
+                            or isinstance(expression, ast.Attribute)
+                            and str(alias.name) in {
+                                "identity_concordance", "*",
+                            }
+                            and expression.attr == "declare_page"
+                        )
+                    ):
+                        import_statement = candidate
+                        break
+                elif (
+                    isinstance(candidate, ast.Import)
+                    and isinstance(expression, ast.Attribute)
+                ):
+                    alias = next((
+                        item for item in candidate.names
+                        if str(item.asname or item.name.split(".")[0])
+                        == imported_binding
+                    ), None)
+                    if (
+                        alias is not None
+                        and str(alias.name)
+                        == "src.compiler.identity_concordance"
+                        and expression.attr == "declare_page"
+                    ):
+                        import_statement = candidate
+                        break
+            definition = exact_page_factory_definition_cell()
+            import_cell = (
+                None if import_statement is None else
+                _post_source_span(import_statement)
+            )
+            return (
+                (definition, import_cell)
+                if definition is not None and import_cell is not None
+                else None
+            )
+
+        for statement in declared_tree.body:
+            targets = (
+                tuple(statement.targets)
+                if isinstance(statement, ast.Assign)
+                else (statement.target,)
+                if isinstance(statement, ast.AnnAssign)
+                else ()
+            )
+            declaration = (
+                statement.value
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                else None
+            )
+            binding_names = tuple(
+                str(target.id) for target in targets
+                if isinstance(target, ast.Name)
+            )
+            factory_resolution = (
+                external_page_factory_cell(declaration.func)
+                if isinstance(declaration, ast.Call) else None
+            )
+            definition_cell = (
+                None if factory_resolution is None else factory_resolution[0]
+            )
+            import_cell = (
+                None if factory_resolution is None else factory_resolution[1]
+            )
+            semantic_arguments = (
+                bind_page_factory_arguments(
+                    declaration, page_factory_parameters(definition_cell),
+                )
+                if isinstance(declaration, ast.Call) else {}
+            )
+            page_name_expression = semantic_arguments.get("name")
+            row_field_expression = semantic_arguments.get("row_fields")
+            fact_type_expression = semantic_arguments.get("fact_type")
+            if not (
+                binding_names
+                and isinstance(declaration, ast.Call)
+                and definition_cell is not None
+                and isinstance(page_name_expression, ast.Constant)
+                and isinstance(page_name_expression.value, str)
+                and isinstance(row_field_expression, (ast.Tuple, ast.List))
+                and fact_type_expression is not None
+            ):
+                continue
+            class_resolution = exact_fact_class(
+                fact_type_expression, str(declared_module),
+                local_classes=external_classes,
+                imported_owner=imported_class_owner,
+            )
+            if class_resolution is None:
+                continue
+            class_identity, class_cell = class_resolution
+            page_name = str(page_name_expression.value)
+            row_fields: list[tuple[str, str]] = []
+            source_nodes: list[ast.AST] = [
+                external_classes.get(
+                    getattr(fact_type_expression, "id", ""),
+                    fact_type_expression,
+                ),
+                declaration,
+                page_name_expression,
+            ]
+            for field_declaration in (
+                row_field_expression.elts
+                if isinstance(row_field_expression, (ast.Tuple, ast.List))
+                else ()
+            ):
+                field_arguments = (
+                    bind_row_field_arguments(field_declaration)
+                    if isinstance(field_declaration, ast.Call) else {}
+                )
+                field_name_expression = field_arguments.get("name")
+                field_kind_expression = field_arguments.get("kind")
+                if not (
+                    isinstance(field_declaration, ast.Call)
+                    and row_field_class_cell is not None
+                    and row_kind_class_cell is not None
+                    and row_kind_enum_cell is not None
+                    and is_exact_row_field_constructor(
+                        field_declaration,
+                        declared_tree.body, str(declared_module),
+                    )
+                    and isinstance(field_name_expression, ast.Constant)
+                    and isinstance(field_name_expression.value, str)
+                    and field_kind_expression is not None
+                    and authored_row_kind(
+                        field_kind_expression,
+                        external_row_kind_aliases,
+                        declared_tree.body, str(declared_module),
+                    ) is not None
+                ):
+                    row_fields = []
+                    source_nodes = []
+                    break
+                row_fields.append((
+                    str(field_name_expression.value),
+                    str(authored_row_kind(
+                        field_kind_expression,
+                        external_row_kind_aliases,
+                        declared_tree.body, str(declared_module),
+                    )),
+                ))
+                source_nodes.extend((
+                    field_declaration,
+                    field_name_expression,
+                    field_kind_expression,
+                ))
+            if not row_fields:
+                continue
+            source_cells = tuple(dict.fromkeys(filter(None, (
+                row_field_class_cell,
+                row_kind_class_cell,
+                row_kind_enum_cell,
+                *(_post_source_span(node) for node in source_nodes),
+            ))))
+            if not source_cells:
+                continue
+            page_cell = declaration_book.post(
+                _SOURCE_PAGE_FACT_CLASS,
+                (str(declared_module), page_name),
+                _SourcePageFactClass(
+                    page_name, class_identity, tuple(row_fields),
+                ),
+                stage=_REDUCTION,
+                provenance=_Derived(tuple(dict.fromkeys(filter(None, (
+                    definition_cell, import_cell, class_cell, *source_cells,
+                ))))),
+                mode=_Mode.CONCORD,
+            )
+            declaration_receipt = (
+                class_identity, page_cell, tuple(row_fields),
+            )
+            incumbent = declared_page_fact_classes.get(page_name)
+            if incumbent is not None and incumbent != declaration_receipt:
+                raise ValueError(
+                    "source page declaration disagreement for "
+                    f"{page_name!r}: {incumbent!r} != "
+                    f"{declaration_receipt!r}"
+                )
+            declared_page_fact_classes[page_name] = declaration_receipt
+            for binding_name in binding_names:
+                declared_page_bindings[binding_name] = page_cell
     graph.G.graph["declared_page_fact_classes"] = (
         declared_page_fact_classes
     )
+    graph.G.graph["declared_page_bindings"] = declared_page_bindings
     # Class navigation owns Python's inherited method surface as well as the
     # methods written directly in each body. Retained numerical wrappers are
     # intentionally thin (for example ComplexRationalPrecision inherits its
@@ -17794,7 +19436,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             )
         }
         function_graph = copy.copy(graph)
-        function_graph.G = graph.G.subgraph(included).copy()
+        if not hasattr(graph.G, "_induced_copy"):
+            raise TypeError(
+                "ProcessGraph function extraction requires its authoritative "
+                "BitTensorMemoryGraph topology"
+            )
+        function_graph.G = graph.G._induced_copy(included)
+        function_graph.MG = function_graph.G.bit_tensor_memory_graph
         # NetworkX copies each node-data dictionary but not mutable values
         # nested inside it.  Topology normalization writes the ``attributes``
         # view of the detached function graph.  Without a distinct mapping,

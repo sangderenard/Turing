@@ -68,6 +68,62 @@ class BitTensorMemory: #sizes in bytes
             on_grow=self._grow_data,
         )
 
+    def __getstate__(self):
+        """Serialize the arena as bytes plus its exact integer allocation map.
+
+        ``ctypes.create_string_buffer`` instances are process-local Python
+        objects and cannot be pickled.  The bytes and integer intervals are
+        the portable state; views, bitmap helpers, graph backreferences, and
+        the allocator growth callback are rehydrated around them.
+        """
+
+        state = dict(self.__dict__)
+        state["_serialized_data"] = bytes(self.data[: self.size])
+        state["_serialized_allocator"] = {
+            "capacity": int(self.allocator.capacity),
+            "growth_quantum": int(self.allocator.growth_quantum),
+            "free": tuple(self.allocator.free_intervals),
+            "by_label": {
+                str(label): dict(records)
+                for label, records in self.allocator._by_label.items()
+            },
+        }
+        for name in ("data", "unit_helper", "graph", "allocator"):
+            state.pop(name, None)
+        return state
+
+    def __setstate__(self, state):
+        payload = state.pop("_serialized_data")
+        allocator_state = state.pop("_serialized_allocator")
+        self.__dict__.update(state)
+        self.data = ctypes.create_string_buffer(int(self.size))
+        ctypes.memmove(self.data, payload, min(len(payload), int(self.size)))
+        self.graph = None
+        self.unit_helper = BitTensorMemoryUnits(
+            0,
+            self.size,
+            self.granular_size,
+            self.chunk_size,
+            node_template=NodeEntry,
+            edge_template=EdgeEntry,
+            association_template=MetaGraphEdge,
+            hard_memory=self,
+        )
+        self.allocator = IntegerRegionAllocator(
+            int(allocator_state["capacity"]),
+            reserved_prefix=0,
+            growth_quantum=int(allocator_state["growth_quantum"]),
+            on_grow=self._grow_data,
+        )
+        self.allocator._free = list(allocator_state["free"])
+        self.allocator._by_label = collections.defaultdict(
+            dict,
+            {
+                str(label): dict(records)
+                for label, records in allocator_state["by_label"].items()
+            },
+        )
+
         
     def pull_full_set_from_memory(self):
         pass
@@ -124,9 +180,7 @@ class BitTensorMemory: #sizes in bytes
 
     def write(self, offset, data, clear_delta_map=False):
         offset, size = self._clip_offset(offset, len(data))
-        print(f"Writing {len(data)} bytes at offset {offset}")
         if len(data) < size:
-            print(f"Writing {len(data)} bytes at offset {offset}, but size is {size}")
             data += b'\x00' * (size - len(data))  # pad with zeros if necessary
         
         

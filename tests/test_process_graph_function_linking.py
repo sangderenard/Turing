@@ -698,6 +698,42 @@ def test_identity_audit_rejects_private_alias_snapshot():
     assert "alias-not-concorded" not in concordance_report(module)
 
 
+def test_source_call_link_order_rows_derive_from_exact_callsite():
+    from src.compiler.concordance_declarations import CALL_LINK_ORDER
+
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def child(value: int):\n"
+        "    return value + 1\n"
+        "def root(value: int):\n"
+        "    return child(value)\n",
+        "root",
+        name="sourced_call_link_order",
+        extraction_contract=CONTRACT,
+        progress=lambda _message: None,
+        progress_bars=False,
+    )
+
+    book = module.metadata["identity_book"]
+    page = book.page(CALL_LINK_ORDER)
+    rows = tuple(page.rows())
+    assert tuple(row[0] for row in rows) == (
+        "sourced_call_link_order", "sourced_call_link_order",
+    )
+    assert {row[1] for row in rows} == {
+        "sourced_call_link_order__child",
+        "sourced_call_link_order__root",
+    }
+    cells = tuple(
+        book.latest_ref(CALL_LINK_ORDER, row) for row in rows
+    )
+    assert all(cell is not None and book.edges_into(cell) for cell in cells)
+    source_keys = tuple(
+        {source.key for source, _stage in book.edges_into(cell)}
+        for cell in cells
+    )
+    assert source_keys[0] == source_keys[1]
+
+
 def test_identity_audit_reads_source_field_identity_history():
     from src.compiler.identity_concordance import (
         IdentityBook,

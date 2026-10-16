@@ -1176,6 +1176,35 @@ def post_source_span(owner_definition, node, *, stage=None, source_cells=None):
     )
 
 
+def _source_enum_declaration(definition):
+    """Return the authored Enum base and literal members, if complete.
+
+    This is the one source-syntax reader used by both declaration ingestion
+    and ProgramABI.  Enum annotations are resident integer values; they are
+    not nested record handles merely because their declaration is a ClassDef.
+    """
+
+    enum_base = next((
+        base_identity
+        for base in definition.bases
+        if (base_identity := _ast_qualified_name(base)) is not None
+        and base_identity.rsplit(".", 1)[-1] in {"Enum", "IntEnum"}
+    ), None)
+    if enum_base is None:
+        return None
+    members = tuple(
+        (str(member.targets[0].id), member.value.value, member)
+        for member in definition.body
+        if isinstance(member, ast.Assign)
+        and len(member.targets) == 1
+        and isinstance(member.targets[0], ast.Name)
+        and isinstance(member.value, ast.Constant)
+        and isinstance(member.value.value, (str, int))
+        and not isinstance(member.value.value, bool)
+    )
+    return (str(enum_base), members) if members else None
+
+
 def _class_schema_from_ast(definition, *, carried_declarations=False):
     """Record only class syntax already being ingested by ``ProcessGraph``.
 
@@ -1271,6 +1300,14 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
     schema = {
         "class_name": definition.name,
         "class_identity": class_identity,
+        # Direct source bases are retained as authored identities.  The
+        # exact declaration-to-declaration topology is published after all
+        # classes in this source have posted their CLASS_DECLARATION cells;
+        # no later type test has to rediscover inheritance from a spelling.
+        "bases": tuple(
+            identity for base in definition.bases
+            if (identity := _ast_qualified_name(base)) is not None
+        ),
         "class_node_id": source_span_row(definition, definition),
         "permissions": (),
         "attributes": tuple(attributes),
@@ -1279,7 +1316,11 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
             "graph_identity": f"{definition.name}.{method.name}",
             "ast_node_id": source_span_row(definition, method),
             "parameters": tuple(
-                argument.arg for argument in method.args.args
+                argument.arg for argument in (
+                    *method.args.posonlyargs,
+                    *method.args.args,
+                    *method.args.kwonlyargs,
+                )
             ),
             "permissions": (),
         } for method in methods),
@@ -1350,36 +1391,22 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
             stage=INGESTION, provenance=Derived((method_span,)),
             mode=Mode.CONCORD,
         ))
-    enum_base = next((
-        base_identity
-        for base in definition.bases
-        if (base_identity := _ast_qualified_name(base)) is not None
-        and base_identity.rsplit(".", 1)[-1] in {"Enum", "IntEnum"}
-    ), None)
-    if enum_base is not None:
+    enum_declaration = _source_enum_declaration(definition)
+    if enum_declaration is not None:
+        enum_base, authored_members = enum_declaration
         from ...compiler.string_table import string_token
 
         enum_members = []
         enum_sources = [class_span]
-        for member in definition.body:
-            if not (
-                isinstance(member, ast.Assign)
-                and len(member.targets) == 1
-                and isinstance(member.targets[0], ast.Name)
-                and isinstance(member.value, ast.Constant)
-                and isinstance(member.value.value, (str, int))
-                and not isinstance(member.value.value, bool)
-            ):
-                continue
+        for member_identity, authored_value, member in authored_members:
             member_cell = post_source_span(definition, member)
             if member_cell is None:
                 continue
             runtime_value = (
-                string_token(member.value.value)
-                if isinstance(member.value.value, str)
-                else int(member.value.value)
+                string_token(authored_value)
+                if isinstance(authored_value, str)
+                else int(authored_value)
             )
-            member_identity = str(member.targets[0].id)
             enum_members.append(SourceEnumMember(
                 member_identity=member_identity,
                 runtime_value=int(runtime_value),
@@ -1492,7 +1519,9 @@ def _map_ir_from_ast(tree):
     """
 
     from ...compiler.concordance_declarations import (
-        ANNOTATION_DECLARATION, CLASS_DECLARATION, AnnotationFact, INGESTION,
+        ANNOTATION_DECLARATION, CLASS_DECLARATION, CLASS_SUBTYPE,
+        AnnotationFact, INGESTION, canonical_python_type_identity,
+        ensure_builtin_class_topology,
     )
     from ...compiler.identity_concordance import (
         Derived, Mode, current_identity_book,
@@ -1572,6 +1601,48 @@ def _map_ir_from_ast(tree):
         for definition in ast.walk(tree)
         if isinstance(definition, ast.ClassDef)
     )
+    # Publish inheritance only between exact class declaration cells.  A
+    # source spelling which does not identify one unique declaration in this
+    # module remains unresolved; accepting it by suffix or class name would
+    # make isinstance depend on a second, weaker identity system.
+    class_page = book.page(CLASS_DECLARATION)
+    ensure_builtin_class_topology(book)
+    for item in objects:
+        span_row = item.get("class_node_id")
+        if span_row is None:
+            continue
+        module_name = span_row[0]
+        declared_derived_identity = str(item["class_identity"])
+        derived_cell = book.latest_ref(
+            CLASS_DECLARATION, (module_name, declared_derived_identity),
+        )
+        if derived_cell is None:
+            continue
+        declared_bases = tuple(item.get("bases") or ())
+        for declared_base_identity in declared_bases or ("object",):
+            declared_base_identity = str(declared_base_identity)
+            base_cell = book.latest_ref(
+                CLASS_DECLARATION, (module_name, declared_base_identity),
+            )
+            derived_identity = ".".join(map(str, derived_cell.row))
+            if base_cell is None:
+                base_identity = canonical_python_type_identity(
+                    declared_base_identity
+                )
+                if not base_identity.startswith("builtins."):
+                    continue
+                sources = (derived_cell,)
+            else:
+                base_identity = ".".join(map(str, base_cell.row))
+                sources = (derived_cell, base_cell)
+            row = (derived_identity, base_identity)
+            if book.page(CLASS_SUBTYPE).latest(row) is not None:
+                continue
+            book.post(
+                CLASS_SUBTYPE, row, row, stage=INGESTION,
+                provenance=Derived(sources),
+                mode=Mode.CONCORD,
+            )
     state_machines = tuple(
         state_machine
         for definition in ast.walk(tree)
@@ -4247,7 +4318,7 @@ class ExpressionTensor:
         return f"ExpressionTensor(shape={self.shape}, data={self.data})"
 
 
-from ...compiler.live_tiles import TiledObject, live_digraph
+from ...compiler.live_tiles import TiledObject
 
 
 class ProcessGraph(TiledObject):
@@ -4262,12 +4333,14 @@ class ProcessGraph(TiledObject):
         boundary_namespace=None,
         source_language="python",
     ):
-        # Translation and scheduling do not require a physical memory graph.
-        # Keep materialization opt-in at the call site so compiler front-ends
-        # can operate even when the experimental allocator is unavailable.
+        # ``materialize_memory`` controls the later allocation/scheduling
+        # products, not the authority that stores graph topology.  Every
+        # ProcessGraph is backed by the AbstractTensor memory graph so callers
+        # asking to defer memory-layout work cannot silently select a second
+        # NetworkX topology.
         self.materialize_memory = materialize_memory
-        self.MG = BitTensorMemoryGraph(size=0) if materialize_memory else None
-        self.G = self.MG.G if self.MG is not None else live_digraph()
+        self.MG = BitTensorMemoryGraph(size=0)
+        self.G = self.MG.G
         self._graph_lock = threading.RLock()
         self._graph_condition = threading.Condition(self._graph_lock)
         self._graph_revision = 0

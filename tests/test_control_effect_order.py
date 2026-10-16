@@ -53,6 +53,32 @@ def test_accept_call_does_not_pass_continue_waiting_for_predicate():
     assert scheduled.root.blocks == (producer, terminal, call)
 
 
+def test_call_that_produces_terminal_guard_moves_before_that_guard():
+    """A predicate call is evaluation of the guard, not later fallthrough."""
+    terminal = ConditionalBlock(
+        3,
+        SequenceBlock((LoopControlBlock(
+            "return", return_value_ids=(5,), site_node_id=4,
+        ),)),
+        source_node_id=4,
+    )
+    call = StatementBlock(("__plan_callsite_3__",))
+    hierarchy = PlanClosure("root", (), (
+        PlanCall(
+            3,
+            PlanClosure("LiveScopeProjection_excludes__excludes", (), ()),
+            argument_bindings=((0, 10), (1, 11)),
+            result_bindings=((12, 3),),
+        ),
+    ))
+
+    scheduled, _ = _schedule_loop_callsites(
+        ControlProgram(SequenceBlock((terminal, call))), hierarchy, {},
+    )
+
+    assert scheduled.root.blocks == (call, terminal)
+
+
 def test_pure_hierarchy_rank_cannot_force_predicate_after_accept_call():
     append = SequenceMutationBlock(ControlSequenceMutation(30, 'append', (3,), 40))
     conditional = ConditionalBlock(10, SequenceBlock((append,)), source_node_id=11)

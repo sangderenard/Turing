@@ -264,10 +264,6 @@ defaults:
 rules:
   # Exact result transport is part of the native call ABI. Arbitrary Python
   # objects remain shell-owned handles; scalar clock readings return inline.
-  - id: unresolved-formatted-repr-utf8-result
-    match: {module: src.compiler.glyph_sequence_format, qualname: runtime_repr_utf8, occurrence: definition}
-    action: use_native
-    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: utf8_sequence}
   - id: native-pickle-object-result
     match: {module: _pickle, qualname: "*", occurrence: definition}
     action: use_native
@@ -283,7 +279,23 @@ rules:
   - id: native-os-replace-none-result
     match: {module: nt, qualname: replace, occurrence: definition}
     action: use_native
-    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: opaque_ref}
+    parameters: {loader: operating_system, symbol_resolution: broker, callbacks: reject, execution: shell_io.file_broker, shell_capability: files, shell_abi: turing-shell-io-abi.files, external_domain: host_system, native_abi: turing-file-broker-v1, runtime_owner: shell, shell_profiles: [c, fortran], result_dtype: opaque_ref}
+  - id: native-os-remove-none-result
+    match: {module: nt, qualname: [remove, unlink], occurrence: definition}
+    action: use_native
+    parameters: {loader: operating_system, symbol_resolution: broker, callbacks: reject, execution: shell_io.file_broker, shell_capability: files, shell_abi: turing-shell-io-abi.files, external_domain: host_system, native_abi: turing-file-broker-v1, runtime_owner: shell, shell_profiles: [c, fortran], result_dtype: opaque_ref}
+  - id: native-os-getpid-scalar-result
+    match: {module: [nt, posix], qualname: getpid, occurrence: definition}
+    action: use_native
+    parameters: {loader: operating_system, symbol_resolution: broker, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: turing-system-v1, runtime_owner: shell, shell_profiles: [c, fortran], result_dtype: int64}
+  - id: native-os-environ-get-text-result
+    match: {module: os, qualname: _Environ.get, occurrence: definition}
+    action: use_native
+    parameters: {loader: operating_system, symbol_resolution: broker, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: turing-system-v1, runtime_owner: shell, shell_profiles: [c, fortran], result_dtype: utf8_sequence, argument_sequences: [{position: 0, encoding: unicode-codepoints}, {position: 1, encoding: unicode-codepoints}]}
+  - id: native-lzma-text-writer
+    match: {module: lzma, qualname: open, occurrence: definition}
+    action: use_native
+    parameters: {loader: operating_system, symbol_resolution: broker, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: turing-liblzma-v1, runtime_owner: shell, shell_profiles: [c, fortran], result_dtype: int64}
 
   # These are ordinary live Python objects, not runtime graph parameters.
   # When an instance or one of its definitions occurs on a reachable source

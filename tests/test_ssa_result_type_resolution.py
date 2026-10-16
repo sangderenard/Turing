@@ -153,3 +153,60 @@ def test_projection_uses_caller_output_identity_after_dead_output_removal():
     assert not conflicts
     assert repeated.shape == (3,)
     assert repeated.accounting['ssa_call_result_from'] == ('producer', 21)
+
+
+def test_accepted_component_is_a_source_not_an_ambient_settlement_target():
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    accepted = function('accepted', SSAValue(1, 'int64'))
+    owner, owner_token = begin_identity_book()
+    try:
+        accepted.metadata['accepted_ssa_component'] = {
+            'schema': 'turing.accepted-ssa-component.v1',
+            'artifact_sha256': 'accepted-fixture',
+            'identity_book': owner,
+        }
+    finally:
+        end_identity_book(owner_token)
+
+    ambient, ambient_token = begin_identity_book()
+    try:
+        settle_call_result_types({'accepted': accepted}, outputs, values)
+        assert not ambient.page('transformation_decision').rows()
+    finally:
+        end_identity_book(ambient_token)
+
+def test_accepted_component_output_is_not_rederived_in_current_caller():
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    source = SSAValue(1, 'bool', accounting={'physical_dtype': 'bool'})
+    accepted = function('accepted', source)
+    owner, owner_token = begin_identity_book()
+    try:
+        accepted.metadata['accepted_ssa_component'] = {
+            'schema': 'turing.accepted-ssa-component.v1',
+            'artifact_sha256': 'accepted-fixture',
+            'identity_book': owner,
+        }
+    finally:
+        end_identity_book(owner_token)
+    result = SSAValue(0, 'float64')
+    caller = function('caller', result, ('accepted',))
+
+    ambient, ambient_token = begin_identity_book()
+    try:
+        _, _, conflicts, _ = settle_call_result_types(
+            {'caller': caller, 'accepted': accepted}, outputs, values,
+        )
+        assert result.dtype == 'float64'
+        assert 'physical_dtype' not in result.accounting
+        assert conflicts == ({
+            'caller': 'caller', 'value_id': 0,
+            'retained': ('float64', (), None),
+            'retained_storage': ('float64', (), None),
+            'callee': 'accepted', 'callee_value_id': 1,
+            'proposed': ('bool', (), None),
+            'proposed_storage': ('bool', (), None),
+        },)
+    finally:
+        end_identity_book(ambient_token)

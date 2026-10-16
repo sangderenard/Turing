@@ -87,6 +87,221 @@ def test_concorded_value_class_retains_every_provenance_edge():
     assert right in predecessors
 
 
+def test_declared_source_page_binding_retains_authored_owner_edge():
+    from src.compiler.concordance_declarations import (
+        CLASS_DECLARATION,
+        SOURCE_PAGE_FACT_CLASS,
+    )
+
+    authority_module = ast.parse("""
+from enum import Enum
+
+class RowFieldKind(Enum):
+    SCOPE = "scope"
+    LABEL = "label"
+    INDEX = "index"
+
+class RowField:
+    name: str
+    kind: RowFieldKind
+
+class Registry:
+    def declare_page(
+        self, name, row_fields, fact_type=object, *, private=False,
+        rows_level=2,
+    ):
+        pass
+""")
+    authority_module._turing_source_module = (
+        "src.compiler.identity_concordance"
+    )
+    authority_graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        authority_graph.build_from_ast(authority_module)
+
+    declaration_module = ast.parse("""
+from src.compiler.identity_concordance import (
+    RowField,
+    RowFieldKind as K,
+    declare_page,
+)
+
+class Publication:
+    digest: str
+    nodes: int
+    value: int
+
+_SCOPE = K.SCOPE
+_LABEL = K.LABEL
+
+PUBLICATION = declare_page("publication", (
+    RowField("scope", K.SCOPE),
+    RowField("index", K.INDEX),
+), Publication)
+SCOPES = declare_page("scope_registry", (
+    RowField("label", K.LABEL),
+    RowField("serial", K.INDEX),
+), bool)
+EDGES = declare_page("concordance_edge", (
+    RowField("target", _SCOPE),
+    RowField("source", _LABEL),
+), bool)
+""")
+    declaration_module._turing_source_module = (
+        "probe.concordance_declarations"
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    program_module = ast.parse("""
+def read_page(book, row):
+    return book.latest_ref(PUBLICATION, row)
+
+def inspect_page(row):
+    fact = PUBLICATION.latest(row)
+    if fact is None:
+        return 0
+    return len(fact.digest) if type(fact.nodes) is int else -1
+""")
+    program_module._turing_source_module = "probe.concordance_declarations"
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(program_module)
+    graph.G.graph["program_abi"] = {"records": {
+        "probe.concordance_declarations.Publication": {
+            "identity": "probe.concordance_declarations.Publication",
+            "fields": {
+                "digest": {
+                    "storage": "span", "dtype": "int64", "rank": 1,
+                    "aggregate_kind": "str", "mutable": False,
+                },
+                "nodes": {
+                    "storage": "scalar", "dtype": "int64", "rank": 0,
+                    "mutable": False,
+                },
+                "value": {
+                    "storage": "scalar", "dtype": "int64", "rank": 0,
+                    "mutable": False,
+                },
+            },
+        },
+        "Page": {"identity": "Page", "fields": {}},
+    }}
+    graph.G.graph["declared_source_modules"] = ((
+        "probe.concordance_declarations", declaration_module,
+    ),)
+
+    reduce_abstract_tensor_topology(graph)
+
+    declaration_cell = current_identity_book().latest_ref(
+        SOURCE_PAGE_FACT_CLASS,
+        ("probe.concordance_declarations", "publication"),
+    )
+    assert declaration_cell is not None
+    executable = graph.function_table.entry("read_page").graph.G
+    page_input = next(
+        data for _node_id, data in executable.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name")
+        == "PUBLICATION"
+    )
+    attributes = page_input["attributes"]
+    assert attributes["source_page_declaration_cell"] == declaration_cell
+    declaration_fact = current_identity_book().page(
+        SOURCE_PAGE_FACT_CLASS
+    ).cell(declaration_cell.row, declaration_cell.column)
+    assert declaration_fact.page_name == "publication"
+    assert declaration_fact.class_identity == (
+        "probe.concordance_declarations.Publication"
+    )
+    assert declaration_fact.row_fields == (
+        ("scope", "SCOPE"), ("index", "INDEX"),
+    )
+    assert attributes["program_abi_record_identity"] == "Page"
+    source_rows = {
+        source.row
+        for source, _stage in current_identity_book().edges_into(
+            declaration_cell
+        )
+        if source.page.name == "source_span"
+    }
+    assert source_rows
+    assert all(
+        row[0] == "probe.concordance_declarations"
+        for row in source_rows
+    )
+    class_rows = tuple(
+        source.row
+        for source, _stage in current_identity_book().edges_into(
+            declaration_cell
+        )
+        if source.page == CLASS_DECLARATION
+    )
+    assert (
+        "probe.concordance_declarations", "Publication",
+    ) in class_rows
+
+    inspected = graph.function_table.entry("inspect_page").graph.G
+    latest = next(
+        data for _node_id, data in inspected.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "latest"
+    )
+    assert latest["attributes"][
+        "source_page_declaration_cell"
+    ] == declaration_cell
+    assert latest["attributes"][
+        "optional_result_class_ref"
+    ] == "probe.concordance_declarations.Publication"
+    projected = {
+        data["expr_obj"].attr: data
+        for _node_id, data in inspected.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and data["expr_obj"].attr in {"digest", "nodes"}
+    }
+    assert projected["digest"]["attributes"]["result_class_ref"] == (
+        "builtins.str"
+    )
+    assert projected["digest"]["attributes"]["aggregate_kind"] == "str"
+    assert projected["digest"]["attributes"]["sequence_writable"] is False
+    assert projected["nodes"]["attributes"]["result_class_ref"] == (
+        "builtins.int"
+    )
+    assert projected["nodes"]["tensor"] == {
+        "shape": (), "dtype": "int64",
+    }
+    for page_name, expected_fields in (
+        (
+            "scope_registry",
+            (("label", "LABEL"), ("serial", "INDEX")),
+        ),
+        (
+            "concordance_edge",
+            (("target", "SCOPE"), ("source", "LABEL")),
+        ),
+    ):
+        builtin_cell = current_identity_book().latest_ref(
+            SOURCE_PAGE_FACT_CLASS,
+            ("probe.concordance_declarations", page_name),
+        )
+        assert builtin_cell is not None
+        builtin_fact = current_identity_book().page(
+            SOURCE_PAGE_FACT_CLASS
+        ).cell(builtin_cell.row, builtin_cell.column)
+        assert builtin_fact.class_identity == "builtins.bool"
+        assert builtin_fact.row_fields == expected_fields
+        builtin_source_rows = {
+            source.row
+            for source, _stage in current_identity_book().edges_into(
+                builtin_cell
+            )
+            if source.page.name == "source_span"
+        }
+        assert builtin_source_rows
+        assert all(
+            row[0] == "probe.concordance_declarations"
+            for row in builtin_source_rows
+        )
+
+
 def test_concorded_primitive_class_has_one_canonical_identity():
     from src.compiler.concordance_declarations import SOURCE_VALUE_CLASS
     from src.compiler.identity_concordance import Derived
@@ -692,6 +907,39 @@ def test_static_identity_concordance_drives_schema_normalization_without_receipt
             == "src.common.tensors.abstraction.AbstractTensor.tensor"
             for fact in identities
         )
+    finally:
+        end_identity_book(token)
+
+
+def test_static_python_identity_concordance_follows_canonical_call_identity():
+    graph = ProcessGraph(materialize_memory=False)
+    book, token = begin_identity_book()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "def kernel(item):\n"
+                "    return isinstance(item, int)\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+
+        executable = graph.function_table.entry("kernel").graph.G
+        call_id, call = next(
+            (node_id, data)
+            for node_id, data in executable.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Call)
+        )
+        identity_row = call["attributes"][
+            "source_python_identity_row"
+        ]
+
+        assert int(identity_row[1]) == int(call_id)
+        identity_page = book.page("source_python_identity_concordance")
+        assert identity_page.latest(identity_row)[0] == "builtins.isinstance"
+        identity_cell = book.latest_ref(identity_page, identity_row)
+        assert "canonical_value" in {
+            source.page.name
+            for source, _stage in book.edges_into(identity_cell)
+        }
     finally:
         end_identity_book(token)
 
@@ -1485,6 +1733,58 @@ class Projection:
     assert (field_id, "rhs") in membership["parents"]
 
 
+def test_program_abi_propagates_nested_record_receiver_and_set_storage():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Page:
+    def private_pages(self):
+        return self.book.registry.private_pages
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    # A scoped compiler unit retains the repository ProgramABI even when
+    # pursuit did not copy the nested records' ClassDefs into this function's
+    # source closure.  The record edges remain the declaration authority.
+    graph.G.graph["program_abi"] = {"records": {
+        "Page": {"identity": "Page", "fields": {
+            "book": {
+                "storage": "record", "record": "Book", "rank": 0,
+                "mutable": False,
+            },
+        }},
+        "Book": {"identity": "Book", "fields": {
+            "registry": {
+                "storage": "record", "record": "Registry", "rank": 0,
+                "mutable": False,
+            },
+        }},
+        "Registry": {"identity": "Registry", "fields": {
+            "private_pages": {
+                "storage": "span", "dtype": "int64", "rank": 1,
+                "mutable": True, "aggregate_kind": "set",
+            },
+        }},
+    }}
+
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("private_pages").graph
+    fields = {
+        ast.unparse(data["expr_obj"]): data["attributes"]
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+    }
+    assert fields["self.book"]["result_class_ref"] == "Book"
+    assert fields["self.book.registry"]["result_class_ref"] == "Registry"
+    assert fields["self.book.registry.private_pages"]["aggregate_kind"] == "set"
+    assert fields["self.book.registry.private_pages"][
+        "sequence_column_dtypes"
+    ] == ("int64",)
+
+
 def test_setdefault_result_retains_nested_collection_identity_in_a_loop():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(
@@ -1625,6 +1925,75 @@ class Builder:
     assert field["attributes"]["mapping_value_dtype"] == "int64"
     assert field["attributes"]["mapping_value_record"] == "SSAValue"
     assert field["attributes"]["mapping_value_optional"] is True
+
+
+def test_mapping_values_loop_target_retains_declared_record_identity():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Segment:
+    pass
+
+def collect(page):
+    detached: dict[str, Segment] | None = page.__dict__.get("_detached")
+    if not detached:
+        return []
+    result = []
+    for segment in detached.values():
+        result.append(segment)
+    return result
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("collect").graph
+    loop = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    target_id = int(loop["attributes"]["loop_target_bindings"]["segment"])
+
+    assert function_graph.G.nodes[target_id]["attributes"][
+        "result_class_ref"
+    ] == "Segment"
+
+
+def test_mapping_values_comprehension_target_retains_declared_record_identity():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Segment:
+    pass
+
+def collect(page):
+    detached: dict[str, Segment] | None = page.__dict__.get("_detached")
+    if not detached:
+        return []
+    return [segment for segment in detached.values()]
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("collect").graph
+    comprehension = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.comprehension)
+    )
+    target_id = int(
+        comprehension["attributes"]["loop_target_bindings"]["segment"]
+    )
+
+    assert function_graph.G.nodes[target_id]["attributes"][
+        "result_class_ref"
+    ] == "Segment"
 
 
 def test_mapping_subscript_carries_declared_record_identity():

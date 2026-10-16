@@ -221,6 +221,118 @@ def check_optional_merges(module: Any) -> list[Finding]:
     return findings
 
 
+def check_value_union_storage(module: Any) -> list[Finding]:
+    """Every semantic union arm must name real side-by-side native storage."""
+
+    findings = []
+    tables = dict(getattr(module, "value_union_tables", {}) or {})
+    sequence_tables = dict(getattr(module, "sequence_tables", {}) or {})
+    record_tables = dict(getattr(module, "record_tables", {}) or {})
+    for name, function in _functions(module):
+        table = tables.get(str(name))
+        declared_tags = tuple(
+            function.metadata.get("native_value_type_tags", ())
+        )
+        if table is None:
+            if declared_tags:
+                findings.append(Finding(
+                    "value_union", str(name),
+                    "native type tags exist without a physical value-union "
+                    "table",
+                ))
+            continue
+        values = {int(value.id): value for value in function.args}
+        values.update({
+            int(instruction.res.id): instruction.res
+            for instruction in _instructions(function)
+            if instruction.res is not None
+        })
+        static_references = {
+            int(instruction.res.id): instruction
+            for instruction in _instructions(function)
+            if instruction.res is not None
+            and instruction.op in {"StaticRef", "static_ref"}
+        }
+        for value_id, tag_id in declared_tags:
+            descriptor = table.by_id(int(value_id))
+            if descriptor is None or int(descriptor.tag_value_id) != int(tag_id):
+                findings.append(Finding(
+                    "value_union", str(name),
+                    f"tag {tag_id} for semantic value {value_id} has no "
+                    "matching side-by-side value-union descriptor",
+                ))
+        for descriptor in table.unions.values():
+            type_fact = dict(function.metadata.get(
+                "native_value_type_abi", {}
+            )).get(int(descriptor.union_id))
+            expected_alternatives = tuple(
+                type_fact.get("alternatives", ())
+                if isinstance(type_fact, dict)
+                else getattr(type_fact, "alternatives", ())
+            )
+            if descriptor.tag_vocabulary != expected_alternatives:
+                findings.append(Finding(
+                    "value_union", str(name),
+                    f"union {descriptor.union_id} physical arm order "
+                    f"{descriptor.tag_vocabulary!r} disagrees with its "
+                    f"authoritative ABI {expected_alternatives!r}",
+                ))
+            tag = values.get(int(descriptor.tag_value_id))
+            if tag is None or str(tag.dtype) != "int64":
+                findings.append(Finding(
+                    "value_union", str(name),
+                    f"union {descriptor.union_id} has no native int64 tag "
+                    f"value {descriptor.tag_value_id}",
+                ))
+            for arm in descriptor.alternatives:
+                missing = tuple(
+                    value_id for value_id in arm.value_ids
+                    if int(value_id) not in values
+                )
+                if missing:
+                    findings.append(Finding(
+                        "value_union", str(name),
+                        f"union {descriptor.union_id} arm {arm.name!r} "
+                        f"names absent payload values {missing!r}",
+                    ))
+                if arm.sequence_id is not None and (
+                    sequence_tables.get(str(name)) is None
+                    or sequence_tables[str(name)].by_id(
+                        int(arm.sequence_id)
+                    ) is None
+                ):
+                    findings.append(Finding(
+                        "value_union", str(name),
+                        f"union {descriptor.union_id} arm {arm.name!r} has "
+                        f"no sequence descriptor {arm.sequence_id}",
+                    ))
+                if arm.record_id is not None and (
+                    record_tables.get(str(name)) is None
+                    or record_tables[str(name)].records.get(
+                        int(arm.record_id)
+                    ) is None
+                ):
+                    findings.append(Finding(
+                        "value_union", str(name),
+                        f"union {descriptor.union_id} arm {arm.name!r} has "
+                        f"no record descriptor {arm.record_id}",
+                    ))
+                if arm.storage.value == "reference":
+                    for value_id in arm.value_ids:
+                        reference = static_references.get(int(value_id))
+                        if reference is None or bool(
+                            reference.attributes.get("host_resident", True)
+                        ):
+                            findings.append(Finding(
+                                "value_union", str(name),
+                                f"union {descriptor.union_id} arm "
+                                f"{arm.name!r} lacks an exact native, "
+                                "non-host-resident reference descriptor for "
+                                f"payload {value_id}",
+                            ))
+    return findings
+
+
 def check_dead_storage_formals(module: Any) -> list[Finding]:
     """No formal is a frame-storage slot that the function never touches.
 
@@ -516,6 +628,7 @@ def run_all(module: Any) -> list[Finding]:
     return [
         *check_formal_parity(module),
         *check_optional_merges(module),
+        *check_value_union_storage(module),
         *check_dead_storage_formals(module),
         *check_id_scale(module),
         *check_output_contract_agreement(module),
@@ -533,6 +646,7 @@ __all__ = [
     "check_structural_outputs",
     "check_formal_parity",
     "check_optional_merges",
+    "check_value_union_storage",
     "check_id_scale",
     "check_output_contract_agreement",
     "check_record_sequence_rows",

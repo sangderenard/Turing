@@ -98,12 +98,12 @@ decimal int64 and prefixed lower-hex int64 spelling.  Source pursuit compiles
 their arithmetic, control flow, and sequence appends through the ordinary
 compiler path.  There is no special formatting backend instruction.
 
-For an unresolved runtime `!r`, the existing extraction contract admits one
-repository-owned CPython call, `runtime_repr_utf8`.  Its result crosses the
-boundary as a resident UTF-8 byte sequence.  An authored helper then segments
-that byte sequence into reversible glyph identities.  This admission is
-specific to the unresolved formatted-value operation; it does not change the
-policy for arbitrary `repr` calls or retain a Python object in SSA.
+Runtime `!r` is admitted only when the source concordance already owns its
+lossless native recipe: record and tuple projections retain their ordered
+member edges, integer leaves call the authored decimal formatter, and string
+tokens read the resident `StringTable` glyph vocabulary in `repr` mode.  An
+unknown scalar stays unresolved.  It is not sent to CPython or another host
+formatter to manufacture a representation outside the compiled graph.
 
 ### Aggregate, control, and resident-storage provenance
 

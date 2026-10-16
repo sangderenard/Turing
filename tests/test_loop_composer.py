@@ -741,6 +741,70 @@ def test_optional_record_payload_storage_does_not_select_present_arm():
     )
 
 
+def test_synthesized_optional_presence_derives_from_field_and_receiver():
+    from src.compiler.concordance_declarations import (
+        CLASS_FIELD_DECLARATION, INGESTION_VALUE,
+    )
+    from src.compiler.fortran_c_shell import (
+        _lower_optional_record_presence_graph,
+    )
+    from src.compiler.identity_concordance import current_identity_book
+
+    graph = _function_graph(
+        "class Book:\n"
+        "    pass\n"
+        "class Page:\n"
+        "    book: Book\n"
+        "def thaw(page: Page):\n"
+        "    return page.__dict__\n",
+        "thaw",
+    )
+    graph.G.graph["parameter_record_abi"] = {
+        "page": {
+            "identity": "Page",
+            "fields": {
+                "book": {
+                    "storage": "record", "record": "Book", "rank": 0,
+                    "mutable": False, "optional": True,
+                },
+            },
+            "source_record_view_schema": ("<string>", "Page"),
+        },
+    }
+    book = current_identity_book()
+    field_rows = tuple(
+        row for row in book.page(CLASS_FIELD_DECLARATION).rows()
+        if row[1:] == ("Page", "book")
+    )
+    assert len(field_rows) == 1
+    graph.G.graph["parameter_record_abi"]["page"][
+        "source_record_view_schema"
+    ] = field_rows[0][:2]
+
+    assert _lower_optional_record_presence_graph(graph.G) == 1
+
+    presence_id = graph.G.graph[
+        "optional_record_presence_receipts"
+    ][0]["presence_value_id"]
+    presence_cell = book.latest_ref(
+        INGESTION_VALUE,
+        (graph.G.graph["operand_position_scope"], presence_id),
+    )
+    assert presence_cell is not None
+    incoming = {
+        source for source, _stage in book.edges_into(presence_cell)
+    }
+    assert book.latest_ref(
+        CLASS_FIELD_DECLARATION, field_rows[0],
+    ) in incoming
+    page_input = next(
+        node_id for node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("binding_name") == "page"
+    )
+    from src.common.tensors.topological_reducer import node_identity_cell
+    assert node_identity_cell(graph, page_input) in incoming
+
+
 def test_structural_fold_follows_keyed_record_row_schema():
     graph = _function_graph(
         "def read_kind(graph, node_id):\n"
@@ -1843,6 +1907,117 @@ def test_declared_tuple_parameter_resolves_isinstance_schema_guard():
     )
 
 
+def test_dynamic_record_fact_type_keeps_exact_schema_guard_boundary():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.project_compilation_product import (
+        _unexplained_root_argument_ids,
+    )
+
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        "from dataclasses import dataclass\n"
+        "from typing import Any\n"
+        "@dataclass(frozen=True)\n"
+        "class Page:\n"
+        "    name: str\n"
+        "    fact_type: Any = object\n"
+        "def validate(page: Page, fact: Any) -> bool:\n"
+        "    if not isinstance(fact, page.fact_type):\n"
+        "        raise ValueError(\n"
+        "            f'{page.name}: fact {fact!r} is not a "
+        "{page.fact_type!r}'\n"
+        "        )\n"
+        "    return True\n",
+        "validate",
+        name="dynamic_page_fact_type",
+        extraction_contract=(
+            pathlib.Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        progress=lambda _message: None,
+        progress_bars=False,
+    )
+
+    root = module.functions[exports[0]]
+    assert not root.metadata.get("structural_output_shortfalls")
+    assert _unexplained_root_argument_ids(root) == ()
+    page_fields = {
+        argument.accounting["program_abi_field"]: argument
+        for argument in root.args
+        if (argument.accounting or {}).get("program_abi_record") == "Page"
+    }
+    assert page_fields["name"].dtype == "int64"
+    assert page_fields["fact_type"].dtype == "opaque_ref"
+    aliases = dict(root.metadata.get("value_aliases", {}) or {})
+    authored_fact_type_id, = (
+        int(alias_id)
+        for alias_id, resident_id in aliases.items()
+        if int(resident_id) == int(page_fields["fact_type"].id)
+    )
+    assert authored_fact_type_id != page_fields["fact_type"].id
+    guard = next(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("source_python_intrinsic")
+        == "schema_type_guard"
+    )
+    assert guard.op == "Call"
+    assert guard.res is not None and guard.res.dtype == "bool"
+    assert guard.attributes["external_identity"] == "builtins.isinstance"
+    assert guard.attributes["object_policy"] == "shell-owned-opaque-handles"
+    assert [argument.id for argument in guard.args] == [
+        0, page_fields["fact_type"].id,
+    ]
+    assert guard.args[1].dtype == "opaque_ref"
+    shell_io = module.metadata["shell_io"]
+    plan, = shell_io["external_reference_plans"]
+    occurrence, = shell_io["external_reference_occurrences"]
+    assert plan["identity"] == "builtins.isinstance"
+    assert plan["shell_capability"] == "host_references"
+    assert occurrence["argument_value_ids"] == (
+        0, page_fields["fact_type"].id,
+    )
+    assert occurrence["result_value_id"] == guard.res.id
+
+
+def test_native_repr_record_field_result_is_not_its_opaque_input():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        "from dataclasses import dataclass\n"
+        "from typing import Any\n"
+        "@dataclass(frozen=True)\n"
+        "class Page:\n"
+        "    fact_type: Any = object\n"
+        "def render(page: Page) -> str:\n"
+        "    return f'{page.fact_type!r}'\n",
+        "render",
+        name="native_repr_record_field",
+        extraction_contract=(
+            pathlib.Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        progress=lambda _message: None,
+        progress_bars=False,
+    )
+
+    root = module.functions[exports[0]]
+    aliases = dict(root.metadata.get("value_aliases", {}) or {})
+    external_utf8, = (
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+        and instruction.attributes.get("external_result_sequence") == "utf8"
+    )
+    assert external_utf8.args[0].dtype == "opaque_ref"
+    assert external_utf8.res.dtype == "int64"
+    assert external_utf8.res.id != external_utf8.args[0].id
+    assert int(external_utf8.res.id) not in aliases
+
+
 def test_authored_local_class_annotation_resolves_loop_receiver():
     graph = _function_graph(
         "class Field:\n"
@@ -2585,6 +2760,34 @@ def test_generator_yield_is_planner_owned_backpressured_loop_output():
         if role == "value"
     )
     assert publication.value_id == payload_id
+
+
+def test_generator_tuple_publication_retains_exact_aggregate_members():
+    graph = _function_graph(
+        "def rows(values):\n"
+        "    for value in values:\n"
+        "        yield value, value + 1\n",
+        "rows",
+    )
+
+    plan, = _glsl_composer().compose(graph)
+    reduction, = analyze_shader_loop_reductions(
+        graph,
+        (plan,),
+        (plan.loop.body_nodes,),
+    )
+    loop = reduction.control_program.root
+    publications = tuple(
+        block
+        for block in loop.body.blocks
+        if isinstance(block, StreamPublishBlock)
+    )
+    publication, = publications
+    payload = graph.G.nodes[publication.value_id]
+
+    assert publication.payload_value_ids == tuple(
+        payload["attributes"]["aggregate_leaf_value_ids"]
+    )
 
 
 def test_consumed_multiclause_generator_uses_nested_iterable_domains():

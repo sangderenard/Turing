@@ -3,7 +3,11 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import pickle
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from src.common.tensors.topological_reducer import (
     node_identity_cell,
@@ -21,23 +25,41 @@ from src.compiler.concordance_declarations import (
     SOURCE_ENUM_GLYPH_TABLE,
     SOURCE_GLYPH_SEQUENCE,
     SOURCE_OPTIONAL_GLYPH_CARRY,
+    SOURCE_PAGE_FACT_CLASS,
     SOURCE_VALUE_CLASS,
     SourceAggregateLayout,
+    SourceGlyphComponent,
+    SourceGlyphSequence,
+    SourceGlyphUnionAlternative,
 )
 from src.compiler.extraction_contract import ExtractionContract
+from src.compiler.control_source import (
+    CallBlock,
+    ControlSequenceMutation,
+    ControlProgram,
+    SequenceBlock,
+    SequenceMutationBlock,
+)
 from src.compiler.ast_control_normalization import (
     _normalize_top_level_guard_returns,
 )
-from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from src.compiler.fortran_c_shell import (
+    _verify_optional_glyph_work,
+    lower_ast_source_to_ssa,
+)
 from src.compiler.glsl_deployment_strategy import (
     _post_source_optional_glyph_carries,
 )
 from src.compiler.glyph_sequence_format import (
     decimal_integer_glyph_tokens,
     prefixed_lower_hex_integer_glyph_tokens,
-    utf8_repr_bytes_to_glyph_tokens,
+    quoted_string_glyph_tokens,
+    static_literal_repr_glyph_tokens,
 )
 from src.compiler.identity_concordance import (
+    CorrelationTable,
+    PROVEN_SHAPE_PAGE,
+    SHAPE_STATE_PAGE,
     begin_identity_book,
     current_identity_book,
     end_identity_book,
@@ -46,6 +68,7 @@ from src.compiler.resident_sequence_materialization import (
     _source_glyph_sequence_materializations,
     _string_token_glyph_materializations,
 )
+from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
 from src.compiler.string_table import string_token
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
@@ -56,6 +79,82 @@ def _source_glyph_cell(book, canonical_cell):
         if source.page is SOURCE_GLYPH_SEQUENCE
         and source.row != canonical_cell.row
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "spelling"),
+    (
+        ("plain", "'plain'"),
+        ("has'quote", '"has\'quote"'),
+        ('both\'"quotes', "'both\\\'\"quotes'"),
+        ("line\nfeed", "'line\\nfeed'"),
+        ("nul\0", "'nul\\x00'"),
+    ),
+)
+def test_quoted_string_glyphs_are_authored_and_lossless(value, spelling):
+    assert quoted_string_glyph_tokens(value) == [
+        string_token(character) for character in spelling
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "spelling"),
+    ((None, "None"), (True, "True"), (False, "False"), (-17, "-17")),
+)
+def test_static_literal_repr_uses_the_authored_glyph_faculty(value, spelling):
+    assert static_literal_repr_glyph_tokens(value) == [
+        string_token(character) for character in spelling
+    ]
+
+
+def test_static_literal_repr_refuses_undeclared_host_formatting():
+    assert static_literal_repr_glyph_tokens(1.25) is None
+
+
+def test_value_union_glyph_recipe_retains_exact_per_arm_sequences():
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        scope = book.mint_scope("value-union-glyph")
+        graph.G.graph["source_glyph_sequence_scope"] = scope
+        for value_id in (10, 20, 21, 30, 40):
+            graph.G.add_node(value_id, value_id=value_id, attributes={})
+        book.page(SOURCE_VALUE_CLASS).revise(
+            (scope, 10), ("builtins.tuple",),
+        )
+        book.page(SOURCE_VALUE_CLASS).revise(
+            (scope, 30), ("builtins.NoneType",),
+        )
+        tuple_source = book.latest_ref(SOURCE_VALUE_CLASS, (scope, 10))
+        none_source = book.latest_ref(SOURCE_VALUE_CLASS, (scope, 30))
+        fact = SourceGlyphSequence((SourceGlyphComponent(
+            kind="formatted", component_value_id=30,
+            operand_value_id=10, glyph_tokens=(), conversion=ord("r"),
+            format_spec_value_id=None, projection_kind="value_union",
+            record_identity=None,
+            union_alternatives=(
+                SourceGlyphUnionAlternative(
+                    "builtins.NoneType", 20, (none_source,),
+                ),
+                SourceGlyphUnionAlternative(
+                    "builtins.tuple", 21, (tuple_source,),
+                ),
+            ),
+        ),))
+        book.page(SOURCE_GLYPH_SEQUENCE).revise((scope, 40), fact)
+        declarations, _initializations, mutations = (
+            _source_glyph_sequence_materializations(graph.G)
+        )
+        assert (30, "duplicates", 1, True) in declarations
+        dispatch = next(
+            mutation for mutation in mutations
+            if mutation.operator == "glyph_union_select"
+        )
+        assert dispatch.sequence_value_id == 30
+        assert dispatch.argument_value_ids == (10, 20, 21)
+        assert dispatch.argument_kind == "value_union_glyph_projection"
+    finally:
+        end_identity_book(token)
 
 
 def test_joined_string_publishes_canonical_glyph_sequence_recipe():
@@ -220,14 +319,6 @@ def test_authored_prefixed_hex_formatter_emits_reversible_glyph_tokens():
         ]
 
 
-def test_utf8_repr_decoder_produces_glyph_identities_not_byte_values():
-    for spelling in ("'ascii'", "'café'", "'🧪'"):
-        encoded = list(spelling.encode("utf-8"))
-        tokens = utf8_repr_bytes_to_glyph_tokens(encoded)
-        assert tokens == [string_token(character) for character in spelling]
-        assert tokens != encoded
-
-
 def test_constant_repr_component_stays_folded_without_runtime_call():
     book, token = begin_identity_book()
     try:
@@ -256,8 +347,8 @@ def test_constant_repr_component_stays_folded_without_runtime_call():
             for spelling in ("42", ":", "'café'")
         )
         assert not any(
-            (data.get("attributes") or {}).get("extraction_identity")
-            == "src.compiler.glyph_sequence_format.runtime_repr_utf8"
+            (data.get("attributes") or {}).get("extraction_action")
+            == "use_native"
             for _node_id, data in function.G.nodes(data=True)
         )
     finally:
@@ -396,7 +487,7 @@ def test_integer_formatted_value_has_authored_call_and_unit_dependency():
 
     plans = []
     with contextlib.redirect_stdout(io.StringIO()):
-        lower_ast_source_to_ssa(
+        module, _outputs, _exports = lower_ast_source_to_ssa(
             "def render(value: int):\n"
             "    return f'n={value!r}'\n",
             "render",
@@ -437,6 +528,48 @@ def test_integer_formatted_value_has_authored_call_and_unit_dependency():
     assert reference_to_unit[formatter.reference.address] in plan["units"][
         reference_to_unit[root_ref]
     ]["dependency_units"]
+
+
+def test_decimal_digit_tuple_shape_keeps_canonical_provenance():
+    """The pursued digit table's shape derives from its constant identity."""
+
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {}, "bindings": [],
+        "values": [{
+            "function": "render", "parameter": "value",
+            "storage": "scalar", "dtype": "int64", "rank": 0,
+            "python_type": "builtins.int",
+        }],
+    })
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, _outputs, _exports = lower_ast_source_to_ssa(
+            "def render(value: int):\n"
+            "    return f'value={value}'\n",
+            "render", name="decimal_digit_shape_provenance",
+            extraction_contract=policy, progress=lambda _message: None,
+        )
+
+    book = module.metadata["identity_book"]
+    shape_page = book.page(PROVEN_SHAPE_PAGE)
+    row = next(
+        row for row in shape_page.rows()
+        if "decimal_digit_glyph_token|shape" in str(row)
+        and shape_page.latest(row)[1] == (10,)
+    )
+    shape_ref = book.latest_ref(PROVEN_SHAPE_PAGE, row)
+    assert shape_ref is not None
+    sources = book.edges_into(shape_ref)
+    assert len(sources) == 1
+    assert sources[0][0].page == SHAPE_STATE_PAGE
+    assert not [
+        finding for finding in CorrelationTable.build(module).findings(module)
+        if finding.kind == "unsourced-fact"
+        and finding.function == "proven_shape"
+        and "decimal_digit_glyph_token|shape" in finding.detail
+    ]
 
 
 def test_integer_intrinsic_result_uses_concorded_typed_ssa_formatters():
@@ -487,7 +620,7 @@ def test_integer_intrinsic_result_uses_concorded_typed_ssa_formatters():
         )
 
     with contextlib.redirect_stdout(io.StringIO()):
-        lower_ast_source_to_ssa(
+        module, _outputs, _exports = lower_ast_source_to_ssa(
             "def render(value: int):\n"
             "    return f'n={int(value)} h={int(value):#x}'\n",
             "render",
@@ -505,129 +638,146 @@ def test_integer_intrinsic_result_uses_concorded_typed_ssa_formatters():
         fact is not None and fact[0] == "int"
         for fact in captured["operand_classes"]
     )
+    # The linked decimal/hex helper chain exercises call-record reordering,
+    # planned-region calls, and caller/callee hierarchy projections.  Every
+    # one must retain its exact callsite, RegionSignature, or equivalence-
+    # class source rather than landing as a raw compiler fact.
+    assert not [
+        finding for finding in CorrelationTable.build(module).findings(module)
+        if finding.kind == "unsourced-fact"
+        and finding.function in {
+            "call_record",
+            "formal_actual_occurrence_concordance",
+            "hierarchy_value",
+            "scalar_integer_width",
+            "transformation_decision",
+        }
+    ]
 
 
-def test_unresolved_repr_uses_external_utf8_then_authored_glyph_decoder():
+def test_optional_authored_tuple_repr_carries_into_exact_finding_row_append():
     policy = ExtractionContract(
         Path(__file__).resolve().parents[1]
         / "extraction_contracts/program_extraction.yaml"
-    ).with_program_abi({
-        "records": {},
-        "bindings": [],
-        "values": [{
-            "function": "render",
-            "parameter": "value",
-            "storage": "scalar",
-            "dtype": "float64",
-            "rank": 0,
-            "python_type": "builtins.float",
-        }],
-    })
+    )
+    source = (
+        "from dataclasses import dataclass\n"
+        "@dataclass(frozen=True)\n"
+        "class Finding:\n"
+        "    kind: str\n"
+        "    function: str\n"
+        "    value_id: int | None\n"
+        "    detail: str\n"
+        "class Publication:\n"
+        "    left: int\n"
+        "    right: int\n"
+        "    has_scope: bool\n"
+        "def render(fact: Publication):\n"
+        "    found = []\n"
+        "    detail = None\n"
+        "    if fact.has_scope:\n"
+        "        read_scope = (fact.left, fact.right)\n"
+        "        detail = f'scope={read_scope!r}'\n"
+        "    if detail is not None:\n"
+        "        found.append(Finding('bad', 'render', None, detail))\n"
+        "    return found\n"
+    )
     captured = {}
 
     def capture(graph):
-        root = next(
+        captured["root"] = next(
             entry.graph for entry in graph.function_table
             if entry.name == "render"
         )
-        source_joined = next(
-            data for _node_id, data in graph.G.nodes(data=True)
-            if isinstance(data.get("expr_obj"), ast.JoinedStr)
-        )
-        byte_id, byte_call = next(
-            (int(node_id), data)
-            for node_id, data in root.G.nodes(data=True)
-            if (data.get("attributes") or {}).get("extraction_identity")
-            == "src.compiler.glyph_sequence_format.runtime_repr_utf8"
-        )
-        decoder_id, decoder_call = next(
-            (int(node_id), data)
-            for node_id, data in root.G.nodes(data=True)
-            if (data.get("attributes") or {}).get("callee_resolution")
-            == "source-glyph-utf8-decoder"
-        )
-        joined = next(
-            data for _node_id, data in root.G.nodes(data=True)
-            if (data.get("attributes") or {}).get(
-                "source_glyph_sequence_row"
-            ) is not None
-        )
-        row = joined["attributes"]["source_glyph_sequence_row"]
-        book = current_identity_book()
-        canonical_cell = book.latest_ref(SOURCE_GLYPH_SEQUENCE, row)
-        local_sources = tuple(
-            source
-            for source, _stage in book.edges_into(canonical_cell)
-            if source.page is SOURCE_GLYPH_SEQUENCE
-            and source.row[0] == (row[0], "ingestion")
-        )
-        captured.update({
-            "byte_id": byte_id,
-            "byte_call": byte_call,
-            "decoder_id": decoder_id,
-            "decoder_call": decoder_call,
-            "fact": book.page(
-                SOURCE_GLYPH_SEQUENCE
-            ).latest(row),
-            "canonical_row": row,
-            "local_sources": local_sources,
-            "source_joined_attributes": dict(
-                source_joined.get("attributes") or {}
-            ),
-            "resident_ids": frozenset(map(int, root.G.nodes)),
-            "boundaries": tuple(root.G.graph.get(
-                "extraction_boundary_calls", ()
-            )),
-        })
 
     with contextlib.redirect_stdout(io.StringIO()):
         lower_ast_source_to_ssa(
-            "def render(value: float):\n"
-            "    return f'x={value!r}'\n",
-            "render",
-            name="runtime_repr_glyph_topology",
+            source, "render", name="optional_tuple_field_finding",
             extraction_contract=policy,
             resolved_process_graph_sink=capture,
-            stop_after_compilation_unit_plan=True,
             progress=lambda _message: None,
         )
 
-    byte_id = captured["byte_id"]
-    decoder_id = captured["decoder_id"]
-    byte_call = captured["byte_call"]
-    decoder_call = captured["decoder_call"]
-    assert "source_glyph_sequence_row" not in captured[
-        "source_joined_attributes"
-    ]
-    local_source, = captured["local_sources"]
-    assert local_source.row[0] == (
-        captured["canonical_row"][0], "ingestion",
+    root = captured["root"]
+    joined = next(
+        data for _node_id, data in root.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.JoinedStr)
     )
-    assert isinstance(byte_call["expr_obj"], ast.Call)
-    assert byte_call["parents"] == [(0, "arg:0")]
-    assert byte_call["attributes"]["aggregate_kind"] == "bytes"
-    assert byte_call["attributes"]["sequence_element_dtypes"] == (
-        "int64",
+    assert joined["attributes"]["source_glyph_sequence_row"]
+    optional = next(
+        data for _node_id, data in root.G.nodes(data=True)
+        if (data.get("attributes") or {}).get(
+            "source_optional_glyph_carry_row"
+        ) is not None
     )
-    assert decoder_call["parents"] == [(byte_id, "arg:0")]
-    assert decoder_call["attributes"]["aggregate_kind"] == "list"
-    formatted = next(
-        component for component in captured["fact"].components
-        if component.kind == "formatted"
+    assert optional["attributes"]["producer_kind"] == (
+        "optional_glyph_sequence"
     )
-    assert formatted.formatted_sequence_value_id == decoder_id
-    assert formatted.formatted_sequence_value_id in captured["resident_ids"]
-    assert byte_id in captured["resident_ids"]
-    assert any(
-        boundary.get("source_glyph_component")
-        == byte_call["attributes"]["source_glyph_component"]
-        and (boundary.get("extraction_contract") or {}).get("action")
+    constructor = next(
+        data for _node_id, data in root.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("class_ref") == "Finding"
+    )
+    assert constructor["attributes"][
+        "program_abi_record_identity"
+    ] == "Finding"
+    destination = next(
+        data for _node_id, data in root.G.nodes(data=True)
+        if (data.get("attributes") or {}).get(
+            "program_abi_sequence_row_identity"
+        ) == "Finding"
+    )
+    assert destination["attributes"]["aggregate_kind"] == "list"
+    assert not any(
+        (data.get("attributes") or {}).get("extraction_action")
         == "use_native"
-        for boundary in captured["boundaries"]
+        for _node_id, data in root.G.nodes(data=True)
     )
 
 
-def test_runtime_repr_boundary_does_not_admit_other_format_conversions():
+def test_unknown_runtime_tuple_repr_refuses_without_host_boundary():
+    """A tuple declaration without member edges is not a repr recipe."""
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "class Publication:\n"
+                "    read_scope: tuple | None\n"
+                "def render(fact: Publication):\n"
+                "    if fact.read_scope is not None:\n"
+                "        return f'scope={fact.read_scope!r}'\n"
+                "    return 'absent'\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("render").graph
+        joined = next(
+            data for _node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.JoinedStr)
+        )
+        fact = book.page(SOURCE_GLYPH_SEQUENCE).latest(
+            joined["attributes"]["source_glyph_sequence_row"]
+        )
+        formatted = next(
+            component for component in fact.components
+            if component.kind == "formatted"
+        )
+        assert formatted.formatted_sequence_value_id is None
+        assert not formatted.projection_components
+        assert not any(
+            (data.get("attributes") or {}).get("extraction_action")
+            == "use_native"
+            for _node_id, data in function.G.nodes(data=True)
+        )
+        with pytest.raises(
+            ValueError, match="formatted glyph component has no resident producer"
+        ):
+            _source_glyph_sequence_materializations(function.G)
+    finally:
+        end_identity_book(token)
+
+
+def test_unsupported_format_conversions_do_not_create_host_boundary():
     policy = ExtractionContract(
         Path(__file__).resolve().parents[1]
         / "extraction_contracts/program_extraction.yaml"
@@ -655,10 +805,8 @@ def test_runtime_repr_boundary_does_not_admit_other_format_conversions():
 
     root = captured["root"]
     assert not any(
-        (data.get("attributes") or {}).get("extraction_identity")
-        == "src.compiler.glyph_sequence_format.runtime_repr_utf8"
-        or (data.get("attributes") or {}).get("callee_resolution")
-        == "source-glyph-utf8-decoder"
+        (data.get("attributes") or {}).get("extraction_action")
+        == "use_native"
         for _node_id, data in root.G.nodes(data=True)
     )
 
@@ -708,6 +856,77 @@ def test_glyph_recipe_materializes_through_resident_sequence_operations():
         assert all(item.source_contract_cell is not None for item in mutations)
     finally:
         end_identity_book(token)
+
+
+def test_string_slice_and_len_formatting_have_exact_resident_producers():
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    )
+    captured = {}
+
+    def capture(graph):
+        root = next(
+            entry.graph for entry in graph.function_table
+            if entry.name == "truncate"
+        )
+        joined = next(
+            data for _node_id, data in root.G.nodes(data=True)
+            if (data.get("attributes") or {}).get(
+                "source_glyph_sequence_row"
+            ) is not None
+        )
+        row = joined["attributes"]["source_glyph_sequence_row"]
+        fact = current_identity_book().page(
+            SOURCE_GLYPH_SEQUENCE
+        ).latest(row)
+        captured.update({
+            "root": root,
+            "fact": fact,
+            "materializations": _source_glyph_sequence_materializations(
+                root.G
+            ),
+        })
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        lower_ast_source_to_ssa(
+            "def truncate(text: str):\n"
+            "    if len(text) <= 240:\n"
+            "        return text\n"
+            "    return f'{text[:240]} ... ({len(text)} chars)'\n",
+            "truncate",
+            name="truncate_glyph_components",
+            extraction_contract=policy,
+            resolved_process_graph_sink=capture,
+            stop_after_compilation_unit_plan=True,
+            progress=lambda _message: None,
+        )
+
+    formatted = tuple(
+        component for component in captured["fact"].components
+        if component.kind == "formatted"
+    )
+    assert tuple(component.projection_kind for component in formatted) == (
+        "string_token", "scalar",
+    )
+    sliced, length = formatted
+    assert sliced.formatted_sequence_value_id is None
+    assert captured["root"].G.nodes[sliced.operand_value_id][
+        "attributes"
+    ]["producer_kind"] == "string_slice"
+    assert length.formatted_sequence_value_id is not None
+    length_formatter = captured["root"].G.nodes[
+        length.formatted_sequence_value_id
+    ]
+    assert length_formatter["attributes"]["callee_resolution"] == (
+        "source-glyph-formatter"
+    )
+    declarations, _initializations, _mutations = captured[
+        "materializations"
+    ]
+    declared = {int(value_id) for value_id, _policy, _columns, _write in declarations}
+    assert sliced.component_value_id in declared
+    assert length.formatted_sequence_value_id in declared
 
 
 def test_record_repr_publishes_declared_field_projection_order():
@@ -931,7 +1150,7 @@ def test_annotated_local_field_uses_declared_string_projection():
         end_identity_book(token)
 
 
-def test_enum_name_projection_uses_authored_resident_lookup_table():
+def test_enum_name_projection_uses_authored_resident_lookup_table_after_rehydration():
     book, token = begin_identity_book()
     try:
         graph = ProcessGraph(materialize_memory=False)
@@ -993,6 +1212,37 @@ def test_enum_name_projection_uses_authored_resident_lookup_table():
             source for source, _stage in book.edges_into(vocabulary_cell)
         }
         assert enum_cell in incoming
+
+        # Compilation-unit control can cross a tile/pickle boundary after the
+        # exact vocabulary Ref is minted.  Its Page is rehydrated by value;
+        # the cell key must still resolve against this book's retained fact.
+        rehydrated = pickle.loads(pickle.dumps(mutation))
+        assert rehydrated.vocabulary_contract_cell.page is not (
+            book.registry.pages["string_glyph_vocabulary"]
+        )
+        lowered, shortfalls = lower_control_program_to_ssa(
+            ControlProgram(SequenceBlock((
+                SequenceMutationBlock(rehydrated),
+            ))),
+            function_name="rehydrated_enum_glyph_vocabulary",
+            sequence_declarations=(
+                *declarations,
+                (
+                    int(rehydrated.sequence_value_id),
+                    "duplicates", 1, True,
+                ),
+            ),
+            sequence_initializations=initializations,
+        )
+        assert shortfalls == ()
+        assert any(
+            instruction.attributes.get("ssa_sequence_operation")
+            == "glyph_token_lookup_copy"
+            and instruction.attributes.get("vocabulary_sequence_id")
+            == vocabulary_id
+            for block in lowered.blocks.values()
+            for instruction in block.instrs
+        )
     finally:
         end_identity_book(token)
 
@@ -1115,9 +1365,18 @@ def test_page_rows_and_isinstance_else_arm_carry_declared_schema():
             if (data.get("attributes") or {}).get("producer_kind")
             == "page_row"
         )
-        assert loop_row["attributes"]["source_page_row_fields"] == (
+        declaration_cell = loop_row["attributes"][
+            "source_page_declaration_cell"
+        ]
+        assert declaration_cell.page == SOURCE_PAGE_FACT_CLASS
+        declaration = current_identity_book().page(
+            SOURCE_PAGE_FACT_CLASS
+        ).cell(declaration_cell.row, declaration_cell.column)
+        assert declaration.row_fields == (
             ("scope", "SCOPE"), ("index", "INDEX"),
         )
+        assert "source_page_row_fields" not in loop_row["attributes"]
+        assert "source_page_fact_class" not in loop_row["attributes"]
         count = next(
             data for _node_id, data in function.G.nodes(data=True)
             if isinstance(data.get("expr_obj"), ast.Attribute)
@@ -1172,6 +1431,170 @@ def test_page_scope_str_call_builds_resident_tuple_glyph_recipe():
         # without inventing a stand-in formatter address.
     finally:
         end_identity_book(token)
+
+
+def test_page_latest_key_declares_exact_optional_field_tuple_repr():
+    """The consuming Page key, not the bare tuple annotation, owns layout."""
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "from dataclasses import dataclass\n"
+                "@dataclass(frozen=True)\n"
+                "class Publication:\n"
+                "    read_scope: tuple | None\n"
+                "PUBLICATIONS = declare_page(\n"
+                "    'publications', (RowField('index', K.INDEX),), "
+                "Publication,\n"
+                ")\n"
+                "SCOPES = declare_page(\n"
+                "    'scopes', (RowField('label', K.LABEL), "
+                "RowField('serial', K.INDEX)), bool,\n"
+                ")\n"
+                "def render(book):\n"
+                "    with book.borrowed('publications') as publications, "
+                "book.borrowed('scopes') as scopes:\n"
+                "        fact = publications.latest((0,))\n"
+                "        if not isinstance(fact, Publication):\n"
+                "            return 'absent'\n"
+                "        if (fact.read_scope is not None "
+                "and scopes.latest(fact.read_scope) is not True):\n"
+                "            return f'{fact.read_scope!r}'\n"
+                "    return 'valid'\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("render").graph
+        joined = next(
+            data for _node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.JoinedStr)
+        )
+        fact = book.page(SOURCE_GLYPH_SEQUENCE).latest(
+            joined["attributes"]["source_glyph_sequence_row"]
+        )
+        formatted = next(
+            component for component in fact.components
+            if component.kind == "formatted"
+        )
+        assert formatted.projection_kind == "tuple"
+        assert tuple(
+            component.projection_kind
+            for component in formatted.projection_components
+        ) == (
+            "literal", "string_token", "literal", "scalar", "literal",
+        )
+        operand = function.G.nodes[formatted.operand_value_id]
+        declaration_cell = operand["attributes"][
+            "source_page_declaration_cell"
+        ]
+        declaration = book.page(SOURCE_PAGE_FACT_CLASS).cell(
+            declaration_cell.row, declaration_cell.column,
+        )
+        assert declaration.page_name == "scopes"
+        assert declaration.class_identity == "builtins.bool"
+        assert declaration.row_fields == (
+            ("label", "LABEL"), ("serial", "INDEX"),
+        )
+        assert not any(
+            (data.get("attributes") or {}).get("extraction_action")
+            == "use_native"
+            for _node_id, data in function.G.nodes(data=True)
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_page_latest_or_absence_repr_owns_nested_optional_glyph_carry():
+    """The original OR keeps record formatting behind exact presence."""
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "from dataclasses import dataclass\n"
+                "@dataclass(frozen=True)\n"
+                "class Region:\n"
+                "    schedule_preference: str\n"
+                "    serial: int\n"
+                "REGIONS = declare_page(\n"
+                "    'regions', (RowField('index', K.INDEX),), Region,\n"
+                ")\n"
+                "def render(book, preference: str):\n"
+                "    with book.borrowed('regions') as regions:\n"
+                "        region = regions.latest((0,))\n"
+                "        if (region is None or "
+                "region.schedule_preference != preference):\n"
+                "            return f'mismatch: {region!r}'\n"
+                "    return 'valid'\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("render").graph
+        merged_id, merged = next(
+            (int(node_id), data)
+            for node_id, data in function.G.nodes(data=True)
+            if (data.get("attributes") or {}).get(
+                "source_optional_glyph_dispatch"
+            ) is not None
+        )
+        row = merged["attributes"]["source_optional_glyph_carry_row"]
+        fact = book.page(SOURCE_OPTIONAL_GLYPH_CARRY).latest(row)
+        assert fact.merged_value_id == merged_id
+        assert fact.initial_value_id is None
+        assert fact.predicate_expect_true is False
+        assert fact.owner_conditional_id == merged["attributes"][
+            "source_optional_glyph_dispatch"
+        ]["owner_conditional_id"]
+        assert fact.true_arm.sequence_value_id == fact.true_value_id
+        assert fact.false_arm.sequence_value_id == fact.false_value_id
+        assert fact.true_arm.presence is True
+        assert fact.false_arm.presence is True
+        assert fact.present_projection_sequence_ids
+        absent = book.page(SOURCE_GLYPH_SEQUENCE).cell(
+            fact.false_arm.presence_source.row,
+            fact.false_arm.presence_source.column,
+        )
+        assert tuple(
+            token
+            for component in absent.components
+            for token in component.glyph_tokens
+        ) == tuple(string_token(character) for character in "None")
+        joined = next(
+            data for _node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.JoinedStr)
+        )
+        joined_fact = book.page(SOURCE_GLYPH_SEQUENCE).latest(
+            joined["attributes"]["source_glyph_sequence_row"]
+        )
+        assert any(
+            component.formatted_sequence_value_id == merged_id
+            and component.projection_kind == "optional_glyph_sequence"
+            for component in joined_fact.components
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_optional_glyph_work_refuses_partial_or_unrecognized_extraction():
+    fact = SimpleNamespace(
+        merged_value_id=30,
+        present_callsite_ids=(11,),
+        present_projection_sequence_ids=(21, 22),
+    )
+    call = CallBlock(11, SequenceBlock(()))
+    first = SequenceMutationBlock(ControlSequenceMutation(
+        21, "clear", (), 21, argument_kind="glyph_sequence_clear",
+    ))
+    second = SequenceMutationBlock(ControlSequenceMutation(
+        22, "clear", (), 22, argument_kind="glyph_sequence_clear",
+    ))
+    with pytest.raises(ValueError, match="partial or not directly owned"):
+        _verify_optional_glyph_work(fact, (call, first), ())
+    with pytest.raises(ValueError, match="unrecognized=1"):
+        _verify_optional_glyph_work(
+            fact, (call, first, second), (second,),
+        )
 
 
 def test_isinstance_true_arm_owns_record_repr_refinement():
@@ -1294,6 +1717,10 @@ def test_record_repr_builds_resident_projection_sequence_end_to_end():
         (instruction.attributes or {}).get("ssa_sequence_operation")
         == "extend" for instruction in operations
     )
+    assert not any(
+        (instruction.attributes or {}).get("external_reference")
+        for instruction in operations
+    )
 
 
 def test_tuple_repr_builds_resident_projection_sequence_end_to_end():
@@ -1328,52 +1755,53 @@ def test_tuple_repr_builds_resident_projection_sequence_end_to_end():
         (instruction.attributes or {}).get("ssa_sequence_operation")
         == "extend" for instruction in operations
     ) >= 3
-
-
-def test_runtime_repr_utf8_decode_builds_resident_sequence_end_to_end():
-    policy = ExtractionContract(
-        Path(__file__).resolve().parents[1]
-        / "extraction_contracts/program_extraction.yaml"
-    ).with_program_abi({
-        "records": {}, "bindings": [],
-        "values": [{
-            "function": "render", "parameter": "value",
-            "storage": "scalar", "dtype": "float64", "rank": 0,
-            "python_type": "builtins.float",
-        }],
-    })
-    with contextlib.redirect_stdout(io.StringIO()):
-        module, _outputs, exports = lower_ast_source_to_ssa(
-            "def render(value: float):\n"
-            "    return f'value={value!r}'\n",
-            "render", name="runtime_repr_utf8_glyph_projection",
-            extraction_contract=policy, progress=lambda _message: None,
-        )
-    root = module.functions[exports[0]]
-    operations = tuple(
-        instruction
-        for block in root.blocks.values()
-        for instruction in block.instrs
-    )
-    external = next(
-        instruction for instruction in operations
-        if (instruction.attributes or {}).get("external_reference")
-        and (instruction.attributes or {}).get("extraction_identity")
-        == "src.compiler.glyph_sequence_format.runtime_repr_utf8"
-    )
-    assert external.attributes["external_result_sequence"] == "utf8"
-    assert any(
-        (instruction.attributes or {}).get("callee", "").endswith(
-            "utf8_repr_bytes_to_glyph_tokens"
-        )
-        for instruction in operations
-        if instruction.op == "Call"
-    )
-    assert any(
-        (instruction.attributes or {}).get("ssa_sequence_operation")
-        == "extend"
+    assert not any(
+        (instruction.attributes or {}).get("external_reference")
         for instruction in operations
     )
+
+
+def test_typed_identity_page_name_is_resident_glyph_producer():
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "class IdentityPage:\n"
+                "    name: str\n"
+                "def replace(page: IdentityPage):\n"
+                "    return f'{page.name}: row'\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("replace").graph
+        joined = next(
+            data for _node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.JoinedStr)
+        )
+        fact = book.page(SOURCE_GLYPH_SEQUENCE).latest(
+            joined["attributes"]["source_glyph_sequence_row"]
+        )
+        formatted = next(
+            component for component in fact.components
+            if component.kind == "formatted"
+        )
+        assert formatted.projection_kind == "string_token"
+        declarations, _initializations, mutations = (
+            _source_glyph_sequence_materializations(function.G)
+        )
+        assert any(
+            declaration[0] == formatted.component_value_id
+            for declaration in declarations
+        )
+        assert any(
+            mutation.argument_kind == "glyph_sequence_component"
+            and mutation.argument_value_ids == (
+                formatted.component_value_id,
+            )
+            for mutation in mutations
+        )
+    finally:
+        end_identity_book(token)
 
 
 def test_optional_glyph_carry_chains_presence_from_exact_source_cells():

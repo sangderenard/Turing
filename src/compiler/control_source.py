@@ -499,11 +499,46 @@ class ExternalReferenceCallBlock(TiledObject):
     keyword_argument_value_ids: tuple[tuple[str, int], ...]
     result_value_id: int
     result_dtype: str
+    argument_sequence_ids: tuple[tuple[int, int, str], ...] = ()
     shell_abi: str = "turing-shell-io-abi.external_references"
     external_domain: str = "host_system"
     native_abi: str = ""
     runtime_owner: str = ""
     shell_profiles: tuple[str, ...] = ()
+    # Exact native failure classes declared by the extraction receipt.  The
+    # integer is the native status tag and the string is the declaration
+    # identity (for example ``builtins.OSError``).  Status is a compiler-owned
+    # result distinct from the authored call's payload.
+    failure_statuses: tuple[tuple[int, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class NativeExceptionHandler(TiledObject):
+    """One exact authored ``except`` arm of a retained native Try."""
+
+    body: "ControlBlock"
+    source_handler_node_id: int
+    # The source graph identities of the exception class declarations.  A
+    # bare except has no declarations and therefore an empty tuple.
+    exception_type_value_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class NativeTryBlock(TiledObject):
+    """Catchable native status control owned by one authored ``ast.Try``.
+
+    Body, handlers, orelse and finalbody remain separate lexical arms.  A
+    backend must run orelse only after a successful body, dispatch a failed
+    native status to the first matching handler, and traverse finalbody for
+    every normal or handled path.  An unmatched status propagates after the
+    finalbody; it must never be converted to success or a process abort.
+    """
+
+    body: "ControlBlock"
+    handlers: tuple[NativeExceptionHandler, ...]
+    orelse: "ControlBlock | None"
+    finalbody: "ControlBlock"
+    source_try_node_id: int
 
 
 @dataclass(frozen=True)
@@ -600,6 +635,10 @@ class StreamPublishBlock(TiledObject):
     count_value_id: int | None = None
     predicate_value_id: int | None = None
     final: bool = False
+    # An authored aggregate has no scalar value of its own.  Its reducer
+    # layout is the payload: retain those exact member identities so SSA does
+    # not manufacture a public formal for the tuple/list syntax node.
+    payload_value_ids: tuple[int, ...] = ()
 
 
 ControlBlock = (
@@ -615,6 +654,7 @@ ControlBlock = (
     | DispatchBlock
     | ResourceScopeBlock
     | ExternalReferenceCallBlock
+    | NativeTryBlock
     | ValidationBlock
     | SequenceMutationBlock
     | SequenceQueryBlock
@@ -761,6 +801,7 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
                 values.add(int(block.default_value_id))
         elif isinstance(block, StreamPublishBlock):
             values.add(int(block.value_id))
+            values.update(int(value_id) for value_id in block.payload_value_ids)
             if block.count_value_id is not None:
                 values.add(int(block.count_value_id))
             if block.predicate_value_id is not None:
@@ -777,6 +818,14 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             visit(block.body)
             for operation in block.cleanup:
                 visit(operation)
+        elif isinstance(block, NativeTryBlock):
+            visit(block.body)
+            for handler in block.handlers:
+                values.update(map(int, handler.exception_type_value_ids))
+                visit(handler.body)
+            if block.orelse is not None:
+                visit(block.orelse)
+            visit(block.finalbody)
         elif isinstance(block, SequenceBlock):
             for child in block.blocks:
                 visit(child)
@@ -901,6 +950,7 @@ def _control_block_kind(block: Any) -> Any:
         DispatchBlock: Kind.DISPATCH,
         ResourceScopeBlock: Kind.RESOURCE_SCOPE,
         ExternalReferenceCallBlock: Kind.EXTERNAL_REFERENCE_CALL,
+        NativeTryBlock: Kind.NATIVE_TRY,
         ValidationBlock: Kind.VALIDATION,
         SequenceMutationBlock: Kind.SEQUENCE_MUTATION,
         SequenceQueryBlock: Kind.SEQUENCE_QUERY,
@@ -960,6 +1010,15 @@ def _control_block_arms(block: Any) -> tuple:
             (Arm.BODY, 0, block.body),
             (Arm.CLEANUP, 0, SequenceBlock(tuple(block.cleanup))),
         ]
+    elif isinstance(block, NativeTryBlock):
+        arms = [(Arm.BODY, 0, block.body)]
+        arms.extend(
+            (Arm.HANDLER, index, handler.body)
+            for index, handler in enumerate(block.handlers)
+        )
+        if block.orelse is not None:
+            arms.append((Arm.ORELSE, 0, block.orelse))
+        arms.append((Arm.FINALBODY, 0, block.finalbody))
     else:
         return ()
     return tuple(
@@ -1096,6 +1155,17 @@ def _describe_control_block(
         )
     elif isinstance(block, ResourceScopeBlock):
         owner = cell(block.source_scope_id)
+    elif isinstance(block, NativeTryBlock):
+        owner = cell(block.source_try_node_id)
+        carried = cells(
+            value_id
+            for handler in block.handlers
+            for value_id in handler.exception_type_value_ids
+        )
+        extra = tuple(
+            int(handler.source_handler_node_id)
+            for handler in block.handlers
+        )
     elif isinstance(block, ValidationBlock):
         owner = predicate = cell(block.predicate_value_id)
         extra = (
@@ -1119,7 +1189,10 @@ def _describe_control_block(
         extra = (str(block.operation),)
     elif isinstance(block, StreamPublishBlock):
         owner = cell(block.value_id)
-        extra = (bool(block.final),)
+        extra = (
+            bool(block.final),
+            tuple(map(int, block.payload_value_ids)),
+        )
     elif isinstance(block, StateMachineTick):
         # Like a conditional: the owner is the dispatch construct's node
         # cell, the predicate is the state selector's value cell.
@@ -1802,7 +1875,7 @@ def render_control_block(
         # A target renderer therefore sees the callee as ordinary nested
         # control, not as a host-language function call.
         return render_control_block(block.callee, target)
-    if isinstance(block, (DispatchBlock, ResourceScopeBlock)):
+    if isinstance(block, (DispatchBlock, ResourceScopeBlock, NativeTryBlock)):
         raise ValueError(
             "dispatcher coordination must lower through SSA and a backend "
             "synchronization implementation; source rendering cannot erase it"
@@ -2105,6 +2178,24 @@ def order_control_region_dependencies(
             else ("callee",) if isinstance(block, CallBlock)
             else ()
         )
+        if isinstance(block, NativeTryBlock):
+            body, body_regions = visit(block.body)
+            handlers = []
+            regions = set(body_regions)
+            for handler in block.handlers:
+                handler_body, handler_regions = visit(handler.body)
+                regions.update(handler_regions)
+                handlers.append(replace(handler, body=handler_body))
+            orelse = None
+            if block.orelse is not None:
+                orelse, members = visit(block.orelse)
+                regions.update(members)
+            finalbody, members = visit(block.finalbody)
+            regions.update(members)
+            return replace(
+                block, body=body, handlers=tuple(handlers),
+                orelse=orelse, finalbody=finalbody,
+            ), regions
         changes, regions = {}, set()
         for field in fields:
             child = getattr(block, field)
@@ -2288,6 +2379,13 @@ def place_loop_carried_region_producers(
             )
         if isinstance(block, (LoopBlock, ResourceScopeBlock)):
             return replace(block, body=visit(block.body))
+        if isinstance(block, NativeTryBlock):
+            return replace(
+                block, body=visit(block.body),
+                handlers=tuple(replace(item, body=visit(item.body)) for item in block.handlers),
+                orelse=None if block.orelse is None else visit(block.orelse),
+                finalbody=visit(block.finalbody),
+            )
         if isinstance(block, CallBlock):
             return replace(block, callee=visit(block.callee))
         return block
@@ -2365,6 +2463,14 @@ def enrich_represented_conditionals(
             )
         if isinstance(block, ResourceScopeBlock):
             return can_fall_through(block.body)
+        if isinstance(block, NativeTryBlock):
+            return (
+                can_fall_through(block.finalbody)
+                and (
+                    can_fall_through(block.body)
+                    or any(can_fall_through(item.body) for item in block.handlers)
+                )
+            )
         if isinstance(block, StateMachineTick):
             return (
                 block.default is None
@@ -2523,6 +2629,13 @@ def enrich_represented_conditionals(
             )
         if isinstance(block, (LoopBlock, ResourceScopeBlock)):
             return replace(block, body=visit(block.body))
+        if isinstance(block, NativeTryBlock):
+            return replace(
+                block, body=visit(block.body),
+                handlers=tuple(replace(item, body=visit(item.body)) for item in block.handlers),
+                orelse=None if block.orelse is None else visit(block.orelse),
+                finalbody=visit(block.finalbody),
+            )
         if isinstance(block, CallBlock):
             return replace(block, callee=visit(block.callee))
         if isinstance(block, StateMachineTick):
@@ -2550,6 +2663,13 @@ def enrich_represented_conditionals(
                 yield from conditional_aliases(child)
         elif isinstance(block, ResourceScopeBlock):
             yield from conditional_aliases(block.body)
+        elif isinstance(block, NativeTryBlock):
+            yield from conditional_aliases(block.body)
+            for handler in block.handlers:
+                yield from conditional_aliases(handler.body)
+            if block.orelse is not None:
+                yield from conditional_aliases(block.orelse)
+            yield from conditional_aliases(block.finalbody)
         elif isinstance(block, StateMachineTick):
             # Loop-carry enrichment reads only (initial, merged); a tick's
             # N-way alias is reported in the conditional's 4-tuple shape.
@@ -2672,6 +2792,13 @@ def enrich_represented_conditionals(
             )
         if isinstance(block, ResourceScopeBlock):
             return replace(block, body=enrich_loop_carries(block.body))
+        if isinstance(block, NativeTryBlock):
+            return replace(
+                block, body=enrich_loop_carries(block.body),
+                handlers=tuple(replace(item, body=enrich_loop_carries(item.body)) for item in block.handlers),
+                orelse=None if block.orelse is None else enrich_loop_carries(block.orelse),
+                finalbody=enrich_loop_carries(block.finalbody),
+            )
         if isinstance(block, CallBlock):
             return replace(block, callee=enrich_loop_carries(block.callee))
         if isinstance(block, StateMachineTick):
@@ -2998,6 +3125,13 @@ def compose_region_code(
             )
         if isinstance(block, ResourceScopeBlock):
             return replace(block, body=substitute(block.body) or SequenceBlock(()))
+        if isinstance(block, NativeTryBlock):
+            return replace(
+                block, body=substitute(block.body) or SequenceBlock(()),
+                handlers=tuple(replace(item, body=substitute(item.body) or SequenceBlock(())) for item in block.handlers),
+                orelse=None if block.orelse is None else substitute(block.orelse),
+                finalbody=substitute(block.finalbody) or SequenceBlock(()),
+            )
         if isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
             return block
         if isinstance(block, ValidationBlock):
@@ -3085,6 +3219,13 @@ def project_control_regions(
             collect_control_definitions(block.body)
         elif isinstance(block, (LoopBlock, ResourceScopeBlock)):
             collect_control_definitions(block.body)
+        elif isinstance(block, NativeTryBlock):
+            collect_control_definitions(block.body)
+            for handler in block.handlers:
+                collect_control_definitions(handler.body)
+            if block.orelse is not None:
+                collect_control_definitions(block.orelse)
+            collect_control_definitions(block.finalbody)
         elif isinstance(block, CallBlock):
             collect_control_definitions(block.callee)
         elif isinstance(block, StateMachineTick):
@@ -3342,6 +3483,13 @@ def project_control_regions(
             )
         if isinstance(block, ResourceScopeBlock):
             return replace(block, body=project(block.body) or SequenceBlock(()))
+        if isinstance(block, NativeTryBlock):
+            return replace(
+                block, body=project(block.body) or SequenceBlock(()),
+                handlers=tuple(replace(item, body=project(item.body) or SequenceBlock(())) for item in block.handlers),
+                orelse=None if block.orelse is None else project(block.orelse),
+                finalbody=project(block.finalbody) or SequenceBlock(()),
+            )
         if isinstance(block, DispatchBlock):
             return block
         if isinstance(block, ValidationBlock):
@@ -4635,6 +4783,8 @@ __all__ = [
     "ScalarFieldWriteBlock",
     "CallBlock",
     "ExternalReferenceCallBlock",
+    "NativeExceptionHandler",
+    "NativeTryBlock",
     "DispatchBlock",
     "ResourceScopeBlock",
     "ValidationBlock",

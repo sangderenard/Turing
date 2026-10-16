@@ -110,6 +110,7 @@ def _authored_sequence_annotation_contract(
         # This proves a collection's SLOT layout without claiming the handle
         # can be dereferenced or its runtime object type inspected.
         "object": "opaque_ref",
+        "Any": "opaque_ref",
     }
 
     def scalar_dtype(node: ast.AST) -> str | None:

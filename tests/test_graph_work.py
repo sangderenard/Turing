@@ -16,6 +16,7 @@ from src.compiler.graph_work import (
 )
 from src.compiler.identity_concordance import IdentityBook
 from src.compiler.work_contract import PRESETS, active_contract, set_active_contract
+from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
 
 def _region(offset=0):
@@ -28,6 +29,26 @@ def _region(offset=0):
     graph.graph["deployment_nodes"] = (offset, offset + 1)
     return SimpleNamespace(G=graph, levels={offset: 0, offset + 1: 1},
                            scheduler=SimpleNamespace(G=graph, levels_asap={}, levels_alap={}))
+
+
+def test_memory_graph_region_pool_preserves_process_graph_storage_authority():
+    region = ProcessGraph(materialize_memory=False)
+    region.G.add_edge(0, 1)
+    original_graph = region.G
+    original_memory = region.MG
+    pool = RegionTopologyPool(IdentityBook(), 1)
+    try:
+        added = pool.add(region)
+
+        assert added is region
+        assert region.G is original_graph
+        assert region.MG is original_memory
+        assert region.G.bit_tensor_memory_graph is original_memory
+        assert region.scheduler.G is original_graph
+        assert pool.resident == {}
+        assert pool.entries == {}
+    finally:
+        pool.close()
 
 
 def test_many_region_headers_hold_only_bounded_topologies_and_preserve_ast_identity():

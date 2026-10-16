@@ -198,6 +198,57 @@ def test_scalar_sequence_projections_retain_exact_authored_source_binding():
     )
 
 
+def test_scalar_receiver_dict_truth_retains_exact_authored_projection():
+    graph = nx.DiGraph()
+    graph.add_node(0, value_id=0, attributes={
+        "binding_kind": "parameter", "binding_name": "self",
+    })
+    graph.add_node(
+        1,
+        value_id=1,
+        expr_obj=ast.Attribute(
+            value=ast.Name(id="self", ctx=ast.Load()),
+            attr="__dict__",
+            ctx=ast.Load(),
+        ),
+        parents=[(0, "value")],
+        attributes={"attribute": "__dict__"},
+    )
+    graph.add_node(2, value_id=2, attributes={"value": "_compressed_ram"})
+    graph.add_node(
+        3,
+        value_id=3,
+        expr_obj=ast.Call(
+            func=ast.Attribute(
+                value=ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr="__dict__",
+                    ctx=ast.Load(),
+                ),
+                attr="get",
+                ctx=ast.Load(),
+            ),
+            args=[ast.Constant("_compressed_ram")],
+            keywords=[],
+        ),
+        parents=[(1, "operand"), (2, "arg:0")],
+        attributes={},
+    )
+    graph.add_node(
+        4,
+        value_id=4,
+        expr_obj=ast.If(
+            test=ast.Constant(True), body=[ast.Pass()], orelse=[],
+        ),
+        parents=[(3, "test")],
+        attributes={},
+    )
+
+    assert _scalar_source_transforms(graph, ()) == (
+        (3, "self", "dict_truth:_compressed_ram"),
+    )
+
+
 def test_authored_dataclass_method_gets_only_its_exact_field_view():
     views = _authored_dataclass_record_views(ast.parse("""
 from dataclasses import dataclass, field
@@ -329,7 +380,7 @@ def emit(body: Builder):
     }
 
 
-def test_authored_constructor_schema_requires_every_field_and_keeps_tuple_slots():
+def test_authored_constructor_schema_keeps_tuple_slots_and_object_references():
     schemas = _authored_complete_record_schemas(ast.parse("""
 from dataclasses import dataclass
 
@@ -345,6 +396,20 @@ class Partial:
 """))
 
     assert schemas == {
+        "Partial": {
+            "identity": "Partial",
+            "source_derived": True,
+            "fields": {
+                "count": {
+                    "storage": "scalar", "dtype": "int64", "rank": 0,
+                    "mutable": False,
+                },
+                "opaque": {
+                    "storage": "reference", "dtype": "opaque_ref", "rank": 0,
+                    "mutable": False,
+                },
+            },
+        },
         "Plan": {
             "identity": "Plan",
             "source_derived": True,
@@ -400,6 +465,10 @@ class Registry:
                 "storage": "span", "dtype": "int64", "rank": 1,
                 "mutable": False, "aggregate_kind": "str",
             },
+            "payload": {
+                "storage": "reference", "dtype": "opaque_ref", "rank": 0,
+                "mutable": False,
+            },
         },
         "source_derived": True,
         "projection_complete": True,
@@ -417,6 +486,69 @@ class Registry:
     }
     assert CLASS_DECLARATION.name in sources
     assert CLASS_FIELD_DECLARATION.name in sources
+
+
+def test_keyed_record_value_derives_nested_enum_row_table_columns():
+    source = """
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+
+class RowKind(Enum):
+    NAME = "name"
+    INDEX = "index"
+
+class LogLevel(IntEnum):
+    OFF = 0
+    FULL = 1
+
+@dataclass(frozen=True)
+class RowField:
+    name: str
+    kind: RowKind
+
+@dataclass(frozen=True)
+class Page:
+    name: str
+    row_fields: tuple[RowField, ...]
+    rows_level: LogLevel
+
+class Registry:
+    pages: dict[str, Page]
+
+    def page(self, name: str):
+        return self.pages.get(name)
+"""
+    schemas = _authored_complete_record_schemas(ast.parse(source))
+    assert schemas["RowField"]["fields"]["kind"] == {
+        "storage": "scalar", "dtype": "int64", "rank": 0,
+        "mutable": False, "token_vocabulary": ("name", "index"),
+    }
+    assert schemas["Page"]["fields"]["rows_level"] == {
+        "storage": "scalar", "dtype": "int64", "rank": 0,
+        "mutable": False,
+    }
+
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts"
+        / "program_extraction.yaml"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "Registry.page", extraction_contract=contract,
+        runtime_closure_only=True, progress=lambda _message: None,
+        progress_bars=False,
+    )
+    function = module.functions[exports[0]]
+    nested_fields = {
+        str(value.accounting["program_abi_field"]): str(value.dtype)
+        for value in function.args
+        if (value.accounting or {}).get("program_abi_field")
+    }
+    assert nested_fields["pages[].row_fields.columns.name"] == "int64"
+    assert nested_fields["pages[].row_fields.columns.kind"] == "int64"
+    assert nested_fields["pages[].row_fields.lengths"] == "int64"
+    assert nested_fields["pages[].row_fields.row_stride"] == "int64"
+    assert nested_fields["pages[].rows_level.column"] == "int64"
 
 
 def test_optional_nested_record_view_is_derived_from_both_class_declarations():
@@ -475,7 +607,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Page:
     name: int
-    payload: object
+    payload: complex
 
 def build(name: int, payload: int):
     return Page(name, payload)

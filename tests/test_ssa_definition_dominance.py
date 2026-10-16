@@ -70,3 +70,61 @@ def test_operand_free_constant_is_hoisted_from_late_exit_with_provenance():
         'tie_policy': 'incumbent',
     },)
     assert hoist_nondominating_constants(function) == ()
+
+
+def test_accepted_component_constant_hoist_uses_its_provenance_owner():
+    from src.compiler.concordance_declarations import (
+        SSA_BLOCK_GEOMETRY,
+        SSA_CONSTANT_HOIST,
+    )
+    from src.compiler.identity_concordance import (
+        IdentityBook,
+        begin_identity_book,
+        end_identity_book,
+    )
+    from src.compiler.ssa_record_return_state import function_scope_of
+    from tests.compiler_provenance_inputs import publish_authored_ssa
+
+    value, output = SSAValue(11, 'int64'), SSAValue(12, 'int64')
+    function = Function('linked', [], {
+        'entry': BasicBlock('entry', [], successors=['body']),
+        'body': BasicBlock('body', [
+            Instr('Add', [value, value], output),
+        ], successors=['exit']),
+        'exit': BasicBlock('exit', [
+            Instr('Const', [], value, attributes={'value': 1}),
+            Instr('Ret', [output], None),
+        ]),
+    })
+    owner, owner_token = begin_identity_book(IdentityBook())
+    try:
+        publish_authored_ssa({function.name: function})
+    finally:
+        end_identity_book(owner_token)
+    function.metadata['accepted_ssa_component'] = {
+        'schema': 'turing.accepted-ssa-component.v1',
+        'artifact_sha256': 'dependency-digest',
+        'unit_index': 44,
+        'identity_book': owner,
+    }
+
+    ambient, ambient_token = begin_identity_book(IdentityBook())
+    try:
+        receipts = hoist_nondominating_constants(function)
+    finally:
+        end_identity_book(ambient_token)
+
+    scope = function_scope_of(function)
+    assert receipts[0]['value_id'] == 11
+    assert owner.page(SSA_BLOCK_GEOMETRY).latest(
+        (scope, function.name, 'entry')
+    ) is not None
+    assert tuple(owner.page(SSA_CONSTANT_HOIST).scope_rows(
+        (scope, function.name)
+    ))
+    assert ambient.page(SSA_BLOCK_GEOMETRY).latest(
+        (scope, function.name, 'entry')
+    ) is None
+    assert tuple(ambient.page(SSA_CONSTANT_HOIST).scope_rows(
+        (scope, function.name)
+    )) == ()

@@ -219,6 +219,124 @@ def publish_program_abi_graph_identities(
             operation = str(
                 data.get("op") or data.get("type") or ""
             ).casefold()
+            if operation == "call":
+                # A schema-declared constructor is the exact record identity
+                # of its result.  Publish that identity on the constructor
+                # edge itself so a resident collection receiving the result
+                # can retain its record-row ABI without inferring anything
+                # from the collection binding's spelling.
+                constructor_candidates = tuple(filter(None, (
+                    attributes.get("class_ref"),
+                    attributes.get("static_python_reference"),
+                )))
+                constructor_schemas = tuple({
+                    str(match[0]): match
+                    for candidate in constructor_candidates
+                    for match in (schema_named(candidate),)
+                    if match is not None
+                }.values())
+                if len(constructor_schemas) == 1:
+                    record_name, record = constructor_schemas[0]
+                    record_identity = str(
+                        record.get("identity") or record_name
+                    )
+                    incumbent = attributes.get(
+                        "program_abi_record_identity"
+                    )
+                    if incumbent not in {None, record_identity}:
+                        raise ValueError(
+                            "record constructor identity disagreement: "
+                            f"recorded={incumbent!r}, "
+                            f"declared={record_identity!r}"
+                        )
+                    if incumbent is None:
+                        attributes[
+                            "program_abi_record_identity"
+                        ] = record_identity
+                        changed_nodes.add(node_id)
+                        changed = True
+            if (
+                isinstance(data.get("expr_obj"), ast.Call)
+                and isinstance(data["expr_obj"].func, ast.Attribute)
+                and data["expr_obj"].func.attr in {"append", "add"}
+            ):
+                # The authored mutation edge transfers its one record
+                # operand's exact schema to the destination row.  This is the
+                # same ProgramABI identity already published on the
+                # constructor/projection, not a type guess from ``append`` or
+                # the destination name.
+                parents = tuple(
+                    (parent, str(role))
+                    for parent, role in data.get("parents") or ()
+                    if parent in graph_obj
+                )
+                destination = next((
+                    graph_obj.nodes[parent]
+                    for parent, role in parents if role == "operand"
+                ), None)
+                argument_identities = {
+                    (graph_obj.nodes[parent].get("attributes") or {}).get(
+                        "program_abi_record_identity"
+                    )
+                    for parent, role in parents
+                    if role.startswith("arg:")
+                    and (graph_obj.nodes[parent].get("attributes") or {}).get(
+                        "program_abi_record_identity"
+                    ) is not None
+                }
+                destination_attributes = (
+                    None if destination is None else
+                    destination.setdefault("attributes", {})
+                )
+                if (
+                    destination_attributes is not None
+                    and destination_attributes.get("aggregate_kind")
+                    in {"list", "set"}
+                    and len(argument_identities) == 1
+                ):
+                    row_identity = str(next(iter(argument_identities)))
+                    incumbent = destination_attributes.get(
+                        "program_abi_sequence_row_identity"
+                    )
+                    if incumbent not in {None, row_identity}:
+                        raise ValueError(
+                            "record sequence row identity disagreement: "
+                            f"recorded={incumbent!r}, "
+                            f"appended={row_identity!r}"
+                        )
+                    if incumbent is None:
+                        destination_attributes[
+                            "program_abi_sequence_row_identity"
+                        ] = row_identity
+                        destination_id = next(
+                            parent for parent, role in parents
+                            if role == "operand"
+                        )
+                        changed_nodes.add(destination_id)
+                        changed = True
+            # A typed local mapping is not a ProgramABI root parameter, but
+            # its reducer receipt names the same repository value record.
+            # Seed that exact keyed-value identity before projecting through
+            # values()/comprehension edges; otherwise the retained Segment
+            # declaration stops at the local mapping node.
+            mapping_record = attributes.get("mapping_value_record")
+            mapping_target = (
+                None if mapping_record is None
+                else schema_named(mapping_record)
+            )
+            if mapping_target is not None:
+                mapping_identity = str(
+                    mapping_target[1].get("identity")
+                    or mapping_target[0]
+                )
+                if attributes.get(
+                    "program_abi_indexed_value_identity"
+                ) != mapping_identity:
+                    attributes[
+                        "program_abi_indexed_value_identity"
+                    ] = mapping_identity
+                    changed_nodes.add(node_id)
+                    changed = True
             parents = tuple(
                 (parent, str(role))
                 for parent, role in data.get("parents") or ()
@@ -1147,6 +1265,7 @@ class CorrelationTable:
         found.extend(self._binding_kind_findings(module))
         found.extend(self._name_binding_capture_findings(module))
         found.extend(self._conditional_binding_preservation_findings(module))
+        found.extend(self._source_page_declaration_findings(module))
         found.extend(self._graph_work_publication_findings(module))
         found.extend(self._tile_storage_findings(module))
         found.extend(self._source_field_identity_findings(module))
@@ -1157,6 +1276,7 @@ class CorrelationTable:
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
+        found.extend(self._value_type_abi_findings(module))
         found.extend(self._source_callsite_activation_findings(module))
         found.extend(self._source_precision_boundary_findings(module))
         found.extend(self._source_precision_operator_findings(module))
@@ -1173,6 +1293,432 @@ class CorrelationTable:
         # per-page kinds first; ``concordance_report`` counts these two kinds
         # on their own line.
         found.extend(self._unsourced_findings(module))
+        return found
+
+    @staticmethod
+    def _value_type_abi_findings(module: Any) -> list[Finding]:
+        """Validate the native type discriminant as a view of value identity.
+
+        Dense integers are deliberately not identities.  The linked
+        ``value_type_abi`` row owns the canonical alternative table; every
+        function-local ``value_type_tag`` must repeat that exact table and
+        derive from its ABI row.  This makes an accidentally re-numbered
+        subset visible before a backend can compare incompatible tags.
+        """
+
+        from .concordance_declarations import (
+            SOURCE_VALUE_CLASS, UNION_ALTERNATIVE_STATE,
+            VALUE_TYPE_ABI, VALUE_TYPE_TAG,
+            UnionAlternativeStateFact,
+            ValueTypeABIFact, ValueTypeTagFact,
+            canonical_python_type_identity,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        if book is None:
+            return []
+        abi_page = (getattr(book, "pages", {}) or {}).get(
+            VALUE_TYPE_ABI.name
+        )
+        tag_page = (getattr(book, "pages", {}) or {}).get(
+            VALUE_TYPE_TAG.name
+        )
+        union_state_page = (getattr(book, "pages", {}) or {}).get(
+            UNION_ALTERNATIVE_STATE.name
+        )
+        found: list[Finding] = []
+        source_classes_by_value: dict[int, list[tuple[str, Ref]]] = {}
+        source_class_page = (getattr(book, "pages", {}) or {}).get(
+            SOURCE_VALUE_CLASS.name
+        )
+        if source_class_page is not None:
+            for source_row in source_class_page.rows():
+                if not (
+                    isinstance(source_row, tuple)
+                    and len(source_row) == 2
+                ):
+                    continue
+                source_fact = source_class_page.latest(source_row)
+                source_ref = book.latest_ref(SOURCE_VALUE_CLASS, source_row)
+                if (
+                    source_ref is not None
+                    and isinstance(source_fact, tuple)
+                    and source_fact
+                ):
+                    source_classes_by_value.setdefault(
+                        int(source_row[1]), []
+                    ).append((
+                        canonical_python_type_identity(source_fact[0]),
+                        source_ref,
+                    ))
+        abi_by_value: dict[int, list[tuple[Any, ValueTypeABIFact, Ref]]] = {}
+        if abi_page is not None:
+            for row in abi_page.rows():
+                fact = abi_page.latest(row)
+                scope, value_id = (
+                    row if isinstance(row, tuple) and len(row) == 2
+                    else (row, None)
+                )
+                problem = None
+                alternatives = tuple(getattr(fact, "alternatives", ()))
+                tags = tuple(getattr(fact, "tags", ()))
+                physical = tuple(
+                    getattr(fact, "physical_alternatives", ())
+                )
+                if not isinstance(fact, ValueTypeABIFact):
+                    problem = f"invalid value type ABI fact {fact!r}"
+                elif (
+                    not alternatives
+                    or alternatives != tuple(sorted(set(alternatives)))
+                    or any(not isinstance(identity, str) or not identity
+                           for identity in alternatives)
+                ):
+                    problem = (
+                        "type alternatives are not unique canonical "
+                        f"identities: {alternatives!r}"
+                    )
+                elif len(alternatives) == 1 and tags:
+                    problem = "an exact type must not allocate a runtime tag"
+                elif len(alternatives) > 1 and tags != tuple(
+                    (identity, ordinal)
+                    for ordinal, identity in enumerate(alternatives)
+                ):
+                    problem = (
+                        "union tag table is not the dense view of its exact "
+                        f"alternatives: {tags!r}"
+                    )
+                elif tuple(
+                    getattr(arm, "identity", None) for arm in physical
+                ) != alternatives:
+                    problem = (
+                        "type ABI semantic alternatives do not have one "
+                        f"ordered physical arm each: {physical!r}"
+                    )
+                elif any(
+                    not tuple(getattr(arm, "source_cells", ()))
+                    or (
+                        getattr(arm, "identity", "")
+                        != "builtins.NoneType"
+                        and not getattr(arm, "storage", "")
+                    )
+                    or (
+                        getattr(arm, "identity", "")
+                        == "builtins.NoneType"
+                        and (
+                            getattr(arm, "storage", "") != "none"
+                            or getattr(arm, "dtype", "")
+                            or tuple(getattr(arm, "shape", ()))
+                        )
+                    )
+                    for arm in physical
+                ):
+                    problem = (
+                        "type ABI has an unrepresented or malformed physical "
+                        f"alternative: {physical!r}"
+                    )
+                ref = (
+                    None if value_id is None else
+                    book.latest_ref(VALUE_TYPE_ABI, row)
+                )
+                if problem is None and ref is not None:
+                    sources = tuple(
+                        source for source, _stage in book.edges_into(ref)
+                    )
+                    if any(
+                        cell not in sources
+                        for arm in physical
+                        for cell in arm.source_cells
+                    ):
+                        problem = (
+                            "type ABI physical arm does not derive from its "
+                            "exact source cell"
+                        )
+                    if not any(
+                        source.page.name in {
+                            "canonical_value", "ingestion_value"
+                        }
+                        and isinstance(source.row, tuple)
+                        and len(source.row) == 2
+                        and int(source.row[1]) == int(value_id)
+                        for source in sources
+                    ):
+                        problem = "type ABI does not derive from its value identity"
+                    ordinary = tuple(
+                        (identity, source_ref)
+                        for identity, source_ref
+                        in source_classes_by_value.get(int(value_id), ())
+                        if identity in alternatives
+                    )
+                    if ordinary and not any(
+                        source_ref in sources
+                        for _identity, source_ref in ordinary
+                    ):
+                        problem = (
+                            "ordinary type ABI does not derive directly from "
+                            "its exact source_value_class cell"
+                        )
+                if problem is not None:
+                    found.append(Finding(
+                        "value-type-abi-disagreement", str(scope),
+                        None if value_id is None else int(value_id), problem,
+                    ))
+                elif ref is not None:
+                    abi_by_value.setdefault(int(value_id), []).append(
+                        (scope, fact, ref)
+                    )
+        if union_state_page is not None:
+            for row in union_state_page.rows():
+                fact = union_state_page.latest(row)
+                scope, value_id = (
+                    row if isinstance(row, tuple) and len(row) == 2
+                    else (row, None)
+                )
+                problem = None
+                if not isinstance(fact, UnionAlternativeStateFact):
+                    problem = f"invalid union alternative state {fact!r}"
+                elif value_id is None:
+                    problem = f"invalid union alternative state row {row!r}"
+                elif len(fact.alternatives) != len(fact.states):
+                    problem = (
+                        "union alternative state has unequal identity/state "
+                        f"arity: {fact!r}"
+                    )
+                else:
+                    state_ref = book.latest_ref(UNION_ALTERNATIVE_STATE, row)
+                    sources = set(
+                        source.key for source, _stage
+                        in book.edges_into(state_ref)
+                    ) if state_ref is not None else set()
+                    tag_ref = book.latest_ref(
+                        VALUE_TYPE_TAG,
+                        (scope, int(value_id), int(fact.tag_value_id)),
+                    )
+                    candidates = [
+                        (abi, ref) for _abi_scope, abi, ref
+                        in abi_by_value.get(int(value_id), ())
+                        if tuple(abi.alternatives) == tuple(fact.alternatives)
+                    ]
+                    if len(candidates) != 1:
+                        problem = (
+                            "union alternative state has no unique exact "
+                            "value type ABI"
+                        )
+                    else:
+                        abi, abi_ref = candidates[0]
+                        expected_states = tuple((
+                            tuple(arm.shape), str(arm.dtype), int(arm.rank),
+                            str(arm.metadata_state),
+                            None if arm.row_shape is None
+                            else tuple(arm.row_shape),
+                        ) for arm in abi.physical_alternatives)
+                        if tuple(fact.states) != expected_states:
+                            problem = (
+                                "union alternative state disagrees with its "
+                                f"physical ABI: {fact.states!r} != "
+                                f"{expected_states!r}"
+                            )
+                        elif abi_ref.key not in sources:
+                            problem = (
+                                "union alternative state does not derive "
+                                "directly from its value type ABI"
+                            )
+                        elif tag_ref is None or tag_ref.key not in sources:
+                            problem = (
+                                "union alternative state does not derive "
+                                "directly from its value type tag"
+                            )
+                if problem is not None:
+                    found.append(Finding(
+                        "union-alternative-state-disagreement", str(scope),
+                        None if value_id is None else int(value_id), problem,
+                    ))
+        if tag_page is None:
+            return found
+        for row in tag_page.rows():
+            fact = tag_page.latest(row)
+            scope, value_id, row_tag_value_id = (
+                row if isinstance(row, tuple) and len(row) == 3
+                else (row, None, None)
+            )
+            problem = None
+            if not isinstance(fact, ValueTypeTagFact):
+                problem = f"invalid value type tag fact {fact!r}"
+            elif value_id is None:
+                problem = f"invalid value type tag row {row!r}"
+            elif int(row_tag_value_id) != int(fact.tag_value_id):
+                problem = (
+                    "tag row identity disagrees with its fact: "
+                    f"row={row_tag_value_id!r}, fact={fact.tag_value_id!r}"
+                )
+            else:
+                tag_ref = book.latest_ref(VALUE_TYPE_TAG, row)
+                sources = set(
+                    source.key for source, _stage in book.edges_into(tag_ref)
+                ) if tag_ref is not None else set()
+                candidates = [
+                    (abi, ref) for _abi_scope, abi, ref
+                    in abi_by_value.get(int(value_id), ())
+                    if (
+                        tuple(abi.alternatives) == tuple(fact.alternatives)
+                        and tuple(abi.tags) == tuple(fact.tags)
+                        and ref.key in sources
+                    )
+                ]
+                if len(candidates) != 1:
+                    problem = (
+                        "tag has no unique directly-derived authoritative "
+                        "ABI table: "
+                        f"alternatives={fact.alternatives!r}, tags={fact.tags!r}"
+                    )
+            if problem is not None:
+                found.append(Finding(
+                    "value-type-tag-disagreement", str(scope),
+                    None if value_id is None else int(value_id), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_page_declaration_findings(module: Any) -> list[Finding]:
+        """A source Page view must resolve through its sole authored cell.
+
+        ProcessGraph consumers retain only ``source_page_declaration_cell``;
+        page name, fact class, and RowField order are read from that cell.  A
+        malformed fact or an edge to another module would otherwise make a
+        projected unit appear typed while pointing at a copied/local schema.
+        """
+
+        from .concordance_declarations import (
+            CLASS_DECLARATION, CLASS_METHOD_DECLARATION,
+            SOURCE_PAGE_FACT_CLASS,
+            SOURCE_ENUM_GLYPH_TABLE, STATIC_SYMBOL_DEFINITION,
+            SourcePageFactClass,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        if book is None or SOURCE_PAGE_FACT_CLASS.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_PAGE_FACT_CLASS)
+        for row in page.rows():
+            fact = page.latest(row)
+            cell = book.latest_ref(SOURCE_PAGE_FACT_CLASS, row)
+            sources = (
+                () if cell is None else book.edges_into(cell)
+            )
+            span_modules = {
+                str(source.row[0])
+                for source, _stage in sources
+                if source.page.name == "source_span"
+                and isinstance(source.row, tuple)
+                and source.row
+            }
+            class_rows = tuple(
+                source.row
+                for source, _stage in sources
+                if source.page == CLASS_DECLARATION
+            )
+            class_identity = str(getattr(fact, "class_identity", ""))
+            fact_class_rows = tuple(
+                candidate for candidate in class_rows
+                if len(candidate) == 2
+                and ".".join(map(str, candidate)) == class_identity
+            )
+            # A locally declared fact class must cite its declaration.  An
+            # imported class edge legitimately names another module; when
+            # present it must still agree with the authored class spelling.
+            # Builtins/unadmitted external types have no CLASS_DECLARATION
+            # row and retain their exact type-expression source span instead.
+            class_edge_valid = (
+                not isinstance(fact, SourcePageFactClass)
+                or (
+                    class_identity.startswith("builtins.")
+                    and len(tuple(
+                        source for source, _stage in sources
+                        if source.page == STATIC_SYMBOL_DEFINITION
+                        and tuple(source.row) == (
+                            "builtins",
+                            class_identity.removeprefix("builtins."),
+                            "",
+                        )
+                        and any(
+                            upstream.page.name == "source_span"
+                            and str(upstream.row[0]) == str(row[0])
+                            for upstream, _upstream_stage
+                            in book.edges_into(source)
+                        )
+                    )) == 1
+                )
+                or len(fact_class_rows) == 1
+            )
+            row_schema_edges_valid = all(
+                required in class_rows
+                for required in (
+                    ("src.compiler.identity_concordance", "RowField"),
+                    (
+                        "src.compiler.identity_concordance",
+                        "RowFieldKind",
+                    ),
+                )
+            )
+            row_kind_enum_edge_valid = any(
+                source.page == SOURCE_ENUM_GLYPH_TABLE
+                and tuple(source.row) == (
+                    "src.compiler.identity_concordance", "RowFieldKind",
+                )
+                for source, _stage in sources
+            )
+            factory_edge_valid = (
+                len(tuple(
+                    source for source, _stage in sources
+                    if source.page == STATIC_SYMBOL_DEFINITION
+                    and tuple(source.row) == (
+                        "src.compiler.identity_concordance",
+                        "Registry.declare_page",
+                        "src.compiler.identity_concordance.Registry",
+                    )
+                    and any(
+                        upstream.page == CLASS_METHOD_DECLARATION
+                        and tuple(upstream.row) == (
+                            "src.compiler.identity_concordance",
+                            "Registry", "declare_page",
+                        )
+                        for upstream, _upstream_stage in book.edges_into(source)
+                    )
+                )) == 1
+            )
+            valid_fields = (
+                isinstance(getattr(fact, "row_fields", None), tuple)
+                and all(
+                    isinstance(field, tuple)
+                    and len(field) == 2
+                    and all(isinstance(item, str) and item for item in field)
+                    for field in fact.row_fields
+                )
+            )
+            if (
+                not isinstance(fact, SourcePageFactClass)
+                or len(row) != 2
+                or str(row[1]) != str(fact.page_name)
+                or not str(fact.class_identity)
+                or not valid_fields
+                or not class_edge_valid
+                or not row_schema_edges_valid
+                or not row_kind_enum_edge_valid
+                or not factory_edge_valid
+                or not span_modules
+                or span_modules != {str(row[0])}
+            ):
+                found.append(Finding(
+                    "source-page-declaration-disagreement",
+                    str(row[0]) if row else "?",
+                    None,
+                    "source page cell disagrees with its authored module, "
+                    "page name, fact class, or RowField source edges",
+                ))
         return found
 
     @staticmethod
@@ -2974,11 +3520,19 @@ class CorrelationTable:
                           if descriptor.live_flags_value_id is not None else ()),
                     )))
                     actual = tuple(int(value.id) for value in instruction.args)
+                    source_queries = tuple(map(
+                        int,
+                        membership.get("source_query_ids") or (
+                            (membership["source_query_id"],)
+                            if membership.get("source_query_id") is not None
+                            else ()
+                        ),
+                    ))
                     helper = module.functions.get(str(attributes.get("callee") or ""))
                     if (descriptor is None or instruction.op != "Call"
                             or attributes.get("ssa_sequence_operation") != "contains"
                             or int(membership["source_target_id"]) != int(descriptor.sequence_id)
-                            or actual != (*storage, int(membership["source_query_id"]))
+                            or actual != (*storage, *source_queries)
                             or helper is None
                             or helper.metadata.get("ssa_sequence_operation") != "contains"
                             or len(helper.args) != len(actual)):
@@ -3104,8 +3658,16 @@ class CorrelationTable:
         # shared authority. This catches the exact class of failure where a
         # late pass proves an identity in ``metadata.value_aliases`` but the
         # next pass reads only ``planning_value_concordance`` (or vice versa).
-        book = dict(getattr(module, "metadata", {}) or {}).get(
-            "identity_book"
+        # Imported functions keep the book that accepted them; the composing
+        # module's book owns only the current unit and does not duplicate the
+        # imported output-identity rows.
+        book = (
+            dict(metadata.get("accepted_ssa_component") or {}).get(
+                "identity_book"
+            )
+            or dict(getattr(module, "metadata", {}) or {}).get(
+                "identity_book"
+            )
         )
         page = (
             None if book is None else
@@ -3459,17 +4021,17 @@ class LiveScopeProjection:
     writer that posts the projection, so the book can refuse a read of a node
     the relation says the scope does not hold."""
 
-    pages: frozenset
+    pages: frozenset[Any]
     #: Nodes excluded by name (a caller that holds the set itself).
-    excluded: frozenset = frozenset()
+    excluded: frozenset[Any] = frozenset()
     #: Excluded as a COMPLEMENT: the nodes of the source graph at fork time
     #: (``universe``, one frozenset shared by every region cut from that
     #: graph -- see ``IdentityBook.register_scope_projection``) that this
     #: scope does not hold (``held``).  Spelling a region's exclusions as
     #: ``universe - held`` cost one source-sized set per region, retained
     #: for the whole compile; the complement costs the region's own nodes.
-    universe: frozenset = frozenset()
-    held: frozenset = frozenset()
+    universe: frozenset[Any] = frozenset()
+    held: frozenset[Any] = frozenset()
     #: The projection of the scope this one was forked from, whose
     #: exclusions it inherits.
     inherited: "LiveScopeProjection | None" = None
@@ -5749,6 +6311,20 @@ SHAPE_STATE_PAGE = declare_page(
     (RowField("scope", _SCOPE), RowField("value_id", _LABEL)),
     tuple,
 )
+#: The settled non-scalar projection consumed by legacy shape readers.  This
+#: used to be an undeclared raw page even when ``record_shape_transformation``
+#: had already recorded the exact graph-derived state.  In the decimal glyph
+#: helper that discarded the canonical-value edge for the ten-element digit
+#: tuple and left ``proven_shape`` unsourced in the accepted dependency.
+PROVEN_SHAPE_PAGE = declare_page(
+    "proven_shape",
+    (RowField("scope", _SCOPE), RowField("value_id", _LABEL)),
+    tuple,
+)
+PROVEN_SHAPE_STAGE = declare_stage("proven_shape")
+PROVEN_SHAPE_SOURCE_NOT_ON_BOOK = declare_reason(
+    "proven_shape_source_not_on_book"
+)
 #: A shape edge whose source identity has no changed state cell on the book
 #: (the source is a graph identity the caller read off the graph).
 SHAPE_SOURCE_NOT_ON_BOOK = declare_reason("shape_source_not_on_book")
@@ -5991,8 +6567,8 @@ def concordant_shape_transformation_state(
 
 def invalidate_shape_transformation(
     scope: Any, value_id: Any, source_id: Any, reason: Any,
-    *, source_scope: Any = None,
-) -> None:
+    *, source_scope: Any = None, source_cells: tuple[Ref, ...] = (),
+) -> Ref | None:
     """Record that a target's prior path was superseded upstream.
 
     The withdrawal derives from the cell of the identity that changed: the
@@ -6012,12 +6588,16 @@ def invalidate_shape_transformation(
             _shape_key(scope if source_scope is None else source_scope),
             source_id,
         ))
-        _post_or_unsourced(
+        return _post_or_unsourced(
             book, SHAPE_STATE_PAGE, row, fact,
             book.registry.declare_stage(str(reason)),
-            () if source_ref is None else (source_ref,),
+            tuple(dict.fromkeys((
+                *source_cells,
+                *(() if source_ref is None else (source_ref,)),
+            ))),
             SHAPE_SOURCE_NOT_ON_BOOK,
         )
+    return book.latest_ref(SHAPE_STATE_PAGE, row)
 
 
 def committed_sequence_row_layout(
@@ -7000,8 +7580,8 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
     functions = getattr(module, "functions", {}) or {}
     book = identity_book(module)
     from .concordance_declarations import (
-        FORMAL_ACTUAL_OCCURRENCE, FORMAL_STORAGE_RESOLUTION,
-        FRAME_BINDING, FRAME_SOURCE_CELL_ABSENT, SSA_VALUE,
+        CALL_RECORD, FORMAL_ACTUAL_OCCURRENCE, FORMAL_STORAGE_RESOLUTION,
+        FRAME_BINDING, FRAME_SOURCE_CELL_ABSENT, REGION_SIGNATURE, SSA_VALUE,
     )
     # Persisted books own their vocabulary. Add this scoped relation through
     # the registry API, keeping earlier six-field rows intact and unclaimed.
@@ -7018,6 +7598,19 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
 
     incoming_page = book.page(occurrence_page)
     for caller_name, caller in functions.items():
+        # Repository-SSA composition retains imported functions beside the
+        # current unit, but their identity rows remain owned by the book that
+        # accepted that component.  Re-publishing an imported caller's
+        # internal calls on the composing book loses the accepted SSA_VALUE
+        # edges (the decimal-glyph dependency has nine planned-region feeds)
+        # and manufactures raw duplicate occurrence facts.  Current-unit
+        # callers still publish calls into imported callees below; ownership
+        # follows the caller that contains the occurrence.
+        caller_book = dict(
+            caller.metadata.get("accepted_ssa_component") or {}
+        ).get("identity_book")
+        if caller_book is not None and caller_book is not book:
+            continue
         scope = caller_scope(caller)
         for block_name, block in caller.blocks.items():
             for instruction_index, instruction in enumerate(block.instrs):
@@ -7037,6 +7630,54 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                     actual_cell = book.latest_ref(
                         SSA_VALUE, (scope, int(actual.id)),
                     )
+                    # A planned-region call is itself the materialization of
+                    # a retained RegionSignature.  Some of its feed ids are
+                    # graph identities rather than separately minted SSA
+                    # values; the signature is the exact statement that this
+                    # occurrence consumes that feed at this region boundary.
+                    if actual_cell is None:
+                        region_index = instruction.attributes.get(
+                            "region_index"
+                        )
+                        signature_row = (
+                            scope, int(region_index)
+                        ) if region_index is not None else None
+                        signature = (
+                            None if signature_row is None
+                            else book.page(REGION_SIGNATURE).latest(
+                                signature_row
+                            )
+                        )
+                        if (
+                            signature is not None
+                            and position < len(signature.feeds)
+                            and int(signature.feeds[position])
+                            == int(actual.id)
+                        ):
+                            actual_cell = book.latest_ref(
+                                REGION_SIGNATURE, signature_row,
+                            )
+                    if actual_cell is None:
+                        callsite_id = instruction.attributes.get(
+                            "plan_callsite_id"
+                        )
+                        call_table = getattr(module, "call_table", None)
+                        records = (
+                            () if call_table is None
+                            else call_table.get(str(caller_name), ())
+                        )
+                        matching_record = next((
+                            record for record in records
+                            if callsite_id is not None
+                            and int(record.callsite_id) == int(callsite_id)
+                            and str(record.callee_symbol or record.callee_name)
+                            == str(callee_name)
+                        ), None)
+                        if matching_record is not None:
+                            actual_cell = book.latest_ref(
+                                CALL_RECORD,
+                                (call_table.owner, str(caller_name)),
+                            )
                     book.post(
                         occurrence_page,
                         (
@@ -7379,16 +8020,33 @@ def record_proven_shape(
     extents = tuple(int(extent) for extent in (extents or ()))
     if not extents:
         return
-    page = current_identity_book().page("proven_shape")
+    book = current_identity_book()
+    page = book.page(PROVEN_SHAPE_PAGE)
     row = (_shape_key(function), int(value_id))
     recorded = page.history(row)
-    fact = ("proven", extents, str(dtype or "float64"))
+    recorded_levels = tuple(
+        int(stored[3])
+        if isinstance(stored, tuple) and len(stored) > 3
+        and stored[0] in {"proven", "conflicting"}
+        else int(column)
+        for column, stored in recorded
+        if not (
+            isinstance(stored, tuple) and stored
+            and stored[0] == "invalidated"
+        )
+    )
     target_level = (
-        max((int(column) for column, _fact in recorded), default=0)
+        max(recorded_levels, default=0)
         if level is None else int(level)
     )
+    fact = ("proven", extents, str(dtype or "float64"), target_level)
     if not recorded:
-        page.set(row, target_level, fact)
+        state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
+        _post_or_unsourced(
+            book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
+            () if state_ref is None else (state_ref,),
+            PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
+        )
         return
     deepest = max(recorded, key=lambda entry: int(entry[0]))
     if isinstance(deepest[1], tuple) and deepest[1] and (
@@ -7397,41 +8055,87 @@ def record_proven_shape(
         # An upstream identity changed after this proof was derived.  The next
         # descriptor query is a new proof generation, not a disagreement with
         # the invalidated fact.  Keep both events in causal order.
-        page.set(row, int(deepest[0]) + 1, fact)
+        target_level = max(recorded_levels, default=-1) + 1
+        fact = ("proven", extents, str(dtype or "float64"), target_level)
+        state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
+        _post_or_unsourced(
+            book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
+            () if state_ref is None else (state_ref,),
+            PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
+        )
         return
+    deepest_level = (
+        int(deepest[1][3])
+        if isinstance(deepest[1], tuple) and len(deepest[1]) > 3
+        else int(deepest[0])
+    )
     if (
         tuple(deepest[1][1]) == extents
-        or target_level > int(deepest[0])
+        or target_level > deepest_level
     ):
-        page.set(row, target_level, fact)
+        # The exact shape-state cell is the authority for this projection.
+        # Repeating the same assertion over an unchanged cell adds no causal
+        # information, while a newer state cell records an ordinary revision.
+        state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
+        latest_ref = book.latest_ref(PROVEN_SHAPE_PAGE, row)
+        if (
+            latest_ref is not None
+            and page.latest(row) == fact
+            and state_ref is not None
+            and any(
+                source == state_ref
+                for source, _stage in book.edges_into(latest_ref)
+            )
+        ):
+            return
+        _post_or_unsourced(
+            book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
+            () if state_ref is None else (state_ref,),
+            PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
+        )
         return
-    page.set(
-        row, target_level,
-        ("conflicting", extents, str(dtype or "")),
+    state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
+    _post_or_unsourced(
+        book, PROVEN_SHAPE_PAGE, row,
+        ("conflicting", extents, str(dtype or ""), target_level),
+        PROVEN_SHAPE_STAGE,
+        () if state_ref is None else (state_ref,),
+        PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
     )
 
 
 def invalidate_proven_shape(
     function: Any, value_id: int, source_id: int, reason: Any,
+    *, source_cells: tuple[Ref, ...] = (),
 ) -> None:
     """Withdraw a derived shape after one of its exact dependencies changes."""
 
-    page = current_identity_book().page("proven_shape")
+    book = current_identity_book()
+    page = book.page(PROVEN_SHAPE_PAGE)
     row = (_shape_key(function), int(value_id))
     recorded = page.history(row)
-    column = max(
-        (int(existing) for existing, _fact in recorded), default=-1,
-    ) + 1
     # A transformation source may be a structured identity (a callee return,
     # a descriptor root), not only a graph value id.
     if isinstance(source_id, int) or not isinstance(source_id, tuple):
         source_id = int(source_id)
-    page.set(
-        row, column,
-        ("invalidated", source_id, str(reason)),
-    )
-    invalidate_shape_transformation(
+    state_ref = invalidate_shape_transformation(
         function, int(value_id), source_id, reason,
+        source_cells=source_cells,
+    )
+    # Scalar identities have no ``proven_shape`` row: this page stores only
+    # non-empty extents.  Loop continuation rewiring used to manufacture a
+    # raw invalidation for every such scalar (the UTF-8 glyph decoder alone
+    # made ten), even though there was no shape proof to withdraw.
+    if not recorded:
+        return
+    cells = tuple(dict.fromkeys((
+        *source_cells, *(() if state_ref is None else (state_ref,)),
+    )))
+    _post_or_unsourced(
+        book, PROVEN_SHAPE_PAGE, row,
+        ("invalidated", source_id, str(reason)),
+        book.registry.declare_stage(str(reason)), cells,
+        SHAPE_SOURCE_NOT_ON_BOOK,
     )
 
 

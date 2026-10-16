@@ -658,9 +658,20 @@ class RegionTopologyPool:
         self._check()
         if reserved:
             self.abandon_reservation()
+        original = subgraph.G
+        memory_graph = getattr(original, "bit_tensor_memory_graph", None)
+        if memory_graph is not None and getattr(subgraph, "MG", None) is memory_graph:
+            # ProcessGraph topology already lives in the compiler's physical
+            # memory graph.  The legacy region pool predates that authority
+            # and must not replace it with an nx.DiGraph header over detached
+            # dictionaries.  The memory graph/spore remains the one storage
+            # owner; scheduling leases are unnecessary because its adapter is
+            # writable in place and retains its own exact allocation map.
+            subgraph.scheduler.G = original
+            self.stats["regions"] += 1
+            return subgraph
         self._trim(incoming=1)
         identity = self.stats["regions"]
-        original = subgraph.G
         self.entries[identity] = _RegionEntry()
         # Ownership transfers here. Do not recursively wrap a topology the
         # source-SSA path may NEVER read. Mutable guards are installed on the

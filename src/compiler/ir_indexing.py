@@ -195,6 +195,7 @@ def _propagate_scalar_dtypes(functions) -> None:
         Derived, Mode, Novel, Unsourced, current_identity_book,
     )
     from .ssa_record_return_state import function_scope_of
+    from .ssa_record_return_state import accepted_ssa_component
 
     narrow_integers = {"int", "int8", "int16", "int32", "i32", "i64"}
     book = current_identity_book()
@@ -204,6 +205,14 @@ def _propagate_scalar_dtypes(functions) -> None:
     )
 
     for function in functions.values():
+        # A composed dependency carries the identity book that already
+        # accepted every value in its body.  Re-running this unit's scalar
+        # settlement against the ambient book cannot strengthen that body:
+        # it can only restate the imported values without their owner cells.
+        # The dependency was audited before ``accepted_ssa_component`` was
+        # attached, so its settled widths are immutable input here.
+        if accepted_ssa_component(function):
+            continue
         scope = function_scope_of(function)
         # An imported repository kernel's values get their identity rows on
         # this book (its definition root and per-value rows) before any

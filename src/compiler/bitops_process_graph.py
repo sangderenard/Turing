@@ -60,7 +60,24 @@ def expand_bitops_process_graph(
         raise ValueError("bit_width must be positive")
 
     target = ProcessGraph(materialize_memory=False)
-    target.G = copy.deepcopy(source.G)
+    if getattr(source.G, "bit_tensor_memory_graph", None) is None:
+        raise TypeError(
+            "bit-operation expansion requires its source ProcessGraph to use "
+            "BitTensorMemoryGraph topology"
+        )
+    # Retain the new ProcessGraph's existing memory arena while making the
+    # deep semantic copy this destructive expansion has always owned.  A
+    # direct ``target.G = deepcopy(source.G)`` can divorce ``target.MG`` from
+    # the copied topology even when both objects are memory-backed.
+    target.G.graph.update(copy.deepcopy(dict(source.G.graph)))
+    target.G.add_nodes_from(
+        (node_id, copy.deepcopy(dict(attributes)))
+        for node_id, attributes in source.G.nodes(data=True)
+    )
+    target.G.add_edges_from(
+        (left, right, copy.deepcopy(dict(attributes)))
+        for left, right, attributes in source.G.edges(data=True)
+    )
     target.scheduler = type(target.scheduler)(target)
     target.roots = list(source.roots)
     target.domain_shape = source.domain_shape
