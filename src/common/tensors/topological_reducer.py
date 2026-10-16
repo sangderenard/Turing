@@ -8152,17 +8152,18 @@ def _normalize_lexical_values(
                 IDENTITY_TRANSITION,
             )
 
-            # Source pursuit can make the same JoinedStr reachable through
-            # more than one retained owner walk.  Once this exact source node
-            # has published its recipe, that concordance row owns every
-            # synthesized projection identity.  Rebuilding the projections
-            # would mint a second set of GetAttr/literal nodes for the same
-            # source value and correctly disagree with the first recipe.
+            # Source pursuit can make the same authored JoinedStr reachable
+            # through more than one retained function copy.  A dynamic recipe
+            # contains projection/formatter nodes minted in THIS copy, so its
+            # ingestion row is copy-local as well.  Never reuse the row leaked
+            # by another copy: its private producers cannot be mapped into
+            # this graph.
             existing_row = (
                 graph.G.nodes[node_id].get("attributes") or {}
             ).get("source_glyph_sequence_row")
             if (
                 existing_row is not None
+                and existing_row[0] == ingestion_read_scope
                 and current_identity_book().page(
                     _SOURCE_GLYPH_SEQUENCE
                 ).latest(existing_row) is not None
@@ -9224,6 +9225,7 @@ def _normalize_lexical_values(
                     projection_names=projection_names,
                     projection_value_ids=projection_value_ids,
                     projection_components=projection_components,
+                    enum_table_cell=enum_name_cell,
                 ))
             if lone_string_projection and valid:
                 # ``str(aggregate)`` is itself the destination resident
@@ -9241,7 +9243,7 @@ def _normalize_lexical_values(
             if valid and joined_cell is not None:
                 fact = _SourceGlyphSequence(tuple(components))
                 book = current_identity_book()
-                row = (value_class_scope, int(node_id))
+                row = (ingestion_read_scope, int(node_id))
                 incumbent = book.page(_SOURCE_GLYPH_SEQUENCE).latest(row)
                 if incumbent is not None and incumbent != fact:
                     raise ValueError(
@@ -9341,13 +9343,22 @@ def _normalize_lexical_values(
                         format_spec_cell = None
                         format_tokens = None
                         if component.format_spec_value_id is not None:
-                            format_spec_row = (
-                                value_class_scope,
-                                int(component.format_spec_value_id),
+                            format_spec_rows = (
+                                (
+                                    ingestion_read_scope,
+                                    int(component.format_spec_value_id),
+                                ),
+                                (
+                                    value_class_scope,
+                                    int(component.format_spec_value_id),
+                                ),
                             )
-                            format_spec_cell = book.latest_ref(
-                                _SOURCE_GLYPH_SEQUENCE, format_spec_row,
-                            )
+                            format_spec_cell = next((
+                                cell for candidate in format_spec_rows
+                                if (cell := book.latest_ref(
+                                    _SOURCE_GLYPH_SEQUENCE, candidate,
+                                )) is not None
+                            ), None)
                             format_spec_fact = (
                                 None if format_spec_cell is None else
                                 book.page(_SOURCE_GLYPH_SEQUENCE).cell(
@@ -12864,12 +12875,21 @@ def _normalize_lexical_values(
     glyph_page = book.page(_SOURCE_GLYPH_SEQUENCE)
     glyph_canonical_scope = tuple(read_scope)
     graph.G.graph["source_glyph_sequence_scope"] = glyph_canonical_scope
-    for row in tuple(glyph_page.rows()):
-        if not (
-            isinstance(row, tuple) and len(row) == 2
-            and row[0] == value_class_scope and row[1] in mapping
-        ):
-            continue
+    # Dynamic recipes are copy-local because they can name generated
+    # projection/formatter producers.  Literal spellings remain authored
+    # facts.  Select the local row for an owner when both exist; no row may
+    # import a generated producer from another function copy.
+    glyph_rows_by_value = {
+        int(row[1]): row
+        for row in glyph_page.scope_rows(value_class_scope)
+        if int(row[1]) in mapping
+    }
+    glyph_rows_by_value.update({
+        int(row[1]): row
+        for row in glyph_page.scope_rows(ingestion_read_scope)
+        if int(row[1]) in mapping
+    })
+    for row in tuple(glyph_rows_by_value.values()):
         source_fact = glyph_page.latest(row)
         def glyph_component_value_ids(component):
             yield int(component.component_value_id)
@@ -12947,6 +12967,7 @@ def _normalize_lexical_values(
                         component.formatted_sequence_value_id
                     )])
                 ),
+                enum_table_cell=component.enum_table_cell,
             )
         canonical_components = tuple(
             canonical_glyph_component(component)
@@ -13500,9 +13521,22 @@ def _normalize_lexical_values(
     def optional_arm(value_id: int):
         if int(value_id) not in graph.G:
             return None
-        glyph_cell = book.latest_ref(
-            _SOURCE_GLYPH_SEQUENCE,
-            (value_class_scope, int(value_id)),
+        # The canonical glyph row is part of the value's graph view.  Dynamic
+        # recipes are copy-local because they name generated formatter and
+        # projection producers; literal recipes cross the same canonical
+        # relabel.  Reconstructing a row from ``value_class_scope`` therefore
+        # looks in the authored scope and loses both kinds of present arm.
+        # Follow the exact row the relabel attached to this value instead.
+        value_attributes = graph.G.nodes[int(value_id)].get(
+            "attributes",
+        ) or {}
+        glyph_row = (
+            value_attributes.get("source_glyph_sequence_row")
+            or value_attributes.get("source_literal_glyph_sequence_row")
+        )
+        glyph_cell = (
+            None if glyph_row is None else
+            book.latest_ref(_SOURCE_GLYPH_SEQUENCE, tuple(glyph_row))
         )
         if glyph_cell is not None:
             return SourceOptionalGlyphArm(
@@ -17757,6 +17791,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         }
         function_graph = copy.copy(graph)
         function_graph.G = graph.G.subgraph(included).copy()
+        # NetworkX copies each node-data dictionary but not mutable values
+        # nested inside it.  Topology normalization writes the ``attributes``
+        # view of the detached function graph.  Without a distinct mapping,
+        # the first retained copy of an authored f-string published its
+        # copy-local glyph row into the root graph and every later copy.
+        # Keep the authored ``expr_obj`` identity shared; detach only the
+        # mutable graph view that this pass owns and updates.
+        for _member, member_data in function_graph.G.nodes(data=True):
+            member_data["attributes"] = dict(
+                member_data.get("attributes") or {}
+            )
         # The subgraph's operand rewrites (parameter Inputs, the filter
         # below) post into its own scope: a copy-on-read fork of the
         # source's rows, projected onto the subgraph's nodes.

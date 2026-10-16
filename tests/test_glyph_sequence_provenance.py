@@ -530,6 +530,10 @@ def test_unresolved_repr_uses_external_utf8_then_authored_glyph_decoder():
             entry.graph for entry in graph.function_table
             if entry.name == "render"
         )
+        source_joined = next(
+            data for _node_id, data in graph.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.JoinedStr)
+        )
         byte_id, byte_call = next(
             (int(node_id), data)
             for node_id, data in root.G.nodes(data=True)
@@ -549,14 +553,28 @@ def test_unresolved_repr_uses_external_utf8_then_authored_glyph_decoder():
             ) is not None
         )
         row = joined["attributes"]["source_glyph_sequence_row"]
+        book = current_identity_book()
+        canonical_cell = book.latest_ref(SOURCE_GLYPH_SEQUENCE, row)
+        local_sources = tuple(
+            source
+            for source, _stage in book.edges_into(canonical_cell)
+            if source.page is SOURCE_GLYPH_SEQUENCE
+            and source.row[0] == (row[0], "ingestion")
+        )
         captured.update({
             "byte_id": byte_id,
             "byte_call": byte_call,
             "decoder_id": decoder_id,
             "decoder_call": decoder_call,
-            "fact": current_identity_book().page(
+            "fact": book.page(
                 SOURCE_GLYPH_SEQUENCE
             ).latest(row),
+            "canonical_row": row,
+            "local_sources": local_sources,
+            "source_joined_attributes": dict(
+                source_joined.get("attributes") or {}
+            ),
+            "resident_ids": frozenset(map(int, root.G.nodes)),
             "boundaries": tuple(root.G.graph.get(
                 "extraction_boundary_calls", ()
             )),
@@ -578,6 +596,13 @@ def test_unresolved_repr_uses_external_utf8_then_authored_glyph_decoder():
     decoder_id = captured["decoder_id"]
     byte_call = captured["byte_call"]
     decoder_call = captured["decoder_call"]
+    assert "source_glyph_sequence_row" not in captured[
+        "source_joined_attributes"
+    ]
+    local_source, = captured["local_sources"]
+    assert local_source.row[0] == (
+        captured["canonical_row"][0], "ingestion",
+    )
     assert isinstance(byte_call["expr_obj"], ast.Call)
     assert byte_call["parents"] == [(0, "arg:0")]
     assert byte_call["attributes"]["aggregate_kind"] == "bytes"
@@ -591,6 +616,8 @@ def test_unresolved_repr_uses_external_utf8_then_authored_glyph_decoder():
         if component.kind == "formatted"
     )
     assert formatted.formatted_sequence_value_id == decoder_id
+    assert formatted.formatted_sequence_value_id in captured["resident_ids"]
+    assert byte_id in captured["resident_ids"]
     assert any(
         boundary.get("source_glyph_component")
         == byte_call["attributes"]["source_glyph_component"]
@@ -944,6 +971,7 @@ def test_enum_name_projection_uses_authored_resident_lookup_table():
         component, = glyph_fact.components
         assert component.projection_kind == "enum_name"
         assert component.record_identity == "Kind"
+        assert component.enum_table_cell == enum_cell
 
         declarations, initializations, mutations = (
             _string_token_glyph_materializations(function.G, None)
@@ -1254,7 +1282,7 @@ def test_record_repr_builds_resident_projection_sequence_end_to_end():
             extraction_contract=policy, progress=lambda _message: None,
         )
     assert exports == (
-        "runtime_repr_utf8_glyph_projection__render",
+        "record_glyph_projection__render",
     )
     root = module.functions[exports[0]]
     operations = tuple(
@@ -1516,9 +1544,15 @@ def test_two_arm_return_phi_publishes_optional_glyph_contract():
             arm for arm in (fact.true_arm, fact.false_arm)
             if arm.presence is True
         )
+        present_attributes = function.G.nodes[
+            present_arm.value_id
+        ]["attributes"]
+        present_row = (
+            present_attributes.get("source_glyph_sequence_row")
+            or present_attributes.get("source_literal_glyph_sequence_row")
+        )
         assert present_arm.presence_source == book.latest_ref(
-            SOURCE_GLYPH_SEQUENCE,
-            (tuple(source_scope), present_arm.value_id),
+            SOURCE_GLYPH_SEQUENCE, tuple(present_row),
         )
         optional_cell = book.latest_ref(
             SOURCE_OPTIONAL_GLYPH_CARRY,

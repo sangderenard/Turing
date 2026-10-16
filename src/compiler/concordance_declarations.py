@@ -125,6 +125,10 @@ class SourceGlyphComponent:
     #: FormattedValue remains ``component_value_id``; generated execution
     #: never replaces that authored identity.
     formatted_sequence_value_id: int | None = None
+    #: Exact authored Enum lookup table for an ``enum_name`` projection.
+    #: The table's module identity must not be reconstructed from the glyph
+    #: recipe row: dynamic recipes live in copy-local lexical-read scopes.
+    enum_table_cell: Ref | None = None
 
 
 @dataclass(frozen=True)

@@ -344,26 +344,37 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
             raise ValueError(
                 "Enum name glyph projection has no declared Enum identity"
             )
-        mode = "repr" if int(component.conversion) == ord("r") else "raw"
-        enum_grouped.setdefault((
-            mode, str(recipe_cell.row[0][0]),
-            str(component.record_identity),
-        ), []).append((recipe_cell, component))
-    for (mode, module_identity, enum_identity), mode_recipes in (
-        enum_grouped.items()
-    ):
-        enum_cell = book.latest_ref(
-            SOURCE_ENUM_GLYPH_TABLE,
-            (module_identity, enum_identity),
-        )
+        enum_cell = component.enum_table_cell
         if enum_cell is None:
             raise ValueError(
-                "Enum name glyph projection has no exact source table: "
-                f"{(module_identity, enum_identity)!r}"
+                "Enum name glyph projection has no exact source table cell: "
+                f"{component.record_identity!r}"
             )
+        if enum_cell.page is not SOURCE_ENUM_GLYPH_TABLE:
+            raise ValueError(
+                "Enum name glyph projection names a non-Enum source cell: "
+                f"{enum_cell.key!r}"
+            )
+        mode = "repr" if int(component.conversion) == ord("r") else "raw"
+        enum_grouped.setdefault((mode, enum_cell), []).append((
+            recipe_cell, component,
+        ))
+    for (mode, enum_cell), mode_recipes in (
+        enum_grouped.items()
+    ):
         enum_fact = enum_page.cell(enum_cell.row, enum_cell.column)
         if not isinstance(enum_fact, SourceEnumGlyphTable):
             raise TypeError(f"invalid source Enum glyph table {enum_fact!r}")
+        enum_identities = {
+            str(component.record_identity)
+            for _recipe_cell, component in mode_recipes
+        }
+        if enum_identities != {str(enum_fact.enum_identity)}:
+            raise ValueError(
+                "Enum name glyph projection disagrees with its exact source "
+                f"table: component={tuple(sorted(enum_identities))!r} "
+                f"table={enum_fact.enum_identity!r}"
+            )
         vocabulary_rows = []
         for member in enum_fact.members:
             spelling = (

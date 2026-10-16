@@ -2,12 +2,14 @@
 See docs/compiler_convergence/15_provenance_sort_glyph_bootstrap_continuation.md.
 Resident stable sort and formatted glyph sequences now lower through repository
 SSA and concorded source contracts.  The latest bootstrap regression was a
-duplicate topology call binder assigning a static-method attribute receiver to
-formal zero; source class propagation now uses the existing authored ABI binder.
-Its exact reproduction and the neighboring generic-formal regression pass, and
-the mapping concordance audit has zero findings and zero unsourced facts.  The
-full bootstrap remains unverified.  Bootstrap caches are clear for the next
-user-owned run.
+cross-copy glyph recipe publishing one function copy's generated formatter
+identity into another through a shared authored scope and shallow-copied nested
+attributes.  Dynamic recipes now use the existing copy-local ingestion scope,
+function graph views detach mutable attributes, and downstream enum/optional
+readers consume exact concordance references.  The complete glyph provenance
+file passes 32 tests; the mapping concordance audit has zero findings and zero
+unsourced facts.  The full bootstrap remains unverified.  Bootstrap caches are
+clear for the next user-owned run.
 
 2026-10-14 PROVENANCE BOOTSTRAP TERMINAL OWNERSHIP + FAILURE ROLLUP (PRIOR):
 The provenance child now exclusively owns the terminal while it is active;

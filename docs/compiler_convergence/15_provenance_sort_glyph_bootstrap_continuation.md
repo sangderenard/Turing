@@ -134,8 +134,16 @@ The important runs, in order, were:
    assigned a `CorrelationTable` receiver to a static method's `name: str`
    formal.  The exact reproduction failed before the repair and passes after
    the repair.
+5. The following run reached topology reduction of `IdentityBook.post` and
+   refused a partially canonicalized glyph recipe.  The recipe named a
+   reducer-generated formatter from a different retained function copy.  The
+   first copy had published that private identity under the shared authored
+   scope, and NetworkX's shallow subgraph copy had also shared the nested
+   mutable `attributes` mapping with the root graph.  Function copies now
+   detach that mapping, dynamic recipes publish in their existing copy-local
+   ingestion scope, and canonical relabeling selects that exact local row.
 
-The fourth repair has not yet been exercised by a complete bootstrap.  The
+The fifth repair has not yet been exercised by a complete bootstrap.  The
 next truthful frontier is therefore the result of the next user-owned run, not
 an inferred return to compilation unit 046.
 
@@ -170,11 +178,13 @@ findings for its successfully lowered fixtures.  Its `mapping` fixture reports
 audit's `toplevel` and `energy` fixtures still stop on three immutable physical
 call-input dtype conflicts; those are not claimed fixed here.
 
-The glyph-focused batch most recently completed with 28 passing tests and four
-known failures outside the repaired formatted-scalar path.  The exact
-`id_space.compose` probe passed the former missing-glyph-producer point and
-reached a later SSA block-geometry refusal.  Neither result is a whole-bootstrap
-success claim.
+The complete glyph provenance file now passes all 32 tests.  Its four former
+failures were closed without changing glyph policy: enum projections retain
+their exact authored table cell, optional arms consume the exact glyph row
+recorded on the arm, and one copied test expectation now names the artifact it
+actually requested.  The exact `id_space.compose` probe passed the former
+missing-glyph-producer point and reached a later SSA block-geometry refusal.
+Neither result is a whole-bootstrap success claim.
 
 One neighboring provenance test,
 `test_call_formal_class_projection_is_predecessor_closed`, currently fails
@@ -185,6 +195,54 @@ recorded declaration scope after confirming the exact source cell.
 
 `git diff --check` is clean.  The only messages are Git's existing LF-to-CRLF
 working-tree warnings.
+
+## Addendum to checkpoint `c40eb1df`
+
+The previous checkpoint's sort and glyph work must be continued through the
+whole-program bootstrap, not treated as complete from focused tests alone.
+`tools.bootstrap_compiler_whole_program` is the integration instrument: it
+compiles the compiler's own authored source through the sanctioned public
+entry, admits the staged provenance-core product, and exposes the first place
+where retained source identity no longer agrees with a later compiler view.
+
+Use the bootstrap as a measured failure sequence:
+
+1. Start with cleared `build/compiler-partitions` and `build/compiler-logs` so
+   every receipt belongs to the current source state.
+2. Run `python -u -m tools.bootstrap_compiler_whole_program` without wrapping,
+   filtering, or replacing its output.
+3. Read the complete blocking-failure set, not only the first visible line.
+   Record each unit, qualified symbol, compiler stage, exception, diagnostic
+   log, unit receipt, and compartment receipt.
+4. Group failures only after comparing their provenance predecessors.  Several
+   failed units can be consequences of one wrong writer; one failed unit can
+   also expose more than one independent disagreement.
+5. Reproduce the earliest disagreement on a seconds-long slice of the real
+   source.  Observe the source fact, every concordance derivation/revision, the
+   graph resident expected by the consumer, and the exact consumer failure.
+6. Repair the first writer or reader that abandoned the exact cell.  Never
+   patch emitted SSA, a partition product, or a later receipt to compensate.
+7. Run the exact regression, its nearest policy neighbors, and
+   `tools/audit_identity_concordance.py`; then clear the two bootstrap cache
+   directories before the next whole-program observation.
+
+Provenance-core is not an auxiliary prepass.  It is the compiler product that
+allows source identity, copied lexical scopes, generated residents, ABI
+bindings, and SSA storage to remain one connected derivation across later
+stages.  Its partial and failed unit receipts are therefore primary evidence,
+not disposable bootstrap noise.
+
+The concordance is the persistent authority that keeps that product coherent.
+A later stage must consume an exact recorded cell or an explicit derivation of
+it.  Reconstructing identity from a name, numeric node id, tuple position,
+source spelling, inferred module, or neighboring graph shape breaks the chain
+even when the reconstructed value looks equal.  The cross-copy glyph failure
+after `c40eb1df` demonstrated the rule directly: an authored owner was shared,
+but its generated formatter was resident only in one retained copy.  Publishing
+that recipe in shared authored scope made a valid cell point outside the graph
+that consumed it.  Copy-local ingestion scope plus exact-cell consumers restore
+the single chain; weakening the resident-producer check would only hide the
+violation.
 
 ## Continuation
 
