@@ -1,4 +1,18 @@
-2026-10-15 PROVENANCE/SORT/GLYPH BOOTSTRAP CONTINUATION (CURRENT):
+2026-10-16 FAILURE NEIGHBORHOODS + PURSUIT DEDUPE + BATCH SORT (CURRENT):
+See docs/compiler_convergence/16_failure_neighborhood_dedupe_continuation.md.
+Refused posts now carry a diffused local neighborhood of the concordance in
+the exception note and the failed log.  Pursuit no longer re-ingests a
+definition the submitted source already defines (re-ingested definitions
+175 -> 65, units 478 -> 296, units stage 5m31s -> 2m41s on the user's run).
+Optional-glyph carries are keyed by the copy's glyph scope.  The resident sort
+is batch-wide (key pass, flat merge passes, batched gather) and needs an
+`order` workspace.  Open: nested child-list sort in IdentityPage._reindex
+(unit 031), _fork_of_scope membership (unit 026), native check of the sort
+(tools/benchmark_ssa_sort.py), and the unattributed 20 GB pytest session:
+tests/test_ast_parent_ingestion.py is SKIPPED until understood.  The full
+bootstrap remains unverified.
+
+2026-10-15 PROVENANCE/SORT/GLYPH BOOTSTRAP CONTINUATION (PRIOR):
 See docs/compiler_convergence/15_provenance_sort_glyph_bootstrap_continuation.md.
 Resident stable sort and formatted glyph sequences now lower through repository
 SSA and concorded source contracts.  The latest bootstrap regression was a

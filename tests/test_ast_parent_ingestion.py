@@ -7,6 +7,15 @@ import types
 
 import pytest
 
+# SKIPPED 2026-10-16 by the user's instruction: a pytest session containing
+# this module ran past 10 minutes and a rerun held over 20 GB without
+# compacting (killed).  Not yet attributed to a test in this module or to the
+# uncommitted graph_express2.py ``exact_existing`` edit.  Remove this marker
+# once the memory behaviour is understood.
+pytestmark = pytest.mark.skip(
+    reason="memory blowup under investigation; see module note"
+)
+
 from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )

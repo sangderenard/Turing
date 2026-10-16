@@ -7644,7 +7644,16 @@ def _post_source_optional_glyph_carries(
         for node_id, data in graph_obj.nodes(data=True)
     }
     retained = []
-    for row in page.scope_rows(source_scope):
+    # The reducer keys a carry by the copy's canonical glyph scope (its arms'
+    # cells live there); the authored scope is kept for carries posted before
+    # a graph named one.
+    scopes = [source_scope]
+    glyph_scope = graph_obj.graph.get("source_glyph_sequence_scope")
+    if glyph_scope is not None and tuple(glyph_scope) != source_scope:
+        scopes.append(tuple(glyph_scope))
+    for row in dict.fromkeys(
+        tuple(row) for scope in scopes for row in page.scope_rows(scope)
+    ):
         if len(row) != 2 or int(row[1]) not in live_value_ids:
             continue
         cell = book.latest_ref(SOURCE_OPTIONAL_GLYPH_CARRY, tuple(row))

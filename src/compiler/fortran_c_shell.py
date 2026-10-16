@@ -47165,6 +47165,19 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
             entrypoint = kwargs.get("entrypoint")
             if entrypoint is None and len(args) > 1:
                 entrypoint = args[1]
+            if not ok:
+                # The failure being propagated carries the claims it was
+                # refused for; their local neighborhood in this book goes to
+                # the exception's notes and to the failed log.
+                import sys as _sys
+                from .identity_concordance import (
+                    annotate_failure_with_neighborhood)
+                _failure = _sys.exc_info()[1]
+                if _failure is not None:
+                    _log_summary = (
+                        *_log_summary,
+                        *annotate_failure_with_neighborhood(_failure, book),
+                    )
             _bars.substage("identity log checkpoint")
             _dump_identity_book_log(
                 book, name=kwargs.get("name"), entrypoint=entrypoint, ok=ok,

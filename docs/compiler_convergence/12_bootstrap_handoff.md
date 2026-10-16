@@ -1,5 +1,9 @@
 # Compiler bootstrap handoff
 
+The 2026-10-16 continuation (failure neighborhoods, pursuit dedupe, batch
+sort, the two remaining unit failures) is
+[16_failure_neighborhood_dedupe_continuation.md](16_failure_neighborhood_dedupe_continuation.md).
+
 The current 2026-10-15 continuation is
 [15_provenance_sort_glyph_bootstrap_continuation.md](15_provenance_sort_glyph_bootstrap_continuation.md).
 It records the resident sort and glyph work, the latest provenance/bootstrap

@@ -591,14 +591,25 @@ def test_sequence_sort_is_stable_repository_ssa_over_complete_rows():
         column_dtypes=("int64", "float64"),
     )
 
-    lowering = lower_sequence_sort(descriptor, scratch, key_column=0)
+    order = SSASequenceDescriptor(
+        sequence_id=3,
+        column_value_ids=(30, 31),
+        length_address_id=32,
+        capacity_value_id=33,
+        column_dtypes=("int64", "int64"),
+    )
+
+    lowering = lower_sequence_sort(descriptor, scratch, order, key_column=0)
 
     assert lowering.complete
     function = lowering.functions[0]
     assert function.metadata["ssa_sequence_operation"] == "sort"
-    assert function.metadata["algorithm"] == "bottom_up_merge_sort"
+    assert function.metadata["algorithm"] == "batch_rank_merge_sort"
     assert function.metadata["stable"] is True
-    assert {"Phi", "Le", "Load", "Store", "CondBr"} <= set(_ops(function))
+    # Branch-free selection inside the data-parallel passes.
+    assert {
+        "Phi", "Le", "Load", "Store", "CondBr", "Select", "FloorDiv",
+    } <= set(_ops(function))
     assert not any(
         instruction.op == "Call"
         for block in function.blocks.values()
@@ -635,8 +646,16 @@ def test_sequence_sort_can_compare_resident_mapping_keys():
         key_columns=(0,),
     )
 
+    order = SSASequenceDescriptor(
+        sequence_id=34,
+        column_value_ids=(340, 341, 342),
+        length_address_id=343,
+        capacity_value_id=344,
+        column_dtypes=("int64", "int64", "int64"),
+    )
+
     lowering = lower_sequence_sort(
-        descriptor, scratch, key_mapping=positions,
+        descriptor, scratch, order, key_mapping=positions,
     )
 
     assert lowering.complete
@@ -655,7 +674,9 @@ def test_sequence_sort_can_compare_resident_mapping_keys():
         for block in lookup.blocks.values()
         for instruction in block.instrs
     )
-    assert len(calls) == 2
+    # Keys are looked up once per row, in the key pass; the merge passes
+    # compare stored keys and never call.
+    assert len(calls) == 1
     assert {call.attributes["callee"] for call in calls} == {lookup.name}
     assert function.metadata["key_mapping_sequence_id"] == 33
 

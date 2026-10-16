@@ -8884,12 +8884,64 @@ class _ControlSSABuilder(TiledObject):
                     "caller_provided_workspace": True,
                     "workspace_operation": "sort",
                 }
+            # The sort orders a permutation: two int64 buffers, plus the
+            # mapped key per source row when keys come from a resident
+            # mapping (looked up once per row, not once per comparison).
+            order_dtypes = ("int64", "int64")
+            if key_mapping is not None:
+                mapping_value_column = next(
+                    column for column in range(len(key_mapping.column_value_ids))
+                    if column not in key_mapping.key_columns
+                )
+                order_dtypes = (
+                    *order_dtypes,
+                    key_mapping.column_dtypes[mapping_value_column],
+                )
+            order_id = int(self.fresh_value(
+                dtype="unknown",
+                transform=DESCRIPTOR_CELL,
+                operands=(
+                    self._sequence_contract_cell(
+                        int(destination.sequence_id)
+                    ),
+                    *self.sequence_storage_values[
+                        int(destination.sequence_id)
+                    ],
+                ),
+            ).id)
+            order = self._sequence_descriptor(
+                order_id,
+                policy="duplicates",
+                writable=True,
+                location=f"{location}.order",
+                column_count=len(order_dtypes),
+                column_dtypes=order_dtypes,
+                column_shapes=((),) * len(order_dtypes),
+            )
+            if order is None:
+                return
+            for value in self.sequence_storage_values[int(order.sequence_id)]:
+                value.accounting = {
+                    **dict(value.accounting or {}),
+                    "caller_provided_workspace": True,
+                    "workspace_operation": "sort_order",
+                }
+            order_status = self.sequence_status_values.get(
+                int(order.sequence_id)
+            )
+            if order_status is not None:
+                order_status.accounting = {
+                    **dict(order_status.accounting or {}),
+                    "caller_provided_workspace": True,
+                    "workspace_operation": "sort_order",
+                }
             function_name = self._sequence_helper_name(
                 int(destination.sequence_id), "sort",
             )
             lowering = lower_sequence_sort(
                 destination,
                 scratch,
+                order,
                 key_column=int(mutation.sort_key_column or 0),
                 key_mapping=key_mapping,
                 reverse=bool(mutation.sort_reverse),
@@ -8910,6 +8962,7 @@ class _ControlSSABuilder(TiledObject):
                 for value in (
                     *self.sequence_storage_values[int(destination.sequence_id)],
                     *self.sequence_storage_values[int(scratch.sequence_id)],
+                    *self.sequence_storage_values[int(order.sequence_id)],
                     *(
                         self.sequence_storage_values[int(key_mapping.sequence_id)]
                         if key_mapping is not None else ()
@@ -8938,6 +8991,7 @@ class _ControlSSABuilder(TiledObject):
                     "ssa_sequence_operation": "sort",
                     "sequence_id": int(destination.sequence_id),
                     "scratch_sequence_id": int(scratch.sequence_id),
+                    "order_sequence_id": int(order.sequence_id),
                     "sort_key_column": int(mutation.sort_key_column or 0),
                     "sort_key_mapping_sequence_id": (
                         None if key_mapping is None

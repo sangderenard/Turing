@@ -1527,11 +1527,17 @@ def test_two_arm_return_phi_publishes_optional_glyph_contract():
             function.G.graph.get("source_numeric_scope")
             or function.G.graph["authored_function_identity"]
         )
+        # The carry names its arms' glyph cells, which are copy-local, so it
+        # is keyed by the copy's canonical glyph scope (never the authored
+        # scope two retained copies would share).
+        carry_scopes = {
+            tuple(source_scope),
+            tuple(function.G.graph["source_glyph_sequence_scope"]),
+        }
         facts = tuple(
             book.page(SOURCE_OPTIONAL_GLYPH_CARRY).latest(row)
-            for row in book.page(SOURCE_OPTIONAL_GLYPH_CARRY).scope_rows(
-                tuple(source_scope)
-            )
+            for scope in carry_scopes
+            for row in book.page(SOURCE_OPTIONAL_GLYPH_CARRY).scope_rows(scope)
         )
         fact = next(
             candidate for candidate in facts
@@ -1556,7 +1562,12 @@ def test_two_arm_return_phi_publishes_optional_glyph_contract():
         )
         optional_cell = book.latest_ref(
             SOURCE_OPTIONAL_GLYPH_CARRY,
-            (tuple(source_scope), fact.merged_value_id),
+            tuple(function.G.nodes[fact.merged_value_id]["attributes"][
+                "source_optional_glyph_carry_row"
+            ]),
+        )
+        assert optional_cell.row[0] == tuple(
+            function.G.graph["source_glyph_sequence_scope"]
         )
         assert node_identity_cell(
             function, fact.conditional_value_id,

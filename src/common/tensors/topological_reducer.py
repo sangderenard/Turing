@@ -13513,9 +13513,13 @@ def _normalize_lexical_values(
         SourceOptionalGlyphCarry,
     )
     optional_page = book.page(SOURCE_OPTIONAL_GLYPH_CARRY)
+    # A carry names its arms' glyph cells, which live in this retained
+    # copy's canonical glyph scope.  Two copies of one authored function
+    # therefore never share a carry row: keying it by the authored scope made
+    # the second copy post the same key with its own arm cells.
     optional_cells = {
         int(row[1]): book.latest_ref(SOURCE_OPTIONAL_GLYPH_CARRY, row)
-        for row in optional_page.scope_rows(value_class_scope)
+        for row in optional_page.scope_rows(glyph_canonical_scope)
     }
 
     def optional_arm(value_id: int):
@@ -13605,7 +13609,7 @@ def _normalize_lexical_values(
             if all(arm.presence is True for arm in concrete_arms):
                 continue
             true_arm, false_arm, initial_arm = arms
-            row = (value_class_scope, int(phi_id))
+            row = (glyph_canonical_scope, int(phi_id))
             fact = SourceOptionalGlyphCarry(
                 conditional_value_id=control_id,
                 true_value_id=true_id, false_value_id=false_id,

@@ -1486,6 +1486,19 @@ class CorrelationTable:
             for row in unsourced_page.rows():
                 tags[(row[0], row[1])] = row[2]
         groups: Counter = Counter()
+        #: The first few exact rows of each group, so a finding names what it
+        #: counts (read by ``_unsourced_findings``; never part of the worklist).
+        samples: dict[tuple[str, str, str], list[str]] = {}
+
+        def sample(group: tuple[str, str, str], row: Any, column: Any = None):
+            rows = samples.setdefault(group, [])
+            if len(rows) < 3:
+                rows.append(
+                    render_row(row) if column is None
+                    else f"{render_row(row)}@{column}"
+                )
+
+        self._unsourced_samples = samples
         # (Each page is borrowed for its scan and let go: the detector walks
         # every cell of the book and must not hold the book to do it.)
         for name in tuple(dict.keys(book.pages)):
@@ -1497,11 +1510,15 @@ class CorrelationTable:
                         continue
                     if (name, row, column) in sourced:
                         continue
-                    groups[(name, tags.get((name, row), "unknown"), "cell")] += 1
+                    group = (name, tags.get((name, row), "unknown"), "cell")
+                    groups[group] += 1
+                    sample(group, row, column)
         for (page_name, _row), stage_name in tags.items():
             if page_name in registered:
                 continue
-            groups[(page_name, stage_name, "raw row")] += 1
+            group = (page_name, stage_name, "raw row")
+            groups[group] += 1
+            sample(group, _row)
         identities = [
             (function, value_id)
             for function, value_id in self.rows
@@ -1511,11 +1528,17 @@ class CorrelationTable:
 
     def _unsourced_findings(self, module: Any) -> list[Finding]:
         groups, identities = self._unsourced_worklist(module)
+        samples = getattr(self, "_unsourced_samples", {})
         found = [
             Finding(
                 "unsourced-fact", page_name, None,
                 f"stage {stage_name}: {count} {unit}(s) with neither an "
-                "inbound edge nor a mint edge",
+                "inbound edge nor a mint edge"
+                + (
+                    "; e.g. " + " | ".join(
+                        samples[(page_name, stage_name, unit)]
+                    ) if samples.get((page_name, stage_name, unit)) else ""
+                ),
             )
             for (page_name, stage_name, unit), count in sorted(groups.items())
         ]
@@ -4827,6 +4850,35 @@ class IdentityBook:
     ) -> Ref:
         """Write one fact with its provenance; the only sanctioned writer.
 
+        Whatever refusal or disagreement leaves ``_post`` is a failure of
+        THIS claim: the exception keeps its type and message and gains the
+        cells the claim stood on (``FailureClaim``).  The neighborhood is not
+        walked here -- a refusal is also control flow for some callers -- but
+        by ``annotate_failure_with_neighborhood`` where the failure reports.
+        """
+        try:
+            return self._post(
+                page, row, fact, stage=stage, provenance=provenance,
+                mode=mode,
+            )
+        except ValueError as error:
+            _attach_failure_claim(
+                self, error, page, row, fact, stage, provenance, mode,
+            )
+            raise
+
+    def _post(
+        self,
+        page: Page,
+        row: tuple,
+        fact: Any,
+        *,
+        stage: Stage,
+        provenance: Derived | Novel | Unsourced,
+        mode: Mode,
+    ) -> Ref:
+        """The body of ``post`` (see there for the contract).
+
         ``Derived``: the fact cell plus one edge per source cell on the
         edge page and its reverse index, all at one clock reading.
         ``Novel``: the row's ``NEW`` is replaced by an id minted here and
@@ -5295,6 +5347,112 @@ class IdentityBook:
             if fact is not None:
                 return fact
         return None
+
+    def neighborhood(
+        self,
+        seeds: Iterable[Ref],
+        *,
+        radius: int = 2,
+        max_nodes: int = 40,
+        fanout: int = 6,
+    ) -> "CellNeighborhood":
+        """The cells within ``radius`` edges of ``seeds``, mass diffused.
+
+        The graph is the book's own: a cell is joined to the cells it was
+        derived from (``edges_into``), the cells derived from it
+        (``edges_out_of``) and, for a minted row, the operands it was minted
+        from (``mint_of``).  Edges are read in both directions; nothing is
+        inferred.  One unit of mass starts on the seeds and each hop passes
+        half of a cell's mass, divided equally, to the neighbors it keeps --
+        the ``fanout`` newest by clock stamp, so a hub with thousands of
+        dependents contributes its most recent ones and reports how many it
+        left out.  Collection stops at ``max_nodes`` cells.  The reach is
+        deliberately modest: this is the evidence at a failure, not the book.
+        """
+        seed_refs = tuple(dict.fromkeys(seeds))
+        nodes: dict[Ref, dict] = {}
+        edges: dict[tuple, None] = {}
+        truncated = False
+        if not seed_refs:
+            return CellNeighborhood((), (), (), radius, False)
+        share = 1.0 / len(seed_refs)
+        frontier: dict[Ref, float] = {}
+        for ref in seed_refs:
+            nodes[ref] = {"hop": 0, "mass": share, "seed": True, "omitted": 0}
+            frontier[ref] = share
+        for hop in range(1, int(radius) + 1):
+            arrivals: dict[Ref, float] = {}
+            for ref, mass in frontier.items():
+                found: list[tuple[Ref, tuple]] = []
+                try:
+                    for other, stage in self.edges_into(ref):
+                        found.append((other, (other, ref, stage.name)))
+                    for other, stage in self.edges_out_of(ref):
+                        found.append((other, (ref, other, stage.name)))
+                    minted = self.mint_of(ref)
+                    if minted is not None:
+                        transform, operands = minted
+                        for other in operands:
+                            found.append((other, (
+                                other, ref, f"mint:{transform.name}",
+                            )))
+                except Exception as error:  # a damaged book still reports
+                    nodes[ref]["omitted"] = -1
+                    nodes[ref]["error"] = f"{type(error).__name__}: {error}"
+                    continue
+
+                def newest(item):
+                    try:
+                        return self.stamp_of(item[0])
+                    except Exception:
+                        return -1
+
+                found.sort(key=newest, reverse=True)
+                kept, left = found[:int(fanout)], len(found) - int(fanout)
+                nodes[ref]["omitted"] = max(0, left)
+                if not kept:
+                    continue
+                push = mass * 0.5 / len(kept)
+                for other, edge in kept:
+                    if other not in nodes and len(nodes) >= int(max_nodes):
+                        truncated = True
+                        continue
+                    edges[edge] = None
+                    if other in nodes:
+                        nodes[other]["mass"] += push
+                    else:
+                        nodes[other] = {
+                            "hop": hop, "mass": push, "seed": False,
+                            "omitted": 0,
+                        }
+                        arrivals[other] = push
+            frontier = arrivals
+            if not frontier:
+                break
+        facts = {}
+        for ref in nodes:
+            stamp = None
+            try:
+                with self.borrowed(ref.page.name) as page:
+                    facts[ref] = page.cells.get((ref.row, ref.column))
+                stamp = self.stamp_of(ref)
+            except Exception:
+                pass
+            nodes[ref]["stamp"] = stamp
+        return CellNeighborhood(
+            seed_refs,
+            tuple(
+                NeighborhoodNode(
+                    ref=ref, hop=info["hop"], mass=info["mass"],
+                    seed=info["seed"], omitted=info["omitted"],
+                    stamp=info.get("stamp"),
+                    fact=_truncate_fact(repr(facts.get(ref))),
+                    error=info.get("error"),
+                )
+                for ref, info in nodes.items()
+            ),
+            tuple(edges), int(radius), truncated,
+        )
 
     def project_cells(self, roots: Iterable[Ref]) -> "IdentityBook":
         """Transport the exact predecessor closure of acceptance cells.
@@ -7641,3 +7799,144 @@ def render_row(row: Any) -> str:
             ) + ")"
         )
     return repr(row)
+
+
+@dataclass(frozen=True)
+class NeighborhoodNode:
+    """One cell of a failure neighborhood: where it is, how far from the
+    seeds, the diffused mass it received, and its fact as the book holds it.
+    ``omitted`` counts the neighbors this cell left out (-1: its edges could
+    not be read, ``error`` says why)."""
+
+    ref: Ref
+    hop: int
+    mass: float
+    seed: bool
+    omitted: int
+    stamp: int | None
+    fact: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class CellNeighborhood:
+    """The cells and edges within ``radius`` of a failure's seed cells.
+
+    ``edges`` are ``(source, target, kind)`` where ``kind`` is the Stage that
+    derived ``target`` from ``source`` or ``mint:<transform>``."""
+
+    seeds: tuple[Ref, ...]
+    nodes: tuple[NeighborhoodNode, ...]
+    edges: tuple[tuple[Ref, Ref, str], ...]
+    radius: int
+    truncated: bool
+
+    def lines(self, labels: Mapping[Ref, str] | None = None) -> tuple[str, ...]:
+        index = {node.ref: f"n{i}" for i, node in enumerate(self.nodes)}
+        out = [
+            f"neighborhood: radius {self.radius}, {len(self.nodes)} cell(s), "
+            f"{len(self.edges)} edge(s)"
+            + (", cell cap reached" if self.truncated else "")
+        ]
+        for node in sorted(self.nodes, key=lambda item: (item.hop, -item.mass)):
+            role = (labels or {}).get(node.ref)
+            tag = "seed" if node.seed else f"hop {node.hop}"
+            if role:
+                tag += f" {role}"
+            more = (
+                f" (+{node.omitted} neighbor(s) not shown)"
+                if node.omitted > 0 else
+                f" (edges unreadable: {node.error})" if node.omitted < 0
+                else ""
+            )
+            out.append(
+                f"  {index[node.ref]} [{tag}] mass={node.mass:.3f} "
+                f"{node.ref.page.name} {render_row(node.ref.row)}"
+                f"@{node.ref.column} stamp={node.stamp} "
+                f"fact={node.fact}{more}"
+            )
+        for source, target, kind in self.edges:
+            out.append(
+                f"  {index.get(source, '?')} --{kind}--> "
+                f"{index.get(target, '?')}"
+            )
+        return tuple(out)
+
+
+@dataclass(frozen=True)
+class FailureClaim:
+    """A post that failed: what it claimed, and the cells it stood on.
+
+    ``seeds`` are ``(role, Ref)``: the row's incumbent cell(s) and the
+    source cells of the proposed fact.  Held by the exception; the
+    neighborhood is walked only where the failure is reported."""
+
+    page: str
+    row: tuple
+    mode: str
+    stage: str
+    proposed: str
+    seeds: tuple[tuple[str, Ref], ...]
+
+
+def _attach_failure_claim(
+    book: IdentityBook, error: BaseException, page: Page, row: tuple,
+    fact: Any, stage: Stage, provenance: Any, mode: Mode,
+) -> None:
+    """Record, on ``error``, the claim ``post`` was refused for."""
+    try:
+        seeds: list[tuple[str, Ref]] = []
+        incumbent = book.latest_ref(page, row)
+        if incumbent is not None:
+            seeds.append(("incumbent", incumbent))
+        if isinstance(provenance, Derived):
+            seeds.extend(("source", ref) for ref in provenance.cells)
+        elif isinstance(provenance, Novel):
+            seeds.extend(("operand", ref) for ref in provenance.operands)
+        claims = error.__dict__.setdefault("concordance_claims", [])
+        claims.append(FailureClaim(
+            page=page.name, row=row, mode=getattr(mode, "name", str(mode)),
+            stage=getattr(stage, "name", str(stage)),
+            proposed=_truncate_fact(repr(fact)), seeds=tuple(seeds),
+        ))
+    except Exception:
+        pass
+
+
+def annotate_failure_with_neighborhood(
+    error: BaseException, book: IdentityBook | None,
+    *, radius: int = 2, max_nodes: int = 40, fanout: int = 6,
+) -> tuple[str, ...]:
+    """The neighborhood of every claim ``error`` (or what it was raised
+    from) carries, as lines; also added to ``error`` as a note once, so the
+    traceback that reports it shows it.  Best-effort: it never raises."""
+    if book is None:
+        return ()
+    try:
+        lines: list[str] = []
+        seen: set[int] = set()
+        pending = [error]
+        while pending:
+            current = pending.pop(0)
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            pending.extend((current.__cause__, current.__context__))
+            for claim in current.__dict__.get("concordance_claims", ()):
+                labels = {ref: role for role, ref in claim.seeds}
+                hood = book.neighborhood(
+                    (ref for _role, ref in claim.seeds),
+                    radius=radius, max_nodes=max_nodes, fanout=fanout,
+                )
+                lines.append(
+                    f"failed post {claim.page} {render_row(claim.row)} "
+                    f"mode={claim.mode} stage={claim.stage} "
+                    f"proposed={claim.proposed}"
+                )
+                lines.extend(hood.lines(labels))
+        if lines and not error.__dict__.get("concordance_noted"):
+            error.__dict__["concordance_noted"] = True
+            error.add_note(chr(10).join(lines))
+        return tuple(lines)
+    except Exception:
+        return ()

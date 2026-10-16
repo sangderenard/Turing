@@ -3638,11 +3638,21 @@ def _expand_unresolved_ast_parents(
             call_name = node.func.attr
         else:
             call_name = None
-        existing = definitions_by_name.get(call_name, ())
+        # (A call spelled ``cls(...)`` or through an alias names its target
+        # by the target's own name, not by the call's spelling.)
+        existing = tuple(dict.fromkeys((
+            *definitions_by_name.get(call_name, ()),
+            *definitions_by_name.get(identity[1].rsplit(".", 1)[-1], ()),
+        )))
+        # A definition already in the tree answers for its live identity,
+        # whether pursuit discovered it or the submitted source defines it:
+        # the source-owner stamp is that identity for the latter.  Ingesting
+        # the live object's source again would lay a second copy of the same
+        # authored function over the first.
         exact_existing = tuple(
             definition
             for definition in existing
-            if getattr(definition, "_python_source_identity", None) == identity
+            if _source_definition_identity(definition) == identity
         )
         if len(exact_existing) == 1:
             definition = exact_existing[0]

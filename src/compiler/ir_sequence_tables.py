@@ -1098,6 +1098,7 @@ def lower_sequence_add(
 def lower_sequence_sort(
     descriptor: SSASequenceDescriptor,
     scratch: SSASequenceDescriptor,
+    order: SSASequenceDescriptor,
     *,
     key_column: int = 0,
     key_mapping: SSASequenceDescriptor | None = None,
@@ -1105,48 +1106,59 @@ def lower_sequence_sort(
     function_name: str | None = None,
     first_value_id: int | None = None,
 ) -> SSASequenceLowering:
-    """Lower a stable bottom-up merge sort into ordinary repository SSA.
+    """Lower a stable, batch-wide bottom-up merge sort into repository SSA.
 
-    ``scratch`` is caller-owned resident storage with the same row layout as
-    ``descriptor``.  Every comparison reads one scalar key column, optionally
-    mapping that value through the resident table named by ``key_mapping``,
-    while every move copies the complete row.  Taking the left row on equality
-    preserves source order.
+    The sort orders a permutation, not the rows, and every phase is a flat
+    loop whose iterations are independent of one another:
 
-    Status 1 means sorted and status 2 means the scratch arena is too small.
-    The helper neither calls a host sort nor hides an algorithm in a backend.
+    * keys: one pass records ``order[i] = i`` and, for a mapping key, looks
+      each row's key up ONCE (``n`` lookups, never one per comparison);
+    * merge passes (``log2 n`` of them): every element of the pass finds its
+      output position in one step, ``run start + own offset + the count of
+      the opposite run that must precede it``, by a fixed-trip binary search
+      that selects instead of branching; a left element precedes equal right
+      elements, which keeps the sort stable (``reverse`` keeps source order
+      among equals too);
+    * rows move twice, whole: a gather into ``scratch`` by the final
+      permutation and a copy back.
+
+    ``order`` is caller-owned workspace: columns ``(a, b[, key])`` where
+    ``a``/``b`` are int64 permutation buffers and ``key`` (present exactly
+    when ``key_mapping`` is) holds the mapped key by source index.
+    ``scratch`` has the row layout of ``descriptor``.
+
+    Status 1 means sorted and status 2 means a workspace is too small.  The
+    helper neither calls a host sort nor hides an algorithm in a backend.
     """
 
     unsupported = _unsupported_destination(descriptor, "sort")
     if unsupported is not None:
         return unsupported
-    scratch_unsupported = _unsupported_destination(scratch, "sort_scratch")
-    if scratch_unsupported is not None:
-        return scratch_unsupported
-    if descriptor.sequence_id == scratch.sequence_id:
-        raise ValueError("sequence sort requires distinct scratch storage")
+    for workspace, label in ((scratch, "sort_scratch"), (order, "sort_order")):
+        unsupported = _unsupported_destination(workspace, label)
+        if unsupported is not None:
+            return unsupported
+    sequence_ids = {descriptor.sequence_id, scratch.sequence_id, order.sequence_id}
+    if len(sequence_ids) != 3:
+        raise ValueError("sequence sort requires distinct scratch and order storage")
     if (
         tuple(descriptor.column_dtypes) != tuple(scratch.column_dtypes)
         or tuple(descriptor.column_shapes) != tuple(scratch.column_shapes)
         or len(descriptor.column_value_ids) != len(scratch.column_value_ids)
     ):
         raise ValueError("sequence sort scratch must match the row layout")
-    if (
-        descriptor.key_columns
-        or scratch.key_columns
-        or descriptor.live_flags_value_id is not None
-        or scratch.live_flags_value_id is not None
-        or descriptor.child_table_pool is not None
-        or scratch.child_table_pool is not None
-        or any(descriptor.column_shapes)
-        or any(scratch.column_shapes)
-    ):
-        raise ValueError(
-            "sequence sort currently requires dense scalar row columns"
-        )
+    for sequence in (descriptor, scratch, order):
+        if (
+            sequence.key_columns
+            or sequence.live_flags_value_id is not None
+            or sequence.child_table_pool is not None
+            or any(sequence.column_shapes)
+        ):
+            raise ValueError(
+                "sequence sort currently requires dense scalar row columns"
+            )
     if not 0 <= int(key_column) < len(descriptor.column_value_ids):
         raise ValueError("sequence sort key column is outside the row layout")
-    key_lookup = None
     key_value_dtype = descriptor.column_dtypes[int(key_column)]
     if key_mapping is not None:
         mapping_values = tuple(
@@ -1160,14 +1172,28 @@ def lower_sequence_sort(
         mapping_key = int(key_mapping.key_columns[0])
         if key_mapping.column_dtypes[mapping_key] != key_value_dtype:
             raise ValueError(
-                "sequence sort row key and mapping key dtypes must match"
+                "sequence sort row key and mapping key dtypes must match: "
+                f"sequence {descriptor.sequence_id} key column "
+                f"{int(key_column)} is {key_value_dtype!r} but mapping "
+                f"{key_mapping.sequence_id} key column {mapping_key} is "
+                f"{key_mapping.column_dtypes[mapping_key]!r}"
             )
         if key_mapping.status_address_id is None:
             raise ValueError("sequence sort key mapping requires a status cell")
         key_value_dtype = key_mapping.column_dtypes[mapping_values[0]]
+    expected_order = (
+        ("int64", "int64") if key_mapping is None
+        else ("int64", "int64", key_value_dtype)
+    )
+    if tuple(order.column_dtypes) != expected_order:
+        raise ValueError(
+            "sequence sort order workspace must have columns "
+            f"{expected_order!r}, got {tuple(order.column_dtypes)!r}"
+        )
 
     destination_storage = _storage_values(descriptor)
     scratch_storage = _storage_values(scratch)
+    order_storage = _storage_values(order)
     key_storage = (
         (*_storage_values(key_mapping), SSAValue(
             int(key_mapping.status_address_id), dtype="int", shape=(1,),
@@ -1176,11 +1202,15 @@ def lower_sequence_sort(
     )
     arguments = tuple({
         int(value.id): value
-        for value in (*destination_storage, *scratch_storage, *key_storage)
+        for value in (
+            *destination_storage, *scratch_storage, *order_storage,
+            *key_storage,
+        )
     }.values())
     values = {int(value.id): value for value in arguments}
     builder = _Builder(_first_fresh_identity(
-        descriptor, scratch, *((key_mapping,) if key_mapping is not None else ()),
+        descriptor, scratch, order,
+        *((key_mapping,) if key_mapping is not None else ()),
         values=arguments, minimum=first_value_id,
     ))
     destination_columns = tuple(
@@ -1189,36 +1219,36 @@ def lower_sequence_sort(
     scratch_columns = tuple(
         values[int(value_id)] for value_id in scratch.column_value_ids
     )
+    order_columns = tuple(
+        values[int(value_id)] for value_id in order.column_value_ids
+    )
+    permutation_in, permutation_out = order_columns[0], order_columns[1]
+    mapped_keys = order_columns[2] if key_mapping is not None else None
 
     entry = builder.block("entry")
     size_check = builder.block("size_check")
+    key_header = builder.block("key_header")
+    key_body = builder.block("key_body")
     pass_header = builder.block("pass_header")
-    run_header = builder.block("run_header")
-    mid_raw = builder.block("mid_raw")
-    mid_length = builder.block("mid_length")
-    mid_merge = builder.block("mid_merge")
-    right_raw = builder.block("right_raw")
-    right_length = builder.block("right_length")
-    right_merge = builder.block("right_merge")
-    merge_header = builder.block("merge_header")
-    merge_compare = builder.block("merge_compare")
-    take_left = builder.block("take_left")
-    take_right = builder.block("take_right")
-    remainder_header = builder.block("remainder_header")
-    remainder_right_check = builder.block("remainder_right_check")
-    remainder_left = builder.block("remainder_left")
-    remainder_right = builder.block("remainder_right")
-    run_latch = builder.block("run_latch")
+    flat_header = builder.block("flat_header")
+    flat_body = builder.block("flat_body")
+    search_header = builder.block("search_header")
+    search_body = builder.block("search_body")
+    search_done = builder.block("search_done")
     copy_header = builder.block("copy_header")
     copy_body = builder.block("copy_body")
-    copy_latch = builder.block("copy_latch")
     pass_latch = builder.block("pass_latch")
+    gather_header = builder.block("gather_header")
+    gather_body = builder.block("gather_body")
+    restore_header = builder.block("restore_header")
+    restore_body = builder.block("restore_body")
     success = builder.block("success")
-    scratch_small = builder.block("scratch_too_small")
+    workspace_small = builder.block("workspace_too_small")
     result = builder.block("result")
 
     zero = builder.const(entry, 0, dtype="int64")
     one = builder.const(entry, 1, dtype="int64")
+    two = builder.const(entry, 2, dtype="int64")
     length_slot = builder.fresh("ptr")
     length = builder.fresh("int64")
     builder.emit(entry, "GetElementPtr", [
@@ -1226,99 +1256,23 @@ def lower_sequence_sort(
     ], length_slot)
     builder.emit(entry, "Load", [length_slot], length)
     scratch_fits = builder.fresh("bool")
+    order_fits = builder.fresh("bool")
+    workspace_fits = builder.fresh("bool")
     builder.emit(entry, "Ge", [
         values[int(scratch.capacity_value_id)], length,
     ], scratch_fits)
-    builder.cond(entry, scratch_fits, size_check, scratch_small)
+    builder.emit(entry, "Ge", [
+        values[int(order.capacity_value_id)], length,
+    ], order_fits)
+    builder.emit(entry, "LAnd", [scratch_fits, order_fits], workspace_fits)
+    builder.cond(entry, workspace_fits, size_check, workspace_small)
 
     needs_sort = builder.fresh("bool")
     builder.emit(size_check, "Gt", [length, one], needs_sort)
-    builder.cond(size_check, needs_sort, pass_header, success)
-
-    width = builder.fresh("int64")
-    next_width = builder.fresh("int64")
-    builder.emit(pass_header, "Phi", [one, next_width], width, attributes={
-        "incoming_blocks": (size_check.name, pass_latch.name),
-    })
-    another_pass = builder.fresh("bool")
-    builder.emit(pass_header, "Lt", [width, length], another_pass)
-    builder.cond(pass_header, another_pass, run_header, success)
-
-    left = builder.fresh("int64")
-    next_left = builder.fresh("int64")
-    builder.emit(run_header, "Phi", [zero, next_left], left, attributes={
-        "incoming_blocks": (pass_header.name, run_latch.name),
-    })
-    has_run = builder.fresh("bool")
-    builder.emit(run_header, "Lt", [left, length], has_run)
-    builder.cond(run_header, has_run, mid_raw, copy_header)
-
-    candidate_mid = builder.fresh("int64")
-    mid_inside = builder.fresh("bool")
-    builder.emit(mid_raw, "Add", [left, width], candidate_mid)
-    builder.emit(mid_raw, "Lt", [candidate_mid, length], mid_inside)
-    builder.cond(mid_raw, mid_inside, mid_merge, mid_length)
-    builder.branch(mid_length, mid_merge)
-    mid = builder.fresh("int64")
-    builder.emit(mid_merge, "Phi", [candidate_mid, length], mid, attributes={
-        "incoming_blocks": (mid_raw.name, mid_length.name),
-    })
-    candidate_right = builder.fresh("int64")
-    right_inside = builder.fresh("bool")
-    builder.emit(mid_merge, "Add", [mid, width], candidate_right)
-    builder.emit(mid_merge, "Lt", [candidate_right, length], right_inside)
-    builder.cond(mid_merge, right_inside, right_raw, right_length)
-    builder.branch(right_raw, right_merge)
-    builder.branch(right_length, right_merge)
-    right = builder.fresh("int64")
-    builder.emit(right_merge, "Phi", [candidate_right, length], right,
-                 attributes={
-                     "incoming_blocks": (right_raw.name, right_length.name),
-                 })
-    builder.branch(right_merge, merge_header)
-
-    left_index = builder.fresh("int64")
-    right_index = builder.fresh("int64")
-    output_index = builder.fresh("int64")
-    next_left_from_left = builder.fresh("int64")
-    next_right_from_right = builder.fresh("int64")
-    next_output_from_left = builder.fresh("int64")
-    next_output_from_right = builder.fresh("int64")
-    builder.emit(
-        merge_header, "Phi",
-        [left, next_left_from_left, left_index], left_index,
-        attributes={"incoming_blocks": (
-            right_merge.name, take_left.name, take_right.name,
-        )},
-    )
-    builder.emit(
-        merge_header, "Phi",
-        [mid, right_index, next_right_from_right], right_index,
-        attributes={"incoming_blocks": (
-            right_merge.name, take_left.name, take_right.name,
-        )},
-    )
-    builder.emit(
-        merge_header, "Phi",
-        [left, next_output_from_left, next_output_from_right], output_index,
-        attributes={"incoming_blocks": (
-            right_merge.name, take_left.name, take_right.name,
-        )},
-    )
-    left_available = builder.fresh("bool")
-    right_available = builder.fresh("bool")
-    both_available = builder.fresh("bool")
-    builder.emit(merge_header, "Lt", [left_index, mid], left_available)
-    builder.emit(merge_header, "Lt", [right_index, right], right_available)
-    builder.emit(
-        merge_header, "LAnd",
-        [left_available, right_available], both_available,
-    )
-    builder.cond(
-        merge_header, both_available, merge_compare, remainder_header,
-    )
+    builder.cond(size_check, needs_sort, key_header, success)
 
     name = function_name or f"ssa_sequence_{descriptor.sequence_id}_sort"
+    key_lookup = None
     if key_mapping is not None:
         key_lookup = lower_table_lookup(
             key_mapping,
@@ -1327,26 +1281,30 @@ def lower_sequence_sort(
             required=True,
         )
 
-    def load_key(block: BasicBlock, index: SSAValue) -> SSAValue:
-        address = builder.fresh("ptr")
-        value = builder.fresh(descriptor.column_dtypes[int(key_column)])
-        builder.emit(block, "GetElementPtr", [
-            destination_columns[int(key_column)], index,
-        ], address)
-        builder.emit(block, "Load", [address], value)
-        if key_mapping is None:
-            return value
-        mapped = builder.fresh(key_value_dtype)
+    def element_pointer(
+        block: BasicBlock, array: SSAValue, index: SSAValue,
+    ) -> SSAValue:
+        pointer = builder.fresh("ptr")
+        builder.emit(block, "GetElementPtr", [array, index], pointer)
+        return pointer
+
+    def load_at(
+        block: BasicBlock, array: SSAValue, index: SSAValue, dtype: str,
+    ) -> SSAValue:
+        value = builder.fresh(dtype)
         builder.emit(
-            block, "Call", [*key_storage, value], mapped,
-            attributes={
-                "callee": key_lookup.functions[-1].name,
-                "source_linked": True,
-                "ssa_sequence_operation": "sort_key_lookup",
-                "sequence_id": int(key_mapping.sequence_id),
-            },
+            block, "Load", [element_pointer(block, array, index)], value,
         )
-        return mapped
+        return value
+
+    def source_key(block: BasicBlock, source_index: SSAValue) -> SSAValue:
+        """The key of the row that started at ``source_index``."""
+        if mapped_keys is not None:
+            return load_at(block, mapped_keys, source_index, key_value_dtype)
+        return load_at(
+            block, destination_columns[int(key_column)], source_index,
+            key_value_dtype,
+        )
 
     def copy_row(
         block: BasicBlock,
@@ -1358,157 +1316,246 @@ def lower_sequence_sort(
         for source, target, dtype in zip(
             source_columns, target_columns, descriptor.column_dtypes,
         ):
-            source_address = builder.fresh("ptr")
-            value = builder.fresh(dtype)
-            target_address = builder.fresh("ptr")
-            builder.emit(
-                block, "GetElementPtr", [source, source_index], source_address,
-            )
-            builder.emit(block, "Load", [source_address], value)
-            builder.emit(
-                block, "GetElementPtr", [target, target_index], target_address,
-            )
-            builder.emit(block, "Store", [value, target_address])
+            value = load_at(block, source, source_index, dtype)
+            builder.emit(block, "Store", [
+                value, element_pointer(block, target, target_index),
+            ])
 
-    left_key = load_key(merge_compare, left_index)
-    right_key = load_key(merge_compare, right_index)
+    # -- keys: one flat pass --------------------------------------------
+    key_index = builder.fresh("int64")
+    next_key_index = builder.fresh("int64")
+    builder.emit(key_header, "Phi", [zero, next_key_index], key_index,
+                 attributes={"incoming_blocks": (
+                     size_check.name, key_body.name,
+                 )})
+    keys_remain = builder.fresh("bool")
+    builder.emit(key_header, "Lt", [key_index, length], keys_remain)
+    builder.cond(key_header, keys_remain, key_body, pass_header)
+    builder.emit(key_body, "Store", [
+        key_index, element_pointer(key_body, permutation_in, key_index),
+    ])
+    if key_mapping is not None:
+        row_key = load_at(
+            key_body, destination_columns[int(key_column)], key_index,
+            descriptor.column_dtypes[int(key_column)],
+        )
+        mapped = builder.fresh(key_value_dtype)
+        builder.emit(
+            key_body, "Call", [*key_storage, row_key], mapped,
+            attributes={
+                "callee": key_lookup.functions[-1].name,
+                "source_linked": True,
+                "ssa_sequence_operation": "sort_key_lookup",
+                "sequence_id": int(key_mapping.sequence_id),
+            },
+        )
+        builder.emit(key_body, "Store", [
+            mapped, element_pointer(key_body, mapped_keys, key_index),
+        ])
+    builder.emit(key_body, "Add", [key_index, one], next_key_index)
+    builder.branch(key_body, key_header)
+
+    # -- merge passes ---------------------------------------------------
+    width = builder.fresh("int64")
+    next_width = builder.fresh("int64")
+    steps = builder.fresh("int64")
+    next_steps = builder.fresh("int64")
+    builder.emit(pass_header, "Phi", [one, next_width], width,
+                 attributes={"incoming_blocks": (
+                     key_header.name, pass_latch.name,
+                 )})
+    builder.emit(pass_header, "Phi", [one, next_steps], steps,
+                 attributes={"incoming_blocks": (
+                     key_header.name, pass_latch.name,
+                 )})
+    another_pass = builder.fresh("bool")
+    builder.emit(pass_header, "Lt", [width, length], another_pass)
+    builder.cond(pass_header, another_pass, flat_header, gather_header)
+
+    element = builder.fresh("int64")
+    next_element = builder.fresh("int64")
+    builder.emit(flat_header, "Phi", [zero, next_element], element,
+                 attributes={"incoming_blocks": (
+                     pass_header.name, search_done.name,
+                 )})
+    elements_remain = builder.fresh("bool")
+    builder.emit(flat_header, "Lt", [element, length], elements_remain)
+    builder.cond(flat_header, elements_remain, flat_body, copy_header)
+
+    pair_width = builder.fresh("int64")
+    run_number = builder.fresh("int64")
+    run_start = builder.fresh("int64")
+    mid_raw = builder.fresh("int64")
+    mid_inside = builder.fresh("bool")
+    run_mid = builder.fresh("int64")
+    end_raw = builder.fresh("int64")
+    end_inside = builder.fresh("bool")
+    run_end = builder.fresh("int64")
+    in_left = builder.fresh("bool")
+    left_offset = builder.fresh("int64")
+    right_offset = builder.fresh("int64")
+    own_offset = builder.fresh("int64")
+    opposite_base = builder.fresh("int64")
+    left_count = builder.fresh("int64")
+    right_count = builder.fresh("int64")
+    opposite_length = builder.fresh("int64")
+    builder.emit(flat_body, "Add", [width, width], pair_width)
+    builder.emit(flat_body, "FloorDiv", [element, pair_width], run_number)
+    builder.emit(flat_body, "Mul", [run_number, pair_width], run_start)
+    builder.emit(flat_body, "Add", [run_start, width], mid_raw)
+    builder.emit(flat_body, "Lt", [mid_raw, length], mid_inside)
+    builder.emit(flat_body, "Select", [mid_inside, mid_raw, length], run_mid)
+    builder.emit(flat_body, "Add", [run_start, pair_width], end_raw)
+    builder.emit(flat_body, "Lt", [end_raw, length], end_inside)
+    builder.emit(flat_body, "Select", [end_inside, end_raw, length], run_end)
+    builder.emit(flat_body, "Lt", [element, run_mid], in_left)
+    builder.emit(flat_body, "Sub", [element, run_start], left_offset)
+    builder.emit(flat_body, "Sub", [element, run_mid], right_offset)
+    builder.emit(flat_body, "Select", [in_left, left_offset, right_offset],
+                 own_offset)
+    builder.emit(flat_body, "Select", [in_left, run_mid, run_start],
+                 opposite_base)
+    builder.emit(flat_body, "Sub", [run_end, run_mid], right_count)
+    builder.emit(flat_body, "Sub", [run_mid, run_start], left_count)
+    builder.emit(flat_body, "Select", [in_left, right_count, left_count],
+                 opposite_length)
+    source_index = load_at(flat_body, permutation_in, element, "int64")
+    element_key = source_key(flat_body, source_index)
+    builder.branch(flat_body, search_header)
+
+    # Fixed-trip binary search over the opposite run: ``position`` ends as
+    # the number of its elements that must precede this one.
+    position = builder.fresh("int64")
+    upper = builder.fresh("int64")
+    step = builder.fresh("int64")
+    next_position = builder.fresh("int64")
+    next_upper = builder.fresh("int64")
+    next_step = builder.fresh("int64")
+    builder.emit(search_header, "Phi", [zero, next_position], position,
+                 attributes={"incoming_blocks": (
+                     flat_body.name, search_body.name,
+                 )})
+    builder.emit(search_header, "Phi", [opposite_length, next_upper], upper,
+                 attributes={"incoming_blocks": (
+                     flat_body.name, search_body.name,
+                 )})
+    builder.emit(search_header, "Phi", [zero, next_step], step,
+                 attributes={"incoming_blocks": (
+                     flat_body.name, search_body.name,
+                 )})
+    searching = builder.fresh("bool")
+    builder.emit(search_header, "Lt", [step, steps], searching)
+    builder.cond(search_header, searching, search_body, search_done)
+
+    active = builder.fresh("bool")
+    span = builder.fresh("int64")
+    midpoint = builder.fresh("int64")
+    probe_raw = builder.fresh("int64")
+    probe = builder.fresh("int64")
+    builder.emit(search_body, "Lt", [position, upper], active)
+    builder.emit(search_body, "Add", [position, upper], span)
+    builder.emit(search_body, "FloorDiv", [span, two], midpoint)
+    builder.emit(search_body, "Add", [opposite_base, midpoint], probe_raw)
+    builder.emit(search_body, "Select", [active, probe_raw, zero], probe)
+    probe_source = load_at(search_body, permutation_in, probe, "int64")
+    probe_key = source_key(search_body, probe_source)
     left_precedes = builder.fresh("bool")
+    right_precedes = builder.fresh("bool")
+    precedes = builder.fresh("bool")
+    # A left element yields to opposite elements strictly before it; a right
+    # element to the opposite elements before it or equal: equals keep order.
     builder.emit(
-        merge_compare, "Ge" if reverse else "Le",
-        [left_key, right_key], left_precedes,
+        search_body, "Gt" if reverse else "Lt",
+        [probe_key, element_key], left_precedes,
     )
-    builder.cond(merge_compare, left_precedes, take_left, take_right)
+    builder.emit(
+        search_body, "Ge" if reverse else "Le",
+        [probe_key, element_key], right_precedes,
+    )
+    builder.emit(search_body, "Select", [in_left, left_precedes, right_precedes],
+                 precedes)
+    take = builder.fresh("bool")
+    after_midpoint = builder.fresh("int64")
+    shrunk = builder.fresh("int64")
+    builder.emit(search_body, "LAnd", [active, precedes], take)
+    builder.emit(search_body, "Add", [midpoint, one], after_midpoint)
+    builder.emit(search_body, "Select", [take, after_midpoint, position],
+                 next_position)
+    builder.emit(search_body, "Select", [active, midpoint, upper], shrunk)
+    builder.emit(search_body, "Select", [precedes, upper, shrunk], next_upper)
+    builder.emit(search_body, "Add", [step, one], next_step)
+    builder.branch(search_body, search_header)
 
-    copy_row(
-        take_left, destination_columns, left_index,
-        scratch_columns, output_index,
-    )
-    builder.emit(take_left, "Add", [left_index, one], next_left_from_left)
-    builder.emit(take_left, "Add", [output_index, one], next_output_from_left)
-    builder.branch(take_left, merge_header)
-
-    copy_row(
-        take_right, destination_columns, right_index,
-        scratch_columns, output_index,
-    )
-    builder.emit(
-        take_right, "Add", [right_index, one], next_right_from_right,
-    )
-    builder.emit(
-        take_right, "Add", [output_index, one], next_output_from_right,
-    )
-    builder.branch(take_right, merge_header)
-
-    remainder_left_index = builder.fresh("int64")
-    remainder_right_index = builder.fresh("int64")
-    remainder_output_index = builder.fresh("int64")
-    next_remainder_left = builder.fresh("int64")
-    next_remainder_right = builder.fresh("int64")
-    next_remainder_output_left = builder.fresh("int64")
-    next_remainder_output_right = builder.fresh("int64")
-    builder.emit(
-        remainder_header, "Phi",
-        [left_index, next_remainder_left, remainder_left_index],
-        remainder_left_index,
-        attributes={"incoming_blocks": (
-            merge_header.name, remainder_left.name, remainder_right.name,
-        )},
-    )
-    builder.emit(
-        remainder_header, "Phi",
-        [right_index, remainder_right_index, next_remainder_right],
-        remainder_right_index,
-        attributes={"incoming_blocks": (
-            merge_header.name, remainder_left.name, remainder_right.name,
-        )},
-    )
-    builder.emit(
-        remainder_header, "Phi",
-        [output_index, next_remainder_output_left,
-         next_remainder_output_right],
-        remainder_output_index,
-        attributes={"incoming_blocks": (
-            merge_header.name, remainder_left.name, remainder_right.name,
-        )},
-    )
-    left_remains = builder.fresh("bool")
-    builder.emit(
-        remainder_header, "Lt",
-        [remainder_left_index, mid], left_remains,
-    )
-    builder.cond(
-        remainder_header, left_remains,
-        remainder_left, remainder_right_check,
-    )
-
-    right_remains = builder.fresh("bool")
-    builder.emit(
-        remainder_right_check, "Lt",
-        [remainder_right_index, right], right_remains,
-    )
-    builder.cond(
-        remainder_right_check, right_remains, remainder_right, run_latch,
-    )
-
-    copy_row(
-        remainder_left, destination_columns, remainder_left_index,
-        scratch_columns, remainder_output_index,
-    )
-    builder.emit(
-        remainder_left, "Add",
-        [remainder_left_index, one], next_remainder_left,
-    )
-    builder.emit(
-        remainder_left, "Add",
-        [remainder_output_index, one], next_remainder_output_left,
-    )
-    builder.branch(remainder_left, remainder_header)
-
-    copy_row(
-        remainder_right, destination_columns, remainder_right_index,
-        scratch_columns, remainder_output_index,
-    )
-    builder.emit(
-        remainder_right, "Add",
-        [remainder_right_index, one], next_remainder_right,
-    )
-    builder.emit(
-        remainder_right, "Add",
-        [remainder_output_index, one], next_remainder_output_right,
-    )
-    builder.branch(remainder_right, remainder_header)
-
-    twice_width = builder.fresh("int64")
-    builder.emit(run_latch, "Add", [width, width], twice_width)
-    builder.emit(run_latch, "Add", [left, twice_width], next_left)
-    builder.branch(run_latch, run_header)
+    run_offset = builder.fresh("int64")
+    output_index = builder.fresh("int64")
+    builder.emit(search_done, "Add", [run_start, own_offset], run_offset)
+    builder.emit(search_done, "Add", [run_offset, position], output_index)
+    builder.emit(search_done, "Store", [
+        source_index, element_pointer(search_done, permutation_out, output_index),
+    ])
+    builder.emit(search_done, "Add", [element, one], next_element)
+    builder.branch(search_done, flat_header)
 
     copy_index = builder.fresh("int64")
     next_copy_index = builder.fresh("int64")
-    builder.emit(
-        copy_header, "Phi", [zero, next_copy_index], copy_index,
-        attributes={"incoming_blocks": (run_header.name, copy_latch.name)},
-    )
-    copy_continues = builder.fresh("bool")
-    builder.emit(copy_header, "Lt", [copy_index, length], copy_continues)
-    builder.cond(copy_header, copy_continues, copy_body, pass_latch)
-    copy_row(
-        copy_body, scratch_columns, copy_index,
-        destination_columns, copy_index,
-    )
-    builder.branch(copy_body, copy_latch)
-    builder.emit(copy_latch, "Add", [copy_index, one], next_copy_index)
-    builder.branch(copy_latch, copy_header)
+    builder.emit(copy_header, "Phi", [zero, next_copy_index], copy_index,
+                 attributes={"incoming_blocks": (
+                     flat_header.name, copy_body.name,
+                 )})
+    copies_remain = builder.fresh("bool")
+    builder.emit(copy_header, "Lt", [copy_index, length], copies_remain)
+    builder.cond(copy_header, copies_remain, copy_body, pass_latch)
+    moved = load_at(copy_body, permutation_out, copy_index, "int64")
+    builder.emit(copy_body, "Store", [
+        moved, element_pointer(copy_body, permutation_in, copy_index),
+    ])
+    builder.emit(copy_body, "Add", [copy_index, one], next_copy_index)
+    builder.branch(copy_body, copy_header)
 
     builder.emit(pass_latch, "Add", [width, width], next_width)
+    builder.emit(pass_latch, "Add", [steps, one], next_steps)
     builder.branch(pass_latch, pass_header)
 
+    # -- rows move twice, whole -----------------------------------------
+    gather_index = builder.fresh("int64")
+    next_gather_index = builder.fresh("int64")
+    builder.emit(gather_header, "Phi", [zero, next_gather_index], gather_index,
+                 attributes={"incoming_blocks": (
+                     pass_header.name, gather_body.name,
+                 )})
+    gathers_remain = builder.fresh("bool")
+    builder.emit(gather_header, "Lt", [gather_index, length], gathers_remain)
+    builder.cond(gather_header, gathers_remain, gather_body, restore_header)
+    gathered_source = load_at(gather_body, permutation_in, gather_index, "int64")
+    copy_row(
+        gather_body, destination_columns, gathered_source,
+        scratch_columns, gather_index,
+    )
+    builder.emit(gather_body, "Add", [gather_index, one], next_gather_index)
+    builder.branch(gather_body, gather_header)
+
+    restore_index = builder.fresh("int64")
+    next_restore_index = builder.fresh("int64")
+    builder.emit(restore_header, "Phi", [zero, next_restore_index], restore_index,
+                 attributes={"incoming_blocks": (
+                     gather_header.name, restore_body.name,
+                 )})
+    restores_remain = builder.fresh("bool")
+    builder.emit(restore_header, "Lt", [restore_index, length], restores_remain)
+    builder.cond(restore_header, restores_remain, restore_body, success)
+    copy_row(
+        restore_body, scratch_columns, restore_index,
+        destination_columns, restore_index,
+    )
+    builder.emit(restore_body, "Add", [restore_index, one], next_restore_index)
+    builder.branch(restore_body, restore_header)
+
     success_status = _status_branch(builder, success, 1, result)
-    scratch_status = _status_branch(builder, scratch_small, 2, result)
+    workspace_status = _status_branch(builder, workspace_small, 2, result)
     status = builder.fresh("int")
     builder.emit(
-        result, "Phi", [success_status, scratch_status], status,
-        attributes={"incoming_blocks": (success.name, scratch_small.name)},
+        result, "Phi", [success_status, workspace_status], status,
+        attributes={"incoming_blocks": (success.name, workspace_small.name)},
     )
     builder.emit(result, "Ret", [status])
 
@@ -1516,14 +1563,15 @@ def lower_sequence_sort(
         "ssa_sequence_operation": "sort",
         "sequence_id": int(descriptor.sequence_id),
         "scratch_sequence_id": int(scratch.sequence_id),
+        "order_sequence_id": int(order.sequence_id),
         "key_column": int(key_column),
         "key_mapping_sequence_id": (
             None if key_mapping is None else int(key_mapping.sequence_id)
         ),
         "reverse": bool(reverse),
         "stable": True,
-        "algorithm": "bottom_up_merge_sort",
-        "status_values": {"sorted": 1, "scratch_too_small": 2},
+        "algorithm": "batch_rank_merge_sort",
+        "status_values": {"sorted": 1, "workspace_too_small": 2},
         "sequence_array_argument_ids": tuple(value.id for value in arguments),
         "named_outputs": (("status", int(status.id)),),
     })
