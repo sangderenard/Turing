@@ -9,9 +9,6 @@ import sys
 import threading
 from uuid import uuid4
 
-from src.cells.simulator import Simulator
-from src.cells.cellsim.api.saline import run_saline_sim
-from src.cells.cell_consts import Cell
 from .helpers.meta_graph_edge import META_GRAPH_TRANSFER_BUFFER_SIZE
 
 import json
@@ -118,7 +115,6 @@ class BitTensorMemoryGraph:
         self.hard_memory = BitTensorMemory(
             self.hard_memory_size, self, dynamic=self._dynamic
         )  # default memory size
-        #self.hard_memory.region_manager.register_object_maps()
         self.meta_graph_root = meta_graph_root  # root of the meta graph
         self.generative_parent = generative_parent
         self.lock_manager = None  # placeholder for lock manager
@@ -131,6 +127,8 @@ class BitTensorMemoryGraph:
         self.edge_count = 0
         self.parent_count = 0
         self.child_count = 0
+        self._node_record_offsets = {}
+        self._edge_record_offsets = {}
 
         self.bit_width = bit_width
         self.encoding = encoding
@@ -156,6 +154,57 @@ class BitTensorMemoryGraph:
         self._dynamic = bool(value)
         if getattr(self, "hard_memory", None) is not None:
             self.hard_memory.dynamic = self._dynamic
+
+    # -- NetworkX surface ------------------------------------------------
+    # ProcessGraph's secondary data/interference graphs hold this outer
+    # object directly, while its primary graph uses ``self.G``.  Both views
+    # must address the same semantic topology and the same physical records.
+    @property
+    def nodes(self):
+        return self.G.nodes
+
+    @property
+    def edges(self):
+        return self.G.edges
+
+    @property
+    def graph(self):
+        return self.G.graph
+
+    @property
+    def in_edges(self):
+        return self.G.in_edges
+
+    @property
+    def out_edges(self):
+        return self.G.out_edges
+
+    def __iter__(self):
+        return iter(self.G)
+
+    def __contains__(self, node):
+        return node in self.G
+
+    def __len__(self):
+        return len(self.G)
+
+    def add_nodes_from(self, nodes_for_adding, **attr):
+        return self.G.add_nodes_from(nodes_for_adding, **attr)
+
+    def add_edges_from(self, ebunch_to_add, **attr):
+        return self.G.add_edges_from(ebunch_to_add, **attr)
+
+    def has_edge(self, source, target):
+        return self.G.has_edge(source, target)
+
+    def number_of_nodes(self):
+        return self.G.number_of_nodes()
+
+    def number_of_edges(self):
+        return self.G.number_of_edges()
+
+    def copy(self, as_view=False):
+        return self.G.copy(as_view=as_view)
     # -- Nodes ----------------------------------------------------------
     def _node_offset(self, node_id) -> int|None:
         """Return byte-offset of the NodeEntry whose node_id matches, else None."""
@@ -306,11 +355,18 @@ class BitTensorMemoryGraph:
 
 
     def add_edge(self, src, dst, **kwargs):
+        result = self._add_edge_record(src, dst, **kwargs)
+        if not self.G.has_edge(src, dst):
+            import networkx as nx
+            nx.DiGraph.add_edge(self.G, src, dst, **kwargs)
+        return result
+
+    def _add_edge_record(self, src, dst, **kwargs):
+        existing = self._edge_record_offsets.get((src, dst))
+        if existing is not None:
+            return (src, dst)
         edge = EdgeEntry(src, dst, **kwargs)
-        # System adaptation: set salinity and balance before allocation
         edge_size = ctypes.sizeof(EdgeEntry)
-        self.hard_memory.region_manager.cells[3].salinity += edge_size  # 3 = 'edge'
-        run_saline_sim(self.hard_memory.region_manager)
         free_space = self.hard_memory.find_free_space("edge", edge_size)
 
         if free_space is not None:
@@ -318,8 +374,14 @@ class BitTensorMemoryGraph:
         else:
             raise MemoryError("Failed to allocate space for edge after balancing.")
         self.edge_count += 1
+        self._edge_record_offsets[(src, dst)] = free_space
 
         return (src, dst)
+
+    def _remove_edge_record(self, src, dst):
+        offset = self._edge_record_offsets.pop((src, dst))
+        self.hard_memory.free(offset, ctypes.sizeof(EdgeEntry))
+        self.edge_count -= 1
 
     def add_meta_parent(self, parent_id):
         # THESE ARE NOT THE SAME AS THE NODES AND EDGES IN THE GRAPH
@@ -328,10 +390,7 @@ class BitTensorMemoryGraph:
         """
         Add a meta parent node to the graph.
         """
-        # System adaptation: set salinity and balance before allocation
         parent_size = ctypes.sizeof(MetaGraphEdge)
-        self.hard_memory.region_manager.cells[4].salinity += parent_size  # 4 = 'parent'
-        run_saline_sim(self.hard_memory.region_manager)
         space = self.hard_memory.find_free_space("parent", parent_size)
         if space is None:
             self.emergency_reference = self.hard_memory.allocate_block(parent_size, (self.LINE_P, self.LINE_C))
@@ -340,7 +399,7 @@ class BitTensorMemoryGraph:
             space = self.emergency_reference
         edge = MetaGraphEdge()
         edge.local_capsid_ref = self.capsid_id
-        edge.remote_capsid_ref = parent_id
+        edge.linked_capsid_ref = parent_id
 
         self.parent_count += 1
         self.hard_memory.write(space, ctypes.string_at(ctypes.addressof(edge), parent_size))
@@ -467,10 +526,7 @@ class BitTensorMemoryGraph:
                 self.start_n = ((self.header_size + self.hard_memory.granular_size - 1) // self.hard_memory.granular_size) * self.hard_memory.granular_size
             else:
                 print(f"Debugging: Dirty memory found, reallocating hard memory.")
-                # System adaptation: set salinity and balance before allocation
                 header_size = self.header_size
-                self.hard_memory.region_manager.cells[0].salinity += header_size  # 0 = 'header'
-                run_saline_sim(self.hard_memory.region_manager)
                 free_space = self.hard_memory.find_free_space("header", header_size)
                 print(f"Debugging: Free space for header serialization: {free_space}")
                 if free_space is None:
@@ -537,10 +593,7 @@ class BitTensorMemoryGraph:
     def add_child(self, free_space=None, child_id=None, meta_graph_node=None, byref=False):
         global meta_nodes
         if free_space is None:
-            # System adaptation: set salinity and balance before allocation
             child_size = ctypes.sizeof(MetaGraphEdge)
-            self.hard_memory.region_manager.cells[5].salinity += child_size  # 5 = 'child'
-            run_saline_sim(self.hard_memory.region_manager)
             free_space = self.hard_memory.find_free_space("child", child_size)
         if not byref:
             new_child_entry = MetaGraphEdge()
@@ -549,7 +602,7 @@ class BitTensorMemoryGraph:
         new_child = None    
         new_child_entry.local_capsid_ref = self.capsid_id
         if child_id is not None:
-            new_child_entry.remote_capsid_ref = child_id
+            new_child_entry.linked_capsid_ref = child_id
         if meta_graph_node is not None:
             new_child = meta_graph_node
         else:
@@ -725,10 +778,7 @@ class BitTensorMemoryGraph:
         # relative to capacity and density of the memory graph.
         # 
         print(self.hard_memory.size, self.header_size, self.hard_memory.size - self.header_size)
-        # System adaptation: set salinity and balance before allocation
         child_size = ctypes.sizeof(MetaGraphEdge)
-        self.hard_memory.region_manager.cells[5].salinity += child_size  # 5 = 'child'
-        run_saline_sim(self.hard_memory.region_manager)
         free_space = self.hard_memory.find_free_space("child", child_size)
         new_child = None
         if free_space == BitTensorMemory.ALLOCATION_FAILURE or free_space is None:
@@ -910,7 +960,11 @@ class BitTensorMemoryGraph:
         ]
 
         # ── 2. push layout into Region-Manager ────────────────────────────────
-        raw_regions = self.hard_memory.reset_region_manager(boundaries, strides)
+        raw_regions = [
+            (index, boundaries[index], boundaries[index + 1], strides[index])
+            for index in range(min(len(strides), len(boundaries) - 1))
+            if boundaries[index + 1] > boundaries[index]
+        ]
 
         # ── 3. harvest per-cell maps ──────────────────────────────────────────
         (active_regions,
@@ -981,17 +1035,29 @@ class BitTensorMemoryGraph:
         for region in active_regions:
             if region is None:
                 continue
-            region_tuples.append(
-                (
-                    getattr(region, "label", ""),
-                    getattr(region, "left", 0),
-                    getattr(region, "right", 0),
-                    getattr(region, "stride", 0),
+            if isinstance(region, tuple) and len(region) == 4:
+                region_tuples.append(region)
+            else:
+                region_tuples.append(
+                    (
+                        getattr(region, "label", ""),
+                        getattr(region, "left", 0),
+                        getattr(region, "right", 0),
+                        getattr(region, "stride", 0),
+                    )
                 )
-            )
 
         # ── 1.  Fresh quanta-level dump from pressure-based manager
-        cell_dump = self.hard_memory.region_manager.dump_cells()
+        cell_dump = {
+            "free_spaces": [
+                (-1, left, right - left)
+                for left, right in self.hard_memory.allocator.free_intervals
+            ],
+            "occupied_spaces": [
+                (record.label, record.start, record.size)
+                for record in self.hard_memory.allocator.allocations()
+            ],
+        }
 
         def group_by_cell(ranges):
             buckets = collections.defaultdict(list)
@@ -1014,6 +1080,18 @@ class BitTensorMemoryGraph:
         if not hasattr(self, "region_layout") or not self.region_layout:
             # Cache the full layout information from the region manager.
             self.region_layout = self.compute_region_boundaries()
+
+        label = {
+            ctypes.sizeof(NodeEntry): "node",
+            ctypes.sizeof(EdgeEntry): "edge",
+        }.get(int(entry_size))
+        if label is not None:
+            flight_zone = list(self.hard_memory.allocator.offsets(label))
+            if not flight_zone:
+                return self.NOTHING_TO_FLY
+            if return_objects:
+                return [self.hard_memory.read(i, entry_size) for i in flight_zone]
+            return flight_zone
 
         active_regions = self.region_layout
         print(f"Debugging: Active regions after harmonization: {active_regions}")
@@ -1266,6 +1344,15 @@ class BitTensorMemoryGraph:
         return None
     
     def add_node(self, node_entry=None, node_id=None, *args, **kwargs):
+        result = self._add_node_record(node_id, node_entry, *args, **kwargs)
+        if result not in self.G:
+            import networkx as nx
+            nx.DiGraph.add_node(self.G, result, **kwargs)
+        return result
+
+    def _add_node_record(self, node_id=None, node_entry=None, *args, **kwargs):
+        if node_id is not None and node_id in self._node_record_offsets:
+            return node_id
         print(f"Adding node with args: {args}, kwargs: {kwargs}, node_entry: {node_entry}, node_id: {node_id}")
 
         # Prepare a byte string from any positional/keyword arguments to store
@@ -1288,27 +1375,20 @@ class BitTensorMemoryGraph:
             return str(obj).encode("utf-8")
 
         if isinstance(node_entry, NodeEntry):
-            # ``node_entry`` may already carry an ID, but treat ``0`` as
-            # "unset" so we always emit a usable identifier.  Callers can
-            # still override via the explicit ``node_id`` parameter.
-            if node_id in (None, 0):
+            if node_id is None:
                 node_id = node_entry.node_id
-            if node_id in (None, 0):
+            if node_id is None:
                 node_id = uuid4().int % 2**32
             node_entry.node_id = node_id
             node_bytes = ctypes.string_at(ctypes.addressof(node_entry), ctypes.sizeof(NodeEntry))
         else:
-            if node_id in (None, 0):
+            if node_id is None:
                 node_id = uuid4().int % 2**32
             node_data = _to_bytes(node_entry)
             new_node_entry = NodeEntry(node_id=node_id, node_data=node_data)
             node_bytes = ctypes.string_at(ctypes.addressof(new_node_entry), ctypes.sizeof(NodeEntry))
 
-        new_node_slot = self.hard_memory.find_free_space("node", ctypes.sizeof(NodeEntry))
-        # System adaptation: set salinity and balance before allocation
         node_size = ctypes.sizeof(NodeEntry)
-        self.hard_memory.region_manager.cells[2].salinity += node_size  # 2 = 'node'
-        run_saline_sim(self.hard_memory.region_manager)
         new_node_slot = self.hard_memory.find_free_space("node", node_size)
         if new_node_slot == BitTensorMemory.ALLOCATION_FAILURE:
             raise MemoryError("Failed to add node: no free space available after balancing")
@@ -1321,6 +1401,12 @@ class BitTensorMemoryGraph:
             raise MemoryError("Failed to write node entry to hard memory")
 
         self.node_count += 1
+        self._node_record_offsets[node_id] = new_node_slot
 
         return node_id
+
+    def _remove_node_record(self, node_id):
+        offset = self._node_record_offsets.pop(node_id)
+        self.hard_memory.free(offset, ctypes.sizeof(NodeEntry))
+        self.node_count -= 1
         

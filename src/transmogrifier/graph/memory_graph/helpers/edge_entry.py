@@ -33,16 +33,11 @@ class EdgeEntry(ctypes.Structure):
         ('_pad', ctypes.c_byte * (128 - 50))  # align to 128
     ]
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.src_ptr = 0
-        self.dst_ptr = 0
-        self.src_graph_id = args[0] if args else 0
-        self.dst_graph_id = args[1] if len(args) > 1 else 0
-        self.data_type = 0
-        self.edge_flags = 0
-        self.timestamp = 0
-        self.alignment = 0
-        self.checksuma = 0
-        self.checksumb = 0
+        src = int(args[0]) if args else int(kwargs.pop("src_ptr", 0))
+        dst = int(args[1]) if len(args) > 1 else int(kwargs.pop("dst_ptr", 0))
+        fields = {field[0] for field in self._fields_}
+        super().__init__(**{key: value for key, value in kwargs.items() if key in fields})
+        self.src_ptr = src
+        self.dst_ptr = dst
     
 META_GRAPH_TRANSFER_BUFFER_SIZE = 60  # 60 uint64 slots for transfer buffer

@@ -9,15 +9,13 @@ import sys
 import threading
 from uuid import uuid4
 
-from src.cells.simulator import Simulator
-from src.cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
-from src.cells.cell_consts import Cell
 from .bt_graph_header import BTGraphHeader
 from .bit_tensor_memory_units import BitTensorMemoryUnits
 from .node_entry import NodeEntry
 from .edge_entry import EdgeEntry
 from .meta_graph_edge import MetaGraphEdge, META_GRAPH_TRANSFER_BUFFER_SIZE
 from .set_micrograin_entry import SetMicrograinEntry
+from .integer_region_allocator import IntegerRegionAllocator, allocation_quantum
 
 import json
 
@@ -36,19 +34,20 @@ class BitTensorMemory: #sizes in bytes
         self.dynamic = dynamic
 
 
-        self.header_size = ctypes.sizeof(BTGraphHeader) if graph else 0
-        self.l_start = graph.l_start if graph else 0
-        self.n_start = graph.n_start if graph else 0
-        self.e_start = graph.e_start if graph else 0
-        self.p_start = graph.p_start if graph else 0
-        self.c_start = graph.c_start if graph else 0
-        self.r_start = graph.r_start if graph else 0
-        self.x_start = graph.x_start if graph else 0
+        self.header_size = ctypes.sizeof(BTGraphHeader) if graph is not None else 0
+        self.l_start = graph.l_start if graph is not None else 0
+        self.n_start = graph.n_start if graph is not None else 0
+        self.e_start = graph.e_start if graph is not None else 0
+        self.p_start = graph.p_start if graph is not None else 0
+        self.c_start = graph.c_start if graph is not None else 0
+        self.r_start = graph.r_start if graph is not None else 0
+        self.x_start = graph.x_start if graph is not None else 0
         self.envelope_domain = (0, self.x_start)
         self.envelope_size = self.size - self.header_size
 
 
-        self.data = ctypes.create_string_buffer(size if size > BitTensorMemory.DEFAULT_BLOCK else BitTensorMemory.DEFAULT_BLOCK)
+        self.size = max(size, BitTensorMemory.DEFAULT_BLOCK)
+        self.data = ctypes.create_string_buffer(self.size)
         self.unit_helper = BitTensorMemoryUnits(0, self.size, self.granular_size, self.chunk_size, node_template = NodeEntry, edge_template= EdgeEntry, association_template=MetaGraphEdge, hard_memory = self)
         self.graph = graph
         
@@ -58,23 +57,16 @@ class BitTensorMemory: #sizes in bytes
         self.extra_data_size = 0
         self.set_cache = set()
 
-        specs = self.get_specs()
-        cells = [
-            Cell(stride=s["stride"], left=s["left"], right=s["right"],
-                 len=s["len"], label=s["label"])
-            for s in specs
-        ]
-        self.region_manager = Simulator(cells)
-
-        # Initialise the hydraulic model upfront so equilibrium fractions and
-        # buffer expansion are resolved before any writes occur.  Some
-        # bootstrapping layouts may temporarily present overlapping or zero-width
-        # regions which violate the snap_cell_walls assertions; in that case,
-        # defer hydraulic balancing until after a valid layout is established.
-        try:
-            self.region_manager.run_saline_sim()
-        except AssertionError:
-            pass
+        quantum = allocation_quantum((
+            ctypes.sizeof(NodeEntry), ctypes.sizeof(EdgeEntry),
+            ctypes.sizeof(MetaGraphEdge), 8,
+        ))
+        self.allocator = IntegerRegionAllocator(
+            self.size,
+            reserved_prefix=self.header_size,
+            growth_quantum=max(self.DEFAULT_BLOCK, quantum),
+            on_grow=self._grow_data,
+        )
 
         
     def pull_full_set_from_memory(self):
@@ -97,28 +89,21 @@ class BitTensorMemory: #sizes in bytes
             offset -= stride
         
     def _clip_offset(self, offset, size):
-        offest = self.unit_helper.bitmap._clip(offset + size) - size
-        size = self.unit_helper.bitmap._clip(size)
+        offset, size = int(offset), int(size)
+        if offset < 0 or size < 0 or offset + size > self.size:
+            raise ValueError(
+                f"byte interval [{offset}, {offset + size}) exceeds arena [0, {self.size})"
+            )
         return offset, size
 
     def reset_region_manager(self, boundaries=None, strides=None, insertion=False):
-        # Recreate region manager with new specs
-        specs = self.get_specs(boundaries, strides)
-        cells = [
-            Cell(stride=s["stride"], left=s["left"], right=s["right"],
-                 len=s["len"], label=s["label"])
-            for s in specs
-        ]
-        self.region_manager = Simulator(cells)
+        return self.get_specs(boundaries, strides)
 
-        # Ensure hydraulic model is primed on reset as well.  If the region
-        # specifications result in overlapping boundaries, defer the hydraulic
-        # pass until the layout is corrected.
-        try:
-            self.region_manager.run_saline_sim()
-        except AssertionError:
-            pass
-        return self.region_manager.cells
+    def _grow_data(self, new_capacity):
+        new_data = ctypes.create_string_buffer(int(new_capacity))
+        ctypes.memmove(new_data, self.data, self.size)
+        self.data = new_data
+        self.size = int(new_capacity)
 
 
     def read(self, offset, size, clear_delta_map=False):
@@ -146,17 +131,15 @@ class BitTensorMemory: #sizes in bytes
         
         
         self.data[offset:offset + size] = data[:size]
-        
-        self.unit_helper.delta(offset, size, "write", string=data[:size])
-        if clear_delta_map:
-            self.unit_helper.delta(offset, size, "read", string=data[:size])
 
     def free(self, offset, size, scramble=False):
         offset, size = self._clip_offset(offset, size)
-        self.mark_free(offset, size)
-
         data = b'\x00' * size if not scramble else random.randbytes(size)
-        self.unit_helper.delta(offset, size, "free", string=data)
+        self.data[offset:offset + size] = data
+        try:
+            self.allocator.release(offset)
+        except KeyError:
+            pass
 
     def bitmap_expanded(self, offset=None, size=None):
         if offset is None:
@@ -172,14 +155,13 @@ class BitTensorMemory: #sizes in bytes
         return return_map
 
     def mark_used(self, offset, size):
-        # mark used bits and increment delta
-        offset, size = self._clip_offset(offset, size)
-        self.unit_helper.delta(offset, size, "alloc")
+        self._clip_offset(offset, size)
     def get_specs(self, boundaries=None, strides=None):
-        """Return region specifications for the underlying simulator.
+        """Return legacy band descriptions for serialized-layout readers.
 
-        Zero-width regions are expanded to a minimal non-zero stride so that
-        the pressure simulator always receives valid ``left < right`` domains.
+        New allocation does not consume these bands.  They remain available to
+        readers of the historical header format while allocation uses exact
+        byte intervals in ``self.allocator``.
         If no region provides a stride from which to derive this width, a
         ``ValueError`` is raised.
         """
@@ -252,9 +234,7 @@ class BitTensorMemory: #sizes in bytes
                 s["max"] *= 8
         return specs
     def mark_free(self, offset, size):
-        # mark free bits and reset delta
-        offset, size = self._clip_offset(offset, size)
-        self.unit_helper.delta(offset, size, "free")
+        self._clip_offset(offset, size)
 
     def inflate_regions(self, boundaries):
         print(f"Inflating regions: {boundaries}")
@@ -274,9 +254,7 @@ class BitTensorMemory: #sizes in bytes
         """
         Return the address of the tightest-fit hole for `bytes_needed` bytes.
 
-        Falls back to enqueueing a zeroed quantum via the pressure simulator
-        until the hole exists.
-        Raises RuntimeError if nothing can be made to fit (immutable cells, etc.).
+        The arena grows by an integer allocation quantum if no hole fits.
         """
         # ── 0. label → cell index ------------------------------------------------
         label2cell = {"header": 0, "node": 2, "edge": 3, "parent": 4, "child": 5}
@@ -284,48 +262,23 @@ class BitTensorMemory: #sizes in bytes
         if cell_idx is None:
             raise ValueError(f"Unknown label '{label}'")
 
-        # convenience
-        stride = self.region_manager.cells[cell_idx].stride
+        stride = {
+            0: ctypes.sizeof(BTGraphHeader), 2: ctypes.sizeof(NodeEntry),
+            3: ctypes.sizeof(EdgeEntry), 4: ctypes.sizeof(MetaGraphEdge),
+            5: ctypes.sizeof(MetaGraphEdge),
+        }[cell_idx]
         if bytes_needed == 0:
             bytes_needed = stride                       # “one quantum” default
 
-        snap = self.region_manager.dump_cells()
-        free  = snap["free_spaces"]
-        candidates = [(addr, size) for lbl, addr, size in free
-                    if size >= bytes_needed and (lbl == cell_idx or allow_drift)]
-        if candidates:
-            addr, size = min(candidates, key=lambda p: (p[1], p[0]))
-            return addr
-
-        # If no space, raise immediately. Salinity and balancing must be handled before calling this function.
-        raise RuntimeError(f"Unable to allocate {bytes_needed} bytes for label '{label}': no free space found after balancing.")
+        return self.allocator.allocate(label, bytes_needed, alignment=stride)
 
 
     def allocate_block(self, block_size, allowed_range):
-        # allowed_range = (min_offset, max_offset)
-        start_chunk = allowed_range[0] // self.chunk_size
-        end_chunk = allowed_range[1] // self.chunk_size
-
-        # Sort candidate chunks by density descending
-        candidates = sorted(range(start_chunk, end_chunk),
-                            key=lambda i: self.density[i],
-                            reverse=True)
-
-        candidates = [self.unit_helper.bytes_for_chunks(c) for c in candidates]
-        for candidate in candidates:
-
-            # System adaptation: set salinity and balance before allocation
-            self.region_manager.cells[candidate].salinity += block_size
-            self.region_manager.run_saline_sim()
-            offset = self.find_free_space(candidate, block_size)
-            if offset is not None:
-                self.mark_used(offset, block_size)
-                return offset
-
-
-
-        # Fallback: expand or trigger bifurcation
-        return BitTensorMemory.ALLOCATION_FAILURE
+        # Emergency blocks use the same exact interval set.  ``allowed_range``
+        # is retained in the signature for callers that still describe the
+        # historical bands; no float simulation or guessed byte/bit conversion
+        # is involved.
+        return self.allocator.allocate("block", int(block_size), alignment=8)
     
     
 # --- In-memory graph entry definitions ---

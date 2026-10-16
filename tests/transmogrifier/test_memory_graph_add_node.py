@@ -1,9 +1,5 @@
 import ctypes
 from src.transmogrifier.graph.memory_graph import BitTensorMemoryGraph, NodeEntry
-import pytest
-
-
-@pytest.mark.xfail(reason="Memory graph allocation issue")
 def test_add_and_retrieve_node():
     g = BitTensorMemoryGraph(1024)
     node_id = g.add_node(b'data', node_id=123)
