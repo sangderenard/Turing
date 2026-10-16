@@ -15,8 +15,23 @@ import pytest
 
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.string_table import StringTable, string_token
+from src.compiler.concordance_declarations import STRING_TABLE_ENTRY
+from src.compiler.identity_concordance import (
+    RowFieldKind, begin_identity_book, end_identity_book,
+)
 from src.compiler.ir_string_interning import intern_string_constants, STRING_TOKEN
 from src.compiler.fused_program_wasm_backend import emit_wasm_module
+
+
+def test_string_table_token_row_is_a_content_label(tmp_path):
+    book, token = begin_identity_book()
+    try:
+        table = StringTable(root=tmp_path)
+        value = table.intern("content-row")
+        assert STRING_TABLE_ENTRY.row_fields[0].kind is RowFieldKind.LABEL
+        assert book.page(STRING_TABLE_ENTRY).latest((value,)) == "content-row"
+    finally:
+        end_identity_book(token)
 
 
 def test_intern_fold_replaces_strings_and_tags_comparison(tmp_path):

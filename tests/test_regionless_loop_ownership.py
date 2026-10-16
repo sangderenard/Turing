@@ -106,6 +106,44 @@ def test_nested_regionless_loop_consumes_exact_comprehension_site(slot):
         assert projected.body.blocks == (child, StatementBlock(("body",)))
 
 
+def test_nested_region_control_consumes_exact_comprehension_predicate_site():
+    """A nested predicate loop remains inside its outer iteration."""
+
+    parent = LoopBlock(
+        "parent", "0", "n", "1",
+        SequenceBlock((_marker := StatementBlock(("__scheduled_region_0__",)),)),
+        source_loop_node_id=11,
+    )
+    child = LoopBlock(
+        "child", "0", "m", "1",
+        SequenceBlock((StatementBlock(("__scheduled_region_1__",)),)),
+        source_loop_node_id=13,
+    )
+    graph = nx.DiGraph()
+    graph.add_nodes_from(((11, {"expr_obj": ast.comprehension()}), (13, {})))
+
+    program = overlay_scheduled_control(
+        (0, 1),
+        (
+            ControlProgram(parent, region_indices=(0,)),
+            ControlProgram(child, region_indices=(1,)),
+        ),
+        known_nesting={0: (1,)},
+        authored_control_sites={
+            (0, 1): AuthoredControlSite(11, 13, "ifs", path=("ifs", 0))
+        },
+        source_graph=SimpleNamespace(G=graph),
+    )
+
+    assert program.root == SequenceBlock((
+        LoopBlock(
+            "parent", "0", "n", "1",
+            SequenceBlock((child, _marker)),
+            source_loop_node_id=11,
+        ),
+    ))
+
+
 @pytest.mark.parametrize('arm', ['body', 'orelse'])
 def test_conditional_generator_runs_native_loop_only_in_selected_arm(tmp_path, arm):
     from tests.test_source_object_context import context

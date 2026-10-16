@@ -17,8 +17,10 @@ from src.compiler.ir_sequence_tables import (
     lower_sequence_pack_bits,
     lower_sequence_prepend,
     lower_sequence_prepend_packed_bytes,
+    lower_sequence_sort,
     lower_sequence_extend,
     lower_sequence_insert,
+    lower_glyph_token_copy,
     schedule_joined_sequence_mutations,
     lower_table_delete,
     lower_table_lookup,
@@ -42,6 +44,16 @@ from src.compiler.fortran_c_shell import (
     _authored_dataclass_record_views,
     _scalar_source_transforms,
     compile_fortran_module_c_shell,
+    lower_ast_source_to_ssa,
+)
+from src.compiler.concordance_declarations import (
+    CLASS_DECLARATION,
+    CLASS_FIELD_DECLARATION,
+    SOURCE_RECORD_VIEW_SCHEMA,
+)
+from src.compiler.identity_concordance import (
+    ConcordanceRefusal,
+    current_identity_book,
 )
 from src.transmogrifier.ssa import (
     BasicBlock,
@@ -351,6 +363,125 @@ class Partial:
     }
 
 
+def test_partial_receiver_mapping_keeps_exact_projection_row_record():
+    projection_schemas = {}
+    views = _authored_dataclass_record_views(ast.parse("""
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass(frozen=True)
+class Page:
+    name: str
+    payload: Any
+
+class Registry:
+    pages: dict[str, Page]
+
+    def page(self, name: str):
+        return self.pages.get(name)
+"""), projection_schemas=projection_schemas)
+
+    assert views["Registry.page"]["self"]["fields"]["pages"] == {
+        "storage": "keyed",
+        "dtype": "int64",
+        "rank": 1,
+        "mutable": False,
+        "key_encoding": "string_token",
+        "value_record": "Page",
+    }
+    page_schema = projection_schemas["Page"]
+    source_row = tuple(page_schema["source_record_view_schema"])
+    assert source_row[0].startswith("<string:")
+    assert source_row[0].endswith(">")
+    assert page_schema == {
+        "identity": "Page",
+        "fields": {
+            "name": {
+                "storage": "span", "dtype": "int64", "rank": 1,
+                "mutable": False, "aggregate_kind": "str",
+            },
+        },
+        "source_derived": True,
+        "projection_complete": True,
+        "constructor_complete": False,
+        "source_record_view_schema": source_row,
+    }
+    book = current_identity_book()
+    receipt = book.latest_ref(
+        SOURCE_RECORD_VIEW_SCHEMA, source_row,
+    )
+    assert receipt is not None
+    sources = {
+        source.page.name
+        for source, _stage in book.edges_into(receipt)
+    }
+    assert CLASS_DECLARATION.name in sources
+    assert CLASS_FIELD_DECLARATION.name in sources
+
+
+def test_optional_nested_record_view_is_derived_from_both_class_declarations():
+    projection_schemas = {}
+    views = _authored_dataclass_record_views(ast.parse("""
+from dataclasses import dataclass, field
+
+@dataclass
+class Book:
+    rows: dict[int, int] = field(default_factory=dict)
+
+@dataclass
+class Page:
+    book: Book | None = None
+
+    def fork(self, scope: int):
+        book = self.book
+        if book is None:
+            return None
+        return book.rows.get(scope)
+"""), projection_schemas=projection_schemas)
+
+    expected_field = {
+        "storage": "record", "record": "Book", "rank": 0,
+        "mutable": False, "optional": True,
+    }
+    assert views["Page.fork"]["self"]["fields"]["book"] == expected_field
+    assert projection_schemas["Page"]["fields"]["book"] == expected_field
+
+    source_row = tuple(
+        projection_schemas["Page"]["source_record_view_schema"]
+    )
+    book = current_identity_book()
+    receipt = book.latest_ref(SOURCE_RECORD_VIEW_SCHEMA, source_row)
+    class_sources = {
+        source.row[1]
+        for source, _stage in book.edges_into(receipt)
+        if source.page.name == CLASS_DECLARATION.name
+    }
+    assert {"Book", "Page"} <= class_sources
+
+
+def test_projection_only_record_schema_refuses_constructor_materialization():
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts"
+        / "program_extraction.yaml"
+    )
+    with pytest.raises(
+        ConcordanceRefusal,
+        match="only an exact projection view is available",
+    ):
+        lower_ast_source_to_ssa("""
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Page:
+    name: int
+    payload: object
+
+def build(name: int, payload: int):
+    return Page(name, payload)
+""", "build", extraction_contract=contract)
+
+
 def test_authored_schema_keeps_literal_vocabulary_and_optional_scalar_tag():
     schemas = _authored_complete_record_schemas(ast.parse("""
 from dataclasses import dataclass
@@ -403,6 +534,134 @@ def test_list_descriptor_allows_duplicates_and_lowers_direct_memory_insert():
     assert {"GetElementPtr", "Store", "Load", "Lt", "CondBr"} <= set(_ops(function))
     assert function.metadata["allows_duplicates"] is True
     assert function.metadata["ssa_sequence_operation"] == "append"
+
+
+def test_glyph_token_copy_is_composed_from_keyed_lookup_and_sequence_append():
+    destination = _sequence(71, 710)
+    vocabulary = SSASequenceDescriptor(
+        sequence_id=72,
+        column_value_ids=(720, 721, 722),
+        length_address_id=723,
+        capacity_value_id=724,
+        status_address_id=725,
+        column_dtypes=("int64", "int64", "int64"),
+        key_columns=(0, 1),
+    )
+
+    lowering = lower_glyph_token_copy(destination, vocabulary)
+
+    assert lowering.complete
+    lookup, append, function = lowering.functions
+    assert lookup.metadata["ssa_sequence_operation"] == "lookup"
+    assert append.metadata["ssa_sequence_operation"] == "append"
+    assert function.metadata["ssa_sequence_operation"] == (
+        "glyph_token_lookup_copy"
+    )
+    calls = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+    ]
+    assert {call.attributes["callee"] for call in calls} == {
+        lookup.name, append.name, "turing_validation_error",
+    }
+    assert any(
+        call.attributes.get("failure") == "unknown_string_token"
+        for call in calls
+    )
+    assert function.metadata["status_values"] == {
+        "unknown_token": 0, "complete": 1, "capacity_exhausted": 2,
+    }
+
+
+def test_sequence_sort_is_stable_repository_ssa_over_complete_rows():
+    descriptor = SSASequenceDescriptor(
+        sequence_id=1,
+        column_value_ids=(10, 11),
+        length_address_id=12,
+        capacity_value_id=13,
+        column_dtypes=("int64", "float64"),
+    )
+    scratch = SSASequenceDescriptor(
+        sequence_id=2,
+        column_value_ids=(20, 21),
+        length_address_id=22,
+        capacity_value_id=23,
+        column_dtypes=("int64", "float64"),
+    )
+
+    lowering = lower_sequence_sort(descriptor, scratch, key_column=0)
+
+    assert lowering.complete
+    function = lowering.functions[0]
+    assert function.metadata["ssa_sequence_operation"] == "sort"
+    assert function.metadata["algorithm"] == "bottom_up_merge_sort"
+    assert function.metadata["stable"] is True
+    assert {"Phi", "Le", "Load", "Store", "CondBr"} <= set(_ops(function))
+    assert not any(
+        instruction.op == "Call"
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+
+    from src.compiler.ssa_self_check import check_definition_dominance
+    module = IRModule({function.name: function})
+    assert check_definition_dominance(module) == []
+
+
+def test_sequence_sort_can_compare_resident_mapping_keys():
+    descriptor = SSASequenceDescriptor(
+        sequence_id=31,
+        column_value_ids=(310,),
+        length_address_id=311,
+        capacity_value_id=312,
+        column_dtypes=("int64",),
+    )
+    scratch = SSASequenceDescriptor(
+        sequence_id=32,
+        column_value_ids=(320,),
+        length_address_id=321,
+        capacity_value_id=322,
+        column_dtypes=("int64",),
+    )
+    positions = SSASequenceDescriptor(
+        sequence_id=33,
+        column_value_ids=(330, 331),
+        length_address_id=332,
+        capacity_value_id=333,
+        status_address_id=334,
+        column_dtypes=("int64", "int64"),
+        key_columns=(0,),
+    )
+
+    lowering = lower_sequence_sort(
+        descriptor, scratch, key_mapping=positions,
+    )
+
+    assert lowering.complete
+    assert len(lowering.functions) == 2
+    lookup, function = lowering.functions
+    calls = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+    ]
+    assert lookup.metadata["ssa_sequence_operation"] == "lookup"
+    assert lookup.metadata["required"] is True
+    assert any(
+        instruction.attributes.get("failure") == "required_key_absent"
+        for block in lookup.blocks.values()
+        for instruction in block.instrs
+    )
+    assert len(calls) == 2
+    assert {call.attributes["callee"] for call in calls} == {lookup.name}
+    assert function.metadata["key_mapping_sequence_id"] == 33
+
+    from src.compiler.ssa_self_check import check_definition_dominance
+    module = IRModule({item.name: item for item in lowering.functions})
+    assert check_definition_dominance(module) == []
 
 
 def test_sequence_helper_fresh_ids_reserve_non_argument_descriptor_identities():

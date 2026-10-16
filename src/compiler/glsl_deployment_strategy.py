@@ -1501,7 +1501,11 @@ def _build_shell_hierarchy_plan(
     boundary_calls = set(shell.callsite_function_shells) | set(recursive_targets)
     for callsite_id, call_data in graph.G.nodes(data=True):
         attributes = call_data.get("attributes") or {}
-        reference = attributes.get("callee_ref", attributes.get("method_ref"))
+        reference = attributes.get("callee_ref")
+        if reference is None:
+            reference = attributes.get("method_ref")
+        if reference is None:
+            reference = attributes.get("constructor_ref")
         if reference is None:
             continue
         entry = graph.function_table.entry(int(reference))
@@ -1603,7 +1607,11 @@ def _build_shell_hierarchy_plan(
         if child is None and recursive_target is not None:
             child = recursive_target
         attributes = graph.G.nodes[node_id].get("attributes") or {}
-        reference = attributes.get("callee_ref", attributes.get("method_ref"))
+        reference = attributes.get("callee_ref")
+        if reference is None:
+            reference = attributes.get("method_ref")
+        if reference is None:
+            reference = attributes.get("constructor_ref")
         entry = None if reference is None else graph.function_table.entry(int(reference))
         host = None if entry is None else entry.metadata.get("host_ssa_module")
         root = None if entry is None else entry.metadata.get("host_ssa_root")
@@ -1620,10 +1628,10 @@ def _build_shell_hierarchy_plan(
             # neither invocation, then read their undefined result IDs 1/2.
             outputs = tuple(contract["output_ids"])
             output_paths = dict(contract.get("output_paths", ()))
-            if not output_paths:
-                if len(outputs) != 1:
-                    raise ValueError("native interface has no accepted result projection layout")
+            if not output_paths and len(outputs) == 1:
                 output_paths = {(0,): int(outputs[0])}
+            elif not output_paths and len(outputs) > 1:
+                raise ValueError("native interface has no accepted result projection layout")
             by_name = dict(declaration.metadata.get("parameter_names", ()))
             formals = tuple(contract["argument_ids"])
             authored_parameters = tuple(declaration.metadata.get("authored_parameters", ()))
@@ -1675,12 +1683,25 @@ def _build_shell_hierarchy_plan(
             expected_formals = (tuple(logical_formals[parameter] for parameter in authored_parameters
                                       if parameter in logical_formals)
                                 if record_abi else formals)
+            required_formals = {
+                int(logical_formals[parameter])
+                for parameter in authored_parameters
+                if parameter in logical_formals
+            }
             bound_formals = {formal for _parent, formal in bindings}
             defaults = {int(by_name[parameter]) for parameter in declaration.metadata.get("parameter_defaults", {})
                         if parameter in by_name}
             if (len(bindings) != len(bound_formals) or not bound_formals.issubset(expected_formals)
-                    or set(expected_formals) - bound_formals - defaults):
-                raise ValueError("native interface call arguments do not match the accepted signature")
+                    or required_formals - bound_formals - defaults):
+                raise ValueError(
+                    "native interface call arguments do not match the accepted "
+                    "signature: "
+                    f"callee={root!r}, callsite={int(node_id)}, "
+                    f"bindings={tuple(bindings)!r}, "
+                    f"expected_formals={tuple(expected_formals)!r}, "
+                    f"required_authored_formals={tuple(sorted(required_formals))!r}, "
+                    f"defaults={tuple(sorted(defaults))!r}"
+                )
             _concord_call_argument_operands(graph, int(node_id), dict(enumerate(edges)))
             result_bindings = _call_result_bindings(graph, node_id, output_paths)
             items.append(PlanCall(int(node_id), PlanClosure(str(root), expected_formals, ()),
@@ -1693,15 +1714,42 @@ def _build_shell_hierarchy_plan(
         if child is not None:
             call_attributes = graph.G.nodes[node_id].get("attributes") or {}
             constructor_call = call_attributes.get("constructor_ref") is not None
-            call_parents = _expanded_callsite_argument_edges(graph, node_id)
-            parents = tuple(parent for parent, _role in call_parents)
+            call_parents = list(_expanded_callsite_argument_edges(
+                graph, node_id,
+            ))
             child_graph = child.process_graph.G
             child_identities = (
                 child_graph.graph.get("identity_table") or {}
             )
+            # A callsite-specialized constructor may consume an authored
+            # parameter as a proven literal and therefore omit that formal
+            # from its physical child graph.  The source call edge still owns
+            # an exact binding to the constructor definition.  Retain that
+            # binding from the FunctionTable declaration graph; it is
+            # provenance for the authored call and does not undo the child's
+            # specialization.
+            declaration_graph = getattr(
+                graph.function_table.entry(int(reference)).graph, "G", None,
+            )
+            declaration_identities = (
+                {}
+                if declaration_graph is None
+                else declaration_graph.graph.get("identity_table") or {}
+            )
             receiver_parameter, positional_parameters, _parameters = (
                 _method_parameter_layout(child_graph)
             )
+            (
+                declaration_receiver_parameter,
+                declaration_positional_parameters,
+                _declaration_parameters,
+            ) = (
+                (None, (), ())
+                if declaration_graph is None
+                else _method_parameter_layout(declaration_graph)
+            )
+            call_parents = tuple(call_parents)
+            parents = tuple(parent for parent, _role in call_parents)
             argument_bindings = []
             if constructor_call and receiver_parameter is not None:
                 receiver_identities = child_identities.get(
@@ -1736,13 +1784,22 @@ def _build_shell_hierarchy_plan(
                     name = (
                         positional_parameters[position]
                         if position < len(positional_parameters)
+                        else declaration_positional_parameters[position]
+                        if position < len(declaration_positional_parameters)
                         else None
                     )
                 elif (
                     role == "operand"
-                    and receiver_parameter is not None
+                    and (
+                        receiver_parameter is not None
+                        or declaration_receiver_parameter is not None
+                    )
                 ):
-                    name = receiver_parameter
+                    name = (
+                        receiver_parameter
+                        if receiver_parameter is not None
+                        else declaration_receiver_parameter
+                    )
                 elif role.startswith("kw:"):
                     name = role.split(":", 1)[1]
                 elif role.startswith("closure:"):
@@ -1750,6 +1807,8 @@ def _build_shell_hierarchy_plan(
                 else:
                     name = None
                 identities = child_identities.get(name, ())
+                if not identities:
+                    identities = declaration_identities.get(name, ())
                 caller_leaves = _authored_aggregate_leaves(
                     graph, int(parent),
                 )
@@ -1819,8 +1878,12 @@ def _build_shell_hierarchy_plan(
                         "structural_specialization"
                     ):
                         # This exact formal has already become a callee-owned
-                        # literal. Its source identity remains in the ledger,
-                        # but it no longer accepts a runtime argument frame.
+                        # literal, so it no longer accepts a runtime argument
+                        # frame.  The PlanCall still records the authored
+                        # actual-to-formal edge: frame linking ignores the
+                        # non-argument formal, while the call record preserves
+                        # which source value selected this specialized body.
+                        argument_bindings.append((parent, child_input))
                         continue
                     argument_bindings.append((parent, child_input))
                     child_leaves = _authored_aggregate_leaves(
@@ -7107,7 +7170,8 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
             int(parent) for parent, role in parents
             if str(role).startswith("arg:") and int(parent) in graph_obj
         )
-        if destination is None or len(arguments) != 1:
+        arity = 1
+        if destination is None or len(arguments) != arity:
             continue
         destination_data = graph_obj.nodes[destination]
         if (destination_data.get("attributes") or {}).get(
@@ -7119,10 +7183,9 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
             "sequence_value_id": int(destination_data.get(
                 "value_id", destination
             )),
-            "argument_value_ids": (
-                int(graph_obj.nodes[arguments[0]].get(
-                    "value_id", arguments[0]
-                )),
+            "argument_value_ids": tuple(
+                int(graph_obj.nodes[argument].get("value_id", argument))
+                for argument in arguments
             ),
             "operator": str(expression.func.attr),
             "policy": (
@@ -7549,6 +7612,50 @@ def _record_field_state_keys(
     return frozenset(keys)
 
 
+def _post_source_optional_glyph_carries(
+    graph: Any,
+    candidates: Iterable[tuple[int, tuple[tuple[int, int, int, int], ...]]],
+) -> tuple[Any, ...]:
+    """Read exact sequence-vs-None carries published by the reducer.
+
+    A scalar string token is not a sequence.  An arm is admitted only when
+    the reducer has already published its exact glyph recipe, when its source
+    expression is literally ``None``, or when it continues a previously
+    published optional glyph carry.  The fixed point is over contract cells,
+    never over a Phi's inferred dtype or a reconstructed source spelling.
+    """
+
+    from .concordance_declarations import (
+        SOURCE_OPTIONAL_GLYPH_CARRY,
+    )
+    from .identity_concordance import current_identity_book
+
+    graph_obj = getattr(graph, "G", graph)
+    source_scope = graph_obj.graph.get("source_numeric_scope")
+    if source_scope is None:
+        source_scope = graph_obj.graph.get("authored_function_identity")
+    if source_scope is None:
+        return ()
+    source_scope = tuple(source_scope)
+    book = current_identity_book()
+    page = book.page(SOURCE_OPTIONAL_GLYPH_CARRY)
+    live_value_ids = {
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+    retained = []
+    for row in page.scope_rows(source_scope):
+        if len(row) != 2 or int(row[1]) not in live_value_ids:
+            continue
+        cell = book.latest_ref(SOURCE_OPTIONAL_GLYPH_CARRY, tuple(row))
+        if cell is None:
+            raise ValueError(
+                "optional glyph graph view has no reducer concordance source: "
+                f"row={row!r}"
+            )
+        retained.append(cell)
+    return tuple(dict.fromkeys(retained))
+
 def _ordinary_conditional_control_programs(
     graph: Any,
     retained_regions: Iterable[int],
@@ -7586,6 +7693,7 @@ def _ordinary_conditional_control_programs(
         ),
     ))
     programs = []
+    optional_glyph_candidates = []
     program_expressions: list[tuple[int, ast.AST]] = []
     for control_id, record in _source_control_records(graph.G).items():
         if int(control_id) in structurally_specialized:
@@ -8179,7 +8287,11 @@ def _ordinary_conditional_control_programs(
             # on a later shell reconstruction to happen to rebuild this branch.
             anchor_region=anchor_region,
         ))
+        optional_glyph_candidates.append((int(control_id), tuple(carried)))
         program_expressions.append((int(control_id), expression))
+    _post_source_optional_glyph_carries(
+        graph, tuple(optional_glyph_candidates),
+    )
     nested = _nest_region_less_conditionals(
         graph, tuple(programs), tuple(program_expressions), subgraphs,
     )
@@ -8584,6 +8696,63 @@ def _source_control_nesting_hints(
             reductions, loop_plans, graph,
         ).items()
     }
+
+    def comprehension_fields(
+        parent_id: int, parent: ast.comprehension,
+    ) -> list[tuple[str, int | None, ast.AST]]:
+        """Return the authored execution slots joined by the aggregate edge.
+
+        ``ast.comprehension`` deliberately excludes the aggregate's element
+        expression.  The ProcessGraph does not: its exact ``generators`` edge
+        joins the clause to the ListComp/SetComp/DictComp/GeneratorExp that
+        owns both the clause and elt/key/value.  Read that existing edge here
+        so containment discovery and authored-site publication use the same
+        graph fact.
+        """
+
+        fields: list[tuple[str, int | None, ast.AST]] = [
+            ("iter", None, parent.iter),
+        ]
+        fields.extend(
+            ("ifs", ordinal, condition)
+            for ordinal, condition in enumerate(parent.ifs)
+        )
+        for owner_id in graph.G.successors(int(parent_id)):
+            owner = graph.G.nodes[int(owner_id)].get("expr_obj")
+            if not isinstance(
+                owner,
+                (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+            ):
+                continue
+            if not any(
+                int(source) == int(parent_id)
+                and str(role) == "generators"
+                for source, role in graph.G.nodes[int(owner_id)].get(
+                    "parents", ()
+                )
+            ):
+                continue
+            for field in ("elt", "key", "value"):
+                member = getattr(owner, field, None)
+                if isinstance(member, ast.AST):
+                    fields.append((field, None, member))
+            parent_ordinal = next(
+                ordinal
+                for ordinal, generator in enumerate(owner.generators)
+                if generator is parent
+            )
+            # Generator clauses are nested left-to-right.  A later clause is
+            # in the execution body of an earlier clause; the earlier clause
+            # is never a descendant of the later one.  Keeping "all other"
+            # clauses here manufactured a two-way ownership edge for every
+            # multi-generator comprehension.
+            fields.extend(
+                ("generators", ordinal, generator)
+                for ordinal, generator in enumerate(owner.generators)
+                if ordinal > parent_ordinal
+            )
+        return fields
+
     # Select the closest authored container for every control.  AST object
     # identity is the compiler's exact ingestion correlation; node count and
     # source span merely rank multiple real ancestors to find the direct one.
@@ -8598,7 +8767,18 @@ def _source_control_nesting_hints(
             # region marker is outside the arm, and overlay refused (4)/(0).
             # Use the same authored arm-slot ownership as ordinary conditional
             # nesting above; do not infer it from overlapping region sets.
-            if isinstance(parent_expression, (ast.If, ast.IfExp)):
+            if isinstance(parent_expression, ast.comprehension):
+                statements = tuple(
+                    member for _slot, _ordinal, member in comprehension_fields(
+                        source_node_ids[parent_index], parent_expression,
+                    )
+                )
+                descendants = tuple(
+                    member
+                    for statement in statements
+                    for member in ast.walk(statement)
+                )
+            elif isinstance(parent_expression, (ast.If, ast.IfExp)):
                 statements = (
                     (parent_expression.body, parent_expression.orelse)
                     if isinstance(parent_expression, ast.IfExp)
@@ -8641,7 +8821,10 @@ def _source_control_nesting_hints(
                              for parent, nested in children.items()
                              for child in nested)
     if not nx.is_directed_acyclic_graph(ownership):
-        raise ValueError('authored control ownership contains a cycle')
+        raise ValueError(
+            "authored control ownership contains a cycle: "
+            f"edges={tuple(sorted(map(tuple, ownership.edges())))!r}"
+        )
     direct = nx.transitive_reduction(ownership)
     nesting = {
         parent: frozenset(direct.successors(parent))
@@ -8679,39 +8862,7 @@ def _source_control_nesting_hints(
 
         fields = []
         if isinstance(parent, ast.comprehension):
-            fields.append(("iter", None, parent.iter))
-            fields.extend(
-                ("ifs", ordinal, condition)
-                for ordinal, condition in enumerate(parent.ifs)
-            )
-            # A comprehension clause does not contain its element expression.
-            # The aggregate materializer owns both the ordered generator list
-            # and elt/key/value, and its existing graph roles are therefore
-            # the authoritative bridge between those authored AST objects.
-            for owner_id in graph.G.successors(int(parent_id)):
-                owner = graph.G.nodes[int(owner_id)].get("expr_obj")
-                if not isinstance(
-                    owner,
-                    (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
-                ):
-                    continue
-                if not any(
-                    int(source) == int(parent_id)
-                    and str(role) == "generators"
-                    for source, role in graph.G.nodes[int(owner_id)].get(
-                        "parents", ()
-                    )
-                ):
-                    continue
-                for field in ("elt", "key", "value"):
-                    member = getattr(owner, field, None)
-                    if isinstance(member, ast.AST):
-                        fields.append((field, None, member))
-                fields.extend(
-                    ("generators", ordinal, generator)
-                    for ordinal, generator in enumerate(owner.generators)
-                    if generator is not parent
-                )
+            fields.extend(comprehension_fields(int(parent_id), parent))
         elif isinstance(parent, ast.For):
             fields.append(("iter", None, parent.iter))
             fields.extend(("body", ordinal, statement)
@@ -18035,7 +18186,15 @@ def release_compile_planning_state(book: Any) -> dict[str, int]:
     rest of the process.  Returns what was released, by item."""
 
     book_id = id(book)
-    shells = [key for key in _CALLSITE_SHELL_TYPE_CACHE.copy() if key[1] == book_id]
+    # Key layout is ``(policy, generation, function-table id, book id, ...)``.
+    # Matching index 1 compared the generation to an object identity, so no
+    # completed compile ever released its specialized shell types.  Once the
+    # old book and function table were collected, Python could reuse both ids
+    # and an unrelated anonymous source would receive the retired shell.
+    shells = [
+        key for key in _CALLSITE_SHELL_TYPE_CACHE.copy()
+        if key[3] == book_id
+    ]
     for key in shells:
         del _CALLSITE_SHELL_TYPE_CACHE[key]
     children = 0
@@ -20572,6 +20731,40 @@ def _fold_callsite_structural_values(
             linked_abi = (graph.G.graph.get("linked_value_abi") or {}).get(
                 int(data.get("value_id", node_id))
             )
+            if linked_abi is not None and linked_abi.get("storage") in {
+                "span", "scalar",
+            }:
+                # This exact value-id contract is the late call-edge answer
+                # for callsite-expanded aggregate members as well as ordinary
+                # formals.  Aggregate members have binding names such as
+                # ``history[0]`` and therefore have no independent
+                # ``parameter_value_abi`` entry; falling through to their
+                # provisional node descriptor rebuilt an exact rank-3 span
+                # as a dynamic rank-1 span.
+                shape = linked_abi.get("shape")
+                dtype = str(linked_abi.get("dtype") or "unknown")
+                python_type = str(linked_abi.get("python_type") or "") or {
+                    "bool": "builtins.bool",
+                    "int": "builtins.int",
+                    "int32": "builtins.int",
+                    "int64": "builtins.int",
+                    "float": "builtins.float",
+                    "float32": "builtins.float",
+                    "float64": "builtins.float",
+                }.get(dtype, dtype)
+                return _ProgramABIValueFact(
+                    python_type,
+                    str(linked_abi["storage"]),
+                    dtype,
+                    shape=(
+                        None if shape is None
+                        else tuple(map(int, shape))
+                    ),
+                    rank=(
+                        None if linked_abi.get("rank") is None
+                        else int(linked_abi["rank"])
+                    ),
+                )
             if linked_abi is not None and linked_abi.get("storage") == "reference":
                 # root(value,memo)->visit(item): tuple(visit(child) for child
                 # in item) already declares item as a reference handle. The
@@ -20885,6 +21078,57 @@ def _fold_callsite_structural_values(
             except (KeyError, ArithmeticError, TypeError, ValueError):
                 return unresolved
         if isinstance(expression, ast.Compare) and len(expression.ops) == 1:
+            if (
+                isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+                and isinstance(expression.left, ast.Call)
+                and isinstance(expression.left.func, ast.Name)
+                and expression.left.func.id == "type"
+                and len(expression.left.args) == 1
+                and len(expression.comparators) == 1
+                and isinstance(expression.comparators[0], ast.Name)
+            ):
+                # An exact-type guard consumes the schema identity stated by
+                # the operand's authored aggregate contract.  Its RHS is not
+                # a runtime data edge (``tuple`` is a schema token), so the
+                # generic two-operand evaluator below cannot recover it.
+                # Resolve it here, where structural specialization still has
+                # the source graph and its exact producer relationship.
+                lhs_id = next((
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"lhs", "left"}
+                ), None)
+                lhs = (
+                    graph.G.nodes.get(lhs_id, {})
+                    if lhs_id is not None else {}
+                )
+                if (lhs.get("attributes") or {}).get(
+                    "extraction_identity"
+                ) == "builtins.type":
+                    subject_id = next((
+                        int(parent)
+                        for parent, role in (lhs.get("parents") or ())
+                        if str(role) in {"arg:0", "arg0"}
+                    ), None)
+                    subject = (
+                        graph.G.nodes.get(subject_id, {})
+                        if subject_id is not None else {}
+                    )
+                    aggregate_kind = str((
+                        subject.get("attributes") or {}
+                    ).get("aggregate_kind") or "")
+                    target_kind = str(expression.comparators[0].id)
+                    exact_kinds = {
+                        "dict", "list", "tuple", "set", "frozenset",
+                        "bytes", "bytearray",
+                    }
+                    if aggregate_kind in exact_kinds and target_kind in exact_kinds:
+                        matched = aggregate_kind == target_kind
+                        return (
+                            not matched
+                            if isinstance(expression.ops[0], ast.IsNot)
+                            else matched
+                        )
             parents = {
                 str(role): int(parent)
                 for parent, role in (data.get("parents") or ())
@@ -22517,11 +22761,22 @@ def _fold_callsite_structural_values(
             # function's graph and nothing else on the book changed, so it
             # derives from the function's ``function_address`` cell.
             from .concordance_declarations import FUNCTION_ADDRESS
+            from ..transmogrifier.function_table import function_address_identity
 
-            for candidate in (
+            candidates = []
+            function_reference = graph.G.graph.get("function_ref")
+            if function_reference is not None:
+                try:
+                    candidates.append(function_address_identity(
+                        graph.function_table.entry(int(function_reference))
+                    ))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            candidates.extend((
                 graph.G.graph.get("qualified_name"),
                 graph.G.graph.get("function_name"),
-            ):
+            ))
+            for candidate in candidates:
                 if candidate is None:
                     continue
                 address = fixed_point_book.latest_ref(
@@ -22530,6 +22785,20 @@ def _fold_callsite_structural_values(
                 if address is not None:
                     fixed_point_sources = (address,)
                     break
+        if not fixed_point_sources:
+            # A deliberately synthetic graph can have no ingestion node
+            # or function address at all.  The fold invocation is still
+            # an exact compiler-owned identity: ``mint_scope`` published
+            # this row as the Novel root before any mutation.  Derive the
+            # fixed-point receipt from that cell rather than making the
+            # synthetic graph unsourced or exempting it from receipts.
+            from .concordance_declarations import SCOPE_REGISTRY
+
+            invocation_cell = fixed_point_book.latest_ref(
+                SCOPE_REGISTRY, fold_scope,
+            )
+            if invocation_cell is not None:
+                fixed_point_sources = (invocation_cell,)
         fixed_point_fact = (
             fixed_point_digest,
             bool(changed),
@@ -23384,6 +23653,11 @@ def _callsite_specialized_shell_type(
     # What each argument is, as the caller's concordance states it.  The
     # specialization's parameters are exactly these values.
     parameter_classes: dict[str, tuple[str, int]] = {}
+    # Keep the exact cells which proved those classes.  A specialized copy
+    # must not turn an accepted caller fact back into an unsourced callee
+    # fact merely because the compact metadata receipt stores the spelling
+    # separately from its concordance edge.
+    parameter_class_cells: dict[str, tuple] = {}
     #: Per literal parameter: the caller argument cells that proved it; the
     #: copy's ``planner_specialization`` rows derive from them.
     specialization_cells: dict[str, tuple] = {}
@@ -23437,6 +23711,13 @@ def _callsite_specialized_shell_type(
             parameter_classes[parameter] = (
                 str(class_fact[0]), max(int(class_fact[1]), 1),
             )
+            from .concordance_declarations import SOURCE_VALUE_CLASS
+
+            class_cell = current_identity_book().latest_ref(
+                SOURCE_VALUE_CLASS, (caller_scope, int(parent)),
+            )
+            if class_cell is not None:
+                parameter_class_cells[parameter] = (class_cell,)
         declared_record_abi = dict(
             original.G.graph.get("parameter_record_abi") or {}
         ).get(parameter)
@@ -23609,6 +23890,13 @@ def _callsite_specialized_shell_type(
             for name, value in record_descriptors.items()
         )),
         tuple(sorted(parameter_classes.items())),
+        # Object identities isolate a live compile, while these concordance
+        # scopes make the cache key stable against Python reusing those ids
+        # after a completed compatibility compile remains cached.  Anonymous
+        # sources have AST-addressed module scopes, so two unrelated
+        # ``<string>`` programs can never share a specialized shell.
+        tuple(caller.G.graph.get("lexical_read_scope") or ()),
+        tuple(original.G.graph.get("lexical_read_scope") or ()),
         int(max_nodes_per_dispatch),
     )
     def publish_call_result_shape(specialized_graph: Any) -> None:
@@ -23702,6 +23990,9 @@ def _callsite_specialized_shell_type(
     )
     specialized.G.graph["planner_parameter_classes"] = dict(
         parameter_classes
+    )
+    specialized.G.graph["planner_parameter_class_cells"] = dict(
+        parameter_class_cells
     )
     specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
         tensor_descriptors
@@ -23977,12 +24268,10 @@ class ProcessGraphGLSLDeployment(TiledObject):
                     caller_metadata.get("function_name") or "<module>"
                 )
                 method_owner = caller_metadata.get("method_owner")
-                caller_identity = str(
-                    caller_metadata.get("qualified_name")
-                    or (
-                        f"{method_owner}.{caller_name}"
-                        if method_owner else caller_name
-                    )
+                from .planner_concordance_posts import _callsite_activation_owner
+
+                caller_identity = _callsite_activation_owner(
+                    owner.process_graph,
                 )
                 planning_key = (
                     caller_identity, int(node_id), reference,
@@ -28258,23 +28547,74 @@ def strategize_shell_deployment(
                     time.monotonic() - function_started, 6
                 ),
             )
-    activation_root_references = []
-    if runtime_closure_only and function_table is not None:
-        for target in graph.G.graph.get("compile_targets", ()):
-            try:
-                reference = int(
-                    function_table.entry(str(target)).reference.address
-                )
-            except (KeyError, TypeError, ValueError):
+    # Executable roots are exact FunctionTable identities.  A selected
+    # compilation unit carries those addresses directly.  An authored source
+    # compile derives them from the SOURCE_PURSUIT_ACTIVATION cells whose
+    # cause is the exact PURSUIT_ROOT demand, joined to the exact definition
+    # node retained by its FunctionTable entry.  Do not round-trip through a
+    # qualified-name string: the table may retain several same-spelled source
+    # views and name lookup is not an activation edge.
+    activation_root_references = list(map(
+        int, graph.G.graph.get("activation_function_references", ()),
+    ))
+    if function_table is not None and not activation_root_references:
+        from .concordance_declarations import (
+            CONTRACT_DEMAND_PAGE, DemandKind, SOURCE_PURSUIT_ACTIVATION,
+        )
+        from .identity_concordance import current_identity_book
+
+        book = current_identity_book()
+        for entry in function_table:
+            source_node = entry.metadata.get("source_node")
+            if source_node is None or int(source_node) not in graph.G:
                 continue
-            if reference in function_shell_types:
+            definition = graph.G.nodes[int(source_node)].get("expr_obj")
+            source_identity = getattr(
+                definition, "_python_source_identity", None,
+            )
+            if not (
+                isinstance(source_identity, tuple)
+                and len(source_identity) == 2
+            ):
+                module_name = getattr(
+                    definition, "_turing_source_module", None,
+                )
+                qualified_name = getattr(
+                    definition, "_turing_source_qualname", None,
+                )
+                if module_name is None or qualified_name is None:
+                    continue
+                source_identity = (module_name, qualified_name)
+            activation_cell = book.latest_ref(
+                SOURCE_PURSUIT_ACTIVATION,
+                tuple(map(str, source_identity)),
+            )
+            if activation_cell is None:
+                continue
+            is_root = any(
+                source.page == CONTRACT_DEMAND_PAGE
+                and source.row[0] == DemandKind.PURSUIT_ROOT
+                for source, _stage in book.edges_into(activation_cell)
+            )
+            reference = int(entry.reference.address)
+            if is_root and reference in function_shell_types:
                 activation_root_references.append(reference)
-        if not activation_root_references:
-            # A caller may provide a precomputed runtime closure without the
-            # source-level target names (for example an older checkpoint).
-            # In that case retain the complete proven runtime set rather than
-            # guessing one privileged root.
-            activation_root_references.extend(sorted(function_shell_types))
+    activation_root_references = list(dict.fromkeys(
+        activation_root_references
+    ))
+    unknown_activation_roots = tuple(
+        reference for reference in activation_root_references
+        if reference not in function_shell_types
+    )
+    if unknown_activation_roots:
+        raise ValueError(
+            "exact activation roots have no retained function shell: "
+            f"{unknown_activation_roots!r}"
+        )
+    if runtime_closure_only and function_shell_types and not activation_root_references:
+        raise ValueError(
+            "runtime-only deployment has no exact source-pursuit activation root"
+        )
     deployment_class.function_shell_types = function_shell_types
     deployment_class.runtime_closure_only = bool(runtime_closure_only)
     deployment_class.planned_function_references = tuple(sorted(

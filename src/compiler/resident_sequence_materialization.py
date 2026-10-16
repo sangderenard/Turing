@@ -9,6 +9,458 @@ from dataclasses import replace
 from typing import Any, Iterable, Mapping
 
 
+def _source_contract_rows(graph_obj: Any, page: Any) -> tuple[tuple, ...]:
+    """Enumerate page rows in every exact source scope carried by the graph."""
+
+    metadata = graph_obj.graph
+    scopes = []
+    for name in (
+        "source_glyph_sequence_scope",
+        "source_aggregate_layout_scope",
+        "source_numeric_scope",
+        "authored_function_identity",
+        "source_numeric_base_scope",
+    ):
+        scope = metadata.get(name)
+        if scope is not None and scope not in scopes:
+            scopes.append(scope)
+    if not scopes:
+        raise ValueError(
+            f"graph has no exact source scope for concordance page {page.name}"
+        )
+    return tuple(dict.fromkeys(
+        tuple(row)
+        for scope in scopes
+        for row in page.scope_rows(scope)
+    ))
+
+
+def _source_glyph_sequence_materializations(graph_obj: Any):
+    """Read exact JoinedStr recipes into incumbent resident-sequence work.
+
+    The reducer owns component order, glyph identities, conversions and value
+    edges on ``source_glyph_sequence``.  This consumer never re-walks the AST.
+    Literal components become fixed one-column token sequences; formatted
+    components are resident sequences produced by their source-linked helper
+    calls.  The JoinedStr destination is cleared and extended in recipe order
+    through the ordinary sequence ABI.
+    """
+
+    from .concordance_declarations import (
+        SOURCE_GLYPH_SEQUENCE,
+        SourceGlyphSequence,
+    )
+    from .control_source import ControlSequenceMutation
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    declarations: list[tuple[int, str, int, bool]] = []
+    initializations: list[tuple[int, str, int]] = []
+    mutations: list[ControlSequenceMutation] = []
+    nodes_by_value = {
+        int(data.get("value_id", node_id)): (int(node_id), data)
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+    page = book.page(SOURCE_GLYPH_SEQUENCE)
+    for row in _source_contract_rows(graph_obj, page):
+        if len(row) != 2 or int(row[1]) not in nodes_by_value:
+            continue
+        node_id, data = nodes_by_value[int(row[1])]
+        cell = book.latest_ref(SOURCE_GLYPH_SEQUENCE, tuple(row))
+        if cell is None:
+            raise ValueError(
+                "glyph-sequence graph view has no concordance source: "
+                f"value={int(data.get('value_id', node_id))} row={row!r}"
+            )
+        fact = book.page(SOURCE_GLYPH_SEQUENCE).cell(cell.row, cell.column)
+        if not isinstance(fact, SourceGlyphSequence):
+            raise TypeError(
+                f"source glyph sequence has invalid fact {fact!r} at {row!r}"
+            )
+        joined_id = int(row[1])
+        literal_alternate = (
+            len(fact.components) == 1
+            and str(fact.components[0].kind) == "literal"
+            and int(fact.components[0].component_value_id) == joined_id
+        )
+        if literal_alternate:
+            if (
+                len(fact.components) != 1
+                or str(fact.components[0].kind) != "literal"
+            ):
+                raise ValueError(
+                    "literal glyph alternate has no exact literal recipe: "
+                    f"value={joined_id} row={row!r}"
+                )
+            declarations.append((joined_id, "duplicates", 1, False))
+            initializations.append((
+                joined_id,
+                "literal_glyphs="
+                f"{tuple(map(int, fact.components[0].glyph_tokens))!r}",
+                1,
+            ))
+            continue
+        declarations.append((joined_id, "duplicates", 1, True))
+        initializations.append((joined_id, "duplicates", 1))
+        mutations.append(ControlSequenceMutation(
+            joined_id, "clear", (), joined_id, policy="duplicates",
+            argument_kind="glyph_sequence_clear",
+            source_contract_cell=cell,
+        ))
+        def materialize_component(component):
+            if component.projection_components:
+                destination_id = int(component.component_value_id)
+                declarations.append((destination_id, "duplicates", 1, True))
+                initializations.append((destination_id, "duplicates", 1))
+                mutations.append(ControlSequenceMutation(
+                    destination_id, "clear", (), destination_id,
+                    policy="duplicates",
+                    argument_kind="glyph_projection_clear",
+                    source_contract_cell=cell,
+                ))
+                for child in component.projection_components:
+                    child_id = materialize_component(child)
+                    mutations.append(ControlSequenceMutation(
+                        destination_id, "extend", (child_id,),
+                        destination_id, policy="duplicates",
+                        argument_kind="glyph_projection_component",
+                        source_contract_cell=cell,
+                    ))
+                return destination_id
+            if (
+                str(component.kind) == "formatted"
+                and component.formatted_sequence_value_id is None
+                and str(component.projection_kind) not in {
+                    "string_token", "enum_name",
+                }
+            ):
+                raise ValueError(
+                    "formatted glyph component has no resident producer: "
+                    f"value={int(component.component_value_id)} "
+                    f"projection={component.projection_kind!r}"
+                )
+            component_id = int(
+                component.formatted_sequence_value_id
+                if component.formatted_sequence_value_id is not None
+                else component.component_value_id
+            )
+            component_node = nodes_by_value.get(component_id)
+            component_attributes = (
+                {} if component_node is None
+                else component_node[1].get("attributes") or {}
+            )
+            source_utf8_id = component_attributes.get(
+                "source_utf8_sequence_value_id"
+            )
+            if source_utf8_id is not None:
+                source_utf8_id = int(source_utf8_id)
+                utf8_node = nodes_by_value.get(source_utf8_id)
+                if utf8_node is None:
+                    raise ValueError(
+                        "runtime repr glyph decoder has no exact UTF-8 "
+                        f"sequence producer: value={source_utf8_id}"
+                    )
+                utf8_attributes = utf8_node[1].get("attributes") or {}
+                decoder_component = component_attributes.get(
+                    "source_glyph_component"
+                )
+                utf8_component = utf8_attributes.get(
+                    "source_glyph_component"
+                )
+                contract = dict(
+                    utf8_attributes.get("extraction_contract") or {}
+                )
+                if (
+                    decoder_component != utf8_component
+                    or not isinstance(decoder_component, tuple)
+                    or len(decoder_component) != 2
+                    or tuple(decoder_component[0]) != tuple(row)
+                    or contract.get("action") != "use_native"
+                    or dict(contract.get("parameters") or {}).get(
+                        "result_dtype"
+                    ) != "utf8_sequence"
+                ):
+                    raise ValueError(
+                        "runtime repr UTF-8 producer disagrees with its "
+                        "exact source glyph component contract"
+                    )
+                # The external writer and decoder are two different resident
+                # representations.  Declare the intermediate byte sequence
+                # from their shared SOURCE_GLYPH_SEQUENCE occurrence before
+                # control lowering creates its physical status cell; only the
+                # decoder's glyph-token result is extended into JoinedStr.
+                declarations.append((
+                    source_utf8_id, "duplicates", 1, True,
+                ))
+            declarations.append((
+                component_id, "duplicates", 1,
+                str(component.kind) != "literal",
+            ))
+            if str(component.kind) == "literal":
+                rows = tuple((int(token),) for token in component.glyph_tokens)
+                initializations.append((
+                    component_id,
+                    f"literal_glyphs={tuple(row[0] for row in rows)!r}",
+                    1,
+                ))
+            return component_id
+
+        for component in fact.components:
+            component_id = materialize_component(component)
+            mutations.append(ControlSequenceMutation(
+                joined_id, "extend", (component_id,), joined_id,
+                policy="duplicates", argument_kind="glyph_sequence_component",
+                source_contract_cell=cell,
+            ))
+    return (
+        tuple(dict.fromkeys(declarations)),
+        tuple(dict.fromkeys(initializations)),
+        tuple(mutations),
+    )
+
+
+def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
+    """Materialize exact StringTable token spellings as a keyed SSA table."""
+
+    from .concordance_declarations import (
+        CONTROL_PROGRAM_BUILD,
+        SOURCE_GLYPH_SEQUENCE,
+        STRING_TABLE_ENTRY,
+        STRING_GLYPH_VOCABULARY,
+        SOURCE_ENUM_GLYPH_TABLE,
+        SourceEnumGlyphTable,
+        SourceGlyphSequence,
+    )
+    from .control_source import ControlSequenceMutation
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+    from .string_table import string_token
+
+    book = current_identity_book()
+    recipes = []
+    enum_recipes = []
+    live_value_ids = {
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+    glyph_page = book.page(SOURCE_GLYPH_SEQUENCE)
+    for row in _source_contract_rows(graph_obj, glyph_page):
+        if len(row) != 2 or int(row[1]) not in live_value_ids:
+            continue
+        cell = book.latest_ref(SOURCE_GLYPH_SEQUENCE, tuple(row))
+        if cell is None:
+            raise ValueError(f"glyph recipe row has no latest cell: {row!r}")
+        fact = glyph_page.cell(cell.row, cell.column)
+        if not isinstance(fact, SourceGlyphSequence):
+            raise TypeError(f"invalid source glyph recipe {fact!r}")
+        def component_tree(component):
+            yield component
+            for child in component.projection_components:
+                yield from component_tree(child)
+
+        for root_component in fact.components:
+            for component in component_tree(root_component):
+                if (
+                    str(component.kind) == "formatted"
+                    and str(component.projection_kind) in {
+                        "string_token", "enum_name",
+                    }
+                    and component.formatted_sequence_value_id is None
+                    and component.operand_value_id is not None
+                ):
+                    target = (
+                        enum_recipes
+                        if str(component.projection_kind) == "enum_name"
+                        else recipes
+                    )
+                    target.append((cell, component))
+    if not recipes and not enum_recipes:
+        return (), (), ()
+
+    source_scope = tuple((recipes or enum_recipes)[0][0].row[0])
+
+    declarations = []
+    initializations = []
+    mutations = []
+    entry_page = book.page(STRING_TABLE_ENTRY)
+    grouped = {}
+    for recipe_cell, component in recipes:
+        mode = "repr" if int(component.conversion) == ord("r") else "raw"
+        grouped.setdefault(mode, []).append((recipe_cell, component))
+    for mode, mode_recipes in grouped.items():
+        vocabulary_rows = []
+        entry_cells = []
+        for row in sorted(entry_page.rows(), key=lambda item: int(item[0])):
+            entry_cell = book.latest_ref(STRING_TABLE_ENTRY, tuple(row))
+            if entry_cell is None:
+                raise ValueError(
+                    f"StringTable entry has no concordance cell: {row!r}"
+                )
+            token = int(row[0])
+            word = entry_page.cell(entry_cell.row, entry_cell.column)
+            if not isinstance(word, str):
+                raise TypeError(
+                    f"StringTable concordance entry is not text: {row!r}"
+                )
+            entry_cells.append(entry_cell)
+            spelling = repr(word) if mode == "repr" else str(word)
+            glyphs = tuple(string_token(character) for character in spelling)
+            vocabulary_rows.append((int(token), -1, len(glyphs)))
+            vocabulary_rows.extend(
+                (int(token), int(ordinal), int(glyph))
+                for ordinal, glyph in enumerate(glyphs)
+            )
+        vocabulary_id = int(GLOBAL_MONOTONIC_IDS.mint())
+        vocabulary_cell = book.post(
+            STRING_GLYPH_VOCABULARY,
+            (source_scope, vocabulary_id),
+            tuple(vocabulary_rows),
+            stage=CONTROL_PROGRAM_BUILD,
+            provenance=Derived(tuple(entry_cells)),
+            mode=Mode.CONCORD,
+        )
+        declarations.append((vocabulary_id, "unique", 3, False))
+        initializations.append((
+            vocabulary_id,
+            f"literal_table={tuple(vocabulary_rows)!r}", 3,
+        ))
+        mutations.extend(
+            ControlSequenceMutation(
+                int(component.component_value_id),
+                "glyph_token_lookup_copy",
+                (int(component.operand_value_id), vocabulary_id),
+                int(component.component_value_id),
+                policy="duplicates",
+                argument_kind="string_table_glyph_projection",
+                source_contract_cell=recipe_cell,
+                vocabulary_contract_cell=vocabulary_cell,
+            )
+            for recipe_cell, component in mode_recipes
+        )
+    enum_page = book.page(SOURCE_ENUM_GLYPH_TABLE)
+    enum_grouped = {}
+    for recipe_cell, component in enum_recipes:
+        if not component.record_identity:
+            raise ValueError(
+                "Enum name glyph projection has no declared Enum identity"
+            )
+        mode = "repr" if int(component.conversion) == ord("r") else "raw"
+        enum_grouped.setdefault((
+            mode, str(recipe_cell.row[0][0]),
+            str(component.record_identity),
+        ), []).append((recipe_cell, component))
+    for (mode, module_identity, enum_identity), mode_recipes in (
+        enum_grouped.items()
+    ):
+        enum_cell = book.latest_ref(
+            SOURCE_ENUM_GLYPH_TABLE,
+            (module_identity, enum_identity),
+        )
+        if enum_cell is None:
+            raise ValueError(
+                "Enum name glyph projection has no exact source table: "
+                f"{(module_identity, enum_identity)!r}"
+            )
+        enum_fact = enum_page.cell(enum_cell.row, enum_cell.column)
+        if not isinstance(enum_fact, SourceEnumGlyphTable):
+            raise TypeError(f"invalid source Enum glyph table {enum_fact!r}")
+        vocabulary_rows = []
+        for member in enum_fact.members:
+            spelling = (
+                repr(str(member.member_identity))
+                if mode == "repr" else str(member.member_identity)
+            )
+            glyphs = tuple(string_token(character) for character in spelling)
+            vocabulary_rows.append((
+                int(member.runtime_value), -1, len(glyphs),
+            ))
+            vocabulary_rows.extend(
+                (
+                    int(member.runtime_value), int(ordinal), int(glyph),
+                )
+                for ordinal, glyph in enumerate(glyphs)
+            )
+        vocabulary_id = int(GLOBAL_MONOTONIC_IDS.mint())
+        vocabulary_cell = book.post(
+            STRING_GLYPH_VOCABULARY,
+            (source_scope, vocabulary_id),
+            tuple(vocabulary_rows),
+            stage=CONTROL_PROGRAM_BUILD,
+            provenance=Derived((enum_cell,)),
+            mode=Mode.CONCORD,
+        )
+        declarations.append((vocabulary_id, "unique", 3, False))
+        initializations.append((
+            vocabulary_id,
+            f"literal_table={tuple(vocabulary_rows)!r}", 3,
+        ))
+        mutations.extend(
+            ControlSequenceMutation(
+                int(component.component_value_id),
+                "glyph_token_lookup_copy",
+                (int(component.operand_value_id), vocabulary_id),
+                int(component.component_value_id),
+                policy="duplicates",
+                argument_kind="enum_name_glyph_projection",
+                source_contract_cell=recipe_cell,
+                vocabulary_contract_cell=vocabulary_cell,
+            )
+            for recipe_cell, component in mode_recipes
+        )
+    return tuple(declarations), tuple(initializations), tuple(mutations)
+
+
+def _source_optional_glyph_materializations(graph_obj: Any):
+    """Declare payload arenas only for exact optional-glyph carry cells."""
+
+    from .concordance_declarations import (
+        SOURCE_OPTIONAL_GLYPH_CARRY,
+        SourceOptionalGlyphCarry,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    declarations = []
+    initializations = []
+    cells = []
+    nodes_by_value = {
+        int(data.get("value_id", node_id)): (int(node_id), data)
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+    page = book.page(SOURCE_OPTIONAL_GLYPH_CARRY)
+    for row in _source_contract_rows(graph_obj, page):
+        if len(row) != 2 or int(row[1]) not in nodes_by_value:
+            continue
+        node_id, data = nodes_by_value[int(row[1])]
+        cell = book.latest_ref(SOURCE_OPTIONAL_GLYPH_CARRY, tuple(row))
+        if cell is None:
+            raise ValueError(
+                "optional glyph graph view has no concordance source: "
+                f"value={int(data.get('value_id', node_id))} row={row!r}"
+            )
+        fact = book.page(SOURCE_OPTIONAL_GLYPH_CARRY).cell(
+            cell.row, cell.column,
+        )
+        if not isinstance(fact, SourceOptionalGlyphCarry):
+            raise TypeError(
+                f"source optional glyph carry has invalid fact {fact!r}"
+            )
+        payload_id = int(fact.payload_sequence_value_id)
+        if payload_id != int(data.get("value_id", node_id)):
+            raise ValueError(
+                "optional glyph payload disagrees with its graph identity: "
+                f"payload={payload_id} node={data.get('value_id', node_id)}"
+            )
+        declarations.append((payload_id, "duplicates", 1, True))
+        initializations.append((payload_id, "duplicates", 1))
+        cells.append(cell)
+    return (
+        tuple(dict.fromkeys(declarations)),
+        tuple(dict.fromkeys(initializations)),
+        tuple(dict.fromkeys(cells)),
+    )
+
+
 def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
     """Graph-derived storage aliases for loop-carried in-place mutation.
 
@@ -150,7 +602,14 @@ def _promote_conditional_sequence_aliases(
         CallBlock, ConditionalBlock, LoopBlock, SequenceBlock, WhileBlock,
     )
 
-    sequence_kinds = {"list", "bytes", "bytearray"}
+    copyable_sequence_kinds = {"list", "bytes", "bytearray"}
+    # ``unique`` is the physical policy recorded by the sequence-contract
+    # concordance for mapping/set storage. Late control planning may no
+    # longer have the frontend's ``dict``/``set`` spelling, but it still has
+    # that exact committed contract; consume the durable policy instead of
+    # reconstructing a source kind from graph-node attributes.
+    in_place_sequence_kinds = {"dict", "set", "unique"}
+    sequence_kinds = copyable_sequence_kinds | in_place_sequence_kinds
     resident_by_value: dict[int, int] = {}
     kind_by_value: dict[int, str] = {}
     for node_id, data in graph_obj.nodes(data=True):
@@ -255,6 +714,18 @@ def _promote_conditional_sequence_aliases(
                     or false_resident is None
                     or true_kind != initial_kind
                     or false_kind != initial_kind
+                    # Mapping/set residents carry multi-column table state.
+                    # They may leave the scalar Phi only when both branches
+                    # already name the same in-place storage; unlike a list
+                    # value, they cannot be represented by the generic
+                    # single-column ``replace`` mutation below.
+                    or (
+                        initial_kind in in_place_sequence_kinds
+                        and not (
+                            int(true_resident) == int(initial_resident)
+                            and int(false_resident) == int(initial_resident)
+                        )
+                    )
                 ):
                     scalar.append(carried)
                     scalar_field_cells.append(cells)
@@ -419,12 +890,12 @@ def _constant_byte_literal_materializations(graph_obj: Any):
 
 
 def _source_sequence_snapshots(graph_obj: Any):
-    """Tuple conversion captures contents and length in separate storage."""
+    """Sequence conversion captures contents and length in separate storage."""
     from .control_source import ControlSequenceMutation
     mutations = []
     for node_id, data in graph_obj.nodes(data=True):
         attrs = data.get("attributes") or {}
-        if (attrs.get("aggregate_kind") != "tuple"
+        if (attrs.get("aggregate_kind") not in {"tuple", "list"}
                 or attrs.get("producer_kind") != "aggregate_materialization"):
             continue
         sources = [int(parent) for parent, role in data.get("parents") or ()
@@ -848,8 +1319,42 @@ def _linked_sequence_propagation_kind(
     return None
 
 
+def source_sort_contract(graph_obj: Any, call_node_id: int):
+    """Return the exact source cell and fact for ``list.sort``/``sorted``.
+
+    Direct row projections and resident mapping lookups are expressible in
+    repository SSA without retaining a Python callable.  Every other keyword
+    form remains explicitly unsupported rather than being silently ignored.
+    """
+
+    from .concordance_declarations import (
+        SOURCE_SORT_CONTRACT, SourceSortContract,
+    )
+    from .identity_concordance import current_identity_book
+
+    data = graph_obj.nodes.get(int(call_node_id), {})
+    row = (data.get("attributes") or {}).get("source_sort_contract_row")
+    if row is None:
+        raise ValueError(
+            f"sort call has no source contract row: value={call_node_id}"
+        )
+    cell = current_identity_book().latest_ref(
+        SOURCE_SORT_CONTRACT, tuple(row)
+    )
+    if cell is None:
+        raise ValueError(f"sort source contract has no latest cell: {row!r}")
+    fact = current_identity_book().page(SOURCE_SORT_CONTRACT).cell(
+        cell.row, cell.column,
+    )
+    if not isinstance(fact, SourceSortContract):
+        raise ValueError(
+            f"sort graph view has no exact source contract: {row!r}"
+        )
+    return fact, cell
+
+
 def _sequence_append_call_mutations(graph_obj: Any):
-    """Recover authored resident ``append/add/clear`` calls as lexical effects."""
+    """Recover authored resident sequence calls as lexical effects."""
 
     from .control_source import ControlExpression, ControlSequenceMutation
     from .string_table import string_token
@@ -877,25 +1382,66 @@ def _sequence_append_call_mutations(graph_obj: Any):
         return (ControlExpression("const", literal=literal),)
 
     sequence_kinds = {"list", "set", "bytes", "bytearray"}
-    mutations = [
-        ControlSequenceMutation(
+    mutations = []
+    from .concordance_declarations import (
+        SOURCE_SORT_CONTRACT, SourceSortContract,
+    )
+    from .identity_concordance import current_identity_book
+    live_value_ids = {
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+    sort_page = current_identity_book().page(SOURCE_SORT_CONTRACT)
+    for row in _source_contract_rows(graph_obj, sort_page):
+        if len(row) != 2 or int(row[1]) not in live_value_ids:
+            continue
+        fact = sort_page.latest(row)
+        if not isinstance(fact, SourceSortContract):
+            raise TypeError(f"invalid source sort contract {fact!r}")
+        if fact.destination_value_id is None:
+            raise ValueError(f"source sort contract has no destination: {row!r}")
+        arguments = tuple(map(int, fact.argument_value_ids))
+        argument_kind = str(fact.argument_kind)
+        if str(fact.operation) == "sorted":
+            if fact.source_value_id is None:
+                raise ValueError(f"sorted contract has no source: {row!r}")
+            arguments = (int(fact.source_value_id), *arguments)
+            argument_kind = f"sorted_{argument_kind}"
+        mutations.append(ControlSequenceMutation(
+            sequence_value_id=int(fact.destination_value_id),
+            operator=str(fact.operation),
+            argument_value_ids=arguments,
+            effect_node_id=int(row[1]),
+            policy=str(fact.policy),
+            argument_kind=argument_kind,
+            sort_key_column=fact.key_column,
+            sort_reverse=bool(fact.reverse),
+            source_contract_cell=current_identity_book().latest_ref(
+                SOURCE_SORT_CONTRACT, row,
+            ),
+        ))
+    for node_id, record in sorted(
+        (graph_obj.graph.get("source_sequence_mutation_records") or {}).items(),
+        key=lambda item: int(item[0]),
+    ):
+        operation = str(record["operator"])
+        if operation == "sort":
+            continue
+        argument_kind = "value"
+        argument_ids = tuple(map(int, record["argument_value_ids"]))
+        key_column = None
+        reverse = False
+        mutations.append(ControlSequenceMutation(
             sequence_value_id=int(record["sequence_value_id"]),
-            operator=str(record["operator"]),
-            argument_value_ids=tuple(map(
-                int, record["argument_value_ids"]
-            )),
+            operator=operation,
+            argument_value_ids=argument_ids,
             effect_node_id=int(node_id),
             policy=record.get("policy"),
+            argument_kind=argument_kind,
             argument_expressions=retained_argument_expressions(record),
-        )
-        for node_id, record in sorted(
-            (
-                graph_obj.graph.get("source_sequence_mutation_records")
-                or {}
-            ).items(),
-            key=lambda item: int(item[0]),
-        )
-    ]
+            sort_key_column=key_column,
+            sort_reverse=reverse,
+        ))
     mutations.extend(_source_mapping_mutations(graph_obj))
     mutations.extend(_source_sequence_snapshots(graph_obj))
     recorded_effect_ids = {
@@ -921,26 +1467,36 @@ def _sequence_append_call_mutations(graph_obj: Any):
             int(parent) for parent, role in parents
             if str(role).startswith("arg:") and int(parent) in graph_obj
         )
-        arity = 0 if expression.func.attr == "clear" else 1
+        operation = str(expression.func.attr)
+        arity = 0 if operation == "clear" else 1
         if destination_node is None or len(arguments) != arity:
             continue
         destination = graph_obj.nodes[destination_node]
         attributes = destination.get("attributes") or {}
         if attributes.get("aggregate_kind") not in sequence_kinds:
             continue
+        argument_kind = "value"
+        argument_ids = tuple(
+            int(graph_obj.nodes[argument].get("value_id", argument))
+            for argument in arguments
+        )
+        key_column = None
+        reverse = False
         mutations.append(ControlSequenceMutation(
             sequence_value_id=int(destination.get(
                 "value_id", destination_node
             )),
-            operator=str(expression.func.attr),
-            argument_value_ids=tuple(int(graph_obj.nodes[argument].get(
-                "value_id", argument
-            )) for argument in arguments),
+            operator=operation,
+            argument_value_ids=argument_ids,
             effect_node_id=int(data.get("value_id", node_id)),
             policy=(
-                "unique" if attributes.get("aggregate_kind") == "set"
+                "unique"
+                if attributes.get("aggregate_kind") == "set"
                 else "duplicates"
             ),
+            argument_kind=argument_kind,
+            sort_key_column=key_column,
+            sort_reverse=reverse,
         ))
     nodes_by_value = {
         int(data.get("value_id", node_id)): data
@@ -958,7 +1514,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
             ))
             abi = (graph_obj.graph.get('linked_value_abi') or {}).get(int(value_id), {})
             if (attributes.get("aggregate_kind") == "tuple" and leaves
-                    and not mutation.argument_kind.startswith("mapping_")
+                    and not mutation.argument_kind.startswith((
+                        "mapping_", "sort_key_",
+                    ))
                     and not (abi.get('storage') == 'reference' and abi.get('dtype') == 'opaque_ref')):
                 arguments.extend(leaves)
             else:
@@ -967,7 +1525,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
             mutation,
             argument_value_ids=tuple(arguments),
             argument_kind=(
-                "row" if len(arguments) > 1 and not mutation.argument_kind.startswith("mapping_")
+                "row" if len(arguments) > 1 and not mutation.argument_kind.startswith((
+                    "mapping_", "sort_key_",
+                ))
                 else mutation.argument_kind
             ),
         ))

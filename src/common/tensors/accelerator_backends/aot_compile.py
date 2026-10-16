@@ -1207,6 +1207,11 @@ def compile_ast_aot(
                     tuple(dict.fromkeys((*targets, *dependency_seeds)))
                     if runtime_closure_only else None
                 ),
+                # Retention policy and executable-root identity are separate.
+                # Whole-program mode keeps the complete catalogue, but these
+                # authored targets still cause the exact source-pursuit
+                # activation cells consumed by deployment.
+                activation_roots=targets,
                 tensor_code_references=tensor_code_references,
                 retain=retain,
                 progress=_report,

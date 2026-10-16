@@ -33,7 +33,10 @@ def is_compiler_owned_storage(value: Any) -> bool:
     """Whether a root-frame value is workspace rather than authored ABI."""
 
     accounting = dict(getattr(value, "accounting", None) or {})
-    if accounting.get("program_abi_parameter"):
+    if (
+        accounting.get("program_abi_parameter")
+        or accounting.get("caller_provided_workspace")
+    ):
         return False
     return any(accounting.get(key) not in {None, ""} for key in (
         "linked_call_frame_storage",

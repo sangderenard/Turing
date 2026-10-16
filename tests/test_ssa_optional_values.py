@@ -249,7 +249,8 @@ def test_energy_limit_exact_helper_has_closed_optional_and_structural_abi():
     assert check_optional_merges(module) == []
     helper = next(
         function for name, function in module.functions.items()
-        if name.endswith("___energy_time_limit")
+        if "___energy_time_limit" in name
+        and "__planned_region_" not in name
     )
     assert any(
         (argument.accounting or {}).get("program_abi_optional_payload")

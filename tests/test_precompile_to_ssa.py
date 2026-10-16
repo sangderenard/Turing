@@ -12,6 +12,7 @@ from src.compiler.control_source import (
     ControlExpression,
     ControlSequenceMutation,
     ControlUniform,
+    ExternalReferenceCallBlock,
     LoopBlock,
     LoopControlBlock,
     ParallelDeployment,
@@ -26,6 +27,7 @@ from src.compiler.control_source import (
     overlay_scheduled_control,
 )
 from src.compiler.precompile_to_ssa import (
+    _ControlSSABuilder,
     _canonicalize_non_dominating_loop_result_uses,
     _inject_field_slot_access,
     _install_loop_owned_table_queries,
@@ -123,6 +125,90 @@ def test_field_receiver_uses_typed_columns_only_for_heterogeneous_slots():
         if instruction.op == "GetElementPtr"
     ]
     assert [instruction.args[0].id for instruction in geps] == [10, integer_column]
+
+
+def test_field_receiver_rewrite_preserves_cfg_successors():
+    predicate = SSAValue(7, dtype="bool")
+    control = Function(
+        "Receiver__branch",
+        [predicate],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [Instr("CondBr", [predicate], None)],
+                ["if_true", "if_false"],
+            ),
+            "if_true": BasicBlock(
+                "if_true", [Instr("Ret", [], None)], [],
+            ),
+            "if_false": BasicBlock(
+                "if_false", [Instr("Ret", [], None)], [],
+            ),
+        },
+    )
+
+
+    lowered, _locations = _inject_field_slot_access(
+        control,
+        self_value_id=10,
+        non_self_param_ids=(7,),
+        field_ops=(("read", 20, 0),),
+        field_count=1,
+        output_value_ids=(),
+        field_dtypes={0: "float64"},
+    )
+
+    assert lowered.blocks["entry"].successors == ["if_true", "if_false"]
+    assert lowered.blocks["if_true"].successors == []
+    assert lowered.blocks["if_false"].successors == []
+
+
+def test_external_utf8_sequence_status_is_checked_before_consumption():
+    control = ControlProgram(ExternalReferenceCallBlock(
+        callsite_id=10,
+        identity="builtins.repr",
+        argument_value_ids=(1,),
+        keyword_argument_value_ids=(),
+        result_value_id=10,
+        result_dtype="utf8_sequence",
+        native_abi="cpython-c-api",
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="repr_utf8_status",
+        first_value_id=20,
+        region_value_meta={1: Meta((), "float64")},
+        sequence_declarations=((10, "duplicates", 1, True),),
+        sequence_initializations=((10, "duplicates", 1),),
+        sequence_column_dtypes={10: ("int64",)},
+    )
+
+    assert shortfalls == ()
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    external = next(
+        instruction for instruction in instructions
+        if instruction.attributes.get("external_reference")
+    )
+    assert external.attributes["external_result_sequence"] == "utf8"
+    assert external.args[0].dtype == "float64"
+    assert any(
+        instruction.op in {"Eq", "equal"}
+        and instruction.attributes.get("external_result_status")
+        == "utf8_sequence"
+        for instruction in instructions
+    )
+    failure = next(
+        instruction for instruction in instructions
+        if instruction.attributes.get("callee") == "turing_validation_error"
+        and instruction.attributes.get("external_result_status")
+        == "utf8_sequence"
+    )
+    assert failure.attributes["error_code"] == 73
 
 
 def test_field_write_versions_result_colliding_with_receiver_storage():
@@ -2255,6 +2341,42 @@ def test_control_ssa_resolves_named_output_from_retained_id_history():
     assert [value.id for value in function.blocks["entry"].instrs[-1].args] == [7]
 
 
+def test_optional_physical_slot_keeps_following_named_output_alignment():
+    program = ControlProgram(SequenceBlock(()))
+    builder = _ControlSSABuilder(
+        program,
+        function_name="optional_then_named",
+        first_value_id=100,
+        region_callees=None,
+        region_signatures=None,
+        named_output_histories={
+            "optional": (10,),
+            "following": (20,),
+        },
+        value_name_histories={
+            "optional": (10,),
+            "following": (20,),
+        },
+    )
+    payload = builder.external_value(10, dtype="int64")
+    following = builder.external_value(20, dtype="int64")
+    presence = builder.external_value(30, dtype="bool")
+    builder.optional_glyph_presence_by_value[int(payload.id)] = presence
+    builder.lower(program.root)
+
+    function, shortfalls = builder.finish()
+
+    assert shortfalls == ()
+    returned = function.blocks["entry"].instrs[-1]
+    assert [int(value.id) for value in returned.args] == [10, 30, 20]
+    assert function.metadata["named_outputs"] == (
+        ("optional", 10), ("following", 20),
+    )
+    assert function.metadata["aggregate_return_layouts"] == (
+        (10, (10, 30)),
+    )
+
+
 def test_control_ssa_names_authored_parameter_used_by_structured_predicate():
     control = ControlProgram(ConditionalBlock(
         0,
@@ -3687,6 +3809,97 @@ def test_inplace_scalar_field_effect_uses_resident_incumbent_on_false_arm(scalar
     assert check_definition_dominance(IRModule({function.name: function})) == []
 
 
+def test_name_carried_arm_lowers_its_exact_structural_producer_before_phi():
+    """A regionless branch assignment still owns a concrete SSA producer."""
+
+    arm_expression = ControlExpression(
+        "or",
+        (
+            ControlExpression("value", value_id=12),
+            ControlExpression("value", value_id=13),
+        ),
+        value_id=40,
+    )
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=10,
+        body=SequenceBlock(()),
+        orelse=SequenceBlock(()),
+        predicate_expression=ControlExpression("value", value_id=10),
+        carried_aliases=((40, 30, 30, 42),),
+        source_node_id=50,
+        body_value_expressions=((40, arm_expression),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_value_meta={
+            10: Meta((), "bool"),
+            12: Meta((), "bool"),
+            13: Meta((), "bool"),
+            30: Meta((), "bool"),
+        },
+    )
+
+    assert shortfalls == ()
+    producer = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None and instruction.res.id == 40
+    )
+    assert producer.op == "LOr"
+    carried = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "conditional_carried"
+    )
+    assert [value.id for value in carried.args] == [40, 30]
+    assert 40 not in {value.id for value in function.args}
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_bound_whole_field_write_publishes_exact_carried_version(
+    scalar_field_version_fixture,
+):
+    scope, observed, written, merged = scalar_field_version_fixture
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=10,
+        body=SequenceBlock((ScalarFieldWriteBlock(
+            field_value_id=None,
+            value_expression=ControlExpression("value", value_id=12),
+            dtype="int64",
+            effect_node_id=99,
+            field_state_cell=None,
+        ),)),
+        orelse=SequenceBlock(()),
+        predicate_expression=ControlExpression("value", value_id=10),
+        carried_aliases=((12, 30, 30, 42),),
+        carried_field_cells=((written, observed, merged),),
+        source_node_id=50,
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        lexical_read_scope=scope,
+        region_value_meta={
+            10: Meta((), "bool"),
+            12: Meta((), "int64"),
+            30: Meta((), "int64"),
+        },
+    )
+
+    assert shortfalls == ()
+    carried = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "conditional_carried"
+    )
+    assert [value.id for value in carried.args] == [12, 30]
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
 def test_repeated_missing_field_arm_reuses_exact_unresolved_fact(
     scalar_field_version_fixture,
 ):
@@ -4168,6 +4381,41 @@ def test_sequence_first_or_default_query_is_resident_and_receipted():
     assert query_phi.attributes["extraction_identity"] == "builtins.next"
     assert 50 not in {value.id for value in function.args}
     assert 51 not in {value.id for value in function.args}
+
+
+def test_sequence_query_consumes_unique_resident_contract():
+    control = ControlProgram(SequenceBlock((
+        SequenceMutationBlock(ControlSequenceMutation(
+            sequence_value_id=30,
+            operator="add",
+            argument_value_ids=(12,),
+            effect_node_id=40,
+            policy="unique",
+        )),
+        SequenceQueryBlock(
+            result_value_id=50,
+            sequence_value_id=30,
+            operation="first_or_default",
+            default_value_id=13,
+            source_call_node_id=41,
+            extraction_identity="builtins.next",
+        ),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        sequence_initializations=((30, "unique", 1),),
+        sequence_declarations=((30, "unique", 1, True),),
+        resolved_sequence_schemas={30: ResolvedSequenceSchema(
+            column_count=1,
+            policy="unique",
+            writable=True,
+            retains_deleted_rows=False,
+            nested_table=False,
+        )},
+    )
+
+    assert shortfalls == ()
 
 
 def test_sequence_maximum_query_carries_order_and_retains_incumbent_on_ties():

@@ -4,10 +4,12 @@ import ast
 import contextlib
 import io
 import inspect
+import pathlib
 import textwrap
 from dataclasses import replace
 
 import numpy as np
+import networkx as nx
 import pytest
 
 from src.compiler.identity_concordance import begin_identity_book, end_identity_book
@@ -50,6 +52,7 @@ from src.compiler.glsl_deployment_strategy import (
 )
 from src.compiler.precompile_to_ssa import lower_control_sections_to_ssa
 from src.compiler.resident_sequence_materialization import (
+    _promote_conditional_sequence_aliases,
     _sequence_append_call_mutations,
 )
 from src.compiler.loop_ir import (
@@ -59,6 +62,8 @@ from src.compiler.loop_ir import (
     LoopStateEffectMode,
 )
 from src.compiler.control_source import (
+    ConditionalBlock,
+    ControlProgram,
     ControlTarget,
     LoopBlock,
     LoopControlBlock,
@@ -172,6 +177,52 @@ def test_static_unroll_clones_authored_calls_with_exact_argument_edges():
         if role == "arg:1"
     )
     assert graph.G.nodes[index_id]["constant"] == 1
+
+
+def test_static_unroll_retains_value_dead_linked_call_occurrences():
+    graph = _function_graph(
+        "def touch(receiver, value):\n"
+        "    receiver = receiver + value\n"
+        "\n"
+        "def kernel(receiver, value):\n"
+        "    for index in range(2):\n"
+        "        touch(receiver, value)\n"
+        "    return receiver\n",
+        "kernel",
+    )
+    plans = _glsl_composer().discover(graph)
+    original_call = next(
+        node_id
+        for node_id in plans[0].loop.body_nodes
+        if graph.G.nodes[node_id]["type"] == "Call"
+    )
+    original = graph.G.nodes[original_call]
+    original_callee = original["attributes"]["callee_ref"]
+    original_receiver = next(
+        parent for parent, role in original["parents"] if role == "arg:0"
+    )
+
+    evaporated = evaporate_unrolled_loops(graph, plans)
+
+    assert evaporated == plans
+    clones = [
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("unrolled_from")
+        == original_call
+    ]
+    assert len(clones) == 2
+    assert all(
+        clone["attributes"]["callee_ref"] == original_callee
+        for clone in clones
+    )
+    assert all(
+        any(
+            parent == original_receiver and role == "arg:0"
+            for parent, role in clone["parents"]
+        )
+        for clone in clones
+    )
 
 
 def test_unroll_does_not_evaporate_explicit_sequence_mutation():
@@ -470,7 +521,7 @@ def test_structural_fold_treats_specialized_scalar_tensor_as_non_none():
 
     assert not any(
         isinstance(data.get("expr_obj"), ast.IfExp)
-        for _node_id, data in graph.G.nodes(data=True)
+        for node_id, data in graph.G.nodes(data=True)
     )
     assert if_exp_id in graph.G.graph[
         "structurally_specialized_conditional_node_ids"
@@ -603,7 +654,7 @@ def test_structural_fold_follows_declared_nested_record_schema():
     ]) == 1
     assert any(
         (data.get("attributes") or {}).get("attribute") == "enabled"
-        for _node_id, data in graph.G.nodes(data=True)
+        for node_id, data in graph.G.nodes(data=True)
     )
 
 
@@ -1196,8 +1247,62 @@ def test_enumerate_nested_target_uses_source_iterable_extent():
 
     assert len(plan.loop.target_bindings) == 3
     assert reduction.control_program is not None
+    assert reduction.control_program.projected_iterable_bindings == (
+        (
+            source_id,
+            int(plan.loop.target_bindings[0][1]),
+            f"iteration_{int(plan.loop.node_id)}",
+            "induction",
+        ),
+        (
+            source_id,
+            int(plan.loop.target_bindings[1][1]),
+            f"iteration_{int(plan.loop.node_id)}",
+            0,
+        ),
+        (
+            source_id,
+            int(plan.loop.target_bindings[2][1]),
+            f"iteration_{int(plan.loop.node_id)}",
+            1,
+        ),
+    )
     assert reduction.control_program.root.stop == (
         f"__iterable_extent_{source_id}__"
+    )
+
+
+def test_enumerate_zip_nested_target_preserves_each_source_column():
+    graph = _function_graph(
+        "def kernel(fields, values):\n"
+        "    total = 0\n"
+        "    for position, (field, item) in enumerate(zip(fields, values)):\n"
+        "        total = total + position\n"
+        "    return total\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,)
+    )
+    enumerate_node = graph.G.nodes[int(plan.loop.iterable_node)]
+    zip_id = next(
+        int(parent)
+        for parent, role in enumerate_node["parents"]
+        if str(role) in {"arg", "args", "arg:0", "arg0"}
+    )
+
+    assert len(plan.loop.target_bindings) == 3
+    assert reduction.control_program is not None
+    assert tuple(
+        (int(target_id), projection)
+        for iterable_id, target_id, _induction, projection
+        in reduction.control_program.projected_iterable_bindings
+        if int(iterable_id) == zip_id
+    ) == (
+        (int(plan.loop.target_bindings[0][1]), "induction"),
+        (int(plan.loop.target_bindings[1][1]), 0),
+        (int(plan.loop.target_bindings[2][1]), 1),
     )
 
 
@@ -1509,6 +1614,637 @@ def test_indexed_table_store_keeps_tuple_value_as_one_mapping_item():
     ) == "tuple"
 
 
+def test_source_sort_retains_lambda_projection_and_mapping_getitem_keys():
+    projected = _function_graph(
+        "def kernel(rows: list[tuple[int, int]]):\n"
+        "    rows.sort(key=lambda row: row[1])\n"
+        "    return rows\n",
+        "kernel",
+    )
+    projected_sort, = (
+        item for item in _sequence_append_call_mutations(projected.G)
+        if item.operator == "sort"
+    )
+    assert projected_sort.argument_kind == "sort_key_column"
+    assert projected_sort.sort_key_column == 1
+    assert projected_sort.argument_value_ids == ()
+
+    mapped = _function_graph(
+        "def kernel(values: list[int], positions: dict[int, int]):\n"
+        "    values.sort(key=positions.__getitem__)\n"
+        "    return values\n",
+        "kernel",
+    )
+    mapped_sort, = (
+        item for item in _sequence_append_call_mutations(mapped.G)
+        if item.operator == "sort"
+    )
+    assert mapped_sort.argument_kind == "sort_key_mapping_getitem"
+    assert len(mapped_sort.argument_value_ids) == 1
+    mapping = mapped.G.nodes[mapped_sort.argument_value_ids[0]]
+    assert (mapping.get("attributes") or {}).get("aggregate_kind") == "dict"
+
+    copied = _function_graph(
+        "def kernel(values: list[int]):\n"
+        "    return sorted(values)\n",
+        "kernel",
+    )
+    copied_sort, = (
+        item for item in _sequence_append_call_mutations(copied.G)
+        if item.operator == "sorted"
+    )
+    assert copied_sort.sequence_value_id != copied_sort.argument_value_ids[0]
+    assert copied_sort.argument_kind == "sorted_value"
+    assert copied_sort.sort_key_column == 0
+
+    mapping_keys = _function_graph(
+        "def kernel(grouped: dict[int, int]):\n"
+        "    return sorted(grouped)\n",
+        "kernel",
+    )
+    mapping_sort, = (
+        item for item in _sequence_append_call_mutations(mapping_keys.G)
+        if item.operator == "sorted"
+    )
+    assert mapping_sort.policy == "unique"
+    from src.compiler.concordance_declarations import PARAMETER_ANNOTATION
+    from src.compiler.identity_concordance import current_identity_book
+    book = current_identity_book()
+    annotation_cell, = (
+        book.latest_ref(PARAMETER_ANNOTATION, row)
+        for row in book.page(PARAMETER_ANNOTATION).rows()
+        if row[-1] == "grouped"
+    )
+    predecessors = set()
+    pending = [mapping_sort.source_contract_cell]
+    while pending:
+        current = pending.pop()
+        for source, _stage in book.edges_into(current):
+            if source not in predecessors:
+                predecessors.add(source)
+                pending.append(source)
+    assert annotation_cell in predecessors
+
+
+def test_loop_sort_uses_carried_source_cell_without_graph_row_view():
+    graph = _function_graph(
+        "def kernel(values: list[int], positions: dict[int, int]):\n"
+        "    for _index in range(1):\n"
+        "        values.sort(key=positions.__getitem__)\n"
+        "    return values\n",
+        "kernel",
+    )
+    sort_node, sort_data = next(
+        (int(node_id), data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "sort"
+    )
+    assert (sort_data.get("attributes") or {}).pop(
+        "source_sort_contract_row", None,
+    ) is not None
+
+    plan, = _glsl_composer().compose(graph)
+    plan, = materialize_retained_loop_ports(graph, (plan,))
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,),
+    )
+    mutation = next(
+        item for item in reduction.control_program.root.sequence_mutations
+        if int(item.effect_node_id) == sort_node
+    )
+
+    assert mutation.argument_kind == "sort_key_mapping_getitem"
+    assert mutation.source_contract_cell is not None
+
+
+def test_standalone_sorted_lowers_copy_then_stable_sort_to_distinct_storage():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def kernel(values: list[int]):\n"
+        "    return sorted(values)\n",
+        "kernel",
+        name="standalone_sorted",
+        extraction_contract=(
+            pathlib.Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        progress=lambda _message: None,
+        progress_bars=False,
+    )
+
+    entrypoint, = exports
+    function = module.functions[entrypoint]
+    output, = outputs[entrypoint]
+    input_id = dict(function.metadata["parameter_names"])["values"]
+    calls = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("ssa_sequence_operation")
+        in {"replace", "sort"}
+    ]
+
+    assert [call.attributes["ssa_sequence_operation"] for call in calls] == [
+        "replace", "sort",
+    ]
+    assert output.id != input_id
+    assert calls[0].attributes["sequence_id"] == output.id
+    assert calls[1].attributes["sequence_id"] == output.id
+    assert function.metadata["sequence_capacity_sources"][0] == (
+        output.id, input_id,
+    )
+    descriptor = module.sequence_tables[entrypoint].by_id(output.id)
+    assert descriptor is not None
+    assert all(
+        (next(
+            value for value in function.args if value.id == storage_id
+        ).accounting or {}).get("workspace_operation") == "sorted_result"
+        for storage_id in (
+            *descriptor.column_value_ids,
+            descriptor.length_address_id,
+            descriptor.capacity_value_id,
+            descriptor.status_address_id,
+        )
+    )
+
+
+def test_declared_tuple_loop_target_resolves_exact_type_guard_for_mutation():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.identity_spill import _reindex_in_place
+    from src.compiler.project_compilation_product import (
+        _unexplained_root_argument_ids,
+    )
+
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        inspect.getsource(_reindex_in_place),
+        "_reindex_in_place",
+        name="reindex_type_guard",
+        extraction_contract=(
+            pathlib.Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        progress=lambda _message: None,
+        progress_bars=False,
+    )
+
+    assert exports == ("reindex_type_guard___reindex_in_place",)
+    assert any(
+        instruction.attributes.get("ssa_sequence_operation") == "sort"
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+    root = module.functions[exports[0]]
+    assert _unexplained_root_argument_ids(root) == ()
+    conceptual_sequence_ids = set(
+        module.sequence_tables[root.name].sequences
+    )
+    assert not {
+        int(argument.id)
+        for argument in root.args
+        if str(argument.dtype or "").casefold() in {
+            "", "none", "unknown", "opaque", "opaque_ref",
+        }
+        and int(argument.id) not in conceptual_sequence_ids
+    }
+
+
+def test_declared_tuple_parameter_resolves_isinstance_schema_guard():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler import identity_concordance
+
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        pathlib.Path(identity_concordance.__file__).read_text(
+            encoding="utf-8",
+        ),
+        "_validate_row",
+        source_module="src.compiler.identity_concordance",
+        python_bindings=vars(identity_concordance),
+        name="validate_row_type_guard",
+        extraction_contract=(
+            pathlib.Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        progress=lambda _message: None,
+        progress_bars=False,
+    )
+
+    assert exports == ("validate_row_type_guard___validate_row",)
+    assert all(
+        not function.metadata.get("lowering_shortfalls")
+        for function in module.functions.values()
+    )
+
+
+def test_authored_local_class_annotation_resolves_loop_receiver():
+    graph = _function_graph(
+        "class Field:\n"
+        "    def admits(self, value) -> bool:\n"
+        "        return True\n"
+        "def kernel(fields: list[Field], values: list[int]):\n"
+        "    field: Field\n"
+        "    value: int\n"
+        "    for field, value in zip(fields, values):\n"
+        "        if field.admits(value):\n"
+        "            return value\n"
+        "    return 0\n",
+        "kernel",
+    )
+
+    field_input = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "field"
+    )
+    assert (field_input.get("attributes") or {}).get(
+        "result_class_ref"
+    ) == "Field"
+    admits_call = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "admits"
+    )
+    assert (admits_call.get("attributes") or {}).get("callee_ref") is not None
+
+
+def test_optional_local_class_annotation_resolves_mapping_get_receiver():
+    graph = _function_graph(
+        "class Projection:\n"
+        "    pages: frozenset\n"
+        "    def reaches(self, value) -> bool:\n"
+        "        return True\n"
+        "def kernel(projections: dict, scope, value):\n"
+        "    projection: Projection | None = projections.get(scope)\n"
+        "    if projection is None:\n"
+        "        return True\n"
+        "    return projection.reaches(value)\n",
+        "kernel",
+    )
+
+    get_call = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "get"
+    )
+    assert (get_call.get("attributes") or {}).get(
+        "result_class_ref"
+    ) == "Projection"
+    reaches_call = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "reaches"
+    )
+    assert (reaches_call.get("attributes") or {}).get("callee_ref") is not None
+
+
+def test_aggregate_field_replacement_owns_later_indexed_mutation_storage():
+    from src.compiler.fortran_c_shell import _field_slot_ops
+    from src.compiler.identity_concordance import (
+        resolved_concordant_alias_bindings,
+    )
+
+    graph = _function_graph(
+        "class Page:\n"
+        "    columns: list[int]\n"
+        "    column_positions: dict[int, int]\n"
+        "    def reindex(self):\n"
+        "        self.column_positions = {\n"
+        "            column: position\n"
+        "            for position, column in enumerate(self.columns)\n"
+        "        }\n"
+        "        for column in self.columns:\n"
+        "            if column not in self.column_positions:\n"
+        "                self.column_positions[column] = len(self.columns)\n",
+        "Page.reindex",
+    )
+
+    replacement_node, replacement = next(
+        (int(node_id), int(data.get("value_id", node_id)))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.DictComp)
+    )
+    field_ops = _field_slot_ops(graph.G)
+    column_positions_slot = field_ops[4].index("column_positions")
+    field_reads = {
+        int(value_id)
+        for kind, value_id, slot in field_ops[1]
+        if kind == "read" and int(slot) == column_positions_slot
+    }
+    scope = str(
+        graph.G.graph.get("qualified_name")
+        or graph.G.graph.get("function_name")
+    )
+    aliases = resolved_concordant_alias_bindings(scope)
+    authored_reads = {
+        int(data.get("value_id", node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and data["expr_obj"].attr == "column_positions"
+        and isinstance(data["expr_obj"].ctx, ast.Load)
+    }
+
+    assert any(
+        sequence_id == replacement and policy == "unique"
+        for sequence_id, policy, _column_count in field_ops[6]
+    )
+    assert any(
+        sequence_id == replacement
+        for _effect, _key, _value, sequence_id in field_ops[12]
+    )
+    assert field_reads == {replacement}
+    assert authored_reads
+    assert {
+        aliases.get(read_id, read_id) for read_id in authored_reads
+    } == {replacement}
+    assert aliases.get(replacement_node, replacement_node) == replacement
+
+
+def test_sequence_snapshot_keeps_source_row_width():
+    """A conversion snapshot has the exact physical row of its source."""
+    from src.compiler.fortran_c_shell import _field_slot_ops
+
+    graph = _function_graph(
+        "def freeze():\n"
+        "    history = []\n"
+        "    history.append((1, 2))\n"
+        "    return tuple(history)\n",
+        "freeze",
+    )
+    declarations = _field_slot_ops(graph.G)[8]
+    source = next(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.List)
+    )
+    snapshot = next(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if (
+            isinstance(data.get("expr_obj"), ast.Call)
+            and isinstance(data["expr_obj"].func, ast.Name)
+            and data["expr_obj"].func.id == "tuple"
+        )
+    )
+
+    assert (source, "duplicates", 2, True) in declarations
+    assert (snapshot, "duplicates", 2, True) in declarations
+
+
+def test_in_place_mapping_field_join_uses_one_resident_sequence():
+    graph = nx.DiGraph()
+    graph.add_node(39, value_id=39, attributes={"aggregate_kind": "dict"})
+    graph.add_node(44, value_id=44, attributes={"aggregate_kind": "dict"})
+    graph.add_node(
+        45,
+        value_id=45,
+        type="IndexedStore",
+        parents=((44, "base"),),
+        attributes={},
+    )
+    graph.add_node(
+        46,
+        value_id=46,
+        type="Phi",
+        parents=((45, "body"), (39, "orelse")),
+        attributes={},
+    )
+    conditional = ConditionalBlock(
+        predicate_value_id=1,
+        body=SequenceBlock(()),
+        orelse=SequenceBlock(()),
+        carried_aliases=((45, 39, 39, 46),),
+        carried_field_cells=(("written", "initial", "merged"),),
+    )
+
+    promoted, aliases, destinations = _promote_conditional_sequence_aliases(
+        ControlProgram(SequenceBlock((conditional,))),
+        graph,
+        structural_aliases={44: (39, "dict")},
+    )
+
+    result, = promoted.root.blocks
+    assert result.carried_aliases == ()
+    assert result.carried_field_cells == ()
+    assert result.carried_sequence_aliases == ((39, 39, 39, 46),)
+    assert aliases == {46: (39, "dict")}
+    assert destinations == (39,)
+
+
+def test_distinct_mapping_field_join_is_not_treated_as_in_place():
+    graph = nx.DiGraph()
+    for value_id in (39, 44, 45):
+        graph.add_node(
+            value_id,
+            value_id=value_id,
+            attributes={"aggregate_kind": "dict"},
+        )
+    conditional = ConditionalBlock(
+        predicate_value_id=1,
+        body=SequenceBlock(()),
+        orelse=SequenceBlock(()),
+        carried_aliases=((44, 45, 39, 46),),
+        carried_field_cells=(("true", "false", "merged"),),
+    )
+
+    promoted, aliases, destinations = _promote_conditional_sequence_aliases(
+        ControlProgram(SequenceBlock((conditional,))), graph,
+    )
+
+    result, = promoted.root.blocks
+    assert result.carried_aliases == conditional.carried_aliases
+    assert result.carried_field_cells == conditional.carried_field_cells
+    assert result.carried_sequence_aliases == ()
+    assert aliases == {}
+    assert destinations == ()
+
+
+def test_committed_unique_field_join_uses_one_resident_sequence():
+    """Late planning may retain only the concorded physical policy."""
+    graph = nx.DiGraph()
+    conditional = ConditionalBlock(
+        predicate_value_id=1,
+        body=SequenceBlock(()),
+        orelse=SequenceBlock(()),
+        carried_aliases=((45, 44, 44, 46),),
+        carried_field_cells=(("written", "initial", "merged"),),
+    )
+
+    promoted, aliases, destinations = _promote_conditional_sequence_aliases(
+        ControlProgram(SequenceBlock((conditional,))),
+        graph,
+        structural_aliases={
+            44: (52, "unique"),
+            45: (52, "unique"),
+        },
+    )
+
+    result, = promoted.root.blocks
+    assert result.carried_aliases == ()
+    assert result.carried_field_cells == ()
+    assert result.carried_sequence_aliases == ((52, 52, 52, 46),)
+    assert aliases == {46: (52, "unique")}
+    assert destinations == (52,)
+
+
+def test_declared_field_chain_and_module_frozenset_resolve_memberships():
+    from src.common.tensors.topological_reducer import _source_numeric_scope
+    from src.compiler.concordance_declarations import (
+        CLASS_FIELD_DECLARATION,
+        SOURCE_VALUE_CLASS,
+    )
+    from src.compiler.fortran_c_shell import _field_slot_ops
+    from src.compiler.identity_concordance import current_identity_book
+
+    graph = _function_graph(
+        "from __future__ import annotations\n"
+        "from typing import Any\n"
+        "EXCLUDED: frozenset[str] = frozenset({'private'})\n"
+        "class Registry:\n"
+        "    def __init__(self):\n"
+        "        self.private_pages: set[str] = set()\n"
+        "class Book:\n"
+        "    registry: Registry\n"
+        "    read_through: dict[Any, tuple[Any, int]]\n"
+        "class Page:\n"
+        "    book: Book | None\n"
+        "    name: str\n"
+        "    def fork(self, scope: Any) -> tuple[Any, int] | None:\n"
+        "        book: Book | None = self.book\n"
+        "        if book is None:\n"
+        "            return None\n"
+        "        forks: dict[Any, tuple[Any, int]] | None = "
+        "book.__dict__.get('read_through')\n"
+        "        if not forks:\n"
+        "            return None\n"
+        "        fork: tuple[Any, int] | None = forks.get(scope)\n"
+        "        if fork is None:\n"
+        "            return None\n"
+        "        name = self.name\n"
+        "        if name in EXCLUDED or name in book.registry.private_pages:\n"
+        "            return None\n"
+        "        return fork\n",
+        "Page.fork",
+    )
+
+    excluded = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("binding_name") == "EXCLUDED"
+    )
+    assert (excluded.get("attributes") or {}).get(
+        "aggregate_kind"
+    ) == "frozenset"
+    assert (excluded.get("attributes") or {}).get(
+        "compile_time_sequence_items"
+    ) == ("private",)
+    forks = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and ast.unparse(data["expr_obj"]) == "book.__dict__.get('read_through')"
+    )
+    assert (forks.get("attributes") or {}).get(
+        "mapping_key_dtype"
+    ) == "int64"
+    assert (forks.get("attributes") or {}).get(
+        "mapping_value_dtype"
+    ) == "int64"
+    assert (forks.get("attributes") or {}).get(
+        "mapping_value_aggregate_kind"
+    ) == "tuple"
+    field_ops = _field_slot_ops(graph.G)
+    excluded_id = int(excluded.get("value_id"))
+    assert (excluded_id, "unique", 1, False) in field_ops[8]
+    assert any(
+        sequence_id == excluded_id
+        and policy.startswith("literal_table=")
+        and column_count == 1
+        for sequence_id, policy, column_count in field_ops[6]
+    )
+
+    registry = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and ast.unparse(data["expr_obj"]) == "book.registry"
+    )
+    private_pages_id, private_pages = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and ast.unparse(data["expr_obj"]) == "book.registry.private_pages"
+    )
+    assert (registry[1].get("attributes") or {}).get(
+        "result_class_ref"
+    ) == "Registry"
+    assert (private_pages.get("attributes") or {}).get(
+        "aggregate_kind"
+    ) == "set"
+    assert (private_pages.get("attributes") or {}).get(
+        "sequence_column_dtypes"
+    ) == ("int64",)
+    name_field_id, name_field = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and ast.unparse(data["expr_obj"]) == "self.name"
+    )
+    assert name_field.get("tensor") == {"shape": (), "dtype": "int64"}
+    memberships = field_ops[9]
+    assert {
+        (query_id, sequence_id, negate)
+        for _result_id, query_id, sequence_id, negate in memberships
+    } == {
+        (int(name_field.get("value_id", name_field_id)), excluded_id, False),
+        (
+            int(name_field.get("value_id", name_field_id)),
+            int(private_pages.get("value_id", private_pages_id)),
+            False,
+        ),
+    }
+
+    book = current_identity_book()
+    registry_class = book.latest_ref(
+        SOURCE_VALUE_CLASS,
+        (_source_numeric_scope(graph.G), int(registry[0])),
+    )
+    book_schema = next(
+        item
+        for item in graph.G.graph["map_ir"]["objects"]
+        if str(item.get("class_identity")) == "Book"
+    )
+    book_span = tuple(book_schema["class_node_id"])
+    registry_field = book.latest_ref(
+        CLASS_FIELD_DECLARATION,
+        (str(book_span[0]), str(book_schema["class_identity"]), "registry"),
+    )
+    assert registry_class is not None
+    assert registry_field is not None
+    predecessors = set()
+    pending = [registry_class]
+    while pending:
+        current = pending.pop()
+        for source, _stage in book.edges_into(current):
+            if source not in predecessors:
+                predecessors.add(source)
+                pending.append(source)
+    assert registry_field in predecessors
+
+
 def test_sequence_mutation_no_longer_uses_index_publication_shortcut():
     graph = _function_graph(
         "def kernel(values):\n"
@@ -1695,9 +2431,10 @@ def test_bootstrap_collection_mutation_occurrence_ledger_is_not_collapsed(target
             ("dependency_seed_definitions", "append", "duplicates"),
             ("pending", "extend", "duplicates"),
             ("pending", "pop", "duplicates"),
-            ("annotation_rows", "append", "duplicates"),
-            ("annotation_rows", "append", "duplicates"),
-        ],
+                ("annotation_rows", "append", "duplicates"),
+                ("annotation_rows", "append", "duplicates"),
+                ("parameter_sources", "append", "duplicates"),
+            ],
     }
     target = (ProcessGraph.build_from_ast if target_name == 'build_from_ast'
               else getattr(graph_express2, target_name))

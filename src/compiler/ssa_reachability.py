@@ -9,6 +9,60 @@ from __future__ import annotations
 from collections import Counter
 
 
+def _record_pruned_block_geometry(function, prior, changed_labels):
+    """Publish CFG/Phi geometry at the pruning writer when it changed.
+
+    Handwritten standalone IR has no concordance owner and remains outside
+    this publication. Source-compiled functions already have geometry; each
+    pruned block is an exact derivation of its immediately preceding geometry,
+    so the later dominance reader never has to infer why an operand or edge
+    disappeared.
+    """
+    if not prior or not changed_labels:
+        return prior
+    from .concordance_declarations import CONTROL_SSA_FINISH, SSA_BLOCK_GEOMETRY
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_record_return_state import function_scope_of
+
+    book = current_identity_book()
+    scope = function_scope_of(function)
+    updated = dict(prior)
+    for label in changed_labels:
+        block = function.blocks.get(label)
+        source = prior.get(label)
+        if block is None or source is None:
+            continue
+        fact = (
+            tuple(
+                (
+                    str(instruction.op),
+                    tuple(int(value.id) for value in instruction.args),
+                    None
+                    if instruction.res is None
+                    else int(instruction.res.id),
+                    tuple(
+                        instruction.attributes.get("incoming_blocks") or ()
+                    ),
+                )
+                for instruction in block.instrs
+            ),
+            tuple(block.successors),
+        )
+        row = (scope, str(function.name), str(label))
+        if book.page(SSA_BLOCK_GEOMETRY).latest(row) == fact:
+            updated[label] = book.latest_ref(SSA_BLOCK_GEOMETRY, row)
+            continue
+        updated[label] = book.post(
+            SSA_BLOCK_GEOMETRY,
+            row,
+            fact,
+            stage=CONTROL_SSA_FINISH,
+            provenance=Derived((source,)),
+            mode=Mode.REVISE,
+        )
+    return updated
+
+
 def prune_unused_phis(function, protected_value_ids=()) -> tuple[int, ...]:
     """Remove unused joins without dropping their producers or effects.
 
@@ -61,7 +115,14 @@ def record_constant_hoists(function, moves):
     for from_block, from_index, instruction, to_block, to_index in moves:
         value_cell = ssa_value_identity_cell(function, instruction.res.id, book=book)
         if value_cell is None or instruction.args:
-            raise ConcordanceRefusal(f"constant hoist %{instruction.res.id} lacks an operand-free recorded producer")
+            raise ConcordanceRefusal(
+                f"constant hoist %{instruction.res.id} in {function.name!r} "
+                "lacks an operand-free recorded producer: "
+                f"value_cell={value_cell!r}, operands="
+                f"{tuple(int(value.id) for value in instruction.args)!r}, "
+                f"accounting={dict(instruction.res.accounting or {})!r}, "
+                f"attributes={dict(instruction.attributes or {})!r}"
+            )
         book.post(SSA_CONSTANT_HOIST,
                   ((scope, str(function.name)), int(instruction.res.id),
                    str(from_block), int(from_index), str(to_block), geometry[from_block]),
@@ -213,6 +274,20 @@ Instructions in reachable blocks retain their order and effects.
     if not blocks:
         return 0
     entry = "entry" if "entry" in blocks else next(iter(blocks))
+    from .concordance_declarations import SSA_BLOCK_GEOMETRY
+    from .identity_concordance import current_identity_book
+    from .ssa_record_return_state import function_scope_of
+
+    book = current_identity_book()
+    scope = function_scope_of(function)
+    prior_geometry = {
+        str(label): cell
+        for label in blocks
+        if (cell := book.latest_ref(
+            SSA_BLOCK_GEOMETRY,
+            (scope, str(function.name), str(label)),
+        )) is not None
+    }
     changes = 0
     while True:
         constants = {}
@@ -265,7 +340,8 @@ Instructions in reachable blocks retain their order and effects.
                 break
 
         changed = 0
-        for block in blocks.values():
+        changed_labels = set()
+        for block_name, block in blocks.items():
             if not block.instrs:
                 continue
             terminator = block.instrs[-1]
@@ -280,6 +356,7 @@ Instructions in reachable blocks retain their order and effects.
                 terminator.arg_roles = []
                 terminator.attributes = {"target": target}
                 changed += 1
+                changed_labels.add(str(block_name))
             if terminator.op == "Br":
                 block.successors = [terminator.attributes["target"]]
             elif terminator.op == "CondBr":
@@ -332,6 +409,10 @@ Instructions in reachable blocks retain their order and effects.
                 if instruction.arg_roles:
                     instruction.arg_roles = [instruction.arg_roles[index] for index in keep]
                 changed += 1
+                changed_labels.add(str(name))
+        prior_geometry = _record_pruned_block_geometry(
+            function, prior_geometry, changed_labels,
+        )
         changes += changed
         if not changed:
             return changes

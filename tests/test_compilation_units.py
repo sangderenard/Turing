@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from types import SimpleNamespace
 
 import networkx as nx
@@ -23,6 +24,9 @@ from src.compiler.compilation_units import (
     record_compilation_unit_plan,
 )
 from src.compiler.shell_reference_tables import build_map_dependency_regions
+from src.compiler.receiver_resolution_prepasses import (
+    _resolve_grounded_method_references,
+)
 from src.transmogrifier.function_table import FunctionTable
 
 
@@ -114,6 +118,48 @@ def test_units_are_one_authored_call_each_and_dependencies_come_first():
     ]
     assert plan.unit_for_reference(references["root"].address).dependency_units == (1,)
     assert plan.unit_for_reference(references["middle"].address).dependency_units == (0,)
+
+
+def test_source_class_constructor_is_resolved_before_unit_division():
+    table = FunctionTable()
+    caller_ref = table.declare("run", qualified_name="project.run")
+    constructor_ref = table.declare(
+        "__init__", qualified_name="project.IdentityBook.__init__",
+    )
+    constructor = nx.DiGraph()
+    constructor.graph.update({
+        "function_name": "__init__", "method_owner": "IdentityBook",
+    })
+    constructor.add_node(0, type="Input", attributes={})
+    table.resolve_graph(constructor_ref, SimpleNamespace(G=constructor))
+
+    caller = nx.DiGraph()
+    caller.graph.update({
+        "function_name": "run",
+        "class_table": {
+            "IdentityBook": {
+                "methods": {"__init__": constructor_ref.address},
+                "fields": ("detached",),
+            },
+        },
+    })
+    caller.add_node(
+        9, type="Call", op="call", value_id=9,
+        expr_obj=ast.parse("IdentityBook(detached=True)", mode="eval").body,
+        attributes={"class_ref": "IdentityBook"}, parents=[],
+    )
+    table.resolve_graph(caller_ref, SimpleNamespace(G=caller))
+
+    _resolve_grounded_method_references(table.entry(caller_ref).graph)
+    attributes = caller.nodes[9]["attributes"]
+    assert attributes["constructor_ref"] == constructor_ref.address
+    assert attributes["constructor_resolution"] == "source-class-ref"
+
+    plan = plan_compilation_units(table)
+    constructor_unit = plan.reference_to_unit[constructor_ref.address]
+    caller_unit = plan.unit_for_reference(caller_ref.address)
+    assert caller_unit.dependency_units == (constructor_unit,)
+    assert caller_unit.dynamic_call_nodes == ()
 
 
 def test_mutual_recursion_is_the_only_automatic_multi_call_unit():

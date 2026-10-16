@@ -19,6 +19,9 @@ from pathlib import Path
 import networkx as nx
 import numpy as np
 import pytest
+import ast
+import contextlib
+import io
 
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
@@ -29,6 +32,21 @@ from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.hierarchical_plan import PlanCall, PlanClosure
 from src.compiler.process_graph_value_ids import next_process_value_id
+from src.compiler.concordance_declarations import (
+    SOURCE_AGGREGATE_LAYOUT,
+    SourceAggregateLayout,
+)
+from src.compiler.identity_concordance import (
+    begin_identity_book,
+    end_identity_book,
+)
+from src.compiler.project_compilation_product import (
+    project_process_graph_acceptance,
+)
+from src.transmogrifier.graph.graph_express2 import ProcessGraph
+from src.common.tensors.topological_reducer import (
+    reduce_abstract_tensor_topology,
+)
 
 CONTRACTS = Path(__file__).resolve().parents[1] / "extraction_contracts"
 
@@ -163,7 +181,11 @@ def tick(array):
     assert len(root.args) == 1  # Only the authored array, no saved/result input.
     assert result.dtype == 'float64'
     assert tuple(result.shape) == (2, 3)
-    recover = module.functions['singleton_snapshot__recover']
+    recover = next(
+        function for name, function in module.functions.items()
+        if name.startswith('singleton_snapshot__recover')
+        and 'planned_region' not in name
+    )
     assert len(recover.args) == 1
     assert tuple(recover.args[0].shape) == (2, 3)
     assert _ret_args(recover)[0].id == recover.args[0].id
@@ -191,8 +213,8 @@ def _capture_plans(monkeypatch):
     captured = []
     original = planner._build_shell_hierarchy_plan
 
-    def capture(shell):
-        plan = original(shell)
+    def capture(shell, *args, **kwargs):
+        plan = original(shell, *args, **kwargs)
         captured.append((shell, plan))
         return plan
 
@@ -207,6 +229,90 @@ def _ret_args(function):
         for instruction in block.instrs
         if instruction.op == "Ret"
     ][-1]
+
+
+def test_nested_conditional_aggregate_layout_is_exact_source_fact():
+    book, token = begin_identity_book()
+    try:
+        process = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            process.build_from_ast(ast.parse(
+                "def choose(flag, first, second, third, fourth):\n"
+                "    value = (first, (second, third))\n"
+                "    if flag:\n"
+                "        value = (fourth, (third, second))\n"
+                "    return value\n"
+            ))
+        reduce_abstract_tensor_topology(process)
+        graph = process.function_table.entry("choose").graph.G
+        scope = graph.graph["source_aggregate_layout_scope"]
+        output_id = int(graph.graph["identity_table"]["value"][-1])
+        layout = book.page(SOURCE_AGGREGATE_LAYOUT).latest((scope, output_id))
+        assert isinstance(layout, SourceAggregateLayout)
+        assert layout.aggregate_kind == "tuple"
+        assert layout.conditional_cell is not None
+        assert len(layout.arm_layout_cells) == 2
+        assert len(layout.members) == 2
+        nested_id = int(layout.members[1].value_id)
+        nested = book.page(SOURCE_AGGREGATE_LAYOUT).latest((scope, nested_id))
+        assert isinstance(nested, SourceAggregateLayout)
+        assert nested.aggregate_kind == "tuple"
+        assert len(nested.members) == 2
+        assert all(member.value_cell is not None for member in nested.members)
+        assert all(member.source_cells for member in nested.members)
+    finally:
+        end_identity_book(token)
+
+
+def test_projected_graph_carries_aggregate_layout_without_graph_attrs():
+    book, token = begin_identity_book()
+    try:
+        process = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            process.build_from_ast(ast.parse(
+                "def nested(first, second, third):\n"
+                "    return (first, (second, third))\n"
+            ))
+        reduce_abstract_tensor_topology(process)
+        entry = process.function_table.entry("nested")
+        graph = entry.graph.G
+        scope = graph.graph["source_aggregate_layout_scope"]
+        page = book.page(SOURCE_AGGREGATE_LAYOUT)
+        output_id = next(
+            int(row[1])
+            for row in page.scope_rows(scope)
+            for candidate in (page.latest(row),)
+            if isinstance(candidate, SourceAggregateLayout)
+            and len(candidate.members) == 2
+            and page.latest((
+                scope, int(candidate.members[1].value_id),
+            )) is not None
+        )
+        expected = page.latest((scope, output_id))
+        assert isinstance(expected, SourceAggregateLayout)
+        for _node_id, data in graph.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            for name in (
+                "source_aggregate_layout_row", "producer_kind",
+                "aggregate_kind", "aggregate_leaf_value_ids",
+            ):
+                attributes.pop(name, None)
+        projected = project_process_graph_acceptance(
+            process, (int(entry.reference.address),), book=book,
+        )
+        carried = projected.page(SOURCE_AGGREGATE_LAYOUT).latest(
+            (scope, output_id)
+        )
+        assert carried == expected
+        nested_id = int(carried.members[1].value_id)
+        assert isinstance(
+            projected.page(SOURCE_AGGREGATE_LAYOUT).latest(
+                (scope, nested_id)
+            ),
+            SourceAggregateLayout,
+        )
+    finally:
+        end_identity_book(token)
 
 
 HISTORY_FEEDS = {
@@ -281,6 +387,12 @@ def test_history_tuple_members_bind_by_exact_identity(monkeypatch):
     assert [tuple(value.shape) for value in _ret_args(callee)] == [
         (8, 4, 3), (8, 4, 3), (8, 4), (8,),
     ]
+    assert callee.metadata["aggregate_return_layout_sources"]
+    assert all(
+        source.page is SOURCE_AGGREGATE_LAYOUT
+        for _aggregate_id, source
+        in callee.metadata["aggregate_return_layout_sources"]
+    )
     assert [tuple(value.shape) for value in _ret_args(root)] == [
         (8, 4, 3), (8, 4, 3), (8, 4), (8,),
     ]
@@ -404,7 +516,8 @@ def tick(metrics):
         runtime_closure_only=True,
     )
     callees = [function for name, function in module.functions.items()
-               if name.endswith("__keep")]
+               if name.startswith("returned_record_parameter__keep")
+               and "planned_region" not in name]
     assert len(callees) == 1
     callee = callees[0]
     returned = _ret_args(callee)

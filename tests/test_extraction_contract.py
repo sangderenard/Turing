@@ -46,7 +46,13 @@ def test_program_abi_table_row_retains_dynamic_span_rank():
     steps = contract.program_abi.records["CompilerFusedProgram"].fields["steps"]
     assert steps.table_columns == (
         {"name": "input_ids", "dtype": "int64", "rank": 1},
-        {"name": "result_id", "dtype": "int64"},
+        {"name": "result_id", "dtype": "int64", "rank": 0},
+    )
+    round_trip = contract.with_program_abi(contract.program_abi.receipt())
+    assert (
+        round_trip.program_abi.records["CompilerFusedProgram"]
+        .fields["steps"].table_columns
+        == steps.table_columns
     )
 
 

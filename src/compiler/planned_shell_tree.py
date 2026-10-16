@@ -13,7 +13,9 @@ def _recursive_callsite_targets(shell: Any) -> dict[int, Any]:
     if graph is None:
         return {}
     page = current_identity_book().page("source_callsite_activation_concordance")
-    owner = str(graph.graph.get("qualified_name") or graph.graph.get("function_name") or "<module>")
+    from .planner_concordance_posts import _callsite_activation_owner
+
+    owner = _callsite_activation_owner(shell.process_graph)
     targets = {}
     for row in page.scope_rows(owner):
         fact = page.latest(row)
@@ -56,15 +58,12 @@ def _walk_planned_shells(
             pending.extend(
                 getattr(current, "function_shells", {}).values()
             )
-        elif (
-            getattr(current, "runtime_closure_only", False)
-            and getattr(current, "_owns_function_shells", False)
-        ):
-            # In runtime-root mode this shell is an administrative owner of
-            # the definition catalogue.  Its executable children are exactly
-            # the submitted activation roots, not every catalogued definition
-            # and not zero children.  Each selected root then exposes its full
-            # explicit callsite tree below.
+        elif getattr(current, "_owns_function_shells", False):
+            # This shell is an administrative owner of the definition
+            # catalogue.  Its executable children are exactly the submitted
+            # activation roots, independently of whether catalogue retention
+            # is runtime-only or complete.  Each selected root then exposes
+            # its full explicit callsite tree below.
             function_shells = getattr(current, "function_shells", {})
             pending.extend(
                 function_shells[int(reference)]

@@ -17,6 +17,163 @@ from .ssa_heap_allocation import heap_release
 from .ssa_object_operations import ObjectOperation, declare_object_helper
 
 
+def _publish_generated_helper(function):
+    """Publish the SSA identities at the writer that installs a helper.
+
+    Object-context helpers are assembled after ordinary control lowering, so
+    they do not pass through ``_ControlSSABuilder._register_sequence_lowering``.
+    They are nevertheless ordinary repository SSA: the helper's function root
+    owns its blocks and formals, and each generated result is caused by its
+    already-published operands (or by that root for a literal/cyclic seed).
+    Record that chain here, before any later geometry-sensitive rewrite sees
+    the function.
+    """
+    from .concordance_declarations import (
+        CELL_SET,
+        CONTROL_CONST,
+        CONTROL_EXPRESSION,
+        CONTROL_SSA_FINISH,
+        SSA_BLOCK,
+        SSA_VALUE,
+        SSABlockKind,
+        SSAValueFact,
+        SSAValueOrigin,
+    )
+    from .identity_concordance import Derived, Mode, Novel, current_identity_book
+    from .precompile_to_ssa import _function_root_cell, _post_ssa_block_geometry
+    from .ssa_record_return_state import function_scope_of
+
+    book = current_identity_book()
+    scope = function_scope_of(function)
+    root = _function_root_cell(book, scope)
+    block_cells = {}
+    for label in function.blocks:
+        row = (scope, str(function.name), str(label))
+        cell = book.latest_ref(SSA_BLOCK, row)
+        if cell is None:
+            cell = book.post(
+                SSA_BLOCK,
+                row,
+                SSABlockKind.SEQUENCE_HELPER,
+                stage=CONTROL_SSA_FINISH,
+                provenance=Derived((root,)),
+                mode=Mode.CONCORD,
+            )
+        block_cells[str(label)] = cell
+
+    for argument in function.args:
+        row = (scope, int(argument.id))
+        if book.latest_ref(SSA_VALUE, row) is None:
+            book.post(
+                SSA_VALUE,
+                row,
+                SSAValueFact(
+                    argument.dtype,
+                    tuple(argument.shape or ()),
+                    SSAValueOrigin.ADOPTED_GRAPH_ID,
+                ),
+                stage=CONTROL_SSA_FINISH,
+                provenance=Derived((root,)),
+                mode=Mode.CONCORD,
+            )
+
+    pending = [
+        (str(label), instruction)
+        for label, block in function.blocks.items()
+        for instruction in block.instrs
+        if instruction.res is not None
+        and book.latest_ref(
+            SSA_VALUE, (scope, int(instruction.res.id)),
+        ) is None
+    ]
+
+    def post_result(label, instruction, *, require_all_operands):
+        result = instruction.res
+        operand_cells = tuple(dict.fromkeys(
+            cell
+            for value in instruction.args
+            if (cell := book.latest_ref(
+                SSA_VALUE, (scope, int(value.id)),
+            )) is not None
+        ))
+        if require_all_operands and len(operand_cells) != len({
+            int(value.id) for value in instruction.args
+        }):
+            return False
+        sources = tuple(dict.fromkeys((
+            *operand_cells,
+            block_cells[label],
+        )))
+        if len(sources) == 1:
+            operand = sources[0]
+        else:
+            ordinal = book.page(CELL_SET).scope_row_count(scope) + 1
+            operand = book.post(
+                CELL_SET,
+                (scope, ordinal),
+                tuple(cell.key for cell in sources),
+                stage=CONTROL_SSA_FINISH,
+                provenance=Derived(sources),
+                mode=Mode.CONCORD,
+            )
+        book.post(
+            SSA_VALUE,
+            (scope, int(result.id)),
+            SSAValueFact(
+                result.dtype,
+                tuple(result.shape or ()),
+                SSAValueOrigin.MINTED,
+            ),
+            stage=CONTROL_SSA_FINISH,
+            provenance=Novel(
+                CONTROL_CONST
+                if str(instruction.op).casefold() in {"const", "constant"}
+                else CONTROL_EXPRESSION,
+                (operand,),
+            ),
+            mode=Mode.CONCORD,
+        )
+        return True
+
+    while pending:
+        retained = []
+        for label, instruction in pending:
+            if not post_result(
+                label, instruction, require_all_operands=True,
+            ):
+                retained.append((label, instruction))
+        if len(retained) == len(pending):
+            # Loop Phi/backedge pairs are mutually causal in SSA. Their exact
+            # helper block is the common producer boundary; publish against
+            # that owner plus every operand already established outside the
+            # cycle, then let the ordinary operand graph retain the cycle.
+            for label, instruction in retained:
+                post_result(
+                    label, instruction, require_all_operands=False,
+                )
+            break
+        pending = retained
+
+    _post_ssa_block_geometry(book, scope, function)
+
+
+def publish_linked_object_context_module(module: IRModule) -> None:
+    """Admit marked object-context helpers into the active compilation book.
+
+    ``lower_object_context`` may run before a source compilation opens its
+    book.  The resulting module is still the exact linked SSA input, but facts
+    written while it was built belong to the earlier book.  Publish those same
+    helper identities at the host-module adoption boundary; later geometry
+    passes then read the active concordance instead of reconstructing an owner.
+    """
+
+    for function in module.functions.values():
+        if function.metadata.get("generated_helper_provenance") == (
+            "object-context"
+        ):
+            _publish_generated_helper(function)
+
+
 def object_type_classes(vocabulary):
     """Resolve only admitted builtin guards, never arbitrary MRO hooks."""
     import builtins
@@ -814,6 +971,8 @@ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_obj
         for function in lowering.functions:
             if function.name in module.functions:
                 raise ValueError(f'duplicate object context helper {function.name}')
+            function.metadata['generated_helper_provenance'] = 'object-context'
+            _publish_generated_helper(function)
             module.functions[function.name] = function
         return lowering.functions[0]
 
@@ -863,10 +1022,12 @@ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_obj
                 instruction.args = [local_by_id.get(value.id, value) for value in instruction.args]
         function = Function(name, [*local_values, *operands], builder.blocks,
             metadata={'object_context': context.to_mapping(),
+                      'generated_helper_provenance': 'object-context',
                       'parameter_names': tuple((f'cell_{value.id}', value.id)
                                                for value in (*values, *operands)),
                       'sequence_array_argument_ids': tuple(value.id for value in values
                           if value.dtype == 'ptr' or value.shape)})
+        _publish_generated_helper(function)
         module.functions[name] = function
         table = SSASequenceTable(owner=name)
         table.register(context.objects)

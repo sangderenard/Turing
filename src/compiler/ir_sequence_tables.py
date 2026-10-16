@@ -1095,6 +1095,443 @@ def lower_sequence_add(
     )
 
 
+def lower_sequence_sort(
+    descriptor: SSASequenceDescriptor,
+    scratch: SSASequenceDescriptor,
+    *,
+    key_column: int = 0,
+    key_mapping: SSASequenceDescriptor | None = None,
+    reverse: bool = False,
+    function_name: str | None = None,
+    first_value_id: int | None = None,
+) -> SSASequenceLowering:
+    """Lower a stable bottom-up merge sort into ordinary repository SSA.
+
+    ``scratch`` is caller-owned resident storage with the same row layout as
+    ``descriptor``.  Every comparison reads one scalar key column, optionally
+    mapping that value through the resident table named by ``key_mapping``,
+    while every move copies the complete row.  Taking the left row on equality
+    preserves source order.
+
+    Status 1 means sorted and status 2 means the scratch arena is too small.
+    The helper neither calls a host sort nor hides an algorithm in a backend.
+    """
+
+    unsupported = _unsupported_destination(descriptor, "sort")
+    if unsupported is not None:
+        return unsupported
+    scratch_unsupported = _unsupported_destination(scratch, "sort_scratch")
+    if scratch_unsupported is not None:
+        return scratch_unsupported
+    if descriptor.sequence_id == scratch.sequence_id:
+        raise ValueError("sequence sort requires distinct scratch storage")
+    if (
+        tuple(descriptor.column_dtypes) != tuple(scratch.column_dtypes)
+        or tuple(descriptor.column_shapes) != tuple(scratch.column_shapes)
+        or len(descriptor.column_value_ids) != len(scratch.column_value_ids)
+    ):
+        raise ValueError("sequence sort scratch must match the row layout")
+    if (
+        descriptor.key_columns
+        or scratch.key_columns
+        or descriptor.live_flags_value_id is not None
+        or scratch.live_flags_value_id is not None
+        or descriptor.child_table_pool is not None
+        or scratch.child_table_pool is not None
+        or any(descriptor.column_shapes)
+        or any(scratch.column_shapes)
+    ):
+        raise ValueError(
+            "sequence sort currently requires dense scalar row columns"
+        )
+    if not 0 <= int(key_column) < len(descriptor.column_value_ids):
+        raise ValueError("sequence sort key column is outside the row layout")
+    key_lookup = None
+    key_value_dtype = descriptor.column_dtypes[int(key_column)]
+    if key_mapping is not None:
+        mapping_values = tuple(
+            column for column in range(len(key_mapping.column_value_ids))
+            if column not in key_mapping.key_columns
+        )
+        if len(key_mapping.key_columns) != 1 or len(mapping_values) != 1:
+            raise ValueError(
+                "sequence sort key mapping requires one key and one value column"
+            )
+        mapping_key = int(key_mapping.key_columns[0])
+        if key_mapping.column_dtypes[mapping_key] != key_value_dtype:
+            raise ValueError(
+                "sequence sort row key and mapping key dtypes must match"
+            )
+        if key_mapping.status_address_id is None:
+            raise ValueError("sequence sort key mapping requires a status cell")
+        key_value_dtype = key_mapping.column_dtypes[mapping_values[0]]
+
+    destination_storage = _storage_values(descriptor)
+    scratch_storage = _storage_values(scratch)
+    key_storage = (
+        (*_storage_values(key_mapping), SSAValue(
+            int(key_mapping.status_address_id), dtype="int", shape=(1,),
+        ))
+        if key_mapping is not None else ()
+    )
+    arguments = tuple({
+        int(value.id): value
+        for value in (*destination_storage, *scratch_storage, *key_storage)
+    }.values())
+    values = {int(value.id): value for value in arguments}
+    builder = _Builder(_first_fresh_identity(
+        descriptor, scratch, *((key_mapping,) if key_mapping is not None else ()),
+        values=arguments, minimum=first_value_id,
+    ))
+    destination_columns = tuple(
+        values[int(value_id)] for value_id in descriptor.column_value_ids
+    )
+    scratch_columns = tuple(
+        values[int(value_id)] for value_id in scratch.column_value_ids
+    )
+
+    entry = builder.block("entry")
+    size_check = builder.block("size_check")
+    pass_header = builder.block("pass_header")
+    run_header = builder.block("run_header")
+    mid_raw = builder.block("mid_raw")
+    mid_length = builder.block("mid_length")
+    mid_merge = builder.block("mid_merge")
+    right_raw = builder.block("right_raw")
+    right_length = builder.block("right_length")
+    right_merge = builder.block("right_merge")
+    merge_header = builder.block("merge_header")
+    merge_compare = builder.block("merge_compare")
+    take_left = builder.block("take_left")
+    take_right = builder.block("take_right")
+    remainder_header = builder.block("remainder_header")
+    remainder_right_check = builder.block("remainder_right_check")
+    remainder_left = builder.block("remainder_left")
+    remainder_right = builder.block("remainder_right")
+    run_latch = builder.block("run_latch")
+    copy_header = builder.block("copy_header")
+    copy_body = builder.block("copy_body")
+    copy_latch = builder.block("copy_latch")
+    pass_latch = builder.block("pass_latch")
+    success = builder.block("success")
+    scratch_small = builder.block("scratch_too_small")
+    result = builder.block("result")
+
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
+    length_slot = builder.fresh("ptr")
+    length = builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr", [
+        values[int(descriptor.length_address_id)], zero,
+    ], length_slot)
+    builder.emit(entry, "Load", [length_slot], length)
+    scratch_fits = builder.fresh("bool")
+    builder.emit(entry, "Ge", [
+        values[int(scratch.capacity_value_id)], length,
+    ], scratch_fits)
+    builder.cond(entry, scratch_fits, size_check, scratch_small)
+
+    needs_sort = builder.fresh("bool")
+    builder.emit(size_check, "Gt", [length, one], needs_sort)
+    builder.cond(size_check, needs_sort, pass_header, success)
+
+    width = builder.fresh("int64")
+    next_width = builder.fresh("int64")
+    builder.emit(pass_header, "Phi", [one, next_width], width, attributes={
+        "incoming_blocks": (size_check.name, pass_latch.name),
+    })
+    another_pass = builder.fresh("bool")
+    builder.emit(pass_header, "Lt", [width, length], another_pass)
+    builder.cond(pass_header, another_pass, run_header, success)
+
+    left = builder.fresh("int64")
+    next_left = builder.fresh("int64")
+    builder.emit(run_header, "Phi", [zero, next_left], left, attributes={
+        "incoming_blocks": (pass_header.name, run_latch.name),
+    })
+    has_run = builder.fresh("bool")
+    builder.emit(run_header, "Lt", [left, length], has_run)
+    builder.cond(run_header, has_run, mid_raw, copy_header)
+
+    candidate_mid = builder.fresh("int64")
+    mid_inside = builder.fresh("bool")
+    builder.emit(mid_raw, "Add", [left, width], candidate_mid)
+    builder.emit(mid_raw, "Lt", [candidate_mid, length], mid_inside)
+    builder.cond(mid_raw, mid_inside, mid_merge, mid_length)
+    builder.branch(mid_length, mid_merge)
+    mid = builder.fresh("int64")
+    builder.emit(mid_merge, "Phi", [candidate_mid, length], mid, attributes={
+        "incoming_blocks": (mid_raw.name, mid_length.name),
+    })
+    candidate_right = builder.fresh("int64")
+    right_inside = builder.fresh("bool")
+    builder.emit(mid_merge, "Add", [mid, width], candidate_right)
+    builder.emit(mid_merge, "Lt", [candidate_right, length], right_inside)
+    builder.cond(mid_merge, right_inside, right_raw, right_length)
+    builder.branch(right_raw, right_merge)
+    builder.branch(right_length, right_merge)
+    right = builder.fresh("int64")
+    builder.emit(right_merge, "Phi", [candidate_right, length], right,
+                 attributes={
+                     "incoming_blocks": (right_raw.name, right_length.name),
+                 })
+    builder.branch(right_merge, merge_header)
+
+    left_index = builder.fresh("int64")
+    right_index = builder.fresh("int64")
+    output_index = builder.fresh("int64")
+    next_left_from_left = builder.fresh("int64")
+    next_right_from_right = builder.fresh("int64")
+    next_output_from_left = builder.fresh("int64")
+    next_output_from_right = builder.fresh("int64")
+    builder.emit(
+        merge_header, "Phi",
+        [left, next_left_from_left, left_index], left_index,
+        attributes={"incoming_blocks": (
+            right_merge.name, take_left.name, take_right.name,
+        )},
+    )
+    builder.emit(
+        merge_header, "Phi",
+        [mid, right_index, next_right_from_right], right_index,
+        attributes={"incoming_blocks": (
+            right_merge.name, take_left.name, take_right.name,
+        )},
+    )
+    builder.emit(
+        merge_header, "Phi",
+        [left, next_output_from_left, next_output_from_right], output_index,
+        attributes={"incoming_blocks": (
+            right_merge.name, take_left.name, take_right.name,
+        )},
+    )
+    left_available = builder.fresh("bool")
+    right_available = builder.fresh("bool")
+    both_available = builder.fresh("bool")
+    builder.emit(merge_header, "Lt", [left_index, mid], left_available)
+    builder.emit(merge_header, "Lt", [right_index, right], right_available)
+    builder.emit(
+        merge_header, "LAnd",
+        [left_available, right_available], both_available,
+    )
+    builder.cond(
+        merge_header, both_available, merge_compare, remainder_header,
+    )
+
+    name = function_name or f"ssa_sequence_{descriptor.sequence_id}_sort"
+    if key_mapping is not None:
+        key_lookup = lower_table_lookup(
+            key_mapping,
+            function_name=f"{name}__key_lookup",
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+            required=True,
+        )
+
+    def load_key(block: BasicBlock, index: SSAValue) -> SSAValue:
+        address = builder.fresh("ptr")
+        value = builder.fresh(descriptor.column_dtypes[int(key_column)])
+        builder.emit(block, "GetElementPtr", [
+            destination_columns[int(key_column)], index,
+        ], address)
+        builder.emit(block, "Load", [address], value)
+        if key_mapping is None:
+            return value
+        mapped = builder.fresh(key_value_dtype)
+        builder.emit(
+            block, "Call", [*key_storage, value], mapped,
+            attributes={
+                "callee": key_lookup.functions[-1].name,
+                "source_linked": True,
+                "ssa_sequence_operation": "sort_key_lookup",
+                "sequence_id": int(key_mapping.sequence_id),
+            },
+        )
+        return mapped
+
+    def copy_row(
+        block: BasicBlock,
+        source_columns: tuple[SSAValue, ...],
+        source_index: SSAValue,
+        target_columns: tuple[SSAValue, ...],
+        target_index: SSAValue,
+    ) -> None:
+        for source, target, dtype in zip(
+            source_columns, target_columns, descriptor.column_dtypes,
+        ):
+            source_address = builder.fresh("ptr")
+            value = builder.fresh(dtype)
+            target_address = builder.fresh("ptr")
+            builder.emit(
+                block, "GetElementPtr", [source, source_index], source_address,
+            )
+            builder.emit(block, "Load", [source_address], value)
+            builder.emit(
+                block, "GetElementPtr", [target, target_index], target_address,
+            )
+            builder.emit(block, "Store", [value, target_address])
+
+    left_key = load_key(merge_compare, left_index)
+    right_key = load_key(merge_compare, right_index)
+    left_precedes = builder.fresh("bool")
+    builder.emit(
+        merge_compare, "Ge" if reverse else "Le",
+        [left_key, right_key], left_precedes,
+    )
+    builder.cond(merge_compare, left_precedes, take_left, take_right)
+
+    copy_row(
+        take_left, destination_columns, left_index,
+        scratch_columns, output_index,
+    )
+    builder.emit(take_left, "Add", [left_index, one], next_left_from_left)
+    builder.emit(take_left, "Add", [output_index, one], next_output_from_left)
+    builder.branch(take_left, merge_header)
+
+    copy_row(
+        take_right, destination_columns, right_index,
+        scratch_columns, output_index,
+    )
+    builder.emit(
+        take_right, "Add", [right_index, one], next_right_from_right,
+    )
+    builder.emit(
+        take_right, "Add", [output_index, one], next_output_from_right,
+    )
+    builder.branch(take_right, merge_header)
+
+    remainder_left_index = builder.fresh("int64")
+    remainder_right_index = builder.fresh("int64")
+    remainder_output_index = builder.fresh("int64")
+    next_remainder_left = builder.fresh("int64")
+    next_remainder_right = builder.fresh("int64")
+    next_remainder_output_left = builder.fresh("int64")
+    next_remainder_output_right = builder.fresh("int64")
+    builder.emit(
+        remainder_header, "Phi",
+        [left_index, next_remainder_left, remainder_left_index],
+        remainder_left_index,
+        attributes={"incoming_blocks": (
+            merge_header.name, remainder_left.name, remainder_right.name,
+        )},
+    )
+    builder.emit(
+        remainder_header, "Phi",
+        [right_index, remainder_right_index, next_remainder_right],
+        remainder_right_index,
+        attributes={"incoming_blocks": (
+            merge_header.name, remainder_left.name, remainder_right.name,
+        )},
+    )
+    builder.emit(
+        remainder_header, "Phi",
+        [output_index, next_remainder_output_left,
+         next_remainder_output_right],
+        remainder_output_index,
+        attributes={"incoming_blocks": (
+            merge_header.name, remainder_left.name, remainder_right.name,
+        )},
+    )
+    left_remains = builder.fresh("bool")
+    builder.emit(
+        remainder_header, "Lt",
+        [remainder_left_index, mid], left_remains,
+    )
+    builder.cond(
+        remainder_header, left_remains,
+        remainder_left, remainder_right_check,
+    )
+
+    right_remains = builder.fresh("bool")
+    builder.emit(
+        remainder_right_check, "Lt",
+        [remainder_right_index, right], right_remains,
+    )
+    builder.cond(
+        remainder_right_check, right_remains, remainder_right, run_latch,
+    )
+
+    copy_row(
+        remainder_left, destination_columns, remainder_left_index,
+        scratch_columns, remainder_output_index,
+    )
+    builder.emit(
+        remainder_left, "Add",
+        [remainder_left_index, one], next_remainder_left,
+    )
+    builder.emit(
+        remainder_left, "Add",
+        [remainder_output_index, one], next_remainder_output_left,
+    )
+    builder.branch(remainder_left, remainder_header)
+
+    copy_row(
+        remainder_right, destination_columns, remainder_right_index,
+        scratch_columns, remainder_output_index,
+    )
+    builder.emit(
+        remainder_right, "Add",
+        [remainder_right_index, one], next_remainder_right,
+    )
+    builder.emit(
+        remainder_right, "Add",
+        [remainder_output_index, one], next_remainder_output_right,
+    )
+    builder.branch(remainder_right, remainder_header)
+
+    twice_width = builder.fresh("int64")
+    builder.emit(run_latch, "Add", [width, width], twice_width)
+    builder.emit(run_latch, "Add", [left, twice_width], next_left)
+    builder.branch(run_latch, run_header)
+
+    copy_index = builder.fresh("int64")
+    next_copy_index = builder.fresh("int64")
+    builder.emit(
+        copy_header, "Phi", [zero, next_copy_index], copy_index,
+        attributes={"incoming_blocks": (run_header.name, copy_latch.name)},
+    )
+    copy_continues = builder.fresh("bool")
+    builder.emit(copy_header, "Lt", [copy_index, length], copy_continues)
+    builder.cond(copy_header, copy_continues, copy_body, pass_latch)
+    copy_row(
+        copy_body, scratch_columns, copy_index,
+        destination_columns, copy_index,
+    )
+    builder.branch(copy_body, copy_latch)
+    builder.emit(copy_latch, "Add", [copy_index, one], next_copy_index)
+    builder.branch(copy_latch, copy_header)
+
+    builder.emit(pass_latch, "Add", [width, width], next_width)
+    builder.branch(pass_latch, pass_header)
+
+    success_status = _status_branch(builder, success, 1, result)
+    scratch_status = _status_branch(builder, scratch_small, 2, result)
+    status = builder.fresh("int")
+    builder.emit(
+        result, "Phi", [success_status, scratch_status], status,
+        attributes={"incoming_blocks": (success.name, scratch_small.name)},
+    )
+    builder.emit(result, "Ret", [status])
+
+    function = Function(name, list(arguments), builder.blocks, metadata={
+        "ssa_sequence_operation": "sort",
+        "sequence_id": int(descriptor.sequence_id),
+        "scratch_sequence_id": int(scratch.sequence_id),
+        "key_column": int(key_column),
+        "key_mapping_sequence_id": (
+            None if key_mapping is None else int(key_mapping.sequence_id)
+        ),
+        "reverse": bool(reverse),
+        "stable": True,
+        "algorithm": "bottom_up_merge_sort",
+        "status_values": {"sorted": 1, "scratch_too_small": 2},
+        "sequence_array_argument_ids": tuple(value.id for value in arguments),
+        "named_outputs": (("status", int(status.id)),),
+    })
+    return SSASequenceLowering((
+        *((key_lookup.functions) if key_lookup is not None else ()), function,
+    ))
+
+
 def lower_sequence_fill(
     descriptor: SSASequenceDescriptor,
     *,
@@ -2069,6 +2506,7 @@ def lower_table_lookup(
     *,
     function_name: str | None = None,
     default_parameter: bool = False,
+    required: bool = False,
     first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Build key lookup for a two-column table and publish found status.
@@ -2173,6 +2611,14 @@ def lower_table_lookup(
             absent, "Const", [], missing_value, attributes={"value": 0},
         )
     builder.emit(absent, "Store", [zero, status_slot])
+    if required:
+        builder.emit(absent, "Call", [], attributes={
+            "callee": "turing_validation_error",
+            "error_code": 84,
+            "source_linked": True,
+            "ssa_sequence_operation": "lookup",
+            "failure": "required_key_absent",
+        })
     builder.branch(absent, result_block)
     result = builder.fresh(value_dtype)
     builder.emit(result_block, "Phi", [found_value, missing_value], result, attributes={
@@ -2198,9 +2644,189 @@ def lower_table_lookup(
                 *((int(descriptor.live_flags_value_id),) if descriptor.live_flags_value_id is not None else ()),
             )),
             "named_outputs": (("value", int(result.id)),),
+            "required": bool(required),
         },
     )
     return SSASequenceLowering((function,))
+
+
+def lower_glyph_token_copy(
+    destination: SSASequenceDescriptor,
+    vocabulary: SSASequenceDescriptor,
+    *,
+    function_name: str | None = None,
+) -> SSASequenceLowering:
+    """Copy one StringTable token's glyph row through keyed resident lookup.
+
+    ``vocabulary`` is the incumbent three-column table keyed by
+    ``(string_token, ordinal)`` with one int64 value column.  Ordinal ``-1``
+    stores the exact glyph count; ordinals ``0..count-1`` store glyph tokens.
+    Unknown tokens return status 0, fixed-capacity exhaustion returns 2, and
+    a complete copy returns 1.  The helper is ordinary CFG/call SSA composed
+    solely from the existing table-lookup and sequence-append operations.
+    """
+
+    if (
+        len(destination.column_value_ids) != 1
+        or destination.key_columns
+        or tuple(destination.column_dtypes) != ("int64",)
+    ):
+        raise ValueError("glyph destination must be one int64 sequence column")
+    if (
+        len(vocabulary.column_value_ids) != 3
+        or tuple(vocabulary.key_columns) != (0, 1)
+        or tuple(vocabulary.column_dtypes) != ("int64", "int64", "int64")
+        or vocabulary.status_address_id is None
+    ):
+        raise ValueError(
+            "glyph vocabulary must be (token, ordinal)->glyph int64 table"
+        )
+    lookup = lower_table_lookup(vocabulary).functions[0]
+    append = lower_sequence_append(destination).functions[0]
+    destination_storage = _storage_values(destination)
+    vocabulary_storage = _storage_values(vocabulary)
+    vocabulary_status = SSAValue(
+        int(vocabulary.status_address_id), dtype="int", shape=(1,),
+    )
+    arguments = tuple({
+        int(value.id): value
+        for value in (
+            *destination_storage,
+            *vocabulary_storage,
+            vocabulary_status,
+        )
+    }.values())
+    builder = _Builder(_first_fresh_identity(
+        destination, vocabulary,
+        values=(*arguments,),
+    ))
+    token = builder.fresh("int64")
+    entry = builder.block("entry")
+    known = builder.block("known")
+    header = builder.block("glyph_header")
+    body = builder.block("glyph_body")
+    append_block = builder.block("glyph_append")
+    latch = builder.block("glyph_latch")
+    complete = builder.block("complete")
+    unknown = builder.block("unknown_token")
+    exhausted = builder.block("capacity_exhausted")
+    result_block = builder.block("result")
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
+    two = builder.const(entry, 2, dtype="int")
+    minus_one = builder.const(entry, -1, dtype="int64")
+
+    destination_length = next(
+        value for value in destination_storage
+        if int(value.id) == int(destination.length_address_id)
+    )
+    destination_length_slot = builder.fresh("ptr")
+    builder.emit(entry, "GetElementPtr", [
+        destination_length, zero,
+    ], destination_length_slot)
+    builder.emit(entry, "Store", [zero, destination_length_slot])
+
+    lookup_storage = [
+        *vocabulary_storage, vocabulary_status,
+    ]
+    length = builder.fresh("int64")
+    builder.emit(entry, "Call", [
+        *lookup_storage, token, minus_one,
+    ], length, attributes={
+        "callee": lookup.name,
+        "source_linked": True,
+        "ssa_sequence_operation": "lookup",
+        "sequence_id": int(vocabulary.sequence_id),
+    })
+    status_slot = builder.fresh("ptr")
+    lookup_status = builder.fresh("int")
+    builder.emit(entry, "GetElementPtr", [
+        vocabulary_status, zero,
+    ], status_slot)
+    builder.emit(entry, "Load", [status_slot], lookup_status)
+    found = builder.fresh("bool")
+    builder.emit(entry, "Eq", [lookup_status, one], found)
+    builder.cond(entry, found, known, unknown)
+    builder.branch(known, header)
+
+    ordinal = builder.fresh("int64")
+    next_ordinal = builder.fresh("int64")
+    builder.emit(header, "Phi", [zero, next_ordinal], ordinal, attributes={
+        "incoming_blocks": (known.name, latch.name),
+    })
+    continues = builder.fresh("bool")
+    builder.emit(header, "Lt", [ordinal, length], continues)
+    builder.cond(header, continues, body, complete)
+    glyph = builder.fresh("int64")
+    builder.emit(body, "Call", [
+        *lookup_storage, token, ordinal,
+    ], glyph, attributes={
+        "callee": lookup.name,
+        "source_linked": True,
+        "ssa_sequence_operation": "lookup",
+        "sequence_id": int(vocabulary.sequence_id),
+    })
+    glyph_status = builder.fresh("int")
+    builder.emit(body, "Load", [status_slot], glyph_status)
+    glyph_found = builder.fresh("bool")
+    builder.emit(body, "Eq", [glyph_status, one], glyph_found)
+    builder.cond(body, glyph_found, append_block, unknown)
+    append_status = builder.fresh("int")
+    builder.emit(append_block, "Call", [
+        *destination_storage, glyph,
+    ], append_status, attributes={
+        "callee": append.name,
+        "source_linked": True,
+        "ssa_sequence_operation": "append",
+        "sequence_id": int(destination.sequence_id),
+    })
+    full = builder.fresh("bool")
+    builder.emit(append_block, "Eq", [append_status, two], full)
+    builder.cond(append_block, full, exhausted, latch)
+    builder.emit(latch, "Add", [ordinal, one], next_ordinal)
+    builder.branch(latch, header)
+    success_value = builder.const(complete, 1)
+    builder.branch(complete, result_block)
+    builder.emit(unknown, "Call", [], attributes={
+        "callee": "turing_validation_error",
+        "error_code": 83,
+        "source_linked": True,
+        "ssa_sequence_operation": "glyph_token_lookup_copy",
+        "failure": "unknown_string_token",
+    })
+    unknown_value = builder.const(unknown, 0)
+    builder.branch(unknown, result_block)
+    exhausted_value = builder.const(exhausted, 2)
+    builder.branch(exhausted, result_block)
+    result = builder.fresh("int")
+    builder.emit(result_block, "Phi", [
+        success_value, unknown_value, exhausted_value,
+    ], result, attributes={
+        "incoming_blocks": (
+            complete.name, unknown.name, exhausted.name,
+        ),
+    })
+    builder.emit(result_block, "Ret", [result])
+    name = function_name or (
+        f"ssa_sequence_{destination.sequence_id}_glyph_token_copy_"
+        f"{vocabulary.sequence_id}"
+    )
+    function = Function(name, [*arguments, token], builder.blocks, metadata={
+        "ssa_sequence_operation": "glyph_token_lookup_copy",
+        "sequence_id": int(destination.sequence_id),
+        "vocabulary_sequence_id": int(vocabulary.sequence_id),
+        "sequence_array_argument_ids": tuple(
+            int(value.id) for value in arguments
+        ),
+        "named_outputs": (("status", int(result.id)),),
+        "status_values": {
+            "unknown_token": 0, "complete": 1,
+            "capacity_exhausted": 2,
+        },
+    })
+    # Dependency helpers precede the public composition entry, matching every
+    # other sequence lowering consumed by ``_register_sequence_lowering``.
+    return SSASequenceLowering((lookup, append, function))
 
 
 def lower_table_store(

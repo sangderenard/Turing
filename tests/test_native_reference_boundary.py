@@ -89,6 +89,15 @@ def test_object_annotation_proves_handle_slots_not_object_payload():
         'duplicates', 1, True, ('opaque_ref',))
 
 
+def test_fixed_tuple_element_annotation_declares_every_sequence_column():
+    assert _authored_sequence_annotation_contract(
+        'list[tuple[int, float]]'
+    ) == ('duplicates', 2, True, ('int64', 'float64'))
+    assert _authored_sequence_annotation_contract(
+        'Sequence[Tuple[bool, int]]'
+    ) == ('duplicates', 2, False, ('bool', 'int64'))
+
+
 def test_conflicting_boundary_row_contract_is_not_silently_overridden():
     import networkx as nx
     graph = nx.DiGraph()

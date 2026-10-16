@@ -61,11 +61,21 @@ def _load_external_checkpoint(store, phase, implementation, directory, artifact,
 
 
 def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None,
-                      max_stage_units=None, schedule_options=None, progress=print):
+                      max_stage_units=None, schedule_options=None,
+                      stop_after_failure=True, progress=print):
     worker_jobs = 12 if jobs is None else int(jobs)
     if worker_jobs < 1:
         raise ValueError('provenance worker count must be positive')
-    stage_units = worker_jobs if max_stage_units is None else max_stage_units
+    # Fail-fast stages remain intentionally small: once a worker reports a
+    # blocker, only the already-admitted peers drain.  A collecting run has a
+    # different policy.  With no explicit stage limit, admit the whole plan
+    # while `jobs` continues to bound concurrency, so one invocation reports
+    # every independent failure instead of five at a time.
+    stage_units = (
+        worker_jobs
+        if max_stage_units is None and stop_after_failure
+        else max_stage_units
+    )
     scheduling = dict(schedule_options or {})
     allowed = {'max_total_resident_bytes', 'minimum_total_resident_bytes',
                'system_reserve_bytes', 'adaptive_memory_ceiling',
@@ -219,7 +229,7 @@ def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None
                     product = compile_resolved_process_graph_plan(
                         growth_root / 'resolved-process-graph.pkl', plan_path,
                         growth_root / 'product', jobs=worker_jobs, max_stage_units=stage_units,
-                        stop_after_failure=True,
+                        stop_after_failure=bool(stop_after_failure),
                         **scheduling,
                         progress=growth_report,
                     )
@@ -364,6 +374,10 @@ def main(argv=None):
                         help='use the original indivisible whole-module lowering')
     parser.add_argument('--jobs', type=int, default=12, help='maximum concurrent isolated workers (default: 12)')
     parser.add_argument('--stage-units', type=int, help='units admitted before draining and restarting (default: jobs)')
+    parser.add_argument(
+        '--continue-after-failure', action='store_true',
+        help='admit the complete scheduled stage and report every failed/partial unit',
+    )
     parser.add_argument('--schedule-json', default='{}', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.grow_stage and args.whole_module:
@@ -387,6 +401,7 @@ def main(argv=None):
             args.output, lower_only=args.lower_only,
             grow_stage=not args.whole_module, jobs=args.jobs,
             max_stage_units=args.stage_units,
+            stop_after_failure=not args.continue_after_failure,
             schedule_options=json.loads(args.schedule_json), progress=present,
         )
     _print_outcome(receipt, args.output, emit=lambda message: print(message, flush=True))

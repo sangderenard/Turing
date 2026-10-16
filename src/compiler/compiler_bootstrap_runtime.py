@@ -212,7 +212,10 @@ class ProvenanceCoreRestartRequired(RuntimeError):
     """A stage is persisted; restart before the next compile or activation."""
 
 
-def ensure_native_provenance_core(directory, *, jobs=None, schedule_options=None, progress=None):
+def ensure_native_provenance_core(
+    directory, *, jobs=None, schedule_options=None,
+    stop_after_failure=True, progress=None,
+):
     """Blocking first stage; no outer compiler workers may start before it."""
     import subprocess
     if provenance_core_state()["backend"] == "native":
@@ -240,10 +243,13 @@ def ensure_native_provenance_core(directory, *, jobs=None, schedule_options=None
     environment[COMPILER_BOOTSTRAP_REGISTRY_ENV] = str(isolated_registry)
     if progress is not None:
         progress("compiler-bootstrap: growing provenance core through SSA enclosures; outer workers blocked")
-    subprocess.run([sys.executable, "-m", "tools.bootstrap_compiler_concordance",
-                    "--grow-stage", "--jobs", str(12 if jobs is None else jobs),
-                    "--schedule-json", json.dumps(dict(schedule_options or {})),
-                    "--output", str(destination)],
+    command = [sys.executable, "-m", "tools.bootstrap_compiler_concordance",
+               "--grow-stage", "--jobs", str(12 if jobs is None else jobs),
+               "--schedule-json", json.dumps(dict(schedule_options or {}))]
+    if not stop_after_failure:
+        command.append("--continue-after-failure")
+    command.extend(("--output", str(destination)))
+    subprocess.run(command,
                    cwd=Path(__file__).resolve().parents[2], env=environment, check=True)
     receipt = json.loads((destination / "compartment.json").read_text(encoding="utf-8"))
     if receipt.get("stage") == "native-growth-stage-persisted":

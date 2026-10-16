@@ -824,6 +824,14 @@ class ProgramABIContract:
                     column = {
                         "name": name,
                         "dtype": str(row_field.dtype or "opaque_ref"),
+                        # Column descriptors normalize rank explicitly.  The
+                        # table-field parser does the same for an authored
+                        # column without a shape, so the derived row-record
+                        # view must retain the scalar's exact rank as well.
+                        # Otherwise ``receipt()`` cannot be consumed again:
+                        # parsing adds rank 0 and the strict row-record join
+                        # then sees two spellings of the same schema.
+                        "rank": int(row_field.rank),
                     }
                     if row_field.token_vocabulary is not None:
                         column["token_vocabulary"] = row_field.token_vocabulary

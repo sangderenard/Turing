@@ -138,6 +138,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "cell_set": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "class_declaration": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "class_field_declaration": PageLifecycle(CLOSURE, LOWERING, LOWERING),
+    "source_record_view_schema": PageLifecycle(CLOSURE, LOWERING, LOWERING),
     "class_method_declaration": PageLifecycle(CLOSURE, None, CLOSURE),
     "compile_policy": PageLifecycle(LOWERING, LOWERING, None),
     "concordance_dependents": PageLifecycle(None, None, None),

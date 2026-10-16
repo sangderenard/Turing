@@ -14,6 +14,7 @@ import pytest
 
 from src.common.tensors.topological_reducer import (
     _concorded_static_parameter_bindings,
+    _concord_source_value_class,
     reduce_abstract_tensor_topology,
 )
 from src.common.tensors.extended_precision import ComplexPrecision
@@ -50,6 +51,108 @@ class _StaticClassMethodFactory:
     @classmethod
     def make(cls, value):
         return cls(value)
+
+
+def test_concorded_value_class_retains_every_provenance_edge():
+    from src.compiler.concordance_declarations import SOURCE_VALUE_CLASS
+    from src.compiler.identity_concordance import Derived
+    from src.transmogrifier.graph.graph_express2 import post_source_span
+
+    module = ast.parse("left = 1\nright = 2\n")
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    left = post_source_span(None, module.body[0])
+    right = post_source_span(None, module.body[1])
+    assert left is not None
+    assert right is not None
+
+    scope = ("<string>", "probe")
+    _concord_source_value_class(
+        scope, 1, "Field", source="left",
+        provenance=Derived((left,)),
+    )
+    _concord_source_value_class(
+        scope, 1, "Field", source="right",
+        provenance=Derived((right,)),
+    )
+
+    book = current_identity_book()
+    target = book.latest_ref(SOURCE_VALUE_CLASS, (scope, 1))
+    assert target is not None
+    predecessors = {
+        source for source, _stage in book.edges_into(target)
+    }
+    assert left in predecessors
+    assert right in predecessors
+
+
+def test_concorded_primitive_class_has_one_canonical_identity():
+    from src.compiler.concordance_declarations import SOURCE_VALUE_CLASS
+    from src.compiler.identity_concordance import Derived
+    from src.transmogrifier.graph.graph_express2 import post_source_span
+
+    module = ast.parse("annotated = 1\npropagated = 2\n")
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    annotation = post_source_span(None, module.body[0])
+    call_actual = post_source_span(None, module.body[1])
+    scope = ("<string>", "callee")
+
+    _concord_source_value_class(
+        scope, 0, "builtins.str", source="parameter annotation",
+        provenance=Derived((annotation,)),
+    )
+    _concord_source_value_class(
+        scope, 0, "str", source="call actual",
+        provenance=Derived((call_actual,)),
+    )
+
+    book = current_identity_book()
+    assert book.page(SOURCE_VALUE_CLASS).latest((scope, 0))[:2] == (
+        "str", 1,
+    )
+    target = book.latest_ref(SOURCE_VALUE_CLASS, (scope, 0))
+    assert {annotation, call_actual}.issubset({
+        source for source, _stage in book.edges_into(target)
+    })
+
+
+def test_staticmethod_receiver_is_not_bound_to_first_formal_class():
+    from src.compiler.concordance_declarations import SOURCE_VALUE_CLASS
+    from src.common.tensors.topological_reducer import _source_numeric_scope
+
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Table:
+    @staticmethod
+    def helper(name: str, value):
+        return name
+
+    def findings(self, name: str, value):
+        return self.helper(str(name), value)
+
+def run(table: Table, name: str, value):
+    return table.findings(name, value)
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    helper = graph.function_table.entry("Table.helper").graph.G
+    name_id = next(
+        int(node_id)
+        for node_id, data in helper.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "name"
+    )
+    assert helper.graph["method_binding"] == "static"
+    assert current_identity_book().page(SOURCE_VALUE_CLASS).latest((
+        _source_numeric_scope(helper), name_id,
+    ))[:2] == ("str", 1)
 
 
 def test_python_named_integer_becomes_plain_constant_with_origin_metadata():
@@ -1099,6 +1202,12 @@ class Graph:
 
 
 def test_method_resolution_follows_an_authored_function_returned_class():
+    from src.compiler.concordance_declarations import (
+        SOURCE_CALL_RESULT_IDENTITY,
+        SOURCE_VALUE_CLASS,
+    )
+    from src.common.tensors.topological_reducer import _source_numeric_scope
+
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(
         """
@@ -1134,6 +1243,121 @@ def run(value):
     assert calls["worker.apply(value)"]["attributes"]["method_ref"] == (
         method_ref
     )
+    build_call_id = next(
+        int(node_id)
+        for node_id, data in run_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and ast.unparse(data["expr_obj"]) == "build_worker()"
+    )
+    book = current_identity_book()
+    result_identity = book.latest_ref(
+        SOURCE_CALL_RESULT_IDENTITY,
+        (_source_numeric_scope(run_graph.G), build_call_id),
+    )
+    value_class = book.latest_ref(
+        SOURCE_VALUE_CLASS,
+        (_source_numeric_scope(run_graph.G), build_call_id),
+    )
+    assert result_identity is not None
+    assert value_class is not None
+    assert result_identity in {
+        source for source, _stage in book.edges_into(value_class)
+    }
+
+
+def test_call_formal_class_projection_is_predecessor_closed():
+    from src.compiler.concordance_declarations import (
+        CLASS_DECLARATION,
+        CLASS_FIELD_DECLARATION,
+        SOURCE_VALUE_CLASS,
+    )
+    from src.common.tensors.topological_reducer import _source_numeric_scope
+
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Field:
+    limit: int
+
+    def admits(self, value):
+        return value > self.limit
+
+def check(field: Field, value):
+    return field.admits(value)
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    caller = graph.function_table.entry("check").graph.G
+    callee = graph.function_table.entry("Field.admits").graph.G
+    actual_id = next(
+        int(node_id)
+        for node_id, data in caller.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "field"
+    )
+    formal_id = next(
+        int(node_id)
+        for node_id, data in callee.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "self"
+    )
+    book = current_identity_book()
+    actual = book.latest_ref(
+        SOURCE_VALUE_CLASS, (_source_numeric_scope(caller), actual_id),
+    )
+    formal = book.latest_ref(
+        SOURCE_VALUE_CLASS, (_source_numeric_scope(callee), formal_id),
+    )
+    declared = book.latest_ref(
+        CLASS_DECLARATION, ("<string>", "Field"),
+    )
+    field = book.latest_ref(
+        CLASS_FIELD_DECLARATION, ("<string>", "Field", "limit"),
+    )
+    assert actual is not None
+    assert formal is not None
+    assert declared is not None
+    assert field is not None
+
+    def predecessors(cell):
+        reached = set()
+        pending = [cell]
+        while pending:
+            current = pending.pop()
+            for source, _stage in book.edges_into(current):
+                if source not in reached:
+                    reached.add(source)
+                    pending.append(source)
+        return reached
+
+    assert actual in predecessors(formal)
+    assert declared in predecessors(actual)
+    assert field in predecessors(declared)
+
+    from src.compiler.project_compilation_product import (
+        project_process_graph_acceptance,
+    )
+
+    callee_reference = graph.function_table.entry("Field.admits").reference
+    projected = project_process_graph_acceptance(
+        graph, (callee_reference.address,), book=book,
+    )
+    assert projected.latest_ref(
+        SOURCE_VALUE_CLASS, (_source_numeric_scope(callee), formal_id),
+    ) is not None
+    assert projected.latest_ref(
+        SOURCE_VALUE_CLASS, (_source_numeric_scope(caller), actual_id),
+    ) is not None
+    assert projected.latest_ref(
+        CLASS_DECLARATION, ("<string>", "Field"),
+    ) is not None
+    assert projected.latest_ref(
+        CLASS_FIELD_DECLARATION, ("<string>", "Field", "limit"),
+    ) is not None
 
 
 def test_generic_formal_accepts_distinct_record_variants_without_class_stamp():
@@ -1226,6 +1450,41 @@ class Builder:
     assert effect["sequence_policy"] == "unique"
 
 
+def test_bare_frozenset_field_annotation_retains_membership_storage():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Projection:
+    excluded: frozenset
+
+    def excludes(self, node):
+        return node in self.excluded
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("excludes").graph
+    field_id, field = next(
+        (node_id, data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and ast.unparse(data["expr_obj"]) == "self.excluded"
+    )
+    membership = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Compare)
+    )
+
+    assert field["attributes"]["aggregate_kind"] == "frozenset"
+    assert field["attributes"]["sequence_key_columns"] == (0,)
+    assert field["attributes"]["sequence_writable"] is False
+    assert (field_id, "rhs") in membership["parents"]
+
+
 def test_setdefault_result_retains_nested_collection_identity_in_a_loop():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(
@@ -1257,6 +1516,39 @@ def group_rows(rows):
     assert effects["setdefault"]["effect_mode"] == "mapping_mutation"
     assert effects["add"]["effect_mode"] == "sequence_mutation"
     assert effects["add"]["sequence_policy"] == "unique"
+
+
+def test_local_aggregate_annotations_classify_loop_mutations():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def rebuild(state):
+    row_columns: dict = state["row_columns"]
+    scopes: dict = state["scopes"]
+    columns: list
+    for row in state["rows"]:
+        row_columns.setdefault(row, [])
+        scopes.setdefault(row, {})
+    for columns in row_columns.values():
+        columns.sort()
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("rebuild").graph.G
+    effects = {
+        effect["operator"]: effect
+        for _node_id, data in function_graph.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+        for effect in (data.get("attributes") or {}).get(
+            "loop_state_effects", ()
+        )
+    }
+    assert effects["setdefault"]["effect_mode"] == "mapping_mutation"
+    assert effects["sort"]["effect_mode"] == "sequence_mutation"
 
 
 def test_imported_dataclass_field_factory_is_a_record_aggregate_contract():

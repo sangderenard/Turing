@@ -58,6 +58,17 @@ class StringTable:
         """Return the word's token, recording token -> text for reverse lookup."""
         token = string_token(text)
         self._entries.setdefault(token, text)
+        from .concordance_declarations import (
+            INGESTION, STRING_TABLE_ENTRY, STRING_TABLE_INGESTION,
+        )
+        from .identity_concordance import Mode, Novel, current_identity_book
+
+        current_identity_book().post(
+            STRING_TABLE_ENTRY, (int(token),), str(text),
+            stage=INGESTION,
+            provenance=Novel(STRING_TABLE_INGESTION, ()),
+            mode=Mode.CONCORD,
+        )
         return token
 
     def get(self, token: int) -> str | None:
@@ -67,6 +78,22 @@ class StringTable:
     def entries(self) -> Mapping[int, str]:
         return dict(self._entries)
 
+    def publish_entries(self, *, book, stage) -> tuple:
+        """Publish the exact loaded/interned vocabulary as ingestion facts."""
+
+        from .concordance_declarations import STRING_TABLE_ENTRY
+
+        cells = []
+        for token, text in sorted(self._entries.items()):
+            cell = book.latest_ref(STRING_TABLE_ENTRY, (int(token),))
+            if cell is None:
+                raise ValueError(
+                    "StringTable entry lacks its ingestion concordance cell: "
+                    f"token={int(token)} text={text!r}"
+                )
+            cells.append(cell)
+        return tuple(cells)
+
     def _load(self) -> None:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -74,7 +101,8 @@ class StringTable:
             return
         for token, text in data.get("strings", {}).items():
             try:
-                self._entries[int(token)] = str(text)
+                if int(token) == string_token(str(text)):
+                    self.intern(str(text))
             except (TypeError, ValueError):
                 continue
 

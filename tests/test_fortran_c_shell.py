@@ -1576,19 +1576,81 @@ def run(key):
         if instruction.op == "Call"
         and instruction.attributes.get("source_linked")
     ]
-    assert [instruction.attributes["callee"] for instruction in calls] == [
-        "constructed_record_order____init__",
-        "constructed_record_order__has",
+    records = tuple(module.call_table[run_name])
+    assert [record.callee_name for record in records] == ["__init__", "has"]
+    assert [
+        (
+            instruction.attributes.get("callee_reference"),
+            instruction.attributes.get("plan_callsite_id"),
+        )
+        for instruction in calls
+    ] == [
+        (record.callee_reference, record.callsite_id)
+        for record in records
     ]
     record = next(iter(module.record_tables[run_name].records.values()))
     storage_ids = record.fields[0].value_ids
-    assert tuple(value.id for value in calls[0].args) == storage_ids
-    assert tuple(value.id for value in calls[1].args[1:]) == storage_ids
+    constructor_storage = tuple(
+        int(source)
+        for _formal, kind, source in records[0].frame_bindings
+        if kind == "caller_storage" and int(source) in set(storage_ids)
+    )
+    assert constructor_storage
+    assert set(constructor_storage).issubset(storage_ids)
+    method_storage = tuple(value.id for value in calls[1].args[1:])
+    assert method_storage
+    assert set(method_storage).issubset(storage_ids)
     assert not any(
         item.resolution == "unresolved"
         for records in module.call_table.values()
         for item in records
     )
+
+
+def test_conditional_constructor_call_is_the_carried_arm_producer():
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = """
+class Box:
+    def __init__(self, detached=False):
+        self.detached = detached
+
+def run(flag):
+    box = None
+    if flag:
+        box = Box(detached=True)
+    return box
+"""
+    policy = ExtractionContract(CONTRACT).with_program_abi({
+        "bindings": [],
+        "values": [{
+            "function": "run", "parameter": "flag", "storage": "scalar",
+            "dtype": "bool", "rank": 0, "python_type": "builtins.bool",
+        }],
+    })
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "run", name="conditional_constructor",
+        extraction_contract=policy, progress=lambda _message: None,
+    )
+    function = module.functions[exports[0]]
+    calls = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("plan_callsite_id") is not None
+    ]
+    carried = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Phi"
+        and instruction.attributes.get("binding") == "conditional_carried"
+    ]
+    assert len(calls) == 1
+    assert len(carried) == 1
+    assert carried[0].args[0].id == calls[0].attributes["plan_callsite_id"]
 
 
 def test_two_constructed_records_have_distinct_arenas_and_constructor_values():
@@ -1625,19 +1687,46 @@ def run(left, right):
     first_storage = records[0].fields[0].value_ids
     second_storage = records[1].fields[0].value_ids
     assert set(first_storage).isdisjoint(second_storage)
+    constructor_records = [
+        record
+        for record in module.call_table[run_name]
+        if record.callee_name == "__init__"
+    ]
+    assert len(constructor_records) == 2
     calls = [
         instruction
         for block in module.functions[run_name].blocks.values()
         for instruction in block.instrs
         if instruction.op == "Call"
-        and instruction.attributes.get("callee")
-        == "two_constructed_records____init__"
+        and instruction.attributes.get("callee_reference")
+        in {record.callee_reference for record in constructor_records}
+        and instruction.attributes.get("plan_callsite_id")
+        in {record.callsite_id for record in constructor_records}
     ]
     assert len(calls) == 2
-    assert calls[0].args[0].id == 1
-    assert calls[1].args[0].id == 2
-    assert set(value.id for value in calls[0].args[1:]) == set(first_storage)
-    assert set(value.id for value in calls[1].args[1:]) == set(second_storage)
+    authored_values = {
+        tuple(
+            caller_id
+            for caller_id, callee_id in record.argument_bindings
+            if caller_id != record.callsite_id
+        )
+        for record in constructor_records
+    }
+    assert authored_values == {(1,), (2,)}
+    storage_by_callsite = {
+        record.callsite_id: {
+            source_id
+            for _callee_id, kind, source_id in record.frame_bindings
+            if kind == "caller_storage"
+        }
+        for record in constructor_records
+    }
+    assert set(first_storage) <= storage_by_callsite[calls[0].attributes[
+        "plan_callsite_id"
+    ]]
+    assert set(second_storage) <= storage_by_callsite[calls[1].attributes[
+        "plan_callsite_id"
+    ]]
 
 
 def test_non_escaping_constructor_inside_loop_reuses_arena_in_loop_body():
@@ -1748,16 +1837,20 @@ def run(count):
     body = module.functions[
         "escaping_loop_constructor__run"
     ].blocks["loop_body"]
-    calls = [
-        instruction.op == "Call"
-        and instruction.attributes.get("callee")
-        for instruction in body.instrs
+    constructor_index = next(
+        index for index, instruction in enumerate(body.instrs)
         if instruction.op == "Call"
-    ]
-    assert calls[:2] == [
-        "escaping_loop_constructor____init__",
-        "ssa_sequence_3_append",
-    ]
+        and instruction.attributes.get("plan_callsite_id")
+        == constructors[0].callsite_id
+        and instruction.attributes.get("callee_reference")
+        == constructors[0].callee_reference
+    )
+    append_index = next(
+        index for index, instruction in enumerate(body.instrs)
+        if instruction.attributes.get("ssa_sequence_operation") == "append"
+        and instruction.attributes.get("sequence_id") == 3
+    )
+    assert constructor_index < append_index
     append = next(
         instruction for instruction in body.instrs
         if instruction.attributes.get("ssa_sequence_operation") == "append"
@@ -2103,6 +2196,57 @@ def run(key, value):
         for block in function.blocks.values()
         for instruction in block.instrs
     )
+
+
+def test_whole_object_table_get_consumed_by_control_has_a_lookup_producer():
+    from src.common.tensors.accelerator_backends.aot_compile import (
+        compile_ast_aot,
+    )
+    from src.compiler.fortran_c_shell import _class_surface_ssa_program
+
+    source = """
+class Store:
+    def __init__(self):
+        self.table = {}
+
+    def choose(self, key, alternate):
+        primary = self.table.get(key)
+        secondary = self.table.get(alternate)
+        value = primary or secondary
+        if value is not None:
+            return value
+        return 0.0
+
+def run(key, alternate):
+    return Store().choose(key, alternate)
+"""
+    compilation = compile_ast_aot(
+        source,
+        "run",
+        {"key": 1.0, "alternate": 2.0},
+        precompile_only=True,
+        bake_mode="whole_program",
+        require_planned_shells=True,
+        project_captured_hierarchy=False,
+    )
+    module, _outputs, _exports = _class_surface_ssa_program(
+        compilation, "table_get_control"
+    )
+    choose = next(
+        function for name, function in module.functions.items()
+        if name.startswith("table_get_control__choose")
+    )
+    lookups = [
+        instruction
+        for block in choose.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "lookup"
+    ]
+    assert len(lookups) == 2
+    argument_ids = {int(argument.id) for argument in choose.args}
+    assert not {
+        int(instruction.res.id) for instruction in lookups
+    }.intersection(argument_ids)
 
 
 def test_whole_object_if_assignment_lowers_to_conditional_phi_merge():

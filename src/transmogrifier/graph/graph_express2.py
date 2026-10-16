@@ -4,6 +4,7 @@ import numpy as np
 import ast
 import builtins
 import copy
+import hashlib
 from fnmatch import fnmatchcase
 import importlib
 import inspect
@@ -142,6 +143,36 @@ def _source_definition_identity(definition):
     if module_name is None or qualname is None:
         return None
     return str(module_name), str(qualname)
+
+
+def _source_module_identity(tree: ast.AST, filename=None) -> str:
+    """Return the exact module scope for one submitted source tree.
+
+    An explicit authored filename wins.  An already-scoped tree keeps its
+    producer's identity.  A bare in-memory tree is addressed by its syntax;
+    ``<string>`` is only a parser sentinel and is never a shared identity.
+    Kept here so pre-ingestion declaration consumers and ``build_from_ast``
+    stamp the same scope instead of either reconstructing it later.
+    """
+
+    source_module_identity = (
+        str(filename)
+        if filename is not None and str(filename) != "<string>"
+        else getattr(tree, "_turing_source_module", None)
+    )
+    if source_module_identity == "<string>":
+        source_module_identity = None
+    if source_module_identity is None:
+        source_module_identity = (
+            "<string:"
+            + hashlib.sha256(
+                ast.dump(
+                    tree, annotate_fields=True, include_attributes=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            + ">"
+        )
+    return str(source_module_identity)
 
 
 def _annotate_visual_source_owners(tree: ast.AST, *, module_name=None):
@@ -1145,7 +1176,7 @@ def post_source_span(owner_definition, node, *, stage=None, source_cells=None):
     )
 
 
-def _class_schema_from_ast(definition):
+def _class_schema_from_ast(definition, *, carried_declarations=False):
     """Record only class syntax already being ingested by ``ProcessGraph``.
 
     This is descriptive AST metadata: attributes and direct method definitions
@@ -1164,7 +1195,8 @@ def _class_schema_from_ast(definition):
 
     from ...compiler.concordance_declarations import (
         CLASS_DECLARATION, CLASS_FIELD_DECLARATION, CLASS_METHOD_DECLARATION,
-        ClassFact, FieldFact, INGESTION, MethodFact,
+        SOURCE_ENUM_GLYPH_TABLE, ClassFact, FieldFact, INGESTION, MethodFact,
+        SourceEnumGlyphTable, SourceEnumMember,
     )
     from ...compiler.identity_concordance import (
         Derived, Mode, current_identity_book,
@@ -1257,12 +1289,14 @@ def _class_schema_from_ast(definition):
         return schema
     book = current_identity_book()
     module_name = class_span.row[0]
+    class_fact = ClassFact(str(definition.name), ())
     book.post(
         CLASS_DECLARATION, (module_name, str(class_identity)),
-        ClassFact(str(definition.name), ()),
+        class_fact,
         stage=INGESTION, provenance=Derived((class_span,)),
         mode=Mode.CONCORD,
     )
+    declaration_cells = []
     for attribute in attributes:
         name = attribute["name"]
         cells = tuple(
@@ -1274,25 +1308,108 @@ def _class_schema_from_ast(definition):
         )
         if not cells:
             continue
-        book.post(
-            CLASS_FIELD_DECLARATION,
-            (module_name, str(class_identity), str(name)),
-            FieldFact(
-                str(attribute["storage"]),
-                str(attribute["annotation"] or ""),
-                tuple(attribute["permissions"]),
-            ),
-            stage=INGESTION, provenance=Derived(cells), mode=Mode.CONCORD,
+        field_row = (
+            module_name, str(class_identity), str(name),
         )
+        field_fact = FieldFact(
+            str(attribute["storage"]),
+            str(attribute["annotation"] or ""),
+            tuple(attribute["permissions"]),
+        )
+        incumbent_cell = book.latest_ref(
+            CLASS_FIELD_DECLARATION, field_row,
+        )
+        incumbent_fact = (
+            None if incumbent_cell is None else
+            book.page(CLASS_FIELD_DECLARATION).cell(
+                incumbent_cell.row, incumbent_cell.column,
+            )
+        )
+        # A projected dependency ClassDef can retain an ``__init__``
+        # assignment after its annotation AST has been narrowed or lowered.
+        # The earlier complete-source declaration is authoritative.  An
+        # explicit carried-declaration survey consumes that exact cell rather
+        # than reinterpreting the projected annotation as new source.
+        if carried_declarations and isinstance(incumbent_fact, FieldFact):
+            field_fact = incumbent_fact
+            cells = tuple(dict.fromkeys((*cells, incumbent_cell)))
+        declaration_cells.append(book.post(
+            CLASS_FIELD_DECLARATION,
+            field_row,
+            field_fact,
+            stage=INGESTION, provenance=Derived(cells), mode=Mode.CONCORD,
+        ))
     for method, entry in zip(methods, schema["methods"]):
         method_span = post_source_span(definition, method)
         if method_span is None:
             continue
-        book.post(
+        declaration_cells.append(book.post(
             CLASS_METHOD_DECLARATION,
             (module_name, str(class_identity), str(method.name)),
             MethodFact(entry["graph_identity"], tuple(entry["parameters"])),
             stage=INGESTION, provenance=Derived((method_span,)),
+            mode=Mode.CONCORD,
+        ))
+    enum_base = next((
+        base_identity
+        for base in definition.bases
+        if (base_identity := _ast_qualified_name(base)) is not None
+        and base_identity.rsplit(".", 1)[-1] in {"Enum", "IntEnum"}
+    ), None)
+    if enum_base is not None:
+        from ...compiler.string_table import string_token
+
+        enum_members = []
+        enum_sources = [class_span]
+        for member in definition.body:
+            if not (
+                isinstance(member, ast.Assign)
+                and len(member.targets) == 1
+                and isinstance(member.targets[0], ast.Name)
+                and isinstance(member.value, ast.Constant)
+                and isinstance(member.value.value, (str, int))
+                and not isinstance(member.value.value, bool)
+            ):
+                continue
+            member_cell = post_source_span(definition, member)
+            if member_cell is None:
+                continue
+            runtime_value = (
+                string_token(member.value.value)
+                if isinstance(member.value.value, str)
+                else int(member.value.value)
+            )
+            member_identity = str(member.targets[0].id)
+            enum_members.append(SourceEnumMember(
+                member_identity=member_identity,
+                runtime_value=int(runtime_value),
+                name_token=int(string_token(member_identity)),
+                source_cell=member_cell,
+            ))
+            enum_sources.append(member_cell)
+        if enum_members:
+            declaration_cells.append(book.post(
+                SOURCE_ENUM_GLYPH_TABLE,
+                (module_name, str(class_identity)),
+                SourceEnumGlyphTable(
+                    enum_identity=str(class_identity),
+                    base_identity=str(enum_base),
+                    members=tuple(enum_members),
+                ),
+                stage=INGESTION,
+                provenance=Derived(tuple(dict.fromkeys(enum_sources))),
+                mode=Mode.CONCORD,
+            ))
+    if declaration_cells:
+        # The class cell is the declaration closure, not merely the ClassDef
+        # header.  Re-posting the concordant fact records the field/method
+        # cells as additional predecessors without creating a competing
+        # identity or revision.  A projected class therefore cannot retain
+        # its name while cutting away the declarations that define it.
+        book.post(
+            CLASS_DECLARATION, (module_name, str(class_identity)),
+            class_fact, stage=INGESTION,
+            provenance=Derived((class_span, *declaration_cells)),
             mode=Mode.CONCORD,
         )
     return schema
@@ -1375,7 +1492,7 @@ def _map_ir_from_ast(tree):
     """
 
     from ...compiler.concordance_declarations import (
-        ANNOTATION_DECLARATION, AnnotationFact, INGESTION,
+        ANNOTATION_DECLARATION, CLASS_DECLARATION, AnnotationFact, INGESTION,
     )
     from ...compiler.identity_concordance import (
         Derived, Mode, current_identity_book,
@@ -1403,13 +1520,51 @@ def _map_ir_from_ast(tree):
         }
         span = post_source_span(owner, statement)
         if span is not None:
-            book.post(
+            annotation_sources = [span]
+            try:
+                annotation_expression = ast.parse(
+                    entry["annotation"], mode="eval",
+                ).body
+            except SyntaxError:
+                annotation_expression = None
+            if annotation_expression is not None:
+                for name in dict.fromkeys(
+                    node.id for node in ast.walk(annotation_expression)
+                    if isinstance(node, ast.Name)
+                ):
+                    declared_class = book.latest_ref(
+                        CLASS_DECLARATION, (span.row[0], str(name)),
+                    )
+                    if declared_class is not None:
+                        annotation_sources.append(declared_class)
+            annotation_cell = book.post(
                 ANNOTATION_DECLARATION,
                 (span.row[0], str(span.row[1]), str(statement.target.id)),
                 AnnotationFact(entry["annotation"], entry["value"] or ""),
-                stage=INGESTION, provenance=Derived((span,)),
+                stage=INGESTION,
+                provenance=Derived(tuple(dict.fromkeys(annotation_sources))),
                 mode=Mode.CONCORD,
             )
+            if isinstance(owner, ast.ClassDef):
+                owner_row = source_span_row(owner, owner)
+                class_row = (
+                    None if owner_row is None
+                    else (owner_row[0], str(owner_row[1]))
+                )
+                class_fact = (
+                    None if class_row is None
+                    else book.page(CLASS_DECLARATION).latest(class_row)
+                )
+                if class_fact is not None:
+                    # Class-field annotations are part of the class
+                    # declaration closure.  This edge also carries nested
+                    # declared types reached through the annotation cell.
+                    book.post(
+                        CLASS_DECLARATION, class_row, class_fact,
+                        stage=INGESTION,
+                        provenance=Derived((annotation_cell,)),
+                        mode=Mode.CONCORD,
+                    )
         return entry
 
     objects = tuple(
@@ -1799,7 +1954,9 @@ def _resolved_ast_literal(node, bindings):
     organize an immutable table from earlier scalar constants, though, and
     treating that table as a runtime external severs its source semantics at
     every compiled function boundary.  This evaluator remains deliberately
-    non-executing: there are no attributes, subscripts, calls, or comprehensions.
+    non-executing: the only calls admitted are the builtin collection
+    constructors applied to already-resolved literal structure; there are no
+    attributes, subscripts, arbitrary calls, or comprehensions.
     """
 
     if isinstance(node, ast.Constant):
@@ -1834,6 +1991,30 @@ def _resolved_ast_literal(node, bindings):
         try:
             return dict(zip(keys, values))
         except TypeError:
+            return _UNRESOLVED_LITERAL
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"tuple", "list", "set", "frozenset", "dict"}
+        and not node.keywords
+        and len(node.args) <= 1
+    ):
+        argument = (
+            () if not node.args
+            else _resolved_ast_literal(node.args[0], bindings)
+        )
+        if argument is _UNRESOLVED_LITERAL:
+            return _UNRESOLVED_LITERAL
+        constructor = {
+            "tuple": tuple,
+            "list": list,
+            "set": set,
+            "frozenset": frozenset,
+            "dict": dict,
+        }[node.func.id]
+        try:
+            return constructor(argument)
+        except (TypeError, ValueError):
             return _UNRESOLVED_LITERAL
     if isinstance(node, ast.UnaryOp):
         operand = _resolved_ast_literal(node.operand, bindings)
@@ -2601,6 +2782,7 @@ def _expand_unresolved_ast_parents(
     package=None,
     include=None,
     pursuit_roots=None,
+    activation_roots=None,
     dependency_seed_definitions=(),
     latent_dependency_seed_definitions=(),
     tensor_code_references=None,
@@ -2970,6 +3152,9 @@ def _expand_unresolved_ast_parents(
     mark_source_pursuit_active = _mark_source_pursuit_active
 
     roots = tuple(dict.fromkeys(map(str, pursuit_roots or ())))
+    requested_activation_roots = tuple(dict.fromkeys(map(
+        str, activation_roots or roots,
+    )))
     if roots:
         root_definitions = tuple(root_definition(root) for root in roots)
         missing_roots = tuple(
@@ -3034,17 +3219,43 @@ def _expand_unresolved_ast_parents(
 
     pursuit_book = current_identity_book()
 
-    def seed_demand(index):
-        if roots:
+    activation_definition_demands = {
+        id(definition): root
+        for root in requested_activation_roots
+        for definition in (root_definition(root),)
+        if definition is not None
+    }
+
+    def seed_demand(index, definition):
+        activation_root = activation_definition_demands.get(id(definition))
+        if activation_root is not None:
             demand = pursuit_book.latest_ref(
-                CONTRACT_DEMAND_PAGE, (DemandKind.PURSUIT_ROOT, roots[index]),
+                CONTRACT_DEMAND_PAGE,
+                (DemandKind.PURSUIT_ROOT, activation_root),
             )
             if demand is not None:
                 return demand
+        if roots:
+            # ``pursuit_roots`` can include compiler-retained definitions
+            # whose calls are synthesized only after source pursuit.  When
+            # the caller supplied the separate activation-root contract,
+            # retaining one of those definitions must not derive its
+            # activation cell from a PURSUIT_ROOT demand and thereby publish
+            # it as a public executable root.
+            if activation_roots is None:
+                demand = pursuit_book.latest_ref(
+                    CONTRACT_DEMAND_PAGE,
+                    (DemandKind.PURSUIT_ROOT, roots[index]),
+                )
+                if demand is not None:
+                    return demand
+            return post_source_span(definition, definition, stage=PURSUIT)
         return post_source_span(module, module, stage=PURSUIT)
 
     for index, definition in enumerate(active_seed_definitions):
-        mark_source_pursuit_active(definition, demand=seed_demand(index))
+        mark_source_pursuit_active(
+            definition, demand=seed_demand(index, definition),
+        )
     all_calls = list(pending_calls)
     call_owners = {}
     for definition in definitions:
@@ -5055,6 +5266,7 @@ class ProcessGraph(TiledObject):
         parent_bindings=None,
         parent_include=None,
         pursuit_roots=None,
+        activation_roots=None,
         tensor_code_references=None,
         source_ast_normalizers=(),
         retained_ast_normalizers=(),
@@ -5170,9 +5382,18 @@ class ProcessGraph(TiledObject):
         # nothing downstream should have to learn the construct.
         tree = inline_context_managers(tree, _context_definition)
         # The module every ``source_span`` row of the submitted program's own
-        # definitions lives in: the name Python itself gives the program
-        # (plan 60, section 1.1).  Stored once so every helper reads one value.
-        tree._turing_source_module = str(filename or "<string>")
+        # definitions lives in (plan 60, section 1.1).  An explicit filename
+        # is the authored module identity, and a tree already stamped by its
+        # producer keeps that identity.  A bare in-memory submission has no
+        # Python module name, so its exact syntax is its stable source scope.
+        # Using the shared spelling ``<string>`` made two independent source
+        # submissions propose different class/method facts on one concordance
+        # row (for example two unrelated ``Bucket.__init__`` declarations).
+        # Content-addressing that otherwise-anonymous scope keeps the source
+        # chain exact before any declaration is posted; no later pass has to
+        # distinguish or rebuild the declarations.
+        source_module_identity = _source_module_identity(tree, filename)
+        tree._turing_source_module = source_module_identity
         # Generated source (``source_cells``: top-level definition name ->
         # the book cell of the declaration it was generated from): every node
         # of that definition carries its declaration cell, the module all of
@@ -5251,7 +5472,10 @@ class ProcessGraph(TiledObject):
                 f"{record.get('function')}.{record.get('parameter')}",
                 dict(record),
             )
-        for root in dict.fromkeys(map(str, pursuit_roots or ())):
+        for root in dict.fromkeys(map(str, (
+            *tuple(pursuit_roots or ()),
+            *tuple(activation_roots or ()),
+        ))):
             post_contract_demand(DemandKind.PURSUIT_ROOT, root)
 
         def ingest_external_class(external_class, *, selected):
@@ -5470,6 +5694,7 @@ class ProcessGraph(TiledObject):
                     package=getattr(self, "python_package", None),
                     include=parent_include,
                     pursuit_roots=pursuit_roots,
+                    activation_roots=activation_roots,
                     dependency_seed_definitions=tuple(
                         definition
                         for index, definition
@@ -5591,10 +5816,24 @@ class ProcessGraph(TiledObject):
                     parameter_span = post_source_span(function, parameter)
                     if parameter_span is None:
                         continue
+                    parameter_sources = [parameter_span]
+                    for name in dict.fromkeys(
+                        node.id for node in ast.walk(parameter.annotation)
+                        if isinstance(node, ast.Name)
+                    ):
+                        declared_class = book.latest_ref(
+                            CLASS_DECLARATION,
+                            (module_name, str(name)),
+                        )
+                        if declared_class is not None:
+                            parameter_sources.append(declared_class)
                     book.post(
                         PARAMETER_ANNOTATION, row,
                         ast.unparse(parameter.annotation),
-                        stage=INGESTION, provenance=Derived((parameter_span,)),
+                        stage=INGESTION,
+                        provenance=Derived(tuple(dict.fromkeys(
+                            parameter_sources
+                        ))),
                         mode=Mode.CONCORD,
                     )
                     annotation_rows.append(((module_name, identity), row))

@@ -267,6 +267,30 @@ def test_every_source_still_reports_to_the_shared_terminal_queue(tmp_path, monke
         assert all(stage["state"] == "done" for stage in worker["stages"])
 
 
+def test_final_detector_skips_an_absent_partial_module(monkeypatch):
+    from src.compiler.fortran_c_shell import _run_source_lowering
+    from src.compiler.identity_concordance import CorrelationTable
+
+    def detector_must_not_run(_module):
+        raise AssertionError("the detector received an absent module")
+
+    monkeypatch.setattr(CorrelationTable, "build", detector_must_not_run)
+    messages = []
+    result = _run_source_lowering(
+        lambda **_kwargs: (None, {}, ()),
+        progress=messages.append,
+        progress_bars=False,
+        compile_profile=False,
+    )
+
+    assert result == (None, {}, ())
+    assert any(
+        "detector skipped: no repository SSA module" in message
+        for message in messages
+    )
+    assert all("detector failed" not in message for message in messages)
+
+
 @pytest.mark.parametrize("fail_release", (False, True))
 def test_finalization_is_visible_until_storage_release_finishes(tmp_path, monkeypatch, fail_release):
     from pathlib import Path

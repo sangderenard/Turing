@@ -1004,6 +1004,7 @@ def evaporate_unrolled_loops(
         default=-1,
     ) + 1
     handled_loop_ids: set[int] = set()
+    effect_live_call_clones: set[int] = set()
 
     def add_clone(source_id: int, parents: tuple[tuple[int, str], ...]) -> int:
         clone_id = next_process_value_id(graph)
@@ -1077,6 +1078,13 @@ def evaporate_unrolled_loops(
             for member in selected_plans
             for node_id in member.loop.body_nodes if node_id in graph.G
         )
+        blocked_by_constructor = any(
+            (graph.G.nodes[node_id].get("attributes") or {}).get(
+                "constructor_ref"
+            ) is not None
+            for member in selected_plans
+            for node_id in member.loop.body_nodes if node_id in graph.G
+        )
         if os.environ.get("TURING_DEBUG_LOOP_EVAPORATION"):
             print(
                 f"DEBUG-LOOP-EVAPORATION loop={loop_id} "
@@ -1088,7 +1096,7 @@ def evaporate_unrolled_loops(
                 f"iterable_constant={type(loop.iterable_constant).__name__}",
                 file=sys.stderr, flush=True,
             )
-        if blocked_by_control:
+        if blocked_by_control or blocked_by_constructor:
             continue
         # Collection mutations are resident memory effects, not values that can
         # be replaced by cloning the loop body's numerical producer cone. The
@@ -1249,6 +1257,27 @@ def evaporate_unrolled_loops(
             for member in selected_plans
             for output in member.loop.iteration_outputs
         )
+        # A linked call can be value-dead while remaining effect-live: the
+        # callee owns its receiver mutation, so loop-state classification
+        # correctly does not duplicate that mutation as an opaque effect.
+        # Seed the exact authored call occurrence itself.  Its existing
+        # operand edges then pull the receiver and arguments into ``needed``;
+        # ``add_clone`` preserves the exact callee address on every unrolled
+        # occurrence.  Without this seed the evaporator deleted calls such as
+        # ``self.field.step(dt)`` because no local value consumed their result.
+        linked_call_occurrences = {
+            int(node_id)
+            for member in selected_plans
+            for node_id in member.loop.body_nodes
+            if node_id in graph.G
+            and isinstance(graph.G.nodes[node_id].get("expr_obj"), ast.Call)
+            and any(
+                (graph.G.nodes[node_id].get("attributes") or {}).get(key)
+                is not None
+                for key in ("callee_ref", "method_ref", "constructor_ref")
+            )
+        }
+        required_outputs.update(linked_call_occurrences)
         carried_bindings = tuple(dict.fromkeys(
             binding
             for member in selected_plans
@@ -1353,6 +1382,8 @@ def evaporate_unrolled_loops(
                     )
                 )
                 mapping[source_id] = add_clone(source_id, parents)
+                if source_id in linked_call_occurrences:
+                    effect_live_call_clones.add(mapping[source_id])
             for _name, initial, updated in carried_bindings:
                 if int(updated) in mapping:
                     carried_values[int(initial)] = int(mapping[int(updated)])
@@ -1598,6 +1629,11 @@ def evaporate_unrolled_loops(
             for root in graph.roots
             if int(root) in graph.G
         }
+        # These activations are semantically live through the exact call
+        # binding, even when their return value is unused.  They are not
+        # function result roots and must not be recast as such merely to
+        # survive ancestry pruning.
+        live.update(effect_live_call_clones)
         # Dataflow ancestry alone is insufficient to retain source control:
         # loop nodes own their bodies semantically, and are not necessarily a
         # value predecessor of the function's return roots.  Evaporating an
@@ -2264,6 +2300,7 @@ def materialize_retained_loop_ports(
                     "effect_mode": effect.mode.value,
                     "sequence_policy": effect.sequence_policy,
                     "argument_kind": effect.argument_kind,
+                    "source_contract_cell": effect.source_contract_cell,
                     "state_input_id": int(effect.state_input_id),
                     "effect_node_id": int(effect.effect_node_id),
                     "state_output_id": None,
@@ -2446,6 +2483,7 @@ def materialize_retained_loop_ports(
                 "effect_mode": effect.mode.value,
                 "sequence_policy": effect.sequence_policy,
                 "argument_kind": effect.argument_kind,
+                "source_contract_cell": effect.source_contract_cell,
                 "state_input_id": int(effect.state_input_id),
                 "effect_node_id": int(effect.effect_node_id),
                 "state_output_id": state_port,
@@ -2492,6 +2530,7 @@ def materialize_retained_loop_ports(
                 ),
                 sequence_policy=effect.get("sequence_policy"),
                 argument_kind=str(effect.get("argument_kind", "value")),
+                source_contract_cell=effect.get("source_contract_cell"),
             )
             for effect in effects
         )
@@ -3565,6 +3604,7 @@ class LoopComposer:
                 ),
                 sequence_policy=effect.get("sequence_policy"),
                 argument_kind=str(effect.get("argument_kind", "value")),
+                source_contract_cell=effect.get("source_contract_cell"),
             )
             for effect in attributes.get("loop_state_effects", ())
         ))
@@ -4631,7 +4671,16 @@ def analyze_shader_loop_reductions(
                     None,
                 )
                 enumerated_source_id = source_id
-                if source_id is not None and len(loop.target_bindings) == 2:
+                if source_id is not None and len(loop.target_bindings) >= 2:
+                    # ``enumerate`` authors a two-member result whose first
+                    # member is the induction and whose second member is one
+                    # element of its exact source iterable.  When that source
+                    # element is itself destructured, the lexical target list
+                    # is flattened (``i, (left, right)`` becomes three exact
+                    # target identities).  The old exact-two check discarded
+                    # every binding in that case.  Preserve the first target
+                    # as enumerate's induction, then project the remaining
+                    # authored targets from the source row in lexical order.
                     projected_iterable_bindings = (
                         (
                             source_id,
@@ -4639,11 +4688,20 @@ def analyze_shader_loop_reductions(
                             induction_name,
                             "induction",
                         ),
-                        (
-                            source_id,
-                            int(loop.target_bindings[1][1]),
-                            induction_name,
-                            None,
+                        *tuple(
+                            (
+                                source_id,
+                                int(target_id),
+                                induction_name,
+                                (
+                                    None
+                                    if len(loop.target_bindings) == 2
+                                    else int(position)
+                                ),
+                            )
+                            for position, (_name, target_id) in enumerate(
+                                loop.target_bindings[1:]
+                            )
                         ),
                     )
             else:
@@ -5244,6 +5302,43 @@ def analyze_shader_loop_reductions(
             mutation_arguments = expanded_row_arguments(
                 effect.argument_value_ids
             )
+            sort_key_column = None
+            sort_reverse = False
+            sort_contract_cell = None
+            if effect.operator == "sort":
+                from .concordance_declarations import (
+                    SOURCE_SORT_CONTRACT, SourceSortContract,
+                )
+                from .identity_concordance import current_identity_book
+
+                sort_contract_cell = effect.source_contract_cell
+                sort_page = current_identity_book().registry.pages.get(
+                    SOURCE_SORT_CONTRACT.name
+                )
+                if (
+                    sort_contract_cell is None
+                    or getattr(sort_contract_cell, "page", None) != sort_page
+                ):
+                    raise ValueError(
+                        "loop sort effect has no exact source contract cell: "
+                        f"effect={effect.effect_node_id}"
+                    )
+                sort_contract = current_identity_book().page(
+                    SOURCE_SORT_CONTRACT
+                ).cell(
+                    sort_contract_cell.row, sort_contract_cell.column,
+                )
+                if not isinstance(sort_contract, SourceSortContract):
+                    raise ValueError(
+                        "loop sort effect source cell has no sort contract: "
+                        f"{sort_contract_cell!r}"
+                    )
+                argument_kind = str(sort_contract.argument_kind)
+                mutation_arguments = tuple(map(
+                    int, sort_contract.argument_value_ids,
+                ))
+                sort_key_column = sort_contract.key_column
+                sort_reverse = bool(sort_contract.reverse)
             if (
                 effect.mode is LoopStateEffectMode.MAPPING_MUTATION
                 and effect.operator == "update"
@@ -5305,6 +5400,9 @@ def analyze_shader_loop_reductions(
                     ) or {}).get("extraction_identity")
                     if int(effect.effect_node_id) in graph.G else None
                 ),
+                source_contract_cell=sort_contract_cell,
+                sort_key_column=sort_key_column,
+                sort_reverse=sort_reverse,
             ))
         sequence_mutations.extend(
             routed_generator_mutations.get(int(loop.node_id), ())

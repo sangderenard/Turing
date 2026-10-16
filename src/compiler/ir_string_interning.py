@@ -41,10 +41,60 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
 
     import dataclasses
 
+    from .concordance_declarations import (
+        CONTROL_SSA_FINISH,
+        SSA_BLOCK_GEOMETRY,
+        SSA_CONSTANT_MATERIALIZATION,
+        SSA_VALUE,
+    )
+    from .identity_concordance import (
+        ConcordanceRefusal,
+        Derived,
+        Mode,
+        current_identity_book,
+    )
+
+    book = current_identity_book()
+
+    def record_normalization(
+        function, block_name, instruction, normalized, literal,
+    ) -> None:
+        if instruction.res is None:
+            return
+        scope = str(
+            function.metadata.get("tensor_shape_concordance_scope")
+            or function.name
+        )
+        value_id = int(instruction.res.id)
+        row = (scope, str(function.name), str(block_name), value_id)
+        sources = tuple(cell for cell in (
+            book.latest_ref(SSA_CONSTANT_MATERIALIZATION, row),
+            book.latest_ref(SSA_VALUE, (scope, value_id)),
+            book.latest_ref(
+                SSA_BLOCK_GEOMETRY,
+                (scope, str(function.name), str(block_name)),
+            ),
+        ) if cell is not None)
+        if not sources:
+            raise ConcordanceRefusal(
+                "SSA literal normalization has no recorded value or prior "
+                f"geometry: {function.name}.{block_name} value={value_id}"
+            )
+        book.post(
+            SSA_CONSTANT_MATERIALIZATION,
+            row,
+            (
+                str(normalized.op), str(normalized.res.dtype), repr(literal),
+            ),
+            stage=CONTROL_SSA_FINISH,
+            provenance=Derived(sources),
+            mode=Mode.REVISE,
+        )
+
     _COMPARES = ("equal", "not_equal", "Eq", "Ne")
     for function in functions.values():
         token_result_ids: set[int] = set()
-        for block in function.blocks.values():
+        for block_name, block in function.blocks.items():
             rewritten = []
             for instruction in block.instrs:
                 is_const = instruction.op in ("Const", "const")
@@ -65,11 +115,15 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
                         attributes = dict(instruction.attributes)
                         attributes.pop("value", None)
                         attributes.pop("constant", None)
-                        rewritten.append(dataclasses.replace(
+                        normalized = dataclasses.replace(
                             instruction, op="NoneValue", attributes=attributes,
-                        ))
+                        )
                         if instruction.res is not None:
                             instruction.res.dtype = "none"
+                        record_normalization(
+                            function, block_name, instruction, normalized, value,
+                        )
+                        rewritten.append(normalized)
                         continue
                     elif isinstance(value, (str, bytes)):
                         token = (
@@ -84,10 +138,8 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
                     attributes.pop("constant", None)
                     attributes["token"] = int(token)
                     attributes["text"] = text
-                    rewritten.append(
-                        dataclasses.replace(
-                            instruction, op=STRING_TOKEN, attributes=attributes
-                        )
+                    normalized = dataclasses.replace(
+                        instruction, op=STRING_TOKEN, attributes=attributes
                     )
                     if instruction.res is not None:
                         # A word is an integer identity in SSA.  It must never
@@ -95,6 +147,10 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
                         # historically used one working dtype.
                         instruction.res.dtype = "int64"
                         token_result_ids.add(int(instruction.res.id))
+                    record_normalization(
+                        function, block_name, instruction, normalized, value,
+                    )
+                    rewritten.append(normalized)
                 else:
                     rewritten.append(instruction)
             block.instrs = rewritten

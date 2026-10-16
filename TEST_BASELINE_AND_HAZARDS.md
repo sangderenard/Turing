@@ -1,4 +1,15 @@
-2026-10-14 PROVENANCE BOOTSTRAP TERMINAL OWNERSHIP + FAILURE ROLLUP (CURRENT):
+2026-10-15 PROVENANCE/SORT/GLYPH BOOTSTRAP CONTINUATION (CURRENT):
+See docs/compiler_convergence/15_provenance_sort_glyph_bootstrap_continuation.md.
+Resident stable sort and formatted glyph sequences now lower through repository
+SSA and concorded source contracts.  The latest bootstrap regression was a
+duplicate topology call binder assigning a static-method attribute receiver to
+formal zero; source class propagation now uses the existing authored ABI binder.
+Its exact reproduction and the neighboring generic-formal regression pass, and
+the mapping concordance audit has zero findings and zero unsourced facts.  The
+full bootstrap remains unverified.  Bootstrap caches are clear for the next
+user-owned run.
+
+2026-10-14 PROVENANCE BOOTSTRAP TERMINAL OWNERSHIP + FAILURE ROLLUP (PRIOR):
 The provenance child now exclusively owns the terminal while it is active;
 the outer bootstrap opens its compositor only after provenance returns. Resolved
 worker events stay structured, worker JSON/traceback stdout remains in each

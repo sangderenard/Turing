@@ -56,6 +56,31 @@ def test_private_cpython_adapter_is_headerless_and_owns_object_handles():
     assert "turing_cpython_retain_bytes" in source
 
 
+def test_private_cpython_adapter_copies_repr_utf8_into_resident_sequence():
+    from src.compiler.cpython_runtime import emit_private_cpython_adapter
+
+    source = emit_private_cpython_adapter(({
+        "symbol": "repr_utf8_thunk",
+        "identity": "builtins.repr",
+        "argument_dtypes": ["opaque_ref"],
+        "result_dtype": "utf8_sequence",
+    },), runtime_dll="python311.dll")
+
+    assert (
+        "void repr_utf8_thunk(int64_t *a0, int64_t *result_data, "
+        "int64_t *result_length, int64_t *result_capacity, "
+        "int64_t *result_status)"
+    ) in source
+    assert "PyUnicode_AsUTF8AndSize" in source
+    assert (
+        "result_data[utf8_index] = "
+        "(int64_t)(unsigned char)utf8[utf8_index]"
+    ) in source
+    assert "*result_length = (int64_t)utf8_size; *result_status = 1;" in source
+    assert "*result_length = 0; *result_status = 2;" in source
+    assert "*result_length = 0; *result_status = 3;" in source
+
+
 def test_compiled_program_api_uses_integer_transport_for_opaque_refs():
     from src.compiler.compiled_program_api import _c_type_for
 

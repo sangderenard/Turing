@@ -112,7 +112,6 @@ def _lower(source, name):
 @pytest.mark.parametrize("label, source", [("direct", DIRECT), ("aliased", ALIASED)])
 def test_a_method_on_a_field_held_object_is_a_linked_call(label, source):
     module, _outputs, _exports = _lower(source, label)
-    assert f"{label}__Field__step" in module.functions, sorted(module.functions)
     entry = module.functions[f"{label}__Sim__step"]
     linked = [
         instruction
@@ -121,10 +120,22 @@ def test_a_method_on_a_field_held_object_is_a_linked_call(label, source):
         if instruction.op in {"Call", "call"}
         and instruction.attributes.get("source_linked")
     ]
-    assert [str(call.attributes["callee"]) for call in linked] == [
-        f"{label}__Field__step"
-    ]
-    assert "loop_body" in entry.blocks, list(entry.blocks)
+    # The finite source loop is unrolled.  Each authored occurrence retains
+    # the exact FunctionTable address while the callee may legitimately have
+    # a callsite-specialized internal symbol.
+    assert len(linked) == 4
+    callee_symbols = {
+        str(call.attributes["callee"]) for call in linked
+    }
+    assert len(callee_symbols) == 1
+    callee_symbol = next(iter(callee_symbols))
+    callee = module.functions[callee_symbol]
+    assert callee.metadata["authored_function_identity"][1] == "Field.step"
+    records = module.call_table[entry.name]
+    assert len(records) == 4
+    assert len({record.callsite_id for record in records}) == 4
+    assert {record.callee_reference for record in records} == {1}
+    assert {record.resolution for record in records} == {"native_call"}
 
 
 def test_a_field_holding_two_classes_stays_unresolved():
@@ -238,9 +249,17 @@ def test_a_declared_source_lets_the_imported_field_class_be_pursued(
         if instruction.op in {"Call", "call"}
         and instruction.attributes.get("source_linked")
     ]
-    assert len(linked) == 1 and linked[0].endswith("__step"), linked
+    assert len(linked) == 4
+    assert len(set(linked)) == 1
     assert linked[0] != "held__Sim__step"
-    assert "loop_body" in entry.blocks, list(entry.blocks)
+    callee = module.functions[linked[0]]
+    assert callee.metadata["authored_function_identity"][1].endswith(
+        "ImportedField.step"
+    )
+    records = module.call_table[entry.name]
+    assert len(records) == 4
+    assert len({record.callsite_id for record in records}) == 4
+    assert {record.resolution for record in records} == {"native_call"}
 
 
 def test_constructor_parameter_annotation_carries_field_receiver_identity(

@@ -455,8 +455,20 @@ def emit_private_cpython_adapter(
             f"{('double' if dtype in {'float32', 'float64'} else 'int64_t')} *a{index}"
             for index, dtype in enumerate(argument_dtypes)
         ]
-        result_c = "double" if result_dtype in {"float32", "float64"} else "int64_t"
-        parameters.append(f"{result_c} *result")
+        if result_dtype == "utf8_sequence":
+            parameters.extend((
+                "int64_t *result_data",
+                "int64_t *result_length",
+                "int64_t *result_capacity",
+                "int64_t *result_status",
+            ))
+        else:
+            result_c = (
+                "double"
+                if result_dtype in {"float32", "float64"}
+                else "int64_t"
+            )
+            parameters.append(f"{result_c} *result")
         argument_lines = []
         for index, dtype in enumerate(argument_dtypes):
             if dtype == "opaque_ref":
@@ -479,7 +491,18 @@ def emit_private_cpython_adapter(
                     f"    if (item == NULL || py.PyDict_SetItemString(kwargs, {json.dumps(keyword)}, item) != 0) goto failed;",
                     "    py.Py_DecRef(item); item = NULL;",
                 ))
-        if result_dtype == "opaque_ref":
+        if result_dtype == "utf8_sequence":
+            result_line = "\n".join((
+                "    utf8 = py.PyUnicode_AsUTF8AndSize(returned, &utf8_size);",
+                "    if (utf8 == NULL) goto failed;",
+                "    if (utf8_size < 0 || utf8_size > *result_capacity) {",
+                "        *result_length = 0; *result_status = 2; goto complete;",
+                "    }",
+                "    for (utf8_index = 0; utf8_index < utf8_size; ++utf8_index)",
+                "        result_data[utf8_index] = (int64_t)(unsigned char)utf8[utf8_index];",
+                "    *result_length = (int64_t)utf8_size; *result_status = 1;",
+            ))
+        elif result_dtype == "opaque_ref":
             result_line = "    *result = turing_python_retain(returned); returned = NULL;"
         elif result_dtype in {"float32", "float64"}:
             result_line = "    *result = py.PyFloat_AsDouble(returned);"
@@ -491,6 +514,9 @@ def emit_private_cpython_adapter(
             f"void {symbol}({', '.join(parameters)}) {{",
             "    TuringPyObject *module = NULL, *callable = NULL, *args = NULL, *kwargs = NULL;",
             "    TuringPyObject *item = NULL, *returned = NULL;",
+            *((
+                "    const char *utf8 = NULL; TuringPySsizeT utf8_size = 0, utf8_index = 0;",
+            ) if result_dtype == "utf8_sequence" else ()),
             "    if (!turing_python_start()) goto failed;",
             f"    module = py.PyImport_ImportModule({json.dumps(module_name)});",
             f"    if (module != NULL) callable = turing_python_resolve(module, {json.dumps(qualname)});",
@@ -501,6 +527,7 @@ def emit_private_cpython_adapter(
             "    returned = py.PyObject_Call(callable, args, kwargs);",
             "    if (returned == NULL) goto failed;",
             result_line,
+            *(("complete:",) if result_dtype == "utf8_sequence" else ()),
             "    if (returned != NULL) py.Py_DecRef(returned);",
             "    if (kwargs != NULL) py.Py_DecRef(kwargs);",
             "    py.Py_DecRef(args); py.Py_DecRef(callable); py.Py_DecRef(module);",
@@ -512,7 +539,10 @@ def emit_private_cpython_adapter(
             "    if (kwargs != NULL) py.Py_DecRef(kwargs);",
             "    if (callable != NULL) py.Py_DecRef(callable);",
             "    if (module != NULL) py.Py_DecRef(module);",
-            "    *result = 0;",
+            (
+                "    *result_length = 0; *result_status = 3;"
+                if result_dtype == "utf8_sequence" else "    *result = 0;"
+            ),
             "}",
         )))
     return "\n".join((
@@ -524,6 +554,7 @@ def emit_private_cpython_adapter(
         "#include <stdlib.h>",
         "#include <string.h>",
         "#include <windows.h>",
+        "typedef intptr_t TuringPySsizeT;",
         "typedef struct _object TuringPyObject;",
         "typedef struct {",
         "    void (*Py_Initialize)(void); int (*Py_IsInitialized)(void);",
@@ -541,6 +572,7 @@ def emit_private_cpython_adapter(
         "    TuringPyObject *(*PyBool_FromLong)(long);",
         "    int (*PyObject_IsTrue)(TuringPyObject *);",
         "    TuringPyObject *(*PyBytes_FromStringAndSize)(const char *, size_t);",
+        "    const char *(*PyUnicode_AsUTF8AndSize)(TuringPyObject *, TuringPySsizeT *);",
         "    void (*Py_DecRef)(TuringPyObject *); void (*Py_IncRef)(TuringPyObject *);",
         "    void (*PyErr_Print)(void);",
         "    int *Py_IsolatedFlag; int *Py_IgnoreEnvironmentFlag;",
@@ -563,6 +595,7 @@ def emit_private_cpython_adapter(
         "        TURING_PY_LOAD(PyLong_AsLongLong); TURING_PY_LOAD(PyFloat_FromDouble);",
         "        TURING_PY_LOAD(PyFloat_AsDouble); TURING_PY_LOAD(PyBool_FromLong);",
         "        TURING_PY_LOAD(PyObject_IsTrue); TURING_PY_LOAD(PyBytes_FromStringAndSize);",
+        "        TURING_PY_LOAD(PyUnicode_AsUTF8AndSize);",
         "        TURING_PY_LOAD(Py_DecRef); TURING_PY_LOAD(Py_IncRef); TURING_PY_LOAD(PyErr_Print);",
         "        TURING_PY_LOAD(Py_IsolatedFlag); TURING_PY_LOAD(Py_IgnoreEnvironmentFlag);",
         "        TURING_PY_LOAD(Py_NoSiteFlag); TURING_PY_LOAD(Py_DontWriteBytecodeFlag);",

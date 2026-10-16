@@ -107,6 +107,7 @@ from typing import Any, Iterable, Mapping
 
 from .id_space import MINTED, group_by_prefix, has_flag, label as id_label
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+from ..transmogrifier.ssa import SSAValue
 
 
 def _edge_count(graph_obj: Any) -> int:
@@ -1155,6 +1156,7 @@ class CorrelationTable:
         found.extend(self._source_numeric_type_dependency_findings(module))
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
+        found.extend(self._source_aggregate_layout_findings(module))
         found.extend(self._source_callsite_activation_findings(module))
         found.extend(self._source_precision_boundary_findings(module))
         found.extend(self._source_precision_operator_findings(module))
@@ -2478,6 +2480,67 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_aggregate_layout_findings(module: Any) -> list[Finding]:
+        """Validate immutable reducer-owned aggregate layout facts."""
+
+        from .concordance_declarations import (
+            SOURCE_AGGREGATE_LAYOUT,
+            SourceAggregateLayout,
+            SourceAggregateMember,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                SOURCE_AGGREGATE_LAYOUT.name
+            )
+        )
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            history = page.history(row)
+            facts = tuple(fact for _column, fact in history)
+            distinct = tuple(dict.fromkeys(map(repr, facts)))
+            fact = facts[-1]
+            problem = None
+            if len(distinct) != 1:
+                problem = f"immutable layout changed: {distinct!r}"
+            elif not isinstance(fact, SourceAggregateLayout):
+                problem = f"invalid aggregate layout fact {fact!r}"
+            elif fact.aggregate_kind not in {"tuple", "list", "set", "dict"}:
+                problem = f"invalid aggregate kind {fact.aggregate_kind!r}"
+            elif any(
+                not isinstance(member, SourceAggregateMember)
+                or not isinstance(member.value_id, int)
+                or not isinstance(member.value_cell, Ref)
+                or not member.source_cells
+                or any(not isinstance(cell, Ref) for cell in member.source_cells)
+                for member in fact.members
+            ):
+                problem = "ordered member identities/cells are incomplete"
+            elif bool(fact.conditional_cell) != bool(fact.arm_layout_cells):
+                problem = "conditional/control and arm layout cells disagree"
+            elif fact.arm_layout_cells and (
+                len(fact.arm_layout_cells) != 2
+                or any(not isinstance(cell, Ref) for cell in fact.arm_layout_cells)
+            ):
+                problem = "conditional aggregate does not name two arm layouts"
+            if problem is not None:
+                scope, value_id = (
+                    row if isinstance(row, tuple) and len(row) == 2
+                    else (row, None)
+                )
+                found.append(Finding(
+                    "source-aggregate-layout-disagreement", str(scope),
+                    None if value_id is None else int(value_id), problem,
+                ))
+        return found
+
+    @staticmethod
     def _source_sequence_mutation_findings(module: Any) -> list[Finding]:
         """Report a source mutation whose resident sequence fact changed."""
 
@@ -2820,7 +2883,19 @@ class CorrelationTable:
             if function_name != name or not authored:
                 continue
             row = rows.get(value_id)
-            if row is None or (not row.is_formal and not row.definitions):
+            # ``sequence_id`` is the descriptor's compile-time identity.  It
+            # commonly aliases column zero, but a selected nested row keeps
+            # its authored graph identity while ``column_value_ids`` names the
+            # row-base address produced inside the loop.  Only the physical
+            # members have to be formals or instruction results.  Treating a
+            # handle-only descriptor key as storage invents a definition the
+            # SSA program neither has nor needs.
+            physical_roles = tuple(
+                role for _sequence_id, role in roles if role != "handle"
+            )
+            if physical_roles and (
+                row is None or (not row.is_formal and not row.definitions)
+            ):
                 found.append(Finding(
                     "descriptor-member-unknown", name, value_id,
                     f"roles={roles!r}: not a formal, never defined",
@@ -3060,22 +3135,46 @@ class CorrelationTable:
                 ))
         return found
 
-    def _abi_or_member_key(self, function: str, formal: Any) -> str | None:
-        accounting = dict(getattr(formal, "accounting", {}) or {})
-        abi_field = accounting.get("program_abi_field")
+    def _abi_or_member_key(
+        self, function: str, formal: SSAValue,
+    ) -> str | None:
+        # ``formal`` is an SSAValue at both call sites above.  Preserve its
+        # authored accounting table as the receiver: copying it through
+        # ``dict(...)`` or replacing it through ``getattr(..., {}) or {}``
+        # severs the resident keyed-table identity needed by source lowering.
+        # The named ABI identity entries read below are the string-valued
+        # projection of the heterogeneous accounting table.  ``callsite_id``
+        # is read separately from the same exact table with its integer
+        # projection; keeping the projections typed prevents their lookup
+        # results from escaping as opaque public formals.
+        accounting: dict[str, str] = formal.accounting
+        abi_field: str | None = accounting.get("program_abi_field")
         if abi_field is not None:
             # Identity is per record INSTANCE: the parameter that carries
             # the record, or the call whose result record this storage
             # holds.  Two instances of one record type in one function
             # (``metrics`` and ``coerced = coerce_metrics(metrics)``)
             # legitimately own the same field name each.
-            instance = accounting.get("returned_record_storage")
-            if instance is not None:
-                instance = f"{instance}@{accounting.get('callsite_id')}"
+            returned_record_storage: str | None = accounting.get(
+                "returned_record_storage"
+            )
+            instance: str | None = returned_record_storage
+            if returned_record_storage is not None:
+                callsite_accounting: dict[str, int] = formal.accounting
+                callsite_id: int | None = callsite_accounting.get("callsite_id")
+                instance = f"{returned_record_storage}@{callsite_id}"
             else:
-                instance = accounting.get("program_abi_parameter") or accounting.get("program_abi_record")
+                program_parameter: str | None = accounting.get(
+                    "program_abi_parameter"
+                )
+                program_record: str | None = accounting.get(
+                    "program_abi_record"
+                )
+                instance = program_parameter or program_record
             return f"{instance}.{abi_field}"
-        roles = self.sequence_roles.get((function, int(formal.id)))
+        roles: list[tuple[int, str]] | None = self.sequence_roles.get((
+            function, int(formal.id),
+        ))
         if roles:
             sequence_id, role = roles[0]
             return f"seq{sequence_id}.{role}"
@@ -3705,7 +3804,7 @@ _PRIVATE_PAGE_NAMES = frozenset(
 #: (``scope_origin``), and the planner's specialization rows are per COPY
 #: (design section 7.1: a copy never carries a literal proven for another
 #: caller).  This is the set ``fork_read_scope`` skipped when it copied.
-READ_THROUGH_EXCLUDED_PAGES = frozenset({
+READ_THROUGH_EXCLUDED_PAGES: frozenset[str] = frozenset({
     "scope_origin", "planner_specialization", "planner_tensor_descriptor",
 })
 
@@ -3716,21 +3815,29 @@ RAW_STAGE = declare_stage("raw_primitive")
 RAW_PRIMITIVE = declare_reason("raw_primitive")
 
 
-def _validate_row(page: Page, row: Any, *, allow_new: bool) -> tuple[int, ...]:
+def _validate_row(page: Page, row: tuple, *, allow_new: bool) -> tuple[int, ...]:
     """Check ``row`` against ``page.row_fields``; return the NEW positions."""
 
-    if not isinstance(row, tuple):
+    row_fields: tuple[RowField, ...] = page.row_fields
+    # Keep tuple subclasses accepted, as ``isinstance(row, tuple)`` did, but
+    # state the exact-type fast path first.  The compiler can settle that
+    # clause from the authored ``row: tuple`` schema; Python still evaluates
+    # the second clause for a tuple subclass and preserves the runtime rule.
+    if type(row) is not tuple and not isinstance(row, tuple):
         raise ConcordanceRefusal(
             f"{page.name}: row must be a tuple, got {type(row).__name__}"
         )
-    if len(row) != len(page.row_fields):
+    if len(row) != len(row_fields):
         raise ConcordanceRefusal(
             f"{page.name}: row {row!r} has {len(row)} element(s); the page "
-            f"declares {len(page.row_fields)}: "
-            f"{tuple(item.name for item in page.row_fields)!r}"
+            f"declares {len(row_fields)}: "
+            f"{tuple(item.name for item in row_fields)!r}"
         )
     new_positions: list[int] = []
-    for position, (declared, item) in enumerate(zip(page.row_fields, row)):
+    position: int
+    declared: RowField
+    item: Any
+    for position, (declared, item) in enumerate(zip(row_fields, row)):
         if item is NEW:
             if declared.kind is not RowFieldKind.VALUE_ID or not allow_new:
                 raise ConcordanceRefusal(
@@ -3815,7 +3922,9 @@ class IdentityPage:
     #: The book this page belongs to (``IdentityBook.page`` sets it); a page
     #: made outside a book has none, so its writes cannot be tagged or
     #: latched.
-    book: Any = field(default=None, repr=False, compare=False)
+    book: IdentityBook | None = field(
+        default=None, repr=False, compare=False,
+    )
     #: The page's own index of ``cells``, kept by ``_stamp`` (the one cell
     #: writer): each column's position in ``columns``, and each row's
     #: columns in that order.  ``history`` reads a row's cells through it
@@ -3998,13 +4107,15 @@ class IdentityPage:
     def _fork_of_scope(self, scope: Any) -> tuple[Any, int] | None:
         """``(origin, stamp)`` when ``scope`` is a copy-on-read fork whose
         rows on THIS page read through to the origin, else None."""
-        book = self.book
+        book: IdentityBook | None = self.book
         if book is None:
             return None
-        forks = book.__dict__.get("read_through")
+        forks: dict[Any, tuple[Any, int]] | None = (
+            book.__dict__.get("read_through")
+        )
         if not forks:
             return None
-        fork = forks.get(scope)
+        fork: tuple[Any, int] | None = forks.get(scope)
         if fork is None:
             return None
         name = self.name
@@ -4018,10 +4129,12 @@ class IdentityPage:
     def _reaches_origin(self, scope: Any, row: tuple) -> bool:
         """Whether the fork ``scope``'s declared projection lets a read of
         ``row`` pass on to its origin (see ``LiveScopeProjection``)."""
-        projections = self.book.__dict__.get("scope_projections")
+        projections: dict[Any, LiveScopeProjection] | None = (
+            self.book.__dict__.get("scope_projections")
+        )
         if not projections:
             return True
-        projection = projections.get(scope)
+        projection: LiveScopeProjection | None = projections.get(scope)
         if projection is None or self.name not in projection.pages:
             return True
         if len(row) > 1 and isinstance(row[1], int):
@@ -5903,6 +6016,8 @@ def concord_sequence_row_dtypes(
     *,
     source: str,
     page: IdentityPage | None = None,
+    sources: Iterable[Ref] = (),
+    stage: Any = None,
 ) -> tuple[str, ...]:
     """Resolve one row layout across sequence identities proven equivalent.
 
@@ -5968,11 +6083,33 @@ def concord_sequence_row_dtypes(
             )
         resolved.append(next(iter(known), "unknown"))
     result = tuple(resolved)
+    declared_sources = tuple(dict.fromkeys(
+        cell for cell in sources if isinstance(cell, Ref)
+    ))
     for sequence_id in normalized:
         row = (scope, int(sequence_id))
-        history = page.history(row)
-        column = history[-1][0] + 1 if history else 0
-        page.set(row, column, (result, str(source)))
+        fact = (result, str(source))
+        prior_cell = page.book.latest_ref(
+            page.book.registry.page("sequence_row_dtype_concordance"), row,
+        )
+        source_cells = tuple(dict.fromkeys((
+            *declared_sources,
+            *((prior_cell,) if prior_cell is not None else ()),
+        )))
+        if source_cells:
+            from .concordance_declarations import (
+                CONTROL_SSA, SEQUENCE_ROW_DTYPE,
+            )
+
+            page.book.post(
+                SEQUENCE_ROW_DTYPE, row, fact,
+                stage=CONTROL_SSA if stage is None else stage,
+                provenance=Derived(source_cells), mode=Mode.REVISE,
+            )
+        else:
+            history = page.history(row)
+            column = history[-1][0] + 1 if history else 0
+            page.set(row, column, fact)
     return result
 
 
@@ -6005,6 +6142,8 @@ def commit_sequence_contract(
     *,
     source: str,
     page: IdentityPage | None = None,
+    sources: Iterable[Ref] = (),
+    stage: Any = None,
 ) -> SequenceContract:
     """Commit or verify one resident sequence's physical row contract.
 
@@ -6046,14 +6185,33 @@ def commit_sequence_contract(
             incumbent.writable if incumbent is not None else False
         )),
     )
-    history = page.history(row)
-    column = history[-1][0] + 1 if history else 0
-    page.set(row, column, (
+    fact = (
         resolved.policy,
         resolved.column_count,
         resolved.writable,
         str(source),
-    ))
+    )
+    prior_cell = page.book.latest_ref(
+        page.book.registry.page("sequence_contract_concordance"), row,
+    )
+    source_cells = tuple(dict.fromkeys((
+        *(cell for cell in sources if isinstance(cell, Ref)),
+        *((prior_cell,) if prior_cell is not None else ()),
+    )))
+    if source_cells:
+        from .concordance_declarations import (
+            CONTROL_SSA, SEQUENCE_CONTRACT_CONCORDANCE,
+        )
+
+        page.book.post(
+            SEQUENCE_CONTRACT_CONCORDANCE, row, fact,
+            stage=CONTROL_SSA if stage is None else stage,
+            provenance=Derived(source_cells), mode=Mode.REVISE,
+        )
+    else:
+        history = page.history(row)
+        column = history[-1][0] + 1 if history else 0
+        page.set(row, column, fact)
     return resolved
 
 
@@ -6684,7 +6842,8 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
     functions = getattr(module, "functions", {}) or {}
     book = identity_book(module)
     from .concordance_declarations import (
-        FORMAL_ACTUAL_OCCURRENCE, FRAME_BINDING, FRAME_SOURCE_CELL_ABSENT, SSA_VALUE,
+        FORMAL_ACTUAL_OCCURRENCE, FORMAL_STORAGE_RESOLUTION,
+        FRAME_BINDING, FRAME_SOURCE_CELL_ABSENT, SSA_VALUE,
     )
     # Persisted books own their vocabulary. Add this scoped relation through
     # the registry API, keeping earlier six-field rows intact and unclaimed.
@@ -6836,13 +6995,29 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                 "kind": "compiler_frame_storage",
             }
             receipts.append(receipt)
-            page = book.page("formal_storage_resolution")
             row = (str(function_name), formal_id)
-            history = page.history(row)
-            column = history[-1][0] + 1 if history else 0
-            page.set(row, column, (
-                "compiler_frame_storage", source_receipts,
+            source_cells = tuple(dict.fromkeys(
+                cell for cell in (
+                    *(
+                        book.latest_ref(occurrence_page, source_row)
+                        for source_row in source_rows
+                    ),
+                    book.latest_ref(
+                        SSA_VALUE,
+                        (caller_scope(function), formal_id),
+                    ),
+                    book.latest_ref(FORMAL_STORAGE_RESOLUTION, row),
+                )
+                if cell is not None
             ))
+            book.post(
+                FORMAL_STORAGE_RESOLUTION,
+                row,
+                ("compiler_frame_storage", source_receipts),
+                stage=FRAME_BINDING,
+                provenance=Derived(source_cells),
+                mode=Mode.REVISE,
+            )
     if receipts:
         getattr(module, "metadata", {})[
             "compiler_frame_formal_reconciliations"

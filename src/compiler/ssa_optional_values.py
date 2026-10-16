@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -41,6 +40,11 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
     functions = _functions(module)
     contracts: dict[str, dict[str, Any]] = {}
     receipts: list[dict[str, Any]] = []
+    from .concordance_declarations import (
+        ADDRESS, CONTROL_CONST, OPTIONAL_AGGREGATE,
+        OPTIONAL_INACTIVE_PAYLOAD, OPTIONAL_PRESENCE, RECORD_RETURN_REPAIR,
+    )
+    from .ssa_record_return_state import mint_ssa_value
 
     # Call-frame and returned-record reconciliation can replace an early
     # ProgramABI argument object with another occurrence of the same settled
@@ -255,7 +259,11 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         edge_instructions: list[Instr] = []
                         if is_absent:
                             payload = SSAValue(
-                                GLOBAL_MONOTONIC_IDS.mint(),
+                                mint_ssa_value(
+                                    function, OPTIONAL_INACTIVE_PAYLOAD,
+                                    (instruction.res, value), dtype=dtype,
+                                    shape=shape, stage=RECORD_RETURN_REPAIR,
+                                ),
                                 dtype=dtype,
                                 shape=shape,
                                 device=device,
@@ -275,7 +283,11 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         present = presence_by_payload.get(int(value.id))
                         if present is None:
                             present = SSAValue(
-                                GLOBAL_MONOTONIC_IDS.mint(),
+                                mint_ssa_value(
+                                    function, OPTIONAL_PRESENCE,
+                                    (instruction.res, value, payload),
+                                    dtype="bool", stage=RECORD_RETURN_REPAIR,
+                                ),
                                 dtype="bool",
                                 accounting={"ssa_optional_presence_edge": True},
                             )
@@ -296,7 +308,11 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                             "binding"
                         ) or "") == "return_merge"
                         presence = SSAValue(
-                            GLOBAL_MONOTONIC_IDS.mint(),
+                            mint_ssa_value(
+                                function, OPTIONAL_PRESENCE,
+                                (instruction.res, *presence_args),
+                                dtype="bool", stage=RECORD_RETURN_REPAIR,
+                            ),
                             dtype="bool",
                             accounting={
                                 "ssa_optional_presence": True,
@@ -452,7 +468,10 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                 "ssa_optional_payload": True,
             }
             presence = SSAValue(
-                GLOBAL_MONOTONIC_IDS.mint(),
+                mint_ssa_value(
+                    function, OPTIONAL_PRESENCE, (payload,),
+                    dtype="bool", stage=RECORD_RETURN_REPAIR,
+                ),
                 dtype="bool",
                 accounting={
                     "ssa_optional_presence": True,
@@ -517,7 +536,10 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                 )
                 if presence is None:
                     presence = SSAValue(
-                        GLOBAL_MONOTONIC_IDS.mint(),
+                        mint_ssa_value(
+                            caller, OPTIONAL_PRESENCE, (payload,),
+                            dtype="bool", stage=RECORD_RETURN_REPAIR,
+                        ),
                         dtype="bool",
                         accounting={
                             "ssa_optional_presence": True,
@@ -525,7 +547,11 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         },
                     )
                 aggregate = SSAValue(
-                    GLOBAL_MONOTONIC_IDS.mint(),
+                    mint_ssa_value(
+                        caller, OPTIONAL_AGGREGATE, (payload, presence),
+                        dtype="ssa.aggregate", shape=(2,),
+                        stage=RECORD_RETURN_REPAIR,
+                    ),
                     dtype="ssa.aggregate",
                     shape=(2,),
                     accounting={
@@ -535,14 +561,14 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                 )
                 projection: list[Instr] = []
                 for position, output in enumerate((payload, presence)):
-                    position_value = SSAValue(
-                        GLOBAL_MONOTONIC_IDS.mint(),
-                        dtype="int",
-                    )
-                    address = SSAValue(
-                        GLOBAL_MONOTONIC_IDS.mint(),
-                        dtype="ptr",
-                    )
+                    position_value = SSAValue(mint_ssa_value(
+                        caller, CONTROL_CONST, (aggregate,), dtype="int",
+                        stage=RECORD_RETURN_REPAIR,
+                    ), dtype="int")
+                    address = SSAValue(mint_ssa_value(
+                        caller, ADDRESS, (aggregate, position_value),
+                        dtype="ptr", stage=RECORD_RETURN_REPAIR,
+                    ), dtype="ptr")
                     projection.extend((
                         Instr("Const", [], position_value,
                               attributes={"value": position}),

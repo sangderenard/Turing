@@ -120,6 +120,40 @@ def _authored_sequence_annotation_contract(
         )
         return scalar_dtypes.get(str(spelling))
 
+    # A collection of fixed tuples is a fixed-width row table.  The source
+    # annotation is the declaration of every physical column; declining it
+    # here leaves the already-correct row width paired with ``unknown``
+    # layouts downstream.  Keep a bare ``tuple[T, U]`` out of this path: it
+    # is one record value, not a sequence whose elements are records.
+    if (
+        container in {"Sequence", "Iterable", "Collection", "List", "list"}
+        and len(element_nodes) == 1
+        and isinstance(element_nodes[0], ast.Subscript)
+    ):
+        row = element_nodes[0]
+        row_container = (
+            row.value.id
+            if isinstance(row.value, ast.Name)
+            else row.value.attr
+            if isinstance(row.value, ast.Attribute)
+            else ""
+        )
+        row_columns = (
+            tuple(row.slice.elts)
+            if isinstance(row.slice, ast.Tuple)
+            else (row.slice,)
+        )
+        if row_container in {"Tuple", "tuple"} and not any(
+            isinstance(column, ast.Constant) and column.value is Ellipsis
+            for column in row_columns
+        ):
+            dtypes = tuple(scalar_dtype(column) for column in row_columns)
+            if len(dtypes) >= 2 and all(dtype is not None for dtype in dtypes):
+                return (
+                    "duplicates", len(dtypes), container in {"List", "list"},
+                    tuple(str(dtype) for dtype in dtypes),
+                )
+
     if container in {"Mapping", "MutableMapping", "Dict", "dict"}:
         if len(element_nodes) != 2:
             return None

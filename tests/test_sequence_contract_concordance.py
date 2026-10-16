@@ -34,6 +34,9 @@ from src.compiler.identity_concordance import (
     end_identity_book,
     resolved_concordant_alias_bindings,
 )
+from src.compiler.concordance_declarations import (
+    SOURCE_SORT_CONTRACT, SourceSortContract,
+)
 from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.transmogrifier.ssa import (
@@ -45,6 +48,35 @@ from src.transmogrifier.ssa import (
     SSASequenceDescriptor,
     SSASequenceTable,
 )
+
+
+def test_sort_policy_is_published_at_source_and_carried_through_relabel():
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "def run():\n"
+                "    rows = [(2, 3), (1, 4)]\n"
+                "    rows.sort(key=lambda row: row[1], reverse=True)\n"
+                "    return rows\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("run").graph
+        call = next(
+            data for _node_id, data in function.G.nodes(data=True)
+            if (data.get("attributes") or {}).get(
+                "source_sort_contract_row"
+            ) is not None
+        )
+        row = call["attributes"]["source_sort_contract_row"]
+        fact = book.page(SOURCE_SORT_CONTRACT).latest(row)
+        assert fact == SourceSortContract(
+            "sort_key_column", (), 1, True,
+            destination_value_id=6,
+        )
+    finally:
+        end_identity_book(token)
 
 
 def test_sequence_contract_concordance_keeps_one_physical_row_contract():
@@ -265,6 +297,35 @@ def test_finalization_closes_terminal_alias_with_no_surviving_identity():
         assert planning.alias_bindings("solve") == {}
     finally:
         end_identity_book(token)
+
+
+def test_imported_function_aliases_use_the_accepted_component_book():
+    owner, owner_token = begin_identity_book()
+    try:
+        planning = owner.page("planning_value_concordance")
+        planning.bind_alias("imported", 5, 7)
+        outputs = owner.page("output_identity_concordance")
+        outputs.bind_alias("imported", 3, 7)
+    finally:
+        end_identity_book(owner_token)
+
+    function = Function("imported", [], {})
+    function.metadata.update({
+        "value_aliases": ((5, 7),),
+        "output_identity_aliases": ((3, 7),),
+        "accepted_ssa_component": {"identity_book": owner},
+    })
+
+    ambient, ambient_token = begin_identity_book()
+    try:
+        assert _concordant_function_aliases(
+            function, include_output_identities=True,
+        ) == {3: 7, 5: 7}
+        assert not ambient.page(
+            "output_identity_concordance"
+        ).scope_rows("imported")
+    finally:
+        end_identity_book(ambient_token)
 
 
 def test_sequence_alias_with_live_length_reads_rebinds_all_descriptor_members(tmp_path):
@@ -750,3 +811,25 @@ class Reading:
 """))
 
     assert schemas["Reading"]["fields"]["samples"]["value_record"] == "Sample"
+
+
+def test_source_record_schema_keeps_record_sequence_row_identity():
+    schemas = _authored_complete_record_schemas(ast.parse("""
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Claim:
+    key: str
+
+@dataclass(frozen=True)
+class ValueRow:
+    claims: list[Claim]
+"""))
+
+    assert schemas["ValueRow"]["fields"]["claims"] == {
+        "storage": "table",
+        "rank": 1,
+        "mutable": True,
+        "aggregate_kind": "list",
+        "row_record": "Claim",
+    }

@@ -469,23 +469,77 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
     contracts: dict[
         tuple[str, int], list[tuple[tuple[int, ...], str]]
     ] = {}
+    native_result_shapes_by_owner: dict[
+        str, dict[int, tuple[tuple[int, ...], str]]
+    ] = {}
     for caller_name, caller in module.functions.items():
-        native_result_shapes: dict[int, tuple[tuple[int, ...], str]] = {}
+        region_integral = dict(
+            (caller.metadata or {}).get("source_region_integral") or {}
+        )
+        owner_name = str(region_integral.get("owner") or caller_name)
+        native_result_shapes = native_result_shapes_by_owner.setdefault(
+            owner_name, {}
+        )
         for caller_block in caller.blocks.values():
             for producer in caller_block.instrs:
                 native_contract = tuple(
                     producer.attributes.get("native_result_contract", ())
                 )
-                if (
-                    producer.op in {"Call", "call"}
-                    and producer.res is not None
-                    and len(native_contract) == 1
-                    and tuple(native_contract[0][2] or ())
-                ):
-                    native_result_shapes[int(producer.res.id)] = (
-                        tuple(native_contract[0][2]),
-                        str(native_contract[0][1] or "float64"),
+                if producer.op not in {"Call", "call"}:
+                    continue
+
+                def retain_native_result_shape(
+                    output_id: int, contract_row: tuple,
+                ) -> None:
+                    if (
+                        len(contract_row) < 3
+                        or not tuple(contract_row[2] or ())
+                    ):
+                        return
+                    proposed = (
+                        tuple(contract_row[2]),
+                        str(contract_row[1] or "float64"),
                     )
+                    incumbent = native_result_shapes.get(int(output_id))
+                    if incumbent is not None and incumbent != proposed:
+                        raise ValueError(
+                            "native call result shape disagreement for "
+                            f"owner {owner_name!r} value {int(output_id)}: "
+                            f"recorded={incumbent!r}, proposed={proposed!r}"
+                        )
+                    native_result_shapes[int(output_id)] = proposed
+
+                if producer.res is not None and len(native_contract) == 1:
+                    retain_native_result_shape(
+                        int(producer.res.id), native_contract[0],
+                    )
+
+                output_ids = tuple(map(
+                    int, producer.attributes.get("output_ids", ())
+                ))
+                output_positions = tuple(map(
+                    int, producer.attributes.get(
+                        "output_positions", range(len(output_ids)),
+                    )
+                ))
+                if len(output_ids) != len(output_positions):
+                    continue
+                for output_id, output_position in zip(
+                    output_ids, output_positions, strict=True,
+                ):
+                    if 0 <= output_position < len(native_contract):
+                        retain_native_result_shape(
+                            output_id, native_contract[output_position],
+                        )
+
+    for caller_name, caller in module.functions.items():
+        region_integral = dict(
+            (caller.metadata or {}).get("source_region_integral") or {}
+        )
+        owner_name = str(region_integral.get("owner") or caller_name)
+        native_result_shapes = native_result_shapes_by_owner.get(
+            owner_name, {}
+        )
         for block in caller.blocks.values():
             for instruction in block.instrs:
                 if instruction.op not in {"Call", "call"}:
@@ -738,7 +792,7 @@ def settle_static_repository_view_shapes(module: IRModule) -> bool:
 
 
 def settle_canonical_value_metadata(module: IRModule) -> bool:
-    """Fill empty tensor metadata when one canonical value id is unanimous."""
+    """Settle one canonical value id from its exact or unanimous writer."""
 
     values: dict[tuple[str, int], list[SSAValue]] = {}
     for function in module.functions.values():
@@ -760,25 +814,41 @@ def settle_canonical_value_metadata(module: IRModule) -> bool:
             value for value in occurrences
             if str(value.dtype or "") not in excluded
         ]
+        exact_writer_shapes = {
+            tuple(value.shape)
+            for value in numerical
+            if tuple(value.shape)
+            and tuple((value.accounting or {}).get(
+                "shape_settlement_provenance", ()
+            ) or ())[:1] == ("shape_preserving_ssa_edge",)
+        }
         shapes = {
             tuple(value.shape) for value in numerical if tuple(value.shape)
         }
-        if len(shapes) != 1:
+        if len(exact_writer_shapes) == 1:
+            shape = next(iter(exact_writer_shapes))
+            provenance = "canonical_identity_exact_writer"
+        elif len(shapes) == 1:
+            shape = next(iter(shapes))
+            provenance = "canonical_identity_unanimous"
+        else:
             continue
-        shape = next(iter(shapes))
         dtype = next((
             value.dtype for value in numerical
             if tuple(value.shape) == shape and value.dtype is not None
         ), None)
         for value in numerical:
-            if not tuple(value.shape):
+            if (
+                tuple(value.shape or ()) != shape
+                and not (value.accounting or {}).get("ssa_storage_view")
+            ):
                 value.shape = shape
                 if value.dtype is None and dtype is not None:
                     value.dtype = dtype
                 value.accounting = {
                     **dict(value.accounting or {}),
                     "shape_settlement_provenance": (
-                        "canonical_identity_unanimous",
+                        provenance,
                         identity[0],
                         identity[1],
                     ),
@@ -967,7 +1037,7 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
             for block in function.blocks.values():
                 for instruction in block.instrs:
                     result = instruction.res
-                    if result is None or tuple(result.shape or ()):
+                    if result is None:
                         continue
                     operation = str(instruction.op).casefold()
                     descriptor_operation = None
@@ -1025,11 +1095,31 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
                             for source in sources
                             if tuple(source.shape or ())
                         }
+                        if len(shapes) > 1:
+                            initial_id = instruction.attributes.get(
+                                "initial_value_id"
+                            )
+                            initial_shapes = {
+                                tuple(source.shape)
+                                for source in sources
+                                if initial_id is not None
+                                and int(source.id) == int(initial_id)
+                                and tuple(source.shape or ())
+                            }
+                            if len(initial_shapes) == 1:
+                                # A loop-carried Phi's authored initial edge
+                                # anchors the recurrence.  Its update can only
+                                # acquire a shape after the Phi itself has one;
+                                # requiring unanimity first leaves the cycle
+                                # stuck on a provisional update extent.
+                                shapes = initial_shapes
                     else:
                         continue
                     if len(shapes) != 1:
                         continue
                     shape = next(iter(shapes))
+                    if tuple(result.shape or ()) == shape:
+                        continue
                     result.shape = shape
                     result.accounting = {
                         **dict(result.accounting or {}),
@@ -1242,13 +1332,23 @@ def propagate_repository_ssa_call_metadata(
             # to ``b``'s own extents, so the broadcast kernel conformed the
             # wrong axes and every consumer read misaligned elements.
             declared_view = (value.accounting or {}).get("ssa_storage_view")
+            declared_view_shape = tuple(
+                declared_view.get("view_shape") or ()
+            ) if isinstance(declared_view, Mapping) else ()
             retained_view = (
                 isinstance(declared_view, Mapping)
-                and tuple(value.shape or ())
-                == tuple(declared_view.get("view_shape") or ())
+                and bool(declared_view_shape)
                 and bool(source_shape)
-                and prod(tuple(value.shape or ())) == prod(source_shape)
+                and prod(declared_view_shape) == prod(source_shape)
             )
+            local_shape_writer = tuple(
+                (value.accounting or {}).get(
+                    "shape_settlement_provenance", ()
+                ) or ()
+            )[:1] in {
+                ("shape_preserving_ssa_edge",),
+                ("canonical_identity_exact_writer",),
+            }
             def _log(field: str, old: Any, new: Any) -> None:
                 mutation_page.set(
                     (
@@ -1259,10 +1359,16 @@ def propagate_repository_ssa_call_metadata(
                     (old, new, authoritative, int(source.id)),
                 )
 
+            if retained_view and tuple(value.shape or ()) != declared_view_shape:
+                _log("shape", tuple(value.shape or ()), declared_view_shape)
+                value.shape = declared_view_shape
+                changed = True
+
             if (
                 not fixed_constant
                 and authoritative
                 and not retained_view
+                and not local_shape_writer
                 and tuple(value.shape or ()) != source_shape
             ):
                 _log("shape", tuple(value.shape or ()), source_shape)
@@ -1939,6 +2045,12 @@ def propagate_repository_ssa_call_metadata(
                                                 authoritative=settle_exact_returns,
                                                 source_owner=callee,
                                             )
+        # Region returns and their owner's Phi values are one constraint
+        # cycle.  Settle local shape-preserving kernel/Phi writers inside the
+        # same fixed point, after this round's exact call edges, so a
+        # provisional return shape cannot be copied outward and then fight
+        # its own binary/broadcast writer in a separate outer pass.
+        changed |= settle_shape_preserving_value_metadata(module)
         settle_exact_formals = False
         settle_exact_returns = False
         state = fixed_point_state()
@@ -2091,8 +2203,13 @@ def settle_repository_ssa_shape_metadata(module: IRModule) -> bool:
     )
     changed_any = False
     while True:
-        changed = propagate_repository_ssa_call_metadata(module)
-        changed |= settle_shape_preserving_value_metadata(module)
+        # Settle the local writer first.  Exact call-return propagation is
+        # authoritative only after the callee's own shape-preserving kernel
+        # and Phi edges have stated their current result; applying the return
+        # first can copy a stale pre-broadcast extent into every region and
+        # then fight the local writer on the next round.
+        changed = settle_shape_preserving_value_metadata(module)
+        changed |= propagate_repository_ssa_call_metadata(module)
         changed_any |= changed
         guard.round(changed)
         if not changed:
@@ -2312,10 +2429,21 @@ def lower_tensor_calls_to_repository_ssa(
                     *(int(value.id) for value in metadata_formals),
                 )))
                 callee.metadata["source_region_integral"] = integral
+            from .concordance_declarations import (
+                SSA_VALUE, TENSOR_METADATA_CALL_BINDING,
+                TENSOR_SHAPE_CONCORDANCE, TENSOR_SSA_LOWERING,
+            )
+            from .identity_concordance import Derived, Mode
+            from .ssa_record_return_state import (
+                function_scope_of, ssa_value_identity_cell,
+            )
+            book = identity_book(module)
             for caller_name, caller in module.functions.items():
                 caller_values = function_values[str(caller_name)]
-                for block in caller.blocks.values():
-                    for instruction in block.instrs:
+                for block_name, block in caller.blocks.items():
+                    for instruction_index, instruction in enumerate(
+                        block.instrs
+                    ):
                         if (
                             instruction.op not in {"Call", "call"}
                             or instruction.attributes.get("callee")
@@ -2347,6 +2475,59 @@ def lower_tensor_calls_to_repository_ssa(
                             *(str(value.dtype or "int32") for value in actuals),
                         ))
                         instruction.attributes = attributes
+                        caller_scope = function_scope_of(caller)
+                        callee_scope = function_scope_of(callee)
+                        row = (
+                            caller_scope, str(caller_name), str(block_name),
+                            int(instruction_index), str(callee_name),
+                        )
+                        sources = tuple(dict.fromkeys(
+                            cell for cell in (
+                                *(
+                                    ssa_value_identity_cell(
+                                        caller, int(actual.id), book=book,
+                                    )
+                                    for actual in actuals
+                                ),
+                                *(
+                                    ssa_value_identity_cell(
+                                        callee, int(formal.id), book=book,
+                                    )
+                                    for formal in metadata_formals
+                                ),
+                                *(
+                                    book.latest_ref(
+                                        TENSOR_SHAPE_CONCORDANCE,
+                                        (str(caller_name), int(actual.id)),
+                                    )
+                                    for actual in actuals
+                                ),
+                                book.latest_ref(
+                                    TENSOR_METADATA_CALL_BINDING, row,
+                                ),
+                            )
+                            if cell is not None
+                        ))
+                        if not sources:
+                            raise ValueError(
+                                "tensor metadata call binding has no "
+                                f"concordance cells for {caller_name} -> "
+                                f"{callee_name}"
+                            )
+                        book.post(
+                            TENSOR_METADATA_CALL_BINDING,
+                            row,
+                            (
+                                tuple(int(value.id) for value in actuals),
+                                tuple(
+                                    int(value.id)
+                                    for value in metadata_formals
+                                ),
+                            ),
+                            stage=TENSOR_SSA_LOWERING,
+                            provenance=Derived(sources),
+                            mode=Mode.REVISE,
+                        )
 
     # Direct source compilation and autograd both consume the same repository
     # SSA.  Region calls must therefore settle their exact actual/formal and
@@ -4057,6 +4238,24 @@ def lower_tensor_calls_to_repository_ssa(
                     and int(argument.id) in constants
                 ]
                 source = data_args[0] if data_args else (args[0] if args else None)
+                unsettled_span_operands = tuple(
+                    operand for operand in data_args
+                    if not tuple(operand.shape or ())
+                    and (operand.accounting or {}).get(
+                        "program_abi_storage"
+                    ) == "span"
+                )
+                if operation == "where" and unsettled_span_operands:
+                    # A linked multi-result call publishes each result's
+                    # extents only after whole-program call linking has paired
+                    # its output_ids/output_positions with the native result
+                    # contract.  Until then an empty-shaped span is not a
+                    # scalar.  Retain the semantic operation so the existing
+                    # late tensor slice can consume that exact call-edge fact;
+                    # lowering it now would irreversibly turn the span into a
+                    # by-value fill_double operand.
+                    rewritten.append(instruction)
+                    continue
                 constructor_count: SSAValue | None = None
                 constructor_operations = {
                     "fill", "full", "zeros", "empty", "ones",

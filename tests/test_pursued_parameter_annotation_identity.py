@@ -161,3 +161,31 @@ def test_imported_views_of_one_definition_keep_exact_function_instances():
         assert _source_graph_for_lowered_function(indexed, "compiled", SimpleNamespace(metadata=metadata)) is entry.graph.G
     assert _source_graph_for_lowered_function(indexed, "compiled", SimpleNamespace(
         metadata={"authored_function_identity": identity})) is None
+
+
+def test_callsite_variants_of_one_function_reference_keep_exact_copy_scopes():
+    from types import SimpleNamespace
+    from src.compiler.fortran_c_shell import (
+        _resolved_source_graphs_by_symbol, _source_graph_for_lowered_function,
+    )
+    identity = ("controller", "_propose_dt_pen")
+    entries = [SimpleNamespace(
+        name="_propose_dt_pen", qualified_name=f"variant_{ordinal}",
+        graph=SimpleNamespace(G=SimpleNamespace(graph={
+            "authored_function_identity": identity,
+            "function_ref": 2,
+            "shape_scope": ("_propose_dt_pen|shape", ordinal),
+        })),
+    ) for ordinal in (7, 8)]
+    indexed = _resolved_source_graphs_by_symbol(SimpleNamespace(
+        function_table=entries,
+    ))
+    for entry in entries:
+        metadata = {
+            "authored_function_identity": identity,
+            "source_function_reference": 2,
+            "shape_scope": entry.graph.G.graph["shape_scope"],
+        }
+        assert _source_graph_for_lowered_function(
+            indexed, "compiled", SimpleNamespace(metadata=metadata),
+        ) is entry.graph.G

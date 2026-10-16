@@ -104,6 +104,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "front (default: 75)"
         ),
     )
+    parser.add_argument(
+        "--continue-after-failure", action="store_true",
+        help=(
+            "admit every unit in each provenance stage and report all "
+            "failed/partial units instead of stopping admission after the "
+            "first observed failure"
+        ),
+    )
     for option in ("unroll-depth", "inline-depth", "custom-version-depth"):
         parser.add_argument("--" + option, type=int, default=0,
                             help="optional expansion nesting (default: 0, disabled)")
@@ -143,6 +151,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             expansion_policy=expansion_policy,
             jobs=arguments.jobs,
             schedule_options=_provenance_schedule_options(arguments),
+            stop_after_failure=not getattr(
+                arguments, "continue_after_failure", False
+            ),
             progress=None,
         )
     except ProvenanceCoreRestartRequired:
@@ -180,6 +191,9 @@ def _build_and_report(arguments, expansion_policy, display):
             expansion_policy=expansion_policy,
             jobs=getattr(arguments, "jobs", None),
             schedule_options=_provenance_schedule_options(arguments),
+            stop_after_failure=not getattr(
+                arguments, "continue_after_failure", False
+            ),
             progress=display.log,
         )
         first = plan["next_partition"]

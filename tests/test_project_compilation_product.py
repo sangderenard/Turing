@@ -93,7 +93,10 @@ def test_source_acceptance_does_not_import_linked_repository_ssa_cells():
     body_graph = nx.DiGraph()
     body_graph.add_node(1, source_cell=local, expr_obj=definition)
     body = SimpleNamespace(G=body_graph)
-    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(graph=body))
+    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(
+        graph=body,
+        qualified_name="linked",
+    ))
     graph = SimpleNamespace(function_table=table, G=SimpleNamespace(graph={}))
 
     projected = project_process_graph_acceptance(graph, (0,), book=book)
@@ -104,6 +107,255 @@ def test_source_acceptance_does_not_import_linked_repository_ssa_cells():
     assert projected.page(INGESTION_VALUE.name).latest(
         (("ingestion:linked-worker", 0), 2)
     ) is None
+
+
+def test_source_acceptance_projects_concorded_value_classes():
+    import networkx as nx
+
+    from src.compiler.concordance_declarations import (
+        INGESTION,
+        INGESTION_VALUE,
+        INGEST_SOURCE,
+        REDUCTION,
+        SOURCE_VALUE_CLASS,
+        NodeFact,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        IdentityBook,
+        Mode,
+        Novel,
+    )
+
+    scope = ("compiler_probe", "RowField.admits")
+    ingestion_scope = ("ingestion:row-field", 0)
+    book = IdentityBook()
+    source = book.post(
+        INGESTION_VALUE,
+        (ingestion_scope, 1),
+        NodeFact("Name", "input", "self"),
+        stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+    value_class = book.post(
+        SOURCE_VALUE_CLASS,
+        (scope, 1),
+        ("RowField", 1, "method receiver"),
+        stage=REDUCTION,
+        provenance=Derived((source,)),
+        mode=Mode.CONCORD,
+    )
+    body_graph = nx.DiGraph()
+    body_graph.graph.update({
+        "authored_function_identity": scope,
+        "function_name": "admits",
+    })
+    body_graph.add_node(
+        1,
+        type="Input",
+        value_id=1,
+        source_cell=source,
+        attributes={"binding_name": "self", "binding_kind": "parameter"},
+    )
+    body = SimpleNamespace(G=body_graph)
+    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(
+        graph=body,
+        qualified_name="RowField.admits",
+    ))
+    graph = SimpleNamespace(function_table=table, G=SimpleNamespace(graph={}))
+
+    projected = project_process_graph_acceptance(graph, (0,), book=book)
+
+    assert projected.page(SOURCE_VALUE_CLASS.name).latest(
+        (scope, 1)
+    ) == book.page(SOURCE_VALUE_CLASS.name).latest((scope, 1))
+    assert projected.stamp_of(value_class) == book.stamp_of(value_class)
+
+
+def test_source_acceptance_projects_sort_contract_named_by_graph_view():
+    import networkx as nx
+
+    from src.compiler.concordance_declarations import (
+        INGESTION,
+        INGESTION_VALUE,
+        INGEST_SOURCE,
+        REDUCTION,
+        SOURCE_SORT_CONTRACT,
+        NodeFact,
+        SourceSortContract,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        IdentityBook,
+        Mode,
+        Novel,
+    )
+
+    scope = ("compiler_probe", "sort_rows")
+    ingestion_scope = ("ingestion:sort-rows", 0)
+    book = IdentityBook()
+    source = book.post(
+        INGESTION_VALUE,
+        (ingestion_scope, 1),
+        NodeFact("Call", "sort", "rows.sort"),
+        stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+    row = (scope, 1)
+    contract = SourceSortContract(
+        "sort_key_mapping_getitem", (2,), 0, False, 3,
+    )
+    cell = book.post(
+        SOURCE_SORT_CONTRACT, row, contract,
+        stage=REDUCTION, provenance=Derived((source,)),
+        mode=Mode.CONCORD,
+    )
+    body_graph = nx.DiGraph()
+    body_graph.graph.update({
+        "authored_function_identity": scope,
+        "function_name": "sort_rows",
+    })
+    body_graph.add_node(
+        1, type="Call", value_id=1, source_cell=source,
+        attributes={"source_sort_contract_row": row},
+    )
+    body = SimpleNamespace(G=body_graph)
+    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(
+        graph=body, qualified_name="compiler_probe.sort_rows",
+    ))
+    graph = SimpleNamespace(function_table=table, G=SimpleNamespace(graph={}))
+
+    projected = project_process_graph_acceptance(graph, (0,), book=book)
+
+    assert projected.page(SOURCE_SORT_CONTRACT.name).latest(row) == contract
+    assert projected.stamp_of(cell) == book.stamp_of(cell)
+
+
+def test_source_acceptance_projects_sort_contract_carried_by_loop_effect():
+    import networkx as nx
+
+    from src.compiler.concordance_declarations import (
+        INGESTION,
+        INGESTION_VALUE,
+        INGEST_SOURCE,
+        REDUCTION,
+        SOURCE_SORT_CONTRACT,
+        NodeFact,
+        SourceSortContract,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        IdentityBook,
+        Mode,
+        Novel,
+    )
+
+    scope = ("compiler_probe", "loop_sort_rows")
+    ingestion_scope = ("ingestion:loop-sort-rows", 0)
+    book = IdentityBook()
+    source = book.post(
+        INGESTION_VALUE,
+        (ingestion_scope, 1),
+        NodeFact("Call", "sort", "rows.sort"),
+        stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+    row = (scope, 1)
+    contract = SourceSortContract(
+        "sort_key_mapping_getitem", (2,), 0, False, 3,
+    )
+    cell = book.post(
+        SOURCE_SORT_CONTRACT, row, contract,
+        stage=REDUCTION, provenance=Derived((source,)),
+        mode=Mode.CONCORD,
+    )
+    body_graph = nx.DiGraph()
+    body_graph.graph.update({
+        "authored_function_identity": scope,
+        "function_name": "loop_sort_rows",
+    })
+    body_graph.add_node(
+        10, type="For", value_id=10, source_cell=source,
+        attributes={
+            "loop_state_effects": ({
+                "state_name": "rows",
+                "operator": "sort",
+                "source_contract_cell": cell,
+            },),
+        },
+    )
+    body = SimpleNamespace(G=body_graph)
+    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(
+        graph=body, qualified_name="compiler_probe.loop_sort_rows",
+    ))
+    graph = SimpleNamespace(function_table=table, G=SimpleNamespace(graph={}))
+
+    projected = project_process_graph_acceptance(graph, (0,), book=book)
+
+    assert projected.page(SOURCE_SORT_CONTRACT.name).latest(row) == contract
+    assert projected.stamp_of(cell) == book.stamp_of(cell)
+
+
+def test_source_acceptance_projects_lexical_read_edge_identities():
+    import networkx as nx
+
+    from src.compiler.concordance_declarations import (
+        INGESTION,
+        INGESTION_VALUE,
+        INGEST_SOURCE,
+        LEXICAL_READ_BINDING,
+        OPERAND_POSITION,
+        NodeFact,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        IdentityBook,
+        Mode,
+        Novel,
+    )
+
+    scope = ("lexical_reads:compiler_probe.reader", 0)
+    ingestion_scope = ("ingestion:reader", 0)
+    book = IdentityBook()
+    source = book.post(
+        INGESTION_VALUE,
+        (ingestion_scope, 1),
+        NodeFact("Name", "input", "value"),
+        stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+    read = book.post(
+        LEXICAL_READ_BINDING,
+        (scope, 2, "lhs", 0),
+        "value",
+        stage=OPERAND_POSITION,
+        provenance=Derived((source,)),
+        mode=Mode.CONCORD,
+    )
+    body_graph = nx.DiGraph()
+    body_graph.graph.update({
+        "lexical_read_scope": scope,
+        "function_name": "reader",
+    })
+    body_graph.add_node(1, type="Input", value_id=1, source_cell=source)
+    body = SimpleNamespace(G=body_graph)
+    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(
+        graph=body,
+        qualified_name="compiler_probe.reader",
+    ))
+    graph = SimpleNamespace(function_table=table, G=SimpleNamespace(graph={}))
+
+    projected = project_process_graph_acceptance(graph, (0,), book=book)
+
+    assert projected.page(LEXICAL_READ_BINDING.name).latest(
+        (scope, 2, "lhs", 0)
+    ) == "value"
+    assert projected.stamp_of(read) == book.stamp_of(read)
+    assert projected.stamp_of(source) == book.stamp_of(source)
 
 
 def test_public_compiler_preserves_module_context_for_relative_imports(
@@ -269,6 +521,9 @@ def test_project_worker_hands_its_resolved_module_context_to_ingestion(
 
     assert observed["source_module"] == "compiler_worker_probe.target"
     assert observed["python_package"] == "compiler_worker_probe"
+    assert observed["extraction_contract"].declared_sources == {
+        source_path.resolve(): "compiler_worker_probe.target",
+    }
     current = json.loads(
         (tmp_path / "product" / "compile-progress.json").read_text()
     )["current"]
@@ -2824,5 +3079,8 @@ def test_finished_ssa_artifact_releases_unpickleable_frontend_graphs():
     assert entry.graph is None
     assert entry.python_callable is None
     assert entry.implementations == {}
-    assert entry.metadata == {"source_node": 17}
+    assert entry.metadata == {
+        "source_node": 17,
+        "function_address_identity": "package.leaf",
+    }
     pickle.dumps(module)

@@ -3583,6 +3583,15 @@ def _unexplained_root_argument_ids(function: Any) -> tuple[int, ...]:
     # exact source-input identity in closure_formals. The publisher previously
     # ignored that existing ABI receipt and falsely called the same id escaped.
     authored_ids.update(int(row["value_id"]) for row in _represented_closure_formals(function))
+    # An instance receiver is intentionally absent from ``parameter_names``:
+    # its public representation is the set of exact field-slot locations.
+    # Those receipts still name the authored receiver value itself, so retain
+    # that existing correlation when auditing the root ABI.
+    authored_ids.update(
+        int(receiver_id)
+        for _slot, receiver_id, _field_index, _dtype
+        in function.metadata.get("receiver_field_locations", ())
+    )
     authored_projection_ids = {
         int(value_id)
         for value_id, source_name, transform
@@ -4911,8 +4920,15 @@ def project_process_graph_acceptance(graph, references, book=None):
                 visit(getattr(value, declared.name))
 
     owner = book or graph.G.graph.get("compilation_unit_identity_book") or current_identity_book()
-    from .concordance_declarations import CANONICAL_VALUE, INGESTION_VALUE, FUNCTION_ADDRESS, NAME_BINDING, SCOPE_REGISTRY, SCOPE_ORIGIN
-    from ..common.tensors.topological_reducer import node_ingestion_scopes
+    from .concordance_declarations import (
+        CANONICAL_VALUE, FUNCTION_ADDRESS, INGESTION_VALUE,
+        LEXICAL_READ_BINDING, NAME_BINDING, SCOPE_ORIGIN, SCOPE_REGISTRY,
+        SOURCE_AGGREGATE_LAYOUT, SOURCE_GLYPH_SEQUENCE,
+        SOURCE_SORT_CONTRACT, SOURCE_VALUE_CLASS,
+    )
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope, node_ingestion_scopes,
+    )
     for reference in references:
         entry = graph.function_table.entry(int(reference))
         body = entry.graph
@@ -4931,6 +4947,95 @@ def project_process_graph_acceptance(graph, references, book=None):
                 cell = owner.latest_ref(CANONICAL_VALUE, (scope, int(node_id)))
                 if cell is not None:
                     roots.add(cell)
+        # Lexical binding rows are edge identities consumed after the worker
+        # has planned regions and loops.  They are keyed by the graph's exact
+        # read scope but are not embedded as Ref objects in the graph.  A
+        # scoped worker therefore received the operand topology while losing
+        # which authored binding each operand read.  Project every row of this
+        # function's declared read scope through its existing predecessor
+        # edges; later copy-on-read forks then see the same graph the source
+        # compiler wrote.
+        if scope is not None:
+            reads = owner.pages.get(LEXICAL_READ_BINDING.name)
+            if reads is not None:
+                for row in reads.scope_rows(tuple(scope)):
+                    cell = owner.latest_ref(LEXICAL_READ_BINDING, row)
+                    if cell is not None:
+                        roots.add(cell)
+        # Source-value classes are the accepted type facts consumed by
+        # callsite specialization and schema guards.  They do not occur as
+        # ``Ref`` objects inside the ProcessGraph, so the generic visitor
+        # above cannot discover them.  Omitting them made a scoped worker
+        # forget, for example, that ``RowField.admits``'s receiver is a
+        # ``RowField`` even though source reduction had already concorded
+        # that exact value.  Carry the incumbent cells for this function's
+        # retained value identities through the same predecessor projection
+        # as every other acceptance root.
+        numeric_scope = _source_numeric_scope(body.G)
+        aggregate_scopes = tuple(dict.fromkeys(
+            tuple(candidate)
+            for candidate in (
+                body.G.graph.get("source_aggregate_layout_scope"),
+                numeric_scope,
+                body.G.graph.get("source_numeric_base_scope"),
+                body.G.graph.get("authored_function_identity"),
+            )
+            if candidate is not None
+        ))
+        for node_id, data in body.G.nodes(data=True):
+            value_id = int(data.get("value_id", node_id))
+            cell = owner.latest_ref(
+                SOURCE_VALUE_CLASS, (numeric_scope, value_id),
+            )
+            if cell is not None:
+                roots.add(cell)
+            # Aggregate layouts are semantic source facts keyed by the exact
+            # function scope and retained value identity.  Root the page cell
+            # directly; projected graphs are allowed to drop every debug
+            # attribute while preserving the same compilation meaning.
+            for aggregate_scope in aggregate_scopes:
+                aggregate_cell = owner.latest_ref(
+                    SOURCE_AGGREGATE_LAYOUT,
+                    (aggregate_scope, value_id),
+                )
+                if aggregate_cell is not None:
+                    roots.add(aggregate_cell)
+            # Sort recipes are source facts whose graph view stores the row,
+            # not a Python ``Ref``.  Carry that already-published cell into
+            # the isolated unit exactly as source-value classes are carried;
+            # otherwise deployment sees a truthful row pointer into a book
+            # from which the scoped projector omitted the row.
+            sort_row = (data.get("attributes") or {}).get(
+                "source_sort_contract_row"
+            )
+            if sort_row is not None:
+                sort_cell = owner.latest_ref(
+                    SOURCE_SORT_CONTRACT, tuple(sort_row),
+                )
+                if sort_cell is None:
+                    raise ValueError(
+                        "sort graph view names no source contract cell: "
+                        f"{tuple(sort_row)!r}"
+                    )
+                roots.add(sort_cell)
+            glyph_row = next((
+                (data.get("attributes") or {}).get(name)
+                for name in (
+                    "source_glyph_sequence_row",
+                    "source_literal_glyph_sequence_row",
+                )
+                if (data.get("attributes") or {}).get(name) is not None
+            ), None)
+            if glyph_row is not None:
+                glyph_cell = owner.latest_ref(
+                    SOURCE_GLYPH_SEQUENCE, tuple(glyph_row),
+                )
+                if glyph_cell is None:
+                    raise ValueError(
+                        "glyph graph view names no source contract cell: "
+                        f"{tuple(glyph_row)!r}"
+                    )
+                roots.add(glyph_cell)
         for ingestion_scope in node_ingestion_scopes(body):
             for page, row in ((SCOPE_REGISTRY, ingestion_scope), (SCOPE_ORIGIN, (ingestion_scope,))):
                 cell = owner.latest_ref(page, row)
@@ -4946,7 +5051,11 @@ def project_process_graph_acceptance(graph, references, book=None):
                 cell = owner.latest_ref(INGESTION_VALUE, (ingestion_scope, int(node_id)))
                 if cell is not None:
                     roots.add(cell)
-        address = owner.latest_ref(FUNCTION_ADDRESS, (str(entry.qualified_name),))
+        from ..transmogrifier.function_table import function_address_identity
+
+        address = owner.latest_ref(
+            FUNCTION_ADDRESS, (function_address_identity(entry),),
+        )
         if address is not None:
             roots.add(address)
     return owner.project_cells(roots)
@@ -5727,6 +5836,7 @@ def compile_project_call(
 
     from .work_contract import expansion_policy as _effective_expansion_policy
     from ..common.tensors.source_realization import authored_source_realization
+    from .extraction_contract import ExtractionContract
     from .fortran_c_shell import lower_ast_source_to_ssa
 
     source_file = Path(source_path).resolve()
@@ -5758,6 +5868,16 @@ def compile_project_call(
         if source_file.name == "__init__.py"
         else source_module_name.rpartition(".")[0] or None
     )
+    extraction_policy = (
+        ExtractionContract(extraction_contract)
+        if isinstance(extraction_contract, (str, os.PathLike))
+        else extraction_contract
+    )
+    if extraction_policy is not None:
+        declaration_module = source_module_name or source_file.stem
+        extraction_policy = extraction_policy.with_sources(((
+            declaration_module, source_file,
+        ),))
     artifact_name = encoded_call_name(qualified_name)
     trace_path = root / "compile-progress.json"
     process_graph_plan_path = root / "process-graph-units.json"
@@ -5904,7 +6024,7 @@ def compile_project_call(
             python_package=source_package_name,
             runtime_closure_only=True,
             progress=report,
-            extraction_contract=extraction_contract,
+            extraction_contract=extraction_policy,
             external_class_field_aggregate_kinds=authored_record_contracts,
             linked_repository_ssa=linked_repository_ssa,
             linked_source_region_ssa=linked_source_region_ssa,
@@ -6282,7 +6402,11 @@ def _compile_resolved_process_graph_unit_impl(
     unit is never silently promoted to a native compiler replacement.
     """
 
-    from .fortran_c_shell import lower_resolved_process_graph_unit_to_ssa
+    from .fortran_c_shell import (
+        _record_module_closure_formals,
+        _resolved_source_graphs_by_symbol,
+        lower_resolved_process_graph_unit_to_ssa,
+    )
 
     resolved_path = Path(graph_path).resolve()
     unit_plan_path = Path(plan_path).resolve()
@@ -6502,6 +6626,17 @@ def _compile_resolved_process_graph_unit_impl(
             progress_bars=False,
             compile_progress_state_sink=compile_progress_state_sink,
         )
+    # Unit lowering starts from the already reduced ProcessGraph and does not
+    # pass through lower_ast_source_to_ssa's whole-program publication tail.
+    # Publish the same exact source-capture receipts here, after every late
+    # storage formal has entered the function signature.  These are not
+    # reconstructed types: each row joins a surviving function argument to
+    # the Input node already marked ``binding_kind=closure`` by reduction.
+    module.metadata["closure_formal_receipts"] = (
+        _record_module_closure_formals(
+            module, _resolved_source_graphs_by_symbol(graph),
+        )
+    )
     if interface_tiles:
         # Interior callsite variants remain in the object/diagnostic SSA.
         # Only canonical authored entries are separate compilation interfaces;
@@ -6733,6 +6868,31 @@ def _compile_resolved_process_graph_unit_impl(
                 paths = {path: accepted_id(value_id) for path, value_id in paths.items()}
                 kinds = set((source.G.graph.get("return_container_kinds") or {}).values())
                 kind = next(iter(kinds)) if len(kinds) == 1 else None
+                optional_layouts = {
+                    int(payload_id): tuple(map(int, layout))
+                    for payload_id, layout in tuple(
+                        function.metadata.get("aggregate_return_layouts", ())
+                    )
+                    if len(tuple(layout)) == 2
+                }
+                if (
+                    len(paths) == 1
+                    and len(published_ids) == 2
+                    and len(optional_layouts) == 1
+                    and (layout := next(iter(optional_layouts.values())))
+                    is not None
+                    and set(layout) == published_ids
+                ):
+                    # Optional lowering turns one authored scalar/record slot
+                    # into its exact physical (payload, presence) return ABI.
+                    # ``aggregate_return_layouts`` is the lowering receipt;
+                    # publish that accepted layout rather than comparing the
+                    # two physical values to the pre-lowering source id.
+                    paths = {
+                        (0,): int(layout[0]),
+                        (1,): int(layout[1]),
+                    }
+                    kind = "tuple"
                 if len(published_ids) == 1 and kind not in {"tuple", "list"}:
                     # A scalar Return/Phi is the one published value, even
                     # when several authored return sites feed that Phi.
@@ -6740,7 +6900,29 @@ def _compile_resolved_process_graph_unit_impl(
             else:
                 raise ValueError("native result layout has no authoritative source reference")
             if set(paths.values()) != published_ids:
-                raise ValueError(f"native result layout disagrees with accepted SSA: {export_name}: {paths} != {published_ids}")
+                mismatch = {
+                    "kind": "native-result-layout-mismatch",
+                    "authored_paths": [
+                        [list(path), int(value_id)]
+                        for path, value_id in paths.items()
+                    ],
+                    "published_output_ids": sorted(published_ids),
+                }
+                accounting = next((
+                    record for record in unit_accounting
+                    if str(record.get("ssa_function") or "")
+                    == str(export_name)
+                ), None)
+                if accounting is None:
+                    raise ValueError(
+                        "native result layout mismatch has no unit "
+                        f"accounting row: {export_name}: {paths} != "
+                        f"{published_ids}"
+                    )
+                accounting["shortfalls"].append(mismatch)
+                accounting["complete"] = False
+                compiled_complete = False
+                continue
             function.metadata["native_output_paths"] = tuple(paths.items())
             function.metadata["native_return_container_kind"] = kind
             if ssa_composition:

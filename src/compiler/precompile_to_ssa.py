@@ -16,7 +16,7 @@ import networkx as nx
 from .live_tiles import TiledObject
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
-from .id_space import serial_of as _id_serial_of
+from .id_space import MINTED, has_flag, serial_of as _id_serial_of
 from .identity_concordance import (
     NEW,
     ConcordanceRefusal,
@@ -106,10 +106,14 @@ from .concordance_declarations import (
     ROW_COLUMN_PROJECTION,
     SCALAR_ITEM_MERGE,
     SCALAR_PARAMETER,
+    SEQUENCE_DESCRIPTOR,
     SEQUENCE_LENGTH_CELL,
     SSA_FIELD_VERSION,
     SSA_BLOCK,
+    SSA_BLOCK_GEOMETRY,
+    SSA_CONSTANT_MATERIALIZATION,
     SSA_VALUE,
+    TABLE_REGISTRATION,
     TABLE_LOOKUP,
     TENSOR_SHAPE_CONCORDANCE,
     VERSIONED_WRITE,
@@ -124,6 +128,7 @@ from .concordance_declarations import (
     RegionSignature,
     SSAValueFact,
     SSAValueOrigin,
+    SSABlockKind,
 )
 from .control_source import (
     CallBlock,
@@ -992,7 +997,9 @@ def resolve_sequence_schemas(
             origin = f"{function_name}{names!r}"
             descriptor_policy = (
                 "duplicates"
-                if str(policy).startswith(("fill=", "literal_bytes="))
+                if str(policy).startswith((
+                    "fill=", "literal_bytes=", "literal_glyphs=",
+                ))
                 else "unique"
                 if str(policy).startswith("literal_table=")
                 else str(policy)
@@ -1590,6 +1597,14 @@ class _ControlSSABuilder(TiledObject):
         self.function_return_edges: list[
             tuple[BasicBlock, tuple[SSAValue | None, ...]]
         ] = []
+        # Exact optional-glyph presence carried by each authored return edge.
+        # The key is the edge block and logical return slot.  It is populated
+        # while lowering the conditional arm from that arm's
+        # SOURCE_OPTIONAL_GLYPH_CARRY cell; finish must not attach the final
+        # merged presence to an earlier return edge where it does not dominate.
+        self.optional_glyph_return_presence_by_edge_slot: dict[
+            tuple[str, int], SSAValue
+        ] = {}
         self._function_exit: BasicBlock | None = None
         self.named_output_histories = {
             str(name): tuple(map(int, history))
@@ -1746,6 +1761,10 @@ class _ControlSSABuilder(TiledObject):
         self.sequence_storage_values: dict[int, tuple[SSAValue, ...]] = {}
         self.sequence_status_values: dict[int, SSAValue] = {}
         self.sequence_helper_functions: dict[str, Function] = {}
+        # Presence is the physical value of an optional resident sequence;
+        # payload storage remains in the incumbent sequence descriptor.
+        # Entries are installed only from SOURCE_OPTIONAL_GLYPH_CARRY cells.
+        self.optional_glyph_presence_by_value: dict[int, SSAValue] = {}
         self.native_object_context = native_object_context
         self.native_object_module = native_object_module
         self.native_object_constructor_receipts = []
@@ -2124,6 +2143,11 @@ class _ControlSSABuilder(TiledObject):
                 int(column_count),
                 bool(writable),
                 source="SSA sequence declaration",
+                sources=(
+                    self._canonical_cell(int(sequence_id))
+                    or self._function_root(),
+                ),
+                stage=self._stage(),
             )
             authored_column_dtypes = tuple(
                 (sequence_column_dtypes or {}).get(int(sequence_id), ())
@@ -2298,9 +2322,12 @@ class _ControlSSABuilder(TiledObject):
                 attributes={"binding": "ssa_joined_sequence_initialize"},
             )
         for sequence_id, policy, column_count in sequence_initializations:
+            literal_table_rows = None
             descriptor_policy = (
                 "duplicates"
-                if str(policy).startswith(("fill=", "literal_bytes="))
+                if str(policy).startswith((
+                    "fill=", "literal_bytes=", "literal_glyphs=",
+                ))
                 else "unique"
                 if str(policy).startswith("literal_table=")
                 else str(policy)
@@ -2319,6 +2346,28 @@ class _ControlSSABuilder(TiledObject):
                 )
             elif str(policy).startswith("literal_bytes="):
                 element_dtype = "int"
+            elif str(policy).startswith("literal_glyphs="):
+                element_dtype = "int64"
+            column_dtypes = None
+            if str(policy).startswith("literal_table="):
+                literal_table_rows = tuple(ast.literal_eval(
+                    str(policy).split("=", 1)[1]
+                ))
+                columns = tuple(zip(*literal_table_rows)) if literal_table_rows else ()
+                column_dtypes = tuple(
+                    "bool" if all(isinstance(value, bool) for value in column)
+                    else "int64" if all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        for value in column
+                    )
+                    else "float64" if all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        for value in column
+                    )
+                    else "unknown"
+                    for column in columns
+                ) or None
             descriptor = self._sequence_descriptor(
                 int(sequence_id),
                 policy=descriptor_policy,
@@ -2332,6 +2381,7 @@ class _ControlSSABuilder(TiledObject):
                 ),
                 nested_value_dtype=nested_value_dtypes.get(int(sequence_id)),
                 element_dtype=element_dtype,
+                column_dtypes=column_dtypes,
             )
             if descriptor is None:
                 continue
@@ -2354,10 +2404,44 @@ class _ControlSSABuilder(TiledObject):
                 [zero, length_address],
                 attributes={"binding": "ssa_sequence_initialize_length"},
             )
-            if str(policy).startswith("literal_table="):
-                rows = tuple(ast.literal_eval(
+            if str(policy).startswith("literal_glyphs="):
+                glyphs = tuple(ast.literal_eval(
                     str(policy).split("=", 1)[1]
                 ))
+                glyph_column = self.sequence_storage_values[
+                    int(sequence_id)
+                ][0]
+                for offset, glyph in enumerate(glyphs):
+                    index = self.constant_value(int(offset), glyph_column)
+                    address = self.fresh_value(
+                        dtype="ptr", transform=ADDRESS,
+                        operands=(glyph_column, index),
+                    )
+                    self.emit(
+                        Handler.GetElementPtr,
+                        [glyph_column, index],
+                        address,
+                        attributes={"binding": "ssa_sequence_literal_glyph"},
+                    )
+                    value = self.fresh_value(
+                        dtype="int64", transform=CONTROL_CONST,
+                        operands=(address,),
+                    )
+                    self.emit(
+                        Handler.Const, [], value,
+                        attributes={"value": int(glyph)},
+                    )
+                    self.emit(
+                        Handler.Store, [value, address],
+                        attributes={"binding": "ssa_sequence_literal_glyph"},
+                    )
+                self.emit(
+                    Handler.Store,
+                    [self.constant_value(len(glyphs), length_cell), length_address],
+                    attributes={"binding": "ssa_sequence_literal_glyph_length"},
+                )
+            elif str(policy).startswith("literal_table="):
+                rows = literal_table_rows or ()
                 if any(len(tuple(row)) != len(descriptor.column_value_ids)
                        for row in rows):
                     self.shortfalls.append(SSALoweringShortfall(
@@ -3587,20 +3671,161 @@ class _ControlSSABuilder(TiledObject):
         return replaces_region
 
     def _register_sequence_lowering(self, lowering) -> None:
-        """Install helpers and reserve their complete program-wide ID range."""
+        """Install helpers and give every generated value a book-minted ID.
+
+        The sequence algorithm builder's IDs are construction-local labels.
+        A helper becomes compiler SSA only here, at its source-linked
+        registration boundary; its durable identities are therefore minted
+        from the exact operation/control cell that caused the helper and from
+        already-published operand cells.
+        """
+
+        def remap_metadata(value: Any, replacements: Mapping[int, int]) -> Any:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, int):
+                return replacements.get(int(value), value)
+            if isinstance(value, tuple):
+                return tuple(remap_metadata(item, replacements) for item in value)
+            if isinstance(value, list):
+                return [remap_metadata(item, replacements) for item in value]
+            if isinstance(value, dict):
+                return {
+                    remap_metadata(key, replacements): remap_metadata(
+                        item, replacements,
+                    )
+                    for key, item in value.items()
+                }
+            return value
 
         for function in lowering.functions:
-            self.sequence_helper_functions[function.name] = function
-            helper_ids = {
-                value.id
-                for value in function.args
+            book = self._book()
+            scope = str(function.name)
+            owner = next((
+                cell for cell in reversed(self._control_cells)
+                if cell is not None
+            ), None) or self._function_root()
+            mint_page = book.pages.get("concordance_mint")
+            minted_with_edges = {
+                int(row[1])
+                for row in (() if mint_page is None else mint_page.rows())
+                if row[1] is not None
             }
-            helper_ids.update(
-                instruction.res.id
+            replacements: dict[int, int] = {}
+            # Extra helper formals (for example a keyed lookup's query) are
+            # construction-local identities. Descriptor storage formals keep
+            # the caller's already-minted physical IDs; only an unaccounted
+            # minted label receives a durable helper-local identity here.
+            for argument in function.args:
+                old_id = int(argument.id)
+                if has_flag(old_id, MINTED) and old_id not in minted_with_edges:
+                    replacements[old_id] = _mint_ssa_id(
+                        book, scope, CONTROL_EXPRESSION, (owner,),
+                        dtype=argument.dtype,
+                        shape=tuple(argument.shape or ()),
+                        stage=self._stage(),
+                    )
+            if replacements:
+                for value in (
+                    *function.args,
+                    *(
+                        item
+                        for block in function.blocks.values()
+                        for instruction in block.instrs
+                        for item in instruction.args
+                    ),
+                ):
+                    value.id = replacements.get(int(value.id), int(value.id))
+                function.metadata = remap_metadata(
+                    dict(function.metadata or {}), replacements,
+                )
+            for label in function.blocks:
+                row = (scope, str(function.name), str(label))
+                if book.latest_ref(SSA_BLOCK, row) is None:
+                    book.post(
+                        SSA_BLOCK,
+                        row,
+                        SSABlockKind.SEQUENCE_HELPER,
+                        stage=self._stage(),
+                        provenance=Derived((owner,)),
+                        mode=Mode.CONCORD,
+                    )
+            for argument in function.args:
+                row = (scope, int(argument.id))
+                if book.latest_ref(SSA_VALUE, row) is None:
+                    book.post(
+                        SSA_VALUE,
+                        row,
+                        SSAValueFact(
+                            argument.dtype,
+                            tuple(argument.shape or ()),
+                            SSAValueOrigin.ADOPTED_GRAPH_ID,
+                        ),
+                        stage=self._stage(),
+                        provenance=Derived((owner,)),
+                        mode=Mode.REVISE,
+                    )
+            generated = tuple(
+                (instruction, instruction.res)
                 for block in function.blocks.values()
                 for instruction in block.instrs
                 if instruction.res is not None
             )
+            for instruction, result in generated:
+                old_id = int(result.id)
+                operand_cells = tuple(dict.fromkeys(
+                    cell for value in instruction.args
+                    if (cell := book.latest_ref(
+                        SSA_VALUE,
+                        (
+                            scope,
+                            replacements.get(int(value.id), int(value.id)),
+                        ),
+                    )) is not None
+                ))
+                replacements[old_id] = _mint_ssa_id(
+                    book,
+                    scope,
+                    (
+                        CONTROL_CONST
+                        if str(instruction.op).casefold() == "const"
+                        else CONTROL_EXPRESSION
+                    ),
+                    operand_cells or (owner,),
+                    dtype=result.dtype,
+                    shape=tuple(result.shape or ()),
+                    stage=self._stage(),
+                )
+            seen_values: set[int] = set()
+            for value in (
+                *function.args,
+                *(
+                    item
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    for item in (
+                        *instruction.args,
+                        *((instruction.res,) if instruction.res is not None else ()),
+                    )
+                ),
+            ):
+                if id(value) in seen_values:
+                    continue
+                seen_values.add(id(value))
+                value.id = replacements.get(int(value.id), int(value.id))
+            function.metadata = remap_metadata(
+                dict(function.metadata or {}), replacements,
+            )
+            self.sequence_helper_functions[function.name] = function
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    result = instruction.res
+                    if result is None:
+                        continue
+                    row = (scope, int(result.id))
+                    if book.latest_ref(SSA_VALUE, row) is not None:
+                        continue
+                    self.ssa_value_objects[int(result.id)] = result
 
     def external_value(
         self,
@@ -4051,6 +4276,16 @@ class _ControlSSABuilder(TiledObject):
                 "nested_row_source_id": int(child_key[1]),
                 "nested_row_projection": int(child_key[2]),
             })
+            for member, value in enumerate((
+                child_data, child_lengths, sequence_stride, row_stride,
+            )):
+                value.accounting.update({
+                    "compiler_frame_storage": str(self.function_name),
+                    "compiler_frame_nested_row_source_id": int(
+                        child_key[1]
+                    ),
+                    "compiler_frame_nested_row_member": int(member),
+                })
             self.arguments.extend((
                 child_data, child_lengths, sequence_stride, row_stride
             ))
@@ -4799,6 +5034,7 @@ class _ControlSSABuilder(TiledObject):
 
     def _publish_field_version(
         self, cell: Any, value: SSAValue, sources: tuple[Any, ...],
+        *, mode: Mode = Mode.CONCORD,
     ) -> Any:
         """Post ``value`` as the SSA version of field-state ``cell``.
 
@@ -4816,7 +5052,7 @@ class _ControlSSABuilder(TiledObject):
             provenance=Derived(tuple(
                 source for source in sources if isinstance(source, Ref)
             )),
-            mode=Mode.CONCORD,
+            mode=mode,
         )
         self.field_version_values[ref] = value
         return ref
@@ -4902,6 +5138,32 @@ class _ControlSSABuilder(TiledObject):
             # The arm did not write: its cell is the state the branch was
             # entered with, whose SSA value is the snapshot.
             return snapshot, arm_cell
+        if kind is FieldStateKind.WRITTEN and arm_value_id is not None:
+            # A scheduled region may already have lowered the exact value of
+            # a whole-field write even when the preparatory scalar pass could
+            # not prove a static dtype (for example ``row.dtype = str(x)``).
+            # The durable planning concordance identifies that resident and
+            # the control binding supplies its actual SSA type. Publish that
+            # existing value at the reducer's WRITTEN cell; no type inference
+            # or fallback-policy decision is needed here.
+            resident_id = self._concorded_resident(int(arm_value_id))
+            value = self.external_values.get(resident_id)
+            if (
+                value is not None
+                and value is not snapshot
+                and self._value_dominates_current_edge(value)
+            ):
+                binding_cell = self._binding_cell(resident_id)
+                version_ref = self._publish_field_version(
+                    arm_cell, value, (arm_cell, binding_cell),
+                    mode=(
+                        Mode.REVISE
+                        if recorded_missing is not None else Mode.CONCORD
+                    ),
+                )
+                return value, (
+                    version_ref if version_ref is not None else arm_cell
+                )
         if kind is FieldStateKind.ELEMENT_WRITTEN and arm_value_id is not None:
             storage_id = self._concorded_resident(int(arm_value_id))
             storage = self.external_values.get(storage_id)
@@ -7072,11 +7334,11 @@ class _ControlSSABuilder(TiledObject):
             return
         if isinstance(block, ExternalReferenceCallBlock):
             arguments = [
-                self.external_value(value_id, dtype="opaque_ref")
+                self.external_value(value_id)
                 for value_id in block.argument_value_ids
             ]
             arguments.extend(
-                self.external_value(value_id, dtype="opaque_ref")
+                self.external_value(value_id)
                 for _name, value_id in block.keyword_argument_value_ids
             )
             result = SSAValue(
@@ -7104,6 +7366,9 @@ class _ControlSSABuilder(TiledObject):
                     "result_frame": "turing.external-reference-value.v1",
                     "object_policy": "shell-owned-opaque-handles",
                     "extraction_identity": str(block.identity),
+                    **({
+                        "external_result_sequence": "utf8",
+                    } if str(block.result_dtype) == "utf8_sequence" else {}),
                 },
             )
             # CALL_RESULT: the external call's argument cells are the cause.
@@ -7111,6 +7376,44 @@ class _ControlSSABuilder(TiledObject):
                 int(block.result_value_id), result, BindingKind.CALL_RESULT,
                 *arguments,
             )
+            if str(block.result_dtype) == "utf8_sequence":
+                status = self.sequence_status_values.get(
+                    int(block.result_value_id)
+                )
+                if status is None:
+                    raise ValueError(
+                        "UTF-8 external result has no exact resident sequence "
+                        f"status cell: value={block.result_value_id}"
+                    )
+                succeeded = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(status,),
+                )
+                self.emit(
+                    Handler.Eq,
+                    [status, self.constant_value(1, status)],
+                    succeeded,
+                    attributes={
+                        "external_result_status": "utf8_sequence",
+                        "source_callsite_id": int(block.callsite_id),
+                    },
+                )
+                passed = self.new_block("validation_pass")
+                failed = self.new_block("validation_fail")
+                self.conditional_branch(succeeded, passed, failed)
+                self.current = failed
+                self.emit(
+                    Handler.Call,
+                    [],
+                    attributes={
+                        "callee": "turing_validation_error",
+                        "error_code": 73,
+                        "extraction_identity": str(block.identity),
+                        "external_result_status": "utf8_sequence",
+                    },
+                )
+                self.branch(passed)
+                self.current = passed
             return
         if isinstance(block, ValidationBlock):
             self.validation_contracts.append({
@@ -7256,10 +7559,16 @@ class _ControlSSABuilder(TiledObject):
         nested_tensor: bool = False,
         nested_value_dtype: str | None = None,
         element_dtype: str | None = None,
-        column_dtypes: tuple[str | None, ...] = (),
-        column_shapes: tuple[tuple[int, ...], ...] = (),
+        column_dtypes: tuple[str | None, ...] | None = (),
+        column_shapes: tuple[tuple[int, ...], ...] | None = (),
     ) -> SSASequenceDescriptor | None:
         value_id = int(value_id)
+        # Literal-table survey uses ``None`` to mean that an empty table has
+        # no authored rows from which a column dtype/shape can be inferred.
+        # Normalize that absence before the column loop; it is not itself a
+        # different sequence representation.
+        column_dtypes = tuple(column_dtypes or ())
+        column_shapes = tuple(column_shapes or ())
         resolved = self.resolved_sequence_schemas.get(value_id)
         existing = self.sequence_descriptors.get(value_id)
         if column_count is None:
@@ -7358,6 +7667,11 @@ class _ControlSSABuilder(TiledObject):
                 self.function_name,
                 {value_id: proposed_column_dtypes},
                 source=f"{location}: descriptor reuse",
+                sources=self._cells(
+                    self._sequence_contract_cell(value_id),
+                    *self.sequence_storage_values.get(value_id, ()),
+                ) or (self._function_root(),),
+                stage=self._stage(),
             )
             if tuple(existing.column_dtypes) != concorded_column_dtypes:
                 existing = replace(
@@ -7397,6 +7711,12 @@ class _ControlSSABuilder(TiledObject):
             self.function_name,
             {value_id: proposed_column_dtypes},
             source=f"{location}: descriptor construction",
+            sources=self._cells(
+                self._sequence_contract_cell(value_id),
+                self.ssa_value_objects.get(value_id),
+                self._canonical_cell(value_id),
+            ) or (self._function_root(),),
+            stage=self._stage(),
         )
         if concorded_column_dtypes:
             first_dtype = concorded_column_dtypes[0]
@@ -7417,11 +7737,18 @@ class _ControlSSABuilder(TiledObject):
             "transformation_tie_policy": "incumbent",
             "sequence_row_shape": proposed_column_shapes[0],
         }
-        if first_dtype is not None and element_dtype is not None:
-            # An explicit element contract (literal bytes, joined outer-row
-            # handles, fill materialization) is stronger than the provisional
-            # float dtype assigned when a structural constant first entered
-            # the control value map.
+        if (
+            first_dtype not in {None, "", "unknown"}
+            and str(data.dtype or "unknown") in {
+                "", "None", "unknown", "opaque", "opaque_ref",
+            }
+        ):
+            # The concorded sequence-row dtype is the physical arena type.
+            # Apply it to a provisional external occurrence regardless of
+            # whether this particular consumer repeated ``element_dtype``;
+            # optional glyph clear/replace operations arrive through their
+            # exact source contract and must not leave the resident payload
+            # opaque at the function boundary.
             data.dtype = str(first_dtype)
         # Every storage cell of the descriptor descends from the data arena
         # (the authored sequence's value) and its contract cell.
@@ -7513,6 +7840,15 @@ class _ControlSSABuilder(TiledObject):
                   if nested_tensor else ()),
                 child_status, child_live,
             )
+            for member, pool_value in enumerate(child_pool_values):
+                pool_value.accounting = {
+                    **dict(pool_value.accounting or {}),
+                    "compiler_frame_storage": str(self.function_name),
+                    "compiler_frame_sequence_id": value_id,
+                    "compiler_frame_child_table_member": int(member),
+                    "transformation_priority": "compiler_storage_identity",
+                    "transformation_tie_policy": "incumbent",
+                }
             self.arguments.extend(child_pool_values)
             # The pool cells are bound under their own (minted) ids: the
             # sequence contract is their cause.
@@ -7685,15 +8021,34 @@ class _ControlSSABuilder(TiledObject):
                 int(query.sequence_value_id),
             )
             return
+        sequence_id = int(query.sequence_value_id)
+        from .identity_concordance import committed_sequence_contract
+
+        contract = committed_sequence_contract(
+            self.function_name, sequence_id,
+        )
+        resolved = self.resolved_sequence_schemas.get(sequence_id)
+        # Length/maximum/first queries do not declare a collection policy.
+        # Consume the exact resident contract committed before control
+        # lowering.  The former unconditional ``duplicates`` claim rewrote a
+        # set comprehension's already-concorded ``unique`` identity merely
+        # because len(layouts) happened to be the first consumer lowered.
+        query_policy = (
+            str(contract.policy)
+            if contract is not None
+            else str(resolved.policy)
+            if resolved is not None
+            else "duplicates"
+        )
         descriptor = self._sequence_descriptor(
-            int(query.sequence_value_id),
-            policy="duplicates",
+            sequence_id,
+            policy=query_policy,
             writable=True,
             location=location,
         )
         if descriptor is None:
             return
-        storage = self.sequence_storage_values[int(query.sequence_value_id)]
+        storage = self.sequence_storage_values[sequence_id]
         length_address = storage[len(descriptor.column_value_ids)]
         attributes = {
             "binding": f"ssa_sequence_{query.operation}",
@@ -8123,6 +8478,199 @@ class _ControlSSABuilder(TiledObject):
     ) -> None:
         operation = str(mutation.operator)
         location = f"{path}.sequence_mutation[{mutation.effect_node_id}]"
+        if operation in {"sort", "sorted"} and mutation.source_contract_cell is None:
+            raise ValueError(
+                f"{location}: native sort has no exact source contract"
+            )
+        if mutation.source_contract_cell is not None:
+            from .concordance_declarations import (
+                SOURCE_GLYPH_SEQUENCE,
+                SOURCE_OPTIONAL_GLYPH_CARRY,
+                SOURCE_SORT_CONTRACT,
+                SourceGlyphSequence,
+                SourceOptionalGlyphCarry,
+                SourceSortContract,
+            )
+
+            cell = mutation.source_contract_cell
+            glyph_page = self._book().registry.pages.get(
+                SOURCE_GLYPH_SEQUENCE.name
+            )
+            optional_page = self._book().registry.pages.get(
+                SOURCE_OPTIONAL_GLYPH_CARRY.name
+            )
+            sort_page = self._book().registry.pages.get(
+                SOURCE_SORT_CONTRACT.name
+            )
+            if getattr(cell, "page", None) not in {
+                glyph_page, optional_page, sort_page,
+            }:
+                raise ValueError(
+                    f"{location}: sequence source cell is not a resident "
+                    "sequence contract"
+                )
+            fact = self._book().page(cell.page).cell(cell.row, cell.column)
+            if isinstance(fact, SourceSortContract):
+                expected_arguments = tuple(map(int, fact.argument_value_ids))
+                expected_kind = str(fact.argument_kind)
+                authored_operation = str(fact.operation)
+                if authored_operation == "sorted":
+                    if fact.source_value_id is None:
+                        raise ValueError(
+                            f"{location}: sorted contract has no source value"
+                        )
+                common = (
+                    int(cell.row[1]) == int(mutation.effect_node_id)
+                    and fact.destination_value_id is not None
+                    and int(fact.destination_value_id)
+                    == int(mutation.sequence_value_id)
+                    and str(fact.policy) == str(mutation.policy)
+                )
+                if authored_operation == "sorted" and operation == "replace":
+                    admitted = (
+                        common
+                        and tuple(map(int, mutation.argument_value_ids))
+                        == (int(fact.source_value_id),)
+                    )
+                elif authored_operation == "sorted" and operation == "sort":
+                    admitted = (
+                        common
+                        and tuple(map(int, mutation.argument_value_ids))
+                        == expected_arguments
+                        and str(mutation.argument_kind) == expected_kind
+                        and fact.key_column == mutation.sort_key_column
+                        and bool(fact.reverse) == bool(mutation.sort_reverse)
+                    )
+                else:
+                    if authored_operation == "sorted":
+                        expected_arguments = (
+                            int(fact.source_value_id), *expected_arguments,
+                        )
+                        expected_kind = f"sorted_{expected_kind}"
+                    admitted = (
+                        common
+                        and authored_operation == operation
+                        and expected_arguments
+                        == tuple(map(int, mutation.argument_value_ids))
+                        and expected_kind == str(mutation.argument_kind)
+                        and fact.key_column == mutation.sort_key_column
+                        and bool(fact.reverse) == bool(mutation.sort_reverse)
+                    )
+            elif isinstance(fact, SourceGlyphSequence):
+                destination_id = int(cell.row[1])
+                def glyph_tree(component):
+                    yield component
+                    for child in component.projection_components:
+                        yield from glyph_tree(child)
+                all_components = tuple(
+                    component
+                    for root in fact.components
+                    for component in glyph_tree(root)
+                )
+                component_ids = {
+                    int(
+                        component.formatted_sequence_value_id
+                        if component.formatted_sequence_value_id is not None
+                        else component.component_value_id
+                    )
+                    for component in all_components
+                }
+                token_components = {
+                    (
+                        int(component.component_value_id),
+                        int(component.operand_value_id),
+                    )
+                    for component in all_components
+                    if str(component.kind) == "formatted"
+                    and str(component.projection_kind) in {
+                        "string_token", "enum_name",
+                    }
+                    and component.operand_value_id is not None
+                    and component.formatted_sequence_value_id is None
+                }
+                projection_destinations = {
+                    int(component.component_value_id): {
+                        int(
+                            child.formatted_sequence_value_id
+                            if child.formatted_sequence_value_id is not None
+                            else child.component_value_id
+                        )
+                        for child in component.projection_components
+                    }
+                    for component in all_components
+                    if component.projection_components
+                }
+                admitted = (
+                    operation == "clear"
+                    and int(mutation.sequence_value_id) == destination_id
+                    and not mutation.argument_value_ids
+                    or operation == "extend"
+                    and int(mutation.sequence_value_id) == destination_id
+                    and len(mutation.argument_value_ids) == 1
+                    and int(mutation.argument_value_ids[0]) in component_ids
+                    or operation == "clear"
+                    and int(mutation.sequence_value_id)
+                    in projection_destinations
+                    and not mutation.argument_value_ids
+                    or operation == "extend"
+                    and int(mutation.sequence_value_id)
+                    in projection_destinations
+                    and len(mutation.argument_value_ids) == 1
+                    and int(mutation.argument_value_ids[0])
+                    in projection_destinations[
+                        int(mutation.sequence_value_id)
+                    ]
+                    or operation == "glyph_token_lookup_copy"
+                    and len(mutation.argument_value_ids) == 2
+                    and (
+                        int(mutation.sequence_value_id),
+                        int(mutation.argument_value_ids[0]),
+                    ) in token_components
+                )
+            elif isinstance(fact, SourceOptionalGlyphCarry):
+                destination_id = int(fact.payload_sequence_value_id)
+                arms = tuple(arm for arm in (
+                    fact.true_arm, fact.false_arm, fact.initial_arm,
+                ) if arm is not None)
+                present_sources = {
+                    int(arm.sequence_value_id)
+                    for arm in arms if arm.sequence_value_id is not None
+                }
+                admitted = (
+                    int(mutation.sequence_value_id) == destination_id
+                    and (
+                        operation == "clear"
+                        and not mutation.argument_value_ids
+                        and any(arm.presence is False for arm in arms)
+                        or operation == "replace"
+                        and len(mutation.argument_value_ids) == 1
+                        and int(mutation.argument_value_ids[0])
+                        in present_sources
+                    )
+                )
+            else:
+                admitted = False
+            if not admitted:
+                raise ValueError(
+                    f"{location}: mutation differs from its source contract"
+                )
+        if operation == "glyph_token_lookup_copy":
+            from .concordance_declarations import STRING_GLYPH_VOCABULARY
+
+            vocabulary_cell = mutation.vocabulary_contract_cell
+            if (
+                vocabulary_cell is None
+                or getattr(vocabulary_cell, "page", None)
+                is not self._book().registry.pages.get(
+                    STRING_GLYPH_VOCABULARY.name
+                )
+                or len(mutation.argument_value_ids) != 2
+                or int(vocabulary_cell.row[1])
+                != int(mutation.argument_value_ids[1])
+            ):
+                raise ValueError(
+                    f"{location}: token projection has no exact vocabulary"
+                )
         if operation == 'object_identity_reduce':
             from .ssa_object_context import object_source_contract
             accepted = object_source_contract(mutation.object_contract_cell, book=self._book())
@@ -8184,7 +8732,7 @@ class _ControlSSABuilder(TiledObject):
                 "destination uniqueness policy is unresolved",
             ))
             return
-        if not mutation.argument_value_ids and operation not in {"clear", "pop"}:
+        if not mutation.argument_value_ids and operation not in {"clear", "pop", "sort"}:
             self.shortfalls.append(SSALoweringShortfall(
                 "ssa-sequence",
                 operation,
@@ -8197,8 +8745,289 @@ class _ControlSSABuilder(TiledObject):
             policy=mutation.policy,
             writable=True,
             location=location,
+            **({
+                "column_count": 1,
+                "column_dtypes": ("int64",),
+            } if operation == "glyph_token_lookup_copy" else {}),
         )
         if destination is None:
+            return
+
+        if operation == "sorted":
+            if not mutation.argument_value_ids:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", operation, location,
+                    "sorted requires one resident source sequence",
+                ))
+                return
+            # ``sorted`` owns a distinct result arena.  Its extent follows
+            # the resident source at run time, so the root ABI must expose
+            # that arena just as it exposes the merge-sort scratch arena;
+            # a one-element private frame cannot represent the persisted
+            # result->source capacity edge.
+            for value in self.sequence_storage_values[
+                int(destination.sequence_id)
+            ]:
+                value.accounting = {
+                    **dict(value.accounting or {}),
+                    "caller_provided_workspace": True,
+                    "workspace_operation": "sorted_result",
+                }
+            destination_status = self.sequence_status_values.get(
+                int(destination.sequence_id)
+            )
+            if destination_status is not None:
+                destination_status.accounting = {
+                    **dict(destination_status.accounting or {}),
+                    "caller_provided_workspace": True,
+                    "workspace_operation": "sorted_result",
+                }
+            source_id, *sort_arguments = tuple(map(
+                int, mutation.argument_value_ids,
+            ))
+            self._lower_sequence_mutation_body(
+                ControlSequenceMutation(
+                    sequence_value_id=int(mutation.sequence_value_id),
+                    operator="replace",
+                    argument_value_ids=(int(source_id),),
+                    effect_node_id=int(mutation.effect_node_id),
+                    policy=mutation.policy,
+                    source_contract_cell=mutation.source_contract_cell,
+                ),
+                path=f"{path}.sorted_copy",
+            )
+            self._lower_sequence_mutation_body(
+                ControlSequenceMutation(
+                    sequence_value_id=int(mutation.sequence_value_id),
+                    operator="sort",
+                    argument_value_ids=tuple(sort_arguments),
+                    effect_node_id=int(mutation.effect_node_id),
+                    policy=mutation.policy,
+                    argument_kind=str(mutation.argument_kind).removeprefix(
+                        "sorted_"
+                    ),
+                    sort_key_column=mutation.sort_key_column,
+                    sort_reverse=mutation.sort_reverse,
+                    source_contract_cell=mutation.source_contract_cell,
+                ),
+                path=f"{path}.sorted_order",
+            )
+            return
+
+        if operation == "sort":
+            key_mapping = None
+            if mutation.argument_kind == "sort_key_mapping_getitem":
+                if len(mutation.argument_value_ids) != 1:
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "ssa-sequence", operation, location,
+                        "mapping-key sort requires one resident mapping",
+                    ))
+                    return
+                key_mapping = self._sequence_descriptor(
+                    int(mutation.argument_value_ids[0]),
+                    policy="unique",
+                    writable=True,
+                    location=f"{location}.key_mapping",
+                )
+                if key_mapping is None:
+                    return
+            elif mutation.argument_kind == "sort_key_unsupported":
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", operation, location,
+                    "sort key must be a direct row projection or a resident "
+                    "mapping __getitem__; reverse must be a bool literal",
+                ))
+                return
+            elif mutation.argument_value_ids:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", operation, location,
+                    "resident sequence sort received unsupported arguments",
+                ))
+                return
+            from .ir_sequence_tables import lower_sequence_sort
+
+            scratch_id = int(self.fresh_value(
+                dtype="unknown",
+                transform=DESCRIPTOR_CELL,
+                operands=(
+                    self._sequence_contract_cell(
+                        int(destination.sequence_id)
+                    ),
+                    *self.sequence_storage_values[
+                        int(destination.sequence_id)
+                    ],
+                ),
+            ).id)
+            scratch = self._sequence_descriptor(
+                scratch_id,
+                policy="duplicates",
+                writable=True,
+                location=f"{location}.scratch",
+                column_count=len(destination.column_value_ids),
+                column_dtypes=tuple(destination.column_dtypes),
+                column_shapes=tuple(destination.column_shapes),
+            )
+            if scratch is None:
+                return
+            for value in self.sequence_storage_values[int(scratch.sequence_id)]:
+                value.accounting = {
+                    **dict(value.accounting or {}),
+                    "caller_provided_workspace": True,
+                    "workspace_operation": "sort",
+                }
+            scratch_status = self.sequence_status_values.get(
+                int(scratch.sequence_id)
+            )
+            if scratch_status is not None:
+                scratch_status.accounting = {
+                    **dict(scratch_status.accounting or {}),
+                    "caller_provided_workspace": True,
+                    "workspace_operation": "sort",
+                }
+            function_name = self._sequence_helper_name(
+                int(destination.sequence_id), "sort",
+            )
+            lowering = lower_sequence_sort(
+                destination,
+                scratch,
+                key_column=int(mutation.sort_key_column or 0),
+                key_mapping=key_mapping,
+                reverse=bool(mutation.sort_reverse),
+                function_name=function_name,
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+            )
+            if not lowering.complete:
+                self.shortfalls.extend(
+                    SSALoweringShortfall(
+                        "ssa-sequence", item.code.value, location, item.reason,
+                    )
+                    for item in lowering.shortfalls
+                )
+                return
+            self._register_sequence_lowering(lowering)
+            available_arguments = {
+                int(value.id): value
+                for value in (
+                    *self.sequence_storage_values[int(destination.sequence_id)],
+                    *self.sequence_storage_values[int(scratch.sequence_id)],
+                    *(
+                        self.sequence_storage_values[int(key_mapping.sequence_id)]
+                        if key_mapping is not None else ()
+                    ),
+                    *(
+                        (self.sequence_status_values[int(key_mapping.sequence_id)],)
+                        if key_mapping is not None else ()
+                    ),
+                )
+            }
+            call_arguments = tuple(
+                available_arguments[int(formal.id)]
+                for formal in lowering.functions[-1].args
+            )
+            status = self.fresh_value(
+                dtype="int", transform=REGION_CALL_RESULT,
+                operands=call_arguments,
+            )
+            self.emit(
+                Handler.Call,
+                list(call_arguments),
+                status,
+                attributes={
+                    "callee": lowering.functions[-1].name,
+                    "source_linked": True,
+                    "ssa_sequence_operation": "sort",
+                    "sequence_id": int(destination.sequence_id),
+                    "scratch_sequence_id": int(scratch.sequence_id),
+                    "sort_key_column": int(mutation.sort_key_column or 0),
+                    "sort_key_mapping_sequence_id": (
+                        None if key_mapping is None
+                        else int(key_mapping.sequence_id)
+                    ),
+                    "sort_reverse": bool(mutation.sort_reverse),
+                    "source_effect_node_id": int(mutation.effect_node_id),
+                },
+            )
+            self.emit(
+                Handler.Store,
+                [
+                    status,
+                    self._sequence_status_address(
+                        self.sequence_status_values[destination.sequence_id]
+                    ),
+                ],
+                attributes={"binding": "ssa_sequence_status"},
+            )
+            return
+
+        if operation == "glyph_token_lookup_copy":
+            if len(mutation.argument_value_ids) != 2:
+                raise ValueError(
+                    f"{location}: glyph token projection requires token and vocabulary"
+                )
+            token_id, vocabulary_id = tuple(map(
+                int, mutation.argument_value_ids,
+            ))
+            vocabulary = self._sequence_descriptor(
+                vocabulary_id,
+                policy="unique",
+                writable=False,
+                location=f"{location}.vocabulary",
+                column_count=3,
+                column_dtypes=("int64", "int64", "int64"),
+            )
+            if vocabulary is None:
+                return
+            from .ir_sequence_tables import lower_glyph_token_copy
+
+            lowering = lower_glyph_token_copy(
+                destination,
+                vocabulary,
+                function_name=self._sequence_helper_name(
+                    int(destination.sequence_id), "glyph_token_copy",
+                    int(vocabulary.sequence_id),
+                ),
+            )
+            self._register_sequence_lowering(lowering)
+            token = self.external_value(token_id, dtype="int64")
+            call_arguments = tuple({
+                int(value.id): value
+                for value in (
+                    *self.sequence_storage_values[
+                        int(destination.sequence_id)
+                    ],
+                    *self.sequence_storage_values[
+                        int(vocabulary.sequence_id)
+                    ],
+                    self.sequence_status_values[int(vocabulary.sequence_id)],
+                )
+            }.values()) + (token,)
+            status = self.fresh_value(
+                dtype="int", transform=REGION_CALL_RESULT,
+                operands=call_arguments,
+            )
+            self.emit(
+                Handler.Call, list(call_arguments), status,
+                attributes={
+                    "callee": lowering.functions[-1].name,
+                    "source_linked": True,
+                    "ssa_sequence_operation": operation,
+                    "sequence_id": int(destination.sequence_id),
+                    "vocabulary_sequence_id": int(vocabulary.sequence_id),
+                    "source_effect_node_id": int(mutation.effect_node_id),
+                },
+            )
+            self.emit(
+                Handler.Store,
+                [
+                    status,
+                    self._sequence_status_address(
+                        self.sequence_status_values[
+                            int(destination.sequence_id)
+                        ]
+                    ),
+                ],
+                attributes={"binding": "ssa_sequence_status"},
+            )
             return
 
         if operation == "clear" and not mutation.argument_kind.startswith(
@@ -9317,6 +10146,19 @@ class _ControlSSABuilder(TiledObject):
                     int(source.sequence_id): source.column_dtypes,
                 },
                 source=f"{location}: {operation} equivalence",
+                sources=self._cells(
+                    self._sequence_contract_cell(
+                        int(destination.sequence_id)
+                    ),
+                    self._sequence_contract_cell(int(source.sequence_id)),
+                    *self.sequence_storage_values.get(
+                        int(destination.sequence_id), ()
+                    ),
+                    *self.sequence_storage_values.get(
+                        int(source.sequence_id), ()
+                    ),
+                ) or (self._function_root(),),
+                stage=self._stage(),
             )
             if tuple(destination.column_dtypes) != concorded_dtypes:
                 destination = replace(
@@ -9608,7 +10450,76 @@ class _ControlSSABuilder(TiledObject):
         stage_before = self.active_stage
         self.active_stage = CONTROL_SSA_CONDITIONAL
 
+        from .concordance_declarations import (
+            SOURCE_OPTIONAL_GLYPH_CARRY,
+            SourceOptionalGlyphCarry,
+        )
+
+        optional_facts = []
+        for cell in conditional.optional_glyph_carry_cells:
+            fact = self._book().page(SOURCE_OPTIONAL_GLYPH_CARRY).cell(
+                cell.row, cell.column,
+            )
+            if not isinstance(fact, SourceOptionalGlyphCarry):
+                raise ValueError(
+                    f"{path}: optional glyph carry cell has no carry fact"
+                )
+            optional_facts.append((cell, fact))
+
+        def lower_optional_arm(cell, fact, arm, *, arm_path: str):
+            destination_id = int(fact.payload_sequence_value_id)
+            if arm.presence is False:
+                self.lower_sequence_mutation(
+                    ControlSequenceMutation(
+                        destination_id, "clear", (), destination_id,
+                        policy="duplicates",
+                        argument_kind="optional_glyph_absent",
+                        source_contract_cell=cell,
+                    ),
+                    path=arm_path,
+                )
+            else:
+                if arm.sequence_value_id is None:
+                    raise ValueError(
+                        f"{arm_path}: present optional glyph arm has no payload"
+                    )
+                source_id = int(arm.sequence_value_id)
+                if source_id != destination_id:
+                    self.lower_sequence_mutation(
+                        ControlSequenceMutation(
+                            destination_id, "replace", (source_id,),
+                            destination_id, policy="duplicates",
+                            argument_kind="optional_glyph_payload",
+                            source_contract_cell=cell,
+                        ),
+                        path=arm_path,
+                    )
+            if arm.presence is None:
+                inherited = self.optional_glyph_presence_by_value.get(
+                    int(arm.value_id)
+                )
+                if inherited is None:
+                    raise ValueError(
+                        f"{arm_path}: inherited optional glyph presence "
+                        f"{int(arm.value_id)} has no prior carry"
+                    )
+                return inherited
+            presence = self.fresh_value(
+                dtype="bool", transform=CONTROL_CONST,
+                operands=(cell, arm.presence_source),
+            )
+            self.emit(
+                Handler.Const, [], presence,
+                attributes={
+                    "value": bool(arm.presence),
+                    "binding": "optional_glyph_presence_edge",
+                    "payload_value_id": destination_id,
+                },
+            )
+            return presence
+
         self.current = true_block
+        true_return_edge_start = len(self.function_return_edges)
         for (
             origin_sequence_id, handle_id, result_id, column, dtype,
         ) in conditional.entry_record_projections:
@@ -9648,6 +10559,15 @@ class _ControlSSABuilder(TiledObject):
         # ``dt`` = ``dt * 0.5`` and the fall-through call read it.)
         values_before_body = dict(self.external_values)
         self.lower(conditional.body, path=f"{path}.body")
+        for value_id, expression in conditional.body_value_expressions:
+            # Bind the reducer's exact arm identity. ``result_override``
+            # prevents the expression lowerer from minting a parallel value;
+            # ``lower_control_expression`` posts the operand-derived binding.
+            result = self.produced_value(
+                int(value_id), claim_provisional_definition=True,
+                cause=(conditional_cell,),
+            )
+            self.lower_control_expression(expression, result_override=result)
         body_falls_through = (
             not self.current.successors
             or merge_block.name in self.current.successors
@@ -9688,6 +10608,33 @@ class _ControlSSABuilder(TiledObject):
             int(result_id): self.external_value(int(true_id))
             for true_id, _false_id, result_id in conditional.result_aliases
         }
+        true_optional_presence = {
+            int(fact.merged_value_id): lower_optional_arm(
+                cell, fact, fact.true_arm,
+                arm_path=f"{path}.body.optional_glyph",
+            )
+            for cell, fact in optional_facts
+        }
+        for _cell, fact in optional_facts:
+            presence = true_optional_presence[int(fact.merged_value_id)]
+            arm_ids = {
+                int(fact.true_arm.value_id),
+                *(
+                    (int(fact.true_arm.sequence_value_id),)
+                    if fact.true_arm.sequence_value_id is not None else ()
+                ),
+            }
+            for edge_block, _edge_values in self.function_return_edges[
+                true_return_edge_start:
+            ]:
+                terminator = edge_block.instrs[-1]
+                for slot, source_id in enumerate(
+                    terminator.attributes.get("return_source_value_ids", ())
+                ):
+                    if source_id is not None and int(source_id) in arm_ids:
+                        self.optional_glyph_return_presence_by_edge_slot.setdefault(
+                            (str(edge_block.name), int(slot)), presence,
+                        )
         for true_id, _false_id, initial_id, merged_id in (
             conditional.carried_sequence_aliases
         ):
@@ -9716,9 +10663,16 @@ class _ControlSSABuilder(TiledObject):
                     snapshot_cells.get(int(snapshot_id)), conditional_cell,
                 )
         self.current = false_block
+        false_return_edge_start = len(self.function_return_edges)
         values_before_orelse = dict(self.external_values)
         if conditional.orelse is not None:
             self.lower(conditional.orelse, path=f"{path}.orelse")
+        for value_id, expression in conditional.orelse_value_expressions:
+            result = self.produced_value(
+                int(value_id), claim_provisional_definition=True,
+                cause=(conditional_cell,),
+            )
+            self.lower_control_expression(expression, result_override=result)
         if self.current.successors and (
             merge_block.name not in self.current.successors
         ):
@@ -9727,6 +10681,33 @@ class _ControlSSABuilder(TiledObject):
             int(result_id): self.external_value(int(false_id))
             for _true_id, false_id, result_id in conditional.result_aliases
         }
+        false_optional_presence = {
+            int(fact.merged_value_id): lower_optional_arm(
+                cell, fact, fact.false_arm,
+                arm_path=f"{path}.orelse.optional_glyph",
+            )
+            for cell, fact in optional_facts
+        }
+        for _cell, fact in optional_facts:
+            presence = false_optional_presence[int(fact.merged_value_id)]
+            arm_ids = {
+                int(fact.false_arm.value_id),
+                *(
+                    (int(fact.false_arm.sequence_value_id),)
+                    if fact.false_arm.sequence_value_id is not None else ()
+                ),
+            }
+            for edge_block, _edge_values in self.function_return_edges[
+                false_return_edge_start:
+            ]:
+                terminator = edge_block.instrs[-1]
+                for slot, source_id in enumerate(
+                    terminator.attributes.get("return_source_value_ids", ())
+                ):
+                    if source_id is not None and int(source_id) in arm_ids:
+                        self.optional_glyph_return_presence_by_edge_slot.setdefault(
+                            (str(edge_block.name), int(slot)), presence,
+                        )
         false_carried = {}
         for _true_id, false_id, initial_id, _merged_id in (
             conditional.carried_aliases
@@ -9763,6 +10744,30 @@ class _ControlSSABuilder(TiledObject):
             self.branch(merge_block)
 
         self.current = merge_block
+        for cell, fact in optional_facts:
+            merged_id = int(fact.merged_value_id)
+            true_presence = true_optional_presence[merged_id]
+            false_presence = false_optional_presence[merged_id]
+            presence = self.fresh_value(
+                dtype="bool", transform=PHI_CONDITIONAL,
+                operands=(cell, true_presence, false_presence, predicate),
+            )
+            presence.accounting.update({
+                "ssa_optional_presence": True,
+                "ssa_optional_payload_id": merged_id,
+                "optional_glyph_sequence": True,
+            })
+            self.emit(
+                Handler.Phi, [true_presence, false_presence], presence,
+                attributes={
+                    "incoming_blocks": (
+                        true_exit.name, false_exit.name,
+                    ),
+                    "binding": "optional_glyph_presence",
+                    "payload_value_id": merged_id,
+                },
+            )
+            self.optional_glyph_presence_by_value[merged_id] = presence
         for _true_id, _false_id, result_id in conditional.result_aliases:
             true_value = true_results[int(result_id)]
             false_value = false_results[int(result_id)]
@@ -10855,6 +11860,9 @@ class _ControlSSABuilder(TiledObject):
                         source.accounting.update({
                             "projected_row_source_id": int(iterable_id),
                             "projected_row_column": int(column_projection),
+                            "compiler_frame_storage": str(
+                                self.function_name
+                            ),
                             **(
                                 {"sequence_row_shape": target_shape}
                                 if target_shape else {}
@@ -10869,6 +11877,9 @@ class _ControlSSABuilder(TiledObject):
                         source.accounting.update({
                             "projected_row_source_id": int(iterable_id),
                             "projected_row_column": int(column_projection),
+                            "compiler_frame_storage": str(
+                                self.function_name
+                            ),
                             **(
                                 {"sequence_row_shape": target_shape}
                                 if target_shape else {}
@@ -12452,6 +13463,59 @@ class _ControlSSABuilder(TiledObject):
                 deploy_site=record.get("deploy_site"),
                 join_site=record.get("join_site"),
             ))
+        optional_glyph_return_layouts = []
+        optional_glyph_return_slots: list[tuple[int, int, int]] = []
+        logical_to_physical_return_slot: dict[int, int] = {}
+        if self.optional_glyph_presence_by_value:
+            physical_returns = []
+            optional_presence_by_slot: dict[int, SSAValue] = {}
+            for slot, value in enumerate(returned):
+                logical_to_physical_return_slot[int(slot)] = len(
+                    physical_returns
+                )
+                presence = self.optional_glyph_presence_by_value.get(
+                    int(value.id)
+                )
+                physical_returns.append(value)
+                if presence is not None:
+                    optional_presence_by_slot[int(slot)] = presence
+                    physical_returns.append(presence)
+                    optional_glyph_return_slots.append((
+                        int(value.id),
+                        len(physical_returns) - 2,
+                        len(physical_returns) - 1,
+                    ))
+            returned = physical_returns
+            if self.function_return_edges:
+                # Expand each authored return from the exact presence value
+                # published for that edge by its conditional-arm source fact.
+                # The final merged presence cannot be used here: early return
+                # edges do not pass through its merge block.
+                expanded_edges = []
+                for block, values in self.function_return_edges:
+                    physical_values = []
+                    for slot, value in enumerate(values):
+                        physical_values.append(value)
+                        if int(slot) not in optional_presence_by_slot:
+                            continue
+                        presence = (
+                            self.optional_glyph_return_presence_by_edge_slot.get(
+                                (str(block.name), int(slot))
+                            )
+                        )
+                        if presence is None:
+                            raise ValueError(
+                                f"{self.function_name}: optional glyph return "
+                                f"edge {block.name!r} slot {slot} has no exact "
+                                "arm presence"
+                            )
+                        physical_values.append(presence)
+                    expanded_edges.append((block, tuple(physical_values)))
+                self.function_return_edges = expanded_edges
+        else:
+            logical_to_physical_return_slot = {
+                int(slot): int(slot) for slot in range(len(returned))
+            }
         fallthrough_open = not self.current.successors and (
             not self.current.instrs
             or self.current.instrs[-1].op
@@ -12473,7 +13537,7 @@ class _ControlSSABuilder(TiledObject):
                         file=sys.stderr,
                     )
             slot_count = max(
-                len(named_returns),
+                len(returned),
                 *(len(values) for _block, values in self.function_return_edges),
             )
             edges = list(self.function_return_edges)
@@ -12487,7 +13551,11 @@ class _ControlSSABuilder(TiledObject):
             exit_block = self.function_exit_block()
             self.current = exit_block
             merged_values: list[SSAValue] = []
-            slot_names = [name for name, _value_id in named_returns]
+            slot_names = {
+                int(logical_to_physical_return_slot[logical_slot]): str(name)
+                for logical_slot, (name, _value_id) in enumerate(named_returns)
+                if logical_slot in logical_to_physical_return_slot
+            }
             for slot in range(slot_count):
                 incoming_blocks = []
                 incoming_values = []
@@ -12536,23 +13604,66 @@ class _ControlSSABuilder(TiledObject):
                             "return_slot_index": slot,
                             **(
                                 {"output_name": slot_names[slot]}
-                                if slot < len(slot_names) else {}
+                                if slot in slot_names else {}
                             ),
                         },
                     )
                 merged_values.append(merged)
             returned = merged_values
             named_returns = [
-                (name, int(merged_values[index].id))
-                for index, (name, _value_id) in enumerate(named_returns)
-                if index < len(merged_values)
+                (
+                    name,
+                    int(merged_values[
+                        logical_to_physical_return_slot[logical_slot]
+                    ].id),
+                )
+                for logical_slot, (name, _value_id) in enumerate(named_returns)
+                if (
+                    logical_slot in logical_to_physical_return_slot
+                    and logical_to_physical_return_slot[logical_slot]
+                    < len(merged_values)
+                )
             ]
             self.emit(Handler.Ret, returned)
         elif fallthrough_open:
             self.emit(Handler.Ret, returned)
+        optional_glyph_return_layouts = [
+            (
+                int(semantic_payload_id),
+                (
+                    int(returned[payload_slot].id),
+                    int(returned[presence_slot].id),
+                ),
+            )
+            for semantic_payload_id, payload_slot, presence_slot
+            in optional_glyph_return_slots
+        ]
         page_metadata = self._finish_pages(
             tuple(named_returns), tuple(parameter_value_names), tuple(returned),
         )
+        sequence_table = SSASequenceTable(owner=self.function_name)
+        for descriptor in self.sequence_descriptors.values():
+            source_cells = self._cells(
+                self._sequence_contract_cell(int(descriptor.sequence_id)),
+                *(
+                    self.ssa_value_objects.get(int(value_id))
+                    for value_id in (
+                        descriptor.sequence_id,
+                        *descriptor.column_value_ids,
+                        descriptor.length_address_id,
+                        descriptor.capacity_value_id,
+                        descriptor.status_address_id,
+                        descriptor.live_flags_value_id,
+                        descriptor.heap_owner_value_id,
+                    )
+                    if value_id is not None
+                ),
+            )
+            sequence_table.register(
+                descriptor,
+                sources=source_cells or (self._function_root(),),
+                stage=self._stage(),
+            )
         function = Function(
                 self.function_name,
                 self.arguments,
@@ -12579,9 +13690,9 @@ class _ControlSSABuilder(TiledObject):
                     )),
                     "control_ir": True,
                     "deployment_regions": tuple(deployment_regions),
-                    "sequence_table": SSASequenceTable(
-                        dict(self.sequence_descriptors),
-                        owner=self.function_name,
+                    "sequence_table": sequence_table,
+                    "aggregate_return_layouts": tuple(
+                        optional_glyph_return_layouts
                     ),
                     "sequence_static_capacity_bounds": tuple(sorted(
                         self.static_sequence_capacities.items()
@@ -12717,17 +13828,74 @@ def _post_ssa_block_geometry(book, scope, function):
     definition positions. Same-value reorderings without a producer receipt
     are refused, rather than given a diagnostic-only root or guessed edge.
     """
-    from .concordance_declarations import SSA_BLOCK_GEOMETRY, SSA_CONSTANT_HOIST
+    from .concordance_declarations import (
+        CALL_BINDING_INPUT, LOOP_RESULT_USE_REBINDING, SSA_BLOCK_GEOMETRY,
+        SSA_CONSTANT_HOIST, SSA_CONSTANT_MATERIALIZATION,
+        TENSOR_METADATA_CALL_BINDING,
+    )
     result = {}
     moved = {}
     for row in book.page(SSA_CONSTANT_HOIST).scope_rows((scope, str(function.name))):
         cell = book.latest_ref(SSA_CONSTANT_HOIST, row)
         moved.setdefault(row[2], []).append(cell)
         moved.setdefault(row[4], []).append(cell)
+    rebound = {}
+    for row in book.page(LOOP_RESULT_USE_REBINDING).scope_rows(scope):
+        if len(row) < 2:
+            continue
+        cell = book.latest_ref(LOOP_RESULT_USE_REBINDING, row)
+        if cell is not None:
+            rebound.setdefault(str(row[1]), []).append(cell)
+    materialized = {}
+    for row in book.page(SSA_CONSTANT_MATERIALIZATION).scope_rows(scope):
+        if len(row) < 4 or str(row[1]) != str(function.name):
+            continue
+        cell = book.latest_ref(SSA_CONSTANT_MATERIALIZATION, row)
+        if cell is not None:
+            materialized.setdefault(str(row[2]), []).append(cell)
+    metadata_bindings = {}
+    for row in book.page(TENSOR_METADATA_CALL_BINDING).scope_rows(scope):
+        if len(row) < 5 or str(row[1]) != str(function.name):
+            continue
+        cell = book.latest_ref(TENSOR_METADATA_CALL_BINDING, row)
+        if cell is not None:
+            metadata_bindings.setdefault(str(row[2]), []).append(cell)
+    call_bindings = {}
+    for binding_row in book.page(CALL_BINDING_INPUT).scope_rows(
+        str(function.name)
+    ):
+        if len(binding_row) < 2:
+            continue
+        cell = book.latest_ref(CALL_BINDING_INPUT, binding_row)
+        if cell is not None:
+            call_bindings.setdefault(int(binding_row[1]), []).append(cell)
+    function_outputs = tuple(
+        book.latest_ref(FUNCTION_OUTPUT, row)
+        for row in book.page(FUNCTION_OUTPUT).scope_rows(scope)
+        if book.latest_ref(FUNCTION_OUTPUT, row) is not None
+    )
     for label, block in function.blocks.items():
+        block_call_bindings = tuple(
+            cell
+            for instruction in block.instrs
+            if instruction.op in {"Call", "call"}
+            for callsite in (
+                instruction.attributes.get("plan_callsite_id"),
+            )
+            if callsite is not None
+            for cell in call_bindings.get(int(callsite), ())
+        )
         sources = tuple(dict.fromkeys(cell for cell in (
             book.latest_ref(SSA_BLOCK, (scope, str(function.name), str(label))),
             *moved.get(label, ()),
+            *rebound.get(str(label), ()),
+            *materialized.get(str(label), ()),
+            *metadata_bindings.get(str(label), ()),
+            *block_call_bindings,
+            *(function_outputs if any(
+                instruction.op in {"Ret", "ret", "Return", "return"}
+                for instruction in block.instrs
+            ) else ()),
             *(book.latest_ref(SSA_VALUE, (scope, int(value.id)))
               for instruction in block.instrs
               for value in (*instruction.args, *((instruction.res,) if instruction.res is not None else ()))),
@@ -12745,9 +13913,21 @@ def _post_ssa_block_geometry(book, scope, function):
         if prior is not None and book.page(SSA_BLOCK_GEOMETRY).latest(row) == fact:
             result[label] = prior
         else:
-            result[label] = book.post(SSA_BLOCK_GEOMETRY, row, fact,
-                                     stage=CONTROL_SSA_FINISH, provenance=Derived(sources),
-                                     mode=Mode.REVISE)
+            previous = (
+                None if prior is None
+                else book.page(SSA_BLOCK_GEOMETRY).latest(row)
+            )
+            try:
+                result[label] = book.post(
+                    SSA_BLOCK_GEOMETRY, row, fact,
+                    stage=CONTROL_SSA_FINISH,
+                    provenance=Derived(sources), mode=Mode.REVISE,
+                )
+            except ConcordanceRefusal as error:
+                raise ConcordanceRefusal(
+                    f"{error}; previous_geometry={previous!r}; "
+                    f"proposed_geometry={fact!r}"
+                ) from error
     return result
 
 
@@ -12768,6 +13948,13 @@ def _canonicalize_non_dominating_loop_result_uses(
 
     from .ssa_record_return_state import accepted_ssa_component
     if accepted_ssa_component(function):
+        return ()
+    if function.metadata.get("llvm_repository_kernel"):
+        # The tensor reference is already-complete repository SSA imported
+        # from its authored LLVM module.  It has no cells in the active
+        # source compilation's concordance and this source-control repair has
+        # no authority to rewrite it.  Call-edge settlement belongs to the
+        # enclosing unit; the reference body remains exactly its input.
         return ()
     port_values = dict(
         function.metadata.get("carried_port_values") or {}
@@ -13185,13 +14372,21 @@ def _sequence_artifacts_from_control(
             )
             if sequence_id is not None
         ))
-        helper_table = SSASequenceTable({
-            sequence_id: replace(
-                table.sequences[sequence_id], child_table_pool=None
+        helper_table = SSASequenceTable(owner=helper.name)
+        for sequence_id in sequence_ids:
+            if sequence_id not in table.sequences:
+                continue
+            descriptor_cell = table.book.latest_ref(
+                SEQUENCE_DESCRIPTOR,
+                (table.owner, int(sequence_id)),
             )
-            for sequence_id in sequence_ids
-            if sequence_id in table.sequences
-        }, owner=helper.name)
+            helper_table.register(
+                replace(
+                    table.sequences[sequence_id], child_table_pool=None,
+                ),
+                sources=(descriptor_cell,) if descriptor_cell is not None else (),
+                stage=TABLE_REGISTRATION,
+            )
         if helper_table.sequences:
             tables[helper.name] = helper_table
     return helpers, tables
@@ -14072,7 +15267,11 @@ def _inject_field_slot_access(
             rebuilt[tail_block].extend(group)
 
     new_blocks = {
-        name: BasicBlock(name, rebuilt[name])
+        name: BasicBlock(
+            name,
+            rebuilt[name],
+            list(control_function.blocks[name].successors),
+        )
         for name in control_function.blocks
     }
 
@@ -15132,6 +16331,11 @@ def _materialize_control_constants(
         (int(value_id), copy.deepcopy(literal))
         for value_id, literal in sorted(constant_values.items())
     )
+    sequence_table = function.metadata.get("sequence_table")
+    resident_sequence_ids = {
+        int(sequence_id)
+        for sequence_id in getattr(sequence_table, "sequences", {})
+    }
     argument_ids = {int(argument.id) for argument in function.args}
     existing: dict[int, Instr] = {}
     for block in function.blocks.values():
@@ -15147,6 +16351,13 @@ def _materialize_control_constants(
                     "const", "constant", "nonevalue",
                 }
             ):
+                # A list/tuple literal which already owns a resident sequence
+                # descriptor is storage, not a second scalar constant.  Its
+                # exact elements are installed by the sequence initializer;
+                # retaining ``Const(value=[])`` under the arena's identity
+                # gives one value two incompatible physical producers.
+                if value_id in resident_sequence_ids:
+                    continue
                 literal = constant_values[value_id]
                 matches = (
                     str(instruction.op).casefold() == "nonevalue"
@@ -15173,11 +16384,17 @@ def _materialize_control_constants(
     materialized_ids = tuple(sorted({
         int(value_id)
         for value_id in constant_values
-        if int(value_id) in argument_ids or int(value_id) in existing
+        if (
+            int(value_id) not in resident_sequence_ids
+            and (
+                int(value_id) in argument_ids
+                or int(value_id) in existing
+            )
+        )
     }))
     if not materialized_ids:
         return function
-    entry = next(iter(function.blocks.values()))
+    entry_label, entry = next(iter(function.blocks.items()))
     materializations = []
     for value_id in materialized_ids:
         resident = existing.get(value_id)
@@ -15212,6 +16429,41 @@ def _materialize_control_constants(
             },
         ))
     entry.instrs[0:0] = materializations
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    scope = str(
+        function.metadata.get("tensor_shape_concordance_scope")
+        or function.name
+    )
+    prior_geometry = book.latest_ref(
+        SSA_BLOCK_GEOMETRY,
+        (scope, str(function.name), str(entry_label)),
+    )
+    for instruction in materializations:
+        value_id = int(instruction.res.id)
+        sources = tuple(cell for cell in (
+            book.latest_ref(SSA_VALUE, (scope, value_id)),
+            prior_geometry,
+        ) if cell is not None)
+        if not sources:
+            # Standalone IR utilities have no source/concordance owner to
+            # publish against.  The materialization remains an ordinary IR
+            # rewrite there; a source compile reaches this point with either
+            # the value cell or the geometry it is revising.
+            continue
+        book.post(
+            SSA_CONSTANT_MATERIALIZATION,
+            (scope, str(function.name), str(entry_label), value_id),
+            (
+                str(instruction.op),
+                str(instruction.res.dtype),
+                repr((instruction.attributes or {}).get("value")),
+            ),
+            stage=CONTROL_SSA_FINISH,
+            provenance=Derived(sources),
+            mode=Mode.CONCORD,
+        )
     materialized = set(materialized_ids)
     function.args = [
         argument for argument in function.args
@@ -18264,9 +19516,25 @@ def lower_control_sections_to_ssa(
     # before repository tensor lowering below; attaching it only after this
     # function returns makes dynamic collection extents invisible at the one
     # phase that must turn ``rows[:, j]`` into bounded index arithmetic.
+    generated_capacity_sources = tuple(
+        (
+            int(instruction.attributes["scratch_sequence_id"]),
+            int(instruction.attributes["sequence_id"]),
+        )
+        for block in control_function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "sort"
+        and instruction.attributes.get("scratch_sequence_id") is not None
+        and instruction.attributes.get("sequence_id") is not None
+    )
     control_function.metadata["sequence_capacity_sources"] = tuple(
-        (int(sequence_id), int(source_id))
-        for sequence_id, source_id in sequence_capacity_sources
+        dict.fromkeys((
+            *(
+                (int(sequence_id), int(source_id))
+                for sequence_id, source_id in sequence_capacity_sources
+            ),
+            *generated_capacity_sources,
+        ))
     )
     debug_region_output_loads(control_function, "after-control-lowering")
     compile_substage(f"SSA section {control_name}: materialize constants and sequence helpers")

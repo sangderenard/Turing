@@ -1,5 +1,10 @@
 # Compiler bootstrap handoff
 
+The current 2026-10-15 continuation is
+[15_provenance_sort_glyph_bootstrap_continuation.md](15_provenance_sort_glyph_bootstrap_continuation.md).
+It records the resident sort and glyph work, the latest provenance/bootstrap
+frontier, the static-method call-binding regression and the exact next run.
+
 The topology-guided SSA growth continuation is documented in
 [13_native_compilation_growth.md](13_native_compilation_growth.md), including
 provenance interior candidates, stage/restart APIs, SSA composition and native execution evidence

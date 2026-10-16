@@ -437,16 +437,20 @@ def _reindex_in_place(page: Any) -> None:
     the dicts it already has (a holder of the dicts keeps a live view)."""
 
     state = page.__dict__
-    positions = state["column_positions"]
-    row_columns = state["row_columns"]
-    scopes = state["scopes"]
+    positions: dict[int, int] = state["column_positions"]
+    row_columns: dict[tuple, list[int]] = state["row_columns"]
+    scopes: dict[Any, dict[tuple, None]] = state["scopes"]
     row_columns.clear()
     scopes.clear()
+    row: tuple
+    column: int
     for row, column in state["cells"]:
         row_columns.setdefault(row, []).append(column)
         if type(row) is tuple and row:
             scopes.setdefault(row[0], {}).setdefault(row, None)
-    for columns in row_columns.values():
+    columns: list[int]
+    for row in row_columns:
+        columns = row_columns[row]
         if len(columns) > 1:
             columns.sort(key=positions.__getitem__)
 

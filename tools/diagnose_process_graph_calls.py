@@ -6,9 +6,11 @@ performed. Pickle input must be a trusted compiler-generated artifact.
 from __future__ import annotations
 
 import ast
+import argparse
 import contextlib
 import hashlib
 import io
+import json
 import pickle
 from pathlib import Path
 
@@ -28,6 +30,36 @@ def inspect_saved_calls(path: Path, entry=None, ids=()):
             raise ValueError(f"expected one exact authored entry {entry!r}, found {len(matches)}")
         graph = matches[0]
     selected = set(map(int, ids))
+    selected_nodes = []
+    for node in sorted(selected):
+        if node not in graph.G:
+            selected_nodes.append({"value_id": node, "present": False})
+            continue
+        data = graph.G.nodes[node]
+        expression = data.get("expr_obj")
+        selected_nodes.append({
+            "value_id": node,
+            "present": True,
+            "type": data.get("type"),
+            "op": data.get("op"),
+            "label": data.get("label"),
+            "source": (
+                ast.unparse(expression)
+                if isinstance(expression, ast.AST) else None
+            ),
+            "parents": [
+                [int(parent), str(role)]
+                for parent, role in data.get("parents") or ()
+            ],
+            "children": [
+                [int(child), str(role)]
+                for child, role in data.get("children") or ()
+            ],
+            "attributes": {
+                str(key): repr(value)
+                for key, value in (data.get("attributes") or {}).items()
+            },
+        })
     loops = []
     effect_ids = set()
     for node, data in graph.G.nodes(data=True):
@@ -110,5 +142,22 @@ def inspect_saved_calls(path: Path, entry=None, ids=()):
         "has_recursion_table": bool(graph.G.graph.get("recursion_table")),
         "calls": rows,
         "loops": loops,
+        "selected_nodes": selected_nodes,
         "limits": "Snapshot facts only: external references may resolve later; this does not prove native closure, binary emission, parity, or performance.",
     }
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", type=Path)
+    parser.add_argument("--entry")
+    parser.add_argument("--id", type=int, action="append", default=[])
+    arguments = parser.parse_args(argv)
+    print(json.dumps(inspect_saved_calls(
+        arguments.path, entry=arguments.entry, ids=arguments.id,
+    ), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

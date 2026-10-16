@@ -48,6 +48,38 @@ def _defaulted_source_helper(local_size=_PURSUED_SOURCE_DEFAULT):
     return local_size
 
 
+def test_anonymous_source_trees_have_distinct_declaration_scopes():
+    """Independent in-memory programs cannot share one declaration row."""
+
+    book, token = begin_identity_book()
+    try:
+        sources = (
+            "class Bucket:\n"
+            "    def __init__(self, value):\n"
+            "        self.value = value\n",
+            "class Bucket:\n"
+            "    def __init__(self):\n"
+            "        self.value = 0\n",
+        )
+        for source in sources:
+            graph = ProcessGraph(materialize_memory=False)
+            graph.build_from_ast(ast.parse(source))
+
+        rows = tuple(
+            row
+            for row in book.page("class_method_declaration").rows()
+            if row[1:] == ("Bucket", "__init__")
+        )
+        assert len(rows) == 2
+        assert rows[0][0] != rows[1][0]
+        assert {
+            book.page("class_method_declaration").latest(row).parameters
+            for row in rows
+        } == {("self", "value"), ("self",)}
+    finally:
+        end_identity_book(token)
+
+
 class _UnpickleableDefault:
     def __init__(self):
         self.callback = lambda value: value

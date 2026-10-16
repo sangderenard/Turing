@@ -150,6 +150,31 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                             continue
                         yield caller, target, callee, source
 
+        # A planned numerical region is a separate repository function, but
+        # its ``source_region_integral`` records each capture as the owner's
+        # exact source value identity.  Call-result linking can settle that
+        # owner value after the region was carved.  Carry the settled physical
+        # type across this recorded capture edge so the region formal and its
+        # consumers do not retain the provisional float default.
+        for region in functions.values():
+            integral = dict(
+                (region.metadata or {}).get("source_region_integral") or {}
+            )
+            owner = functions.get(str(integral.get("owner") or ""))
+            if owner is None:
+                continue
+            capture_ids = set(map(
+                int, integral.get("capture_value_ids") or ()
+            ))
+            if not capture_ids:
+                continue
+            owner_values = function_values(owner)
+            for target in region.args:
+                value_id = int(target.id)
+                source = owner_values.get(value_id)
+                if value_id in capture_ids and source is not None:
+                    yield region, target, owner, source
+
     exact_values = set()
     changed = True
     rounds = 0

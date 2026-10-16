@@ -6,6 +6,20 @@ import ast
 from typing import Any, Iterable, Mapping
 
 
+def _callsite_activation_owner(graph: Any) -> str:
+    """Exact authored function identity used by callsite activation rows."""
+
+    metadata = graph.G.graph if hasattr(graph, "G") else graph.graph
+    authored = tuple(metadata.get("authored_function_identity") or ())
+    if authored:
+        return repr(authored)
+    return str(
+        metadata.get("qualified_name")
+        or metadata.get("function_name")
+        or "<module>"
+    )
+
+
 def _post_deployment_region(graph: Any, subgraph: Any, region_index: int) -> None:
     """The book rows of one carved region (plan 80, A2.4)."""
 
@@ -225,6 +239,7 @@ def _post_planner_specialization(
 
 def _post_call_binding(
     graph: Any, node_id: int, reference: int, resolution: str,
+    *, source_cells: tuple[Any, ...] = (),
 ) -> Any:
     """One ``call_binding`` row (caller read scope, call node) ->
     ``CallBinding(callee, resolution)`` DERIVED from the call node's identity
@@ -256,11 +271,17 @@ def _post_call_binding(
         except (KeyError, TypeError, ValueError):
             entry = None
         if entry is not None:
+            from ..transmogrifier.function_table import function_address_identity
+
             address = book.latest_ref(
-                FUNCTION_ADDRESS, (str(entry.qualified_name),),
+                FUNCTION_ADDRESS, (function_address_identity(entry),),
             )
             if address is not None:
                 cells.append(address)
+    cells.extend(
+        cell for cell in source_cells
+        if cell is not None and cell not in cells
+    )
     row = (tuple(scope), int(node_id))
     fact = CallBinding(int(reference), CallResolution(resolution))
     page = book.pages.get(CALL_BINDING.name)

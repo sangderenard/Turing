@@ -133,6 +133,9 @@ from .resident_sequence_materialization import (
     _promote_conditional_sequence_aliases as _promote_conditional_sequence_aliases,
     _sequence_append_call_mutations as _sequence_append_call_mutations,
     _source_mapping_mutations as _source_mapping_mutations,
+    _source_glyph_sequence_materializations as _source_glyph_sequence_materializations,
+    _source_optional_glyph_materializations as _source_optional_glyph_materializations,
+    _string_token_glyph_materializations as _string_token_glyph_materializations,
     _source_sequence_snapshots as _source_sequence_snapshots,
     _static_mapping_capacity_bounds as _static_mapping_capacity_bounds,
     _static_sequence_capacity_bounds as _static_sequence_capacity_bounds,
@@ -204,14 +207,17 @@ def _concordant_function_aliases(
     )
 
     metadata = dict(getattr(function, "metadata", {}) or {})
+    accepted = dict(metadata.get("accepted_ssa_component") or {})
+    owner_book = accepted.get("identity_book") or current_identity_book()
     aliases = resolved_concordant_alias_bindings(
         str(function.name),
         dict(metadata.get("value_aliases", {}) or {}),
+        page=owner_book.page("planning_value_concordance"),
     )
     if not include_output_identities:
         return aliases
 
-    page = current_identity_book().page("output_identity_concordance")
+    page = owner_book.page("output_identity_concordance")
     durable = dict(metadata.get("output_identity_aliases", ()) or ())
     concorded = page.alias_bindings(str(function.name))
     if durable != concorded:
@@ -1270,8 +1276,52 @@ def _recover_late_source_literals(
         instructions.append(instruction)
         recovered.append((value_id, literal))
     if instructions:
-        next(iter(function.blocks.values())).instrs[0:0] = instructions
+        entry_label, entry = next(iter(function.blocks.items()))
+        entry.instrs[0:0] = instructions
         function.args = retained_args
+        # This is the writer that changes block geometry.  Publish the
+        # materialization here from the exact source-graph identity and the
+        # SSA value/formal it replaces; a later dominance pass must not be
+        # asked to infer that cause from the newly shaped instruction list.
+        from .concordance_declarations import (
+            CONTROL_SSA_FINISH, SSA_BLOCK_GEOMETRY,
+            SSA_CONSTANT_MATERIALIZATION,
+        )
+        from .identity_concordance import Derived, Mode, current_identity_book
+        from .ssa_record_return_state import (
+            function_scope_of, ssa_value_identity_cell,
+        )
+
+        book = current_identity_book()
+        scope = function_scope_of(function)
+        prior_geometry = book.latest_ref(
+            SSA_BLOCK_GEOMETRY,
+            (scope, str(function.name), str(entry_label)),
+        )
+        recovered_by_id = dict(recovered)
+        for instruction in instructions:
+            value_id = int(instruction.res.id)
+            sources = tuple(dict.fromkeys(cell for cell in (
+                _frame_graph_cell(graph_obj, value_id)
+                if graph_obj is not None else None,
+                ssa_value_identity_cell(function, value_id, book=book),
+                prior_geometry,
+            ) if cell is not None))
+            if not sources:
+                continue
+            literal = recovered_by_id[value_id]
+            book.post(
+                SSA_CONSTANT_MATERIALIZATION,
+                (scope, str(function.name), str(entry_label), value_id),
+                (
+                    str(instruction.op),
+                    str(instruction.res.dtype),
+                    repr(literal),
+                ),
+                stage=CONTROL_SSA_FINISH,
+                provenance=Derived(sources),
+                mode=Mode.CONCORD,
+            )
     return tuple(recovered)
 
 
@@ -1894,13 +1944,20 @@ def _source_graph_instance_key(metadata: Mapping[str, Any]) -> Any:
 
     Pursuit may retain both the submitted definition and an imported view of
     it. Their source identity agrees while their function-table references
-    and value-id spaces differ. Neither graph may win a source-name lookup.
+    and value-id spaces differ. Callsite specialization may then retain more
+    than one copy of that same function-table entry; its already-minted shape
+    scope is the identity of that copy. Neither graph may win a source-name
+    lookup.
     """
     identity = metadata.get("authored_function_identity")
     reference = metadata.get("source_function_reference", metadata.get("function_ref"))
+    shape_scope = metadata.get("shape_scope")
     if identity is None:
         return None
-    return identity if reference is None else ("source-function-instance", identity, int(reference))
+    if reference is None:
+        return identity
+    instance = ("source-function-instance", identity, int(reference))
+    return instance if shape_scope is None else (*instance, tuple(shape_scope))
 
 
 def _resolved_source_graphs_by_symbol(resolved_graph: Any) -> dict[Any, Any]:
@@ -4632,8 +4689,14 @@ def _lower_optional_record_presence_catalogue(graph: Any) -> int:
 def _authored_annotation_field_receipt(
     annotation: ast.AST,
     python_bindings: Mapping[str, Any] | None = None,
+    authored_record_identities: Mapping[str, str] | None = None,
 ) -> Mapping[str, Any] | None:
-    """Return the exact scalar/fixed-span ABI stated by an annotation."""
+    """Return the exact physical ABI stated by an authored annotation.
+
+    ``authored_record_identities`` is populated only from the source
+    declaration book.  It lets a class field retain a nested-record identity
+    without treating an arbitrary annotation spelling as a record.
+    """
 
     if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
         members = (annotation.left, annotation.right)
@@ -4644,7 +4707,7 @@ def _authored_annotation_field_receipt(
         )
         if len(concrete) == 1 and len(concrete) != len(members):
             receipt = _authored_annotation_field_receipt(
-                concrete[0], python_bindings,
+                concrete[0], python_bindings, authored_record_identities,
             )
             if receipt is not None:
                 return {**dict(receipt), "optional": True}
@@ -4683,6 +4746,14 @@ def _authored_annotation_field_receipt(
                 "mutable": False,
                 "aggregate_kind": annotation.id,
             }
+        record_identity = dict(authored_record_identities or {}).get(
+            annotation.id
+        )
+        if record_identity is not None:
+            return {
+                "storage": "record", "record": str(record_identity),
+                "rank": 0, "mutable": False,
+            }
         return None
     if not isinstance(annotation, ast.Subscript):
         return None
@@ -4713,7 +4784,7 @@ def _authored_annotation_field_receipt(
         return None
     if container == "Optional":
         receipt = _authored_annotation_field_receipt(
-            annotation.slice, python_bindings,
+            annotation.slice, python_bindings, authored_record_identities,
         )
         return (
             None if receipt is None
@@ -4832,6 +4903,15 @@ def _authored_annotation_field_receipt(
         element = element.elts[0]
     if not isinstance(element, ast.Name):
         return None
+    element_record = dict(authored_record_identities or {}).get(element.id)
+    if element_record is not None:
+        return {
+            "storage": "table",
+            "rank": 1,
+            "mutable": container == "list",
+            "aggregate_kind": container.casefold(),
+            "row_record": str(element_record),
+        }
     dtype = {
         "int": "int64", "float": "float64", "bool": "bool",
         "bytes": "int64", "bytearray": "int64", "str": "int64",
@@ -4859,6 +4939,11 @@ def _authored_complete_record_schemas(
     """
 
     schemas: dict[str, Mapping[str, Any]] = {}
+    declared_record_identities = {
+        statement.name: statement.name
+        for statement in tree.body
+        if isinstance(statement, ast.ClassDef)
+    }
     for statement in tree.body:
         if not isinstance(statement, ast.ClassDef):
             continue
@@ -4885,7 +4970,10 @@ def _authored_complete_record_schemas(
         fields: dict[str, Mapping[str, Any]] = {}
         complete = True
         for field in declared:
-            receipt = _authored_annotation_field_receipt(field.annotation)
+            receipt = _authored_annotation_field_receipt(
+                field.annotation,
+                authored_record_identities=declared_record_identities,
+            )
             if receipt is None:
                 complete = False
                 break
@@ -5548,6 +5636,10 @@ def _annotated_parameter_record_identity(
 
 def _authored_dataclass_record_views(
     tree: ast.Module,
+    *,
+    projection_schemas: dict[str, Mapping[str, Any]] | None = None,
+    source_module: str | Path | None = None,
+    carried_declarations: bool = False,
 ) -> dict[str, dict[str, Mapping[str, Any]]]:
     """Derive exact per-method record views from authored class fields.
 
@@ -5571,8 +5663,51 @@ def _authored_dataclass_record_views(
         if isinstance(statement, ast.ClassDef)
     }
 
+    # Record-view discovery is an ingestion consumer, not a parallel parser.
+    # Ensure the source declarations have their normal rows, then retain the
+    # exact class/field cells used by every projection-only schema below.
+    from ..transmogrifier.graph.graph_express2 import (
+        _annotate_visual_source_owners,
+        _class_schema_from_ast,
+        _source_module_identity,
+    )
+
+    tree._turing_source_module = _source_module_identity(
+        tree, source_module,
+    )
+    _annotate_visual_source_owners(
+        tree, module_name=tree._turing_source_module,
+    )
+    class_declaration_rows: dict[str, tuple[str, str]] = {}
+    for class_name, definition in classes.items():
+        declaration = _class_schema_from_ast(
+            definition,
+            carried_declarations=bool(carried_declarations),
+        )
+        span_row = declaration.get("class_node_id")
+        if span_row is None:
+            continue
+        class_declaration_rows[class_name] = (
+            str(span_row[0]), str(declaration["class_identity"]),
+        )
+
+    authored_record_identities = {
+        str(class_name): str(class_name)
+        for class_name in class_declaration_rows
+    }
+
     def field_receipt(annotation: ast.AST) -> Mapping[str, Any] | None:
-        return _authored_annotation_field_receipt(annotation)
+        receipt = _authored_annotation_field_receipt(
+            annotation,
+            authored_record_identities=authored_record_identities,
+        )
+        if receipt is None:
+            return None
+        # A declared Mapping[K, Row] remains exactly that declaration.  Row
+        # construction and row projection have distinct completeness rules;
+        # rewriting an incomplete constructor schema into opaque_ref destroys
+        # the authored row identity before either rule can make its decision.
+        return dict(receipt)
 
     def initialized_field_receipt(value: ast.AST) -> Mapping[str, Any] | None:
         """Prove a scalar field from its authored initializer, without guessing."""
@@ -5642,6 +5777,104 @@ def _authored_dataclass_record_views(
                     fields.pop(target.attr, None)
         class_fields[class_name] = fields
         class_methods[class_name] = methods
+
+    if projection_schemas is not None:
+        from .concordance_declarations import (
+            CLASS_DECLARATION, CLASS_FIELD_DECLARATION, INGESTION,
+            SOURCE_RECORD_VIEW_SCHEMA,
+        )
+        from .identity_concordance import (
+            ConcordanceRefusal, Derived, Mode, current_identity_book,
+        )
+
+        book = current_identity_book()
+
+        def frozen_receipt(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return tuple(sorted(
+                    (str(key), frozen_receipt(item))
+                    for key, item in value.items()
+                ))
+            if isinstance(value, (tuple, list)):
+                return tuple(frozen_receipt(item) for item in value)
+            return value
+
+        for class_name, fields in class_fields.items():
+            if not fields:
+                continue
+            declaration_row = class_declaration_rows.get(class_name)
+            if declaration_row is None:
+                raise ConcordanceRefusal(
+                    "source record projection has no class declaration: "
+                    f"class={class_name!r}"
+                )
+            module_name, class_identity = declaration_row
+            class_cell = book.latest_ref(
+                CLASS_DECLARATION, declaration_row,
+            )
+            field_cells = tuple(
+                book.latest_ref(
+                    CLASS_FIELD_DECLARATION,
+                    (module_name, class_identity, str(field_name)),
+                )
+                for field_name in sorted(fields)
+            )
+            nested_class_cells = tuple(
+                book.latest_ref(
+                    CLASS_DECLARATION,
+                    class_declaration_rows[str(field["record"])],
+                )
+                for field in fields.values()
+                if str(field.get("storage") or "") == "record"
+                and str(field.get("record") or "") in class_declaration_rows
+            )
+            if class_cell is None or any(cell is None for cell in field_cells):
+                missing = tuple(
+                    field_name
+                    for field_name, cell in zip(sorted(fields), field_cells)
+                    if cell is None
+                )
+                raise ConcordanceRefusal(
+                    "source record projection has no exact declaration cells: "
+                    f"class={class_name!r}, fields={missing!r}"
+                )
+            fact = (
+                str(class_name),
+                tuple(
+                    (str(field_name), frozen_receipt(fields[field_name]))
+                    for field_name in sorted(fields)
+                ),
+                "projection_complete",
+            )
+            row = (module_name, class_identity)
+            incumbent_schema_cell = book.latest_ref(
+                SOURCE_RECORD_VIEW_SCHEMA, row,
+            )
+            if carried_declarations and incumbent_schema_cell is not None:
+                fact = book.page(SOURCE_RECORD_VIEW_SCHEMA).cell(
+                    incumbent_schema_cell.row,
+                    incumbent_schema_cell.column,
+                )
+            book.post(
+                SOURCE_RECORD_VIEW_SCHEMA, row, fact,
+                stage=INGESTION,
+                provenance=Derived(tuple(dict.fromkeys((
+                    class_cell, *field_cells,
+                    *(cell for cell in nested_class_cells if cell is not None),
+                    *((incumbent_schema_cell,)
+                      if incumbent_schema_cell is not None
+                      and carried_declarations else ()),
+                )))),
+                mode=Mode.CONCORD,
+            )
+            projection_schemas[class_name] = {
+                "identity": class_name,
+                "fields": copy.deepcopy(fields),
+                "source_derived": True,
+                "projection_complete": True,
+                "constructor_complete": False,
+                "source_record_view_schema": row,
+            }
 
     required_cache: dict[tuple[str, str], dict[str, bool] | None] = {}
 
@@ -7591,16 +7824,25 @@ def _field_slot_ops(
     slot_of = {name: index for index, name in enumerate(fields)}
 
     identity = dict(graph_obj.graph.get("identity_table") or {})
+    authored_function_identity = tuple(
+        graph_obj.graph.get("authored_function_identity") or ()
+    )
     sequence_contract_scope = str(
         contract_scope
         or graph_obj.graph.get("qualified_name")
         or graph_obj.graph.get("function_name")
+        or (
+            repr(authored_function_identity)
+            if authored_function_identity else None
+        )
         or "<anonymous>"
     )
     from .identity_concordance import (
+        Mode,
         commit_sequence_contract,
         committed_sequence_contract,
     )
+    from .concordance_declarations import PLANNING_VALUE, SHELL_HANDOFF
     self_history = identity.get("self") or ()
     self_value_id = int(self_history[-1]) if self_history else None
 
@@ -7729,6 +7971,8 @@ def _field_slot_ops(
             int(column_count),
             bool(writable),
             source=f"authored/ProgramABI parameter {parameter_name}",
+            sources=(_frame_graph_cell(graph_obj, int(history[0])),),
+            stage=SHELL_HANDOFF,
         )
     for binding_name, record in _graph_sequence_record_abi(graph_obj).items():
         width = len(_sequence_record_storage_columns(record))
@@ -7752,7 +7996,7 @@ def _field_slot_ops(
         ))
     for attribute, canonical, result_id in aggregate_reads:
         if attribute == canonical:
-            field_sequence_ids[canonical] = result_id
+            field_sequence_ids.setdefault(canonical, result_id)
     for _attribute, canonical, result_id in aggregate_reads:
         field_sequence_ids.setdefault(canonical, result_id)
     # Table fields on ordinary record parameters and on rows selected from a
@@ -7919,6 +8163,8 @@ def _field_slot_ops(
                 f"runtime aggregate {binding_kind}.{binding_name} "
                 f"viewed as {aggregate_kind}"
             ),
+            sources=(_frame_graph_cell(graph_obj, sequence_id),),
+            stage=SHELL_HANDOFF,
         )
         storage_identity = f"{binding_kind}.{binding_name}"
         if storage_identity in retained_storage_identities:
@@ -8052,7 +8298,7 @@ def _field_slot_ops(
         snapshot = (aggregate_kind == "tuple" and
                     attributes.get("producer_kind") == "aggregate_materialization")
         if not snapshot and aggregate_kind not in {
-            "list", "set", "dict", "bytes", "bytearray"
+            "list", "set", "frozenset", "dict", "bytes", "bytearray"
         }:
             continue
         if (
@@ -8085,7 +8331,8 @@ def _field_slot_ops(
             continue
         sequence_declarations.append((
             sequence_id,
-            "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
+            "unique" if aggregate_kind in {"set", "frozenset", "dict"}
+            else "duplicates",
             (
                 (
                     int(attributes.get("mapping_key_column_count", 1)) + 1
@@ -8096,7 +8343,8 @@ def _field_slot_ops(
                 )
             ),
             snapshot or bool(attributes.get(
-                "sequence_writable", aggregate_kind != "bytes"
+                "sequence_writable",
+                aggregate_kind not in {"bytes", "frozenset"},
             )),
         ))
         mapping_items = attributes.get("compile_time_mapping_items")
@@ -8115,6 +8363,24 @@ def _field_slot_ops(
                 sequence_id,
                 f"literal_table={encoded_rows!r}",
                 2,
+            ))
+        sequence_items = attributes.get("compile_time_sequence_items")
+        if (
+            aggregate_kind in {"set", "frozenset"}
+            and sequence_items is not None
+        ):
+            from .string_table import string_token
+
+            encoded_rows = tuple(
+                (
+                    string_token(item) if isinstance(item, str) else item,
+                )
+                for item in tuple(sequence_items)
+            )
+            sequence_initializations.append((
+                sequence_id,
+                f"literal_table={encoded_rows!r}",
+                1,
             ))
         if attributes.get("mapping_value_aggregate_kind") in {
             "list", "set", "dict", "bytearray"
@@ -8270,15 +8536,34 @@ def _field_slot_ops(
             continue
         if node_type == "getattr":
             result_id = data.get("value_id", node_id)
-            field_ops.append((
-                "read", int(result_id), slot_of[canonical_attribute]
-            ))
             field_value_id = int(result_id)
             aggregate_kind = field_aggregate_kinds.get(str(attribute))
             if aggregate_kind in {
                 "list", "set", "dict", "tuple", "bytes", "bytearray"
             }:
                 sequence_id = field_sequence_ids[canonical_field(str(attribute))]
+                # A field read is a view of the field's current resident, not
+                # a newly allocated sequence. Keep the graph occurrence as an
+                # alias on the planning concordance and put the resident
+                # itself in the field-slot handoff. In particular, after
+                # ``self.table = {...}``, every later ``self.table`` read must
+                # remain chained to that authored replacement through branch
+                # planning and record construction.
+                if int(result_id) != int(sequence_id):
+                    _frame_post(
+                        PLANNING_VALUE,
+                        (sequence_contract_scope, int(result_id)),
+                        int(sequence_id),
+                        stage=SHELL_HANDOFF,
+                        mode=Mode.REVISE,
+                        cells=(
+                            _frame_graph_cell(graph_obj, int(result_id)),
+                            _frame_graph_cell(graph_obj, int(sequence_id)),
+                        ),
+                    )
+                field_ops.append((
+                    "read", int(sequence_id), slot_of[canonical_attribute]
+                ))
                 if int(result_id) == sequence_id:
                     declared_field = dict(
                         dict(declared_self_record.get("fields") or {}).get(
@@ -8306,6 +8591,10 @@ def _field_slot_ops(
                     retained_sequence_ids.add(sequence_id)
                 if field_value_aggregate_kinds.get(str(attribute)) == "dict":
                     nested_sequence_ids.add(sequence_id)
+            else:
+                field_ops.append((
+                    "read", int(result_id), slot_of[canonical_attribute]
+                ))
         elif node_type == "setattr":
             source_parent = next(
                 (
@@ -8377,6 +8666,19 @@ def _field_slot_ops(
                 # iteration and call-frame forwarding derive views of that
                 # same resident instead of materializing an opaque slot beside
                 # a second sequence object.
+                if int(source_parent) != int(source_id):
+                    _frame_post(
+                        PLANNING_VALUE,
+                        (sequence_contract_scope, int(source_parent)),
+                        int(source_id),
+                        stage=SHELL_HANDOFF,
+                        mode=Mode.REVISE,
+                        cells=(
+                            _frame_graph_cell(graph_obj, int(source_parent)),
+                            _frame_graph_cell(graph_obj, int(source_id)),
+                        ),
+                    )
+                field_sequence_ids[canonical_attribute] = int(source_id)
                 sequence_initializations.append((
                     int(source_id),
                     "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
@@ -8476,12 +8778,31 @@ def _field_slot_ops(
         sequence_id = None
         if field_aggregate_kinds.get(str(field_name)) in {"dict", "set"}:
             sequence_id = field_sequence_ids[canonical_field(str(field_name))]
-        elif field_attributes.get("aggregate_kind") in {"dict", "set"}:
+        elif field_attributes.get("aggregate_kind") in {
+            "dict", "set", "frozenset",
+        }:
+            # A nested declared field (``book.registry.private_pages``) and
+            # an authored module constant (``READ_THROUGH_EXCLUDED_PAGES``)
+            # already own sequence declarations under their exact value ids.
+            # They are not lexical aliases of the current method owner's
+            # fields, so the binding-name lookup below cannot identify them.
+            # Use the declaration that this same pass just admitted; falling
+            # back to the lexical identity preserves the existing local path.
+            declared_sequence_id = int(
+                field_data.get("value_id", field_id)
+            )
+            if any(
+                int(candidate_id) == declared_sequence_id
+                for candidate_id, _policy, _columns, _writable
+                in sequence_declarations
+            ):
+                sequence_id = declared_sequence_id
             identity_key = (
                 str(field_attributes.get("binding_kind")),
                 str(field_attributes.get("binding_name")),
             )
-            sequence_id = lexical_sequence_ids.get(identity_key)
+            if sequence_id is None:
+                sequence_id = lexical_sequence_ids.get(identity_key)
         elif int(field_data.get("value_id", field_id)) in (
             inferred_nested_table_bases
         ):
@@ -8741,6 +9062,73 @@ def _field_slot_ops(
         in sequence_declarations
     ]
 
+    # ``tuple(resident)``/``list(resident)`` is an explicit snapshot edge:
+    # the destination owns distinct storage, but its physical row is exactly
+    # the source row.  Local aggregate discovery initially sees only the
+    # constructor and therefore gives that destination a provisional width of
+    # one.  Apply the already-retained replace edge after authored append rows
+    # have fixed the source width, before either side is committed.  This is a
+    # graph edge, not a reconstruction from the Python value.
+    declaration_widths: dict[int, set[int]] = {}
+    declaration_policies: dict[int, set[str]] = {}
+    for sequence_id, policy, column_count, _writable in sequence_declarations:
+        declaration_widths.setdefault(int(sequence_id), set()).add(
+            int(column_count)
+        )
+        declaration_policies.setdefault(int(sequence_id), set()).add(
+            str(policy)
+        )
+    snapshot_widths: dict[int, int] = {}
+    snapshot_sources: dict[int, int] = {}
+    for mutation in _source_sequence_snapshots(graph_obj):
+        destination = int(mutation.sequence_value_id)
+        source, = tuple(map(int, mutation.argument_value_ids))
+        source_widths = declaration_widths.get(source, set())
+        source_policies = declaration_policies.get(source, set())
+        destination_policies = declaration_policies.get(destination, set())
+        if len(source_widths) != 1:
+            continue
+        if (
+            len(source_policies) != 1
+            or len(destination_policies) != 1
+            or source_policies != destination_policies
+        ):
+            continue
+        snapshot_widths[destination] = next(iter(source_widths))
+        snapshot_sources[destination] = source
+    if snapshot_widths:
+        sequence_declarations = [
+            (
+                sequence_id,
+                policy,
+                snapshot_widths.get(int(sequence_id), int(column_count)),
+                writable,
+            )
+            for sequence_id, policy, column_count, writable
+            in sequence_declarations
+        ]
+        for destination, source in snapshot_sources.items():
+            policy = next(iter(declaration_policies[destination]))
+            writable = any(
+                bool(candidate_writable)
+                for candidate_id, _candidate_policy, _candidate_width,
+                    candidate_writable in sequence_declarations
+                if int(candidate_id) == destination
+            )
+            commit_sequence_contract(
+                sequence_contract_scope,
+                destination,
+                policy,
+                snapshot_widths[destination],
+                writable,
+                source=f"source sequence snapshot from {source}",
+                sources=(
+                    _frame_graph_cell(graph_obj, source),
+                    _frame_graph_cell(graph_obj, destination),
+                ),
+                stage=SHELL_HANDOFF,
+            )
+
     key_width_by_sequence: dict[int, int] = {}
     for _effect_or_result, key_ids, sequence_id, *_rest in (
         *table_lookups, *table_stores, *table_deletions
@@ -8811,6 +9199,8 @@ def _field_slot_ops(
             int(column_count),
             bool(writable),
             source="shell sequence declaration",
+            sources=(_frame_graph_cell(graph_obj, int(sequence_id)),),
+            stage=SHELL_HANDOFF,
         )
     graph_obj.graph["field_write_state_cells"] = tuple(write_state_cells)
     return (
@@ -9385,6 +9775,69 @@ def _attach_graph_control_expressions(
 
     def attach(block):
         if isinstance(block, ConditionalBlock):
+            from .concordance_declarations import (
+                SOURCE_OPTIONAL_GLYPH_CARRY,
+                SourceOptionalGlyphCarry,
+            )
+            from .identity_concordance import current_identity_book
+
+            optional_cells = []
+            scalar_aliases = []
+            for alias in block.carried_aliases:
+                merged_id = int(alias[3])
+                merged_data = graph_obj.nodes.get(merged_id, {})
+                row = (merged_data.get("attributes") or {}).get(
+                    "source_optional_glyph_carry_row"
+                )
+                cell = (
+                    None if row is None else current_identity_book().latest_ref(
+                        SOURCE_OPTIONAL_GLYPH_CARRY, tuple(row),
+                    )
+                )
+                fact = (
+                    None if cell is None else current_identity_book().page(
+                        SOURCE_OPTIONAL_GLYPH_CARRY
+                    ).cell(cell.row, cell.column)
+                )
+                if (
+                    isinstance(fact, SourceOptionalGlyphCarry)
+                    and fact.initial_value_id is not None
+                    and (
+                        int(fact.true_value_id), int(fact.false_value_id),
+                        int(fact.initial_value_id), int(fact.merged_value_id),
+                    ) == tuple(map(int, alias))
+                ):
+                    optional_cells.append(cell)
+                else:
+                    scalar_aliases.append(alias)
+            scalar_result_aliases = []
+            for alias in block.result_aliases:
+                merged_id = int(alias[2])
+                merged_data = graph_obj.nodes.get(merged_id, {})
+                row = (merged_data.get("attributes") or {}).get(
+                    "source_optional_glyph_carry_row"
+                )
+                cell = (
+                    None if row is None else current_identity_book().latest_ref(
+                        SOURCE_OPTIONAL_GLYPH_CARRY, tuple(row),
+                    )
+                )
+                fact = (
+                    None if cell is None else current_identity_book().page(
+                        SOURCE_OPTIONAL_GLYPH_CARRY
+                    ).cell(cell.row, cell.column)
+                )
+                if (
+                    isinstance(fact, SourceOptionalGlyphCarry)
+                    and fact.initial_value_id is None
+                    and (
+                        int(fact.true_value_id), int(fact.false_value_id),
+                        int(fact.merged_value_id),
+                    ) == tuple(map(int, alias))
+                ):
+                    optional_cells.append(cell)
+                else:
+                    scalar_result_aliases.append(alias)
             predicate_expression = (
                 block.predicate_expression
                 if owns_optional_presence(block.predicate_expression)
@@ -9393,11 +9846,44 @@ def _attach_graph_control_expressions(
                     resident=resident,
                 )
             )
+            # A name-carried Phi may name a structural assignment made wholly
+            # inside one arm (for example ``x = a or b``). Such a producer
+            # owns no numerical dispatch region, so retaining only the Phi
+            # edge leaves the control builder with the authored arm id but no
+            # operation that can bind it. Carry the exact graph expression
+            # into the arm when the established scalar control vocabulary can
+            # represent it. A leaf means the capability is not represented
+            # here (notably JoinedStr and record construction) and remains an
+            # honest missing producer instead of becoming a fabricated scalar.
+            def arm_expressions(index: int):
+                result = []
+                for alias in block.carried_aliases:
+                    value_id = int(alias[index])
+                    if value_id == int(alias[2]):
+                        continue
+                    expression = _graph_control_expression(
+                        graph_obj, value_id, resident=resident,
+                    )
+                    if (
+                        expression is not None
+                        and not (
+                            expression.op == "value"
+                            and int(expression.value_id) == value_id
+                        )
+                    ):
+                        result.append((value_id, expression))
+                return tuple(result)
+
             return replace(
                 block,
                 body=attach(block.body),
                 orelse=(None if block.orelse is None else attach(block.orelse)),
                 predicate_expression=predicate_expression,
+                carried_aliases=tuple(scalar_aliases),
+                result_aliases=tuple(scalar_result_aliases),
+                body_value_expressions=arm_expressions(0),
+                orelse_value_expressions=arm_expressions(1),
+                optional_glyph_carry_cells=tuple(optional_cells),
             )
         if isinstance(block, SequenceBlock):
             children = list(attach(item) for item in block.blocks)
@@ -15175,7 +15661,8 @@ def _class_surface_ssa_program(
         AGGREGATE_POSITION_MISSING, ARGUMENT_BINDING, ArgumentBindingFact,
         CALL_BINDING_INPUT, CALL_RECORD_PAIR, CONSTRUCTOR_REMAP,
         CallBindingSource, DECLARED_ROW_COLUMN, FRAME_BINDING, FRAME_LINK,
-        FRAME_SCAFFOLD, FRAME_STORAGE_CLONE, GRAPH_ID_WITHOUT_CANONICAL_CELL,
+        FRAME_SCAFFOLD, FRAME_STORAGE_CLONE, FRESHEN,
+        GRAPH_ID_WITHOUT_CANONICAL_CELL,
         NESTED_RECORD_PART, PLANNER_OUTPUT_UNROUTED, PLANNING_VALUE,
         RECORD_ABI_MATERIALIZATION, RECORD_DESCRIPTOR, RECORD_FIELD_RESIDENT,
         ROW_LEAF_VIEW,
@@ -15184,7 +15671,8 @@ def _class_surface_ssa_program(
         RESIDENCY_FROM_NAME_MATCH, RESIDENT_CHOSEN_BY_ORDER,
         RESULT_STORAGE_LEASE, ROW_IDENTITY_FROM_SCHEMA_NAME, SHELL_HANDOFF,
         STORAGE_MINTED_FROM_ABSENCE, STRUCTURAL_FOLD, NAME_BINDING,
-        CONTRACT_DEMAND_PAGE, DemandKind,
+        CONTRACT_DEMAND_PAGE, DemandKind, SOURCE_AGGREGATE_LAYOUT,
+        SourceAggregateLayout,
     )
     from .string_table import StringTable
 
@@ -15290,8 +15778,9 @@ def _class_surface_ssa_program(
         """
         from .identity_concordance import current_identity_book
 
-        owner = str(caller_graph.graph.get("qualified_name")
-                    or caller_graph.graph.get("function_name") or "<module>")
+        from .planner_concordance_posts import _callsite_activation_owner
+
+        owner = _callsite_activation_owner(caller_graph)
         activation = current_identity_book().page(
             "source_callsite_activation_concordance"
         ).latest((owner, int(callsite_id)))
@@ -15426,6 +15915,12 @@ def _class_surface_ssa_program(
         return int(role)
     function_symbols: dict[int, str] = {}
     shell_symbols: dict[int, str] = {}
+    public_activation_references = set(map(
+        int,
+        getattr(
+            compilation.deployment, "activation_root_references", (),
+        ),
+    ))
     section_outputs: dict[str, tuple[Any, ...]] = {}
     export_symbols: list[str] = []
     lowering_failures: list[tuple[str, Any]] = []
@@ -15897,8 +16392,9 @@ def _class_surface_ssa_program(
                 # unknown and invented an unowned recursive scratch formal.
                 # Consume the book's SCC edge and the SAME activation graph;
                 # do not infer the result layout from the calling expression.
-                owner = str(caller_graph.graph.get('qualified_name')
-                            or caller_graph.graph.get('function_name') or '<module>')
+                from .planner_concordance_posts import _callsite_activation_owner
+
+                owner = _callsite_activation_owner(caller_graph)
                 activation = current_identity_book().page(
                     'source_callsite_activation_concordance').latest(
                         (owner, int(planned_call.callsite_id)))
@@ -16381,6 +16877,10 @@ def _class_surface_ssa_program(
             host_root = entry.metadata.get("host_ssa_root")
             if host_module is None or host_root is None:
                 continue
+            from .ssa_object_context import (
+                publish_linked_object_context_module,
+            )
+            publish_linked_object_context_module(host_module)
             all_functions.update(host_module.functions)
             section_outputs.update(dict(
                 entry.metadata.get("host_ssa_outputs") or {}
@@ -17389,7 +17889,13 @@ def _class_surface_ssa_program(
         record_specialization = graph_obj.graph.get("parameter_record_abi") or {}
         if record_specialization and shape_scope_is_variant(graph_obj):
             specialization_contract = (*specialization_contract, record_specialization)
-        if any(specialization_contract):
+        if (
+            any(specialization_contract)
+            and (
+                function_reference is None
+                or int(function_reference) not in public_activation_references
+            )
+        ):
             specialization_digest = hashlib.sha256(
                 repr(specialization_contract).encode("utf-8")
             ).hexdigest()[:12]
@@ -17444,8 +17950,34 @@ def _class_surface_ssa_program(
                 and bool(_field.get("mutable", False))
             ),
         )
+        (
+            glyph_sequence_declarations,
+            glyph_sequence_initializations,
+            glyph_sequence_mutations,
+        ) = _source_glyph_sequence_materializations(graph_obj)
+        (
+            optional_glyph_declarations,
+            optional_glyph_initializations,
+            _optional_glyph_cells,
+        ) = _source_optional_glyph_materializations(graph_obj)
+        (
+            token_glyph_declarations,
+            token_glyph_initializations,
+            token_glyph_mutations,
+        ) = _string_token_glyph_materializations(
+            graph_obj, string_table,
+        )
+        sequence_declarations = tuple(dict.fromkeys((
+            *sequence_declarations,
+            *glyph_sequence_declarations,
+            *optional_glyph_declarations,
+            *token_glyph_declarations,
+        )))
         sequence_initializations = tuple(dict.fromkeys((
             *sequence_initializations,
+            *glyph_sequence_initializations,
+            *optional_glyph_initializations,
+            *token_glyph_initializations,
             *(
                 (int(value_id), f"literal_bytes={payload.hex()}", 1)
                 for value_id, payload, _node_id, _identity
@@ -17614,6 +18146,44 @@ def _class_surface_ssa_program(
                 ),
             )
         }
+        # `_field_slot_ops` publishes every aggregate field occurrence as a
+        # planning alias of the field's current resident. Read those exact
+        # concordance rows here so conditional sequence promotion sees the
+        # same identity chain; do not infer it again from names or slots.
+        from .identity_concordance import (
+            committed_sequence_contract,
+            resolved_concordant_alias_bindings,
+        )
+
+        graph_node_by_value = {
+            int(data.get("value_id", node_id)): data
+            for node_id, data in graph_obj.nodes(data=True)
+        }
+        field_sequence_aliases = {}
+        for alias_id, resident_id in resolved_concordant_alias_bindings(
+            str(symbol)
+        ).items():
+            alias_data = graph_node_by_value.get(int(alias_id), {})
+            resident_data = graph_node_by_value.get(int(resident_id), {})
+            aggregate_kind = str(
+                (alias_data.get("attributes") or {}).get("aggregate_kind")
+                or (resident_data.get("attributes") or {}).get(
+                    "aggregate_kind"
+                )
+                or ""
+            )
+            if not aggregate_kind:
+                contract = committed_sequence_contract(
+                    str(symbol), int(resident_id),
+                )
+                if contract is not None and contract.policy == "unique":
+                    aggregate_kind = contract.policy
+            if aggregate_kind in {
+                "list", "set", "dict", "unique", "bytes", "bytearray"
+            }:
+                field_sequence_aliases[int(alias_id)] = (
+                    int(resident_id), aggregate_kind,
+                )
         (
             control,
             conditional_sequence_aliases,
@@ -17622,7 +18192,10 @@ def _class_surface_ssa_program(
             control,
             graph_obj,
             call_result_kinds=sequence_call_result_kinds,
-            structural_aliases=source_transform_aliases,
+            structural_aliases={
+                **source_transform_aliases,
+                **field_sequence_aliases,
+            },
         )
         (
             sequence_concats,
@@ -17815,6 +18388,11 @@ def _class_surface_ssa_program(
                     "control sequence mutation "
                     f"{mutation.effect_node_id}:{mutation.operator}"
                 ),
+                sources=(
+                    _frame_graph_cell(graph_obj, int(mutation.effect_node_id)),
+                    _frame_graph_cell(graph_obj, sequence_id),
+                ),
+                stage=SHELL_HANDOFF,
             )
 
         def _generated_sequence_ids(block):
@@ -17851,6 +18429,8 @@ def _class_surface_ssa_program(
                 if (
                     sequence_data.get("type") == "LoopResult"
                     and sequence_attributes.get("result_kind") == "collection"
+                    or sequence_attributes.get("producer_kind")
+                    == "sorted_materialization"
                 ):
                     found.add(sequence_id)
             return found
@@ -17973,13 +18553,16 @@ def _class_surface_ssa_program(
         literal_mutations = (*joined_literal_mutations, *_list_literal_mutations(
             graph_obj, declared_sequence_ids - set(joined_sequence_ids) - native_handle_ids,
         ))
-        if literal_mutations:
+        if glyph_sequence_mutations or token_glyph_mutations or literal_mutations:
             control, joined_literal_shortfalls = (
                 _install_lexical_sequence_mutations(
                     control,
                     graph,
                     getattr(shell, "dispatch_subgraphs", ()),
-                    extra_mutations=literal_mutations,
+                    extra_mutations=(
+                        *token_glyph_mutations,
+                        *glyph_sequence_mutations, *literal_mutations,
+                    ),
                 )
             )
             lexical_sequence_shortfalls = (
@@ -18210,6 +18793,22 @@ def _class_surface_ssa_program(
                 parameter_value_dtypes.setdefault(
                     int(history[0]), annotation_dtypes[str(parameter_name)]
                 )
+        # Local annotations use the same authored identity histories as
+        # parameters.  Carry their scalar contract across every version,
+        # including loop-target projections, so the compiler-frame formal
+        # is typed from the retained source declaration.
+        for binding_name, annotation in dict(
+            graph_obj.graph.get("type_annotations") or {}
+        ).items():
+            dtype = {
+                "bool": "bool",
+                "int": "int64",
+                "float": "float64",
+            }.get(str(annotation).strip())
+            if dtype is None:
+                continue
+            for value_id in identities.get(str(binding_name), ()):
+                parameter_value_dtypes.setdefault(int(value_id), dtype)
         for value_id, data in graph_obj.nodes(data=True):
             if str(data.get("type") or "").casefold() in {
                 "constant", "const",
@@ -18444,6 +19043,15 @@ def _class_surface_ssa_program(
                 continue
             source_data = graph_obj.nodes[source_id]
             source_value_id = int(source_data.get("value_id", source_id))
+            # `_field_slot_ops` has already classified sequence writes and
+            # committed their physical row contract. They are not failed
+            # scalar writes, so do not overwrite that durable source fact
+            # with a scalar-dtype shortfall.
+            from .identity_concordance import committed_sequence_contract
+            if committed_sequence_contract(
+                str(symbol), source_value_id,
+            ) is not None:
+                continue
             source_shape = parameter_value_shapes.get(source_value_id)
             source_dtype = parameter_value_dtypes.get(source_value_id)
             if source_dtype is None and source_value_id in constant_values:
@@ -18554,10 +19162,13 @@ def _class_surface_ssa_program(
                 return block
             control = replace(control, root=order_field_effects(control.root))
             from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
-        # Direct keyed return operands have no numerical region to schedule
-        # their reads. Retain their authored positions in the same control
-        # tree as construction and mutation, rather than treating them as
-        # absent region outputs or performing the reads at function entry.
+        # Keyed values consumed directly by control have no numerical region
+        # to schedule their reads.  This includes direct return operands, but
+        # also branch predicates and resident sequence mutations (notably the
+        # glyph composition of a formatted string).  Retain each lookup at
+        # its exact authored position in the same control tree as construction
+        # and mutation, rather than exposing its result as a producerless
+        # public formal or hoisting the read to function entry.
         from .control_source import SequenceQueryBlock
         region_owned_nodes = {
             int(node_id)
@@ -18569,8 +19180,55 @@ def _class_surface_ssa_program(
             for slots in (graph_obj.graph.get("return_slot_values") or {}).values()
             for slot in slots if slot is not None
         }
+        source_nodes_by_value_id: dict[int, list[int]] = {}
+        for source_node_id, source_data in graph_obj.nodes(data=True):
+            source_nodes_by_value_id.setdefault(
+                int(source_data.get("value_id", source_node_id)), []
+            ).append(int(source_node_id))
+
+        def lookup_dependent_value_ids(result_id: int) -> set[int]:
+            """Exact source-dataflow closure rooted at one keyed read."""
+
+            dependent = {int(result_id)}
+            roots = tuple(source_nodes_by_value_id.get(int(result_id), ()))
+            # ProcessGraph edges point from a consumer to its operands;
+            # consumers are therefore graph ancestors of the lookup.  Use
+            # that authoritative topology as well as the retained child
+            # index, whose convenience entries can be pruned by reduction.
+            for source_node_id in roots:
+                dependent.update(
+                    int(graph_obj.nodes[consumer].get("value_id", consumer))
+                    for consumer in nx.ancestors(
+                        graph_obj, int(source_node_id)
+                    )
+                )
+            pending = list(roots)
+            visited: set[int] = set()
+            while pending:
+                source_node_id = int(pending.pop())
+                if source_node_id in visited or source_node_id not in graph_obj:
+                    continue
+                visited.add(source_node_id)
+                for child, _role in (
+                    graph_obj.nodes[source_node_id].get("children") or ()
+                ):
+                    child = int(child)
+                    if child not in graph_obj:
+                        continue
+                    dependent.add(int(graph_obj.nodes[child].get(
+                        "value_id", child
+                    )))
+                    pending.append(child)
+            return dependent
+
         for result_id, key_ids, sequence_id in table_lookups:
-            if result_id not in direct_return_ids or result_id in region_owned_nodes:
+            control_consumed = _control_block_consumes_values(
+                control.root, lookup_dependent_value_ids(int(result_id))
+            )
+            if (
+                result_id not in direct_return_ids
+                and not control_consumed
+            ) or result_id in region_owned_nodes:
                 continue
             query = SequenceQueryBlock(
                 result_value_id=int(result_id), sequence_value_id=int(sequence_id),
@@ -18705,6 +19363,8 @@ def _class_surface_ssa_program(
                 int(column_count),
                 bool(writable),
                 source="shell control handoff",
+                sources=(_frame_graph_cell(graph_obj, int(sequence_id)),),
+                stage=SHELL_HANDOFF,
             )
             concorded_sequence_declarations.append((
                 int(sequence_id),
@@ -18716,17 +19376,30 @@ def _class_surface_ssa_program(
             concorded_sequence_declarations
         ))
         sequence_capacity_sources = tuple(
-            (
-                int(data.get("value_id", node_id)),
-                int(graph_obj.nodes[int(source_id)].get(
-                    "value_id", source_id
-                )),
-            )
-            for node_id, data in graph_obj.nodes(data=True)
-            for source_id in ((data.get("attributes") or {}).get(
-                "collection_iterable_value_id"
-            ),)
-            if source_id is not None and int(source_id) in graph_obj
+            dict.fromkeys((
+                *(
+                    (
+                        int(data.get("value_id", node_id)),
+                        int(graph_obj.nodes[int(source_id)].get(
+                            "value_id", source_id
+                        )),
+                    )
+                    for node_id, data in graph_obj.nodes(data=True)
+                    for source_id in ((data.get("attributes") or {}).get(
+                        "collection_iterable_value_id"
+                    ),)
+                    if source_id is not None and int(source_id) in graph_obj
+                ),
+                *(
+                    (
+                        int(mutation.sequence_value_id),
+                        int(mutation.argument_value_ids[0]),
+                    )
+                    for mutation in control_mutations
+                    if str(mutation.operator) == "sorted"
+                    and mutation.argument_value_ids
+                ),
+            ))
         )
         from .identity_concordance import shape_scope_of
         for value_id in native_constructor_ids:
@@ -19254,7 +19927,12 @@ def _class_surface_ssa_program(
             )
             module_ir.functions[symbol].metadata[
                 "sequence_capacity_sources"
-            ] = sequence_capacity_sources
+            ] = tuple(dict.fromkeys((
+                *module_ir.functions[symbol].metadata.get(
+                    "sequence_capacity_sources", ()
+                ),
+                *sequence_capacity_sources,
+            )))
             source_output_value_ids = tuple(
                 int(history[-1])
                 for name in tuple(
@@ -19423,7 +20101,42 @@ def _class_surface_ssa_program(
             ).class_table
         section_outputs.update(shell_section_outputs)
         module_ir.functions[symbol].metadata["source_callsite_variant"] = shape_scope_is_variant(graph_obj)
-        export_symbols.append(symbol)
+        # Retained dependencies stay linkable module functions, while the
+        # ordinary public surface is the exact activation catalogue.
+        # Explicit linked ProcessGraphs preserve their established exported
+        # surface; compiler-authored glyph implementations do not. Read both
+        # distinctions from their retained FunctionTable/definition cells.
+        private_compiler_helper = False
+        linked_process_export = False
+        if (
+            function_reference is not None
+            and source_function_table is not None
+            and deployment_graph is not None
+        ):
+            source_entry = source_function_table.entry(
+                int(function_reference)
+            )
+            linked_process_export = bool(
+                source_entry.metadata.get("linked_process_graph")
+            )
+            source_node = source_entry.metadata.get("source_node")
+            if source_node is not None and int(source_node) in deployment_graph:
+                source_definition = deployment_graph.nodes[
+                    int(source_node)
+                ].get("expr_obj")
+                private_compiler_helper = bool(getattr(
+                    source_definition, "_turing_private_export", False,
+                ))
+        if (
+            not private_compiler_helper
+            and (
+                not public_activation_references
+                or function_reference is None
+                or int(function_reference) in public_activation_references
+                or linked_process_export
+            )
+        ):
+            export_symbols.append(symbol)
         report(
             f"function {shell_index}/{len(planned_shells)} {function_name}: "
             f"local lowering complete; module_functions={len(module_ir.functions)} "
@@ -19607,6 +20320,15 @@ def _class_surface_ssa_program(
                 or identity.endswith("." + str(candidate))
                 for candidate in candidates
             ):
+                if record.get("constructor_complete") is False:
+                    from .identity_concordance import ConcordanceRefusal
+
+                    raise ConcordanceRefusal(
+                        "record constructor requires a complete physical "
+                        "schema, but only an exact projection view is "
+                        f"available: record={identity!r}, fields="
+                        f"{tuple(dict(record.get('fields') or {}))!r}"
+                    )
                 return str(record_name), record
         return None
 
@@ -21207,6 +21929,7 @@ def _class_surface_ssa_program(
             *tuple(named_output_ids),
         )))
         semantic_output_ids = []
+        semantic_output_bindings = []
         for output_name in output_names:
             history = tuple(identities.get(str(output_name), ()))
             if not history and str(output_name) not in named_output_ids:
@@ -21217,6 +21940,7 @@ def _class_surface_ssa_program(
                 else history[-1]
             )
             semantic_output_ids.append(int(output_id))
+            semantic_output_bindings.append((str(output_name), int(output_id)))
             structural_root_ids.add(output_id)
             if output_id in published:
                 continue
@@ -21288,33 +22012,66 @@ def _class_surface_ssa_program(
                 returned_record_layouts.append((output_id, layout))
                 continue
             attributes = data.get("attributes") or {}
+            from ..common.tensors.topological_reducer import (
+                _source_numeric_scope,
+            )
+
+            aggregate_scopes = tuple(dict.fromkeys(
+                tuple(scope)
+                for scope in (
+                    graph.graph.get("source_aggregate_layout_scope"),
+                    _source_numeric_scope(graph),
+                    graph.graph.get("source_numeric_base_scope"),
+                    graph.graph.get("authored_function_identity"),
+                )
+                if scope is not None
+            ))
+            from .identity_concordance import (
+                current_identity_book as _aggregate_identity_book,
+            )
+            aggregate_book = _aggregate_identity_book()
+            aggregate_page = aggregate_book.page(SOURCE_AGGREGATE_LAYOUT)
+
+            def source_aggregate_layout(value_id: int):
+                cell = next(filter(None, (
+                    aggregate_book.latest_ref(
+                        SOURCE_AGGREGATE_LAYOUT,
+                        (scope, int(value_id)),
+                    )
+                    for scope in aggregate_scopes
+                )), None)
+                if cell is None:
+                    return None, None
+                fact = aggregate_page.cell(cell.row, cell.column)
+                if not isinstance(fact, SourceAggregateLayout):
+                    raise TypeError(
+                        "source aggregate layout page contains invalid fact: "
+                        f"row={cell.row!r} fact={fact!r}"
+                    )
+                return fact, cell
 
             def aggregate_output_leaves(value_id: int) -> tuple[int, ...]:
-                node = graph.nodes.get(int(value_id), {})
-                node_attributes = node.get("attributes") or {}
-                member_ids = tuple(map(int, node_attributes.get(
-                    "aggregate_leaf_value_ids", ()
-                )))
-                if (
-                    node_attributes.get("producer_kind") == "aggregate"
-                    and member_ids
-                ):
-                    return tuple(
-                        leaf
-                        for member_id in member_ids
-                        for leaf in aggregate_output_leaves(member_id)
+                layout, _cell = source_aggregate_layout(int(value_id))
+                if layout is None:
+                    return (int(value_id),)
+                return tuple(
+                    leaf
+                    for member in layout.members
+                    for leaf in aggregate_output_leaves(
+                        int(member.value_id)
                     )
-                return (int(value_id),)
+                )
 
-            if (
-                attributes.get("producer_kind") == "aggregate"
-                and attributes.get("aggregate_leaf_value_ids")
-            ):
+            output_layout, output_layout_cell = source_aggregate_layout(
+                int(output_id)
+            )
+            if output_layout is not None:
                 # ``return total, (hub, angle), valid``: an authored aggregate
-                # output has no physical value of its own.  Its exact leaf
-                # ledger IS the return surface: publish every leaf, in ledger
-                # order, as a physical Ret operand and record the layout so a
-                # caller's path-bound projections correlate positionally.
+                # output has no physical value of its own.  Its immutable
+                # reducer concordance layout IS the return surface: publish
+                # every leaf in that exact order and retain the owning cell
+                # beside the physical receipt.  Graph attrs are only a debug
+                # view and may be absent from a projected unit.
                 layout = aggregate_output_leaves(output_id)
                 for leaf_id in layout:
                     if leaf_id not in values:
@@ -21333,9 +22090,20 @@ def _class_surface_ssa_program(
                         terminator.args.append(values[leaf_id])
                         published.add(leaf_id)
                 published.add(output_id)
-                function.metadata.setdefault(
-                    "aggregate_return_layouts", []
-                ).append((int(output_id), tuple(layout)))
+                function.metadata["aggregate_return_layouts"] = tuple((
+                    *tuple(function.metadata.get(
+                        "aggregate_return_layouts", ()
+                    )),
+                    (int(output_id), tuple(layout)),
+                ))
+                function.metadata[
+                    "aggregate_return_layout_sources"
+                ] = tuple((
+                    *tuple(function.metadata.get(
+                        "aggregate_return_layout_sources", ()
+                    )),
+                    (int(output_id), output_layout_cell),
+                ))
                 continue
             reconstructed = ensure_structural_value(output_id)
             if reconstructed is not None:
@@ -21856,6 +22624,69 @@ def _class_surface_ssa_program(
                                                else min(consumer_index, len(use_block.instrs)))
                         use_block.instrs[consumer_index:consumer_index] = moving
                     break
+            from .concordance_declarations import (
+                CONTROL_SSA_FINISH, SSA_BLOCK_GEOMETRY,
+                SSA_CONSTANT_MATERIALIZATION,
+            )
+            from .identity_concordance import (
+                ConcordanceRefusal, Derived, Mode, current_identity_book,
+            )
+            from .ssa_record_return_state import (
+                function_scope_of, return_site_cells,
+                ssa_value_identity_cell,
+            )
+
+            book = current_identity_book()
+            scope = function_scope_of(function)
+            for recovered in insertions:
+                if (
+                    recovered.res is None
+                    or str(recovered.op).casefold() not in {
+                        "const", "constant", "nonevalue", "string_token",
+                    }
+                ):
+                    continue
+                owners = tuple(
+                    (str(block_name), block)
+                    for block_name, block in function.blocks.items()
+                    if recovered in block.instrs
+                )
+                if len(owners) != 1:
+                    raise ConcordanceRefusal(
+                        "recovered source literal has no unique SSA block: "
+                        f"function={function.name!r}, "
+                        f"value={int(recovered.res.id)}"
+                    )
+                block_name, _block = owners[0]
+                value_id = int(recovered.res.id)
+                sources = tuple(dict.fromkeys(cell for cell in (
+                    _frame_graph_cell(graph, value_id),
+                    ssa_value_identity_cell(function, value_id, book=book),
+                    book.latest_ref(
+                        SSA_BLOCK_GEOMETRY,
+                        (scope, str(function.name), block_name),
+                    ),
+                ) if cell is not None))
+                if not sources:
+                    raise ConcordanceRefusal(
+                        "recovered source literal has no source identity: "
+                        f"function={function.name!r}, value={value_id}"
+                    )
+                literal = (recovered.attributes or {}).get(
+                    "value",
+                    (recovered.attributes or {}).get("text"),
+                )
+                book.post(
+                    SSA_CONSTANT_MATERIALIZATION,
+                    (scope, str(function.name), block_name, value_id),
+                    (
+                        str(recovered.op), str(recovered.res.dtype),
+                        repr(literal),
+                    ),
+                    stage=CONTROL_SSA_FINISH,
+                    provenance=Derived(sources),
+                    mode=Mode.CONCORD,
+                )
             function.metadata["recovered_structural_outputs"] = tuple(
                 int(instruction.res.id) for instruction in insertions
             )
@@ -21891,6 +22722,73 @@ def _class_surface_ssa_program(
                 function, output_identity_aliases,
             )
         if semantic_output_ids:
+            # This is the source-level writer that can turn the builder's
+            # provisional empty Ret into the authored output ABI.  Publish
+            # that decision on the existing FUNCTION_OUTPUT page from the
+            # exact graph node and SSA value cells; later geometry revisions
+            # consume these cells instead of trying to infer the cause from
+            # the changed instruction list.
+            from .concordance_declarations import (
+                CONTROL_SSA_FINISH, DECLARED_PARAMETER, FUNCTION_OUTPUT,
+                FUNCTION_PARAMETER,
+            )
+            from .identity_concordance import (
+                ConcordanceRefusal, Derived, Mode, current_identity_book,
+            )
+            from .ssa_record_return_state import (
+                function_scope_of, return_site_cells,
+                ssa_value_identity_cell,
+            )
+
+            output_book = current_identity_book()
+            output_scope = function_scope_of(function)
+            authored_return_cells = tuple(dict.fromkeys(
+                return_site_cells(graph.graph).values()
+            ))
+            for slot, (output_name, output_id) in enumerate(
+                semantic_output_bindings
+            ):
+                output_row = (output_scope, int(slot))
+                incumbent_output = output_book.page(
+                    FUNCTION_OUTPUT
+                ).latest(output_row)
+                if incumbent_output is not None:
+                    # The control builder already published this ordered
+                    # slot.  Its cell is the authority consumed by geometry;
+                    # structural recovery must not restate the slot from a
+                    # differently grouped aggregate-output view.
+                    continue
+                parameter_cells = tuple(
+                    output_book.latest_ref(FUNCTION_PARAMETER, row)
+                    for row in output_book.page(
+                        FUNCTION_PARAMETER
+                    ).scope_rows(output_scope)
+                    if output_book.page(FUNCTION_PARAMETER).latest(row)
+                    == output_id
+                )
+                output_sources = tuple(dict.fromkeys(cell for cell in (
+                    _frame_graph_cell(graph, output_id),
+                    ssa_value_identity_cell(
+                        function, output_id, book=output_book,
+                    ),
+                    output_book.latest_ref(
+                        DECLARED_PARAMETER, (output_scope, output_id),
+                    ),
+                    *parameter_cells,
+                    *authored_return_cells,
+                ) if cell is not None))
+                if not output_sources:
+                    raise ConcordanceRefusal(
+                        "semantic function output has no exact graph or SSA "
+                        f"identity: function={function.name!r}, "
+                        f"slot={slot}, value={output_id}"
+                    )
+                output_book.post(
+                    FUNCTION_OUTPUT, output_row,
+                    (output_name, output_id),
+                    stage=CONTROL_SSA_FINISH,
+                    provenance=Derived(output_sources), mode=Mode.CONCORD,
+                )
             function.metadata["semantic_output_ids"] = tuple(
                 semantic_output_ids
             )
@@ -25541,9 +26439,12 @@ def _class_surface_ssa_program(
             LITERAL_FIELD_DEFERRED, NUMERAL_RECORD_LITERAL,
             OPTIONAL_INACTIVE_PAYLOAD, OPTIONAL_PRESENCE, PROGRAM_ABI_DEFAULT,
             RECORD_LITERAL_MATERIALIZATION, RECORD_RETURN_LAYOUT_STAGE,
+            SSA_BLOCK_GEOMETRY, SSA_CONSTANT_MATERIALIZATION,
+            SSA_VALUE, SSAValueFact, SSAValueOrigin,
         )
         from .identity_concordance import (
-            Derived, Mode, Unresolved, Unsourced, current_identity_book,
+            ConcordanceRefusal, Derived, Mode, Unresolved, Unsourced,
+            current_identity_book,
         )
         from .precompile_to_ssa import _post_derived_or_raw
         from .ssa_record_return_state import (
@@ -25741,6 +26642,36 @@ def _class_surface_ssa_program(
                             [], value,
                             attributes={} if literal is None else {"value": literal},
                         ))
+                        source_cell = _frame_graph_cell(
+                            graph, int(physical_value_id),
+                        )
+                        if source_cell is None:
+                            raise ConcordanceRefusal(
+                                "record constructor literal has no source graph "
+                                "identity: "
+                                f"function={function.name!r}, "
+                                f"record={record['identity']!r}, "
+                                f"field={field_name!r}, "
+                                f"value={int(physical_value_id)}"
+                            )
+                        if _frame_value_cell(
+                            function, int(physical_value_id),
+                        ) is None:
+                            book.post(
+                                SSA_VALUE,
+                                (
+                                    _frame_book_scope(function),
+                                    int(physical_value_id),
+                                ),
+                                SSAValueFact(
+                                    value.dtype,
+                                    tuple(value.shape or ()),
+                                    SSAValueOrigin.ADOPTED_GRAPH_ID,
+                                ),
+                                stage=RECORD_LITERAL_MATERIALIZATION,
+                                provenance=Derived((source_cell,)),
+                                mode=Mode.CONCORD,
+                            )
                         values[int(physical_value_id)] = value
                 if not physical_value_ids or any(
                     int(physical_value_id) not in values
@@ -26165,11 +27096,46 @@ def _class_surface_ssa_program(
                     )
                     constructor_anchors[(str(symbol), int(node_id))] = None
         if constants:
-            for block in function.blocks.values():
+            for block_name, block in function.blocks.items():
                 if block.instrs and block.instrs[-1].op in {
                     "Ret", "ret", "Return", "return"
                 }:
                     block.instrs[-1:-1] = constants
+                    scope = _frame_book_scope(function)
+                    prior_geometry = book.latest_ref(
+                        SSA_BLOCK_GEOMETRY,
+                        (scope, str(function.name), str(block_name)),
+                    )
+                    for instruction in constants:
+                        value_id = int(instruction.res.id)
+                        sources = tuple(dict.fromkeys(cell for cell in (
+                            _frame_value_cell(function, value_id),
+                            prior_geometry,
+                        ) if cell is not None))
+                        if not sources:
+                            raise ConcordanceRefusal(
+                                "record literal materialization has no value "
+                                "or prior block geometry: "
+                                f"function={function.name!r}, "
+                                f"block={block_name!r}, value={value_id}"
+                            )
+                        book.post(
+                            SSA_CONSTANT_MATERIALIZATION,
+                            (
+                                scope, str(function.name),
+                                str(block_name), value_id,
+                            ),
+                            (
+                                str(instruction.op),
+                                str(instruction.res.dtype),
+                                repr((instruction.attributes or {}).get(
+                                    "value"
+                                )),
+                            ),
+                            stage=RECORD_LITERAL_MATERIALIZATION,
+                            provenance=Derived(sources),
+                            mode=Mode.CONCORD,
+                        )
                     break
         if layouts:
             function.metadata["record_return_layouts"] = tuple((
@@ -27916,8 +28882,11 @@ def _class_surface_ssa_program(
         for block_name, block in function.blocks.items():
             retained = []
             for index, instruction in enumerate(block.instrs):
-                if (str(instruction.op).casefold() in {"const", "constant"}
-                        and instruction.res is not None):
+                if (
+                    str(instruction.op).casefold() in {"const", "constant"}
+                    and instruction.res is not None
+                    and not instruction.args
+                ):
                     value_id = int(instruction.res.id)
                     if value_id in seen_constant_ids:
                         raise ValueError("one SSA constant identity is produced more than "
@@ -28384,7 +29353,13 @@ def _class_surface_ssa_program(
                 ), None)
                 if constructor_method is None:
                     continue
-                constructor_symbol = str(constructor_method.function_name)
+                constructor_child = getattr(
+                    caller_shell, "callsite_function_shells", {}
+                ).get(int(node_id))
+                constructor_symbol = str(
+                    shell_symbols.get(id(constructor_child))
+                    or constructor_method.function_name
+                )
                 constructor = all_functions.get(constructor_symbol)
                 constructor_table = all_record_tables.get(constructor_symbol)
                 constructor_sequences = all_sequence_tables.get(
@@ -28992,7 +29967,17 @@ def _class_surface_ssa_program(
                     callee_reference=int(constructor_method.function_reference),
                     callee_name=str(constructor_method.name),
                     callee_symbol=constructor_symbol,
-                    argument_bindings=((receiver_id, constructor_self_id),),
+                    # The hierarchy PlanCall is the exact authored call edge.
+                    # Its binding surface includes ``self`` and any authored
+                    # arguments whose formals were folded into a specialized
+                    # constructor body.  The record-ABI materializer owns the
+                    # expanded storage frame, but must not replace that source
+                    # binding surface with a synthetic self-only view.
+                    argument_bindings=(
+                        tuple(planned_constructor_call.argument_bindings)
+                        if planned_constructor_call is not None
+                        else ((receiver_id, constructor_self_id),)
+                    ),
                     enclosing_loop_ids=enclosing_loop_ids,
                     callee_storage_value_ids=tuple(
                         int(value.id) for value in constructor.args
@@ -30508,6 +31493,34 @@ def _class_surface_ssa_program(
                         all_functions[caller_symbol].args.append(
                             receiver_value
                         )
+                    else:
+                        # The exact caller value may already be an authored
+                        # formal (for example ``self`` in a method which calls
+                        # another method).  The frame binding proves that this
+                        # existing value is the callee's record-alias receiver
+                        # just as strongly as it proves a newly appended one.
+                        # Publish the same physical role on the canonical SSA
+                        # object instead of leaving class emission to infer a
+                        # receiver from position.
+                        receiver_value = caller_values[caller_value_id]
+                        accounting = dict(receiver_value.accounting or {})
+                        incumbent = accounting.get(
+                            "linked_method_receiver_storage"
+                        )
+                        receiver_name = str(parameter_contract.name)
+                        if incumbent not in {None, receiver_name}:
+                            raise ValueError(
+                                "linked method receiver storage disagreement: "
+                                f"caller={caller_symbol!r}, "
+                                f"callsite={planned_call.callsite_id}, "
+                                f"value={caller_value_id}, "
+                                f"recorded={incumbent!r}, "
+                                f"resolved={receiver_name!r}"
+                            )
+                        accounting[
+                            "linked_method_receiver_storage"
+                        ] = receiver_name
+                        receiver_value.accounting = accounting
                     frame_bindings.append((
                         value_id, "caller_storage", caller_value_id
                     ))
@@ -35572,9 +36585,55 @@ def _class_surface_ssa_program(
                             "plan_callsite_id", -1
                         )) == int(record.callsite_id)
                     )
-                    inserted = replace_at_callsite_marker(
-                        record, native_sequence
-                    )
+                    inserted = False
+                    if instance_pool is not None and not returns_physical_result:
+                        # The exact source edge is constructor-result ->
+                        # containing sequence mutation.  Control lowering can
+                        # place the void-call marker after that mutation
+                        # because it observes no scalar result dependency;
+                        # the record pool does.  Consume that marker while
+                        # placing the constructor immediately before its exact
+                        # append/add consumer, so the published handle cannot
+                        # precede initialization.
+                        destination_sequence_id = int(
+                            instance_pool["destination_sequence_id"]
+                        )
+                        consumer = next((
+                            (block, index)
+                            for block in caller.blocks.values()
+                            for index, instruction in enumerate(block.instrs)
+                            if instruction.attributes.get(
+                                "ssa_sequence_operation"
+                            ) in {"append", "add"}
+                            and int(instruction.attributes.get(
+                                "sequence_id", -1
+                            )) == destination_sequence_id
+                        ), None)
+                        if consumer is not None:
+                            consumer_block, consumer_index = consumer
+                            consumer_block.instrs[
+                                consumer_index:consumer_index
+                            ] = [*constants, *pooled_setup, native_call]
+                            for marker_block in caller.blocks.values():
+                                marker_block.instrs[:] = [
+                                    instruction
+                                    for instruction in marker_block.instrs
+                                    if not (
+                                        instruction is not native_call
+                                        and (instruction.attributes or {}).get(
+                                            "plan_callsite_marker"
+                                        )
+                                        and int((
+                                            instruction.attributes or {}
+                                        ).get("plan_callsite_id", -1))
+                                        == int(record.callsite_id)
+                                    )
+                                ]
+                            inserted = True
+                    if not inserted:
+                        inserted = replace_at_callsite_marker(
+                            record, native_sequence
+                        )
                     if not inserted and marker_blocks:
                         # The scheduler placed this call at its marker.  A
                         # marker that cannot be honoured means a consumer of
@@ -37994,7 +39053,17 @@ def _class_surface_ssa_program(
             old_id = int(result.id)
             if canonical[old_id] is result:
                 continue
-            result.id = mint_compiler_value_id()
+            # Collision freshening is an SSA transformation, so the new
+            # identity must be minted from the concordance cell of the value
+            # it replaces.  A bare global id leaves later type-settlement
+            # decisions with no source cell and breaks the identity chain.
+            result.id = mint_compiler_value_id(
+                function,
+                FRESHEN,
+                (_frame_value_cell(function, old_id),),
+                dtype=result.dtype,
+                shape=result.shape,
+            )
             occupied.add(int(result.id))
             freshened[old_id] = int(result.id)
         if freshened:
@@ -38034,7 +39103,11 @@ def _class_surface_ssa_program(
     )
 
     module_metadata["physical_region_input_conversions"] = (
-        adapt_physical_call_inputs(all_functions, progress=report)
+        adapt_physical_call_inputs(
+            all_functions,
+            progress=report,
+            defer_unsettled_region_call_results=True,
+        )
     )
     physical_conflicts = physical_call_input_conflicts(all_functions)
     if physical_conflicts:
@@ -38832,7 +39905,18 @@ def _class_surface_ssa_program(
             row for row in function.metadata.get(
                 "unresolved_required_source_values", ()
             )
-            if int(row[0]) not in available
+            if (
+                int(row[0]) not in available
+                and not (
+                    str(row[1]) in {"Tuple", "List"}
+                    and len(row) >= 3
+                    and tuple(row[2])
+                    and all(
+                        int(parent_id) in available
+                        for parent_id, _role in tuple(row[2])
+                    )
+                )
+            )
         )
         if unresolved_required:
             function.metadata[
@@ -42205,6 +43289,35 @@ def _class_surface_ssa_program(
     lowered_module.metadata["final_static_extent_restamp"] = bool(
         settle_repository_ssa_static_extent_operands(lowered_module)
     )
+    # The late adapter can revise a planned region's provisional feed from an
+    # exact source-linked result (for example ``inspect`` returning int64
+    # into a region cut while that result was still the default float64).
+    # Final address/scalar lowering above is the writer which carries that
+    # revised formal through the region expression and Ret.  Now carry the
+    # settled region output back over the same aggregate-result edge before
+    # native emission; otherwise the owner's loop-carried occurrence retains
+    # the earlier provisional result projection.
+    (
+        _late_exact_result_values,
+        late_type_events,
+        late_type_conflicts,
+        late_result_rounds,
+    ) = settle_call_result_types(
+        lowered_module.functions, emit_outputs, function_values,
+    )
+    lowered_module.metadata["late_result_type_transformation_provenance"] = (
+        late_type_events
+    )
+    lowered_module.metadata["late_call_result_type_conflicts"] = (
+        late_type_conflicts
+    )
+    lowered_module.metadata["initial_call_result_type_conflicts"] = tuple(
+        lowered_module.metadata.get("call_result_type_conflicts", ())
+    )
+    lowered_module.metadata["call_result_type_conflicts"] = (
+        late_type_conflicts
+    )
+    lowered_module.metadata["late_result_type_rounds"] = late_result_rounds
 
     report(
         f"complete; functions={len(lowered_module.functions)} "
@@ -42356,6 +43469,12 @@ def _lower_resolved_process_graph_deployment(
             for reference in activation
         )
         graph.G.graph["compile_targets"] = activation_names
+        # The selected compilation-unit receipt already names exact
+        # FunctionTable addresses.  Preserve that identity through the
+        # otherwise-empty deployment graph; deployment must not turn it into
+        # a qualified-name lookup and accidentally elect another retained
+        # shell with the same spelling.
+        graph.G.graph["activation_function_references"] = activation
         map_ir = dict(graph.G.graph.get("map_ir") or {})
         map_ir["dependency_regions"] = {
             "runtime": selected,
@@ -42933,6 +44052,74 @@ def _lower_ast_source_to_ssa_impl(
             f"{len(interchange.decisions)} reduction nest(s)"
         )
     tree = ast.parse(source)
+    # Dynamic string components call ordinary authored source.  Install the
+    # formatter definitions before source pursuit so their FunctionTable
+    # addresses, bodies and internal dependencies follow the same path as
+    # every other pursued Python helper.  The formatted-component Call itself
+    # is created later by the reducer, when SOURCE_GLYPH_SEQUENCE owns the
+    # exact operand/conversion recipe; no callee address is invented here.
+    glyph_formatter_pursuit_roots: tuple[str, ...] = ()
+    glyph_runtime_repr_contract: dict[str, Any] | None = None
+    if any(isinstance(node, ast.JoinedStr) for node in ast.walk(tree)):
+        from . import glyph_sequence_format as glyph_format_module
+
+        glyph_formatters = (
+            glyph_format_module.decimal_digit_glyph_token,
+            glyph_format_module.append_decimal_integer_glyphs,
+            glyph_format_module.decimal_integer_glyph_tokens,
+            glyph_format_module.lower_hex_digit_glyph_token,
+            glyph_format_module.prefixed_lower_hex_integer_glyph_tokens,
+            glyph_format_module.utf8_repr_bytes_to_glyph_tokens,
+        )
+        glyph_runtime_repr_contract = extraction_policy.decide(
+            glyph_format_module.runtime_repr_utf8
+        ).receipt()
+        if (
+            glyph_runtime_repr_contract.get("action") != "use_native"
+            or dict(glyph_runtime_repr_contract.get("parameters") or {}).get(
+                "result_dtype"
+            ) != "utf8_sequence"
+        ):
+            raise ValueError(
+                "unresolved !r requires the exact runtime_repr_utf8 "
+                "external UTF-8 sequence contract"
+            )
+        existing_top_level_names = {
+            statement.name
+            for statement in tree.body
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        collisions = tuple(
+            helper.__name__ for helper in glyph_formatters
+            if helper.__name__ in existing_top_level_names
+        )
+        if collisions:
+            raise ValueError(
+                "dynamic glyph formatter names collide with authored "
+                f"top-level definitions: {collisions!r}"
+            )
+        formatter_bindings = dict(vars(glyph_format_module))
+        formatter_definitions = []
+        for helper in glyph_formatters:
+            definition = ast.parse(
+                textwrap.dedent(inspect.getsource(helper)),
+                filename=str(inspect.getsourcefile(helper) or source_module or "<glyph-format>"),
+            ).body[0]
+            if not isinstance(definition, ast.FunctionDef):
+                raise TypeError(
+                    f"glyph formatter {helper.__qualname__!r} is not an authored function"
+                )
+            definition._python_source_identity = (
+                str(helper.__module__), str(helper.__qualname__),
+            )
+            definition._python_bindings = formatter_bindings
+            definition._turing_private_export = True
+            formatter_definitions.append(definition)
+        tree.body.extend(formatter_definitions)
+        ast.fix_missing_locations(tree)
+        glyph_formatter_pursuit_roots = tuple(
+            definition.name for definition in formatter_definitions
+        )
     # A numeric annotation is a request to compile the wrapper's existing
     # implementation, not merely a dtype label. Admit the exact eager classes
     # (and the source bases that own inherited operators) so normal class
@@ -43870,8 +45057,15 @@ def _lower_ast_source_to_ssa_impl(
             "ssa-source: normalized return-only guards in "
             f"{len(single_exit_receipts)} selected function(s)"
         )
-    inferred_record_views = _authored_dataclass_record_views(tree)
-    inferred_record_schemas = _authored_complete_record_schemas(tree)
+    inferred_projection_record_schemas: dict[str, Mapping[str, Any]] = {}
+    inferred_record_views = _authored_dataclass_record_views(
+        tree, projection_schemas=inferred_projection_record_schemas,
+        source_module=source_module,
+    )
+    inferred_record_schemas = {
+        **inferred_projection_record_schemas,
+        **_authored_complete_record_schemas(tree),
+    }
 
     def numeric_record_schema(descriptor: Any) -> tuple[str, dict[str, Any]] | None:
         """Materialize a composite numeric annotation as its physical record.
@@ -44031,12 +45225,18 @@ def _lower_ast_source_to_ssa_impl(
         declared_class_tree = ast.Module(
             body=declared_classes, type_ignores=[]
         )
+        declared_projection_schemas: dict[str, Mapping[str, Any]] = {}
+        declared_record_views = _authored_dataclass_record_views(
+            declared_class_tree,
+            projection_schemas=declared_projection_schemas,
+        )
         inferred_record_schemas = {
+            **declared_projection_schemas,
             **_authored_complete_record_schemas(declared_class_tree),
             **inferred_record_schemas,
         }
         inferred_record_views = {
-            **_authored_dataclass_record_views(declared_class_tree),
+            **declared_record_views,
             **inferred_record_views,
         }
     inferred_sequence_record_views = _authored_sequence_record_views(
@@ -44095,6 +45295,10 @@ def _lower_ast_source_to_ssa_impl(
     # entries (python_callable=None), so their call results had no SSA producer.
     graph.python_package = python_package
     graph.G.graph["assignment_normalization_receipts"] = assignment_receipts
+    if glyph_runtime_repr_contract is not None:
+        graph.G.graph["runtime_repr_utf8_extraction_contract"] = dict(
+            glyph_runtime_repr_contract
+        )
     if native_object_context is not None:
         from ..transmogrifier.ssa import SSAObjectContext
         if not isinstance(native_object_context, SSAObjectContext):
@@ -44203,9 +45407,14 @@ def _lower_ast_source_to_ssa_impl(
             tuple(dict.fromkeys((
                 *compile_targets,
                 *numeric_source_roots,
+                *glyph_formatter_pursuit_roots,
             )))
             if runtime_closure_only and not whole_source else None
         ),
+        # Activation is an exact source-pursuit fact even when whole-program
+        # retention deliberately keeps every authored definition available.
+        # It selects executable roots; it does not narrow catalogue policy.
+        activation_roots=compile_targets,
         tensor_code_references=source_tensor_references,
         source_ast_normalizers=(
             _normalize_none_default_assignments,
@@ -44245,6 +45454,51 @@ def _lower_ast_source_to_ssa_impl(
     declared_class_field_contracts: dict[
         tuple[str, str], Mapping[str, Any]
     ] = {}
+    declared_record_identities = {
+        str(class_definition.name): str(class_definition.name)
+        for class_definition in declared_classes
+    }
+
+    def declared_mapping_contract(
+        annotation: ast.AST,
+    ) -> Mapping[str, Any] | None:
+        """Return the value-row identity stated by a mapping annotation."""
+
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        container = (
+            annotation.value.id
+            if isinstance(annotation.value, ast.Name)
+            else annotation.value.attr
+            if isinstance(annotation.value, ast.Attribute)
+            else ""
+        )
+        if container not in {"dict", "Dict", "Mapping", "MutableMapping"}:
+            return None
+        columns = (
+            tuple(annotation.slice.elts)
+            if isinstance(annotation.slice, ast.Tuple)
+            else (annotation.slice,)
+        )
+        if len(columns) != 2:
+            return None
+        value = columns[1]
+        value_name = (
+            value.id if isinstance(value, ast.Name)
+            else value.attr if isinstance(value, ast.Attribute)
+            else None
+        )
+        value_record = declared_record_identities.get(str(value_name or ""))
+        if value_record is None:
+            return None
+        return {
+            "aggregate_kind": "dict",
+            "mapping_key_dtype": "int64",
+            "mapping_value_dtype": "int64",
+            "mapping_value_record": str(value_record),
+            "mutable": container in {"dict", "Dict", "MutableMapping"},
+        }
+
     for class_definition in declared_classes:
         for declaration in (
             node for node in ast.walk(class_definition)
@@ -44264,8 +45518,11 @@ def _lower_ast_source_to_ssa_impl(
             if field_name is None:
                 continue
             receipt = _authored_annotation_field_receipt(
-                declaration.annotation
+                declaration.annotation,
+                authored_record_identities=declared_record_identities,
             )
+            if receipt is None:
+                receipt = declared_mapping_contract(declaration.annotation)
             if receipt is not None:
                 declared_class_field_contracts[
                     (str(class_definition.name), str(field_name))
@@ -44289,16 +45546,20 @@ def _lower_ast_source_to_ssa_impl(
         expanded_tree = ast.Module(
             body=list(expanded_classes), type_ignores=[]
         )
+        expanded_projection_schemas: dict[str, Mapping[str, Any]] = {}
+        expanded_record_views = _authored_dataclass_record_views(
+            expanded_tree,
+            projection_schemas=expanded_projection_schemas,
+            carried_declarations=True,
+        )
         expanded_record_schemas = _authored_complete_record_schemas(
             expanded_tree
         )
         inferred_record_schemas = {
+            **expanded_projection_schemas,
             **expanded_record_schemas,
             **inferred_record_schemas,
         }
-        expanded_record_views = _authored_dataclass_record_views(
-            expanded_tree
-        )
         inferred_record_views = {
             **expanded_record_views,
             **inferred_record_views,
@@ -44742,7 +46003,6 @@ def _lower_ast_source_to_ssa_impl(
         # claim, deployment/SSA work beyond that boundary.
         return None, {}, ()
     final_source_literal_catalogue = _resolved_source_literals_by_symbol(graph)
-    final_source_graphs_by_symbol = _resolved_source_graphs_by_symbol(graph)
     artifact_name = _identifier(str(name or entrypoint or "whole_source"))
     module, outputs, exports = _lower_resolved_process_graph_deployment(
         graph,
@@ -44755,6 +46015,11 @@ def _lower_ast_source_to_ssa_impl(
         assignment_normalization=assignment_receipts,
         progress=progress,
     )
+    # Deployment stamps the exact shape/copy scope onto each retained source
+    # graph.  Index those identities only after that writer has run; an index
+    # captured before deployment cannot name the shaped SSA function and
+    # therefore drops its closure/callable provenance at publication.
+    final_source_graphs_by_symbol = _resolved_source_graphs_by_symbol(graph)
     compile_stage("pre-native-repairs")
     compile_substage("release selected deployment planning state")
     # The deployment (every planned shell, its callsite copies and dispatch
@@ -45814,20 +47079,29 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
         # made "detector still reports 0" untrue when another concordance
         # invariant was introduced by a late pass.
         _unresolved = ()
+        _detector_note = None
         _bars.substage("final concordance detector")
-        try:
-            from .identity_concordance import CorrelationTable
+        if module is None:
+            # A partitioned source compile with blocking partial units has no
+            # composed repository-SSA module yet.  That is an explicit
+            # compilation result, not a detector exception: asking the table
+            # to inspect ``None`` obscured the real unit shortfalls with a
+            # secondary ``NoneType.functions`` diagnostic.
+            _detector_note = "detector skipped: no repository SSA module"
+        else:
+            try:
+                from .identity_concordance import CorrelationTable
 
-            _bars.substage("build final concordance correlation table")
-            _table = CorrelationTable.build(module)
-            _bars.substage("final concordance detector")
-            _unresolved = tuple(_table.findings(module))
-        except Exception as _error:
-            _unresolved = (f"detector failed: {_error}",)
+                _bars.substage("build final concordance correlation table")
+                _table = CorrelationTable.build(module)
+                _bars.substage("final concordance detector")
+                _unresolved = tuple(_table.findings(module))
+            except Exception as _error:
+                _unresolved = (f"detector failed: {_error}",)
         # The detector's own findings are the SUMMARY log's diagnostics:
         # already computed above, so the log asks nothing new of the book.
         _log_summary = (
-            f"detector findings: {len(_unresolved)}",
+            _detector_note or f"detector findings: {len(_unresolved)}",
             *(
                 f"  {getattr(f, 'function', '?')} value "
                 f"{getattr(f, 'value_id', '?')} {getattr(f, 'detail', f)}"
@@ -45842,13 +47116,18 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
                 f"{len(_loop_scope_reconciliations)}; ProgramABI frame "
                 f"transitions concorded: {len(_program_abi_frame_transitions)}; "
                 "compiler-frame formals "
-                f"concorded: {len(_frame_formal_reconciliations)}; detector "
-                "still reports "
-                f"{len(_unresolved)}: "
-                + "; ".join(
-                    f"{getattr(f, 'function', '?')} value "
-                    f"{getattr(f, 'value_id', '?')} {getattr(f, 'detail', f)}"
-                    for f in _unresolved[:2]
+                f"concorded: {len(_frame_formal_reconciliations)}; "
+                + (
+                    _detector_note
+                    if _detector_note is not None
+                    else "detector still reports "
+                    f"{len(_unresolved)}: "
+                    + "; ".join(
+                        f"{getattr(f, 'function', '?')} value "
+                        f"{getattr(f, 'value_id', '?')} "
+                        f"{getattr(f, 'detail', f)}"
+                        for f in _unresolved[:2]
+                    )
                 )
             )
         ok = True

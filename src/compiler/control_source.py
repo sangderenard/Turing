@@ -148,6 +148,21 @@ class ConditionalBlock(TiledObject):
     # SSA version at its cell instead of looking a graph id up by hand.
     # Last field on purpose: positional constructions above never reach it.
     carried_field_cells: tuple[Any, ...] = ()
+    # Exact structural producers for name-carried arm versions which are not
+    # owned by a numerical region or a scheduled call. Each pair is
+    # ``(graph value id, expression)`` and is evaluated inside the named arm
+    # before its Phi operand is selected. The reducer's Phi parent edge is
+    # the authority for membership; this is not rebuilt from the binding
+    # name. String/record producers stay absent until their native sequence/
+    # record representation is admitted -- they must not be forced through
+    # the scalar expression vocabulary.
+    body_value_expressions: tuple[tuple[int, ControlExpression], ...] = ()
+    orelse_value_expressions: tuple[tuple[int, ControlExpression], ...] = ()
+    # Exact SOURCE_OPTIONAL_GLYPH_CARRY cells removed from the scalar-carried
+    # lane.  Their payload is resident sequence storage and their value is an
+    # explicit presence bit; lowering must not manufacture a scalar Phi for
+    # the sequence identity.
+    optional_glyph_carry_cells: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -168,6 +183,18 @@ class ControlSequenceMutation(TiledObject):
     extraction_identity: str | None = None
     # Accepted object representation on the shared book, not a second schema.
     object_contract_cell: Any = None
+    # Exact source recipe cell for compiler-authored resident sequence
+    # composition (currently dynamic glyph sequences).  This is distinct
+    # from ``object_contract_cell``: no object is admitted, and lowering may
+    # only consume the sequence operations named by this source cell.
+    source_contract_cell: Any = None
+    vocabulary_contract_cell: Any = None
+    # Native ``list.sort`` options retained from the authored call.  Mapping
+    # ``__getitem__`` keys use ``argument_value_ids`` plus
+    # ``argument_kind == "sort_key_mapping_getitem"``; a direct row
+    # projection such as ``lambda row: row[1]`` records its resident column.
+    sort_key_column: int | None = None
+    sort_reverse: bool = False
 
 
 @dataclass(frozen=True)
@@ -1200,6 +1227,7 @@ def post_control_program(
         CONTROL_FUNCTION_SCOPE_UNKNOWN, CONTROL_OWNER_UNKNOWN,
         CONTROL_PROGRAM, ControlBlockFact, ControlProgramFact,
         DEPLOYMENT_REGION, Placement, REGION_CELL_UNROUTED, ROOT, SHELL,
+        SCOPE_REGISTRY,
     )
     from .identity_concordance import (
         Derived, Mode, Ref, Unresolved, Unsourced, current_identity_book,
@@ -1330,11 +1358,13 @@ def post_control_program(
     if program_cell is None:
         seeds = tuple(dict.fromkeys((
             *cause,
+            book.latest_ref(SCOPE_REGISTRY, scope),
             *(
                 described[1] for described in descriptions.values()
                 if described is not None and described[1] is not None
             ),
         )))
+        seeds = tuple(seed for seed in seeds if isinstance(seed, Ref))
         program_cell = book.post(
             CONTROL_PROGRAM, program_row,
             ControlProgramFact((), (), (), None, (), ()),
@@ -1384,14 +1414,30 @@ def post_control_program(
             return None
         return revise(CONTROL_BLOCK, row, fact, sources)
 
-    def place(block_cell: Any, parent: Any, arm: Any, index: int, ordinal: int) -> None:
+    def place(
+        block_cell: Any,
+        parent: Any,
+        arm: Any,
+        index: int,
+        ordinal: int,
+        predecessors: tuple,
+    ) -> None:
         row = (scope, block_cell)
         fact = Placement(parent, arm, int(ordinal), int(index))
         if latest_fact(CONTROL_BLOCK_PLACEMENT, row) == fact:
             return
+        # A placement's ordinal is a graph fact: it is determined by the
+        # ordered predecessor blocks in this arm.  Include those exact cells
+        # so inserting/reordering siblings revises the placement from the
+        # changed prefix instead of producing an uncaused rewrite.
         revise(
             CONTROL_BLOCK_PLACEMENT, row, fact,
-            (block_cell, parent if isinstance(parent, Ref) else program_cell, *cause),
+            (
+                block_cell,
+                parent if isinstance(parent, Ref) else program_cell,
+                *predecessors,
+                *cause,
+            ),
         )
 
     def visit(blocks: tuple, parent: Any, arm: Any, index: int) -> tuple:
@@ -1401,8 +1447,11 @@ def post_control_program(
             if block_cell is None:
                 continue
             posted_block_cells.add(block_cell.key)
+            predecessors = tuple(placed)
             placed.append(block_cell)
-            place(block_cell, parent, arm, index, ordinal)
+            place(
+                block_cell, parent, arm, index, ordinal, predecessors,
+            )
             for child_arm, child_index, children in _control_block_arms(block):
                 visit(children, block_cell, child_arm, child_index)
         return tuple(placed)
@@ -3074,7 +3123,11 @@ def project_control_regions(
             orelse = (
                 None if block.orelse is None else project(block.orelse)
             )
-            if body is None and orelse is None and not block.result_aliases:
+            if (
+                body is None and orelse is None
+                and not block.result_aliases
+                and not block.optional_glyph_carry_cells
+            ):
                 return None
             return ConditionalBlock(
                 block.predicate_value_id,
@@ -3112,6 +3165,9 @@ def project_control_regions(
                     if all(value_survives_projection(value_id)
                            for value_id in carried)
                 ),
+                body_value_expressions=block.body_value_expressions,
+                orelse_value_expressions=block.orelse_value_expressions,
+                optional_glyph_carry_cells=block.optional_glyph_carry_cells,
             )
         if isinstance(block, LoopBlock):
             body = project(block.body)
@@ -3620,12 +3676,37 @@ def overlay_scheduled_control(
         frozenset(control.region_indices) for control in controls
     )
 
+    def _declared_descendant(
+        child: int, parent: int, visiting: frozenset[int] = frozenset(),
+    ) -> bool:
+        """Answer containment from the authored control graph alone."""
+
+        if parent in visiting:
+            raise ValueError("cyclic declared loop-control containment")
+        children = direct_children.get(parent, ())
+        return child in children or any(
+            _declared_descendant(
+                child, intermediate, visiting | {parent},
+            )
+            for intermediate in children
+        )
+
     def _nested_in(child: int, parent: int) -> bool:
         if child == parent:
             return False
+        # The authored control graph is the authority when it relates these
+        # controls.  Region sets are only a proxy for otherwise unrelated
+        # controls: successive clauses of one comprehension can give the
+        # outer clause {r1} and its inner clause {r1, r2}.  Treating the
+        # strict subset as reverse containment contradicts the exact
+        # generators edge and makes both controls non-maximal.
+        if _declared_descendant(child, parent):
+            return True
+        if _declared_descendant(parent, child):
+            return False
         if controlled_sets[child] < controlled_sets[parent]:
             return True
-        return child in direct_children.get(parent, ())
+        return False
 
     def embed(
         block: ControlBlock,
@@ -3800,7 +3881,9 @@ def overlay_scheduled_control(
 
     nested_roots: dict[int, ControlBlock] = {}
 
-    def place_regionless_loop(root, child_root, authored_site=None):
+    def place_authored_comprehension_control(
+        root, child_root, authored_site=None,
+    ):
         """Consume the declared nesting edge in its exact authored arm.
 
         In root(value,memo)->visit(item), conditional 11 owns comprehension
@@ -3825,7 +3908,11 @@ def overlay_scheduled_control(
                 _source_control_expression(graph, int(node_id))
             )
 
-        child_expression = expression(child_root.source_loop_node_id)
+        child_expression = expression(
+            getattr(child_root, "source_loop_node_id", None)
+            if authored_site is None
+            else authored_site.child_source_node_id
+        )
 
         def insert_at_comprehension_site(block):
             """Consume an exact comprehension slot without arm inference."""
@@ -3990,13 +4077,44 @@ def overlay_scheduled_control(
             set(children).difference(exact_comprehension_children)
         )
         # Exact comprehension sites insert at the front of their execution
-        # slot.  Consume later-authored siblings first so repeated insertion
-        # preserves source evaluation order.
-        for child in (*exact_comprehension_children, *remaining_children):
+        # slot. Consume later-authored siblings first so repeated insertion
+        # preserves source evaluation order. A region-owning child normally
+        # replaces its markers below. When none of those markers occur in the
+        # parent's program, the authored graph edge is the only valid site:
+        # this is the nested ``any(... for ...)`` inside an outer
+        # comprehension predicate. Place that complete control there rather
+        # than pretending its numerical region is a root sibling.
+        placed_exact_children = set()
+        for child in exact_comprehension_children:
+            control = controls[child]
+            child_regions = controlled_sets[child]
+            present_markers = _marker_scope_paths(root, child_regions)
+            if child_regions and present_markers:
+                child_root = nested_root(child, visiting | {index})
+                root, consumed = embed(root, child_root, child_regions)
+                if not consumed:
+                    raise ValueError(
+                        "authored nested control has no consumable marker at "
+                        "its exact parent site"
+                    )
+                # The exact source edge owns the child's complete region set.
+                # A later comprehension clause may have additional regions
+                # which cannot appear in the earlier clause's flat body;
+                # requiring equality here reverses the graph relationship.
+                placed_exact_children.add(child)
+                continue
+            if isinstance(control.root, (LoopBlock, WhileBlock)) or child_regions:
+                root = place_authored_comprehension_control(
+                    root,
+                    nested_root(child, visiting | {index}),
+                    authored_control_sites.get((index, child)),
+                )
+                placed_exact_children.add(child)
+        for child in remaining_children:
             control = controls[child]
             if (not control.region_indices
                     and isinstance(control.root, (LoopBlock, WhileBlock))):
-                root = place_regionless_loop(
+                root = place_authored_comprehension_control(
                     root,
                     nested_root(child, visiting | {index}),
                     authored_control_sites.get((index, child)),
@@ -4017,6 +4135,7 @@ def overlay_scheduled_control(
             child
             for child, child_regions in enumerate(controlled_sets)
             if child != index
+            and child not in placed_exact_children
             and child_regions
             and _nested_in(child, index)
             and not any(
@@ -4133,9 +4252,16 @@ def overlay_scheduled_control(
                 f"'regions': {controlled!r}, 'root': "
                 f"{type(control.root).__name__!r}}}; previous={previous!r}"
             )
-        first = min(controlled, key=positions.__getitem__)
+        def owned_regions(owner: int) -> frozenset[int]:
+            return controlled_sets[owner] | frozenset().union(*(
+                owned_regions(child)
+                for child in direct_children.get(owner, ())
+            )) if direct_children.get(owner) else controlled_sets[owner]
+
+        complete_controlled = owned_regions(index)
+        first = min(complete_controlled, key=positions.__getitem__)
         replacements[first] = nested_root(index)
-        covered.update(controlled)
+        covered.update(complete_controlled)
     # Controls with no numerical region can still own complete compiled work:
     # resident sequence mutation, or an empty loop body into which hierarchy
     # composition will insert a source-linked CallBlock.  They have no schedule

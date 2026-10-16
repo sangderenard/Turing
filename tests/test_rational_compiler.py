@@ -280,6 +280,11 @@ def coefficient(value: ComplexRationalPrecision[7]):
 
 
 def test_precision_width_is_concorded_per_exact_specialization():
+    from src.compiler.concordance_declarations import (
+        FUNCTION_ADDRESS,
+        SOURCE_VALUE_CLASS,
+    )
+
     _book, token = begin_identity_book()
     try:
         graph = ProcessGraph(materialize_memory=False)
@@ -292,7 +297,27 @@ def evaluate(parts, limbs):
             graph.build_from_ast(source, retain=(Precision,))
         reduce_abstract_tensor_topology(graph)
 
-        function = graph.function_table.entry("evaluate").graph
+        entry = graph.function_table.entry("evaluate")
+        function = entry.graph
+        parts_id = next(
+            int(node_id)
+            for node_id, data in function.G.nodes(data=True)
+            if data.get("type") == "Input"
+            and (data.get("attributes") or {}).get("binding_name") == "parts"
+        )
+        class_page = current_identity_book().page(
+            "source_value_class_concordance"
+        )
+        class_source = current_identity_book().latest_ref(
+            FUNCTION_ADDRESS, (str(entry.qualified_name),),
+        )
+        assert class_source is not None
+        function.G.graph["planner_parameter_classes"] = {
+            "parts": ("Precision", 1),
+        }
+        function.G.graph["planner_parameter_class_cells"] = {
+            "parts": (class_source,),
+        }
         scopes = []
         for width in (2, 7):
             function.G.graph["planner_specializations"] = {"limbs": width}
@@ -326,6 +351,15 @@ def evaluate(parts, limbs):
             class_page = current_identity_book().page(
                 "source_value_class_concordance"
             )
+            specialized_parts = current_identity_book().latest_ref(
+                SOURCE_VALUE_CLASS, (scope, parts_id),
+            )
+            assert class_source in {
+                source
+                for source, _stage in current_identity_book().edges_into(
+                    specialized_parts
+                )
+            }
             assert tuple(class_page.latest((scope, constructor_id)))[:2] == (
                 "Precision", width,
             )

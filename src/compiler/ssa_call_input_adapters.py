@@ -8,6 +8,7 @@ import time
 from .identity_concordance import current_identity_book, Derived, Mode
 from .concordance_declarations import (
     CONTROL_CAST, PHYSICAL_CALL_INPUT_ADAPTATION, CALL_INPUT_CONVERSION,
+    CALL_INPUT_STORAGE,
     KERNEL_INPUT_CONVERSION,
 )
 from .ssa_record_return_state import mint_ssa_value, ssa_value_identity_cell, identity_cells
@@ -101,6 +102,29 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                     or len(instruction.args) != len(callee.args)
                 ):
                     continue
+                # The region was cut before source-linked call results were
+                # settled.  Once result settlement has attached the exact
+                # callee-output edge to the owner resident, that edge revises
+                # the provisional cut-time feed dtype.  This is the recorded
+                # capture identity itself (feed id == owner value id), not a
+                # reconstruction from a consumer or from the Phi downstream.
+                revised_feed_dtypes = list(feed_dtypes)
+                for position, (actual, feed_id) in enumerate(zip(
+                    instruction.args, feed_ids,
+                )):
+                    resident = residents.get(int(feed_id))
+                    if resident is None:
+                        resident = residents.get(int(actual.id))
+                    if (
+                        resident is not None
+                        and (resident.accounting or {}).get(
+                            'ssa_call_result_from'
+                        )
+                        and str(resident.dtype or '') in _NUMERIC_DTYPES
+                    ):
+                        revised_feed_dtypes[position] = str(resident.dtype)
+                feed_dtypes = tuple(revised_feed_dtypes)
+                instruction.attributes['feed_dtypes'] = feed_dtypes
                 for position, (actual, formal, feed_id, exact_dtype) in enumerate(zip(
                     instruction.args, callee.args, feed_ids, feed_dtypes,
                 )):
@@ -568,6 +592,7 @@ def _read_only_feed(
 
 def _adapt_physical_call_inputs_round(
     functions, *, progress=None, round_index=0,
+    defer_unsettled_region_call_results=False,
 ) -> int:
     """Perform one ordered physical-call adaptation round.
 
@@ -591,7 +616,11 @@ def _adapt_physical_call_inputs_round(
         f'elapsed={time.monotonic() - started:.1f}s'
     )
     region_changes = []
-    count = _concord_exact_region_feed_dtypes(functions, region_changes)
+    count = (
+        0
+        if defer_unsettled_region_call_results
+        else _concord_exact_region_feed_dtypes(functions, region_changes)
+    )
     report(
         f'physical-call adaptation round {round_index}: exact region feeds '
         f'settled; changes={count}; changed_rows={region_changes[:8]!r}; '
@@ -635,6 +664,18 @@ def _adapt_physical_call_inputs_round(
         if accepted_ssa_component(caller):
             continue
         caller_formals = {int(value.id): value for value in caller.args}
+        unsettled_call_result_ids = {
+            int(value_id)
+            for owner_block in caller.blocks.values()
+            for owner_instruction in owner_block.instrs
+            if owner_instruction.op in {'Call', 'call'}
+            for value_id in (
+                *tuple(owner_instruction.attributes.get('output_ids', ())),
+                *(() if owner_instruction.res is None else (
+                    int(owner_instruction.res.id),
+                )),
+            )
+        }
         for block_name, block in caller.blocks.items():
             rewritten = []
             for instruction in block.instrs:
@@ -722,6 +763,17 @@ def _adapt_physical_call_inputs_round(
                         and len(instruction.args) == len(callee.args)):
                     for index, (actual, formal) in enumerate(zip(instruction.args, callee.args)):
                         diagnostics['call_operands'] += 1
+                        if (
+                            defer_unsettled_region_call_results
+                            and callee.metadata.get('source_region_integral')
+                            and int(actual.id) in unsettled_call_result_ids
+                        ):
+                            # Result settlement owns this edge.  Adapting its
+                            # provisional cut-time dtype first stamps a
+                            # physical contract which the exact callee result
+                            # can no longer revise.  Other region feeds still
+                            # adapt normally in this early transaction.
+                            continue
                         accounting = {**dict(actual.accounting or {}),
                             **dict((caller_formals.get(int(actual.id), actual).accounting or {}))}
                         scalar_region = bool(callee.metadata.get('source_region_integral') and not formal.shape and formal.dtype != 'ptr')
@@ -758,6 +810,29 @@ def _adapt_physical_call_inputs_round(
                         # slot. The pointer contract still requires a VALUE
                         # conversion to its inferred double element type;
                         # without it C/LLVM read eight bytes from a bool slot.
+                        sequence_arena_by_reference = bool(
+                            accounting.get('sequence_arena')
+                        )
+                        if sequence_arena_by_reference:
+                            book = current_identity_book()
+                            storage_row = (
+                                str(caller.name), int(actual.id),
+                            )
+                            if book.latest_ref(
+                                CALL_INPUT_STORAGE, storage_row,
+                            ) is None:
+                                actual_cell = ssa_value_identity_cell(
+                                    caller, int(actual.id), book=book,
+                                )
+                                if actual_cell is not None:
+                                    book.post(
+                                        CALL_INPUT_STORAGE,
+                                        storage_row,
+                                        'sequence_arena_by_reference',
+                                        stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                                        provenance=Derived((actual_cell,)),
+                                        mode=Mode.CONCORD,
+                                    )
                         logical_scalar_conversion = bool(
                             not actual.shape
                             and not formal.shape
@@ -766,15 +841,7 @@ def _adapt_physical_call_inputs_round(
                             and not accounting.get('physical_dtype')
                             # A sequence arena (a record's list column) is
                             # storage passed by reference, not a scalar value.
-                            and not (
-                                accounting.get('sequence_arena')
-                                and current_identity_book().page(
-                                    'call_input_storage_concordance'
-                                ).concord(
-                                    (str(caller.name), int(actual.id)),
-                                    'sequence_arena_by_reference',
-                                ) == 'sequence_arena_by_reference'
-                            )
+                            and not sequence_arena_by_reference
                             and source_dtype in numeric
                             and formal.dtype in numeric
                             and source_dtype != formal.dtype
@@ -986,7 +1053,10 @@ def _adaptation_state_signature(functions):
     )
 
 
-def adapt_physical_call_inputs(functions, *, progress=None) -> int:
+def adapt_physical_call_inputs(
+    functions, *, progress=None,
+    defer_unsettled_region_call_results=False,
+) -> int:
     """Converge physical call-edge contracts and record every adaptation.
 
     A later caller can settle a region formal after that region's own calls
@@ -1064,6 +1134,9 @@ def adapt_physical_call_inputs(functions, *, progress=None) -> int:
         )
         changed = _adapt_physical_call_inputs_round(
             functions, progress=progress, round_index=round_index,
+            defer_unsettled_region_call_results=(
+                defer_unsettled_region_call_results
+            ),
         )
         book.post(PHYSICAL_CALL_INPUT_ADAPTATION_ROUND, (round_scope, round_index),
                   int(changed), stage=PHYSICAL_CALL_INPUT_ADAPTATION,

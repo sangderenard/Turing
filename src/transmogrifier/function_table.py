@@ -128,6 +128,17 @@ class FunctionEntry(TiledObject):
         self.__dict__.setdefault("parameter_contracts", ())
 
 
+def function_address_identity(entry: FunctionEntry) -> str:
+    """The concordance row name of ``entry``'s table-local address."""
+
+    return str(
+        (getattr(entry, "metadata", None) or {}).get(
+            "function_address_identity"
+        )
+        or entry.qualified_name
+    )
+
+
 class StaticFunctionSlot:
     """Forward callable declaration used for recursive static definitions."""
 
@@ -209,7 +220,12 @@ class FunctionTable(TiledObject):
                 ),
             )
             self._qualified[qualified] = reference
-            self._post_function_address(qualified, reference, source, external)
+            address_identity = self._post_function_address(
+                qualified, reference, source, external,
+            )
+            self._entries[reference].metadata[
+                "function_address_identity"
+            ] = address_identity
         else:
             entry = self._entries[reference]
             entry.metadata.update(dict(metadata or {}))
@@ -225,7 +241,7 @@ class FunctionTable(TiledObject):
     @staticmethod
     def _post_function_address(
         qualified: str, reference: FunctionReference, source: Any, external: bool,
-    ) -> None:
+    ) -> str:
         from ..compiler.concordance_declarations import (
             EXTERNAL_DECLARATION, FUNCTION_ADDRESS, FUNCTION_TABLE,
             HELPER_CALLER_UNROUTED,
@@ -236,14 +252,24 @@ class FunctionTable(TiledObject):
 
         if isinstance(source, Ref):
             provenance = Derived((source,))
+            # Function addresses are local to one FunctionTable, while the
+            # concordance is shared by every source admitted to the book.
+            # Qualify an authored address by the exact module identity on its
+            # source cell; anonymous programs use their AST-SHA module scope.
+            # A bare spelling such as ``run`` is therefore never asked to
+            # concord two unrelated tables' dense local addresses.
+            address_identity = repr((source.row[0], str(qualified)))
         elif external:
             provenance = Unsourced(EXTERNAL_DECLARATION)
+            address_identity = str(qualified)
         else:
             provenance = Unsourced(HELPER_CALLER_UNROUTED)
+            address_identity = str(qualified)
         current_identity_book().post(
-            FUNCTION_ADDRESS, (qualified,), int(reference.address),
+            FUNCTION_ADDRESS, (address_identity,), int(reference.address),
             stage=FUNCTION_TABLE, provenance=provenance, mode=Mode.CONCORD,
         )
+        return address_identity
 
     def set_parameter_contracts(
         self,

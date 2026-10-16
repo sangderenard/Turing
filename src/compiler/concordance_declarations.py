@@ -99,6 +99,142 @@ class BindingFact:
 
 
 @dataclass(frozen=True)
+class SourceGlyphComponent:
+    """One ordered source component of a resident glyph-token sequence.
+
+    Literal components carry their already-interned, single-character glyph
+    tokens.  Formatted components instead name the exact value edge and its
+    authored conversion/format-specification.  ``projection_kind`` and
+    ``record_identity`` state only source facts already known at reduction;
+    an absent record identity remains absent rather than being reconstructed
+    from a later SSA shape.
+    """
+
+    kind: str
+    component_value_id: int
+    operand_value_id: int | None
+    glyph_tokens: tuple
+    conversion: int
+    format_spec_value_id: int | None
+    projection_kind: str
+    record_identity: str | None
+    projection_names: tuple = ()
+    projection_value_ids: tuple = ()
+    projection_components: tuple = ()
+    #: The resident sequence returned by the authored formatter.  The source
+    #: FormattedValue remains ``component_value_id``; generated execution
+    #: never replaces that authored identity.
+    formatted_sequence_value_id: int | None = None
+
+
+@dataclass(frozen=True)
+class SourceGlyphSequence:
+    """The exact ordered source recipe for one dynamic string value."""
+
+    components: tuple
+
+
+@dataclass(frozen=True)
+class SourceAggregateMember:
+    """One ordered member of an authored aggregate layout.
+
+    ``value_cell`` is the exact identity of the member value in the layout's
+    current id space.  ``source_cells`` retain the authored operand slot, or
+    for a conditional member the two arm-member and control cells which
+    caused its member Phi.  The cells are part of the immutable fact so no
+    later graph projection has to rediscover member order from node attrs.
+    """
+
+    value_id: int
+    value_cell: Ref
+    source_cells: tuple
+
+
+@dataclass(frozen=True)
+class SourceAggregateLayout:
+    """The authoritative semantic layout of one source aggregate value."""
+
+    aggregate_kind: str
+    members: tuple
+    conditional_cell: Ref | None = None
+    arm_layout_cells: tuple = ()
+
+
+@dataclass(frozen=True)
+class SourcePageFactClass:
+    """The declared fact class yielded by one named IdentityBook page."""
+
+    page_name: str
+    class_identity: str
+    # Exact authored ``RowField`` order and kind spellings.  ``rows()``
+    # yields these keys; consumers must not rediscover that tuple ABI from a
+    # runtime row or from the page variable's local spelling.
+    row_fields: tuple = ()
+
+
+@dataclass(frozen=True)
+class SourceEnumMember:
+    """One authored Enum member's resident value/name token relation."""
+
+    member_identity: str
+    runtime_value: int
+    name_token: int
+    source_cell: Ref
+
+
+@dataclass(frozen=True)
+class SourceEnumGlyphTable:
+    """Finite source-level lookup used to render an Enum member's name."""
+
+    enum_identity: str
+    base_identity: str
+    members: tuple
+
+
+@dataclass(frozen=True)
+class SourceOptionalGlyphArm:
+    """One source arm of an optional resident glyph sequence.
+
+    ``presence`` is ``True`` or ``False`` when the source proves that arm
+    present or absent.  ``None`` means the arm continues an earlier optional
+    carry, whose contract is ``presence_source``.  A present arm names its
+    resident sequence; an absent arm deliberately does not invent one.
+    """
+
+    value_id: int
+    presence: bool | None
+    presence_source: Ref
+    sequence_value_id: int | None
+
+
+@dataclass(frozen=True)
+class SourceOptionalGlyphCarry:
+    """An exact conditional carry of glyph-sequence payload plus presence."""
+
+    conditional_value_id: int
+    true_value_id: int
+    false_value_id: int
+    initial_value_id: int | None
+    merged_value_id: int
+    true_arm: SourceOptionalGlyphArm
+    false_arm: SourceOptionalGlyphArm
+    initial_arm: SourceOptionalGlyphArm | None
+    payload_sequence_value_id: int
+
+
+@dataclass(frozen=True)
+class SourceSortContract:
+    argument_kind: str
+    argument_value_ids: tuple[int, ...]
+    key_column: int | None
+    reverse: bool
+    destination_value_id: int | None = None
+    operation: str = "sort"
+    policy: str = "duplicates"
+    source_value_id: int | None = None
+
+
+@dataclass(frozen=True)
 class ClassFact:
     class_name: str
     permissions: tuple
@@ -169,6 +305,9 @@ CLASS_FIELD_DECLARATION = declare_page("class_field_declaration", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
     RowField("field", K.NAME),
 ), FieldFact)
+SOURCE_RECORD_VIEW_SCHEMA = declare_page("source_record_view_schema", (
+    RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
+), tuple)
 CLASS_METHOD_DECLARATION = declare_page("class_method_declaration", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
     RowField("method", K.NAME),
@@ -573,6 +712,48 @@ CALLSITE_RETURN_MEMBER = declare_page("callsite_return_member", (
     RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
     RowField("index", K.INDEX), RowField("member", K.VALUE_ID),
 ), object)
+SOURCE_GLYPH_SEQUENCE = declare_page("source_glyph_sequence", (
+    RowField("source_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), SourceGlyphSequence)
+SOURCE_AGGREGATE_LAYOUT = declare_page("source_aggregate_layout", (
+    RowField("source_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), SourceAggregateLayout)
+SOURCE_PAGE_FACT_CLASS = declare_page("source_page_fact_class", (
+    RowField("module", K.SCOPE), RowField("page_name", K.NAME),
+), SourcePageFactClass)
+SOURCE_ENUM_GLYPH_TABLE = declare_page("source_enum_glyph_table", (
+    RowField("module", K.SCOPE), RowField("enum_identity", K.NAME),
+), SourceEnumGlyphTable)
+#: Exact compile vocabulary admitted from the shared StringTable.  The entry
+#: page is the ingestion authority; the resident vocabulary page is a derived
+#: ordered `(token, ordinal, glyph)` table used by ordinary keyed sequence
+#: lookup.  Ordinal -1 stores the word length.
+STRING_TABLE_INGESTION = declare_transform("string_table_ingestion", 0)
+STRING_TABLE_ENTRY = declare_page("string_table_entry", (
+    # A content token is a reversible vocabulary label, not a graph/SSA
+    # value identity.  It may numerically equal any signed i64 and must never
+    # participate in value-id canonical relabel or producer accounting.
+    RowField("token", K.LABEL),
+), str)
+STRING_GLYPH_VOCABULARY = declare_page("string_glyph_vocabulary", (
+    RowField("function_scope", K.SCOPE), RowField("sequence", K.VALUE_ID),
+), tuple)
+SOURCE_OPTIONAL_GLYPH_CARRY = declare_page("source_optional_glyph_carry", (
+    RowField("source_scope", K.SCOPE), RowField("merged", K.VALUE_ID),
+), SourceOptionalGlyphCarry)
+SOURCE_SORT_CONTRACT = declare_page("source_sort_contract", (
+    RowField("source_scope", K.SCOPE),
+    RowField("call_value_id", K.VALUE_ID),
+), SourceSortContract)
+SOURCE_LITERAL_VALUE = declare_page("source_literal_value", (
+    RowField("source_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), object)
+SOURCE_SEQUENCE_MUTATION = declare_page(
+    "source_sequence_mutation_concordance", (
+        RowField("source_scope", K.SCOPE),
+        RowField("call_value_id", K.VALUE_ID),
+    ), tuple,
+)
 SOURCE_CONTROL_SPECIALIZATION = declare_page(
     "source_control_specialization_concordance", (
         RowField("function", K.NAME), RowField("control", K.VALUE_ID),
@@ -1027,6 +1208,10 @@ SSA_BLOCK_GEOMETRY = declare_page("ssa_block_geometry", (
     RowField("scope", K.SCOPE), RowField("function", K.NAME),
     RowField("block", K.NAME),
 ), tuple)                              # ordered instructions/CFG; REVISE
+SSA_CONSTANT_MATERIALIZATION = declare_page("ssa_constant_materialization", (
+    RowField("scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("block", K.NAME), RowField("value", K.VALUE_ID),
+), tuple)                              # (operation, dtype, literal repr); CONCORD
 SSA_CONSTANT_HOIST = declare_page("ssa_constant_hoist", (
     RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
     RowField("from_block", K.NAME), RowField("from_index", K.INDEX),
@@ -1350,6 +1535,7 @@ RECORD_FIELD_PHI = declare_transform("record_field_phi", 1)
 PROGRAM_ABI_DEFAULT = declare_transform("program_abi_default", 1)
 OPTIONAL_PRESENCE = declare_transform("optional_presence", 1)
 OPTIONAL_INACTIVE_PAYLOAD = declare_transform("optional_inactive_payload", 1)
+OPTIONAL_AGGREGATE = declare_transform("optional_aggregate", 1)
 #: The conceptual record header Phi a loop acquires: operand = the
 #: ``cell_set`` of the initial and updated descriptors' cells.
 LOOP_RECORD_HEADER = declare_transform("loop_record_header", 1)
@@ -1712,6 +1898,9 @@ FORMAL_ACTUAL_OCCURRENCE = declare_page("formal_actual_occurrence_concordance", 
     RowField("instruction", K.INDEX), RowField("position", K.INDEX),
     RowField("caller_scope", K.SCOPE),
 ), int)                                # DERIVED(actual ssa_value); CONCORD
+FORMAL_STORAGE_RESOLUTION = declare_page("formal_storage_resolution", (
+    RowField("function", K.SCOPE), RowField("formal", K.VALUE_ID),
+), tuple)                              # DERIVED(incoming occurrences); REVISE
 #: ``TransformationLedger`` (routed by ``propose(..., sources=)``): the
 #: retained (rule, proof, target) per identity, REVISE; every proposal as an
 #: event dict, CONCORD; each rejection once, by its full key, CONCORD.
@@ -2222,6 +2411,7 @@ class SSABlockKind(Enum):
     SEQUENCE_REMOVE_STORE_LENGTH = "sequence_remove_store_length"
     SEQUENCE_REMOVE_ABSENT = "sequence_remove_absent"
     SEQUENCE_REMOVE_COMPLETE = "sequence_remove_complete"
+    SEQUENCE_HELPER = "sequence_helper"
 
 
 #: A block made while lowering a control block that has no ``control_block``
@@ -3081,6 +3271,11 @@ SSA_CALL_SHAPE_EVIDENCE = declare_page("ssa_call_shape_evidence", (
     RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
     RowField("caller", K.NAME), RowField("actual", K.VALUE_ID),
 ), str)
+TENSOR_METADATA_CALL_BINDING = declare_page("tensor_metadata_call_binding", (
+    RowField("caller_scope", K.SCOPE), RowField("caller", K.NAME),
+    RowField("block", K.NAME), RowField("instruction", K.INDEX),
+    RowField("callee", K.NAME),
+), tuple)                              # DERIVED(shape/value cells); REVISE
 #: ``propagate_repository_ssa_call_metadata``: the functions of a module that
 #: mention one value id of one source owner's id space, ``(owner scope, id)``
 #: -> sorted function names, DERIVED(the value's ``ssa_value`` cell in each).
@@ -3123,6 +3318,16 @@ SOURCE_FUNCTION_REACHABILITY = declare_page(
         RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
         RowField("callee_scope", K.SCOPE),
     ), bool,
+)
+#: The one source-level result identity a reached call owns.  Duplicate table
+#: entries for the same authored definition use their canonical address, so a
+#: call vertex cannot acquire two identities merely because pursuit reached
+#: both qualified spellings.  CONCORD, DERIVED(the call vertex, canonical
+#: function address, and returned value-class cells).
+SOURCE_CALL_RESULT_IDENTITY = declare_page(
+    "source_call_result_identity_concordance", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    ), tuple,
 )
 #: ``specialize_python_precision_widths``: the numeric scope a callsite
 #: specialization owns, ``(authored function, receipt digest)`` ->

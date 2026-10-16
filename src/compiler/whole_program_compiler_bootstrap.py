@@ -236,6 +236,7 @@ def bootstrap_provenance_core(
     expansion_policy: Mapping[str, Any] | None = None,
     jobs: int | None = None,
     schedule_options: Mapping[str, Any] | None = None,
+    stop_after_failure: bool = True,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Complete the bootstrap's blocking provenance stage and nothing later."""
@@ -248,7 +249,8 @@ def bootstrap_provenance_core(
     first = plan["next_partition"]
     core = ensure_native_provenance_core(
         destination / "products" / first["name"] / first["version"], jobs=jobs,
-        schedule_options=dict(schedule_options or {}), progress=progress)
+        schedule_options=dict(schedule_options or {}),
+        stop_after_failure=bool(stop_after_failure), progress=progress)
     if core.get("backend") != "native":
         raise RuntimeError("outer compiler schedule requires native provenance core")
     return plan, core

@@ -61,12 +61,13 @@ class Counter:
     assert [(item.name, item.position) for item in methods["bump"].parameters] == [
         ("amount", 1),
     ]
-    # The nested-call linker appends the logical receiver after the scalar
-    # formal. The shared plan follows physical SSA evidence, not source order.
-    assert methods["twice"].receiver_position == 1
+    # The exact call-frame binding marks the existing authored ``self``
+    # formal as receiver storage.  The shared plan follows that physical SSA
+    # evidence rather than reconstructing the receiver from source order.
+    assert methods["twice"].receiver_position == 0
     assert methods["twice"].receiver_evidence == "linked-method-receiver-storage"
     assert [(item.name, item.position) for item in methods["twice"].parameters] == [
-        ("amount", 0),
+        ("amount", 1),
     ]
     assert all(
         record.resolution == "native_call"

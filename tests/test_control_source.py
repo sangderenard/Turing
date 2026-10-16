@@ -20,6 +20,7 @@ from src.compiler.control_source import (
     render_python_shell,
     compile_python_shell,
     overlay_scheduled_control,
+    post_control_program,
 )
 from src.common.tensors.accelerator_backends.glsl_backend import (
     compose_control_shader,
@@ -30,6 +31,36 @@ from src.common.tensors.accelerator_backends.c_primitive_program import (
 from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
 from src.compiler.glsl_deployment_strategy import _loop_reduction_nesting_hints
 from src.compiler.loop_composer import LoopShaderReduction
+
+
+def test_empty_control_program_derives_from_its_registered_scope():
+    from src.compiler.concordance_declarations import (
+        CONTROL_PROGRAM,
+        CONTROL_PROGRAM_REWRITE,
+        SCOPE_REGISTRY,
+    )
+    from src.compiler.identity_concordance import (
+        begin_identity_book,
+        end_identity_book,
+    )
+
+    book, token = begin_identity_book()
+    try:
+        scope = book.mint_scope("empty-control", CONTROL_PROGRAM_REWRITE)
+        graph = nx.DiGraph()
+        graph.graph["lexical_read_scope"] = scope
+        cell = post_control_program(
+            graph,
+            ControlProgram(SequenceBlock(())),
+            stage=CONTROL_PROGRAM_REWRITE,
+        )
+
+        assert cell == book.latest_ref(CONTROL_PROGRAM, (scope, "shell"))
+        assert {
+            source for source, _stage in book.edges_into(cell)
+        } == {book.latest_ref(SCOPE_REGISTRY, scope)}
+    finally:
+        end_identity_book(token)
 
 
 def test_same_planned_loop_renders_as_python_c_and_glsl():

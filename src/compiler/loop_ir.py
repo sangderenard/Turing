@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 from .hierarchical_plan import PlanClosure
 from .live_tiles import TiledObject
@@ -62,7 +63,7 @@ class LoopStateEffectMode(str, Enum):
 #: spelled out in a message is a copy that drifts, and a message that
 #: lists the wrong vocabulary is worse than one that lists none.
 SEQUENCE_MUTATION_OPERATORS = frozenset({
-    "add", "append", "clear", "extend", "pop", "remove",
+    "add", "append", "clear", "extend", "pop", "remove", "sort",
 })
 MAPPING_MUTATION_OPERATORS = frozenset({
     "update", "pop", "setdefault",
@@ -137,6 +138,11 @@ class LoopStateEffect:
     # explicit lowering shortfall until source storage establishes the policy.
     sequence_policy: str | None = None
     argument_kind: str = "value"
+    # Exact source concordance cell for effects whose authored policy is a
+    # source fact (currently list.sort/sorted).  The effect carries this Ref
+    # across graph serialization so composition never has to rediscover a
+    # row from a graph attribute.
+    source_contract_cell: Any = None
 
     def __post_init__(self) -> None:
         if self.sequence_policy not in {None, "unique", "duplicates"}:

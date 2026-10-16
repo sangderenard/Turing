@@ -170,6 +170,93 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         graph.G.graph.get("parameter_record_abi") or {}
     )
 
+    # A class call already carries the reducer's exact ``class_ref``.  Resolve
+    # its initializer from that class-table row before compilation-unit
+    # planning, at the same source-receiver seam as ordinary grounded method
+    # calls.  Doing this only in the later hierarchy planner made the call
+    # dynamic while the project was divided: the constructor body was absent
+    # from the unit and the conditional arm therefore had no producer for the
+    # constructed record.  ``class_ref`` and the class-table method edge are
+    # the two existing identities; no spelling or host object participates.
+    for _node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        attributes = data.get("attributes") or {}
+        if (
+            not isinstance(expression, ast.Call)
+            or attributes.get("class_ref") is None
+            or any(attributes.get(key) is not None for key in (
+                "callee_ref", "method_ref", "constructor_ref",
+            ))
+        ):
+            continue
+        class_identity = str(attributes["class_ref"])
+        class_record = class_table.get(class_identity)
+        if not isinstance(class_record, dict):
+            continue
+        methods = class_record.get("methods") or {}
+        reference = methods.get("__new__", methods.get("__init__"))
+        if reference is None:
+            continue
+        data["attributes"] = {
+            **attributes,
+            "constructor_ref": int(reference),
+            "constructor_resolution": "source-class-ref",
+        }
+        # Persist the early unit-division dependency from the exact class
+        # declaration edge.  Activation-root selection is independently
+        # anchored to the authored compile target; a constructor binding is a
+        # dependency, never a replacement program root.
+        from .concordance_declarations import (
+            CLASS_DECLARATION, CLASS_METHOD_DECLARATION,
+        )
+        from .identity_concordance import current_identity_book
+        from .planner_concordance_posts import _post_call_binding
+
+        method_name = "__new__" if methods.get("__new__") is not None else "__init__"
+        book = current_identity_book()
+        method_page = book.page(CLASS_METHOD_DECLARATION)
+        call_span_row = getattr(
+            expression, "_turing_source_span_row", None,
+        )
+        source_module = (
+            call_span_row[0]
+            if isinstance(call_span_row, tuple) and len(call_span_row) == 3
+            else None
+        )
+        matching_rows = tuple(
+            row for row in method_page.rows()
+            if len(row) == 3
+            and (
+                source_module is None
+                or str(row[0]) == str(source_module)
+            )
+            and str(row[1]) == class_identity
+            and str(row[2]) == method_name
+        )
+        if (
+            graph.G.graph.get("lexical_read_scope") is not None
+            and len(matching_rows) != 1
+        ):
+            # A production graph may expose the dependency only after its
+            # exact declaration cell is available.  Leave the call dynamic
+            # rather than retaining a graph-only constructor assertion.
+            data["attributes"] = attributes
+            continue
+        if len(matching_rows) == 1:
+            method_row = matching_rows[0]
+            method_cell = book.latest_ref(
+                CLASS_METHOD_DECLARATION, method_row,
+            )
+            class_cell = book.latest_ref(
+                CLASS_DECLARATION, method_row[:2],
+            )
+            binding_cell = _post_call_binding(
+                graph, int(_node_id), int(reference), "constructor",
+                source_cells=tuple(filter(None, (class_cell, method_cell))),
+            )
+            if binding_cell is not None:
+                data["attributes"]["constructor_binding_row"] = binding_cell.row
+
     def source_expression_identity(expression: ast.AST) -> tuple[Any, ...]:
         """Identify one authored expression across copied AST instances."""
 

@@ -95,3 +95,65 @@ def test_comprehension_ownership_preserves_exact_authored_site(
     assert sites[(0, 1)].parent_source_node_id == 1
     assert sites[(0, 1)].child_source_node_id == 2
     assert sites[(0, 1)].slot == expected_slot
+
+
+def test_comprehension_element_conditional_uses_aggregate_owner_edge():
+    """The clause and element meet through their exact aggregate graph node."""
+
+    aggregate = ast.parse(
+        "result = {(value.dtype, tuple(value.shape or ())) if value "
+        "else (None, ()) for value in values}"
+    ).body[0].value
+    parent = aggregate.generators[0]
+    child = aggregate.elt
+    graph_data = nx.DiGraph()
+    graph_data.add_node(1, expr_obj=parent)
+    graph_data.add_node(2, expr_obj=child)
+    graph_data.add_node(3, expr_obj=aggregate, parents=((1, "generators"),))
+    graph_data.add_edge(1, 3)
+    graph = SimpleNamespace(G=graph_data)
+    reductions = (
+        SimpleNamespace(loop_node_id=1, control_program=None, region_indices=(0, 1)),
+    )
+    control = ControlProgram(
+        ConditionalBlock(
+            10, StatementBlock(("__scheduled_region_0__",)), source_node_id=2,
+        ),
+        region_indices=(0, 1),
+    )
+    sites = {}
+
+    hints = _source_control_nesting_hints(
+        reductions, (control,), (), graph, authored_control_site_sink=sites,
+    )
+
+    assert hints == {0: frozenset({1})}
+    assert sites[(0, 1)].slot == "elt"
+
+
+def test_comprehension_generator_ownership_is_left_to_right():
+    aggregate = ast.parse(
+        "result = [(left, right) for left in rows for right in left]"
+    ).body[0].value
+    outer, inner = aggregate.generators
+    graph_data = nx.DiGraph()
+    graph_data.add_node(1, expr_obj=outer)
+    graph_data.add_node(2, expr_obj=inner)
+    graph_data.add_node(3, expr_obj=aggregate, parents=(
+        (1, "generators"), (2, "generators"),
+    ))
+    graph_data.add_edges_from(((1, 3), (2, 3)))
+    reductions = (
+        SimpleNamespace(loop_node_id=1, control_program=None, region_indices=(0,)),
+        SimpleNamespace(loop_node_id=2, control_program=None, region_indices=(1,)),
+    )
+    sites = {}
+
+    hints = _source_control_nesting_hints(
+        reductions, (), (), SimpleNamespace(G=graph_data),
+        authored_control_site_sink=sites,
+    )
+
+    assert hints == {0: frozenset({1})}
+    assert sites[(0, 1)].slot == "generators"
+    assert sites[(0, 1)].ordinal == 1

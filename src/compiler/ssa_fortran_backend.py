@@ -47,6 +47,7 @@ from ..transmogrifier.ssa import (
     Instr,
     IRModule,
     SSAValue,
+    SSASequenceTable,
     SSATensorTable,
 )
 from .string_table import NONE_TOKEN as _NONE_TOKEN, string_token as _string_token
@@ -795,6 +796,7 @@ class _FunctionEmitter:
         value_dtypes: Mapping[int, str] | None = None,
         value_shapes: Mapping[int, Sequence[int]] | None = None,
         tensor_table: SSATensorTable | None = None,
+        sequence_table: SSASequenceTable | None = None,
         native_symbol: str | None = None,
         callee_native_symbols: Mapping[str, str] | None = None,
         extent_namespace: str = "",
@@ -815,6 +817,7 @@ class _FunctionEmitter:
         self.dtype = dtype
         self.outputs = tuple(outputs)
         self.tensor_table = tensor_table or SSATensorTable()
+        self.sequence_table = sequence_table
         # Value ids used as an address base anywhere in the module (dynamic
         # arrays), and those a store mutates -- shared across a method's
         # functions by id, so every function that names one declares it as the
@@ -2663,6 +2666,30 @@ class _FunctionEmitter:
             int(instr.attributes["external_callsite_id"]),
             str(instr.attributes["external_identity"]),
         )
+        if instr.attributes.get("external_result_sequence") == "utf8":
+            descriptor = (
+                None if self.sequence_table is None
+                else self.sequence_table.by_id(int(instr.res.id))
+            )
+            if (
+                descriptor is None
+                or len(descriptor.column_value_ids) != 1
+                or descriptor.status_address_id is None
+                or tuple(descriptor.column_dtypes) != ("int64",)
+            ):
+                raise FortranEmissionError(
+                    "UTF-8 external result requires one exact int64 resident "
+                    f"sequence descriptor with status: value={instr.res.id}"
+                )
+            self.array_base_ids.add(int(descriptor.column_value_ids[0]))
+            operands = [self._operand(argument) for argument in instr.args]
+            operands.extend((
+                f"t{int(descriptor.column_value_ids[0])}",
+                f"t{int(descriptor.length_address_id)}",
+                f"t{int(descriptor.capacity_value_id)}",
+                f"t{int(descriptor.status_address_id)}",
+            ))
+            return [f"    call {symbol}({', '.join(operands)})"]
         self._locals[int(instr.res.id)] = self._typed(instr.res)
         operands = [self._operand(argument) for argument in instr.args]
         return [
@@ -2691,6 +2718,41 @@ class _FunctionEmitter:
                     continue
                 seen.add(symbol)
                 values = (*instr.args, instr.res)
+                if instr.attributes.get("external_result_sequence") == "utf8":
+                    descriptor = (
+                        None if self.sequence_table is None
+                        else self.sequence_table.by_id(int(instr.res.id))
+                    )
+                    if (
+                        descriptor is None
+                        or len(descriptor.column_value_ids) != 1
+                        or descriptor.status_address_id is None
+                        or tuple(descriptor.column_dtypes) != ("int64",)
+                    ):
+                        raise FortranEmissionError(
+                            "UTF-8 external interface has no exact resident "
+                            f"sequence descriptor: value={instr.res.id}"
+                        )
+                    argument_names = tuple(
+                        f"a{index}" for index in range(len(instr.args))
+                    )
+                    interfaces.extend((
+                        "    interface",
+                        f"      subroutine {symbol}({', '.join((*argument_names, 'result_data', 'result_length', 'result_capacity', 'result_status'))}) "
+                        f"bind(C, name=\"{symbol}\")",
+                        "        use, intrinsic :: iso_c_binding",
+                        *(
+                            f"        {_DTYPE_KIND.get(str(self._typed(value).dtype or self.dtype), 'real(c_double)')} :: {name}"
+                            for name, value in zip(argument_names, instr.args)
+                        ),
+                        "        integer(c_int64_t) :: result_data(*)",
+                        "        integer(c_int64_t) :: result_length",
+                        "        integer(c_int64_t) :: result_capacity",
+                        "        integer(c_int64_t) :: result_status",
+                        f"      end subroutine {symbol}",
+                        "    end interface",
+                    ))
+                    continue
                 if any(_is_array(self._typed(value)) for value in values):
                     continue
                 names = tuple(f"a{index}" for index in range(len(values)))
@@ -4265,6 +4327,7 @@ def emit_function(
     value_dtypes: Mapping[int, str] | None = None,
     value_shapes: Mapping[int, Sequence[int]] | None = None,
     tensor_table: SSATensorTable | None = None,
+    sequence_table: SSASequenceTable | None = None,
     native_symbol: str | None = None,
     callee_native_symbols: Mapping[str, str] | None = None,
     extent_namespace: str = "",
@@ -4318,6 +4381,7 @@ def emit_function(
         value_dtypes=value_dtypes,
         value_shapes=value_shapes,
         tensor_table=tensor_table,
+        sequence_table=sequence_table,
         native_symbol=native_symbol,
         callee_native_symbols=callee_native_symbols,
         extent_namespace=extent_namespace,
@@ -5706,6 +5770,7 @@ def emit_module(
                 value_dtypes=function_value_dtypes.get(function_name, {}),
                 value_shapes=function_value_shapes.get(function_name, {}),
                 tensor_table=module_tensor_tables.get(function_name),
+                sequence_table=module_sequence_tables.get(function_name),
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,
                 extent_namespace=extent_namespaces[function_name],
@@ -5765,6 +5830,7 @@ def emit_module(
                 value_dtypes=function_value_dtypes.get(function_name, {}),
                 value_shapes=function_value_shapes.get(function_name, {}),
                 tensor_table=module_tensor_tables.get(function_name),
+                sequence_table=module_sequence_tables.get(function_name),
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,
                 extent_namespace=extent_namespaces[function_name],
@@ -6148,9 +6214,12 @@ def emit_module(
                         instruction.attributes.get("keyword_names") or (),
                     )),
                     "result_dtype": str(
-                        resolved_dtypes.get(int(instruction.res.id))
-                        or instruction.res.dtype
-                        or dtype
+                        "utf8_sequence"
+                        if instruction.attributes.get(
+                            "external_result_sequence"
+                        ) == "utf8"
+                        else resolved_dtypes.get(int(instruction.res.id))
+                        or instruction.res.dtype or dtype
                     ),
                     "shell_abi": str(instruction.attributes["shell_abi"]),
                     "native_abi": str(

@@ -264,6 +264,10 @@ defaults:
 rules:
   # Exact result transport is part of the native call ABI. Arbitrary Python
   # objects remain shell-owned handles; scalar clock readings return inline.
+  - id: unresolved-formatted-repr-utf8-result
+    match: {module: src.compiler.glyph_sequence_format, qualname: runtime_repr_utf8, occurrence: definition}
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: utf8_sequence}
   - id: native-pickle-object-result
     match: {module: _pickle, qualname: "*", occurrence: definition}
     action: use_native

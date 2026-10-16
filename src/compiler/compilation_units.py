@@ -146,6 +146,9 @@ def _reference_sort_key(reference: int, names: Mapping[int, str]) -> tuple[str, 
 
 
 def _call_references(graph: Any) -> tuple[set[int], list[int]]:
+    from .concordance_declarations import CALL_BINDING, CallBinding
+    from .identity_concordance import current_identity_book
+
     references: set[int] = set()
     dynamic_nodes: list[int] = []
     for node_id, data in graph.nodes(data=True):
@@ -153,7 +156,23 @@ def _call_references(graph: Any) -> tuple[set[int], list[int]]:
         selected = None
         for field in _CALL_REFERENCE_FIELDS:
             if attributes.get(field) is not None:
-                selected = int(attributes[field])
+                candidate = int(attributes[field])
+                if field == "constructor_ref" and graph.graph.get(
+                    "lexical_read_scope"
+                ) is not None:
+                    binding_row = attributes.get("constructor_binding_row")
+                    binding = (
+                        None if binding_row is None else
+                        current_identity_book().page(CALL_BINDING).latest(
+                            tuple(binding_row)
+                        )
+                    )
+                    if not (
+                        isinstance(binding, CallBinding)
+                        and int(binding.callee) == candidate
+                    ):
+                        continue
+                selected = candidate
                 references.add(selected)
         operation = str(data.get("op") or data.get("type") or "").casefold()
         if operation in {"call", "methodcall", "functioncall"} and selected is None:
