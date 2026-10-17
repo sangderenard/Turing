@@ -450,9 +450,14 @@ def test_a_move_in_the_subgraph_continues_the_position_row(book):
         function, 3, [(2, "renamed")], cause=FUNCTION_SUBGRAPH_FILTER,
     )
     lrb, it = book.page(LRB), book.page(IT)
-    # The vacated position: copy then withdrawal; the arrival: the binding
-    # moved to the new position.
-    assert lrb.history((forked, 3, "arg", 0)) == ((0, "read2"), (1, None))
+    # The vacated position: copy then withdrawal (an ``Unresolved`` revision
+    # derived from the move, which readers take as absence); the arrival:
+    # the binding moved to the new position.
+    from src.compiler.identity_concordance import Unresolved
+    vacated = lrb.history((forked, 3, "arg", 0))
+    assert vacated[0] == (0, "read2") and len(vacated) == 2
+    assert vacated[1][0] == 1 and isinstance(vacated[1][1], Unresolved)
+    assert vacated[1][1].reason.name == "operand_position_vacated"
     assert lrb.latest((forked, 3, "renamed", 0)) == "read2"
     assert it.latest((forked, 3, "arg", 0)) == OperandMove(
         "function_subgraph_filter", 3, "renamed", 0,
