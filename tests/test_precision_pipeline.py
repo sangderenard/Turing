@@ -13,7 +13,14 @@ from src.compiler.ir_identities import (
     apply_precision_pipeline,
     precision_backend_shortfalls,
 )
-from src.compiler.identity_concordance import current_identity_book, identity_book
+from src.compiler.concordance_declarations import (
+    INGESTION, INGEST_SOURCE, SSA_VALUE, SSAValueFact, SSAValueOrigin,
+)
+from src.compiler.identity_concordance import (
+    Mode, Novel, begin_identity_book, current_identity_book,
+    end_identity_book, identity_book,
+)
+from src.compiler.ssa_record_return_state import function_scope_of
 from src.transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -26,6 +33,53 @@ from src.transmogrifier.ssa import (
 
 def value(identifier):
     return SSAValue(identifier, dtype="float64")
+
+
+@pytest.fixture
+def book():
+    """The book a hand-built module's values are authored on."""
+
+    book, token = begin_identity_book()
+    try:
+        yield book
+    finally:
+        end_identity_book(token)
+
+
+def _authored(module):
+    """Seed the ``ssa_value`` root of every value a test wrote by hand.
+
+    The test is the ingestion of these values -- no pass minted them -- so
+    each row is a root, ``Novel(INGEST_SOURCE, ())``, as a source
+    construct's span is.  The pipeline's own facts then derive from them.
+    """
+
+    book = current_identity_book()
+    for function in module.functions.values():
+        scope = function_scope_of(function)
+        seen: set[int] = set()
+        for candidate in (
+            *function.args,
+            *(
+                item
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for item in (instruction.res, *instruction.args)
+            ),
+        ):
+            if candidate is None or int(candidate.id) in seen:
+                continue
+            seen.add(int(candidate.id))
+            book.post(
+                SSA_VALUE, (scope, int(candidate.id)),
+                SSAValueFact(
+                    candidate.dtype, tuple(candidate.shape or ()),
+                    SSAValueOrigin.MINTED,
+                ),
+                stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+                mode=Mode.CONCORD,
+            )
+    return module
 
 
 def _lowered_limbs(function, value_id):
@@ -98,7 +152,7 @@ def _evaluate_scalar_block(function, arguments):
     ),
 )
 def test_precision_transcendentals_lower_registered_proof_cores(
-    operation, argument, reference,
+    operation, argument, reference, book,
 ):
     """Exp/Log consume symbolic cores inside the indivisible wide section."""
 
@@ -144,7 +198,7 @@ def test_precision_transcendentals_lower_registered_proof_cores(
     function = Function(
         "f", [x], {"entry": BasicBlock("entry", instructions)},
     )
-    module = IRModule({"f": function})
+    module = _authored(IRModule({"f": function}))
 
     receipt = apply_precision_pipeline(module)
     environment = _evaluate_scalar_block(function, [argument, 0.0])
@@ -260,7 +314,7 @@ def test_shader_capability_selection_does_not_claim_abstract_precision_ops():
     assert not registered["webgpu"].capabilities.supports(precision_ops)
 
 
-def test_precision_pipeline_carries_derived_limbs_across_call_and_zero_extends_scalar():
+def test_precision_pipeline_carries_derived_limbs_across_call_and_zero_extends_scalar(book):
     precision_add = PRECISION_SINGULAR_NAMES["Add"]
     caller_x, caller_y, derived = value(1), value(2), value(3)
     call_result = value(4)
@@ -302,6 +356,7 @@ def test_precision_pipeline_carries_derived_limbs_across_call_and_zero_extends_s
             resolution="native_call",
         ),)},
     )
+    _authored(module)
 
     receipt = apply_precision_pipeline(module)
 
@@ -338,7 +393,7 @@ def test_precision_pipeline_carries_derived_limbs_across_call_and_zero_extends_s
     )
 
 
-def test_precision_pipeline_is_idempotent():
+def test_precision_pipeline_is_idempotent(book):
     x, y, result = value(1), value(2), value(3)
     function = Function("f", [x, y], {
         "entry": BasicBlock("entry", [Instr(
@@ -346,7 +401,7 @@ def test_precision_pipeline_is_idempotent():
             attributes={"precision_limbs": 2},
         )])
     })
-    module = IRModule({"f": function})
+    module = _authored(IRModule({"f": function}))
 
     first = apply_precision_pipeline(module)
     instruction_count = len(function.blocks["entry"].instrs)
@@ -366,14 +421,14 @@ def test_precision_pipeline_is_idempotent():
     assert precision_backend_shortfalls(module, "fortran", ("f",)) == ()
 
 
-def test_precision_pipeline_lowers_authored_width_beyond_policy_ladder():
+def test_precision_pipeline_lowers_authored_width_beyond_policy_ladder(book):
     x, y, result = value(1), value(2), value(3)
-    module = IRModule({"f": Function("f", [x, y], {
+    module = _authored(IRModule({"f": Function("f", [x, y], {
         "entry": BasicBlock("entry", [Instr(
             PRECISION_SINGULAR_NAMES["Add"], [x, y], result,
             attributes={"precision_limbs": 5},
         )])
-    })})
+    })}))
 
     receipt = apply_precision_pipeline(module)
 
@@ -397,7 +452,7 @@ def test_automatic_precision_ceiling_is_an_explicit_optional_policy_bound():
 
 @pytest.mark.parametrize("width", (3, 4))
 def test_precision_pipeline_lowers_every_multiply_limb_at_width_three_and_four(
-    width,
+    width, book,
 ):
     x, y, result = value(1), value(2), value(3)
     function = Function("f", [x, y], {
@@ -406,7 +461,7 @@ def test_precision_pipeline_lowers_every_multiply_limb_at_width_three_and_four(
             attributes={"precision_limbs": width},
         )])
     })
-    module = IRModule({"f": function})
+    module = _authored(IRModule({"f": function}))
 
     receipt = apply_precision_pipeline(module)
 
@@ -424,7 +479,7 @@ def test_precision_pipeline_lowers_every_multiply_limb_at_width_three_and_four(
 @pytest.mark.parametrize("width", (3, 4))
 @pytest.mark.parametrize("operator", ("Add", "Sub", "neg"))
 def test_precision_pipeline_preserves_requested_width_for_linear_operations(
-    width, operator,
+    width, operator, book,
 ):
     x, y, result = value(1), value(2), value(3)
     arguments = [x] if operator == "neg" else [x, y]
@@ -435,7 +490,7 @@ def test_precision_pipeline_preserves_requested_width_for_linear_operations(
         )])
     })
 
-    apply_precision_pipeline(IRModule({"f": function}))
+    apply_precision_pipeline(_authored(IRModule({"f": function})))
 
     result_limbs = _lowered_limbs(function, result.id)
     assert len(result_limbs) == len(set(result_limbs)) == width
@@ -443,7 +498,7 @@ def test_precision_pipeline_preserves_requested_width_for_linear_operations(
 
 @pytest.mark.parametrize("width", (3, 4))
 def test_precision_pipeline_stores_every_array_limb_at_width_three_and_four(
-    width,
+    width, book,
 ):
     left, right, output = value(1), value(2), value(3)
     index = SSAValue(4, dtype="int64")
@@ -466,7 +521,7 @@ def test_precision_pipeline_stores_every_array_limb_at_width_three_and_four(
         ])
     })
 
-    apply_precision_pipeline(IRModule({"f": function}))
+    apply_precision_pipeline(_authored(IRModule({"f": function})))
 
     stores = [
         instruction for instruction in function.blocks["entry"].instrs
@@ -491,7 +546,11 @@ def test_width_four_ssa_multiplication_carries_more_exact_information_than_three
                 attributes={"precision_limbs": width},
             )])
         })
-        apply_precision_pipeline(IRModule({"f": function}))
+        _book, token = begin_identity_book()
+        try:
+            apply_precision_pipeline(_authored(IRModule({"f": function})))
+        finally:
+            end_identity_book(token)
 
         left_limbs = _fraction_limbs(left_number, width)
         right_limbs = _fraction_limbs(right_number, width)
@@ -529,7 +588,11 @@ def test_width_four_ssa_division_carries_more_exact_information_than_three():
                 attributes={"precision_limbs": width},
             )])
         })
-        apply_precision_pipeline(IRModule({"f": function}))
+        _book, token = begin_identity_book()
+        try:
+            apply_precision_pipeline(_authored(IRModule({"f": function})))
+        finally:
+            end_identity_book(token)
 
         left_limbs = _fraction_limbs(numerator, width)
         right_limbs = _fraction_limbs(denominator, width)
@@ -621,10 +684,14 @@ def test_split_two_product_flavour_matches_fma_bit_for_bit_and_frees_wasm():
                 attributes={"precision_limbs": width},
             )])
         })
-        module = IRModule({"f": function})
-        receipt = apply_precision_pipeline(
-            module, two_product_flavor=flavour
-        )
+        _book, token = begin_identity_book()
+        try:
+            module = _authored(IRModule({"f": function}))
+            receipt = apply_precision_pipeline(
+                module, two_product_flavor=flavour
+            )
+        finally:
+            end_identity_book(token)
         assert receipt["two_product_flavor"] == flavour
 
         operations = {
@@ -681,12 +748,12 @@ def _lowered_precision_mul_module():
             Instr("Ret", [], None),
         ])
     })
-    module = IRModule({"f": function})
+    module = _authored(IRModule({"f": function}))
     apply_precision_pipeline(module)
     return module, function
 
 
-def test_spirv_backend_delivers_precision_sections_with_fma_and_nocontraction():
+def test_spirv_backend_delivers_precision_sections_with_fma_and_nocontraction(book):
     from src.compiler.ssa_spirv_backend import emit_function
 
     module, function = _lowered_precision_mul_module()
@@ -752,7 +819,7 @@ def test_spirv_backend_leaves_ordinary_instructions_contractible():
     assert "NoContraction" not in emitted.source
 
 
-def test_spirv_precision_module_assembles_and_validates():
+def test_spirv_precision_module_assembles_and_validates(book):
     import shutil
     import subprocess
     import tempfile
@@ -783,7 +850,7 @@ def test_spirv_precision_module_assembles_and_validates():
         assert validated.returncode == 0, validated.stderr
 
 
-def test_webgpu_backend_refuses_precision_sections_loudly():
+def test_webgpu_backend_refuses_precision_sections_loudly(book):
     from src.compiler.ssa_webgpu_backend import emit_module as emit_webgpu
 
     module, _function = _lowered_precision_mul_module()
@@ -805,7 +872,7 @@ def test_webgpu_backend_refuses_precision_sections_loudly():
     assert SECTION_ISOLATION not in refusals[0].reason
 
 
-def test_webgpu_accepts_a_split_flavoured_section():
+def test_webgpu_accepts_a_split_flavoured_section(book):
     """The split flavour is the route onto a lane with no honest fma.
 
     Veltkamp halves at 4097 are exact for a 24-bit significand, so the
@@ -834,7 +901,7 @@ def test_webgpu_accepts_a_split_flavoured_section():
     assert precision_backend_shortfalls(module, "webgpu") == ()
 
 
-def test_webgl_backend_refuses_precision_sections_loudly():
+def test_webgl_backend_refuses_precision_sections_loudly(book):
     from src.compiler.ssa_webgl_backend import emit_ssa_webgl_fragment_module
 
     module, function = _lowered_precision_mul_module()
@@ -864,7 +931,7 @@ def test_webgl_backend_refuses_precision_sections_loudly():
     assert SECTION_ISOLATION in bare_refusals[0].reason
 
 
-def test_float32_limb_sections_widen_to_eight_and_split_with_4097():
+def test_float32_limb_sections_widen_to_eight_and_split_with_4097(book):
     """The binary32 ladder: wider sections, its own Veltkamp constant.
 
     A float32 limb carries 24 bits, so the proven ceiling doubles (eight
@@ -886,7 +953,7 @@ def test_float32_limb_sections_widen_to_eight_and_split_with_4097():
             },
         )])
     })
-    module = IRModule({"f": function})
+    module = _authored(IRModule({"f": function}))
     receipt = apply_precision_pipeline(module, two_product_flavor="split")
 
     assert receipt["status"] == "lowered"
@@ -914,12 +981,12 @@ def test_float32_limb_sections_widen_to_eight_and_split_with_4097():
     # the error-free transform constants; it no longer imposes an unrelated
     # ABI ceiling on a width-generic expansion algorithm.
     x64, y64, r64 = value(11), value(12), value(13)
-    wide = IRModule({"g": Function("g", [x64, y64], {
+    wide = _authored(IRModule({"g": Function("g", [x64, y64], {
         "entry": BasicBlock("entry", [Instr(
             PRECISION_SINGULAR_NAMES["Mul"], [x64, y64], r64,
             attributes={"precision_limbs": 6},
         )])
-    })})
+    })}))
     wide_receipt = apply_precision_pipeline(wide, two_product_flavor="split")
     assert wide_receipt["status"] == "lowered"
     assert wide_receipt["section_contracts"][0]["limbs"] == 6
@@ -948,7 +1015,7 @@ def test_precision_scalar_operands_keep_element_shape():
     assert quotients[0] == 10.0 and abs(quotients[2] - 10.0 / 3.0) < 1e-15
 
 
-def test_precision_collapse_restores_logical_extent_equal_to_limb_width():
+def test_precision_collapse_restores_logical_extent_equal_to_limb_width(book):
     """A logical length of two is not the two-limb channel itself."""
 
     left = SSAValue(1, dtype="float64", shape=(2,))
@@ -966,7 +1033,7 @@ def test_precision_collapse_restores_logical_extent_equal_to_limb_width():
             Instr("Ret", [publication], None),
         ]),
     })
-    module = IRModule({"vector_add": function})
+    module = _authored(IRModule({"vector_add": function}))
 
     apply_precision_pipeline(module)
 

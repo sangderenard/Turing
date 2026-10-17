@@ -18,6 +18,11 @@ class AssignmentNormalizationReceipt:
     temporary_names: tuple[str, ...]
     projections: tuple[tuple[str, int, str], ...] = ()
     scope: str = "<module>"
+    #: One generated ``target = temporary[position]`` statement per entry of
+    #: ``projections``, in order: the authored construct the projection
+    #: relation stands on once the rewritten tree is ingested (its
+    #: ``source_span`` row).
+    projection_statements: tuple[ast.Assign, ...] = ()
 
 
 class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
@@ -103,6 +108,7 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
         temporaries: list[str],
         projections: list[tuple[str, int, str]],
         aggregate_name: str | None = None,
+        projection_statements: list[ast.Assign] | None = None,
     ) -> Iterator[ast.Assign]:
         """Yield ordinary assignments for one target/value pair."""
 
@@ -154,7 +160,11 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
             projected_value: ast.expr = self._projection(
                 aggregate_name, projection, binding_target
             )
-            if isinstance(projection, int) and isinstance(binding_target, ast.Name):
+            recorded = (
+                isinstance(projection, int)
+                and isinstance(binding_target, ast.Name)
+            )
+            if recorded:
                 projections.append((
                     str(aggregate_name), int(projection), binding_target.id,
                 ))
@@ -169,13 +179,20 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
                     ),
                     binding_target,
                 )
-            yield from self._iterate_assignment(
+            for assignment in self._iterate_assignment(
                 binding_target,
                 projected_value,
                 location=location,
                 temporaries=temporaries,
                 projections=projections,
-            )
+                projection_statements=projection_statements,
+            ):
+                # A Name target yields exactly one statement: the
+                # projection's own.
+                if recorded and projection_statements is not None:
+                    projection_statements.append(assignment)
+                    recorded = False
+                yield assignment
 
     def visit_Assign(self, node: ast.Assign):  # noqa: N802 - ast visitor API
         node = self.generic_visit(node)
@@ -225,6 +242,7 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
 
         temporaries: list[str] = []
         projections: list[tuple[str, int, str]] = []
+        projection_statements: list[ast.Assign] = []
         root_name = self._fresh_name()
         temporaries.append(root_name)
         normalized: list[ast.Assign] = [ast.copy_location(
@@ -247,6 +265,7 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
                     temporaries=temporaries,
                     projections=projections,
                     aggregate_name=root_name,
+                    projection_statements=projection_statements,
                 ):
                     normalized.append(assignment)
             else:
@@ -269,6 +288,7 @@ class _DestructuringAssignmentNormalizer(ast.NodeTransformer):
             temporary_names=tuple(temporaries),
             projections=tuple(projections),
             scope=".".join(self._scope) or "<module>",
+            projection_statements=tuple(projection_statements),
         ))
         return normalized
 
