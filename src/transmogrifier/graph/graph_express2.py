@@ -545,6 +545,29 @@ def _resolve_class_body_field(
     return incumbent
 
 
+def _stamp_reference_class_identity(owner, definition):
+    """Stamp a class definition read by reference, and each method it
+    defines, with the live identity its span rows are keyed by (plan 60,
+    section 1.1): the class's own module and qualified name, the method's
+    ``Class.method`` under it.  A nested definition owns its own nodes
+    (``_source_span_path`` stops at it), so an ``__init__`` assignment's
+    span is keyed by the method, which must therefore carry an identity.
+    A definition that already has one (submitted or pursued source) keeps
+    it."""
+
+    module_name = str(getattr(owner, "__module__", ""))
+    qualname = str(getattr(owner, "__qualname__", getattr(owner, "__name__", "")))
+    if _source_definition_identity(definition) is None:
+        definition._turing_source_module = module_name
+        definition._turing_source_qualname = qualname
+    for member in definition.body:
+        if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if _source_definition_identity(member) is None:
+            member._turing_source_module = module_name
+            member._turing_source_qualname = f"{qualname}.{member.name}"
+
+
 def _class_field_reference(owner, attribute, seen):
     """Infer a field's constructor provenance without constructing an object."""
 
@@ -558,11 +581,7 @@ def _class_field_reference(owner, attribute, seen):
     # its live qualified name (plan 60, section 1.1); the definition is not
     # part of the submitted program, so it carries no
     # ``_python_source_identity`` and only the span identity is stamped.
-    if _source_definition_identity(definition) is None:
-        definition._turing_source_module = str(getattr(owner, "__module__", ""))
-        definition._turing_source_qualname = str(
-            getattr(owner, "__qualname__", getattr(owner, "__name__", ""))
-        )
+    _stamp_reference_class_identity(owner, definition)
     field_bindings = _import_ast_bindings(
         definition,
         _ast_definition_bindings(owner),
@@ -595,11 +614,7 @@ def ingest_class_declaration_by_reference(owner):
     definition = _source_ast_definition(owner)
     if not isinstance(definition, ast.ClassDef):
         return None
-    if _source_definition_identity(definition) is None:
-        definition._turing_source_module = str(getattr(owner, "__module__", ""))
-        definition._turing_source_qualname = str(
-            getattr(owner, "__qualname__", getattr(owner, "__name__", ""))
-        )
+    _stamp_reference_class_identity(owner, definition)
     return _class_schema_from_ast(definition)
 
 

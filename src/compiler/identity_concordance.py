@@ -5226,14 +5226,10 @@ class IdentityBook:
         #: the proof that no writer bypasses ``post``.
         import os
 
-        # CLOSED by default: a fact is recorded only with the cells it was
-        # read from.  ``TURING_IDENTITY_LATCH=open`` is the diagnostic mode
-        # that tags unsourced writes instead of refusing them.
-        self.latch: Latch = (
-            Latch.OPEN
-            if os.environ.get(LATCH_ENV, "").strip().lower() == "open"
-            else Latch.CLOSED
-        )
+        # Always CLOSED: a fact is recorded only with the cells it was read
+        # from.  The attribute remains for readers (the viewer); it is not
+        # a switch.
+        self.latch: Latch = Latch.CLOSED
         #: When a pass sets this, raw writes made while it is set are tagged
         #: with that stage instead of ``RAW_STAGE``.
         self.active_stage: Stage | None = None
@@ -5551,23 +5547,18 @@ class IdentityBook:
             for operand in provenance.operands:
                 self._source_stamp(operand)
         elif isinstance(provenance, Unsourced):
-            if self.latch is not Latch.OPEN:
-                raise ConcordanceRefusal(
-                    f"post {page.name} {row!r}: Unsourced({provenance.reason.name})"
-                    " refused; the latch is CLOSED"
-                )
-            reason = provenance.reason
-            if (
-                not isinstance(reason, Reason)
-                or registry.reasons.get(reason.name) != reason
-            ):
-                raise ConcordanceRefusal(
-                    f"post {page.name}: undeclared reason {reason!r}"
-                )
+            # Not a provenance: a record names what it was read from or it
+            # is not a record.  ``Unsourced`` survives only as the read type
+            # of rows older books tagged.
+            raise ConcordanceRefusal(
+                f"post {page.name} {row!r}: Unsourced({provenance.reason.name})"
+                " is not a provenance; derive the fact from the cell it was "
+                "read from, or mint it NOVEL from its operands"
+            )
         else:
             raise ConcordanceRefusal(
-                f"post {page.name}: provenance must be Derived, Novel or "
-                f"Unsourced, got {provenance!r}"
+                f"post {page.name}: provenance must be Derived or Novel, "
+                f"got {provenance!r}"
             )
 
         if self._spill is not None:
@@ -5704,16 +5695,12 @@ class IdentityBook:
         return page.stamps[(ref.row, ref.column)]
 
     def _admit_raw_write(self, page: IdentityPage, row: Any) -> None:
-        """Tag (OPEN) or refuse (CLOSED) a write made through a raw
-        primitive rather than ``post``."""
-        if self.latch is not Latch.OPEN:
-            raise ConcordanceRefusal(
-                f"raw write refused under a CLOSED latch: page {page.name!r} "
-                f"row {row!r}; write it through IdentityBook.post"
-            )
-        stage = self.active_stage if self.active_stage is not None else RAW_STAGE
-        self._page(UNSOURCED_PAGE.name)._stamp(
-            (page.name, row, stage.name), 0, RAW_PRIMITIVE,
+        """Refuse a write made through a raw primitive rather than
+        ``post``: a page is written only by the book, from a fact's
+        sources."""
+        raise ConcordanceRefusal(
+            f"raw write refused: page {page.name!r} row {row!r}; write it "
+            "through IdentityBook.post with the cells the fact was read from"
         )
 
     # -------------------------------------------------------------- reading
@@ -6519,17 +6506,13 @@ def _post_or_unsourced(
     because nothing in ``cells`` changed and the cell set is the previous
     revision's (or there are no cells), post it ``Unsourced(reason)`` so the
     causeless statement is listed by the audit instead of hidden."""
-    if cells:
-        try:
-            return book.post(
-                page, row, fact, stage=stage,
-                provenance=Derived(cells), mode=Mode.REVISE,
-            )
-        except ConcordanceRefusal:
-            pass
+    # ``reason`` stays in the signature for its callers; there is no
+    # unsourced path: the post derives from ``cells`` or is refused, and a
+    # revision the api finds causeless is refused with that cause named.
+    del reason
     return book.post(
         page, row, fact, stage=stage,
-        provenance=Unsourced(reason), mode=Mode.REVISE,
+        provenance=Derived(tuple(cells)), mode=Mode.REVISE,
     )
 
 
@@ -8339,9 +8322,8 @@ def row_value_id(row: Any) -> int | None:
     return None
 
 
-#: Every new book is closed: a raw write, or a post that names no source,
-#: is refused at the line that makes it.  ``open`` tags such writes on the
-#: unsourced page instead (diagnostic only).
+#: Retained name: the latch is always closed; the variable no longer opens
+#: it (a raw write or a post without a source is refused unconditionally).
 LATCH_ENV = "TURING_IDENTITY_LATCH"
 LOG_LEVEL_ENV = "TURING_IDENTITY_LOG_LEVEL"
 LOG_PRESET_ENV = "TURING_IDENTITY_LOG_LZMA_PRESET"

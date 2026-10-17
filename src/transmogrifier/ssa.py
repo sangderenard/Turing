@@ -387,6 +387,22 @@ def _mint_table_owner(book: Any, label: Any) -> tuple[str, int]:
     return book.mint_scope(label or "table")
 
 
+def _owner_cell(table: Any) -> Any:
+    """The ``scope_registry`` cell of a table's owner scope: the row the
+    book minted for the table, which a descriptor restored from an
+    artifact or copied without its origin cell stands on."""
+
+    from ..compiler.concordance_declarations import SCOPE_REGISTRY
+
+    cell = table.book.latest_ref(SCOPE_REGISTRY, tuple(table.owner))
+    if cell is None:
+        raise ValueError(
+            f"table owner {table.owner!r} has no scope_registry row on the "
+            "book: tables are owned by a scope the book minted"
+        )
+    return cell
+
+
 def _table_post(
     book: Any, page_name: str, row: tuple, fact: Any, *,
     sources: tuple, stage: Any, mode: Any = None,
@@ -469,14 +485,16 @@ class _BookRows(__import__("collections.abc").abc.MutableMapping):
     ) -> Any:
         row = (self._owner, int(key))
         old = self._page.latest(row)
-        cell = None
-        if sources:
-            cell = _table_post(
-                self._book, self._page.name, row, value,
-                sources=sources, stage=stage,
+        if not sources:
+            raise ValueError(
+                f"table {self._page.name} row {row!r}: a descriptor is "
+                "written with the cells it was read from (assign/remove "
+                "sources=); the mapping syntax carries none"
             )
-        else:
-            self._page.revise(row, value)
+        cell = _table_post(
+            self._book, self._page.name, row, value,
+            sources=sources, stage=stage,
+        )
         self._on_change(old, value, cell, stage)
         return cell
 
@@ -498,11 +516,29 @@ class _BookRows(__import__("collections.abc").abc.MutableMapping):
             raise KeyError(key)
         return self._write(key, None, sources=tuple(sources), stage=stage)
 
+    def _incumbent_cell(self, key: Any) -> Any:
+        return self._book.latest_ref(
+            self._book.registry.page(self._page.name), (self._owner, int(key)),
+        )
+
     def __setitem__(self, key: Any, value: Any) -> None:
-        self.assign(key, value)
+        # ``rows[id] = descriptor`` is a revision of the row that exists:
+        # it derives from the incumbent descriptor cell.  A row that does
+        # not exist yet is registered with the cells it was read from.
+        incumbent = self._incumbent_cell(key)
+        if incumbent is None:
+            raise ValueError(
+                f"table {self._page.name} row {(self._owner, int(key))!r}: "
+                "no incumbent to revise; register the descriptor with the "
+                "cells it was read from (register/assign sources=)"
+            )
+        self.assign(key, value, sources=(incumbent,))
 
     def __delitem__(self, key: Any) -> None:
-        self.remove(key)
+        incumbent = self._incumbent_cell(key)
+        if incumbent is None:
+            raise KeyError(key)
+        self.remove(key, sources=(incumbent,))
 
     def __iter__(self):
         for row in self._page.scope_rows(self._owner):
@@ -618,12 +654,10 @@ class SSARecordTable:
                     (copied_from.owner, int(record_id)),
                 )
             )
-            if copied is None:
-                self.records[int(record_id)] = descriptor
-            else:
-                self.records.assign(
-                    int(record_id), descriptor, sources=(copied,),
-                )
+            self.records.assign(
+                int(record_id), descriptor,
+                sources=(copied if copied is not None else _owner_cell(self),),
+            )
 
     def member_claims(self, value_id: int) -> tuple:
         """Every (record id, field name, storage identity, role) naming
@@ -864,7 +898,10 @@ class SSAValueUnionTable:
             ),
         )
         for union_id, descriptor in dict(unions or {}).items():
-            self.unions[int(union_id)] = descriptor
+            # A restored/copied union stands on its table's own scope row.
+            self.unions.assign(
+                int(union_id), descriptor, sources=(_owner_cell(self),),
+            )
 
     def register(
         self,
@@ -2311,12 +2348,10 @@ class SSASequenceTable:
                     (copied_from.owner, int(sequence_id)),
                 )
             )
-            if copied is None:
-                self.sequences[int(sequence_id)] = descriptor
-            else:
-                self.sequences.assign(
-                    int(sequence_id), descriptor, sources=(copied,),
-                )
+            self.sequences.assign(
+                int(sequence_id), descriptor,
+                sources=(copied if copied is not None else _owner_cell(self),),
+            )
 
     def member_claims(self, value_id: int) -> tuple:
         """Every (sequence id, role) naming ``value_id``, read from the book."""

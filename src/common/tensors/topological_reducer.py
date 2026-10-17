@@ -654,14 +654,12 @@ def node_identity_cell(graph: Any, node_id: int) -> Any:
             "built by build_from_ast nor entered lexical normalization"
         )
     data = getattr(graph, "G", graph).nodes.get(node_id) or {}
-    return book.post(
-        INGESTION_VALUE, (scopes[0], node_id),
-        NodeFact(
-            str(data.get("type") or ""), str(data.get("op") or ""),
-            str(data.get("label") or ""),
-        ),
-        stage=REDUCTION, provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
-        mode=Mode.CONCORD,
+    # A node is registered when it is made (``new_node`` / ``ensure_node``);
+    # one with no row is a creation that skipped the book, named here.
+    raise ValueError(
+        f"node {node_id} ({data.get('type')!r} {data.get('label')!r}) has no "
+        f"identity row under {scopes!r}: it was created without being "
+        "registered on the book"
     )
 
 
@@ -1799,6 +1797,23 @@ def _static_symbol_definition_cell(target: Any) -> Any:
         if isinstance(obj, types.ModuleType):
             return (str(obj.__name__), "")
         module = getattr(obj, "__module__", None)
+        if module is None:
+            # A slot/method descriptor of a builtin class (``dict.keys``),
+            # or a builtin classmethod bound to its class
+            # (``dict.fromkeys``), declares no module of its own: it is
+            # declared where its class is.
+            owner_class = getattr(obj, "__objclass__", None)
+            if owner_class is None:
+                bound_to = getattr(obj, "__self__", None)
+                if isinstance(bound_to, type):
+                    owner_class = bound_to
+                elif bound_to is not None and not isinstance(
+                    bound_to, types.ModuleType,
+                ):
+                    # A builtin method bound to an instance (``"".join``)
+                    # is declared where the instance's class is.
+                    owner_class = type(bound_to)
+            module = getattr(owner_class, "__module__", None)
         qualname = getattr(obj, "__qualname__", None) or getattr(
             obj, "__name__", None,
         )
@@ -1808,6 +1823,13 @@ def _static_symbol_definition_cell(target: Any) -> Any:
 
     receiver = ""
     function = target
+    descriptor_class = (
+        getattr(target, "__objclass__", None)
+        if isinstance(target, (
+            types.MethodDescriptorType, types.WrapperDescriptorType,
+            types.ClassMethodDescriptorType,
+        )) else None
+    )
     if inspect.ismethod(target) or (
         isinstance(target, types.BuiltinMethodType)
         and getattr(target, "__self__", None) is not None
@@ -1817,6 +1839,10 @@ def _static_symbol_definition_cell(target: Any) -> Any:
         bound_identity = declared(bound if isinstance(bound, type) else type(bound))
         receiver = "" if bound_identity is None else ".".join(bound_identity)
         function = getattr(target, "__func__", target)
+    elif descriptor_class is not None:
+        # An unbound method of a builtin class: its receiver is that class.
+        bound_identity = declared(descriptor_class)
+        receiver = "" if bound_identity is None else ".".join(bound_identity)
     identity = declared(function)
     if identity is None:
         return None
@@ -4793,7 +4819,6 @@ def _normalize_lexical_values(
         source: Any = None,
         source_cell: Any = None,
         cause: Any = _REDUCER_SYNTHESIS,
-        unsourced_reason: Any = None,
     ) -> int:
         # ``cause``: the Transform the caller names for this node's operand
         # edges (plan 100, 1.2); ``REDUCER_SYNTHESIS`` for a caller that
@@ -4865,14 +4890,20 @@ def _normalize_lexical_values(
         if not cells:
             span = _post_source_span(source)
             cells = () if span is None else (span,)
+        if not cells:
+            # Creation is registration: a node stands for an authored
+            # construct (``source``) or derives from cells (``source_cell``).
+            graph.G.remove_node(node_id)
+            raise ValueError(
+                f"new_node({node_type!r}, {label!r}): no source -- a "
+                "synthesized node names the authored construct it stands "
+                "for or the cells it derives from"
+            )
         current_identity_book().post(
             _INGESTION_VALUE, (ingestion_read_scope, int(node_id)),
             _NodeFact(str(node_type), str(node_type.lower()), str(label)),
             stage=_REDUCTION,
-            provenance=(
-                _Derived(cells) if cells
-                else _Unsourced(unsourced_reason or _SYNTHESIZED_NO_SOURCE)
-            ),
+            provenance=_Derived(cells),
             mode=_Mode.CONCORD,
         )
         # The operand edges after the node's row exists: each Append
@@ -5649,7 +5680,6 @@ def _normalize_lexical_values(
             reference.path,
             attributes=attributes,
             source_cell=definition_cell,
-            unsourced_reason=STATIC_SYMBOL_UNDECLARED,
         )
         if definition_cell is not None:
             static_reference_definition_cells[int(node_id)] = definition_cell
@@ -5682,7 +5712,6 @@ def _normalize_lexical_values(
                 "reference_kind": "function_subgraph",
             },
             source_cell=definition_cell,
-            unsourced_reason=_HELPER_CALLER_UNROUTED,
         )
         if definition_cell is not None:
             static_reference_definition_cells[int(node_id)] = definition_cell
@@ -6919,6 +6948,7 @@ def _normalize_lexical_values(
                     else materialized_attribute_nodes.get(expression_id)
                 )
                 if attribute_id is None:
+                    # The read IS the authored ``Attribute`` expression.
                     attribute_id = new_node(
                         "GetAttr",
                         f"getattr[{expression.attr}]",
@@ -6926,6 +6956,7 @@ def _normalize_lexical_values(
                             "attribute": expression.attr,
                             "source_type": "Attribute",
                         },
+                        source=expression,
                     )
                     materialized_attribute_nodes[expression_id] = attribute_id
                 # A field read immediately from an authored record
@@ -11274,6 +11305,7 @@ def _normalize_lexical_values(
                     "DelAttr",
                     f"delattr[{target.attr}]",
                     attributes={"attribute": target.attr},
+                    source=target,
                 )
             node_data = graph.G.nodes[node_id]
             node_data["type"] = "DelAttr"
@@ -11299,7 +11331,7 @@ def _normalize_lexical_values(
                 )
             node_id = id(target)
             if node_id not in graph.G:
-                node_id = new_node("DelItem", "delitem")
+                node_id = new_node("DelItem", "delitem", source=target)
             node_data = graph.G.nodes[node_id]
             node_data["type"] = "DelItem"
             node_data["op"] = "delitem"
@@ -11499,6 +11531,8 @@ def _normalize_lexical_values(
             if current is None or node_id not in graph.G:
                 return None
             if isinstance(arena_mask, int):
+                # The ``where`` IS the authored masked augmented assignment
+                # in its functional form: it stands on that statement.
                 where_id = new_node(
                     "where",
                     "where",
@@ -11511,6 +11545,7 @@ def _normalize_lexical_values(
                         (node_id, "true"),
                         (current, "false"),
                     ),
+                    source=body_statement,
                 )
                 bind_target(body_statement.target.value, where_id)
                 return where_id
@@ -13351,6 +13386,8 @@ def _normalize_lexical_values(
         if isinstance(expression.value, ast.Name):
             receiver = environment.get(expression.value.id)
             if receiver is None:
+                # The free name is read by this receiver occurrence: the
+                # Input stands for that read.
                 receiver = input_value(
                     expression.value.id,
                     binding_kind=(
@@ -13358,6 +13395,7 @@ def _normalize_lexical_values(
                         if expression.value.id in parameter_names
                         else "local"
                     ),
+                    occurrence=expression.value,
                 )
         else:
             inner_id = id(expression.value)

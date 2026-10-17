@@ -1056,16 +1056,11 @@ def _post_derived_or_raw(
     """
 
     cells = tuple(cell for cell in (sources or ()) if isinstance(cell, Ref))
-    if cells:
-        return book.post(
-            page, row, fact, stage=stage, provenance=Derived(cells), mode=mode,
-        )
-    stored = book.page(page)
-    if mode is Mode.CONCORD:
-        stored.concord(row, fact)
-    else:
-        stored.revise(row, fact)
-    return book.latest_ref(page, row)
+    # No raw path: the post derives from ``cells`` or is refused at the
+    # caller that handed it none.
+    return book.post(
+        page, row, fact, stage=stage, provenance=Derived(cells), mode=mode,
+    )
 
 
 def _post_region_signature(

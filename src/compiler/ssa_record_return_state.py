@@ -268,20 +268,18 @@ def post_record_return_layout(function, table, record_id, layout, *, stage):
 
 def assign_record_descriptor(table, record_id, descriptor, sources, *, stage):
     """``table.records[record_id] = descriptor`` with its cause: the revision
-    is posted DERIVED from ``sources`` when the api admits it (a changed or
-    different source), else written raw as before (tagged by the latch)."""
-    from .identity_concordance import ConcordanceRefusal
+    is posted DERIVED from ``sources`` and the incumbent descriptor cell."""
+    from .concordance_declarations import RECORD_DESCRIPTOR
 
-    cells = tuple(cell for cell in sources if cell is not None)
-    if cells:
-        try:
-            table.records.assign(
-                int(record_id), descriptor, sources=cells, stage=stage,
-            )
-            return
-        except ConcordanceRefusal:
-            pass
-    table.records[int(record_id)] = descriptor
+    incumbent = table.book.latest_ref(
+        RECORD_DESCRIPTOR, (table.owner, int(record_id)),
+    )
+    cells = tuple(dict.fromkeys(
+        cell for cell in (*sources, incumbent) if cell is not None
+    ))
+    table.records.assign(
+        int(record_id), descriptor, sources=cells, stage=stage,
+    )
 
 
 def normalize_declared_scalar_record_shapes(module):

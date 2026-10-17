@@ -112,14 +112,19 @@ def test_typed_storage_retains_fork_snapshot_and_exact_registry_leaves(storage):
 def test_integer_layout_does_not_narrow_or_sort_authored_columns(storage):
     book, declared, _origin, stage, transform, transition = storage
     page = book.page(declared)
-    columns = (-9, (1 << 100) + 1, 4)
-    for column in columns:
-        page.set(("scope", -((1 << 100) + 1)), column, column)
+    row = ("scope", -((1 << 100) + 1))
+    # Three revisions of one wide-keyed row through the book: the columns
+    # are the book's (0, 1, 2), each revision derived from the cell it
+    # revises; the storage keeps the authored wide values intact.
+    values = (-9, (1 << 100) + 1, 4)
+    cell = post(book, declared, row, values[0], stage, transform)
+    for value in values[1:]:
+        cell = post(book, declared, row, value, stage, transform, (cell,), core.Mode.REVISE)
     transition()
-    assert page.history(("scope", -((1 << 100) + 1))) == tuple((value, value) for value in columns)
-    assert page.latest_column(("scope", -((1 << 100) + 1))) == 4
-    assert page.latest(("scope", -((1 << 100) + 1))) == 4
-    book.latch = core.Latch.CLOSED
+    assert page.history(row) == tuple(enumerate(values))
+    assert page.latest_column(row) == 2
+    assert page.latest(row) == 4
+    # A page is written only by the book.
     with pytest.raises(core.ConcordanceRefusal):
         page.set(("scope", 3), 0, 1)
     with pytest.raises(core.ConcordanceRefusal):

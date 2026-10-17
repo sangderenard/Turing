@@ -71,14 +71,7 @@ def make_book():
     }
     stage = registry.declare_stage("spill_test")
     root = registry.declare_transform("spill_root", 0)
-    book = IdentityBook(registry=registry)
-    # These tests exercise the spill machinery on raw and unsourced rows
-    # too (the tagged unsourced page is part of what a cold page owns), so
-    # the book is opened explicitly: the diagnostic latch state.
-    from src.compiler.identity_concordance import Latch
-
-    book.latch = Latch.OPEN
-    return book, pages, stage, root
+    return IdentityBook(registry=registry), pages, stage, root
 
 
 def test_acceptance_cell_projection_preserves_exact_predecessors_without_siblings():
@@ -105,16 +98,6 @@ def test_acceptance_cell_projection_preserves_exact_predecessors_without_sibling
     projected.post(pages[HOT], ("new", 4), "accepted", stage=stage,
         provenance=Derived((second,)), mode=Mode.CONCORD)
     assert book.page(HOT).latest(("new", 4)) is None
-
-
-def test_acceptance_cell_projection_does_not_hide_unsourced_roots():
-    from src.compiler.identity_concordance import Unsourced
-    book, pages, stage, _root = make_book()
-    reason = book.registry.declare_reason("projection_test_unsourced")
-    ref = book.post(pages[COLD], ("chosen", 0), "unproved", stage=stage,
-                    provenance=Unsourced(reason), mode=Mode.CONCORD)
-    projected = book.project_cells((ref,))
-    assert projected.unsourced_rows() == book.unsourced_rows()
 
 
 class Rows:
@@ -157,10 +140,10 @@ def populated(rounds=6):
     for i in range(rounds):
         b[i] = rows.derive(HOT, ("s", i), f"b{i}", a[i])
         c[i] = rows.derive(COLD2, ("s", i), f"c{i}", b[i], a[(i + 1) % rounds])
-    # A raw revision tags the unsourced page: a cold page's unsourced rows
-    # are part of what it owns.
-    book.page(COLD).revise(("s", 0), "a0-revised")
-    book.page(COLD).revise(("s", 0), "a0-revised-again")
+    # Revisions of one row (each derived from the cell it revises): a cold
+    # page's row history is part of what it owns.
+    revised = rows.revise(COLD, ("s", 0), "a0-revised", a[0])
+    rows.revise(COLD, ("s", 0), "a0-revised-again", revised)
     # A fact holding a Ref (a Page inside a fact must come back as the
     # registry's own object).
     rows.novel(COLD, ("ref", 0), (b[0], "points at b"))
@@ -209,8 +192,8 @@ def test_spill_drops_the_cold_page_and_the_edges_it_owns_from_ram():
               if key[0][0][0] == COLD)
         + sum(1 for key in book.pages["concordance_mint"].cells
               if key[0][0][0] == COLD)
-        + sum(1 for key in book.pages["concordance_unsourced"].cells
-              if key[0][0] == COLD)
+        + sum(1 for key in book.pages["concordance_edge"].cells
+              if key[0][0][0] == COLD)
     )
     assert owned > book.page(COLD).cell_count()      # it owns edge rows too
 
@@ -274,8 +257,8 @@ def test_reads_reload_byte_identical_facts_stamps_and_edges():
     for name in (COLD, HOT, COLD2):
         assert state1[name] == state0[name]
     for name in PARTITIONED:
-        old, new = state0.get(name), state1[name]
-        if old is None:
+        old, new = state0.get(name), state1.get(name)
+        if old is None or new is None:
             continue
         old_cells, new_cells = old[0], new[0]
         # the old rows come back in the order they had; the receipts follow
@@ -309,6 +292,9 @@ def test_private_edge_page_order_survives_posts_between_spills():
         interleaved.append((HOT, ("s", i)))
         interleaved.append((COLD2, ("s", i)))
         interleaved.append((COLD2, ("s", i)))
+    # ... then the two revisions of cold_a[0], each derived from the cell
+    # it revises, then the two new edges.
+    interleaved += [(COLD, ("s", 0)), (COLD, ("s", 0))]
     interleaved += [(HOT, ("s", 100)), (HOT, ("s", 101))]
     assert [(row[0][0], row[0][1]) for row in keys] == interleaved
     assert extra.row == ("s", 100) and later.row == ("s", 101)
@@ -329,11 +315,9 @@ def test_a_write_to_a_spilled_page_reloads_it_first():
     with pytest.raises(ValueError, match="disagreement"):
         rows.novel(COLD, ("s", 4), "different")
     book.spill_pages([COLD], trigger="explicit")
-    # a raw write reloads the page AND its unsourced rows before tagging
-    book.page(COLD).revise(("s", 1), "a1-raw")
-    assert book.page(COLD).history(("s", 1))[-1] == (1, "a1-raw")
-    tags = [r for r in book.pages["concordance_unsourced"].rows() if r[0] == COLD]
-    assert len({(r[1], r[2]) for r in tags}) == len(tags)
+    # a revision reloads the page before writing
+    rows.revise(COLD, ("s", 1), "a1-revised", rows.refs["a"][1])
+    assert book.page(COLD).history(("s", 1))[-1] == (1, "a1-revised")
     # the cell survives with its stamp and its edges
     assert book.page(COLD).cell(("s", 0), 0) == "a0"
     assert a0.key == (COLD, ("s", 0), 0)
@@ -506,7 +490,11 @@ def test_only_cold_pages_spill_and_a_read_of_a_hot_page_never_does(monkeypatch):
     assert not dict.get(book.pages, HOT).spilled
     assert set(book.spilled_pages()) == {COLD, COLD2}
     # an unclassified page is never spilled
-    book.page("unclassified").set(("x", 1), 0, "kept")
+    unclassified = book.registry.declare_page(
+        "unclassified", FIELDS, object,
+    )
+    book.post(unclassified, ("x", 1), "kept", stage=rows.stage,
+              provenance=Novel(rows.root, ()), mode=Mode.CONCORD)
     page_lifecycle.spill_cold_pages(book, "build")
     assert not dict.get(book.pages, "unclassified").spilled
 
@@ -576,7 +564,7 @@ def test_a_borrowed_page_is_read_and_let_go_without_a_receipt():
     assert len(book.pages[PAGE_SPILL_RECEIPT.name].rows()) == receipts
     # a write while it is on loan keeps the page
     with book.borrowed(COLD) as page:
-        page.set(("s", 9), 0, "written on loan")
+        rows.novel(COLD, ("s", 9), "written on loan")
     assert not dict.get(book.pages, COLD).spilled
     assert book.page(COLD).latest(("s", 9)) == "written on loan"
     assert book.page(COLD).latest(("s", 2)) == "a2"
@@ -800,10 +788,10 @@ def test_a_copy_on_read_fork_of_a_spilled_origin_reads_and_materialises():
 
     from src.common.tensors.topological_reducer import fork_read_scope
     from src.compiler.concordance_declarations import (
-        LEXICAL_READ_BINDING, READ_SCOPE_FORK, SYNTHESIZED_NO_SOURCE,
+        LEXICAL_READ_BINDING, READ_SCOPE_FORK, SCOPE_REGISTRY,
     )
     from src.compiler.identity_concordance import (
-        Unsourced, begin_identity_book, end_identity_book,
+        Derived, begin_identity_book, end_identity_book,
     )
 
     class Graph:
@@ -813,18 +801,15 @@ def test_a_copy_on_read_fork_of_a_spilled_origin_reads_and_materialises():
             self.G.graph["lexical_read_scope"] = scope
 
     book, token = begin_identity_book()
-    # This test seeds unsourced rows on purpose (the fork must carry them):
-    # the diagnostic latch state, opened explicitly.
-    from src.compiler.identity_concordance import Latch
-
-    book.latch = Latch.OPEN
     try:
         source = book.mint_scope("fn", READ_SCOPE_FORK)
+        origin = book.latest_ref(SCOPE_REGISTRY, source)
         for consumer, fact in ((1, "a"), (2, "b"), (3, "c")):
+            # The test authors these reads: each derives from the scope row.
             book.post(
                 LEXICAL_READ_BINDING, (source, consumer, "arg0", 0), fact,
                 stage=READ_SCOPE_FORK,
-                provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+                provenance=Derived((origin,)), mode=Mode.CONCORD,
             )
         graph = Graph((1, 2, 3), source)
         fork_read_scope(graph, "test", source_graph=None)
@@ -841,7 +826,11 @@ def test_a_copy_on_read_fork_of_a_spilled_origin_reads_and_materialises():
         assert list(page.scope_rows(forked)) == before
         book.spill_pages([LEXICAL_READ_BINDING.name], trigger="explicit")
         # a write under the fork materialises the row from the origin
-        page.revise(row, "b2")
+        book.post(
+            LEXICAL_READ_BINDING, row, "b2", stage=READ_SCOPE_FORK,
+            provenance=Derived((book.latest_ref(LEXICAL_READ_BINDING, row),)),
+            mode=Mode.REVISE,
+        )
         assert page.history(row)[0] == (0, "b") and page.latest(row) == "b2"
         assert book.page(LEXICAL_READ_BINDING).latest((source, 2, "arg0", 0)) == "b"
     finally:
@@ -916,9 +905,11 @@ def _apply(rows, refs, op):
         sources = [refs[pick % len(refs)] for pick in picks]
         refs.append(rows.derive(name, ("r", index), fact, *dict.fromkeys(sources)))
     elif kind == "raw":
+        # A revision of an existing row, derived from its latest cell.
         _, name, pick, fact = op
         row = refs[pick % len(refs)]
-        rows.book.page(row.page.name).revise(row.row, fact)
+        latest = rows.book.latest_ref(row.page, row.row)
+        rows.revise(row.page.name, row.row, fact, latest)
     elif kind == "latest":
         ref = refs[op[1] % len(refs)]
         return rows.book.page(ref.page.name).latest(ref.row)
@@ -1057,7 +1048,6 @@ def test_the_unsourced_detector_scans_a_spilled_book_without_reading_it_back():
     book = rows.book
     module = SimpleNamespace(metadata={"identity_book": book}, functions={})
     before = CorrelationTable()._unsourced_worklist(module)
-    assert before[0], "the raw revisions are unsourced cells"
     book.spill_pages([COLD, COLD2], trigger="explicit")
     posted = set(book.pages[PAGE_SPILL_RECEIPT.name].rows())
     after = CorrelationTable()._unsourced_worklist(module)
