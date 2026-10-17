@@ -5,6 +5,8 @@ import io
 import networkx as nx
 import pickle
 
+import pytest
+
 from src.transmogrifier.graph.memory_graph import BitTensorMemoryGraph
 from src.transmogrifier.graph.memory_graph.helpers import EdgeEntry, NodeEntry
 from src.transmogrifier.graph.memory_graph.helpers.integer_region_allocator import (

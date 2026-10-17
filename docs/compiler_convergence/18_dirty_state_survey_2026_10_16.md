@@ -144,3 +144,35 @@ Counts are working tree vs `f503ba22`: 63 modified files (+15,234/-1,364) and
    (`tests/test_ast_parent_ingestion.py` is skipped).
 5. A fresh user-owned provenance bootstrap is the next authoritative
    observation (doc 17); this tree cannot run one until it imports.
+
+## Follow-up, 19:00: import fixed; the union feature still fails its tests
+
+The user's own bootstrap run on the checkpoint died at the import break above
+(`bootstrap_compiler_concordance.py` -> `fortran_c_shell` -> ... -> `ssa.py:829`).
+Fixed by quoting the five forward references to `SSAValueUnionDescriptor`
+(`SSAValueUnionTable.__init__`, `register` parameter and return, `by_id`,
+`SSAValueUnionFrameMember`).  The whole compiler import chain and the
+bootstrap tool now import.  The new `tests/transmogrifier/test_memory_graph_integer_allocation.py`
+also used `pytest` without importing it; fixed.
+
+With imports working, the focused gate (the doc 17 modules plus the new ones)
+still fails, and every failure traces to the unfinished value-union feature, not
+to the memory-graph, unit 026/031 or retention work (those suites pass):
+
+* `ValueError: type ABI alternative requires physical storage`
+  (`concordance_declarations.py:3048`): some producer constructs a type-ABI
+  alternative with an empty `storage`.  Raised in 10 tests of
+  `test_sequence_contract_concordance.py` (it failed 10 of 37) and in
+  `test_ir_sequence_tables.py` (2).
+* `AttributeError: Can't pickle local object 'SSAValueUnionTable.__init__.<locals>.<lambda>'`
+  (`fortran_c_shell.py:36215`): `SSAValueUnionTable` passes `_BookRows` a closure,
+  so the value-union table cannot be pickled with the module metadata.  3 tests
+  of `test_native_reference_boundary.py`.
+* The lifecycle audit
+  (`test_identity_book_spill.py::test_every_declared_page_is_classified_and_the_table_is_consistent`)
+  fails again: `class_subtype`, `union_alternative_state`, `value_union_descriptor`
+  and `value_union_member` are declared but absent from `PAGE_LIFECYCLE`.
+
+Not touched: these are design decisions of the value-union feature (what an
+alternative's storage is for each producer; how the table is made picklable;
+when the new pages may be released).

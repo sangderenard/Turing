@@ -826,7 +826,7 @@ class SSAValueUnionTable:
 
     def __init__(
         self,
-        unions: Dict[int, SSAValueUnionDescriptor] | None = None,
+        unions: Dict[int, "SSAValueUnionDescriptor"] | None = None,
         *,
         owner: Any = None,
         book: Any = None,
@@ -853,11 +853,11 @@ class SSAValueUnionTable:
 
     def register(
         self,
-        descriptor: SSAValueUnionDescriptor,
+        descriptor: "SSAValueUnionDescriptor",
         *,
         sources: tuple = (),
         stage: Any = None,
-    ) -> SSAValueUnionDescriptor:
+    ) -> "SSAValueUnionDescriptor":
         existing = self.unions.get(int(descriptor.union_id))
         if existing is not None and existing != descriptor:
             raise ValueError(
@@ -874,7 +874,7 @@ class SSAValueUnionTable:
                 self.unions[int(descriptor.union_id)] = descriptor
         return descriptor
 
-    def by_id(self, union_id: int) -> SSAValueUnionDescriptor | None:
+    def by_id(self, union_id: int) -> "SSAValueUnionDescriptor | None":
         return self.unions.get(int(union_id))
 
     def member_claims(self, value_id: int) -> tuple:
@@ -910,7 +910,7 @@ class SSAValueUnionFrameMember:
 
 
 def value_union_frame_members(
-    descriptor: SSAValueUnionDescriptor,
+    descriptor: "SSAValueUnionDescriptor",
     *,
     sequence_table: "SSASequenceTable | None" = None,
     record_table: "SSARecordTable | None" = None,
