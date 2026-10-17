@@ -253,17 +253,20 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
     """Materialize exact StringTable token spellings as a keyed SSA table."""
 
     from .concordance_declarations import (
+        CELL_SET,
         CONTROL_PROGRAM_BUILD,
         SOURCE_GLYPH_SEQUENCE,
         STRING_TABLE_ENTRY,
         STRING_GLYPH_VOCABULARY,
+        STRING_GLYPH_VOCABULARY_MINT,
         SOURCE_ENUM_GLYPH_TABLE,
         SourceEnumGlyphTable,
         SourceGlyphSequence,
     )
     from .control_source import ControlSequenceMutation
-    from .identity_concordance import Derived, Mode, current_identity_book
-    from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+    from .identity_concordance import (
+        NEW, ConcordanceRefusal, Derived, Mode, Novel, current_identity_book,
+    )
     from .string_table import string_token
     from .glyph_sequence_format import quoted_string_glyph_tokens
 
@@ -310,6 +313,40 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
 
     source_scope = tuple((recipes or enum_recipes)[0][0].row[0])
 
+    def mint_vocabulary(rows, cells):
+        """Mint one vocabulary table id through the book: a NOVEL
+        ``string_glyph_vocabulary`` row on ``(source_scope, NEW)`` under
+        ``string_glyph_vocabulary_mint`` whose operand is the one cell in
+        ``cells`` (several become one ``cell_set`` row DERIVED from all of
+        them, as ``_mint_ssa_id`` does).  The id is born with its mint edge,
+        where the SSA composition audit reads it; a ``GLOBAL_MONOTONIC_IDS``
+        mint here recorded nothing and the function that declared the table
+        was refused as a dependency (``unsourced-identity``).  Returns
+        ``(vocabulary id, its cell)``."""
+        cells = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+        if len(cells) == 1:
+            operand = cells[0]
+        elif cells:
+            ordinal = book.page(CELL_SET).scope_row_count(source_scope) + 1
+            operand = book.post(
+                CELL_SET, (source_scope, ordinal),
+                tuple(cell.key for cell in cells),
+                stage=CONTROL_PROGRAM_BUILD, provenance=Derived(cells),
+                mode=Mode.CONCORD,
+            )
+        else:
+            raise ConcordanceRefusal(
+                f"string glyph vocabulary under {source_scope!r} names no "
+                "operand cell"
+            )
+        cell = book.post(
+            STRING_GLYPH_VOCABULARY, (source_scope, NEW), tuple(rows),
+            stage=CONTROL_PROGRAM_BUILD,
+            provenance=Novel(STRING_GLYPH_VOCABULARY_MINT, (operand,)),
+            mode=Mode.CONCORD,
+        )
+        return int(cell.row[1]), cell
+
     declarations = []
     initializations = []
     mutations = []
@@ -344,22 +381,14 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
                 (int(token), int(ordinal), int(glyph))
                 for ordinal, glyph in enumerate(glyphs)
             )
-        vocabulary_id = int(GLOBAL_MONOTONIC_IDS.mint())
         # The vocabulary is read from every StringTable entry this compile
         # interned and built for the glyph recipes that project a token in
-        # this mode: DERIVED from both, so a compile that interned no word
+        # this mode: minted from both, so a compile that interned no word
         # still names the recipes the (empty) vocabulary serves.
-        vocabulary_cell = book.post(
-            STRING_GLYPH_VOCABULARY,
-            (source_scope, vocabulary_id),
-            tuple(vocabulary_rows),
-            stage=CONTROL_PROGRAM_BUILD,
-            provenance=Derived(tuple(dict.fromkeys((
-                *entry_cells,
-                *(recipe_cell for recipe_cell, _component in mode_recipes),
-            )))),
-            mode=Mode.CONCORD,
-        )
+        vocabulary_id, vocabulary_cell = mint_vocabulary(vocabulary_rows, (
+            *entry_cells,
+            *(recipe_cell for recipe_cell, _component in mode_recipes),
+        ))
         declarations.append((vocabulary_id, "unique", 3, False))
         initializations.append((
             vocabulary_id,
@@ -433,14 +462,8 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
                 )
                 for ordinal, glyph in enumerate(glyphs)
             )
-        vocabulary_id = int(GLOBAL_MONOTONIC_IDS.mint())
-        vocabulary_cell = book.post(
-            STRING_GLYPH_VOCABULARY,
-            (source_scope, vocabulary_id),
-            tuple(vocabulary_rows),
-            stage=CONTROL_PROGRAM_BUILD,
-            provenance=Derived((enum_cell,)),
-            mode=Mode.CONCORD,
+        vocabulary_id, vocabulary_cell = mint_vocabulary(
+            vocabulary_rows, (enum_cell,),
         )
         declarations.append((vocabulary_id, "unique", 3, False))
         initializations.append((
