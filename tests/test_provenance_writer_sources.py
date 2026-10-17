@@ -174,3 +174,69 @@ def test_frame_and_planning_pages_have_no_raw_page_writers():
     assert not re.search(r"value_concordance\.bind_alias\(", precompile)
     # An argument binding with no named cell still stands on its call.
     assert "_frame_call_cells(caller_graph, planned_call.callsite_id)" in shell
+
+
+def test_reducer_and_region_pages_have_no_raw_page_writers():
+    """The reducer's concordance rows (precision boundaries, packs and
+    operators, numeric components and intrinsics, operator dispatch and
+    specialization, receiver constructors, type normalization, static
+    parameter identity, the return-root lexical reads) and the planner's
+    precision regions are posted through the book, DERIVED from the node,
+    span and symbol cells each fact was read from.  No ``IdentityPage.set``
+    / ``concord`` / ``revise`` call survives in the reducer, and a page
+    named by its string there is only ever read."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src"
+    reducer = (
+        root / "common" / "tensors" / "topological_reducer.py"
+    ).read_text(encoding="utf-8")
+    raw = [
+        reducer.count("\n", 0, match.start()) + 1
+        for match in re.finditer(r"\w*page\.(set|concord|revise)\(", reducer)
+    ]
+    assert raw == [], raw
+    written_by_name = [
+        reducer.count("\n", 0, match.start()) + 1
+        for match in re.finditer(
+            r'\.page\(\s*"[^"]+"\s*\)\s*\.(set|concord|revise)\(', reducer,
+        )
+    ]
+    assert written_by_name == [], written_by_name
+    planner = (
+        root / "compiler" / "glsl_deployment_strategy.py"
+    ).read_text(encoding="utf-8")
+    assert not re.search(r"region_page\.(set|concord|revise)\(", planner)
+    assert 'page("source_precision_region_concordance")' not in planner
+
+
+def test_reducer_pages_are_declared_and_classified():
+    """Each page the reducer posts is a ``declare_page`` object with the
+    ``(numeric scope, value id)`` row shape its readers index by, and has a
+    spill lifecycle like its ``source_value_class`` sibling."""
+    from src.compiler import concordance_declarations as declared
+    from src.compiler.identity_concordance import REGISTRY, RowFieldKind
+    from src.compiler.page_lifecycle import PAGE_LIFECYCLE
+
+    numeric_pages = (
+        declared.SOURCE_PRECISION_BOUNDARY, declared.SOURCE_PRECISION_PACK,
+        declared.SOURCE_PRECISION_OPERATOR, declared.SOURCE_PRECISION_REGION,
+        declared.SOURCE_NUMERIC_COMPONENT, declared.SOURCE_NUMERIC_INTRINSIC,
+        declared.SOURCE_NUMERIC_OPERATOR_SPECIALIZATION,
+        declared.SOURCE_RECEIVER_CONSTRUCTOR, declared.SOURCE_OPERATOR_DISPATCH,
+        declared.SOURCE_TYPE_NORMALIZATION,
+    )
+    for page in numeric_pages:
+        assert REGISTRY.pages[page.name] is page
+        assert tuple(field.kind for field in page.row_fields) == (
+            RowFieldKind.SCOPE, RowFieldKind.VALUE_ID,
+        ), page
+        assert page.fact_type is tuple, page
+        assert page.name in PAGE_LIFECYCLE, page
+    parameter = declared.SOURCE_PARAMETER_IDENTITY
+    assert REGISTRY.pages[parameter.name] is parameter
+    assert tuple(field.kind for field in parameter.row_fields) == (
+        RowFieldKind.SCOPE, RowFieldKind.NAME,
+    )
+    assert parameter.name in PAGE_LIFECYCLE
