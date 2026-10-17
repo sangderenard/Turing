@@ -28860,6 +28860,58 @@ def _class_surface_ssa_program(
                                 for candidate_id in candidate_ids:
                                     values.pop(candidate_id, None)
                                 values[result_id] = result
+                                # The leaf's result (and a vocabulary
+                                # predicate) IS the authored read's graph
+                                # id, adopted as this function's value:
+                                # ADOPTED_GRAPH_ID DERIVED from the id's
+                                # ``canonical_value`` cell and the cells of
+                                # the column and row handle it is read
+                                # through, as the builder's ``_value_cell``
+                                # adopts a graph id.  A value that already
+                                # has a row keeps it.
+                                from .concordance_declarations import (
+                                    SSA_VALUE, SSAValueFact, SSAValueOrigin,
+                                )
+                                for adopted in (
+                                    result,
+                                    *(values[predicate_id]
+                                      for predicate_id in predicate_ids),
+                                ):
+                                    if _frame_value_cell(
+                                        function, int(adopted.id),
+                                    ) is not None:
+                                        continue
+                                    _frame_post(
+                                        SSA_VALUE,
+                                        (
+                                            _frame_book_scope(function),
+                                            int(adopted.id),
+                                        ),
+                                        SSAValueFact(
+                                            adopted.dtype,
+                                            tuple(adopted.shape or ()),
+                                            SSAValueOrigin.ADOPTED_GRAPH_ID,
+                                        ),
+                                        stage=RECORD_ABI_MATERIALIZATION,
+                                        cells=(
+                                            _frame_graph_cell(
+                                                graph, int(adopted.id),
+                                            ),
+                                            _frame_value_cell(
+                                                function, int(column.id),
+                                            ),
+                                            _frame_value_cell(
+                                                function, int(row_handle_id),
+                                            ),
+                                            *(
+                                                ()
+                                                if adopted is result
+                                                else (_frame_value_cell(
+                                                    function, int(result.id),
+                                                ),)
+                                            ),
+                                        ),
+                                    )
                                 if row_leaf_pointer is not None:
                                     values[int(row_leaf_pointer.id)] = (
                                         row_leaf_pointer
