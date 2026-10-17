@@ -155,17 +155,20 @@ def return_site_span(expression):
 def return_site_cells(metadata):
     """``span -> return-site cell`` for one graph's metadata mapping.
 
-    Read from the reducer's return-site views (their cell -> span join);
-    a site whose construct node still carries ``return_site_cell`` is
-    found on the node too.  Empty when neither survives (the receipts were
-    copied into plain dicts), in which case no site identity is claimed.
+    Read from the reducer's own join, ``return_site_spans`` (cell -> span,
+    recorded on the graph so it crosses the worker boundary, where the
+    views below become the plain span-keyed dicts they present), else from
+    the return-site views' join; a site whose construct node still carries
+    ``return_site_cell`` is found on the node too.  Empty when none
+    survives, in which case no site identity is claimed.
     """
     from .identity_concordance import Ref
 
     found = {}
+    joins = [(metadata or {}).get("return_site_spans")]
     for key in ("return_slot_values", "return_record_field_states"):
-        view = (metadata or {}).get(key)
-        spans = getattr(view, "_spans", None)
+        joins.append(getattr((metadata or {}).get(key), "_spans", None))
+    for spans in joins:
         if not isinstance(spans, dict):
             continue
         for cell, span in spans.items():

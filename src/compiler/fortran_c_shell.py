@@ -25737,11 +25737,28 @@ def _class_surface_ssa_program(
                     ) else None
                 )
                 if opcode is not None and len(operands) >= 2:
+                    from .concordance_declarations import (
+                        CONTROL_EXPRESSION, STRUCTURAL_RECOVERY,
+                    )
                     current = values[operands[0]]
                     for operand_id in operands[1:]:
                         is_last = operand_id == operands[-1]
+                        # The last combination IS the authored BoolOp's graph
+                        # id (adopted when the insertions are posted); an
+                        # intermediate combination of a longer chain is a
+                        # value of this pass, minted through the book from
+                        # the two cells it combines.
                         combined = SSAValue(
-                            output_id if is_last else max(values) + 1,
+                            output_id if is_last else _frame_mint(
+                                function, CONTROL_EXPRESSION,
+                                (
+                                    _frame_value_cell(function, int(current.id)),
+                                    _frame_value_cell(
+                                        function, int(values[operand_id].id),
+                                    ),
+                                ),
+                                dtype="bool", stage=STRUCTURAL_RECOVERY,
+                            ),
                             dtype="bool",
                         )
                         insertions.append(Instr(
@@ -26157,6 +26174,61 @@ def _class_surface_ssa_program(
 
             book = current_identity_book()
             scope = function_scope_of(function)
+            # Every value this pass defined is an ``ssa_value`` row before
+            # any later reader (the Ret publication, the composed-SSA link)
+            # asks for its producer.  Observed on ``LiveScopeProjection.
+            # reaches`` (census 2026-10-17, unit 29): ``return not
+            # self.restricts or node in self.held`` is structural, the
+            # control builder lowered no region for it, and
+            # ``ensure_structural_value`` rebuilt the LNot (graph id 7) and
+            # the LOr (graph id 10) here as bare SSAValues; the unit that
+            # linked the product refused it ("lost its value producers:
+            # [6, 7, 10]").  The rule is ``_post_planned_region_identities``':
+            # a recovered value whose id is a graph id is ADOPTED_GRAPH_ID
+            # DERIVED from that id's node cell and its operands' ``ssa_value``
+            # cells; an id carrying the MINTED flag is a mint of this pass
+            # that posted no record and the row says MINTED, DERIVED from its
+            # operands (else the function root); any other id names this
+            # writer.  A value that already has a row keeps it.
+            from .concordance_declarations import (
+                SSA_VALUE, STRUCTURAL_RECOVERY, SSAValueFact, SSAValueOrigin,
+            )
+            from .id_space import MINTED, has_flag
+            from .precompile_to_ssa import _function_root_cell
+            for recovered in insertions:
+                if recovered.res is None or getattr(recovered.res, "id", None) is None:
+                    continue
+                value_id = int(recovered.res.id)
+                if _frame_value_cell(function, value_id) is not None:
+                    continue
+                graph_cell = _frame_graph_cell(graph, value_id)
+                operand_cells = _frame_cells(*(
+                    _frame_value_cell(function, int(argument.id))
+                    for argument in recovered.args
+                    if getattr(argument, "id", None) is not None
+                ))
+                if graph_cell is not None:
+                    origin = SSAValueOrigin.ADOPTED_GRAPH_ID
+                    cells = _frame_cells(graph_cell, *operand_cells)
+                elif has_flag(value_id, MINTED):
+                    origin = SSAValueOrigin.MINTED
+                    cells = operand_cells or (_function_root_cell(book, scope),)
+                else:
+                    raise ConcordanceRefusal(
+                        "recovered structural value is neither a graph id "
+                        "nor a minted id: "
+                        f"function={function.name!r}, value={value_id}, "
+                        f"op={recovered.op!r}"
+                    )
+                book.post(
+                    SSA_VALUE, (scope, value_id),
+                    SSAValueFact(
+                        recovered.res.dtype,
+                        tuple(recovered.res.shape or ()), origin,
+                    ),
+                    stage=STRUCTURAL_RECOVERY, provenance=Derived(cells),
+                    mode=Mode.CONCORD,
+                )
             for recovered in insertions:
                 if (
                     recovered.res is None
@@ -30227,6 +30299,33 @@ def _class_surface_ssa_program(
                         )
                         function.args.append(value)
                         values[value_id] = value
+                        # A field the control builder never read is first
+                        # seen here (observed: ``self.restricts`` in
+                        # ``LiveScopeProjection.reaches``, graph id 6, read
+                        # only by the structural return expression; the
+                        # formal had no ``ssa_value`` row and the composing
+                        # unit refused the product).  The formal IS the
+                        # authored GetAttr's graph id: ADOPTED_GRAPH_ID
+                        # DERIVED from that node's cell and the declared
+                        # record's demand cell, as the builder's
+                        # ``_value_cell`` adopts a graph id.
+                        if _frame_value_cell(function, int(value_id)) is None:
+                            from .concordance_declarations import (
+                                SSA_VALUE, SSAValueFact, SSAValueOrigin,
+                            )
+                            _frame_post(
+                                SSA_VALUE,
+                                (_frame_book_scope(function), int(value_id)),
+                                SSAValueFact(
+                                    value.dtype, tuple(value.shape or ()),
+                                    SSAValueOrigin.ADOPTED_GRAPH_ID,
+                                ),
+                                stage=RECORD_ABI_MATERIALIZATION,
+                                cells=(
+                                    _frame_graph_cell(graph, int(value_id)),
+                                    GLOBAL_MONOTONIC_IDS.declaration,
+                                ),
+                            )
                     else:
                         if dtype is not None:
                             # The explicit program ABI is authoritative over

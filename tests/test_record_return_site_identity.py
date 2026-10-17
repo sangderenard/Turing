@@ -281,3 +281,74 @@ def test_each_live_return_field_has_a_sourced_exact_selection(lowered):
         ), selection
         selected_by = book.latest_ref(RECORD_RETURN_FIELD_SELECTION, row)
         assert book.edges_into(selected_by)
+
+
+EARLY_RETURN_SOURCE = '''
+def hex_tokens(value: int) -> list[int]:
+    result: list[int] = []
+    if value == 0:
+        result.append(48)
+        return result
+    if value < 0:
+        result.append(45)
+        return result
+    result.append(49)
+    return result
+
+
+def root(value: int) -> list[int]:
+    return hex_tokens(value)
+'''
+
+
+def test_return_sites_cross_the_worker_boundary_with_their_cells(tmp_path):
+    """``prefixed_lower_hex_integer_glyph_tokens`` cut to seconds: three
+    ``return result`` sites, two of them early returns inside ``if`` arms,
+    compiled as one planned unit and linked by another (the census's SSA
+    composition).  The worker receives the reducer's receipts as plain
+    span-keyed dicts and the ``Name`` occurrence nodes that carried
+    ``return_site_cell`` are gone, so the site identity must be the graph's
+    own ``return_site_spans`` record and the site rows must be in the scoped
+    input's book: every early-return edge then names its own site and the
+    linking unit's audit (``_return_site_edge_findings``) accepts the
+    product instead of refusing it with ``return-site-edge-disagreement``."""
+    from src.compiler import project_compilation_product as product
+    from src.compiler.concordance_declarations import RETURN_SITE_SLOT
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.identity_concordance import Ref
+
+    contract = ExtractionContract(
+        "extraction_contracts/program_extraction.yaml",
+    ).with_program_abi({
+        "values": [{"function": name, "parameter": "value", "storage": "scalar",
+                    "dtype": "int64", "rank": 0, "shape": [],
+                    "python_type": "builtins.int"}
+                   for name in ("hex_tokens", "root")],
+        "records": {}, "bindings": [],
+    })
+    planned = product.compile_partitioned_source(
+        EARLY_RETURN_SOURCE, tmp_path / "growth", extraction_contract=contract,
+        ssa_composition=True, plan_only=True, max_unit_source_nodes=64,
+    )
+    manifest = product.compile_resolved_process_graph_plan(
+        planned["resolved_process_graph"], planned["process_graph_unit_plan"],
+        tmp_path / "growth/product", jobs=1,
+        worker_resident_reservation_bytes=256 << 20,
+    )
+    units = {unit["qualified_names"][0]: unit for unit in manifest["units"]}
+    assert units["hex_tokens"]["status"] == "compiled-unverified", units["hex_tokens"]
+    assert "return-site-edge-disagreement" not in str(units["root"].get("error", ""))
+    module, _outputs, _exports = product._load_pickle_artifact(
+        tmp_path / "growth/product/units"
+        / f'unit_{units["hex_tokens"]["unit_index"]:03d}' / units["hex_tokens"]["artifact"]
+    )
+    assert CorrelationTable.build(module).findings(module) == []
+    function = module.functions["hex_tokens__hex_tokens"]
+    edges = [block.instrs[-1].attributes for block in function.blocks.values()
+             if block.instrs and "return_source_value_ids" in (block.instrs[-1].attributes or {})]
+    assert len(edges) == 2
+    sites = [edge.get("return_site_cell") for edge in edges]
+    assert all(isinstance(site, Ref) for site in sites) and len(set(sites)) == 2
+    scope = tuple(function.metadata["record_return_state_scope"])
+    rows = module.metadata["identity_book"].pages[RETURN_SITE_SLOT.name].scope_rows(scope)
+    assert {row[1] for row in rows} >= set(sites)

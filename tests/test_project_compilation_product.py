@@ -3263,3 +3263,133 @@ def test_finished_ssa_artifact_releases_unpickleable_frontend_graphs():
         "function_address_identity": "package.leaf",
     }
     pickle.dumps(module)
+
+
+def test_source_acceptance_projects_return_site_rows_of_the_read_scope():
+    """The reducer's return-site rows are keyed by the site's node cell and
+    are successors of the graph's cells, so the predecessor projection never
+    carried them: a worker then held no record to stamp its return edges
+    against and the composed-SSA audit refused every early return of a
+    record-returning function (``return-site-edge-disagreement``, observed
+    on ``prefixed_lower_hex_integer_glyph_tokens``).  They are rooted like
+    the lexical binding rows."""
+    import networkx as nx
+
+    from src.compiler.concordance_declarations import (
+        INGESTION,
+        INGESTION_VALUE,
+        INGEST_SOURCE,
+        REDUCER_RETURN,
+        RETURN_SITE_CONTAINER,
+        RETURN_SITE_SLOT,
+        ContainerKind,
+        NodeFact,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        IdentityBook,
+        Mode,
+        Novel,
+    )
+
+    scope = ("lexical_reads:compiler_probe.returner", 0)
+    ingestion_scope = ("ingestion:returner", 0)
+    book = IdentityBook()
+    site = book.post(
+        INGESTION_VALUE, (ingestion_scope, 7),
+        NodeFact("Name", "result", "value"), stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+    )
+    value = book.post(
+        INGESTION_VALUE, (ingestion_scope, 1),
+        NodeFact("List", "result", "value"), stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+    )
+    slot = book.post(
+        RETURN_SITE_SLOT, (scope, site, 0), value, stage=REDUCER_RETURN,
+        provenance=Derived((value, site)), mode=Mode.CONCORD,
+    )
+    container = book.post(
+        RETURN_SITE_CONTAINER, (scope, site), ContainerKind.VALUE,
+        stage=REDUCER_RETURN, provenance=Derived((site,)), mode=Mode.CONCORD,
+    )
+    body_graph = nx.DiGraph()
+    body_graph.graph.update({
+        "lexical_read_scope": scope,
+        "function_name": "returner",
+        "return_site_spans": {site: (4, 11, 4, 17)},
+        "return_slot_values": {(4, 11, 4, 17): (1,)},
+    })
+    body_graph.add_node(1, type="List", value_id=1, source_cell=value)
+    body = SimpleNamespace(G=body_graph)
+    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(
+        graph=body,
+        qualified_name="compiler_probe.returner",
+    ))
+    graph = SimpleNamespace(function_table=table, G=SimpleNamespace(graph={}))
+
+    projected = project_process_graph_acceptance(graph, (0,), book=book)
+
+    assert projected.page(RETURN_SITE_SLOT.name).latest((scope, site, 0)) == value
+    assert projected.page(RETURN_SITE_CONTAINER.name).latest((scope, site)) == ContainerKind.VALUE
+    assert projected.stamp_of(slot) == book.stamp_of(slot)
+    assert projected.stamp_of(container) == book.stamp_of(container)
+    assert projected.stamp_of(site) == book.stamp_of(site)
+
+
+STRUCTURAL_RETURN_SOURCE = '''
+def excludes(value: int) -> bool:
+    return value < 0
+
+
+def reaches(value: int) -> bool:
+    if excludes(value):
+        return False
+    return not value > 7 or value == 9
+'''
+
+
+def test_recovered_structural_values_are_ssa_value_rows_of_their_function():
+    """``LiveScopeProjection.reaches`` cut to seconds: the fall-through
+    ``return not ... or ...`` is structural, the control builder lowers no
+    region for it, and ``recover_structural_source_outputs`` rebuilds the
+    LNot / Eq / LOr chain from the graph.  Every value that pass defines is
+    an ``ssa_value`` row of the function (ADOPTED_GRAPH_ID from its node
+    cell), which is what the composing unit checks before it links the
+    product ("lost its value producers: [6, 7, 10]" on census 2026-10-17
+    unit 30)."""
+    from src.compiler.concordance_declarations import (
+        SSA_VALUE, SSAValueOrigin,
+    )
+    from src.compiler.ssa_record_return_state import function_scope_of
+
+    contract = ExtractionContract(
+        "extraction_contracts/program_extraction.yaml",
+    ).with_program_abi({
+        "values": [{"function": name, "parameter": "value", "storage": "scalar",
+                    "dtype": "int64", "rank": 0, "shape": [],
+                    "python_type": "builtins.int"}
+                   for name in ("excludes", "reaches")],
+        "records": {}, "bindings": [],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        STRUCTURAL_RETURN_SOURCE, extraction_contract=contract,
+        progress=lambda message: None,
+    )
+    function = module.functions["whole_source__reaches"]
+    recovered = tuple(function.metadata.get("recovered_structural_outputs") or ())
+    assert recovered, "the fall-through return expression was not recovered structurally"
+    book = module.metadata["identity_book"]
+    scope = function_scope_of(function)
+    page = book.pages[SSA_VALUE.name]
+    missing = [
+        int(value.id) for value in (
+            *function.args,
+            *(instruction.res for block in function.blocks.values()
+              for instruction in block.instrs if instruction.res is not None),
+        )
+        if book.latest_ref(SSA_VALUE, (scope, int(value.id))) is None
+    ]
+    assert missing == []
+    for value_id in recovered:
+        assert page.latest((scope, int(value_id))).origin is SSAValueOrigin.ADOPTED_GRAPH_ID
