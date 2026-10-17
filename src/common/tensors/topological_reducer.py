@@ -1088,8 +1088,12 @@ def specialize_python_precision_widths(graph: Any) -> bool:
 
     def call_return_identity(
         attributes: Mapping[str, Any], expression: ast.Call,
-    ) -> tuple[str | None, int | None, dict[str, Any] | None]:
-        """Read the authored return class and exact specialized limbs."""
+    ) -> tuple[str | None, int | None, dict[str, Any] | None, tuple]:
+        """Read the authored return class and exact specialized limbs.
+
+        The fourth element is the callee return value's
+        ``source_value_class`` cell when the class was read from it.
+        """
 
         class_identity = attributes.get(
             "result_class_ref", attributes.get("class_ref")
@@ -1099,6 +1103,7 @@ def specialize_python_precision_widths(graph: Any) -> bool:
         )
         callee = None
         return_tensor = None
+        callee_class_cells: tuple = ()
         if reference is not None and function_table is not None:
             try:
                 callee = function_table.entry(int(reference)).graph
@@ -1119,6 +1124,12 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                 )
                 if candidate is not None:
                     class_identity = candidate
+                    callee_class_cells = _source_cells((
+                        current_identity_book().latest_ref(
+                            _SOURCE_VALUE_CLASS,
+                            (_source_numeric_scope(callee.G), int(value_id)),
+                        ),
+                    ))
                     descriptor = callee.G.nodes[value_id].get("tensor")
                     if isinstance(descriptor, Mapping):
                         return_tensor = copy.deepcopy(dict(descriptor))
@@ -1150,6 +1161,7 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             None if class_identity is None else str(class_identity),
             width,
             return_tensor,
+            callee_class_cells,
         )
 
     changed = False
@@ -1165,8 +1177,8 @@ def specialize_python_precision_widths(graph: Any) -> bool:
         attributes = data.setdefault("attributes", {})
         if not isinstance(expression, ast.Call):
             continue
-        class_identity, call_width, return_tensor = call_return_identity(
-            attributes, expression
+        class_identity, call_width, return_tensor, callee_class_cells = (
+            call_return_identity(attributes, expression)
         )
         if not is_precision(class_identity):
             continue
@@ -1196,10 +1208,24 @@ def specialize_python_precision_widths(graph: Any) -> bool:
         attributes["result_class_ref"] = str(class_identity)
         if return_tensor is not None:
             publish_tensor(int(node_id), return_tensor)
+        # DERIVED from the call and its operands (the width is read off the
+        # authored arguments), the call's own class cell when source
+        # reduction already named it, and the callee return value's class
+        # cell when the class was read from the callee.
         _concord_source_value_class(
             scope, int(node_id), str(class_identity),
             precision_limbs=int(width),
             source="callsite-specialized Precision result",
+            provenance=_Derived(_source_cells((
+                *_node_identity_cells(target_wrapper, node_id, *(
+                    int(parent) for parent, _role in data.get("parents", ())
+                    if int(parent) in target
+                )),
+                current_identity_book().latest_ref(
+                    _SOURCE_VALUE_CLASS, (scope, int(node_id)),
+                ),
+                *callee_class_cells,
+            ))),
         )
         value_id = next((
             int(parent) for parent, role in data.get("parents", ())
@@ -1418,10 +1444,21 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                 publish_tensor(
                     int(node_id), precision_flow_tensors[int(node_id)]
                 )
+            # DERIVED from the value, the producers whose width flowed into
+            # it, and the value's own class cell the class was read from.
             _concord_source_value_class(
                 scope, int(node_id), str(class_identity),
                 precision_limbs=int(width),
                 source="callsite-specialized Precision producer flow",
+                provenance=_Derived(_source_cells((
+                    *_node_identity_cells(target_wrapper, node_id, *(
+                        int(parent) for parent, _role in data.get("parents", ())
+                        if int(parent) in precision_flow_widths
+                    )),
+                    current_identity_book().latest_ref(
+                        _SOURCE_VALUE_CLASS, (scope, int(node_id)),
+                    ),
+                ))),
             )
             changed = True
 
@@ -1499,10 +1536,23 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                 precision_flow_tensors[int(node_id)] = copy.deepcopy(
                     result_tensor
                 )
+            # DERIVED from the operator, its operands and the operands'
+            # class cells the Precision width was read from.
             _concord_source_value_class(
                 scope, int(node_id), class_identity,
                 precision_limbs=int(width),
                 source="callsite-specialized Precision operator",
+                provenance=_Derived(_source_cells((
+                    *_node_identity_cells(
+                        target_wrapper, node_id, *operand_ids,
+                    ),
+                    *(
+                        current_identity_book().latest_ref(
+                            _SOURCE_VALUE_CLASS, (scope, int(value_id)),
+                        )
+                        for value_id in operand_ids
+                    ),
+                ))),
             )
             precision_flow_widths[int(node_id)] = int(width)
             row = (scope, int(node_id))
@@ -7618,12 +7668,23 @@ def _normalize_lexical_values(
                             ),
                             "result_class_ref": projected_numeric.type_name,
                         })
+                        # DERIVED from the projection, its receiver and
+                        # the receiver's class cell the fact was read from.
                         _concord_source_value_class(
                             value_class_scope,
                             int(attribute_id),
                             projected_numeric.type_name,
                             precision_limbs=projected_numeric.limbs,
                             source="numeric-component-projection",
+                            provenance=_Derived(_source_cells((
+                                *_node_identity_cells(
+                                    graph, attribute_id, receiver,
+                                ),
+                                current_identity_book().latest_ref(
+                                    _SOURCE_VALUE_CLASS,
+                                    (value_class_scope, int(receiver)),
+                                ),
+                            ))),
                         )
                     _concord_numeric_feature_projection(
                         value_class_scope,
@@ -18398,10 +18459,28 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 (int(other_id), "arg:0"),
                 (int(operation_id), "arg:1"),
             ))
+            # DERIVED from the call, its three operands, and the class cells
+            # of the receiver, the argument and the two formals whose
+            # concorded descriptors decided the specialization.
             _concord_source_value_class(
                 scope, int(node_id), self_descriptor.type_name,
                 precision_limbs=self_descriptor.limbs,
                 source="concorded same-type numeric operator specialization",
+                provenance=_Derived(_source_cells((
+                    *_node_identity_cells(
+                        target_wrapper, node_id, receiver_id, other_id,
+                        operation_id,
+                    ),
+                    *(
+                        current_identity_book().latest_ref(
+                            _SOURCE_VALUE_CLASS, (scope, int(value_id)),
+                        )
+                        for value_id in (
+                            receiver_id, other_id,
+                            inputs["self"], inputs["other"],
+                        )
+                    ),
+                ))),
             )
             changed = True
         return changed
@@ -18495,10 +18574,18 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 for parent, role in data.get("parents", ())
                 if str(role) != "callee"
             ))
+            # The same cells as the constructor row: the call, its receiver
+            # and the receiver's class cell the class was read from.
             _concord_source_value_class(
                 scope, int(node_id), class_identity,
                 precision_limbs=limbs,
                 source="concorded receiver constructor",
+                provenance=_Derived(_source_cells((
+                    *_node_identity_cells(target_wrapper, node_id, receiver_id),
+                    current_identity_book().latest_ref(
+                        _SOURCE_VALUE_CLASS, (scope, int(receiver_id)),
+                    ),
+                ))),
             )
             changed = True
         return changed
@@ -18628,10 +18715,22 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         "numeric_feature_descriptor": descriptor.receipt(),
                         "result_class_ref": descriptor.type_name,
                     })
+                    # DERIVED from the projection, the intrinsic call and
+                    # the index it selects, and the intrinsic row the
+                    # component results were read from.
                     _concord_source_value_class(
                         scope, int(node_id), descriptor.type_name,
                         precision_limbs=descriptor.limbs,
                         source="numeric-intrinsic-result-projection",
+                        provenance=_Derived(_source_cells((
+                            *_node_identity_cells(
+                                target_wrapper, node_id, base_id, index_id,
+                            ),
+                            current_identity_book().latest_ref(
+                                _SOURCE_NUMERIC_INTRINSIC,
+                                (scope, int(base_id)),
+                            ),
+                        ))),
                     )
                 _concord_numeric_feature_projection(
                     scope, int(node_id), int(base_id), f"result[{index}]",
@@ -18703,10 +18802,20 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         "numeric_feature_descriptor": projected.receipt(),
                         "result_class_ref": projected.type_name,
                     })
+                    # DERIVED from the projection, its receiver and the
+                    # receiver's class cell the descriptor was read from.
                     _concord_source_value_class(
                         scope, int(node_id), projected.type_name,
                         precision_limbs=projected.limbs,
                         source="post-call numeric-component-projection",
+                        provenance=_Derived(_source_cells((
+                            *_node_identity_cells(
+                                target_wrapper, node_id, receiver_id,
+                            ),
+                            current_identity_book().latest_ref(
+                                _SOURCE_VALUE_CLASS, (scope, int(receiver_id)),
+                            ),
+                        ))),
                     )
                 _concord_numeric_feature_projection(
                     scope, int(node_id), int(receiver_id), str(attribute),
@@ -18859,6 +18968,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 attributes.pop("numeric_composite_pending", None)
                 if returned_class is not None:
                     attributes["result_class_ref"] = str(returned_class)
+                    # DERIVED from the operator and its operands, the
+                    # operands' class cells the dispatch and the width were
+                    # read from, the operator's own class cell when the
+                    # returned class is its concorded descriptor, and the
+                    # dispatched method's address cell when the class was
+                    # read from that method's authored definition.
+                    dispatch_book = current_identity_book()
+                    method_entry = next((
+                        entry for entry in function_table
+                        if int(entry.reference.address) == method_reference
+                    ), None)
                     _concord_source_value_class(
                         scope,
                         int(node_id),
@@ -18869,6 +18989,27 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             if other_id is not None else 1,
                         ),
                         source=f"operator method {method_name}",
+                        provenance=_Derived(_source_cells((
+                            *_node_identity_cells(
+                                target_wrapper, node_id, receiver_id,
+                                *(() if other_id is None else (other_id,)),
+                            ),
+                            *(
+                                dispatch_book.latest_ref(
+                                    _SOURCE_VALUE_CLASS, (scope, int(value_id)),
+                                )
+                                for value_id in (receiver_id, other_id, node_id)
+                                if value_id is not None
+                            ),
+                            *(
+                                () if method_entry is None else (
+                                    dispatch_book.latest_ref(
+                                        _FUNCTION_ADDRESS,
+                                        (function_address_identity(method_entry),),
+                                    ),
+                                )
+                            ),
+                        ))),
                     )
                 data["type"] = "Call"
                 data["op"] = "call"

@@ -1746,6 +1746,25 @@ NUMERAL_LEAF_MATERIALIZATION = declare_page("numeral_leaf_materialization_concor
 NUMERAL_RETURN_LEAVES = declare_page("numeral_return_leaves_concordance", (
     RowField("symbol", K.SCOPE), RowField("argument", K.VALUE_ID),
 ), tuple)                              # CONCORD
+#: ``_class_surface_ssa_program``: the limb width of one leaf of a composite
+#: numeral, read from the numeral's ``source_numeric_record_abi`` receipt --
+#: a declared parameter's leaf, ``(symbol, parameter name, leaf path)``, at
+#: record ABI materialization, or a returned numeral's leaf the caller leases
+#: storage for, ``(caller symbol, callsite, callee value)``, at frame
+#: binding -- CONCORD, DERIVED(the leaf value's cell and the record ABI
+#: cells the width was read from).
+NUMERAL_LEAF_WIDTH = declare_page("numeral_leaf_width_concordance", (
+    RowField("symbol", K.SCOPE), RowField("owner", K.LABEL),
+    RowField("leaf", K.LABEL),
+), int)                                # CONCORD
+#: ``_class_surface_ssa_program``'s record access survey: every leaf path of
+#: a composite numeral parameter's declared layout, all of which the frame
+#: must carry, ``(symbol, parameter)`` -> sorted leaf paths, CONCORD,
+#: DERIVED(the record's PARAMETER_RECORD demand cell and the
+#: ``source_numeric_record_abi`` cells of the layout and each nested layout).
+RECORD_FIELD_DEMAND = declare_page("record_field_demand_concordance", (
+    RowField("symbol", K.SCOPE), RowField("parameter", K.NAME),
+), tuple)                              # CONCORD
 #: ``_publish_concorded_output_identities``: alias value -> result value;
 #: REVISE, DERIVED(the alias's and the result's ``ssa_value`` cells).
 OUTPUT_IDENTITY = declare_page("output_identity_concordance", (
@@ -3740,6 +3759,29 @@ SOURCE_NUMERIC_METHOD_DEPENDENCY = declare_page(
 SOURCE_NUMERIC_PARAMETER_ABI = declare_page(
     "source_numeric_parameter_abi_concordance", (
         RowField("function", K.NAME), RowField("parameter", K.NAME),
+    ), tuple,
+)
+#: ``_lower_ast_source_to_ssa_impl.numeric_record_schema``: the physical
+#: record a composite numeric type is materialized as, ``(type name, limbs)``
+#: -> ``(schema name, receipt)``, CONCORD, DERIVED(the
+#: ``static_symbol_definition`` cell of the numeric type whose features
+#: shape it and, for a complex layer, the nested coefficient record's own
+#: row cell).
+SOURCE_NUMERIC_RECORD_ABI = declare_page(
+    "source_numeric_record_abi_concordance", (
+        RowField("type_name", K.NAME), RowField("limbs", K.INDEX),
+    ), tuple,
+)
+#: ``_lower_ast_source_to_ssa_impl.numeric_parameter_record_views``: a
+#: formal Input whose propagated composite numeric descriptor selects a
+#: physical record, ``(numeric scope, parameter, input)`` -> ``(schema name,
+#: type name, limbs)``, CONCORD, DERIVED(the Input's node identity cell, its
+#: ``source_value_class`` cell the descriptor was concorded on, and the
+#: record's ``source_numeric_record_abi`` cell).
+SOURCE_NUMERIC_PARAMETER_RECORD_VIEW = declare_page(
+    "source_numeric_parameter_record_view_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("parameter", K.NAME),
+        RowField("value_id", K.VALUE_ID),
     ), tuple,
 )
 #: ``_class_surface_ssa_program``: which authored target each evaluate-once

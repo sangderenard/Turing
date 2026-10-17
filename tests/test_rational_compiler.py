@@ -284,6 +284,7 @@ def test_precision_width_is_concorded_per_exact_specialization():
         FUNCTION_ADDRESS,
         SOURCE_VALUE_CLASS,
     )
+    from src.transmogrifier.function_table import function_address_identity
 
     _book, token = begin_identity_book()
     try:
@@ -309,7 +310,7 @@ def evaluate(parts, limbs):
             "source_value_class_concordance"
         )
         class_source = current_identity_book().latest_ref(
-            FUNCTION_ADDRESS, (str(entry.qualified_name),),
+            FUNCTION_ADDRESS, (function_address_identity(entry),),
         )
         assert class_source is not None
         function.G.graph["planner_parameter_classes"] = {

@@ -17811,6 +17811,77 @@ def _retire_dead_planning_aliases(
 _LITERAL_ABSENT = object()
 
 
+def _numeric_record_abi_cells(identity: Any) -> tuple:
+    """The ``source_numeric_record_abi`` cells a numeral layout was read
+    from: every row whose type name is ``identity`` (a record identity such
+    as ``RationalPrecision`` names one row per width) or whose fact's schema
+    name is ``identity`` (``RationalPrecision__limbs_2`` names one row)."""
+
+    from .concordance_declarations import SOURCE_NUMERIC_RECORD_ABI
+    from .identity_concordance import current_identity_book
+
+    if identity is None:
+        return ()
+    book = current_identity_book()
+    page = book.pages.get(SOURCE_NUMERIC_RECORD_ABI.name)
+    if page is None:
+        return ()
+    identity = str(identity)
+    return tuple(dict.fromkeys(
+        cell
+        for row in page.rows()
+        if isinstance(row, tuple) and len(row) == 2
+        for fact in (page.latest(row),)
+        if row[0] == identity or (
+            isinstance(fact, tuple) and fact and fact[0] == identity
+        )
+        for cell in (book.latest_ref(SOURCE_NUMERIC_RECORD_ABI, row),)
+        if cell is not None
+    ))
+
+
+def _schema_declaration_cells(
+    schema_identity: Any, schema_name: Any = None,
+) -> tuple:
+    """The cells a record schema's layout was declared by: its
+    PARAMETER_RECORD ``contract_demand`` cell (a record the extraction
+    contract or a retained source class demanded) and, for a composite
+    numeral materialized from an authored annotation -- which no contract
+    demands -- its ``source_numeric_record_abi`` cells: the row its schema
+    name names, else the rows of its type identity."""
+
+    from .concordance_declarations import CONTRACT_DEMAND_PAGE, DemandKind
+    from .identity_concordance import current_identity_book
+
+    demand = current_identity_book().latest_ref(
+        CONTRACT_DEMAND_PAGE,
+        (DemandKind.PARAMETER_RECORD, str(schema_identity)),
+    )
+    abi = (
+        () if schema_name is None else _numeric_record_abi_cells(schema_name)
+    )
+    if not abi:
+        abi = _numeric_record_abi_cells(schema_identity)
+    return _frame_cells(demand, *abi)
+
+
+def _post_numeral_leaf_width(
+    row: tuple, width: int, *, stage: Any, cells: Any,
+) -> int:
+    """Post ``numeral_leaf_width`` row ``row`` = ``width`` CONCORD, DERIVED
+    from ``cells``, and return the width (a different recorded width is the
+    disagreement ``concord`` always raised)."""
+
+    from .concordance_declarations import NUMERAL_LEAF_WIDTH
+    from .identity_concordance import Mode
+
+    _frame_post(
+        NUMERAL_LEAF_WIDTH, tuple(row), int(width), stage=stage,
+        mode=Mode.CONCORD, cells=tuple(cells),
+    )
+    return int(width)
+
+
 def _class_surface_ssa_program(
     compilation: Any,
     artifact_name: str,
@@ -17863,6 +17934,7 @@ def _class_surface_ssa_program(
             RECORD_ABI_MATERIALIZATION, RECORD_DESCRIPTOR, RECORD_FIELD_RESIDENT,
             SEQUENCE_DESCRIPTOR,
         ROW_LEAF_VIEW,
+        RECORD_FIELD_DEMAND,
         RECORD_FORWARDING, RECORD_MEMBER, RECORD_PARAMETER_ROW_HANDLE,
         RECORD_PARAMETER_VALUE, RECORD_STORAGE_ALIAS, REPLACEMENT_SLOT,
         RESIDENCY_FROM_NAME_MATCH, RESIDENT_CHOSEN_BY_ORDER,
@@ -26933,6 +27005,7 @@ def _class_surface_ssa_program(
                 # nested materialization reads these paths exactly as the
                 # top level reads field names.
                 leaf_paths: list[str] = []
+                walked_schemas: list[str] = []
                 pending = [("", dict(record))]
                 while pending:
                     prefix, layout = pending.pop()
@@ -26942,13 +27015,28 @@ def _class_surface_ssa_program(
                         path = f"{prefix}{field_name}"
                         leaf_paths.append(path)
                         if str(field.get("storage") or "") == "record":
+                            walked_schemas.append(str(field.get("record")))
                             pending.append((
                                 f"{path}.",
                                 dict(abi_records[str(field.get("record"))]),
                             ))
-                demanded_leaf_paths = current_identity_book().page(
-                    "record_field_demand_concordance"
-                ).concord(key, tuple(sorted(leaf_paths)))
+                demanded_leaf_paths = tuple(sorted(leaf_paths))
+                # The leaf set is the numeral's declared layout: DERIVED
+                # from the record's demand cell and the numeric record ABI
+                # cells of the layout and of every nested layout walked.
+                _frame_post(
+                    RECORD_FIELD_DEMAND, key, demanded_leaf_paths,
+                    stage=RECORD_FORWARDING, mode=Mode.CONCORD,
+                    cells=(
+                        record_declaration_cell,
+                        *_numeric_record_abi_cells(record_identity),
+                        *(
+                            cell
+                            for schema_name in walked_schemas
+                            for cell in _numeric_record_abi_cells(schema_name)
+                        ),
+                    ),
+                )
                 for field_path in demanded_leaf_paths:
                     note_record_field_access(
                         key, record, str(field_path), "layout",
@@ -28146,13 +28234,14 @@ def _class_surface_ssa_program(
                           ("row_stride", "int64", "scalar", 0, False, ())))
             context_values = []
             context_fields = []
-            declaration = current_identity_book().latest_ref(
-                CONTRACT_DEMAND_PAGE, (DemandKind.PARAMETER_RECORD, schema_identity))
+            declaration = _schema_declaration_cells(
+                schema_identity
+            )
             for member_name, member_dtype, storage, rank, writable, vocabulary in specs:
                 path = f"{field_path}.{member_name}"
                 value = SSAValue(
                     _frame_mint(function, NESTED_RECORD_PART,
-                        _frame_cells(declaration, _frame_graph_cell(graph, record_id)),
+                        _frame_cells(*declaration, _frame_graph_cell(graph, record_id)),
                         dtype=member_dtype, stage=RECORD_ABI_MATERIALIZATION),
                     dtype=member_dtype,
                     accounting={
@@ -28247,19 +28336,13 @@ def _class_surface_ssa_program(
                         (str(symbol), str(parameter_name), nested_path),
                         "required_unread_leaf",
                         stage=RECORD_ABI_MATERIALIZATION, mode=Mode.CONCORD,
-                        cells=_frame_cells(current_identity_book().latest_ref(
-                            CONTRACT_DEMAND_PAGE,
-                            (DemandKind.PARAMETER_RECORD, schema_identity),
-                        )),
+                        cells=_frame_cells(*_schema_declaration_cells(schema_identity, schema_name)),
                     )
                     # A leaf no read names but the layout requires:
                     # NOVEL(NESTED_RECORD_PART, the schema's declaration cell).
                     candidates = (_frame_mint(
                         function, NESTED_RECORD_PART,
-                        (current_identity_book().latest_ref(
-                            CONTRACT_DEMAND_PAGE,
-                            (DemandKind.PARAMETER_RECORD, schema_identity),
-                        ),),
+                        (*_schema_declaration_cells(schema_identity, schema_name),),
                         stage=RECORD_ABI_MATERIALIZATION,
                     ),)
                 nested_storage = str(nested_field.get("storage") or "")
@@ -28638,8 +28721,7 @@ def _class_surface_ssa_program(
                                         cells=_frame_cells(
                                             _frame_graph_cell(graph, int(source_id)),
                                             _frame_graph_cell(graph, int(sequence_id)),
-                                            current_identity_book().latest_ref(CONTRACT_DEMAND_PAGE,
-                                                (DemandKind.PARAMETER_RECORD, schema_identity)),
+                                            *_schema_declaration_cells(schema_identity, schema_name),
                                         ),
                                     )
                                     sequence_table.sequences.remove(int(source_id),
@@ -28659,8 +28741,7 @@ def _class_surface_ssa_program(
                                     int(source_id), bound_view,
                                     sources=_frame_cells(
                                         _frame_graph_cell(graph, int(source_id)),
-                                        current_identity_book().latest_ref(CONTRACT_DEMAND_PAGE,
-                                            (DemandKind.PARAMETER_RECORD, schema_identity)),
+                                        *_schema_declaration_cells(schema_identity, schema_name),
                                         _frame_value_cell(function, int(row_handle_id)),
                                     ), stage=RECORD_ABI_MATERIALIZATION,
                                 )
@@ -29079,17 +29160,21 @@ def _class_surface_ssa_program(
                         "program_abi_field_written": False,
                         "program_abi_token_vocabulary": token_vocabulary,
                         # A declared Precision leaf is that many limbs.
+                        # DERIVED from the schema's demand cell, the record
+                        # ABI cells the leaf's width was read from, and the
+                        # leaf value's own cell.
                         **(
-                            {"precision_limbs": int(
-                                current_identity_book().page(
-                                    "numeral_leaf_width_concordance"
-                                ).concord(
-                                    (
-                                        str(symbol), str(parameter_name),
-                                        str(nested_path),
-                                    ),
-                                    int(nested_field["precision_limbs"]),
-                                )
+                            {"precision_limbs": _post_numeral_leaf_width(
+                                (
+                                    str(symbol), str(parameter_name),
+                                    str(nested_path),
+                                ),
+                                int(nested_field["precision_limbs"]),
+                                stage=RECORD_ABI_MATERIALIZATION,
+                                cells=(
+                                    *_schema_declaration_cells(schema_identity, schema_name),
+                                    _frame_value_cell(function, int(value_id)),
+                                ),
                             )}
                             if nested_field.get("precision_limbs") else {}
                         ),
@@ -29287,10 +29372,7 @@ def _class_surface_ssa_program(
                     _frame_mint(
                         function, DECLARED_ROW_COLUMN,
                         (
-                            current_identity_book().latest_ref(
-                                CONTRACT_DEMAND_PAGE,
-                                (DemandKind.PARAMETER_RECORD, schema_identity),
-                            ),
+                            *_schema_declaration_cells(schema_identity),
                             leaf_declaration_cell,
                         ),
                         dtype=leaf_dtype, shape=column_shape,
@@ -29341,10 +29423,7 @@ def _class_surface_ssa_program(
                     f"declared_row_leaf_deferred:{leaf_storage}",
                     stage=RECORD_ABI_MATERIALIZATION, mode=Mode.CONCORD,
                     cells=_frame_cells(
-                        current_identity_book().latest_ref(
-                            CONTRACT_DEMAND_PAGE,
-                            (DemandKind.PARAMETER_RECORD, schema_identity),
-                        ),
+                        *_schema_declaration_cells(schema_identity),
                         leaf_declaration_cell,
                     ),
                 )
@@ -34759,9 +34838,28 @@ def _class_surface_ssa_program(
                 ):
                     returned.append(argument)
                     continue
-                leaves = tuple(current_identity_book().page(
-                    "numeral_return_leaves_concordance"
-                ).concord((str(symbol), int(argument.id)), tuple(leaves)))
+                from .concordance_declarations import (
+                    NUMERAL_RETURN_LEAVES, RECORD_RETURN_LAYOUT_STAGE,
+                )
+                from .ssa_record_return_state import record_descriptor_cell
+
+                leaves = tuple(leaves)
+                # The leaves are the record's declared order: DERIVED from
+                # the record's descriptor cell, the numeric record ABI cells
+                # naming its type, and each leaf value's cell.
+                _frame_post(
+                    NUMERAL_RETURN_LEAVES, (str(symbol), int(argument.id)),
+                    leaves, stage=RECORD_RETURN_LAYOUT_STAGE,
+                    mode=Mode.CONCORD,
+                    cells=(
+                        record_descriptor_cell(table, int(argument.id)),
+                        *_numeric_record_abi_cells(str(record.identity)),
+                        *(
+                            _frame_value_cell(function, int(leaf))
+                            for leaf in leaves
+                        ),
+                    ),
+                )
                 layouts[int(argument.id)] = leaves
                 returned.extend(defined[int(leaf)] for leaf in leaves)
             terminator.args = returned
@@ -35161,16 +35259,28 @@ def _class_surface_ssa_program(
                     if len(widths) == 1 and next(iter(widths)) > 1:
                         value.accounting = {
                             **dict(value.accounting or {}),
-                            "precision_limbs": int(current_identity_book().page(
-                                "numeral_leaf_width_concordance"
-                            ).concord(
+                            # DERIVED from the lease's cells (the callee
+                            # value and its record member), the leased
+                            # value's own cell and the record ABI cells the
+                            # width was read from.
+                            "precision_limbs": _post_numeral_leaf_width(
                                 (
                                     str(caller_symbol),
                                     int(planned_call.callsite_id),
                                     int(old_id),
                                 ),
                                 next(iter(widths)),
-                            )),
+                                stage=FRAME_BINDING,
+                                cells=(
+                                    *lease_cells,
+                                    _frame_value_cell(
+                                        all_functions[caller_symbol], new_id,
+                                    ),
+                                    *_numeric_record_abi_cells(
+                                        record_identity,
+                                    ),
+                                ),
+                            ),
                         }
                 if invocation_local:
                     publish_invocation_storage(all_functions[caller_symbol], value)
@@ -49968,9 +50078,16 @@ def _lower_ast_source_to_ssa_impl(
             "identity": str(descriptor.type_name),
             "fields": fields,
         }
-        page = current_identity_book().page(
-            "source_numeric_record_abi_concordance"
+        from ..common.tensors.topological_reducer import (
+            _static_symbol_definition_cell,
         )
+        from .concordance_declarations import (
+            INGESTION, SOURCE_NUMERIC_RECORD_ABI,
+        )
+        from .identity_concordance import Derived, Mode, current_identity_book
+
+        book = current_identity_book()
+        page = book.page(SOURCE_NUMERIC_RECORD_ABI)
         row = (str(descriptor.type_name), int(descriptor.limbs))
         fact = (schema_name, copy.deepcopy(receipt))
         incumbent = page.latest(row)
@@ -49979,8 +50096,30 @@ def _lower_ast_source_to_ssa_impl(
                 "numeric record ABI concordance disagreement for "
                 f"{row!r}: recorded={incumbent!r}, proposed={fact!r}"
             )
-        if incumbent is None:
-            page.set(row, 0, fact)
+        # The record is the numeric type's own feature structure, read from
+        # the numeric feature type registry: DERIVED from the type's
+        # ``static_symbol_definition`` cell (a declaration ingested by
+        # reference) and, for a complex layer, from the nested coefficient
+        # record's row this one points at.  A same-fact re-post is CONCORD.
+        book.post(
+            SOURCE_NUMERIC_RECORD_ABI, row, fact, stage=INGESTION,
+            provenance=Derived(tuple(dict.fromkeys(
+                cell for cell in (
+                    _static_symbol_definition_cell(
+                        numeric_registry[descriptor.type_name],
+                    ),
+                    *(
+                        () if "complex" not in features or nested is None
+                        else (book.latest_ref(
+                            SOURCE_NUMERIC_RECORD_ABI,
+                            (str(child.type_name), int(child.limbs)),
+                        ),)
+                    ),
+                )
+                if cell is not None
+            ))),
+            mode=Mode.CONCORD,
+        )
         inferred_record_schemas[schema_name] = receipt
         return schema_name, receipt
 
@@ -50471,11 +50610,18 @@ def _lower_ast_source_to_ssa_impl(
         """Read propagated composite identities from exact formal Inputs."""
 
         selected: dict[str, dict[str, Any]] = {}
-        from ..common.tensors.topological_reducer import _source_numeric_scope
-        scope = _source_numeric_scope(function_graph)
-        page = current_identity_book().page(
-            "source_numeric_parameter_record_view_concordance"
+        from ..common.tensors.topological_reducer import (
+            _source_numeric_scope, node_identity_cell,
         )
+        from .concordance_declarations import (
+            SOURCE_NUMERIC_PARAMETER_RECORD_VIEW, SOURCE_NUMERIC_RECORD_ABI,
+            SOURCE_VALUE_CLASS, REDUCTION,
+        )
+        from .identity_concordance import Derived, Mode, current_identity_book
+
+        scope = _source_numeric_scope(function_graph)
+        book = current_identity_book()
+        page = book.page(SOURCE_NUMERIC_PARAMETER_RECORD_VIEW)
         for node_id, data in function_graph.nodes(data=True):
             attributes = dict(data.get("attributes") or {})
             parameter = attributes.get("binding_name")
@@ -50514,8 +50660,27 @@ def _lower_ast_source_to_ssa_impl(
                     "numeric parameter record-view concordance disagreement "
                     f"for {row!r}: recorded={incumbent!r}, proposed={fact!r}"
                 )
-            if incumbent is None:
-                page.set(row, 0, fact)
+            # The descriptor is the formal's propagated numeric class:
+            # DERIVED from the Input's node cell, the ``source_value_class``
+            # cell the reducer concorded it on, and the record ABI row the
+            # schema was materialized under.  A same-fact re-post is CONCORD.
+            book.post(
+                SOURCE_NUMERIC_PARAMETER_RECORD_VIEW, row, fact,
+                stage=REDUCTION,
+                provenance=Derived(tuple(dict.fromkeys(
+                    cell for cell in (
+                        node_identity_cell(function_graph, int(node_id)),
+                        book.latest_ref(
+                            SOURCE_VALUE_CLASS, (scope, int(node_id)),
+                        ),
+                        book.latest_ref(
+                            SOURCE_NUMERIC_RECORD_ABI, (type_name, limbs),
+                        ),
+                    )
+                    if cell is not None
+                ))),
+                mode=Mode.CONCORD,
+            )
             selected[str(parameter)] = copy.deepcopy(schema)
         return selected
 
