@@ -3162,21 +3162,22 @@ def _set_operands(
                 )
         for target, fact in arriving.items():
             if page.latest((scope, node_id, *target)) != fact:
-                if isinstance(fact, _Unresolved) or not isinstance(fact, str):
-                    page.revise((scope, node_id, *target), fact)
-                    continue
-                # The follow-up names the transition that caused it: the
-                # arriving fact derives from the position's transition cell
-                # (the move's source position, or the fork's target).
+                # The arriving fact derives from the position's transition
+                # cell (the move's source position, or the fork's target),
+                # whatever the fact's type (a str binding or an Unresolved
+                # carried along); a position nothing moved into has no
+                # arrival to record.
                 cause_cell = (
                     transitions[arrived_from[target]]
                     if target in arrived_from else transitions.get(target)
                 )
                 if cause_cell is None:
-                    page.revise((scope, node_id, *target), fact)
-                    continue
+                    raise ValueError(
+                        f"{name}: operand position {(scope, node_id, *target)!r} "
+                        "receives a fact with no transition into it"
+                    )
                 book.post(
-                    LEXICAL_READ_BINDING, (scope, node_id, *target), fact,
+                    book.registry.page(name), (scope, node_id, *target), fact,
                     stage=OPERAND_POSITION,
                     provenance=_Derived((cause_cell,)),
                     mode=_Mode.REVISE,
@@ -3191,6 +3192,7 @@ def _set_operands(
         page = book.page(name)
         if not positions_moved:
             continue
+        declared = book.registry.page(name)
         for _role, _ordinal, parent in old:
             row = (scope, node_id, parent)
             positions = page.latest(row)
@@ -3202,10 +3204,29 @@ def _set_operands(
             )
             moved = tuple(position for position in moved if position is not None)
             target_row = (scope, node_id, renamed.get(parent, parent))
+            # The operand's position set derives from the transitions of
+            # the positions that moved (or were retired) and from the row
+            # it revises.
+            position_cells = tuple(dict.fromkeys(
+                cell for cell in (
+                    *(transitions.get(tuple(position)) for position in positions),
+                    book.latest_ref(declared, row),
+                )
+                if cell is not None
+            ))
             if target_row != row:
-                page.revise(row, ())
+                book.post(
+                    declared, row, (), stage=OPERAND_POSITION,
+                    provenance=_Derived(position_cells), mode=_Mode.REVISE,
+                )
             if page.latest(target_row) != moved:
-                page.revise(target_row, moved)
+                book.post(
+                    declared, target_row, moved, stage=OPERAND_POSITION,
+                    provenance=_Derived(tuple(dict.fromkeys((
+                        *position_cells, book.latest_ref(declared, row),
+                    )))),
+                    mode=_Mode.REVISE,
+                )
 
 
 def _post_copy_on_read_fork(

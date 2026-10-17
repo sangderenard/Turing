@@ -27,7 +27,7 @@
 # -----------------------------------------------------------------------------
 # Imports
 # -----------------------------------------------------------------------------
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional, Dict, Callable, Union
 from enum import Enum
 from collections.abc import Mapping
@@ -2562,10 +2562,31 @@ class SSACallRecord:
     unresolved_frame_value_ids: tuple[int, ...] = ()
     resolution: str = "unresolved"
     decomposition: str | None = None
+    #: The ``call_record`` cell this record was read from (attached by the
+    #: table on every read; not part of the record's identity).  A decision
+    #: about this call derives from it.
+    cell: Any = __import__("dataclasses").field(
+        default=None, compare=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.resolution not in {"unresolved", "native_call", "decomposed"}:
             raise ValueError(f"unknown SSA call resolution {self.resolution!r}")
+
+
+def _records_with_cell(page: Any, row: Any) -> tuple:
+    """A caller's records as stored, each carrying the row's cell."""
+
+    records = tuple(page.latest(row) or ())
+    book = page.book
+    cell = (
+        None if book is None
+        else book.latest_ref(book.registry.page(page.name), row)
+    )
+    return tuple(
+        record if record.cell == cell else replace(record, cell=cell)
+        for record in records
+    )
 
 
 class _BookCallList(__import__("collections.abc").abc.MutableSequence):
@@ -2577,7 +2598,7 @@ class _BookCallList(__import__("collections.abc").abc.MutableSequence):
         self._row = row
 
     def _records(self) -> tuple:
-        return tuple(self._page.latest(self._row) or ())
+        return _records_with_cell(self._page, self._row)
 
     def _commit(
         self, records: Any, *, sources: tuple = (), stage: Any = None,
@@ -2700,9 +2721,12 @@ class SSACallTable(__import__("collections.abc").abc.MutableMapping):
                     (source_table.owner, str(caller)),
                 )
             )
+            # A copy stands on the row it copies; records handed in as
+            # plain data (a restored artifact) stand on this table's own
+            # scope row.
             self.assign(
                 caller, caller_records,
-                sources=(() if source is None else (source,)),
+                sources=((_owner_cell(self),) if source is None else (source,)),
             )
 
     def __getitem__(self, caller: Any) -> Any:
@@ -2710,7 +2734,10 @@ class SSACallTable(__import__("collections.abc").abc.MutableMapping):
         records = self._page.latest(row)
         if records is None:
             raise KeyError(caller)
-        return _BookCallList(self._page, row) if self.mutable else records
+        return (
+            _BookCallList(self._page, row) if self.mutable
+            else _records_with_cell(self._page, row)
+        )
 
     def assign(
         self, caller: Any, records: Any, *,
@@ -2732,13 +2759,11 @@ class SSACallTable(__import__("collections.abc").abc.MutableMapping):
             owner_cell = self.book.latest_ref(SCOPE_REGISTRY, self.owner)
             if owner_cell is not None:
                 sources = (owner_cell,)
-        if sources:
-            return _table_post(
-                self.book, self._page.name, row, records,
-                sources=tuple(sources), stage=stage,
-            )
-        self._page.revise(row, records)
-        return None
+        # No raw path: the revision derives from ``sources`` or is refused.
+        return _table_post(
+            self.book, self._page.name, row, records,
+            sources=tuple(sources), stage=stage,
+        )
 
     def remove(
         self, caller: Any, *, sources: tuple = (), stage: Any = None,
@@ -2747,18 +2772,35 @@ class SSACallTable(__import__("collections.abc").abc.MutableMapping):
         superseded its records."""
 
         row = (self.owner, str(caller))
-        if self._page.latest(row) is None:
+        incumbent = self.book.latest_ref(
+            self.book.registry.page(self._page.name), row,
+        )
+        if incumbent is None:
             raise KeyError(caller)
-        if sources:
-            return _table_post(
-                self.book, self._page.name, row, None,
-                sources=tuple(sources), stage=stage,
-            )
-        self._page.revise(row, None)
-        return None
+        # The withdrawal derives from what superseded the records, else from
+        # the records withdrawn.
+        return _table_post(
+            self.book, self._page.name, row, None,
+            sources=tuple(sources) or (incumbent,), stage=stage,
+        )
 
     def __setitem__(self, caller: Any, records: Any) -> None:
-        self.assign(caller, records)
+        # The mapping syntax is a revision of the caller's row, derived from
+        # its incumbent cell; a caller with no row yet is registered with
+        # ``assign(sources=...)``.
+        row = (self.owner, str(caller))
+        incumbent = self.book.latest_ref(
+            self.book.registry.page(self._page.name), row,
+        )
+        if incumbent is None and tuple(records):
+            raise ValueError(
+                f"call_record row {row!r}: no incumbent to revise; register "
+                "the caller's records with the cells they were built from "
+                "(assign sources=)"
+            )
+        self.assign(
+            caller, records, sources=() if incumbent is None else (incumbent,),
+        )
 
     def __delitem__(self, caller: Any) -> None:
         self.remove(caller)

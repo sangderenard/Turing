@@ -2866,7 +2866,11 @@ def _linked_caller_member(
     sequence_members: set[int] = set()
     # The cells this decision reads, so the ``linked_caller_member`` row
     # derives from them: the callee formal's membership cells first.
+    # The decision reads the call record (its bindings) and the callee
+    # formal's membership cells; the record's own cell is the cause a
+    # formal of an accepted component (rows on its owner book) stands on.
     source_cells: list = list(_frame_cells(
+        getattr(record, "cell", None),
         _frame_table_cell(callee_records, callee_id, RECORD_MEMBER),
         _frame_table_cell(callee_sequences, callee_id, SEQUENCE_MEMBER),
         callee_cell,
