@@ -4102,6 +4102,356 @@ def _relabel_field_state_pages(book: Any, read_scope: Any, mapping: Any) -> None
             )
 
 
+def _mint_settled_node(
+    graph: Any,
+    node_type: str,
+    label: str,
+    *,
+    attributes: dict[str, Any] | None = None,
+    parents: tuple[tuple[int, str], ...] = (),
+    source_cell: Any = None,
+    cause: Any = _REDUCER_SYNTHESIS,
+) -> int:
+    """Mint one reducer node in a function graph that has already been
+    canonically relabelled (``new_node`` of ``_normalize_lexical_values`` is
+    that pass's own minter).
+
+    The node's identity row is posted by ``post_derived_node_identity`` in
+    the scope ``node_identity_cell`` reads (the relabelled graph's
+    ``operand_position_scope``), DERIVED from ``source_cell``; its operands
+    are written by the one operand writer.  No source cells: refused, as
+    ``new_node`` refuses -- creation is registration.
+    """
+
+    from ...compiler.process_graph_value_ids import next_process_value_id
+
+    cells = (
+        (source_cell,) if isinstance(source_cell, _Ref)
+        else tuple(dict.fromkeys(
+            cell for cell in (source_cell or ()) if isinstance(cell, _Ref)
+        ))
+    )
+    if not cells:
+        raise ValueError(
+            f"_mint_settled_node({node_type!r}, {label!r}): no source -- a "
+            "synthesized node derives from the cells it stands on"
+        )
+    node_id = next_process_value_id(graph)
+    graph.G.add_node(
+        node_id,
+        label=label,
+        type=node_type,
+        op=node_type.lower(),
+        expr_obj=None,
+        extra_args={},
+        domain_node=None,
+        store_id=None,
+        parents=[],
+        children=[],
+        attributes=dict(attributes or {}),
+    )
+    cell = post_derived_node_identity(
+        graph, int(node_id), cells, stage=_REDUCTION,
+    )
+    if cell is None:
+        graph.G.remove_node(node_id)
+        raise ValueError(
+            f"_mint_settled_node({node_type!r}, {label!r}): the graph has "
+            "no identity scope to register the node in"
+        )
+    _set_operands(graph, node_id, list(parents), cause=cause)
+    return int(node_id)
+
+
+def _link_integer_glyph_formatter_calls(
+    graph: Any,
+    function_table: Any,
+    *,
+    row: tuple,
+    glyph_cell: Any,
+    components: Any,
+    value_class_scope: Any,
+    format_spec_scopes: tuple,
+    new_node: Any,
+) -> list:
+    """Give each formatted scalar component of one glyph recipe whose operand
+    is a concorded ``int`` its authored formatter call, and REVISE the recipe
+    row to name it.
+
+    A formatted scalar is an ordinary call to the authored decimal (or
+    ``#x`` hex) formatter.  Its graph identity derives from the exact glyph
+    recipe cell, the value-class cell the ``int`` was read from and the
+    format-spec recipe cell; the callee address is the exact FunctionTable
+    entry declared from that helper's source span.  ``callee_ref`` is only
+    the graph read view of that pair.
+
+    Formatter selection is a read of the value-class concordance.
+    Parameter / local / call / literal graph shapes are deliberately
+    irrelevant: their respective producers must all carry the same class
+    fact to this value before formatting can occur.  The recipe is linked
+    when it is authored (``_normalize_lexical_values``) and again once the
+    call-edge class facts have settled (``propagate_call_formal_numeric_types``
+    publishes an unannotated formal's class from its call actuals after
+    every recipe exists), so the second read is the same read, later.
+
+    The recipe already has the only lossless native representations
+    admitted here: exact record and tuple projections, resident StringTable
+    tokens, and the authored integer formatter.  An unknown scalar ``!r``
+    has no representation fact.  It is kept unresolved; calling a host
+    interpreter would replace the missing concordance edge with a different
+    runtime and make the product Python-dependent.
+    """
+
+    from ...compiler.string_table import string_token
+
+    book = current_identity_book()
+    components = list(components)
+    if glyph_cell is None:
+        return components
+    formatter_entry = next((
+        entry
+        for entry in function_table
+        if str(entry.qualified_name) == (
+            "src.compiler.glyph_sequence_format."
+            "decimal_integer_glyph_tokens"
+        )
+    ), None)
+    prefixed_hex_formatter_entry = next((
+        entry
+        for entry in function_table
+        if str(entry.qualified_name) == (
+            "src.compiler.glyph_sequence_format."
+            "prefixed_lower_hex_integer_glyph_tokens"
+        )
+    ), None)
+    rewritten_components = list(components)
+    for ordinal, component in enumerate(components):
+        if (
+            component.kind != "formatted"
+            or component.operand_value_id is None
+            or component.formatted_sequence_value_id is not None
+        ):
+            continue
+        value_class_cell = book.latest_ref(
+            _SOURCE_VALUE_CLASS,
+            (value_class_scope, int(component.operand_value_id)),
+        )
+        value_class_fact = (
+            None if value_class_cell is None else
+            book.page(_SOURCE_VALUE_CLASS).cell(
+                value_class_cell.row,
+                value_class_cell.column,
+            )
+        )
+        value_class_identity = (
+            str(value_class_fact[0])
+            if isinstance(value_class_fact, tuple)
+            and value_class_fact else None
+        )
+        integer_value = value_class_identity in {
+            "int", "builtins.int",
+        }
+        format_spec_cell = None
+        format_tokens = None
+        if component.format_spec_value_id is not None:
+            format_spec_rows = tuple(
+                (scope, int(component.format_spec_value_id))
+                for scope in format_spec_scopes
+            )
+            format_spec_cell = next((
+                cell for candidate in format_spec_rows
+                if (cell := book.latest_ref(
+                    _SOURCE_GLYPH_SEQUENCE, candidate,
+                )) is not None
+            ), None)
+            format_spec_fact = (
+                None if format_spec_cell is None else
+                book.page(_SOURCE_GLYPH_SEQUENCE).cell(
+                    format_spec_cell.row,
+                    format_spec_cell.column,
+                )
+            )
+            if (
+                isinstance(format_spec_fact, _SourceGlyphSequence)
+                and all(
+                    item.kind == "literal"
+                    for item in format_spec_fact.components
+                )
+            ):
+                format_tokens = tuple(
+                    token
+                    for item in format_spec_fact.components
+                    for token in item.glyph_tokens
+                )
+        integer_formatter_entry = (
+            formatter_entry
+            if component.format_spec_value_id is None
+            and component.conversion in {-1, ord("r")}
+            else prefixed_hex_formatter_entry
+            if component.conversion == -1
+            and format_tokens == (
+                int(string_token("#")),
+                int(string_token("x")),
+            )
+            else None
+        )
+        integer_formatter_name = (
+            None if integer_formatter_entry is None else
+            str(integer_formatter_entry.qualified_name).rsplit(
+                ".", 1,
+            )[-1]
+        )
+        typed_integer_format = (
+            component.projection_kind == "scalar"
+            and integer_value
+            and integer_formatter_entry is not None
+        )
+        if not typed_integer_format:
+            continue
+        call_id = new_node(
+            "Call",
+            str(integer_formatter_name),
+            attributes={
+                "callee_ref": int(
+                    integer_formatter_entry.reference.address
+                ),
+                "callee_resolution": "source-glyph-formatter",
+                "producer_kind": "formatted_glyph_sequence",
+                "aggregate_kind": "list",
+                "sequence_key_columns": (),
+                "sequence_column_count": 1,
+                "sequence_writable": True,
+                "sequence_element_dtypes": ("int64",),
+                "sequence_column_dtypes": ("int64",),
+                "source_glyph_component": (row, int(ordinal)),
+            },
+            parents=((int(component.operand_value_id), "arg:0"),),
+            source_cell=tuple(dict.fromkeys(filter(None, (
+                glyph_cell,
+                value_class_cell,
+                format_spec_cell,
+            )))),
+        )
+        rewritten_components[ordinal] = _dataclass_replace(
+            component,
+            formatted_sequence_value_id=int(call_id),
+        )
+    if tuple(rewritten_components) != tuple(components):
+        revised_fact = _SourceGlyphSequence(tuple(rewritten_components))
+        call_cells = tuple(
+            node_identity_cell(
+                graph,
+                int(component.formatted_sequence_value_id),
+            )
+            for component in rewritten_components
+            if component.kind == "formatted"
+            and component.formatted_sequence_value_id is not None
+            and int(component.formatted_sequence_value_id) in graph.G
+        )
+        book.post(
+            _SOURCE_GLYPH_SEQUENCE,
+            row,
+            revised_fact,
+            stage=_REDUCTION,
+            provenance=_Derived(tuple(dict.fromkeys((
+                glyph_cell, *call_cells,
+            )))),
+            mode=_Mode.REVISE,
+        )
+    return rewritten_components
+
+
+def _relink_settled_glyph_formatters(graph: Any, function_table: Any) -> None:
+    """Link the integer formatter into every canonical glyph recipe of a
+    settled function graph whose formatted scalar operand acquired its
+    ``int`` class after the recipe was authored.
+
+    The program ``def f(x): return f"{x!r}"`` called once as ``f(a)`` with
+    ``a: int`` lowered its recipe with the formatted component unresolved
+    (``projection='scalar'``, no resident producer): the formal ``x`` has no
+    annotation, so its class row is published by the call-edge settlement
+    (``propagate_call_formal_numeric_types``: ``call actual render:0``),
+    which runs after every function's recipe was authored and linked.  The
+    rule now holding: the formatter link is the same read of the
+    value-class row, repeated once the call-edge facts have settled; the
+    recipe is REVISED from its cell and the new call's cell, and the call
+    carries its ``call_binding`` row as a recipe-time formatter call does.
+    """
+
+    from ...compiler.planner_concordance_posts import _post_call_binding
+
+    book = current_identity_book()
+    metadata = graph.G.graph
+    glyph_scope = metadata.get("source_glyph_sequence_scope")
+    if glyph_scope is None:
+        return
+    value_class_scope = _source_numeric_scope(graph)
+    for node_id, data in tuple(graph.G.nodes(data=True)):
+        attributes = data.get("attributes") or {}
+        row = attributes.get("source_glyph_sequence_row")
+        if row is None or tuple(row[0]) != tuple(glyph_scope):
+            continue
+        glyph_cell = book.latest_ref(_SOURCE_GLYPH_SEQUENCE, tuple(row))
+        if glyph_cell is None:
+            continue
+        fact = book.page(_SOURCE_GLYPH_SEQUENCE).cell(
+            glyph_cell.row, glyph_cell.column,
+        )
+        if not isinstance(fact, _SourceGlyphSequence):
+            continue
+        if not any(
+            component.kind == "formatted"
+            and component.projection_kind == "scalar"
+            and component.operand_value_id is not None
+            and component.formatted_sequence_value_id is None
+            for component in fact.components
+        ):
+            continue
+        components = _link_integer_glyph_formatter_calls(
+            graph, function_table,
+            row=tuple(row), glyph_cell=glyph_cell,
+            components=fact.components,
+            value_class_scope=value_class_scope,
+            format_spec_scopes=(tuple(glyph_scope),),
+            new_node=lambda node_type, label, *, attributes=None,
+            parents=(), source_cell=None: _mint_settled_node(
+                graph, node_type, label, attributes=attributes,
+                parents=parents, source_cell=source_cell,
+            ),
+        )
+        if tuple(components) == tuple(fact.components):
+            continue
+        for ordinal, component in enumerate(components):
+            if (
+                component.kind != "formatted"
+                or component.formatted_sequence_value_id is None
+                or fact.components[ordinal].formatted_sequence_value_id
+                is not None
+            ):
+                continue
+            call_id = int(component.formatted_sequence_value_id)
+            graph.G.nodes[call_id].setdefault("attributes", {})[
+                "source_glyph_component"
+            ] = (tuple(row), int(ordinal))
+            graph.G.nodes[int(component.component_value_id)].setdefault(
+                "attributes", {}
+            ).update({
+                "producer_kind": "formatted_glyph_sequence",
+                "aggregate_kind": "list",
+                "sequence_key_columns": (),
+                "sequence_column_count": 1,
+                "sequence_writable": True,
+                "sequence_element_dtypes": ("int64",),
+                "source_glyph_component": (tuple(row), int(ordinal)),
+            })
+            _post_call_binding(
+                graph, call_id,
+                int(graph.G.nodes[call_id]["attributes"]["callee_ref"]),
+                "callsite_shell",
+            )
+
+
+
 def _normalize_lexical_values(
     function_graph: Any,
     statement: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -10485,203 +10835,18 @@ def _normalize_lexical_values(
                         )),
                     )
                 # A formatted scalar is an ordinary call to the authored
-                # decimal formatter.  Its graph identity derives from the
-                # exact glyph recipe cell; the callee address is the exact
-                # FunctionTable entry declared from that helper's source
-                # span.  ``callee_ref`` below is only the graph read view of
-                # that pair.  The canonical relabel below publishes
+                # decimal formatter (``_link_integer_glyph_formatter_calls``:
+                # the same link is repeated once the call-edge class facts
+                # have settled).  The canonical relabel below publishes
                 # CALL_BINDING from the call cell and FUNCTION_ADDRESS before
                 # compilation-unit division.
-                formatter_entry = next((
-                    entry
-                    for entry in function_table
-                    if str(entry.qualified_name) == (
-                        "src.compiler.glyph_sequence_format."
-                        "decimal_integer_glyph_tokens"
-                    )
-                ), None)
-                prefixed_hex_formatter_entry = next((
-                    entry
-                    for entry in function_table
-                    if str(entry.qualified_name) == (
-                        "src.compiler.glyph_sequence_format."
-                        "prefixed_lower_hex_integer_glyph_tokens"
-                    )
-                ), None)
-                rewritten_components = list(components)
-                if glyph_cell is not None:
-                    for ordinal, component in enumerate(components):
-                        if (
-                            component.kind != "formatted"
-                            or component.operand_value_id is None
-                        ):
-                            continue
-                        operand_expression = graph.G.nodes[
-                            int(component.operand_value_id)
-                        ].get("expr_obj")
-                        operand_attributes = graph.G.nodes[
-                            int(component.operand_value_id)
-                        ].get("attributes") or {}
-                        # Formatter selection is a read of the value-class
-                        # concordance.  Parameter/local/call/literal graph
-                        # shapes are deliberately irrelevant here: their
-                        # respective producers must all carry the same class
-                        # fact to this value before formatting can occur.
-                        value_class_cell = book.latest_ref(
-                            _SOURCE_VALUE_CLASS,
-                            (value_class_scope, int(component.operand_value_id)),
-                        )
-                        value_class_fact = (
-                            None if value_class_cell is None else
-                            book.page(_SOURCE_VALUE_CLASS).cell(
-                                value_class_cell.row,
-                                value_class_cell.column,
-                            )
-                        )
-                        value_class_identity = (
-                            str(value_class_fact[0])
-                            if isinstance(value_class_fact, tuple)
-                            and value_class_fact else None
-                        )
-                        integer_value = value_class_identity in {
-                            "int", "builtins.int",
-                        }
-                        format_spec_cell = None
-                        format_tokens = None
-                        if component.format_spec_value_id is not None:
-                            format_spec_rows = (
-                                (
-                                    ingestion_read_scope,
-                                    int(component.format_spec_value_id),
-                                ),
-                                (
-                                    value_class_scope,
-                                    int(component.format_spec_value_id),
-                                ),
-                            )
-                            format_spec_cell = next((
-                                cell for candidate in format_spec_rows
-                                if (cell := book.latest_ref(
-                                    _SOURCE_GLYPH_SEQUENCE, candidate,
-                                )) is not None
-                            ), None)
-                            format_spec_fact = (
-                                None if format_spec_cell is None else
-                                book.page(_SOURCE_GLYPH_SEQUENCE).cell(
-                                    format_spec_cell.row,
-                                    format_spec_cell.column,
-                                )
-                            )
-                            if (
-                                isinstance(format_spec_fact, _SourceGlyphSequence)
-                                and all(
-                                    item.kind == "literal"
-                                    for item in format_spec_fact.components
-                                )
-                            ):
-                                format_tokens = tuple(
-                                    token
-                                    for item in format_spec_fact.components
-                                    for token in item.glyph_tokens
-                                )
-                        integer_formatter_entry = (
-                            formatter_entry
-                            if component.format_spec_value_id is None
-                            and component.conversion in {-1, ord("r")}
-                            else prefixed_hex_formatter_entry
-                            if component.conversion == -1
-                            and format_tokens == (
-                                int(string_token("#")),
-                                int(string_token("x")),
-                            )
-                            else None
-                        )
-                        integer_formatter_name = (
-                            None if integer_formatter_entry is None else
-                            str(integer_formatter_entry.qualified_name).rsplit(
-                                ".", 1,
-                            )[-1]
-                        )
-                        typed_integer_format = (
-                            component.projection_kind == "scalar"
-                            and integer_value
-                            and integer_formatter_entry is not None
-                        )
-                        call_id = None
-                        if typed_integer_format:
-                            call_id = new_node(
-                                "Call",
-                                str(integer_formatter_name),
-                                attributes={
-                                    "callee_ref": int(
-                                        integer_formatter_entry.reference.address
-                                    ),
-                                    "callee_resolution": (
-                                        "source-glyph-formatter"
-                                    ),
-                                    "producer_kind": (
-                                        "formatted_glyph_sequence"
-                                    ),
-                                    "aggregate_kind": "list",
-                                    "sequence_key_columns": (),
-                                    "sequence_column_count": 1,
-                                    "sequence_writable": True,
-                                    "sequence_element_dtypes": ("int64",),
-                                    "sequence_column_dtypes": ("int64",),
-                                    "source_glyph_component": (
-                                        row, int(ordinal),
-                                    ),
-                                },
-                                parents=((
-                                    int(component.operand_value_id), "arg:0",
-                                ),),
-                                source_cell=tuple(dict.fromkeys(filter(None, (
-                                    glyph_cell,
-                                    value_class_cell,
-                                    format_spec_cell,
-                                )))),
-                            )
-                        if call_id is None:
-                            # The recipe already has the only lossless native
-                            # representations admitted here: exact record and
-                            # tuple projections, resident StringTable tokens,
-                            # and the authored integer formatter.  An unknown
-                            # scalar ``!r`` has no representation fact.  Keep
-                            # it unresolved; calling a host interpreter would
-                            # replace the missing concordance edge with a
-                            # different runtime and make the product Python-
-                            # dependent.
-                            continue
-                        rewritten_components[ordinal] = _dataclass_replace(
-                            component,
-                            formatted_sequence_value_id=int(call_id),
-                        )
-                    if tuple(rewritten_components) != tuple(components):
-                        revised_fact = _SourceGlyphSequence(tuple(
-                            rewritten_components
-                        ))
-                        call_cells = tuple(
-                            node_identity_cell(
-                                graph,
-                                int(component.formatted_sequence_value_id),
-                            )
-                            for component in rewritten_components
-                            if component.kind == "formatted"
-                            and component.formatted_sequence_value_id is not None
-                            and int(component.formatted_sequence_value_id)
-                            in graph.G
-                        )
-                        book.post(
-                            _SOURCE_GLYPH_SEQUENCE,
-                            row,
-                            revised_fact,
-                            stage=_REDUCTION,
-                            provenance=_Derived(tuple(dict.fromkeys((
-                                glyph_cell, *call_cells,
-                            )))),
-                            mode=_Mode.REVISE,
-                        )
-                        components = rewritten_components
+                components = _link_integer_glyph_formatter_calls(
+                    graph, function_table,
+                    row=row, glyph_cell=glyph_cell, components=components,
+                    value_class_scope=value_class_scope,
+                    format_spec_scopes=(ingestion_read_scope, value_class_scope),
+                    new_node=new_node,
+                )
                 # Only a successfully posted recipe admits the JoinedStr as
                 # resident sequence storage.  These attributes are a graph
                 # view of the concordance cell, not a second type decision.
@@ -20802,6 +20967,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 lower_class_operator_calls(entry_wrapper)
         if not propagate_call_formal_numeric_types():
             break
+    # An unannotated formal's class arrives on the call edge above, after
+    # its function's glyph recipes were authored and linked; link the
+    # integer formatter again now that the facts have settled.
+    compile_substage("topology: link settled glyph formatters")
+    for entry in compile_iter(function_table, "settled-glyph-formatters",
+            label="Settled glyph formatters linked"):
+        entry_wrapper = getattr(entry, "graph", None)
+        if entry_wrapper is not None:
+            _relink_settled_glyph_formatters(entry_wrapper, function_table)
 
     compile_substage("topology: finalize extracted graph operators")
     for entry in compile_iter(function_table, "final-graph-operators",

@@ -542,6 +542,176 @@ def test_integer_formatted_value_has_authored_call_and_unit_dependency():
     ]["dependency_units"]
 
 
+def test_unannotated_formal_links_the_integer_formatter_once_its_callsite_class_settles():
+    """``def f(x): return f"{x!r}"`` called once as ``f(a)`` with ``a: int``.
+
+    The formal ``x`` has no annotation: its class row is published from the
+    call actual by the call-edge settlement, which runs after ``f``'s recipe
+    was authored.  The recipe is linked again once that fact exists: the
+    formatted component names the authored decimal formatter call, the
+    call derives from the recipe cell and the formal's class cell, the
+    revised recipe derives from the call, and the call has its binding.
+    """
+
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {},
+        "bindings": [],
+        "values": [{
+            "function": "render",
+            "parameter": "a",
+            "storage": "scalar",
+            "dtype": "int64",
+            "rank": 0,
+            "python_type": "builtins.int",
+        }],
+    })
+    captured = {}
+
+    def capture(graph):
+        callee = next(
+            entry.graph for entry in graph.function_table
+            if entry.name == "f"
+        )
+        formatter = next(
+            entry for entry in graph.function_table
+            if entry.qualified_name == (
+                "src.compiler.glyph_sequence_format."
+                "decimal_integer_glyph_tokens"
+            )
+        )
+        book = current_identity_book()
+        glyph_row = next(
+            (data.get("attributes") or {})["source_glyph_sequence_row"]
+            for _node_id, data in callee.G.nodes(data=True)
+            if (data.get("attributes") or {}).get(
+                "source_glyph_sequence_row"
+            ) is not None
+        )
+        formal_id = next(
+            int(node_id)
+            for node_id, data in callee.G.nodes(data=True)
+            if data.get("type") == "Input"
+            and (data.get("attributes") or {}).get("binding_name") == "x"
+        )
+        glyph_cell = book.latest_ref(SOURCE_GLYPH_SEQUENCE, glyph_row)
+        glyph_fact = book.page(SOURCE_GLYPH_SEQUENCE).latest(glyph_row)
+        formatted = next(
+            component for component in glyph_fact.components
+            if component.kind == "formatted"
+        )
+        call_id = formatted.formatted_sequence_value_id
+        call_cell = (
+            None if call_id is None
+            else node_identity_cell(callee, int(call_id))
+        )
+        formal_class_rows = {
+            row: book.page(SOURCE_VALUE_CLASS).latest(row)
+            for row in book.page(SOURCE_VALUE_CLASS).rows()
+            if int(row[1]) == formal_id
+            and row[0] == callee.G.graph["authored_function_identity"]
+        }
+        captured.update({
+            "callee": callee,
+            "formatter": formatter,
+            "glyph_row": glyph_row,
+            "glyph_fact": glyph_fact,
+            "glyph_sources": {
+                source for source, _stage in book.edges_into(glyph_cell)
+            },
+            "formal_id": formal_id,
+            "formal_class_rows": formal_class_rows,
+            "formal_class_cells": {
+                row: book.latest_ref(SOURCE_VALUE_CLASS, row)
+                for row in formal_class_rows
+            },
+            "call_cell": call_cell,
+            "call_sources": set() if call_cell is None else {
+                source for source, _stage in book.edges_into(call_cell)
+            },
+            "binding": None if call_id is None else book.page(
+                CALL_BINDING
+            ).latest((
+                tuple(callee.G.graph["lexical_read_scope"]), int(call_id),
+            )),
+        })
+
+    plans = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        lower_ast_source_to_ssa(
+            "def f(x):\n"
+            "    return f'v={x!r}'\n"
+            "\n"
+            "def render(a: int):\n"
+            "    return f(a)\n",
+            "render",
+            name="glyph_formatter_settled_formal",
+            extraction_contract=policy,
+            resolved_process_graph_sink=capture,
+            compilation_unit_plan_sink=plans.append,
+            stop_after_compilation_unit_plan=True,
+            progress=lambda _message: None,
+        )
+
+    callee = captured["callee"]
+    formatter = captured["formatter"]
+    # The formal's class came from the call edge, not an annotation.
+    (class_row, class_fact), = captured["formal_class_rows"].items()
+    assert class_fact[0] == "builtins.int"
+    assert str(class_fact[2]).startswith("call actual ")
+    class_cell = captured["formal_class_cells"][class_row]
+    assert class_cell is not None
+
+    fact = captured["glyph_fact"]
+    formatted = next(
+        component for component in fact.components
+        if component.kind == "formatted"
+    )
+    assert formatted.operand_value_id == captured["formal_id"]
+    assert formatted.projection_kind == "scalar"
+    call_id = formatted.formatted_sequence_value_id
+    assert call_id is not None and call_id != formatted.component_value_id
+    call = callee.G.nodes[int(call_id)]
+    assert call["type"] == "Call"
+    assert call["attributes"]["callee_ref"] == formatter.reference.address
+    assert call["attributes"]["callee_resolution"] == "source-glyph-formatter"
+    assert call["attributes"]["source_glyph_component"] == (
+        captured["glyph_row"], fact.components.index(formatted),
+    )
+    assert call["parents"] == [(captured["formal_id"], "arg:0")]
+    assert callee.G.nodes[formatted.component_value_id]["attributes"][
+        "source_glyph_component"
+    ] == (captured["glyph_row"], fact.components.index(formatted))
+
+    # Provenance: the call stands on the recipe cell and the class cell it
+    # was selected from; the revised recipe stands on the call.
+    call_cell = captured["call_cell"]
+    call_sources = captured["call_sources"]
+    assert class_cell in call_sources
+    assert any(
+        source.page is SOURCE_GLYPH_SEQUENCE for source in call_sources
+    )
+    assert call_cell in captured["glyph_sources"]
+    binding = captured["binding"]
+    assert binding.callee == formatter.reference.address
+    assert binding.resolution is CallResolution.CALLSITE_SHELL
+
+    plan = plans[0]
+    reference_to_unit = {
+        int(reference): int(unit)
+        for reference, unit in plan["reference_to_unit"].items()
+    }
+    callee_ref = next(
+        reference for reference, unit in reference_to_unit.items()
+        if "f" in plan["units"][unit]["qualified_names"]
+    )
+    assert reference_to_unit[formatter.reference.address] in plan["units"][
+        reference_to_unit[callee_ref]
+    ]["dependency_units"]
+
+
 def test_decimal_digit_tuple_shape_keeps_canonical_provenance():
     """The pursued digit table's shape derives from its constant identity."""
 
