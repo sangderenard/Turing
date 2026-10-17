@@ -14,7 +14,18 @@ import contextlib
 import io
 import re
 
+from src.compiler.concordance_declarations import (
+    INGESTION_VALUE,
+    INGEST_SOURCE,
+    LEXICAL_READ_BINDING,
+    NodeFact,
+    OPERAND_POSITION,
+    READ_SCOPE_FORK,
+)
 from src.compiler.identity_concordance import (
+    Derived,
+    Mode,
+    Novel,
     begin_identity_book,
     end_identity_book,
 )
@@ -35,6 +46,44 @@ SOURCES = (
     "        total = total + xs[i] * y\n"
     "    return {'a': total, 'b': max(total, y)} if y else None\n",
 )
+
+
+def _ingest(graph, book, nodes):
+    """Enter hand-built nodes through the same identity API as scoped cuts.
+
+    The nodes are authored here, not read from a source file, so they
+    carry no source span: the test is the ingestion, and each node's
+    ``ingestion_value`` row is a ``Novel(INGEST_SOURCE)`` root under the
+    build's scope (as ``_scope_dispatch_fixture`` seeds its graphs).
+    """
+
+    scope = book.mint_scope("ingestion:t")
+    graph.G.graph["ingestion_value_scope"] = scope
+    for node in nodes:
+        data = graph.G.nodes[id(node)]
+        book.post(
+            INGESTION_VALUE, (scope, id(node)),
+            NodeFact(data.get("type"), data.get("op"), data.get("label")),
+            stage=READ_SCOPE_FORK, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+    return scope
+
+
+def _bind(book, row, fact):
+    """A binding fact the test authors at ``row``: a root the first time,
+    then a revision derived from the row's latest cell."""
+
+    latest = book.latest_ref(LEXICAL_READ_BINDING, row)
+    if latest is None:
+        return book.post(
+            LEXICAL_READ_BINDING, row, fact, stage=READ_SCOPE_FORK,
+            provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+        )
+    return book.post(
+        LEXICAL_READ_BINDING, row, fact, stage=OPERAND_POSITION,
+        provenance=Derived((latest,)), mode=Mode.REVISE,
+    )
 
 
 def _normalized_rows(book, node_ids):
@@ -170,9 +219,9 @@ def test_commit_edges_writes_the_rows_connect_wrote_in_order():
         graph = ProcessGraph(materialize_memory=False)
         book, token = begin_identity_book()
         try:
-            graph.G.graph["ingestion_value_scope"] = book.mint_scope("ingestion:t")
             for node in (*sources, target):
                 graph.ensure_node(node)
+            _ingest(graph, book, (*sources, target))
             # source 1 is authored twice (the second adds only an Edge).
             edges = [
                 (id(sources[i]), id(target), producer, consumer, None)
@@ -230,19 +279,16 @@ def test_append_only_writes_what_the_general_path_writes():
         graph = ProcessGraph(materialize_memory=False)
         book, token = begin_identity_book()
         try:
-            scope = book.mint_scope("ingestion:t")
-            graph.G.graph["ingestion_value_scope"] = scope
             for node in (*sources.values(), target):
                 graph.ensure_node(node)
                 graph.G.nodes[id(node)].setdefault("children", [])
+            scope = _ingest(graph, book, (*sources.values(), target))
             tgt = id(target)
             for step in steps:
                 parents = list(graph.G.nodes[tgt]["parents"])
                 parents += [(id(sources[n]), role) for n, role in step]
                 # A binding fact on a position that must survive the append.
-                book.page("lexical_read_binding").revise(
-                    (scope, tgt, "args", 0), "bound-first",
-                )
+                _bind(book, (scope, tgt, "args", 0), "bound-first")
                 _set_operands(
                     graph, tgt, parents, cause=INGEST_EDGE,
                     edge_payload={"extra": set()}, append_only=append_only,
@@ -271,10 +317,10 @@ def test_hub_children_index_matches_the_scan():
         graph = ProcessGraph(materialize_memory=False)
         book, token = begin_identity_book()
         try:
-            graph.G.graph["ingestion_value_scope"] = book.mint_scope("ingestion:t")
             for node in (hub, *names):
                 graph.ensure_node(node)
                 graph.G.nodes[id(node)].setdefault("children", [])
+            _ingest(graph, book, (hub, *names))
             h = id(hub)
 
             def write(consumer, parents):
