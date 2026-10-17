@@ -6,12 +6,16 @@ import networkx as nx
 
 from src.compiler.concordance_declarations import (
     CANONICAL_VALUE,
+    INGEST_SOURCE,
+    INGESTION,
     SPECIALIZATION_DYNAMIC_ARGUMENT,
 )
 from src.compiler.glsl_deployment_strategy import (
     _canonical_planner_specialization_cells,
 )
 from src.compiler.identity_concordance import (
+    Mode,
+    Novel,
     Unresolved,
     begin_identity_book,
     current_identity_book,
@@ -28,9 +32,15 @@ def test_dynamic_specialization_cell_order_is_not_a_revision():
 
     _book, token = begin_identity_book()
     try:
-        page = current_identity_book().page(CANONICAL_VALUE)
-        page.set((("caller", 0), 1), 0, ("first",))
-        page.set((("caller", 0), 2), 0, ("second",))
+        # The test authors these canonical_value rows by hand: it is their
+        # ingestion, so each is posted as a root (Novel(INGEST_SOURCE)).
+        book = current_identity_book()
+        for value_id, fact in ((1, ("first",)), (2, ("second",))):
+            book.post(
+                CANONICAL_VALUE, (("caller", 0), value_id), fact,
+                stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+                mode=Mode.CONCORD,
+            )
         first = current_identity_book().latest_ref(
             CANONICAL_VALUE, (("caller", 0), 1),
         )
