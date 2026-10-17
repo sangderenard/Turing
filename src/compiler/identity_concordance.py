@@ -1027,6 +1027,59 @@ _INOUT_REDEFINED = ("program_abi_mutable", "program_abi_field_written")
 _UNSOURCED_KINDS = frozenset({"unsourced-fact", "unsourced-identity"})
 
 
+_IDENTITY_PAGES = frozenset(("canonical_value", "ingestion_value"))
+
+
+def _canonical_identity_base(book: Any, ref: Any) -> Any:
+    """The first copy of an identity cell: a ``canonical_value`` row of a
+    read-scope fork derives from the row it copies (``read_scope_fork``),
+    so the cell is followed to the copy that has no such parent."""
+    seen = set()
+    while ref not in seen:
+        seen.add(ref)
+        parents = [
+            source for source, _stage in book.edges_into(ref)
+            if source.page.name == ref.page.name
+            and isinstance(source.row, tuple) and len(source.row) == 2
+            and isinstance(ref.row, tuple) and len(ref.row) == 2
+            and source.row[1] == ref.row[1]
+        ]
+        if len(parents) != 1:
+            return ref
+        ref = parents[0]
+    return ref
+
+
+def _identity_bases_of(book: Any, ref: Any, value_id: int) -> set:
+    """The canonical identity cells (``_canonical_identity_base``) of
+    ``value_id`` that ``ref`` derives from, walking its inbound edges up to
+    and not through the identity pages.  Empty when the ancestry reaches
+    none."""
+    found = set()
+    seen = {ref}
+    frontier = [ref]
+    depth = 0
+    while frontier and depth < 12:
+        next_frontier = []
+        for cell in frontier:
+            for source, _stage in book.edges_into(cell):
+                if source in seen:
+                    continue
+                seen.add(source)
+                if source.page.name in _IDENTITY_PAGES:
+                    if (
+                        isinstance(source.row, tuple)
+                        and len(source.row) == 2
+                        and source.row[1] == value_id
+                    ):
+                        found.add(_canonical_identity_base(book, source))
+                    continue
+                next_frontier.append(source)
+        frontier = next_frontier
+        depth += 1
+    return found
+
+
 class CorrelationTable:
     """Every identity claim the module makes, keyed by (function, value id)."""
 
@@ -1454,11 +1507,35 @@ class CorrelationTable:
                         for source in sources
                     ):
                         problem = "type ABI does not derive from its value identity"
+                    # A class row is this value's only when both stand on
+                    # one canonical identity cell: the dense id alone is
+                    # not one (``root``'s formal 15 and ``execute``'s call
+                    # result 15 are two values).  A class row whose
+                    # ancestry reaches no identity cell is still counted.
+                    abi_bases = set()
+                    for source in sources:
+                        if (
+                            source.page.name in {
+                                "canonical_value", "ingestion_value"
+                            }
+                            and isinstance(source.row, tuple)
+                            and len(source.row) == 2
+                            and int(source.row[1]) == int(value_id)
+                        ):
+                            abi_bases.add(
+                                _canonical_identity_base(book, source)
+                            )
                     ordinary = tuple(
                         (identity, source_ref)
                         for identity, source_ref
                         in source_classes_by_value.get(int(value_id), ())
                         if identity in alternatives
+                        and (
+                            not (class_bases := _identity_bases_of(
+                                book, source_ref, int(value_id),
+                            ))
+                            or class_bases & abi_bases
+                        )
                     )
                     if ordinary and not any(
                         source_ref in sources

@@ -368,6 +368,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "table_owner": PageLifecycle(None, None, REPAIRS),
     "tensor_operation_parameter": PageLifecycle(LOWERING, None, LOWERING),
     "tensor_metadata_call_binding": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "tensor_reduction_domain_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "tensor_shape_concordance": PageLifecycle(FUNCTIONS, LOWERING, LOWERING),
     "tensor_shape_settlement_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "tensor_shape_enrichment": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
