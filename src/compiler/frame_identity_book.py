@@ -200,7 +200,7 @@ def _frame_post(
 
     from .concordance_declarations import FRAME_SOURCE_CELL_ABSENT
     from .identity_concordance import (
-        ConcordanceRefusal, Derived, Mode, Unsourced, current_identity_book,
+        Derived, Mode, current_identity_book,
     )
 
     book = current_identity_book()
@@ -217,17 +217,12 @@ def _frame_post(
                 unchanged = recorded is fact
             if unchanged:
                 return previous
-    if cells:
-        try:
-            return book.post(
-                page, row, fact, stage=stage, provenance=Derived(cells),
-                mode=mode,
-            )
-        except ConcordanceRefusal:
-            if mode is not Mode.REVISE:
-                raise
+    if not cells:
+        raise ValueError(
+            f"{page.name}: no source cell for {row!r} -- {reason}"
+        )
     return book.post(
-        page, row, fact, stage=stage, provenance=Unsourced(reason), mode=mode,
+        page, row, fact, stage=stage, provenance=Derived(cells), mode=mode,
     )
 
 

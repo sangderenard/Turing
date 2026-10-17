@@ -67,7 +67,6 @@ from typing import Any, Iterable, Mapping
 from .concordance_declarations import (
     ARTIFACT_BUILD,
     AUTHORED_KERNEL_TEXT,
-    BLOCK_ORIGIN_UNROUTED,
     CONTROL_VALUE_BINDING,
     EMISSION_ARTIFACT,
     EMISSION_FUNCTION,
@@ -77,8 +76,6 @@ from .concordance_declarations import (
     FUNCTION_TEXT_PENDING,
     NATIVE_LOOP_VALUE,
     NATIVE_LOOP_WRAPPER_VALUE,
-    NO_BOOK_AT_EMISSION,
-    NO_FUNCTION_SCOPE,
     PIECE_ARTIFACT_UNROUTED,
     PROGRAM_ABI_FIELD_SLOT,
     SSA_VALUE,
@@ -103,7 +100,6 @@ from .identity_concordance import (
     Novel,
     Ref,
     Unresolved,
-    Unsourced,
 )
 
 _NO_BOOK_REPORTED = [False]
@@ -155,13 +151,10 @@ def replay_emission_gaps(module: Any) -> tuple[Ref, ...]:
         return ()
     posted: list[Ref] = []
     for artifact, backend, digest, length, what in tuple(metadata[EMISSION_GAPS]):
-        posted.append(book.post(
-            EMISSION_ARTIFACT,
-            (str(artifact), backend, (ArtifactPart.MODULE_TEXT, NO_BOOK_AT_EMISSION.name)),
-            ArtifactFact(digest, length, (str(what),)),
-            stage=ARTIFACT_BUILD, provenance=Unsourced(NO_BOOK_AT_EMISSION),
-            mode=Mode.REVISE,
-        ))
+        raise ValueError(
+            f"emission_artifact: no source cell for {str(artifact)!r} -- "
+            f"{what} was emitted with no book attached"
+        )
     metadata[EMISSION_GAPS] = []
     return tuple(posted)
 
@@ -452,10 +445,7 @@ class EmissionRecorder:
             ))
         self.function_cell = book.post(
             EMISSION_FUNCTION, row, pending, stage=self.stage,
-            provenance=(
-                Derived(sources) if sources else Unsourced(NO_FUNCTION_SCOPE)
-            ),
-            mode=Mode.REVISE,
+            provenance=Derived(sources), mode=Mode.REVISE,
         )
         return self.function_cell
 
@@ -516,19 +506,21 @@ class EmissionRecorder:
             self.local_values += len(missing)
             missing = []
         if missing:
-            provenance: Any = Unsourced(VALUE_WITHOUT_IDENTITY_CELL)
-            self.unsourced += 1
-            self.unsourced_values.extend(missing)
-        elif kind is UnitKind.BLOCK_LABEL and label_cell is None:
-            provenance = Unsourced(BLOCK_ORIGIN_UNROUTED)
-            self.unsourced += 1
-        elif not _distinct(cells):
-            # No header was posted before this unit (a programming error at
-            # the emitter would raise here; the recorder says it instead).
-            provenance = Unsourced(NO_FUNCTION_SCOPE)
-            self.unsourced += 1
-        else:
-            provenance = Derived(_distinct(cells))
+            raise ValueError(
+                f"emission_unit: no source cell for {(self.key, self.backend, ordinal)!r}"
+                f" -- values {missing} have no identity cell"
+            )
+        if kind is UnitKind.BLOCK_LABEL and label_cell is None:
+            raise ValueError(
+                f"emission_unit: no source cell for {(self.key, self.backend, ordinal)!r}"
+                " -- the block label has no block origin cell"
+            )
+        if not _distinct(cells):
+            raise ValueError(
+                f"emission_unit: no source cell for {(self.key, self.backend, ordinal)!r}"
+                " -- no function header was posted before this unit"
+            )
+        provenance: Any = Derived(_distinct(cells))
         ref = self._post(
             EMISSION_UNIT, (self.key, self.backend, ordinal),
             EmittedUnit(kind, str(text), str(spelling)), provenance,
@@ -632,7 +624,7 @@ class EmissionRecorder:
         ref = self._post(
             EMISSION_UNIT, (self.key, self.backend, ordinal),
             Unresolved(UNIT_ELIDED, read),
-            Derived(sources) if sources else Unsourced(NO_FUNCTION_SCOPE),
+            Derived(sources),
         )
         self.units.append(ref)
         self.instruction_units.setdefault(id(instruction), ref)
@@ -776,10 +768,11 @@ def _post_revision(
 
     sources = tuple(sources)
     cells = _distinct(sources)
-    if cells and all(isinstance(cell, Ref) for cell in sources):
-        provenance: Any = Derived(cells)
-    else:
-        provenance = Unsourced(reason)
+    if not (cells and all(isinstance(cell, Ref) for cell in sources)):
+        raise ValueError(
+            f"{page.name}: no source cell for {row!r} -- {reason}"
+        )
+    provenance: Any = Derived(cells)
     latest = book.latest_ref(page, row)
     try:
         return book.post(

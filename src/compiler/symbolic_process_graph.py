@@ -818,20 +818,16 @@ class _SympyIngestionProvenance:
         a node with neither is ``Unsourced(SYNTHESIZED_NO_SOURCE)``."""
 
         from .concordance_declarations import (
-            INGESTION, INGESTION_VALUE, NodeFact, SYNTHESIZED_NO_SOURCE,
+            INGESTION, INGESTION_VALUE, NodeFact,
         )
-        from .identity_concordance import Derived, Mode, Unsourced
+        from .identity_concordance import Derived, Mode
 
         cells = tuple(dict.fromkeys((*self.node_cells(value), *extra_cells)))
         return self.book.post(
             INGESTION_VALUE, (self.scope, int(node_id)),
             NodeFact(str(node_type), str(operation), str(label)),
             stage=INGESTION,
-            provenance=(
-                Derived(cells) if cells
-                else Unsourced(SYNTHESIZED_NO_SOURCE)
-            ),
-            mode=Mode.CONCORD,
+            provenance=Derived(cells), mode=Mode.CONCORD,
         )
 
 

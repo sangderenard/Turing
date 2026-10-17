@@ -35,7 +35,6 @@ from ...compiler.call_argument_binding import (
     _method_parameter_layout,
 )
 # Step 2 (plan 60): the ingestion-root vocabulary this module posts with.
-from ...compiler.identity_concordance import Unsourced as _Unsourced
 from ...compiler.concordance_declarations import (
     ANNOTATION_DECLARATION as _ANNOTATION_DECLARATION,
     BindingFact as _BindingFact,
@@ -73,7 +72,6 @@ from ...compiler.concordance_declarations import (
     STATIC_SYMBOL_DEFINITION as _STATIC_SYMBOL_DEFINITION,
     StaticSymbolFact as _StaticSymbolFact,
     StaticSymbolKind as _StaticSymbolKind,
-    SYNTHESIZED_NO_SOURCE as _SYNTHESIZED_NO_SOURCE,
     ValueKind as _ValueKind,
 )
 from ...compiler.identity_concordance import (
@@ -445,9 +443,9 @@ def _concord_source_value_class(
     """
 
     from ...compiler.concordance_declarations import (
-        HELPER_CALLER_UNROUTED, REDUCTION, SOURCE_VALUE_CLASS,
+        REDUCTION, SOURCE_VALUE_CLASS,
     )
-    from ...compiler.identity_concordance import Derived, Mode, Unsourced
+    from ...compiler.identity_concordance import Derived, Mode
 
     book = current_identity_book()
     page = book.page(SOURCE_VALUE_CLASS)
@@ -486,13 +484,14 @@ def _concord_source_value_class(
                 provenance=provenance, mode=Mode.CONCORD,
             )
         return recorded
+    if not isinstance(provenance, Derived):
+        raise ValueError(
+            f"source_value_class: no source cell for {row!r} -- the caller "
+            f"({source}) passed no Derived cells"
+        )
     book.post(
         SOURCE_VALUE_CLASS, row, (*proposed, str(source)), stage=REDUCTION,
-        provenance=(
-            provenance if isinstance(provenance, Derived)
-            else Unsourced(HELPER_CALLER_UNROUTED)
-        ),
-        mode=Mode.CONCORD,
+        provenance=provenance, mode=Mode.CONCORD,
     )
     return proposed
 
@@ -623,16 +622,12 @@ def node_identity_cell(graph: Any, node_id: int) -> Any:
     ``ingestion_value`` row cell -- posted by ``new_node`` in this
     reduction's ingestion scope (``operand_position_scope``) or by
     ``ProcessGraph.ensure_node`` in the build's ``ingestion_value_scope``.
-    A node with no row yet gets its ``ingestion_value`` row posted
-    ``Unsourced(SYNTHESIZED_NO_SOURCE)`` at stage REDUCTION, and that cell
-    is returned; the E-edits of plan 60 make this path rare.
+    A node with no row yet raises: a writer with no cell is a bug upstream.
     """
 
     from ...compiler.concordance_declarations import (
-        CANONICAL_VALUE, INGESTION_VALUE, NodeFact, REDUCTION,
-        SYNTHESIZED_NO_SOURCE,
+        CANONICAL_VALUE, INGESTION_VALUE,
     )
-    from ...compiler.identity_concordance import Mode, Unsourced
 
     book = current_identity_book()
     metadata = getattr(getattr(graph, "G", graph), "graph", {}) or {}
@@ -893,14 +888,16 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             ), None)
         # The specialization is its authored function with some inputs
         # known: NOVEL from the authored function's address cell.
+        if authored_cell is None:
+            raise ValueError(
+                f"{_SPECIALIZATION_PAGE}: no source cell for "
+                f"{identity_row!r} -- the graph's function_ref has no "
+                "function_address row on the book"
+            )
         specialization_book.post(
             _SPECIALIZATION_PAGE, identity_row, identity_fact,
             stage=_REDUCTION,
-            provenance=(
-                _Novel(_SOURCE_NUMERIC_SPECIALIZATION, (authored_cell,))
-                if authored_cell is not None
-                else _Unsourced(_SYNTHESIZED_NO_SOURCE)
-            ),
+            provenance=_Novel(_SOURCE_NUMERIC_SPECIALIZATION, (authored_cell,)),
             mode=_Mode.CONCORD,
         )
     metadata["source_numeric_scope"] = scope
@@ -2974,19 +2971,10 @@ def _set_operands(
     if scope is None:
         if (not tail_positions) if tail_only else new == old:
             return
-        from ...compiler.concordance_declarations import (
-            IDENTITY_TRANSITION, NO_OPERAND_POSITION_SCOPE, OPERAND_POSITION,
-            OperandAppend,
+        raise ValueError(
+            f"identity_transition: no source cell for node {node_id} -- "
+            "the operand rewrite was made with no operand-position scope"
         )
-        current_identity_book().post(
-            IDENTITY_TRANSITION,
-            (_UNSCOPED_OPERANDS, node_id, "rewrite", 0),
-            OperandAppend(cause_name, tuple(parents)),
-            stage=OPERAND_POSITION,
-            provenance=_Unsourced(NO_OPERAND_POSITION_SCOPE),
-            mode=_Mode.REVISE,
-        )
-        return
     renamed = dict(same or {})
     taken: set[int] = set()
     moves: dict[tuple[Any, int], tuple[Any, int] | None] = {}
@@ -3292,10 +3280,7 @@ def _post_copy_on_read_fork(
         SCOPE_ORIGIN, (forked,),
         ScopeFork(source, str(cause), projection, copy_on_read=True),
         stage=stage,
-        provenance=(
-            _Derived((source_cell,)) if source_cell is not None
-            else _Unsourced(_SYNTHESIZED_NO_SOURCE)
-        ),
+        provenance=_Derived((source_cell,)),
         mode=_Mode.CONCORD,
     )
     # The refusal: the nodes this copy lacks, and those its source lacked.
@@ -5746,11 +5731,7 @@ def _normalize_lexical_values(
         book.post(
             _CALLABLE_IDENTITY, (_source_numeric_scope(graph), int(node_id)),
             int(address), stage=_REDUCTION,
-            provenance=(
-                _Derived(cells) if address_cell is not None
-                else _Unsourced(_HELPER_CALLER_UNROUTED)
-            ),
-            mode=_Mode.CONCORD,
+            provenance=_Derived(cells), mode=_Mode.CONCORD,
         )
 
     def bind_loop_target(target: ast.AST) -> None:
@@ -7728,14 +7709,16 @@ def _normalize_lexical_values(
                             node_identity_cell(graph, int(node_id))
                             if node_id in graph.G else None
                         )
+                        if identity_cell is None:
+                            raise ValueError(
+                                f"{_SOURCE_PYTHON_IDENTITY}: no source cell "
+                                f"for {identity_row!r} -- node {node_id} has "
+                                "no identity cell on the graph"
+                            )
                         identity_book.post(
                             _SOURCE_PYTHON_IDENTITY, identity_row, descriptor,
                             stage=_REDUCTION,
-                            provenance=(
-                                _Derived((identity_cell,))
-                                if identity_cell is not None
-                                else _Unsourced(_SYNTHESIZED_NO_SOURCE)
-                            ),
+                            provenance=_Derived((identity_cell,)),
                             mode=_Mode.CONCORD,
                         )
                     identity_cell = current_identity_book().latest_ref(
@@ -20369,10 +20352,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     reach_book.post(
                         _SOURCE_FUNCTION_REACHABILITY, reachability_row, True,
                         stage=_REDUCTION,
-                        provenance=(
-                            _Derived(reach_cells) if reach_cells
-                            else _Unsourced(_SYNTHESIZED_NO_SOURCE)
-                        ),
+                        provenance=_Derived(reach_cells),
                         mode=_Mode.CONCORD,
                     )
                 if not callee.graph.get("source_pursuit_active"):
@@ -20459,11 +20439,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         result_row,
                         result_fact,
                         stage=_REDUCTION,
-                        provenance=(
-                            _Derived(result_sources)
-                            if result_sources
-                            else _Unsourced(_SYNTHESIZED_NO_SOURCE)
-                        ),
+                        provenance=_Derived(result_sources),
                         mode=_Mode.CONCORD,
                     )
                     call_result_attributes = caller.nodes[

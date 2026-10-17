@@ -502,10 +502,10 @@ def _resolve_class_body_field(
     # Publish the exact reference once and require every later lookup to read
     # the same row from the shared concordance.
     from ...compiler.concordance_declarations import (
-        PURSUIT, SOURCE_FIELD_IDENTITY, SYNTHESIZED_NO_SOURCE,
+        PURSUIT, SOURCE_FIELD_IDENTITY,
     )
     from ...compiler.identity_concordance import (
-        Derived, Mode, Unsourced, current_identity_book,
+        Derived, Mode, current_identity_book,
     )
 
     source_identity = getattr(definition, "_python_source_identity", None)
@@ -529,11 +529,7 @@ def _resolve_class_body_field(
         )
         book.post(
             SOURCE_FIELD_IDENTITY, row, result, stage=PURSUIT,
-            provenance=(
-                Derived(cells) if cells
-                else Unsourced(SYNTHESIZED_NO_SOURCE)
-            ),
-            mode=Mode.CONCORD,
+            provenance=Derived(cells), mode=Mode.CONCORD,
         )
         return result
     if not _same_ast_reference(incumbent, result):
@@ -648,10 +644,10 @@ def _source_class_field_reference(definition, attribute, bindings, seen):
     ), None)
     if method is not None:
         from ...compiler.concordance_declarations import (
-            PURSUIT, SOURCE_METHOD_IDENTITY, SYNTHESIZED_NO_SOURCE,
+            PURSUIT, SOURCE_METHOD_IDENTITY,
         )
         from ...compiler.identity_concordance import (
-            Derived, Mode, Unsourced, current_identity_book,
+            Derived, Mode, current_identity_book,
         )
 
         source_identity = getattr(definition, "_python_source_identity", None)
@@ -669,13 +665,14 @@ def _source_class_field_reference(definition, attribute, bindings, seen):
         if incumbent is None:
             # DERIVED from the method's own span (plan 60, section 3.6).
             span = post_source_span(definition, method, stage=PURSUIT)
+            if span is None:
+                raise ValueError(
+                    f"{SOURCE_METHOD_IDENTITY.name}: no source cell for "
+                    f"{row!r} -- the method carries no source span"
+                )
             book.post(
                 SOURCE_METHOD_IDENTITY, row, method, stage=PURSUIT,
-                provenance=(
-                    Derived((span,)) if span is not None
-                    else Unsourced(SYNTHESIZED_NO_SOURCE)
-                ),
-                mode=Mode.CONCORD,
+                provenance=Derived((span,)), mode=Mode.CONCORD,
             )
             return method
         if not _same_ast_reference(incumbent, method):
@@ -2848,10 +2845,10 @@ def _mark_source_pursuit_active(definition, *, demand):
     """
 
     from ...compiler.concordance_declarations import (
-        PURSUIT, SOURCE_PURSUIT_ACTIVATION, SYNTHESIZED_NO_SOURCE,
+        PURSUIT, SOURCE_PURSUIT_ACTIVATION,
     )
     from ...compiler.identity_concordance import (
-        Derived, Mode, Ref, Unsourced, current_identity_book,
+        Derived, Mode, Ref, current_identity_book,
     )
 
     identity = _source_definition_identity(definition)
@@ -2877,10 +2874,7 @@ def _mark_source_pursuit_active(definition, *, demand):
     )
     book.post(
         SOURCE_PURSUIT_ACTIVATION, row, True, stage=PURSUIT,
-        provenance=(
-            Derived(cells) if cells else Unsourced(SYNTHESIZED_NO_SOURCE)
-        ),
-        mode=Mode.CONCORD,
+        provenance=Derived(cells), mode=Mode.CONCORD,
     )
     definition._source_pursuit_active = True
 
@@ -5016,23 +5010,23 @@ class ProcessGraph(TiledObject):
             return
         from ...compiler.concordance_declarations import (
             INGESTION, INGESTION_VALUE, NodeFact, SCHEMA_NODE,
-            SYNTHESIZED_NO_SOURCE,
         )
         from ...compiler.identity_concordance import (
-            Derived, Mode, Unsourced, current_identity_book,
+            Derived, Mode, current_identity_book,
         )
 
         book = current_identity_book()
         span = post_source_span(None, node)
+        if span is None:
+            raise ValueError(
+                f"{INGESTION_VALUE.name}: no source cell for "
+                f"{(scope, int(nid))!r} -- the node carries no source span"
+            )
         book.post(
             INGESTION_VALUE, (scope, int(nid)),
             NodeFact(str(semantic_type), str(op), str(label)),
             stage=INGESTION,
-            provenance=(
-                Derived((span,)) if span is not None
-                else Unsourced(SYNTHESIZED_NO_SOURCE)
-            ),
-            mode=Mode.CONCORD,
+            provenance=Derived((span,)), mode=Mode.CONCORD,
         )
         if span is None:
             return

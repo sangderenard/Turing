@@ -393,10 +393,9 @@ def _post_scalar_kernel_operand(
     ``Unsourced`` when neither has a cell."""
 
     from .concordance_declarations import (
-        SCALAR_KERNEL_OPERAND, SSA_CALL_EDGE_CELL_NOT_ON_BOOK,
-        TENSOR_SSA_LOWERING,
+        SCALAR_KERNEL_OPERAND, TENSOR_SSA_LOWERING,
     )
-    from .identity_concordance import Derived, Mode, Unsourced
+    from .identity_concordance import Derived, Mode
     from .ssa_record_return_state import ssa_value_identity_cell
 
     book = identity_book(module)
@@ -407,13 +406,14 @@ def _post_scalar_kernel_operand(
         )
         if cell is not None
     ))
+    if not cells:
+        raise ValueError(
+            f"{SCALAR_KERNEL_OPERAND.name}: no source cell for {row!r} -- "
+            "neither the result nor the scalar operand has an ssa_value cell"
+        )
     book.post(
         SCALAR_KERNEL_OPERAND, row, fact, stage=TENSOR_SSA_LOWERING,
-        provenance=(
-            Derived(cells) if cells
-            else Unsourced(SSA_CALL_EDGE_CELL_NOT_ON_BOOK)
-        ),
-        mode=Mode.CONCORD,
+        provenance=Derived(cells), mode=Mode.CONCORD,
     )
 
 
@@ -425,33 +425,22 @@ def _post_call_edge_fact(
     changed over the same unchanged cells.  A fact the row already holds is
     not restated."""
 
-    from .concordance_declarations import (
-        SSA_CALL_EDGE_CAUSE_NOT_ON_BOOK, SSA_CALL_EDGE_CELL_NOT_ON_BOOK,
-        TENSOR_SSA_LOWERING,
-    )
-    from .identity_concordance import (
-        ConcordanceRefusal, Derived, Mode, Unsourced,
-    )
+    from .concordance_declarations import TENSOR_SSA_LOWERING
+    from .identity_concordance import Derived, Mode
 
     book = identity_book(module)
     stored = book.pages.get(page.name)
     if stored is not None and stored.latest(row) == fact:
         return
     sources = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
-    if sources:
-        try:
-            book.post(
-                page, row, fact, stage=TENSOR_SSA_LOWERING,
-                provenance=Derived(sources), mode=Mode.REVISE,
-            )
-            return
-        except ConcordanceRefusal:
-            reason = SSA_CALL_EDGE_CAUSE_NOT_ON_BOOK
-    else:
-        reason = SSA_CALL_EDGE_CELL_NOT_ON_BOOK
+    if not sources:
+        raise ValueError(
+            f"{page.name}: no source cell for {row!r} -- the call edge names "
+            "no cell"
+        )
     book.post(
         page, row, fact, stage=TENSOR_SSA_LOWERING,
-        provenance=Unsourced(reason), mode=Mode.REVISE,
+        provenance=Derived(sources), mode=Mode.REVISE,
     )
 
 
@@ -2272,10 +2261,9 @@ def _post_scalar_kernel_input_conversion(
     ``Unsourced(KERNEL_OPERAND_NOT_ON_BOOK)`` when the book holds none."""
 
     from .concordance_declarations import (
-        KERNEL_INPUT_CONVERSION, KERNEL_OPERAND_NOT_ON_BOOK,
-        TENSOR_SSA_LOWERING,
+        KERNEL_INPUT_CONVERSION, TENSOR_SSA_LOWERING,
     )
-    from .identity_concordance import Derived, Mode, Unsourced
+    from .identity_concordance import Derived, Mode
     from .ssa_record_return_state import (
         function_scope_of, ssa_value_identity_cell,
     )
@@ -2289,13 +2277,14 @@ def _post_scalar_kernel_input_conversion(
         int(source.id), int(converted.id), str(source.dtype), "float64",
         "binary_scalar_double",
     )
+    if cell is None:
+        raise ValueError(
+            f"{KERNEL_INPUT_CONVERSION.name}: no source cell for {row!r} -- "
+            "the source value has no ssa_value cell on the book"
+        )
     book.post(
         KERNEL_INPUT_CONVERSION, row, fact, stage=TENSOR_SSA_LOWERING,
-        provenance=(
-            Unsourced(KERNEL_OPERAND_NOT_ON_BOOK) if cell is None
-            else Derived((cell,))
-        ),
-        mode=Mode.REVISE,
+        provenance=Derived((cell,)), mode=Mode.REVISE,
     )
 
 

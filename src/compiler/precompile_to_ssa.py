@@ -26,7 +26,6 @@ from .identity_concordance import (
     Novel,
     Ref,
     Unresolved,
-    Unsourced,
     committed_sequence_row_layout,
     concord_sequence_row_dtypes,
     proven_shape_contract_of,
@@ -39,7 +38,6 @@ from .concordance_declarations import (
     ParameterAbiKind,
     STORAGE_FORMAL,
     STORAGE_PRODUCED,
-    STORAGE_PRODUCER_UNROUTED,
     STORAGE_ROOT,
     STORAGE_ROOT_STAGE,
     STORAGE_ROOT_UNKNOWN,
@@ -1197,24 +1195,24 @@ def _post_storage_roots(
         if value_id in resolving:
             # A store version feeding its own base through a carried edge:
             # the cycle names no producer.
-            cells[value_id] = book.post(
-                STORAGE_ROOT, row, Unresolved(STORAGE_ROOT_UNKNOWN),
-                stage=STORAGE_ROOT_STAGE,
-                provenance=Unsourced(STORAGE_ROOT_UNKNOWN), mode=Mode.CONCORD,
+            raise ValueError(
+                f"{STORAGE_ROOT.name}: no source cell for {row!r} -- a store "
+                "version feeds its own base through a carried edge"
             )
-            return cells[value_id]
         resolving.add(value_id)
         try:
             if value_id in formals:
                 source = formals[value_id] or canonical_cell(value_id)
+                if source is None:
+                    raise ValueError(
+                        f"{STORAGE_ROOT.name}: no source cell for {row!r} -- "
+                        "the formal has neither a binding nor a canonical_value cell"
+                    )
                 cell = book.post(
                     STORAGE_ROOT, row,
                     StorageRootFact(StorageRootKind.FORMAL),
                     stage=STORAGE_ROOT_STAGE,
-                    provenance=(
-                        Novel(STORAGE_FORMAL, (source,)) if source is not None
-                        else Unsourced(STORAGE_PRODUCER_UNROUTED)
-                    ),
+                    provenance=Novel(STORAGE_FORMAL, (source,)),
                     mode=Mode.CONCORD,
                 )
             elif value_id in aliases and int(aliases[value_id]) != value_id:
@@ -1248,23 +1246,22 @@ def _post_storage_roots(
                     )
                 else:
                     source = canonical_cell(value_id)
+                    if source is None:
+                        raise ValueError(
+                            f"{STORAGE_ROOT.name}: no source cell for {row!r}"
+                            " -- the produced value has no canonical_value cell"
+                        )
                     cell = book.post(
                         STORAGE_ROOT, row,
                         StorageRootFact(StorageRootKind.PRODUCED),
                         stage=STORAGE_ROOT_STAGE,
-                        provenance=(
-                            Novel(STORAGE_PRODUCED, (source,))
-                            if source is not None
-                            else Unsourced(STORAGE_PRODUCER_UNROUTED)
-                        ),
+                        provenance=Novel(STORAGE_PRODUCED, (source,)),
                         mode=Mode.CONCORD,
                     )
             else:
-                cell = book.post(
-                    STORAGE_ROOT, row, Unresolved(STORAGE_ROOT_UNKNOWN),
-                    stage=STORAGE_ROOT_STAGE,
-                    provenance=Unsourced(STORAGE_ROOT_UNKNOWN),
-                    mode=Mode.CONCORD,
+                raise ValueError(
+                    f"{STORAGE_ROOT.name}: no source cell for {row!r} -- the "
+                    "value is no formal, alias or instruction result"
                 )
         finally:
             resolving.discard(value_id)
@@ -1337,8 +1334,10 @@ def post_parameter_abi_kinds(
             fact = Unresolved(PARAMETER_ABI_UNDECLARED, (binding,))
             provenance = Derived((binding,))
         else:
-            fact = kind if kind is not None else Unresolved(PARAMETER_ABI_UNDECLARED)
-            provenance = Unsourced(PARAMETER_ABI_UNDECLARED)
+            raise ValueError(
+                f"{PARAMETER_ABI_KIND.name}: no source cell for {row!r} -- "
+                "the parameter has no version-0 name_binding cell"
+            )
         existing = book.latest_ref(PARAMETER_ABI_KIND, row)
         if existing is not None and book.page(PARAMETER_ABI_KIND).latest(row) == fact:
             cells[name] = existing

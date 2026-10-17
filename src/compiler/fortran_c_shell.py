@@ -17840,7 +17840,7 @@ def _class_surface_ssa_program(
         resolve_sequence_schemas,
     )
     from .identity_concordance import (
-        Derived, Mode, Unresolved, Unsourced, current_identity_book,
+        Derived, Mode, Unresolved, current_identity_book,
     )
     from .concordance_declarations import (
         AGGREGATE_POSITION_MISSING, ARGUMENT_BINDING, ArgumentBindingFact,
@@ -18208,7 +18208,6 @@ def _class_surface_ssa_program(
         COPY_VALUE_SHAPE as _COPY_VALUE_SHAPE,
         INGESTION_VALUE as _SHAPE_INGESTION_VALUE,
         LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
-        SHAPE_STATEMENT_SOURCE_NOT_ON_BOOK as _SHAPE_STATEMENT_UNSOURCED,
         VALUE_SHAPE_POLYMORPHISM as _VALUE_SHAPE_POLYMORPHISM,
         VALUE_SHAPE as _VALUE_SHAPE,
         CopyShapeFact as _CopyShapeFact,
@@ -18219,7 +18218,6 @@ def _class_surface_ssa_program(
         Derived as _ShapeDerived,
         Mode as _ShapeMode,
         SHAPE_STATE_PAGE as _SHAPE_STATE_PAGE,
-        Unsourced as _ShapeUnsourced,
         invalidate_proven_shape as _invalidate_abi_shape,
         record_proven_shape as _record_abi_shape,
         record_shape_transformation as _record_abi_shape_transformation,
@@ -18318,11 +18316,7 @@ def _class_surface_ssa_program(
         ref = shape_identity_book.post(
             _COPY_VALUE_SHAPE, row, statement,
             stage=_LINKED_VALUE_ABI_SETTLEMENT,
-            provenance=(
-                _ShapeDerived(cells) if cells
-                else _ShapeUnsourced(_SHAPE_STATEMENT_UNSOURCED)
-            ),
-            mode=_ShapeMode.REVISE,
+            provenance=_ShapeDerived(cells), mode=_ShapeMode.REVISE,
         )
         authored = (str(owner.graph.get("function_name")), int(value_id))
         rows = copy_statement_rows.setdefault(authored, [])
@@ -30597,7 +30591,7 @@ def _class_surface_ssa_program(
             SSA_VALUE, SSAValueFact, SSAValueOrigin,
         )
         from .identity_concordance import (
-            ConcordanceRefusal, Derived, Mode, Unresolved, Unsourced,
+            ConcordanceRefusal, Derived, Mode, Unresolved,
             current_identity_book,
         )
         from .precompile_to_ssa import _post_derived_or_raw
@@ -31198,11 +31192,7 @@ def _class_surface_ssa_program(
                     book.post(
                         NUMERAL_RECORD_LITERAL, deferred_row, deferred_fact,
                         stage=RECORD_LITERAL_MATERIALIZATION,
-                        provenance=(
-                            Derived(missing) if missing
-                            else Unsourced(LITERAL_FIELD_DEFERRED)
-                        ),
-                        mode=Mode.CONCORD,
+                        provenance=Derived(missing), mode=Mode.CONCORD,
                     )
                 constructor_anchors[(str(symbol), int(node_id))] = None
                 continue
@@ -31343,7 +31333,7 @@ def _class_surface_ssa_program(
             RECORD_RETURN_LAYOUT_STAGE, RECORD_RETURN_VERSION,
         )
         from .identity_concordance import (
-            Derived, Mode, Ref, Unresolved, Unsourced, current_identity_book,
+            Derived, Mode, Ref, Unresolved, current_identity_book,
         )
         from .precompile_to_ssa import _function_root_cell, _post_derived_or_raw
         from .ssa_record_return_state import (
@@ -31414,10 +31404,7 @@ def _class_surface_ssa_program(
                                 book.post(
                                     RECORD_RETURN_FIELD_SELECTION, row, fact,
                                     stage=RECORD_RETURN_VERSION,
-                                    provenance=(
-                                        Derived(read) if read
-                                        else Unsourced(RECORD_DESCRIPTORS_DIFFER)
-                                    ),
+                                    provenance=Derived(read),
                                     mode=Mode.REVISE,
                                 )
                         selected_arguments.append(argument)

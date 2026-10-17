@@ -604,11 +604,10 @@ def _synthetic_device_scalar_shell(graph: Any, predicate_id: int) -> Any:
     from ..common.tensors.topological_reducer import node_identity_cell
     from .concordance_declarations import (
         BindingFact, CANONICAL_VALUE, NAME_BINDING, PLANNER_SCOPE,
-        PLANNER_STRUCTURAL_FOLD, SYNTHESIZED_NO_SOURCE,
-        SYNTHETIC_DEVICE_SCALAR_PREDICATE,
+        PLANNER_STRUCTURAL_FOLD, SYNTHETIC_DEVICE_SCALAR_PREDICATE,
     )
     from .identity_concordance import (
-        Derived, Mode, Novel, Unsourced, current_identity_book,
+        Derived, Mode, Novel, current_identity_book,
     )
 
     book = current_identity_book()
@@ -619,6 +618,11 @@ def _synthetic_device_scalar_shell(graph: Any, predicate_id: int) -> Any:
         predicate_cell = node_identity_cell(graph, int(predicate_id))
     except ValueError:
         predicate_cell = None
+    if predicate_cell is None:
+        raise ValueError(
+            "canonical_value: no source cell for the synthetic device scalar "
+            f"-- predicate node {int(predicate_id)} has no identity cell"
+        )
     rows = {}
     for synthetic_id in (input_id, item_id, call_id):
         node = wrapper.nodes[synthetic_id]
@@ -626,10 +630,8 @@ def _synthetic_device_scalar_shell(graph: Any, predicate_id: int) -> Any:
         rows[synthetic_id] = book.post(
             CANONICAL_VALUE, (scope, int(synthetic_id)), fact,
             stage=PLANNER_STRUCTURAL_FOLD,
-            provenance=(
-                Novel(SYNTHETIC_DEVICE_SCALAR_PREDICATE, (predicate_cell,))
-                if predicate_cell is not None
-                else Unsourced(SYNTHESIZED_NO_SOURCE)
+            provenance=Novel(
+                SYNTHETIC_DEVICE_SCALAR_PREDICATE, (predicate_cell,),
             ),
             mode=Mode.CONCORD,
         )
@@ -6167,10 +6169,9 @@ def _dispatch_metadata_node_classifier(graph: Any):
     from .concordance_declarations import (
         EXECUTABLE_NODE, ExecutionKind, MetadataRule, NodeExecution,
         PLANNER_DISPATCH_CLASSIFICATION, PLANNER_SCOPE, SCALAR_PARAMETER,
-        SYNTHESIZED_NO_SOURCE,
     )
     from .identity_concordance import (
-        Derived, Mode, Unsourced, current_identity_book,
+        Derived, Mode, current_identity_book,
     )
 
     G = graph.G
@@ -6210,16 +6211,10 @@ def _dispatch_metadata_node_classifier(graph: Any):
         row = (planning_scope, int(node_id))
         try:
             cell = node_identity_cell(graph, int(node_id))
-        except ValueError:
-            # A graph the reducer never scoped (a synthetic wrapper): the
-            # verdict is recorded, its source is not.
-            book.post(
-                EXECUTABLE_NODE, row, fact,
-                stage=PLANNER_DISPATCH_CLASSIFICATION,
-                provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
-                mode=Mode.CONCORD,
-            )
-            return
+        except ValueError as exc:
+            raise ValueError(
+                f"executable_node: no source cell for {row!r} -- {exc}"
+            ) from exc
         cells = [cell]
         if rule is MetadataRule.COORDINATOR_NODE_TYPE:
             # An Input the reducer declared scalar: the rule read that row.
@@ -17453,28 +17448,25 @@ def _propagate_callsite_tensor_specializations(
                         )
                         from .concordance_declarations import (
                             PLANNER_TENSOR_SPECIALIZATION as _SETTLE_STAGE,
-                            SYNTHESIZED_NO_SOURCE as _SETTLE_NO_SOURCE,
                             TENSOR_SHAPE_SETTLEMENT,
                         )
                         from .identity_concordance import (
                             Derived as _SettleDerived, Mode as _SettleMode,
-                            Unsourced as _SettleUnsourced,
                         )
 
                         try:
                             settled_cell = _settled_node_cell(
                                 caller, int(value_id),
                             )
-                        except ValueError:
-                            settled_cell = None
+                        except ValueError as exc:
+                            raise ValueError(
+                                "tensor_shape_settlement: no source cell for "
+                                f"{settlement_row!r} -- {exc}"
+                            ) from exc
                         current_identity_book().post(
                             TENSOR_SHAPE_SETTLEMENT, settlement_row,
                             settlement_fact, stage=_SETTLE_STAGE,
-                            provenance=(
-                                _SettleDerived((settled_cell,))
-                                if settled_cell is not None
-                                else _SettleUnsourced(_SETTLE_NO_SOURCE)
-                            ),
+                            provenance=_SettleDerived((settled_cell,)),
                             mode=_SettleMode.CONCORD,
                         )
                         changed = True
@@ -17779,13 +17771,11 @@ def propagate_bound_planner_specializations(
 
     from ..common.tensors.topological_reducer import node_identity_cell
     from .concordance_declarations import (
-        EXTERNAL_DECLARATION, PLANNER_SPECIALIZATION,
+        PLANNER_SPECIALIZATION,
         PLANNER_SPECIALIZATION_PAGE, SpecializationFact,
         SpecializationSource,
     )
-    from .identity_concordance import (
-        Mode, Unsourced, current_identity_book,
-    )
+    from .identity_concordance import Mode, current_identity_book
 
     book = current_identity_book()
 
@@ -17795,8 +17785,7 @@ def propagate_bound_planner_specializations(
         binding under ``graph_obj``'s scope: DERIVED from the call node's
         cell and the caller's rows the binding was resolved from; the
         entrypoint's own bindings come from the caller of the compile (no
-        cell on the book) and are posted ``Unsourced(EXTERNAL_DECLARATION)``
-        under the latch."""
+        cell on the book) and raise."""
 
         scope = graph_obj.G.graph.get("lexical_read_scope")
         if scope is None:
@@ -17812,10 +17801,9 @@ def propagate_bound_planner_specializations(
                 book.pages[PLANNER_SPECIALIZATION_PAGE.name].latest(row) == fact
             ):
                 continue
-            book.post(
-                PLANNER_SPECIALIZATION_PAGE, row, fact,
-                stage=PLANNER_SPECIALIZATION,
-                provenance=Unsourced(EXTERNAL_DECLARATION), mode=Mode.REVISE,
+            raise ValueError(
+                f"{PLANNER_SPECIALIZATION_PAGE.name}: no source cell for "
+                f"{row!r} -- the binding came from the caller of the compile"
             )
         _materialize_planner_specializations(graph_obj)
 
@@ -21645,7 +21633,7 @@ def _fold_callsite_structural_values(
                 PLANNER_STRUCTURAL_FOLD, PROVEN_LITERAL,
             )
             from .identity_concordance import (
-                Mode, RAW_PRIMITIVE, Unsourced, current_identity_book,
+                Mode, current_identity_book,
             )
 
             literal_row = (
@@ -21666,11 +21654,10 @@ def _fold_callsite_structural_values(
                         stage=PLANNER_STRUCTURAL_FOLD, cells=literal_sources,
                     ))
                 else:
-                    round_cells.append(book.post(
-                        PROVEN_LITERAL, literal_row, value,
-                        stage=PLANNER_STRUCTURAL_FOLD,
-                        provenance=Unsourced(RAW_PRIMITIVE), mode=Mode.REVISE,
-                    ))
+                    raise ValueError(
+                        f"{PROVEN_LITERAL.name}: no source cell for "
+                        f"{literal_row!r} -- the fold evaluated no operand cell"
+                    )
 
     def remove_node(node_id: int) -> None:
         nonlocal topology_changed

@@ -187,12 +187,12 @@ def _propagate_scalar_dtypes(functions) -> None:
     }
 
     from .concordance_declarations import (
-        CONST_DECLARED_WIDTH_NOT_ON_BOOK, LOAD_DECLARED_WIDTH_NOT_ON_BOOK, INFERRED_INTEGER_WIDEN,
+        INFERRED_INTEGER_WIDEN,
         IntegerWidthDecision, IntegerWidthFact, SCALAR_DTYPE_SETTLEMENT,
-        SCALAR_INTEGER_WIDTH, SSA_VALUE, WIDENED_VALUE_NOT_ON_BOOK, SSAValueFact,
+        SCALAR_INTEGER_WIDTH, SSA_VALUE, SSAValueFact,
     )
     from .identity_concordance import (
-        Derived, Mode, Novel, Unsourced, current_identity_book,
+        Derived, Mode, Novel, current_identity_book,
     )
     from .ssa_record_return_state import function_scope_of
     from .ssa_record_return_state import accepted_ssa_component
@@ -471,13 +471,12 @@ def _propagate_scalar_dtypes(functions) -> None:
         ) in width_decisions.items():
             fact = IntegerWidthFact(decision, source_dtype, dtype)
             if source_cell is None:
-                provenance = Unsourced(
-                    (LOAD_DECLARED_WIDTH_NOT_ON_BOOK if result_id in declared_load_ids
-                     else CONST_DECLARED_WIDTH_NOT_ON_BOOK)
-                    if decision is IntegerWidthDecision.KEPT_DECLARED
-                    else WIDENED_VALUE_NOT_ON_BOOK
+                raise ValueError(
+                    f"{SCALAR_INTEGER_WIDTH.name}: no source cell for "
+                    f"{(scope, int(result_id))!r} -- the value has no "
+                    "ssa_value cell on the book"
                 )
-            elif decision is IntegerWidthDecision.KEPT_DECLARED:
+            if decision is IntegerWidthDecision.KEPT_DECLARED:
                 provenance = Derived((source_cell,))
             else:
                 provenance = Novel(INFERRED_INTEGER_WIDEN, (source_cell,))
