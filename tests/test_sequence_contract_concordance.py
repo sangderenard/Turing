@@ -398,9 +398,9 @@ def test_output_concordance_closes_nonphysical_record_planning_alias():
         _publish_concordant_function_aliases(
             function, {2: 1}, provenance="linked_record_projection",
         )
-        output_page = book.page("output_identity_concordance")
-        output_page.bind_alias("solve", 1, 3)
-        output_page.bind_alias("solve", 2, 3)
+        # The output aliases the test authors are its roots.
+        _seed_alias(book, OUTPUT_IDENTITY, "solve", 1, 3)
+        _seed_alias(book, OUTPUT_IDENTITY, "solve", 2, 3)
 
         assert _retire_concorded_record_identity_aliases(
             {"solve": function}, {"solve": records}, book,
