@@ -1829,6 +1829,48 @@ class Page:
     assert fields["self.count"]["result_class_ref"] == "builtins.int"
 
 
+def test_program_abi_physical_dtype_does_not_override_a_declared_enum_class():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+from enum import Enum
+
+
+class Kind(Enum):
+    LABEL = "label"
+
+
+class Row:
+    kind: Kind
+
+    def admits(self):
+        return self.kind
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    # An Enum is a resident int64: its receipt names no class.
+    graph.G.graph["program_abi"] = {"records": {
+        "Row": {"identity": "Row", "fields": {
+            "kind": {
+                "storage": "scalar", "dtype": "int64", "rank": 0,
+                "mutable": False,
+            },
+        }},
+    }}
+
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("admits").graph
+    fields = {
+        ast.unparse(data["expr_obj"]): data["attributes"]
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+    }
+    assert fields["self.kind"].get("result_class_ref") != "builtins.int"
+
+
 def test_setdefault_result_retains_nested_collection_identity_in_a_loop():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(

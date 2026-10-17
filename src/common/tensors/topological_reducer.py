@@ -7265,6 +7265,18 @@ def _normalize_lexical_values(
                         ) in {"", "scalar"}
                         else None
                     )
+                if (
+                    declared_field_class is not None
+                    and refined_annotation
+                    and not _canonical_source_class_identity(
+                        refined_annotation
+                    ).startswith("builtins.")
+                ):
+                    # The ProgramABI field describes the physical carrier (an
+                    # Enum is a resident int64).  A declared non-primitive
+                    # class owns the semantic class of the read; the carrier's
+                    # dtype never overrides it.
+                    declared_field_class = None
                 if declared_field_class is not None:
                     field_class_sources = tuple(dict.fromkeys(filter(None, (
                         node_identity_cell(graph, int(attribute_id)),
