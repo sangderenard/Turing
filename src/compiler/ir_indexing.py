@@ -505,3 +505,27 @@ def _propagate_scalar_dtypes(functions) -> None:
                       SSAValueFact(instruction.res.dtype, fact.shape, fact.origin),
                       stage=SCALAR_DTYPE_SETTLEMENT,
                       provenance=Derived((previous, *sources)), mode=Mode.REVISE)
+        # Every other result this settlement retyped is the same identity
+        # too, revised from its operands' records (the dtype was inferred
+        # from them) and its integer-width decision when one was posted.
+        producers = {
+            int(instruction.res.id): instruction
+            for instruction in instructions if instruction.res is not None
+        }
+        for value_id, dtype in dtype_of.items():
+            previous, fact = value_cell(int(value_id))
+            if previous is None or fact is None or fact.dtype == dtype:
+                continue
+            producer = producers.get(int(value_id))
+            operand_cells = tuple(
+                cell for operand in (producer.args if producer is not None else ())
+                for cell in (value_cell(int(operand.id))[0],) if cell is not None
+            )
+            width_cell = book.latest_ref(SCALAR_INTEGER_WIDTH, (scope, int(value_id)))
+            book.post(SSA_VALUE, (scope, int(value_id)),
+                      SSAValueFact(dtype, fact.shape, fact.origin),
+                      stage=SCALAR_DTYPE_SETTLEMENT,
+                      provenance=Derived(tuple(dict.fromkeys(
+                          cell for cell in (previous, *operand_cells, width_cell)
+                          if cell is not None))),
+                      mode=Mode.REVISE)

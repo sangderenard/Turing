@@ -47018,8 +47018,25 @@ def _class_surface_ssa_program(
                     dtype = str(formal.dtype or "")
                     if dtype in {"", "unknown"}:
                         continue
+                    retyped = False
                     for occurrence in occurrences.get(int(actual.id), ()):
+                        retyped = retyped or occurrence.dtype != dtype
                         occurrence.dtype = dtype
+                    if retyped:
+                        # The helper formal's declared element type is now
+                        # the actual's: a REVISE of the actual's
+                        # ``ssa_value`` row DERIVED from the formal's cell.
+                        from .ssa_record_return_state import (
+                            revise_ssa_value, ssa_value_identity_cell,
+                        )
+                        revise_ssa_value(
+                            function, int(actual.id), dtype=dtype,
+                            shape=tuple(actual.shape or ()),
+                            stage="sequence_helper_value_types",
+                            sources=(ssa_value_identity_cell(
+                                callee, int(formal.id),
+                            ),),
+                        )
 
     # Call-frame linking and record expansion above are the final whole-program
     # composition seam and may reconstruct operands after a method's local

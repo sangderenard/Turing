@@ -1376,6 +1376,7 @@ def propagate_repository_ssa_call_metadata(
         }
         fixed_constant = int(value_id) in constant_result_ids(function)
         for value in occurrences_of(int(value_id), function):
+            before = (tuple(value.shape or ()), value.dtype)
             # An occurrence that declares itself an exact view of this same
             # storage owns its shape.  Restamping it with the allocation
             # owner's shape silently rewrote ``b.reshape((-1, 1, 2))`` back
@@ -1430,10 +1431,14 @@ def propagate_repository_ssa_call_metadata(
                 value.shape = source_shape
                 changed = True
             if (
-                source_dtype is not None
-                and (value.dtype is None or authoritative)
+                source_dtype not in {None, "unknown"}
+                and (value.dtype in {None, "unknown"} or authoritative)
                 and value.dtype != source_dtype
             ):
+                # ``"unknown"`` is the state's spelling of an absent dtype
+                # (``shape_transformation_state``); an occurrence left at
+                # it beside a resolved one posted the same shape edge with
+                # another target state on every pass.
                 _log("dtype", value.dtype, source_dtype)
                 value.dtype = source_dtype
                 changed = True
@@ -1478,7 +1483,29 @@ def propagate_repository_ssa_call_metadata(
                 record_shape_transformation,
                 shape_scope_of,
             )
-            from .ssa_record_return_state import ssa_value_identity_cell
+            from .ssa_record_return_state import (
+                revise_ssa_value, ssa_value_identity_cell,
+            )
+
+            book = identity_book(module)
+            source_value_cell = ssa_value_identity_cell(
+                function if source_owner is None else source_owner,
+                int(source.id), book=book,
+            )
+            target_value_cell = ssa_value_identity_cell(
+                function, int(value.id), book=book,
+            )
+            if before != (tuple(value.shape or ()), value.dtype):
+                # The transport changed this value's dtype or shape: that
+                # is a revision of its ``ssa_value`` row, DERIVED from the
+                # row's previous cell and the source value's cell.  The
+                # shape edge below then stands on a cell that changed,
+                # which is the cause of its revision.
+                target_value_cell = revise_ssa_value(
+                    function, int(value.id), dtype=value.dtype,
+                    shape=tuple(value.shape or ()), stage=stage,
+                    sources=(source_value_cell,), book=book,
+                ) or target_value_cell
 
             source_rank = int(source_accounting.get(
                 "program_abi_rank", len(source_shape),
@@ -1534,11 +1561,11 @@ def propagate_repository_ssa_call_metadata(
                 # from that value's ``ssa_value`` cell in its own function.
                 source_cells=tuple(
                     cell for cell in (
-                        ssa_value_identity_cell(
-                            function if source_owner is None else source_owner,
-                            int(source.id),
-                            book=identity_book(module),
-                        ),
+                        source_value_cell,
+                        # The target state was read off the target value:
+                        # its ``ssa_value`` cell (revised above when the
+                        # transport changed it) is a source of this edge.
+                        target_value_cell,
                         # The state the source was last resolved to: when
                         # that changed, this edge's revision has its cause.
                         identity_book(module).latest_ref(
@@ -1725,24 +1752,61 @@ def propagate_repository_ssa_call_metadata(
     }
     scoped_values: dict[tuple[str, int], dict[int, SSAValue]] = {}
     reference_counts: dict[tuple[str, int], set[str]] = {}
+    # The blocks in which each owner references the value: a formal is
+    # referenced by the function's entry block, an operand or result by the
+    # block of its instruction.  Each is a witness of the reference.
+    reference_blocks: dict[tuple[str, int], set[tuple[str, str]]] = {}
     for owner_name, owner_function in module.functions.items():
         for value in values(owner_function):
             key = (scopes[id(owner_function)], int(value.id))
             scoped_values.setdefault(key, {})[id(value)] = value
             reference_counts.setdefault(key, set()).add(owner_name)
+        entry_label = next(iter(owner_function.blocks), None)
+        for formal in owner_function.args:
+            if entry_label is not None:
+                reference_blocks.setdefault(
+                    (scopes[id(owner_function)], int(formal.id)), set(),
+                ).add((str(owner_name), str(entry_label)))
+        for label, block in owner_function.blocks.items():
+            for instruction in block.instrs:
+                for value in (*instruction.args, instruction.res):
+                    if value is None:
+                        continue
+                    reference_blocks.setdefault(
+                        (scopes[id(owner_function)], int(value.id)), set(),
+                    ).add((str(owner_name), str(label)))
     from .concordance_declarations import CROSS_FUNCTION_REFERENCES
-    from .ssa_record_return_state import ssa_value_identity_cell
+    from .ssa_record_return_state import (
+        ssa_block_identity_cell, ssa_value_identity_cell,
+    )
 
     for key, owners in reference_counts.items():
         if len(owners) > 1:
+            # DERIVED from the value's cell in each owner and from the
+            # ``ssa_block`` cell of every block that references it: the
+            # owner set is what those blocks say, so a block or a whole
+            # function leaving the module changes the cells this fact
+            # stands on, which is the cause of its revision.  (Regions share
+            # their owner's value scope, so the value cells alone are one
+            # cell for every owner.)
             _post_call_edge_fact(
                 module, CROSS_FUNCTION_REFERENCES, key, tuple(sorted(owners)),
-                tuple(
-                    ssa_value_identity_cell(
-                        module.functions[owner], int(key[1]),
-                        book=identity_book(module),
-                    )
-                    for owner in sorted(owners)
+                (
+                    *(
+                        ssa_value_identity_cell(
+                            module.functions[owner], int(key[1]),
+                            book=identity_book(module),
+                        )
+                        for owner in sorted(owners)
+                    ),
+                    *(
+                        ssa_block_identity_cell(
+                            module.functions[owner], label,
+                            book=identity_book(module),
+                        )
+                        for owner, label in sorted(reference_blocks.get(key, ()))
+                        if owner in module.functions
+                    ),
                 ),
             )
 

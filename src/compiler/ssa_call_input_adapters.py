@@ -65,6 +65,19 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
     page = book.page('exact_region_feed_dtype')
     changed = 0
     from .ssa_record_return_state import accepted_ssa_component
+
+    def revise_value_row(owner, value_id, dtype, shape, *causes):
+        """The exact feed dtype installed on ``value_id`` of ``owner`` is a
+        REVISE of its ``ssa_value`` row, DERIVED from the row's previous
+        cell and ``causes`` (the feed concordance cell, the other side's
+        value cell)."""
+        from .ssa_record_return_state import revise_ssa_value
+
+        return revise_ssa_value(
+            owner, int(value_id), dtype=dtype, shape=shape,
+            stage=PHYSICAL_CALL_INPUT_ADAPTATION, sources=causes, book=book,
+        )
+
     for caller in functions.values():
         if accepted_ssa_component(caller):
             continue
@@ -215,6 +228,16 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                         )
                         actual = instruction.args[position]
                         changed += 1
+                        revise_value_row(
+                            caller, int(actual.id), exact_dtype, actual.shape,
+                            book.latest_ref(
+                                EXACT_REGION_FEED_DTYPE,
+                                (str(caller.name), int(actual.id)),
+                            ),
+                            ssa_value_identity_cell(
+                                callee, int(formal.id), book=book,
+                            ),
+                        )
 
                     if formal_physical in _NUMERIC_DTYPES and formal_physical != exact_dtype:
                         continue
@@ -238,6 +261,16 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                                 str(caller.name), int(actual.id), int(position),
                             ),
                         }
+                        revise_value_row(
+                            callee, int(formal.id), exact_dtype, formal.shape,
+                            book.latest_ref(
+                                EXACT_REGION_FEED_DTYPE,
+                                (str(callee.name), int(formal.id)),
+                            ),
+                            ssa_value_identity_cell(
+                                caller, int(actual.id), book=book,
+                            ),
+                        )
                         changed += 1
     return changed
 

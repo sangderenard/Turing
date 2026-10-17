@@ -214,6 +214,43 @@ def mint_ssa_value(function, transform, operands, *, dtype=None, shape=(), stage
     )
 
 
+def revise_ssa_value(function, value_id, *, dtype, shape, stage, sources=(), book=None):
+    """Record an in-place dtype/shape change of ``value_id`` in ``function``
+    as a REVISE of its ``ssa_value`` row, DERIVED from the row's previous
+    cell and ``sources`` (the cells the new dtype/shape was read from), as
+    the control builder's ``_revise_value`` does for its own changes.  The
+    recorded origin is kept.  Returns the row's cell: the new one, the
+    previous one when the fact is unchanged, or None when the value has no
+    row (a creation that skipped the book; this writer does not supply it)."""
+    from .concordance_declarations import SSA_VALUE, SSAValueFact
+    from .identity_concordance import (
+        Derived, Mode, Stage, current_identity_book,
+    )
+
+    if book is None:
+        book = current_identity_book()
+    row = (function_scope_of(function), int(value_id))
+    previous = book.latest_ref(SSA_VALUE, row)
+    if previous is None:
+        return None
+    recorded = book.pages[SSA_VALUE.name].cells.get((row, previous.column))
+    origin = getattr(recorded, "origin", None)
+    if origin is None:
+        return previous
+    fact = SSAValueFact(dtype, tuple(shape or ()), origin)
+    if fact == recorded:
+        return previous
+    if not isinstance(stage, Stage):
+        stage = book.registry.declare_stage(str(stage))
+    return book.post(
+        SSA_VALUE, row, fact, stage=stage,
+        provenance=Derived(tuple(dict.fromkeys(
+            cell for cell in (previous, *sources) if cell is not None
+        ))),
+        mode=Mode.REVISE,
+    )
+
+
 def record_descriptor_cell(table, record_id):
     """The latest ``record_descriptor`` cell of ``record_id`` in ``table``."""
     from .concordance_declarations import RECORD_DESCRIPTOR
