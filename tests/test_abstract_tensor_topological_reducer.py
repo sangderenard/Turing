@@ -1785,6 +1785,50 @@ class Page:
     ] == ("int64",)
 
 
+def test_program_abi_aggregate_field_dtype_is_not_the_class_of_the_field():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Page:
+    def read(self):
+        return self.pages, self.members, self.count
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    graph.G.graph["program_abi"] = {"records": {
+        "Page": {"identity": "Page", "fields": {
+            "pages": {
+                "storage": "keyed", "dtype": "int64", "rank": 1,
+                "mutable": True,
+            },
+            "members": {
+                "storage": "span", "dtype": "int64", "rank": 1,
+                "mutable": True, "aggregate_kind": "set",
+            },
+            "count": {
+                "storage": "scalar", "dtype": "int64", "rank": 0,
+                "mutable": True,
+            },
+        }},
+    }}
+
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("read").graph
+    fields = {
+        ast.unparse(data["expr_obj"]): data["attributes"]
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+    }
+    # The element dtype of a dict or set is not the class of the field.
+    assert fields["self.pages"].get("result_class_ref") != "builtins.int"
+    assert fields["self.members"].get("result_class_ref") != "builtins.int"
+    # A scalar field's dtype is its class.
+    assert fields["self.count"]["result_class_ref"] == "builtins.int"
+
+
 def test_setdefault_result_retains_nested_collection_identity_in_a_loop():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(

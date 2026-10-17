@@ -102,3 +102,31 @@ def test_reach_is_bounded_and_reports_what_it_left_out():
     assert "(+16 neighbor(s) not shown)" in "\n".join(hood.lines())
     capped = book.neighborhood((hub,), radius=2, max_nodes=3, fanout=4)
     assert len(capped.nodes) == 3 and capped.truncated
+
+
+def test_a_source_value_class_disagreement_carries_its_claim():
+    from src.common.tensors.topological_reducer import (
+        _concord_source_value_class,
+    )
+    from src.compiler.identity_concordance import (
+        begin_identity_book, end_identity_book,
+    )
+
+    book, token = begin_identity_book()
+    try:
+        _concord_source_value_class(
+            ("module", "function"), 7, "builtins.int", source="first writer",
+        )
+        with pytest.raises(ValueError) as caught:
+            _concord_source_value_class(
+                ("module", "function"), 7, "_PageTable",
+                source="second writer",
+            )
+        claim, = caught.value.concordance_claims
+        assert claim.page == "source_value_class_concordance"
+        assert [role for role, _ref in claim.seeds] == ["incumbent"]
+        lines = annotate_failure_with_neighborhood(caught.value, book)
+        assert any("failed post source_value_class_concordance" in line
+                   for line in lines)
+    finally:
+        end_identity_book(token)

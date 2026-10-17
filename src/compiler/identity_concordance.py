@@ -8607,6 +8607,11 @@ def _attach_failure_claim(
         pass
 
 
+#: The public name for a writer that refuses a claim itself (not through
+#: ``post``) to hand the claim to the failure report.
+attach_failure_claim = _attach_failure_claim
+
+
 def annotate_failure_with_neighborhood(
     error: BaseException, book: IdentityBook | None,
     *, radius: int = 2, max_nodes: int = 40, fanout: int = 6,

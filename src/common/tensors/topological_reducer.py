@@ -460,12 +460,22 @@ def _concord_source_value_class(
     if incumbent is not None:
         recorded = (str(incumbent[0]), int(incumbent[1]))
         if recorded != proposed:
-            raise ValueError(
+            from ...compiler.identity_concordance import attach_failure_claim
+
+            error = ValueError(
                 "source value class concordance disagreement for "
                 f"{scope!r} value {value_id}: recorded={recorded!r}, "
                 f"recorded_source={tuple(incumbent[2:])!r}, "
                 f"{source} says {proposed!r}"
             )
+            # Refused here, not through ``post``: hand the claim to the
+            # failure report so its concordance neighborhood is shown.
+            attach_failure_claim(
+                book, error, SOURCE_VALUE_CLASS, row,
+                (*proposed, str(source)), REDUCTION, provenance,
+                Mode.CONCORD,
+            )
+            raise error
         if isinstance(provenance, Derived):
             # CONCORD owns exactly this case: the fact remains unchanged while
             # every independently established predecessor edge is retained.
@@ -7235,15 +7245,26 @@ def _normalize_lexical_values(
                         "float": "builtins.float",
                         "float32": "builtins.float",
                         "float64": "builtins.float",
-                    }.get(declared_aggregate) or {
-                        "bool": "builtins.bool",
-                        "int": "builtins.int",
-                        "int32": "builtins.int",
-                        "int64": "builtins.int",
-                        "float": "builtins.float",
-                        "float32": "builtins.float",
-                        "float64": "builtins.float",
-                    }.get(declared_dtype)
+                    }.get(declared_aggregate) or (
+                        # ``dtype`` is the class of the value read only for a
+                        # scalar field.  For a keyed, table or span field it is
+                        # the element dtype of the aggregate (a dict of int64
+                        # values is not an int), and the field's class is the
+                        # one its own declaration states.
+                        {
+                            "bool": "builtins.bool",
+                            "int": "builtins.int",
+                            "int32": "builtins.int",
+                            "int64": "builtins.int",
+                            "float": "builtins.float",
+                            "float32": "builtins.float",
+                            "float64": "builtins.float",
+                        }.get(declared_dtype)
+                        if str(
+                            declared_receiver_field.get("storage") or ""
+                        ) in {"", "scalar"}
+                        else None
+                    )
                 if declared_field_class is not None:
                     field_class_sources = tuple(dict.fromkeys(filter(None, (
                         node_identity_cell(graph, int(attribute_id)),
