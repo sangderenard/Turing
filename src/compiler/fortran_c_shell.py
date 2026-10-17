@@ -32946,7 +32946,26 @@ def _class_surface_ssa_program(
                         # this owner's cell: say so, or the formal carrying it
                         # has no identity claim at all.
                         status = instruction.args[4]
+                        # Spelled as every other keyed part of this field is
+                        # (``<field>.<part>`` of the owner record): a formal
+                        # that names only its parameter reads as the record
+                        # parameter itself, which has no ``function_parameter``
+                        # row once it is expanded into its parts.
+                        owner_record = next((
+                            part.accounting["program_abi_record"]
+                            for part in (
+                                parts["length"], parts["keys"], parts["values"],
+                            )
+                            if (part.accounting or {}).get(
+                                "program_abi_record"
+                            ) is not None
+                        ), None)
                         status.accounting = {
+                            **(
+                                {} if owner_record is None
+                                else {"program_abi_record": str(owner_record)}
+                            ),
+                            "program_abi_field": f"{owner_name}.status",
                             **dict(status.accounting or {}),
                             "program_abi_keyed_owner": str(owner_name),
                             "program_abi_keyed_part": "status",
