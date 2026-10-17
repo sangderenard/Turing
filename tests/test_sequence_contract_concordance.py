@@ -691,6 +691,9 @@ def test_output_settlement_keeps_frame_arena_as_physical_resident():
 
 
 def test_authored_mapping_contract_governs_specialized_parameter_view():
+    # The test is the ingestion: the graph is built and reduced on the book
+    # ``_field_slot_ops`` then reads its parameter rows from.
+    _book, token = begin_identity_book()
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(ast.parse("""
@@ -711,7 +714,6 @@ def kernel(values: Mapping[str, float]):
         "sequence_writable": False,
     })
 
-    _book, token = begin_identity_book()
     try:
         declarations = _field_slot_ops(
             executable, contract_scope="kernel-specialized"
@@ -724,6 +726,9 @@ def kernel(values: Mapping[str, float]):
 
 
 def test_annotated_list_slice_iteration_does_not_become_a_keyed_table():
+    # The test is the ingestion: the graph is built and reduced on the book
+    # ``_field_slot_ops`` then reads its parameter rows from.
+    _book, token = begin_identity_book()
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(ast.parse("""
@@ -739,7 +744,6 @@ def product(factors: list[Any]):
     executable = graph.function_table.entry("product").graph.G
     parameter_id = int(executable.graph["identity_table"]["factors"][0])
 
-    _book, token = begin_identity_book()
     try:
         declarations = _field_slot_ops(
             executable, contract_scope="product"

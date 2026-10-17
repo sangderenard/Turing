@@ -345,12 +345,19 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
                 for ordinal, glyph in enumerate(glyphs)
             )
         vocabulary_id = int(GLOBAL_MONOTONIC_IDS.mint())
+        # The vocabulary is read from every StringTable entry this compile
+        # interned and built for the glyph recipes that project a token in
+        # this mode: DERIVED from both, so a compile that interned no word
+        # still names the recipes the (empty) vocabulary serves.
         vocabulary_cell = book.post(
             STRING_GLYPH_VOCABULARY,
             (source_scope, vocabulary_id),
             tuple(vocabulary_rows),
             stage=CONTROL_PROGRAM_BUILD,
-            provenance=Derived(tuple(entry_cells)),
+            provenance=Derived(tuple(dict.fromkeys((
+                *entry_cells,
+                *(recipe_cell for recipe_cell, _component in mode_recipes),
+            )))),
             mode=Mode.CONCORD,
         )
         declarations.append((vocabulary_id, "unique", 3, False))

@@ -26717,6 +26717,15 @@ def _class_surface_ssa_program(
     compile_substage("record field access and mutation survey")
     for source_symbol, source_graph in compile_iter(source_graphs_by_symbol.items(),
             "record-access-survey", label="Source record access surveyed"):
+        if all_functions.get(source_symbol) is None:
+            # ``source_graphs_by_symbol`` also indexes each graph under its
+            # authored instance identity (``_index_source_graph_spellings``);
+            # that alias is a lookup spelling, not a compiled symbol.  The
+            # survey writes its rows under the compiled symbol -- the one
+            # ``record_field_role_cells`` and the forwarding stage read back
+            # -- exactly as every other per-symbol pass here acts only on the
+            # function its symbol names.
+            continue
         identities = source_graph.graph.get("identity_table") or {}
         declared = dict(
             source_graph.graph.get("parameter_record_abi") or {}
@@ -28851,6 +28860,58 @@ def _class_surface_ssa_program(
                                 for candidate_id in candidate_ids:
                                     values.pop(candidate_id, None)
                                 values[result_id] = result
+                                # The leaf's result (and a vocabulary
+                                # predicate) IS the authored read's graph
+                                # id, adopted as this function's value:
+                                # ADOPTED_GRAPH_ID DERIVED from the id's
+                                # ``canonical_value`` cell and the cells of
+                                # the column and row handle it is read
+                                # through, as the builder's ``_value_cell``
+                                # adopts a graph id.  A value that already
+                                # has a row keeps it.
+                                from .concordance_declarations import (
+                                    SSA_VALUE, SSAValueFact, SSAValueOrigin,
+                                )
+                                for adopted in (
+                                    result,
+                                    *(values[predicate_id]
+                                      for predicate_id in predicate_ids),
+                                ):
+                                    if _frame_value_cell(
+                                        function, int(adopted.id),
+                                    ) is not None:
+                                        continue
+                                    _frame_post(
+                                        SSA_VALUE,
+                                        (
+                                            _frame_book_scope(function),
+                                            int(adopted.id),
+                                        ),
+                                        SSAValueFact(
+                                            adopted.dtype,
+                                            tuple(adopted.shape or ()),
+                                            SSAValueOrigin.ADOPTED_GRAPH_ID,
+                                        ),
+                                        stage=RECORD_ABI_MATERIALIZATION,
+                                        cells=(
+                                            _frame_graph_cell(
+                                                graph, int(adopted.id),
+                                            ),
+                                            _frame_value_cell(
+                                                function, int(column.id),
+                                            ),
+                                            _frame_value_cell(
+                                                function, int(row_handle_id),
+                                            ),
+                                            *(
+                                                ()
+                                                if adopted is result
+                                                else (_frame_value_cell(
+                                                    function, int(result.id),
+                                                ),)
+                                            ),
+                                        ),
+                                    )
                                 if row_leaf_pointer is not None:
                                     values[int(row_leaf_pointer.id)] = (
                                         row_leaf_pointer
@@ -29073,8 +29134,16 @@ def _class_surface_ssa_program(
                     leaf_shape = (int(leaf_field["fixed_length"]),)
                 if leaf_storage == "scalar":
                     leaf_shape = ()
+                # The leaf's declared page row: a source-derived record's
+                # ``class_field_declaration`` cell (an external record has
+                # only its ``contract_demand`` row, read below).
+                leaf_declaration_cell = _record_field_declaration_cell(
+                    schema, leaf_name,
+                )
                 if leaf_storage not in {"scalar", "span"} or leaf_shape is None:
-                    deferred.append((leaf_path, leaf_storage))
+                    deferred.append((
+                        leaf_path, leaf_storage, leaf_declaration_cell,
+                    ))
                     continue
                 leaf_dtype = str(leaf_field.get("dtype") or "float64")
                 leaf_mutable = bool(leaf_field.get("mutable", False))
@@ -29083,14 +29152,18 @@ def _class_surface_ssa_program(
                     else (int(row_count), *leaf_shape)
                 )
                 # NOVEL(DECLARED_ROW_COLUMN, the value record's declaration
-                # cell) on this function's ``ssa_value`` page.
+                # cell and the leaf's declared page row) on this function's
+                # ``ssa_value`` page.
                 column = SSAValue(
                     _frame_mint(
                         function, DECLARED_ROW_COLUMN,
-                        (current_identity_book().latest_ref(
-                            CONTRACT_DEMAND_PAGE,
-                            (DemandKind.PARAMETER_RECORD, schema_identity),
-                        ),),
+                        (
+                            current_identity_book().latest_ref(
+                                CONTRACT_DEMAND_PAGE,
+                                (DemandKind.PARAMETER_RECORD, schema_identity),
+                            ),
+                            leaf_declaration_cell,
+                        ),
                         dtype=leaf_dtype, shape=column_shape,
                         stage=RECORD_ABI_MATERIALIZATION,
                     ),
@@ -29130,16 +29203,21 @@ def _class_surface_ssa_program(
                     dtype=leaf_dtype,
                     writable=leaf_mutable,
                 ))
-            for leaf_path, leaf_storage in deferred:
+            for leaf_path, leaf_storage, leaf_declaration_cell in deferred:
+                # DERIVED from what was read: the record's demand cell and
+                # the deferred leaf's declared page row.
                 _frame_post(
                     NUMERAL_LEAF_MATERIALIZATION,
                     (str(symbol), str(parameter_name), leaf_path),
                     f"declared_row_leaf_deferred:{leaf_storage}",
                     stage=RECORD_ABI_MATERIALIZATION, mode=Mode.CONCORD,
-                    cells=_frame_cells(current_identity_book().latest_ref(
-                        CONTRACT_DEMAND_PAGE,
-                        (DemandKind.PARAMETER_RECORD, schema_identity),
-                    )),
+                    cells=_frame_cells(
+                        current_identity_book().latest_ref(
+                            CONTRACT_DEMAND_PAGE,
+                            (DemandKind.PARAMETER_RECORD, schema_identity),
+                        ),
+                        leaf_declaration_cell,
+                    ),
                 )
                 report(
                     f"record abi: {symbol}: declared row leaf {leaf_path} "
@@ -32868,7 +32946,26 @@ def _class_surface_ssa_program(
                         # this owner's cell: say so, or the formal carrying it
                         # has no identity claim at all.
                         status = instruction.args[4]
+                        # Spelled as every other keyed part of this field is
+                        # (``<field>.<part>`` of the owner record): a formal
+                        # that names only its parameter reads as the record
+                        # parameter itself, which has no ``function_parameter``
+                        # row once it is expanded into its parts.
+                        owner_record = next((
+                            part.accounting["program_abi_record"]
+                            for part in (
+                                parts["length"], parts["keys"], parts["values"],
+                            )
+                            if (part.accounting or {}).get(
+                                "program_abi_record"
+                            ) is not None
+                        ), None)
                         status.accounting = {
+                            **(
+                                {} if owner_record is None
+                                else {"program_abi_record": str(owner_record)}
+                            ),
+                            "program_abi_field": f"{owner_name}.status",
                             **dict(status.accounting or {}),
                             "program_abi_keyed_owner": str(owner_name),
                             "program_abi_keyed_part": "status",
