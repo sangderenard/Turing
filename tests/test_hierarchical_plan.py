@@ -1439,3 +1439,46 @@ from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
+
+
+def test_callee_value_without_a_graph_node_derives_from_its_call_node(monkeypatch):
+    """A callee closure value no graph node names (a native-interface formal)
+    is posted on ``hierarchy_value`` DERIVED from the instantiating call's
+    identity cell, not as an unsourced synthesized value."""
+    from src.common.tensors import topological_reducer
+    from src.compiler.concordance_declarations import (
+        CELL_SET, CONTROL_FUNCTION_ROOT, CONTROL_SSA_ENTRY, HIERARCHY_VALUE,
+    )
+    from src.compiler.identity_concordance import (
+        Mode, Novel, current_identity_book,
+    )
+
+    book = current_identity_book()
+    call_cell = book.post(
+        CELL_SET, ("hierarchy_call_node_probe", 0), (),
+        stage=CONTROL_SSA_ENTRY, provenance=Novel(CONTROL_FUNCTION_ROOT, ()),
+        mode=Mode.CONCORD,
+    )
+    caller_graph = SimpleNamespace(G=nx.DiGraph())
+    caller_graph.G.add_node(7)
+    shell = SimpleNamespace(
+        process_graph=caller_graph,
+        callsite_function_shells={7: SimpleNamespace(
+            process_graph=SimpleNamespace(G=nx.DiGraph()),
+        )},
+    )
+    monkeypatch.setattr(
+        topological_reducer, "node_identity_cell",
+        lambda graph, node: call_cell if graph is caller_graph else None,
+    )
+    child = PlanClosure("child", (1 << 61,), ())
+    root = PlanClosure("root", (), (PlanCall(7, child, (), ()),))
+
+    planned, values = assign_hierarchy_ids(root, shell=shell)
+
+    scope = values.scope
+    child_id = planned.items[0].callee.closure_id
+    row = (scope, child_id, 1 << 61)
+    ref = book.latest_ref(HIERARCHY_VALUE, row)
+    assert ref is not None
+    assert call_cell in [source for source, _stage in book.edges_into(ref)]

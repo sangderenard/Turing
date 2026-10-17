@@ -128,6 +128,43 @@ def test_field_receiver_uses_typed_columns_only_for_heterogeneous_slots():
     assert [instruction.args[0].id for instruction in geps] == [10, integer_column]
 
 
+def test_shared_receiver_column_is_the_declared_self_formal():
+    """A one-arena receiver holds several slots, so no field names it, but it
+    is still the authored ``self`` formal: it must carry the parameter claim
+    (``unaccounted-formal`` otherwise)."""
+
+    from src.compiler.identity_concordance import CorrelationTable
+    from src.transmogrifier.ssa import IRModule
+
+    control = Function(
+        "Receiver__init",
+        [SSAValue(7, dtype="int64")],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], None)])},
+        metadata={"authored_parameters": ("self", "scope")},
+    )
+    lowered, _locations = _inject_field_slot_access(
+        control,
+        self_value_id=10,
+        non_self_param_ids=(7,),
+        field_ops=(("write", 7, 0),),
+        field_count=1,
+        field_dtypes={0: "float64"},
+        receiver_accounting={
+            "program_abi_record": "Receiver",
+            "program_abi_parameter": "self",
+        },
+    )
+
+    receiver = lowered.args[0]
+    assert receiver.id == 10
+    assert receiver.accounting["program_abi_parameter"] == "self"
+    module = IRModule({lowered.name: lowered})
+    assert not [
+        finding for finding in CorrelationTable.build(module).findings(module)
+        if finding.kind == "unaccounted-formal" and finding.value_id == 10
+    ]
+
+
 def test_field_receiver_rewrite_preserves_cfg_successors():
     predicate = SSAValue(7, dtype="bool")
     control = Function(

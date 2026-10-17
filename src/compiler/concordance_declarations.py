@@ -781,6 +781,14 @@ STRING_TABLE_ENTRY = declare_page("string_table_entry", (
 STRING_GLYPH_VOCABULARY = declare_page("string_glyph_vocabulary", (
     RowField("function_scope", K.SCOPE), RowField("sequence", K.VALUE_ID),
 ), tuple)
+#: One step of a resident glyph sequence's composition (its clear or one
+#: extend), a row of its own so each control-program mutation block has its
+#: own owner cell.  Fact ``(operator, argument value ids, argument kind)``,
+#: DERIVED from the ``source_glyph_sequence`` recipe cell.  Mode REVISE.
+GLYPH_SEQUENCE_STEP = declare_page("glyph_sequence_step", (
+    RowField("source_scope", K.SCOPE), RowField("sequence", K.VALUE_ID),
+    RowField("step", K.INDEX),
+), tuple)
 SOURCE_OPTIONAL_GLYPH_CARRY = declare_page("source_optional_glyph_carry", (
     RowField("source_scope", K.SCOPE), RowField("merged", K.VALUE_ID),
 ), SourceOptionalGlyphCarry)
@@ -1659,6 +1667,13 @@ RECORD_FIELD_DECOMPOSITION = declare_page("record_field_decomposition", (
     RowField("owner", K.SCOPE), RowField("record", K.VALUE_ID),
     RowField("storage_identity", K.NAME),
 ), tuple)                              # CONCORD
+#: ``_receiver_field_ops``: the nested record identity a method receiver's
+#: declared record field carries, per (function scope, canonical field);
+#: CONCORD, DERIVED(the field's ``class_field_declaration`` cell the
+#: ProgramABI view schema names).
+RECEIVER_NESTED_RECORD_FIELD = declare_page("receiver_nested_record_field_concordance", (
+    RowField("function", K.SCOPE), RowField("field", K.NAME),
+), str)
 PROGRAM_ABI_KEYED_ROW_RECORD = declare_page("program_abi_keyed_row_record", (
     RowField("owner", K.SCOPE), RowField("record", K.VALUE_ID),
     RowField("storage_identity", K.NAME),
@@ -1982,6 +1997,11 @@ FORMAL_STORAGE_RESOLUTION = declare_page("formal_storage_resolution", (
 #: ``TransformationLedger`` (routed by ``propose(..., sources=)``): the
 #: retained (rule, proof, target) per identity, REVISE; every proposal as an
 #: event dict, CONCORD; each rejection once, by its full key, CONCORD.
+#: A ledger identity's FIRST decision whose proof cells are not on the book
+#: (the proposer's value has no ``ssa_value`` row): the root of that
+#: identity's decision chain.  Every later decision derives from the
+#: incumbent decision cell; every event derives from the decision it records.
+TRANSFORMATION_LEDGER_ROOT = declare_transform("transformation_ledger_root", 0)
 TRANSFORMATION_DECISION = declare_page("transformation_decision", (
     RowField("scope", K.SCOPE), RowField("identity", K.LABEL),
 ), tuple)
@@ -3632,32 +3652,50 @@ def canonical_python_type_identity(identity: object) -> str:
 
 
 def ensure_builtin_class_topology(book: object) -> None:
-    """Publish Python's builtin class edges once as concordance facts."""
+    """Publish Python's builtin class edges once as concordance facts.
 
-    from .identity_concordance import Mode, Unsourced
+    Each edge is DERIVED from the two classes' ``static_symbol_definition``
+    cells (row ``("builtins", name, "")``), the book's record of an external
+    declaration ingested by reference; the reducer reads the same cells when
+    it publishes an authored class's builtin base.
+    """
+
+    import builtins
+    import types
+
+    from .identity_concordance import Derived, Mode
+    from ..common.tensors.topological_reducer import (
+        _static_symbol_definition_cell,
+    )
 
     declarations = (
-        ("builtins.bool", "builtins.int"),
-        ("builtins.bytearray", "builtins.object"),
-        ("builtins.bytes", "builtins.object"),
-        ("builtins.complex", "builtins.object"),
-        ("builtins.dict", "builtins.object"),
-        ("builtins.float", "builtins.object"),
-        ("builtins.frozenset", "builtins.object"),
-        ("builtins.int", "builtins.object"),
-        ("builtins.list", "builtins.object"),
-        ("builtins.NoneType", "builtins.object"),
-        ("builtins.set", "builtins.object"),
-        ("builtins.str", "builtins.object"),
-        ("builtins.tuple", "builtins.object"),
+        (builtins.bool, builtins.int),
+        (builtins.bytearray, builtins.object),
+        (builtins.bytes, builtins.object),
+        (builtins.complex, builtins.object),
+        (builtins.dict, builtins.object),
+        (builtins.float, builtins.object),
+        (builtins.frozenset, builtins.object),
+        (builtins.int, builtins.object),
+        (builtins.list, builtins.object),
+        (types.NoneType, builtins.object),
+        (builtins.set, builtins.object),
+        (builtins.str, builtins.object),
+        (builtins.tuple, builtins.object),
     )
     page = book.page(CLASS_SUBTYPE)
     for derived, base in declarations:
-        row = (derived, base)
+        row = (
+            canonical_python_type_identity(derived.__name__),
+            canonical_python_type_identity(base.__name__),
+        )
         if page.latest(row) is None:
             book.post(
                 CLASS_SUBTYPE, row, row, stage=INGESTION,
-                provenance=Unsourced(EXTERNAL_DECLARATION),
+                provenance=Derived((
+                    _static_symbol_definition_cell(derived),
+                    _static_symbol_definition_cell(base),
+                )),
                 mode=Mode.CONCORD,
             )
 

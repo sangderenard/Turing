@@ -283,7 +283,7 @@ def test_mapping_items_nested_key_keeps_string_class_from_store_layout():
         assert len(kind_rows) == 1
         kind_row = kind_rows[0]
         kind_class = book.page(SOURCE_VALUE_CLASS).latest(kind_row)
-        assert kind_class[:2] == ("str", 1)
+        assert kind_class[:2] == ("builtins.str", 1)
         kind_cell = book.latest_ref(SOURCE_VALUE_CLASS, kind_row)
         assert kind_cell is not None
         assert book.edges_into(kind_cell)
@@ -635,7 +635,7 @@ def test_integer_intrinsic_result_uses_concorded_typed_ssa_formatters():
         "prefixed_lower_hex_integer_glyph_tokens",
     )
     assert all(
-        fact is not None and fact[0] == "int"
+        fact is not None and fact[0] == "builtins.int"
         for fact in captured["operand_classes"]
     )
     # The linked decimal/hex helper chain exercises call-record reordering,
@@ -1065,7 +1065,8 @@ def test_string_partition_member_keeps_declared_string_class():
         }
         assert set(class_rows) == set(member_ids)
         assert all(
-            class_page.latest(class_rows[member_id])[:2] == ("str", 1)
+            class_page.latest(class_rows[member_id])[:2]
+            == ("builtins.str", 1)
             for member_id in member_ids
         )
         for member_id in member_ids:
@@ -2031,3 +2032,130 @@ def test_local_list_of_tuple_annotation_publishes_exact_row_dtypes():
         assert annotated["sequence_element_dtypes"] == ("int64", "int64")
     finally:
         end_identity_book(token)
+
+
+def _reduced_joined_components(source, entry, which=-1):
+    """Reduce ``source`` and return the formatted components of one f-string."""
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(source))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry(entry).graph
+        joined = sorted(
+            (
+                data for _node_id, data in function.G.nodes(data=True)
+                if isinstance(data.get("expr_obj"), ast.JoinedStr)
+                and (data.get("attributes") or {}).get(
+                    "source_glyph_sequence_row"
+                ) is not None
+            ),
+            key=lambda data: data["expr_obj"].lineno,
+        )[which]
+        fact = book.page(SOURCE_GLYPH_SEQUENCE).latest(
+            joined["attributes"]["source_glyph_sequence_row"]
+        )
+        classes = book.page(SOURCE_VALUE_CLASS)
+        formatted = tuple(
+            component for component in fact.components
+            if component.kind == "formatted"
+        )
+        return formatted, {
+            int(component.operand_value_id): next((
+                classes.latest(row) for row in classes.rows()
+                if len(row) == 2
+                and int(row[1]) == int(component.operand_value_id)
+            ), None)
+            for component in formatted
+        }
+    finally:
+        end_identity_book(token)
+
+
+def test_str_call_result_has_str_class_even_without_a_glyph_recipe():
+    # ``str(thing)`` is a ``str`` by the builtin's own semantics, whatever
+    # ``thing`` is: the consuming f-string takes the string_token path.
+    formatted, classes = _reduced_joined_components(
+        "def render(thing: object):\n"
+        "    text = str(thing)\n"
+        "    return f'v={text}'\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert classes[int(component.operand_value_id)][:2] == (
+        "builtins.str", 1,
+    )
+    assert classes[int(component.operand_value_id)][2] == (
+        "builtins.str call result"
+    )
+
+
+def test_joined_string_result_has_str_class_for_a_consuming_fstring():
+    formatted, classes = _reduced_joined_components(
+        "def render(count: int):\n"
+        "    inner = f'n={count}'\n"
+        "    return f'<{inner}>'\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert classes[int(component.operand_value_id)][:2] == (
+        "builtins.str", 1,
+    )
+
+
+def test_type_name_attribute_has_str_class():
+    formatted, classes = _reduced_joined_components(
+        "def render(owner):\n"
+        "    return f'{type(owner).__name__!r} has no member'\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert component.conversion == ord("r")
+    assert classes[int(component.operand_value_id)][:2] == (
+        "builtins.str", 1,
+    )
+
+
+def test_bare_primitive_local_annotation_declares_the_local_class():
+    formatted, classes = _reduced_joined_components(
+        "def render(items: list[str]):\n"
+        "    label: str = items[0]\n"
+        "    return f'{label}'\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert classes[int(component.operand_value_id)][:2] == (
+        "builtins.str", 1,
+    )
+
+
+def test_primitive_union_local_annotation_is_not_given_a_class():
+    # ``str | None`` has no single class: nothing is invented for it.
+    formatted, classes = _reduced_joined_components(
+        "def render(items: list[str]):\n"
+        "    label: str | None = items[0]\n"
+        "    return f'{label}'\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "scalar"
+    assert classes[int(component.operand_value_id)] is None
+
+
+def test_string_slice_class_is_read_through_the_canonical_identity():
+    formatted, classes = _reduced_joined_components(
+        "def render(text: str):\n"
+        "    return f'{text[2:-2]}'\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert classes[int(component.operand_value_id)][2] == (
+        "authored string slice"
+    )

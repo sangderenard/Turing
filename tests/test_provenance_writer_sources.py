@@ -154,3 +154,23 @@ def test_record_pages_have_no_raw_page_writers():
     assert not re.search(r"record_field_concordance\.(set|concord)\(", shell)
     assert not re.search(r"_scalar_shape_page", shell)
     assert not re.search(r"slot_storage_page", precompile)
+
+
+def test_frame_and_planning_pages_have_no_raw_page_writers():
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "compiler"
+    shell = (root / "fortran_c_shell.py").read_text(encoding="utf-8")
+    precompile = (root / "precompile_to_ssa.py").read_text(encoding="utf-8")
+    for page in (
+        "numeral_leaf_materialization_concordance",
+        "program_abi_keyed_row_record",
+    ):
+        assert not re.search(
+            rf'"{page}"\s*\)\s*\.(concord|revise|set)\(', shell,
+        ), page
+    # The planning page is bound through the book, never ``bind_alias``.
+    assert not re.search(r"value_concordance\.bind_alias\(", precompile)
+    # An argument binding with no named cell still stands on its call.
+    assert "_frame_call_cells(caller_graph, planned_call.callsite_id)" in shell

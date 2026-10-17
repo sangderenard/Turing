@@ -104,11 +104,13 @@ from .frame_identity_book import (
     _frame_graph_cell as _frame_graph_cell,
     _frame_mint as _frame_mint,
     _frame_post as _frame_post,
+    _frame_register_sequence as _frame_register_sequence,
     _frame_table_cell as _frame_table_cell,
     _frame_value_cell as _frame_value_cell,
     _monotonic_ssa_ids as _monotonic_ssa_ids,
     _post_result_storage_lease as _post_result_storage_lease,
     _rebind_linked_storage_alias as _rebind_linked_storage_alias,
+    _record_field_declaration_cell as _record_field_declaration_cell,
     _result_storage_lease_cell as _result_storage_lease_cell,
 )
 from .frame_storage_roles import (
@@ -457,7 +459,7 @@ def _publish_concorded_output_identities(
 
     from .concordance_declarations import OUTPUT_IDENTITY, OUTPUT_IDENTITY_STAGE
     from .identity_concordance import Mode, current_identity_book
-    from .precompile_to_ssa import _post_derived_or_raw
+    from .precompile_to_ssa import _function_root_cell, _post_derived_or_raw
     from .ssa_record_return_state import identity_cells
 
     book = current_identity_book()
@@ -481,11 +483,14 @@ def _publish_concorded_output_identities(
             )
         if incumbent is None:
             # The output history row derives from the two values it relates:
-            # the alias's and the result's identity cells (raw, as before,
-            # when neither value has a row).
+            # the alias's and the result's identity cells; when neither value
+            # has a row it stands on the function's root, as a mint with no
+            # more specific cell does.
             _post_derived_or_raw(
                 book, OUTPUT_IDENTITY, (str(function.name), alias_id), result_id,
-                identity_cells(function, alias_id, result_id),
+                identity_cells(function, alias_id, result_id) or (
+                    _function_root_cell(book, _frame_book_scope(function)),
+                ),
                 stage=OUTPUT_IDENTITY_STAGE, mode=Mode.REVISE,
             )
         committed[alias_id] = result_id
@@ -897,6 +902,7 @@ def _publish_concordant_function_aliases(
                         "planning concordance transformation "
                         f"{alias_id}->{resident_id}"
                     ),
+                    sources=alias_cells(alias_id, resident_id),
                 )
     if aliases:
         function.metadata["value_aliases"] = aliases
@@ -9286,14 +9292,30 @@ def _field_slot_ops(
                     or {}
                 ).get(nested_schema) or {}
             )
+            from .concordance_declarations import (
+                RECEIVER_NESTED_RECORD_FIELD,
+            )
             from .identity_concordance import current_identity_book
 
-            nested_identity = current_identity_book().page(
-                "receiver_nested_record_field_concordance"
-            ).concord(
-                (sequence_contract_scope, str(canonical_attribute)),
-                str(nested_receipt.get("identity") or nested_schema),
+            # The fact is read out of the declared receiver record's field,
+            # so it derives from that field's ``class_field_declaration``
+            # cell.
+            nested_field_cell = _record_field_declaration_cell(
+                declared_self_record, canonical_attribute,
+                identity=record_identity,
             )
+            nested_identity_fact = str(
+                nested_receipt.get("identity") or nested_schema
+            )
+            _frame_post(
+                RECEIVER_NESTED_RECORD_FIELD,
+                (sequence_contract_scope, str(canonical_attribute)),
+                nested_identity_fact,
+                stage=SHELL_HANDOFF, cells=(nested_field_cell,),
+            )
+            nested_identity = current_identity_book().pages[
+                RECEIVER_NESTED_RECORD_FIELD.name
+            ].latest((sequence_contract_scope, str(canonical_attribute)))
             nested_record_fields.setdefault(
                 slot_of[canonical_attribute],
                 (nested_identity, field_value_id),
@@ -15051,6 +15073,9 @@ def _sequence_column_dtype_contracts(
                 tuple(shape for _name, _dtype, shape in row_columns),
                 dtypes,
                 source="ProgramABI sequence row record",
+                sources=_frame_cells(
+                    _frame_graph_cell(graph_obj, int(sequence_id)),
+                ),
             )
     for binding_name, annotation in dict(
         graph_obj.graph.get("type_annotations") or {}
@@ -17391,6 +17416,8 @@ def _retire_concordant_sequence_aliases(
         SSARecordDescriptor, SSARecordFieldDescriptor,
     )
 
+    from .concordance_declarations import SEQUENCE_DESCRIPTOR
+
     retired = 0
     for symbol, function in all_functions.items():
         sequence_table = all_sequence_tables.get(str(symbol))
@@ -17555,7 +17582,19 @@ def _retire_concordant_sequence_aliases(
                         **accounting,
                         "compiler_frame_sequence_id": int(resident_id),
                     }
-            del sequence_table.sequences[int(stale_id)]
+            # The duplicate is withdrawn by the resident descriptor the
+            # planning concordance proved it to be.
+            sequence_table.sequences.remove(
+                int(stale_id),
+                sources=_frame_cells(
+                    _frame_table_cell(
+                        sequence_table, int(stale_id), SEQUENCE_DESCRIPTOR,
+                    ),
+                    _frame_table_cell(
+                        sequence_table, int(resident_id), SEQUENCE_DESCRIPTOR,
+                    ),
+                ),
+            )
             function.metadata.setdefault(
                 "retired_concordant_sequence_descriptors", []
             ).append((
@@ -17814,6 +17853,7 @@ def _class_surface_ssa_program(
         STORAGE_MINTED_FROM_ABSENCE, STRUCTURAL_FOLD, NAME_BINDING,
         CONTRACT_DEMAND_PAGE, DemandKind, SOURCE_AGGREGATE_LAYOUT,
         SourceAggregateLayout,
+        NUMERAL_LEAF_MATERIALIZATION, PROGRAM_ABI_KEYED_ROW_RECORD,
     )
     from .string_table import StringTable
 
@@ -27024,9 +27064,6 @@ def _class_surface_ssa_program(
     record_parameter_row_handle = access_book.page(
         "record_parameter_row_handle"
     ).mapping(access_scope)
-    record_forwarding_unresolved = access_book.page(
-        "record_forwarding_unresolved_actual"
-    )
 
     def forwarding_caller_side(
         caller_symbol: str, caller_id: int,
@@ -27089,14 +27126,52 @@ def _class_surface_ssa_program(
                     int(caller_id), str(callee_symbol), int(callee_id),
                 ),
             )
+
+            def post_unresolved(fact: Any) -> None:
+                """The unresolved binding stands on the call's own binding
+                cell and on whichever formals' parameter receipts exist."""
+
+                from .concordance_declarations import (
+                    RECORD_FORWARDING_UNRESOLVED_ACTUAL,
+                )
+
+                _frame_post(
+                    RECORD_FORWARDING_UNRESOLVED_ACTUAL, unresolved_row,
+                    fact, stage=RECORD_FORWARDING,
+                    cells=(
+                        *_frame_call_cells(
+                            caller_graph, planned_call.callsite_id,
+                        ),
+                        access_book.latest_ref(
+                            RECORD_PARAMETER_VALUE, (
+                                access_scope,
+                                (str(caller_symbol), int(caller_id)),
+                            ),
+                        ),
+                        access_book.latest_ref(
+                            RECORD_PARAMETER_ROW_HANDLE, (
+                                access_scope,
+                                (str(caller_symbol), int(caller_id)),
+                            ),
+                        ),
+                        access_book.latest_ref(
+                            RECORD_PARAMETER_VALUE, (
+                                access_scope,
+                                (str(callee_symbol), int(callee_id)),
+                            ),
+                        ),
+                    ),
+                    reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
+                )
+
             if callee_key is None:
-                record_forwarding_unresolved.concord(unresolved_row, (
+                post_unresolved((
                     "callee formal is no declared record parameter value",
                     caller_key, None,
                 ))
                 continue
             if caller_key is None:
-                record_forwarding_unresolved.concord(unresolved_row, (
+                post_unresolved((
                     "caller actual is neither a declared record parameter "
                     "value nor a keyed-field row handle on the book",
                     None, callee_key,
@@ -27123,7 +27198,7 @@ def _class_surface_ssa_program(
                 else str(callee_record.get("identity"))
             )
             if str(caller_identity) != str(callee_identity):
-                record_forwarding_unresolved.concord(unresolved_row, (
+                post_unresolved((
                     "bound record identities differ",
                     (caller_key, str(caller_identity)),
                     (callee_key, str(callee_identity)),
@@ -27374,6 +27449,12 @@ def _class_surface_ssa_program(
 
             value_id, resident_id = int(value_id), int(resident_id)
             cells = _frame_cells(_frame_graph_cell(graph, value_id), *cells)
+            # A value the graph has no node for is read from the function's
+            # own ``ssa_value`` cells, the aliased value's and the resident's.
+            cells = cells or _frame_cells(
+                _frame_value_cell(function, value_id),
+                _frame_value_cell(function, resident_id),
+            )
             alias_source_cells[value_id] = cells
             if record_storage_aliases.get(value_id) == resident_id:
                 return
@@ -27381,7 +27462,7 @@ def _class_surface_ssa_program(
                 RECORD_STORAGE_ALIAS,
                 (record_storage_alias_scope, value_id), resident_id,
                 stage=RECORD_ABI_MATERIALIZATION, mode=Mode.REVISE,
-                cells=() if reason is not None else cells,
+                cells=cells,
                 reason=(
                     GRAPH_ID_WITHOUT_CANONICAL_CELL if reason is None
                     else reason
@@ -27948,11 +28029,17 @@ def _class_surface_ssa_program(
                 if not candidates:
                     if not access_receipts and not declared_row_leaf:
                         continue
-                    current_identity_book().page(
-                        "numeral_leaf_materialization_concordance"
-                    ).concord(
+                    # DERIVED(the schema's declaration cell the layout
+                    # requires the leaf from).
+                    _frame_post(
+                        NUMERAL_LEAF_MATERIALIZATION,
                         (str(symbol), str(parameter_name), nested_path),
                         "required_unread_leaf",
+                        stage=RECORD_ABI_MATERIALIZATION, mode=Mode.CONCORD,
+                        cells=_frame_cells(current_identity_book().latest_ref(
+                            CONTRACT_DEMAND_PAGE,
+                            (DemandKind.PARAMETER_RECORD, schema_identity),
+                        )),
                     )
                     # A leaf no read names but the layout requires:
                     # NOVEL(NESTED_RECORD_PART, the schema's declaration cell).
@@ -28809,9 +28896,24 @@ def _class_surface_ssa_program(
                         writable=mutable,
                     ))
             if nested_fields and descriptor_id not in table.records:
-                table.register(SSARecordDescriptor(
-                    int(descriptor_id), schema_identity, tuple(nested_fields),
-                ))
+                # The nested record stands on its authored identity's graph
+                # cell and on the cells of the physical leaves it expands to.
+                table.register(
+                    SSARecordDescriptor(
+                        int(descriptor_id), schema_identity,
+                        tuple(nested_fields),
+                    ),
+                    sources=_frame_cells(
+                        _frame_graph_cell(graph, int(descriptor_id)),
+                        _frame_value_cell(function, int(descriptor_id)),
+                        *(
+                            _frame_value_cell(function, value_id)
+                            for nested_field in nested_fields
+                            for value_id in nested_field.value_ids
+                        ),
+                    ),
+                    stage=RECORD_ABI_MATERIALIZATION,
+                )
 
         def materialize_declared_row_columns(
             schema_name: str,
@@ -28956,11 +29058,15 @@ def _class_surface_ssa_program(
                     writable=leaf_mutable,
                 ))
             for leaf_path, leaf_storage in deferred:
-                current_identity_book().page(
-                    "numeral_leaf_materialization_concordance"
-                ).concord(
+                _frame_post(
+                    NUMERAL_LEAF_MATERIALIZATION,
                     (str(symbol), str(parameter_name), leaf_path),
                     f"declared_row_leaf_deferred:{leaf_storage}",
+                    stage=RECORD_ABI_MATERIALIZATION, mode=Mode.CONCORD,
+                    cells=_frame_cells(current_identity_book().latest_ref(
+                        CONTRACT_DEMAND_PAGE,
+                        (DemandKind.PARAMETER_RECORD, schema_identity),
+                    )),
                 )
                 report(
                     f"record abi: {symbol}: declared row leaf {leaf_path} "
@@ -28979,11 +29085,23 @@ def _class_surface_ssa_program(
                 ),
                 stage=RECORD_ABI_MATERIALIZATION,
             )
-            table.register(SSARecordDescriptor(
-                int(row_record_id), schema_identity, tuple(row_fields),
-            ))
+            # The row record stands on its own minted ``ssa_value`` cell and
+            # on its columns' cells.
+            table.register(
+                SSARecordDescriptor(
+                    int(row_record_id), schema_identity, tuple(row_fields),
+                ),
+                sources=_frame_cells(
+                    _frame_value_cell(function, row_record_id),
+                    *(
+                        _frame_value_cell(function, value_id)
+                        for row_field in row_fields
+                        for value_id in row_field.value_ids
+                    ),
+                ),
+                stage=RECORD_ABI_MATERIALIZATION,
+            )
             from .concordance_declarations import RECORD_DESCRIPTOR, RECORD_FIELD_DECOMPOSITION
-            from .identity_concordance import Mode
             for storage_identity, roles in table_decompositions:
                 _frame_post(RECORD_FIELD_DECOMPOSITION,
                     (table.owner, int(row_record_id), storage_identity), roles,
@@ -29233,7 +29351,10 @@ def _class_surface_ssa_program(
                         # the concordance-authorized completion of a single
                         # provisional descriptor. _BookRows updates all
                         # sequence-member claims for the replacement.
-                        sequence_table.sequences[int(sequence_id)] = sequence
+                        _frame_register_sequence(
+                            function, sequence_table, sequence,
+                            stage=RECORD_ABI_MATERIALIZATION, revise=True,
+                        )
                     if sequence is not None and (
                         (requires_status and sequence.status_address_id is None)
                         or (
@@ -29256,7 +29377,10 @@ def _class_surface_ssa_program(
                                 else sequence.live_flags_value_id
                             ),
                         )
-                        sequence_table.sequences[int(sequence_id)] = sequence
+                        _frame_register_sequence(
+                            function, sequence_table, sequence,
+                            stage=RECORD_ABI_MATERIALIZATION, revise=True,
+                        )
                     if sequence is None:
                         column_ids = (
                             sequence_id,
@@ -29338,7 +29462,8 @@ def _class_surface_ssa_program(
                                 "program_abi_mutable": mutable,
                                 "record_field_sequence_view": True,
                             }
-                        sequence = sequence_table.register(
+                        sequence = _frame_register_sequence(
+                            function, sequence_table,
                             SSASequenceDescriptor(
                                 sequence_id=sequence_id,
                                 column_value_ids=tuple(map(int, column_ids)),
@@ -29362,7 +29487,8 @@ def _class_surface_ssa_program(
                                 ),
                                 capacity_policy=str(capacity_policy),
                                 writable=mutable,
-                            )
+                            ),
+                            stage=RECORD_ABI_MATERIALIZATION,
                         )
                     for member_id, role, fallback_dtype in (
                         (
@@ -29477,15 +29603,26 @@ def _class_surface_ssa_program(
                             (("length_address_id",), length_id),
                             (("capacity_value_id",), length_id),
                         )
-                        current_identity_book().page(
-                            "record_field_decomposition"
-                        ).concord(
+                        from .concordance_declarations import (
+                            RECORD_FIELD_DECOMPOSITION,
+                        )
+
+                        # Derived from the ``ssa_value`` cells of the
+                        # physical parts the roles name (the record-abi
+                        # minter posted each NOVEL).
+                        _frame_post(
+                            RECORD_FIELD_DECOMPOSITION,
                             (
                                 table.owner,
                                 int(record_id),
                                 f"{record['identity']}.{field_name}",
                             ),
                             roles,
+                            stage=RECORD_ABI_MATERIALIZATION,
+                            cells=tuple(
+                                _frame_value_cell(function, part_id)
+                                for _role, part_id in roles
+                            ),
                         )
 
                     # Materialize once per function. A second pass over the
@@ -29684,14 +29821,27 @@ def _class_surface_ssa_program(
                                 f"{field_name}[]", declared_rows,
                             )
                             if row_record_id is not None:
-                                current_identity_book().page(
-                                    "program_abi_keyed_row_record"
-                                ).concord(
+                                # DERIVED(the keyed record's descriptor cell,
+                                # the row record's descriptor cell).
+                                _frame_post(
+                                    PROGRAM_ABI_KEYED_ROW_RECORD,
                                     (
                                         table.owner, int(record_id),
                                         f"{record['identity']}.{field_name}",
                                     ),
                                     int(row_record_id),
+                                    stage=RECORD_ABI_MATERIALIZATION,
+                                    mode=Mode.CONCORD,
+                                    cells=_frame_cells(
+                                        _frame_table_cell(
+                                            table, record_id,
+                                            RECORD_DESCRIPTOR,
+                                        ),
+                                        _frame_table_cell(
+                                            table, row_record_id,
+                                            RECORD_DESCRIPTOR,
+                                        ),
+                                    ),
                                 )
                                 fields.append(SSARecordFieldDescriptor(
                                     f"{field_name}[]",
@@ -29780,19 +29930,23 @@ def _class_surface_ssa_program(
                                     str(field_name) in written_fields
                                 ),
                             }
-                        sequence_table.register(SSASequenceDescriptor(
-                            sequence_id=sequence_id,
-                            column_value_ids=tuple(column_ids),
-                            length_address_id=length_id,
-                            capacity_value_id=capacity_id,
-                            status_address_id=status_id,
-                            column_dtypes=tuple(
-                                str(column.get("dtype") or "unknown")
-                                for column in columns
+                        _frame_register_sequence(
+                            function, sequence_table,
+                            SSASequenceDescriptor(
+                                sequence_id=sequence_id,
+                                column_value_ids=tuple(column_ids),
+                                length_address_id=length_id,
+                                capacity_value_id=capacity_id,
+                                status_address_id=status_id,
+                                column_dtypes=tuple(
+                                    str(column.get("dtype") or "unknown")
+                                    for column in columns
+                                ),
+                                key_columns=(),
+                                writable=bool(mutable),
                             ),
-                            key_columns=(),
-                            writable=bool(mutable),
-                        ))
+                            stage=RECORD_ABI_MATERIALIZATION,
+                        )
                     fields.append(SSARecordFieldDescriptor(
                         str(field_name),
                         SSARecordFieldStorage.SEQUENCE,
@@ -32340,18 +32494,23 @@ def _class_surface_ssa_program(
             "record_field_decomposition"
         )
         if record_table is not None and sequence_table is not None:
+            from .concordance_declarations import RECORD_FIELD_DECOMPOSITION
             for record_id, descriptor in tuple(record_table.records.items()):
                 revised_fields = []
                 changed_descriptor = False
+                # The cells the revised descriptor stands on: the incumbent
+                # descriptor's and each advanced field's decomposition.
+                advance_cells = []
                 for record_field in descriptor.fields:
                     old_sequence_id = record_field.sequence_id
+                    decomposition_row = (
+                        record_table.owner,
+                        int(record_id),
+                        str(record_field.storage_identity),
+                    )
                     decomposition = (
                         None if old_sequence_id is None
-                        else decomposition_page.latest((
-                            record_table.owner,
-                            int(record_id),
-                            str(record_field.storage_identity),
-                        ))
+                        else decomposition_page.latest(decomposition_row)
                     )
                     old_sequence = (
                         None if old_sequence_id is None
@@ -32467,8 +32626,34 @@ def _class_surface_ssa_program(
                                 and int(argument.id) not in consumed
                             ],
                         )
-                        del sequence_table.sequences[int(old_sequence_id)]
-                    sequence_table.register(resident_sequence)
+                        sequence_table.sequences.remove(
+                            int(old_sequence_id),
+                            sources=_frame_cells(
+                                _frame_table_cell(
+                                    sequence_table, int(old_sequence_id),
+                                    SEQUENCE_DESCRIPTOR,
+                                ),
+                                current_identity_book().latest_ref(
+                                    RECORD_FIELD_DECOMPOSITION,
+                                    decomposition_row,
+                                ),
+                                *(
+                                    _frame_value_cell(function, value_id)
+                                    for value_id in resident_members
+                                ),
+                            ),
+                            stage=RECORD_ABI_MATERIALIZATION,
+                        )
+                    _frame_register_sequence(
+                        function, sequence_table, resident_sequence,
+                        current_identity_book().latest_ref(
+                            RECORD_FIELD_DECOMPOSITION, decomposition_row,
+                        ),
+                        stage=RECORD_ABI_MATERIALIZATION,
+                    )
+                    advance_cells.append(current_identity_book().latest_ref(
+                        RECORD_FIELD_DECOMPOSITION, decomposition_row,
+                    ))
                     revised_fields.append(replace(
                         record_field,
                         value_ids=(),
@@ -32476,8 +32661,16 @@ def _class_surface_ssa_program(
                     ))
                     changed_descriptor = True
                 if changed_descriptor:
-                    record_table.records[int(record_id)] = replace(
-                        descriptor, fields=tuple(revised_fields),
+                    record_table.records.assign(
+                        int(record_id),
+                        replace(descriptor, fields=tuple(revised_fields)),
+                        sources=_frame_cells(
+                            _frame_table_cell(
+                                record_table, int(record_id), RECORD_DESCRIPTOR,
+                            ),
+                            *advance_cells,
+                        ),
+                        stage=RECORD_ABI_MATERIALIZATION,
                     )
         if not replacements:
             return
@@ -33690,7 +33883,7 @@ def _class_surface_ssa_program(
                             mapped_sequence_id = remap[
                                 int(source_sequence.sequence_id)
                             ]
-                            caller_sequences.register(SSASequenceDescriptor(
+                            _frame_register_sequence(caller, caller_sequences, SSASequenceDescriptor(
                                 sequence_id=mapped_sequence_id,
                                 column_value_ids=tuple(
                                     remap[int(value_id)]
@@ -33720,6 +33913,10 @@ def _class_surface_ssa_program(
                                 child_table_pool=map_child_pool(
                                     source_sequence.child_table_pool, remap
                                 ),
+                            ), _frame_table_cell(
+                                constructor_sequences,
+                                source_sequence.sequence_id,
+                                SEQUENCE_DESCRIPTOR,
                             ))
                         mapped_fields.append(SSARecordFieldDescriptor(
                             name=field.name,
@@ -35051,7 +35248,9 @@ def _class_surface_ssa_program(
                                 mapped_sequence_id = allocate_result_storage(
                                     int(sequence.sequence_id)
                                 )
-                                caller_result_sequences.register(
+                                _frame_register_sequence(
+                                    all_functions[caller_symbol],
+                                    caller_result_sequences,
                                     SSASequenceDescriptor(
                                         sequence_id=mapped_sequence_id,
                                         column_value_ids=tuple(
@@ -35091,7 +35290,12 @@ def _class_surface_ssa_program(
                                             sequence.child_table_pool,
                                             result_storage_bindings,
                                         ),
-                                    )
+                                    ),
+                                    _frame_table_cell(
+                                        callee_result_sequences,
+                                        sequence.sequence_id,
+                                        SEQUENCE_DESCRIPTOR,
+                                    ),
                                 )
                         mapped_value_ids = tuple(
                             allocate_result_storage(
@@ -35739,7 +35943,7 @@ def _class_surface_ssa_program(
             cells = _frame_cells(
                 formal_cell, source_cell, lease_cell,
                 *binding_cells.get(recorded_value_id, ()),
-            )
+            ) or _frame_call_cells(caller_graph, planned_call.callsite_id)
             _frame_post(
                 ARGUMENT_BINDING,
                 (
@@ -38305,7 +38509,8 @@ def _class_surface_ssa_program(
                                 sequence_id
                             )
                             mapped_sequences[sequence_id] = mapped_sequence_id
-                            caller_sequence_table.register(
+                            _frame_register_sequence(
+                                caller, caller_sequence_table,
                                 SSASequenceDescriptor(
                                     sequence_id=mapped_sequence_id,
                                     column_value_ids=tuple(
@@ -38346,7 +38551,11 @@ def _class_surface_ssa_program(
                                         sequence.child_table_pool,
                                         result_storage_bindings,
                                     ),
-                                )
+                                ),
+                                _frame_table_cell(
+                                    callee_sequence_table, sequence_id,
+                                    SEQUENCE_DESCRIPTOR,
+                                ),
                             )
                             return mapped_sequence_id
 
@@ -45346,7 +45555,7 @@ def _class_surface_ssa_program(
                         # claim than deciding what the right dtype would
                         # have been.
                         continue
-                    caller_sequences.register(SSASequenceDescriptor(
+                    _frame_register_sequence(caller, caller_sequences, SSASequenceDescriptor(
                         sequence_id=mapped_sequence_id,
                         column_value_ids=mapped_columns,
                         length_address_id=frame_map[int(
@@ -45369,6 +45578,9 @@ def _class_surface_ssa_program(
                         capacity_policy=descriptor.capacity_policy,
                         writable=bool(descriptor.writable),
                         child_table_pool=map_child_pool(pool, frame_map),
+                    ), _frame_table_cell(
+                        callee_sequences, descriptor.sequence_id,
+                        SEQUENCE_DESCRIPTOR,
                     ))
                     callee_bounds = dict(
                         callee.metadata.get(
@@ -45559,10 +45771,19 @@ def _class_surface_ssa_program(
                                 field.name: field
                                 for field in propagated.fields
                             }
+                            from .concordance_declarations import (
+                                RECORD_FIELD_STORAGE,
+                            )
+
                             refined_fields = []
                             refined = False
-                            storage_concordance = current_identity_book().page(
-                                "record_field_storage_concordance"
+                            # The refinement stands on the caller's resident
+                            # descriptor and the callee descriptor that
+                            # proved the field's storage.
+                            refinement_cells = []
+                            callee_descriptor_cell = _frame_table_cell(
+                                callee_records, int(descriptor.record_id),
+                                RECORD_DESCRIPTOR,
                             )
                             for resident in existing.fields:
                                 incoming = incoming_by_name.get(resident.name)
@@ -45588,14 +45809,23 @@ def _class_surface_ssa_program(
                                         int(caller_record_id),
                                         str(resident.storage_identity),
                                     )
-                                    history = storage_concordance.history(row)
-                                    column = history[-1][0] + 1 if history else 0
-                                    storage_concordance.set(row, column, {
-                                        "from": resident.storage.value,
-                                        "to": incoming.storage.value,
-                                        "sequence_id": incoming.sequence_id,
-                                        "record_id": incoming.record_id,
-                                    })
+                                    refinement_cells.append(_frame_post(
+                                        RECORD_FIELD_STORAGE, row, {
+                                            "from": resident.storage.value,
+                                            "to": incoming.storage.value,
+                                            "sequence_id": incoming.sequence_id,
+                                            "record_id": incoming.record_id,
+                                        },
+                                        stage=FRAME_LINK, mode=Mode.REVISE,
+                                        cells=(
+                                            _frame_table_cell(
+                                                caller_records,
+                                                int(caller_record_id),
+                                                RECORD_DESCRIPTOR,
+                                            ),
+                                            callee_descriptor_cell,
+                                        ),
+                                    ))
                                     refined_fields.append(incoming)
                                     refined = True
                                 else:
@@ -45607,9 +45837,18 @@ def _class_surface_ssa_program(
                                     tuple(refined_fields),
                                     existing.instance_pool,
                                 )
-                                caller_records.records[
-                                    int(caller_record_id)
-                                ] = existing
+                                caller_records.records.assign(
+                                    int(caller_record_id), existing,
+                                    sources=_frame_cells(
+                                        _frame_table_cell(
+                                            caller_records,
+                                            int(caller_record_id),
+                                            RECORD_DESCRIPTOR,
+                                        ),
+                                        *refinement_cells,
+                                    ),
+                                    stage=FRAME_LINK,
+                                )
                             existing_fields = {
                                 field.name: field for field in existing.fields
                             }
@@ -46170,7 +46409,7 @@ def _class_surface_ssa_program(
                     ):
                         continue
                     if caller_sequences.by_id(mapped_sequence_id) is None:
-                        caller_sequences.register(SSASequenceDescriptor(
+                        _frame_register_sequence(caller, caller_sequences, SSASequenceDescriptor(
                             sequence_id=mapped_sequence_id,
                             column_value_ids=mapped_columns,
                             length_address_id=frame_map[int(
@@ -46195,6 +46434,9 @@ def _class_surface_ssa_program(
                             capacity_policy=descriptor.capacity_policy,
                             writable=bool(descriptor.writable),
                             child_table_pool=map_child_pool(pool, frame_map),
+                        ), _frame_table_cell(
+                            callee_sequences, descriptor.sequence_id,
+                            SEQUENCE_DESCRIPTOR,
                         ))
                         sequence_propagation_changed = True
                     callee_bounds = dict(callee.metadata.get(

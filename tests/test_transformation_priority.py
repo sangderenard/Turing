@@ -113,3 +113,27 @@ def test_repeated_rejection_is_found_by_its_book_key_at_scale():
         "distinct_owner", ("first", 7),
     )) == count + 7
     assert elapsed < 10.0, elapsed
+
+
+def test_ledger_rows_are_sourced_without_the_proposer_naming_cells():
+    """A decision stands on the incumbent decision it supersedes (its first
+    claim, with no proof cell on the book, is the chain's NOVEL root); an
+    event stands on the decision cell it records; a rejection stands on the
+    retained decision.  No row is a raw primitive."""
+    ledger = frame_transformation_ledger()
+    book = ledger.book
+    identity = ("caller", 9, "callee", 1)
+    assert ledger.propose(identity, "linked_record_member", "p1", after=4)
+    first = ledger.decision_cell(identity)
+    assert ledger.propose(identity, "distinct_owner", "p2", after=20)
+    second = ledger.decision_cell(identity)
+    assert not ledger.propose(identity, "linked_record_member", "p1", after=4)
+    sources = lambda ref: {src.key for src, _ in book.edges_into(ref)}
+    assert not sources(first)  # NOVEL root: a mint row, no inbound edge
+    assert first.key in sources(second)
+    event_page = book.page("transformation_event")
+    refs = [book.latest_ref(book.registry.pages["transformation_event"], row)
+            for row in event_page.scope_rows(ledger.scope)]
+    assert sources(refs[0]) == {first.key}
+    assert sources(refs[1]) == {second.key}
+    assert sources(refs[2]) == {second.key}

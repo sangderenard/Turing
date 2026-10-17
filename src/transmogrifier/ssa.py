@@ -591,6 +591,7 @@ class SSARecordTable:
         *,
         owner: Any = None,
         book: Any = None,
+        copied_from: "SSARecordTable | None" = None,
     ) -> None:
         from ..compiler.identity_concordance import current_identity_book
 
@@ -609,7 +610,20 @@ class SSARecordTable:
             ),
         )
         for record_id, descriptor in dict(records or {}).items():
-            self.records[int(record_id)] = descriptor
+            # A copy stands on the descriptor cell it copies.
+            copied = (
+                None if copied_from is None
+                else self.book.latest_ref(
+                    self.book.registry.page("record_descriptor"),
+                    (copied_from.owner, int(record_id)),
+                )
+            )
+            if copied is None:
+                self.records[int(record_id)] = descriptor
+            else:
+                self.records.assign(
+                    int(record_id), descriptor, sources=(copied,),
+                )
 
     def member_claims(self, value_id: int) -> tuple:
         """Every (record id, field name, storage identity, role) naming
@@ -631,6 +645,7 @@ class SSARecordTable:
     def __deepcopy__(self, memo: dict) -> "SSARecordTable":
         return SSARecordTable(
             dict(self.records), owner=self.owner[0], book=self.book,
+            copied_from=self,
         )
 
     def __reduce__(self):
@@ -2269,6 +2284,7 @@ class SSASequenceTable:
         *,
         owner: Any = None,
         book: Any = None,
+        copied_from: "SSASequenceTable | None" = None,
     ) -> None:
         from ..compiler.identity_concordance import current_identity_book
 
@@ -2287,7 +2303,20 @@ class SSASequenceTable:
             ),
         )
         for sequence_id, descriptor in dict(sequences or {}).items():
-            self.sequences[int(sequence_id)] = descriptor
+            # A copy stands on the descriptor cell it copies.
+            copied = (
+                None if copied_from is None
+                else self.book.latest_ref(
+                    self.book.registry.page("sequence_descriptor"),
+                    (copied_from.owner, int(sequence_id)),
+                )
+            )
+            if copied is None:
+                self.sequences[int(sequence_id)] = descriptor
+            else:
+                self.sequences.assign(
+                    int(sequence_id), descriptor, sources=(copied,),
+                )
 
     def member_claims(self, value_id: int) -> tuple:
         """Every (sequence id, role) naming ``value_id``, read from the book."""
@@ -2397,6 +2426,7 @@ class SSASequenceTable:
     def __deepcopy__(self, memo: dict) -> "SSASequenceTable":
         return SSASequenceTable(
             dict(self.sequences), owner=self.owner[0], book=self.book,
+            copied_from=self,
         )
 
     def __reduce__(self):

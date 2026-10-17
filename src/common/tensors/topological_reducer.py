@@ -4486,6 +4486,18 @@ def _normalize_lexical_values(
                     and member.id in known_class_identities
                 ):
                     class_identities.append(member.id)
+                elif (
+                    member is annotation_expression
+                    and isinstance(member, ast.Name)
+                    and member.id in primitive_class_identities
+                ):
+                    # A bare primitive annotation (``x: str``) declares the
+                    # local's class exactly; a ``T | None`` union does not
+                    # (the None arm has no single class), so it is not
+                    # admitted here.
+                    class_identities.append(
+                        primitive_class_identities[member.id]
+                    )
                 else:
                     valid_class_annotation = False
                     break
@@ -7477,6 +7489,30 @@ def _normalize_lexical_values(
                         ),
                         stage=_REDUCER_FIELD_WRITE,
                     )
+                if (
+                    expression.attr == "__name__"
+                    and isinstance(expression.value, ast.Call)
+                    and isinstance(expression.value.func, ast.Name)
+                    and expression.value.func.id == "type"
+                    and len(expression.value.args) == 1
+                    and not expression.value.keywords
+                ):
+                    # ``type(x).__name__`` is a ``str`` by the data model:
+                    # the class of the attribute value does not depend on
+                    # what ``x`` is.
+                    type_name_cell = node_identity_cell(
+                        graph, int(attribute_id),
+                    )
+                    _concord_source_value_class(
+                        value_class_scope,
+                        int(attribute_id),
+                        "str",
+                        source="type(x).__name__ result",
+                        provenance=(
+                            _Derived((type_name_cell,))
+                            if type_name_cell is not None else None
+                        ),
+                    )
                 return attribute_id
 
         if isinstance(expression, ast.Call):
@@ -8371,7 +8407,9 @@ def _normalize_lexical_values(
                 isinstance(expression.slice, ast.Slice)
                 and isinstance(base_class_fact, tuple)
                 and base_class_fact
-                and str(base_class_fact[0]) == "str"
+                and _canonical_source_class_identity(
+                    base_class_fact[0]
+                ) == "builtins.str"
             ):
                 # Slicing an authored string produces another resident string
                 # sequence.  Carry the exact source-value class across the
@@ -10146,6 +10184,26 @@ def _normalize_lexical_values(
                     glyph_cell = book.latest_ref(
                         _SOURCE_GLYPH_SEQUENCE, row,
                     )
+                if glyph_cell is not None:
+                    # A JoinedStr and ``str(x)`` evaluate to a ``str`` by
+                    # Python's own semantics; their authored glyph recipe is
+                    # the producer.  Record the class the way every other
+                    # string producer does (the string slice above), so a
+                    # consumer f-string takes the existing string_token path.
+                    _concord_source_value_class(
+                        value_class_scope,
+                        int(node_id),
+                        "str",
+                        source=(
+                            "builtins.str call result"
+                            if lone_string_projection
+                            else "authored joined string result"
+                        ),
+                        provenance=_Derived(tuple(
+                            cell for cell in (glyph_cell, joined_cell)
+                            if cell is not None
+                        )),
+                    )
                 # A formatted scalar is an ordinary call to the authored
                 # decimal formatter.  Its graph identity derives from the
                 # exact glyph recipe cell; the callee address is the exact
@@ -10374,6 +10432,21 @@ def _normalize_lexical_values(
                         "sequence_element_dtypes": ("int64",),
                         "source_glyph_component": (row, int(ordinal)),
                     })
+        if lone_string_projection and node_id in graph.G:
+            # ``str(x)`` evaluates to a ``str`` whether or not its argument
+            # has a glyph recipe: the class is the builtin's own result
+            # class, recorded on the call like ``len``'s ``int``.
+            str_call_cell = node_identity_cell(graph, int(node_id))
+            _concord_source_value_class(
+                value_class_scope,
+                int(node_id),
+                "str",
+                source="builtins.str call result",
+                provenance=(
+                    _Derived((str_call_cell,))
+                    if str_call_cell is not None else None
+                ),
+            )
         if (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Name)

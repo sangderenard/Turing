@@ -189,6 +189,12 @@ class ControlSequenceMutation(TiledObject):
     # only consume the sequence operations named by this source cell.
     source_contract_cell: Any = None
     vocabulary_contract_cell: Any = None
+    # The ``glyph_sequence_step`` cell of this one step of a compiler-authored
+    # glyph composition, derived from ``source_contract_cell``.  Like a
+    # scalar write's ``field_state_cell`` it owns the step's control block,
+    # so a ``clear`` and its ``extend`` steps (one effect node) are rows of
+    # their own rather than revisions of one.
+    step_cell: Any = None
     # Native ``list.sort`` options retained from the authored call.  Mapping
     # ``__getitem__`` keys use ``argument_value_ids`` plus
     # ``argument_kind == "sort_key_mapping_getitem"``; a direct row
@@ -1173,7 +1179,11 @@ def _describe_control_block(
             block.extraction_identity,
         )
     elif isinstance(block, SequenceMutationBlock):
-        owner = cell(block.mutation.effect_node_id)
+        owner = (
+            block.mutation.step_cell
+            if isinstance(block.mutation.step_cell, Ref)
+            else cell(block.mutation.effect_node_id)
+        )
         extra = (str(block.mutation.operator),)
     elif isinstance(block, ScalarFieldWriteBlock):
         owner = (

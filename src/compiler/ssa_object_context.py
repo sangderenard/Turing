@@ -1179,9 +1179,11 @@ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_obj
                           if value.dtype == 'ptr' or value.shape)})
         _publish_generated_helper(function)
         module.functions[name] = function
+        from .frame_identity_book import _frame_register_sequence
+
         table = SSASequenceTable(owner=name)
-        table.register(context.objects)
-        table.register(context.members)
+        _frame_register_sequence(function, table, context.objects)
+        _frame_register_sequence(function, table, context.members)
         module.sequence_tables[name] = table
         returned = [instruction.args[0] for block in function.blocks.values()
                     for instruction in block.instrs if instruction.op == 'Ret' and instruction.args]

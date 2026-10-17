@@ -5215,7 +5215,13 @@ class IdentityBook:
         #: OPEN admits ``Unsourced`` posts and raw primitive writes (tagging
         #: each on the unsourced page); CLOSED refuses both.  Closing it is
         #: the proof that no writer bypasses ``post``.
-        self.latch: Latch = Latch.OPEN
+        import os
+
+        self.latch: Latch = (
+            Latch.CLOSED
+            if os.environ.get(LATCH_ENV, "").strip().lower() == "closed"
+            else Latch.OPEN
+        )
         #: When a pass sets this, raw writes made while it is set are tagged
         #: with that stage instead of ``RAW_STAGE``.
         self.active_stage: Stage | None = None
@@ -6354,6 +6360,12 @@ PROVEN_SHAPE_STAGE = declare_stage("proven_shape")
 PROVEN_SHAPE_SOURCE_NOT_ON_BOOK = declare_reason(
     "proven_shape_source_not_on_book"
 )
+#: A resident sequence's element layout, committed from the cells the
+#: caller read it from; ``..._NOT_ON_BOOK`` is a layout with no such cell.
+SEQUENCE_ROW_LAYOUT_STAGE = declare_stage("sequence_row_layout")
+SEQUENCE_ROW_LAYOUT_SOURCE_NOT_ON_BOOK = declare_reason(
+    "sequence_row_layout_source_not_on_book"
+)
 #: A shape edge whose source identity has no changed state cell on the book
 #: (the source is a graph identity the caller read off the graph).
 SHAPE_SOURCE_NOT_ON_BOOK = declare_reason("shape_source_not_on_book")
@@ -6665,14 +6677,22 @@ def invalidate_sequence_row_layout(
     a fact the transformation graph no longer supports.
     """
 
-    page = current_identity_book().page("sequence_row_layout_concordance")
+    book = current_identity_book()
+    page = book.page("sequence_row_layout_concordance")
     row = (_shape_key(scope), int(sequence_id))
     incumbent = page.latest(row)
     if incumbent is None:
         return
     fact = ("invalidated", source_id, str(reason))
     if incumbent != fact:
-        page.revise(row, fact)
+        # The withdrawal stands on the shape state that was superseded.
+        state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
+        _post_or_unsourced(
+            book, book.registry.page("sequence_row_layout_concordance"),
+            row, fact, book.registry.declare_stage(str(reason)),
+            () if state_ref is None else (state_ref,),
+            SEQUENCE_ROW_LAYOUT_SOURCE_NOT_ON_BOOK,
+        )
 
 
 def commit_sequence_row_layout(
@@ -6683,8 +6703,13 @@ def commit_sequence_row_layout(
     *,
     source: str,
     page: IdentityPage | None = None,
+    sources: Iterable[Ref] = (),
 ) -> SequenceRowLayout:
     """Commit an element layout reached through the transformation graph.
+
+    The row is posted DERIVED from ``sources`` (the cells the caller read the
+    layout from) and the shape-state cell of the same row; a layout with
+    neither is recorded ``Unsourced``.
 
     This is a direct identity-book row, not an id-keyed cache.  Producers
     publish the layout on the resident sequence identity they proved, and
@@ -6744,13 +6769,28 @@ def commit_sequence_row_layout(
         resolved_dtypes = tuple(merged)
     resolved = SequenceRowLayout(shapes, resolved_dtypes)
     row = (scope, sid)
-    history = page.history(row)
-    column = history[-1][0] + 1 if history else 0
-    page.set(row, column, (
+    fact = (
         resolved.column_shapes,
         resolved.column_dtypes,
         str(source),
-    ))
+    )
+    book = page.book
+    if book is None:
+        history = page.history(row)
+        column = history[-1][0] + 1 if history else 0
+        page.set(row, column, fact)
+        return resolved
+    _post_or_unsourced(
+        book, book.registry.page("sequence_row_layout_concordance"), row,
+        fact, SEQUENCE_ROW_LAYOUT_STAGE,
+        tuple(dict.fromkeys(
+            cell for cell in (
+                *sources, book.latest_ref(SHAPE_STATE_PAGE, row),
+            )
+            if isinstance(cell, Ref)
+        )),
+        SEQUENCE_ROW_LAYOUT_SOURCE_NOT_ON_BOOK,
+    )
     return resolved
 
 
@@ -8263,6 +8303,9 @@ def row_value_id(row: Any) -> int | None:
     return None
 
 
+#: ``closed`` closes every new book: a raw write, or a post that names no
+#: source, is refused at the line that makes it.
+LATCH_ENV = "TURING_IDENTITY_LATCH"
 LOG_LEVEL_ENV = "TURING_IDENTITY_LOG_LEVEL"
 LOG_PRESET_ENV = "TURING_IDENTITY_LOG_LZMA_PRESET"
 #: Longest fact text a FACTS-level row keeps before the length marker.

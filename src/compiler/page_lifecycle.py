@@ -106,6 +106,7 @@ REPAIRS = "pre-native-repairs"
 EMISSION = "emission"
 
 PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
+    "glyph_sequence_step": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "graph_math_output": PageLifecycle(LOWERING, EMISSION, EMISSION),
     "abstract_tensor_program_value": PageLifecycle(LOWERING, None, LOWERING),
     "aggregate_ledger": PageLifecycle(LOWERING, LOWERING, LOWERING),
@@ -244,6 +245,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "proven_shape": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "pruned_callee_formal_concordance": PageLifecycle(None, REPAIRS, REPAIRS),
     "receiver_field_slot_read": PageLifecycle(FUNCTIONS, LOWERING, LOWERING),
+    "receiver_nested_record_field_concordance": PageLifecycle(None, LOWERING, LOWERING),
     "record_descriptor": PageLifecycle(None, REPAIRS, REPAIRS),
     "record_descriptor_merge": PageLifecycle(None, LOWERING, LOWERING),
     "record_field_access": PageLifecycle(LOWERING, LOWERING, LOWERING),

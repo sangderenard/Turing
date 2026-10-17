@@ -1094,6 +1094,12 @@ def _post_region_signature(
             )
             if cell is not None and cell not in sources:
                 sources.append(cell)
+    if not sources:
+        # A region of a lowering with no lexical read scope (a fused or
+        # planned region) or whose values have no canonical cell stands on
+        # its control function's root, as ``fresh_value`` does for a mint
+        # with no more specific cell.
+        sources.append(_function_root_cell(book, scope))
     return _post_derived_or_raw(
         book, REGION_SIGNATURE, row, fact, tuple(sources),
         stage=CONTROL_SSA_REGION, mode=Mode.CONCORD,
@@ -1113,6 +1119,39 @@ def _function_root_cell(book: Any, scope: Any) -> Ref:
         stage=CONTROL_SSA_ENTRY,
         provenance=Novel(CONTROL_FUNCTION_ROOT, ()),
         mode=Mode.CONCORD,
+    )
+
+
+def _bind_planning_alias(
+    page: Any, scope: Any, alias: int, resident: int, sources: Any = (),
+    *, root_scope: Any = None,
+) -> None:
+    """``IdentityPage.bind_alias`` through the book: REVISE
+    ``planning_value_concordance`` row ``(scope, alias)`` DERIVED from
+    ``sources`` (the graph cells the caller read), the planning rows the
+    resident already resolves through, else the control function's root
+    (``root_scope``, the lowering's ``name@control:N``).  A page the book does not own (a standalone planning page) keeps
+    the page's own ``bind_alias``."""
+
+    from .concordance_declarations import PLANNING_RESIDENCY, PLANNING_VALUE
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    if book.pages.get(page.name) is not page:
+        page.bind_alias(scope, alias, resident)
+        return
+    cells = [cell for cell in (sources or ()) if isinstance(cell, Ref)]
+    cell = book.latest_ref(PLANNING_VALUE, (scope, int(resident)))
+    if cell is not None and cell not in cells:
+        cells.append(cell)
+    if not cells:
+        cells.append(_function_root_cell(
+            book, scope if root_scope is None else root_scope,
+        ))
+    book.post(
+        PLANNING_VALUE, (scope, int(alias)), int(resident),
+        stage=PLANNING_RESIDENCY, provenance=Derived(tuple(cells)),
+        mode=Mode.REVISE,
     )
 
 
@@ -1409,6 +1448,15 @@ def _post_planned_region_identities(
             # plan's min/max fold) posted no record, and the row says so
             # rather than calling it adopted.
             minted = has_flag(int(value.id), MINTED)
+            if source is None:
+                # No canonical cell: the value is the region's own (a planned
+                # or fused region, or a plan-minted id) and stands on the
+                # region's signature cell, else on the control function's
+                # root -- the rule ``_post_region_signature`` applies.
+                source = (
+                    signature_cell if isinstance(signature_cell, Ref)
+                    else _function_root_cell(book, scope)
+                )
             book.post(
                 SSA_VALUE, row,
                 SSAValueFact(
@@ -1417,11 +1465,7 @@ def _post_planned_region_identities(
                     else SSAValueOrigin.ADOPTED_GRAPH_ID,
                 ),
                 stage=CONTROL_SSA_REGION,
-                provenance=(
-                    Derived((source,)) if source is not None
-                    else Unsourced(REGION_VALUE_MINT_UNRECORDED) if minted
-                    else Unsourced(GRAPH_ID_WITHOUT_CANONICAL_CELL)
-                ),
+                provenance=Derived((source,)),
                 mode=Mode.REVISE,
             )
     if not isinstance(signature_cell, Ref):
@@ -4399,6 +4443,20 @@ class _ControlSSABuilder(TiledObject):
         self._bind(value_id, value, BindingKind.REGION_RESULT, *producer)
         return value
 
+    def _declaring_region_cell(self, value_id: int) -> Ref | None:
+        """The ``region_signature`` cell of the first region whose feeds or
+        outputs name ``value_id``, when one is on the book: the control
+        program's own declaration of the id."""
+
+        for region_index, (feeds, outputs) in self.region_signatures.items():
+            if int(value_id) in outputs or int(value_id) in feeds:
+                cell = self._declared_cell(
+                    REGION_SIGNATURE.name, (self._scope(), int(region_index)),
+                )
+                if cell is not None:
+                    return cell
+        return None
+
     def _producing_region_cell(self, value_id: int) -> Ref | None:
         """The ``region_signature`` cell of the region whose outputs name
         ``value_id``, when one is on the book."""
@@ -5406,13 +5464,31 @@ class _ControlSSABuilder(TiledObject):
             SSAValueOrigin.ADOPTED_GRAPH_ID,
         )
         sources = self._cells(self._canonical_cell(value.id), *cells)
+        if not sources and has_flag(int(value.id), MINTED):
+            # A minted id is no graph id and never has a canonical cell (a
+            # sequence handle, a record part): it stands on the sequence's
+            # contract cell when it is one, else on the function root, as
+            # ``fresh_value`` does for a mint.
+            fact = SSAValueFact(
+                value.dtype, tuple(value.shape or ()), SSAValueOrigin.MINTED,
+            )
+            sources = self._cells(
+                self._sequence_contract_cell(int(value.id)),
+            ) or (self._function_root(),)
+        if not sources:
+            # A graph id the reducer never saw in this lowering (no lexical
+            # read scope: a fused or planned control program) is declared by
+            # the control program itself: it stands on the ``region_signature``
+            # cell of the region that names it as a feed or output, else on
+            # the function root -- the rule ``_post_region_signature`` applies
+            # to the region.
+            sources = self._cells(
+                self._declaring_region_cell(int(value.id)),
+            ) or (self._function_root(),)
         ref = book.post(
             SSA_VALUE, row, fact,
             stage=self._stage(stage),
-            provenance=(
-                Derived(sources) if sources
-                else Unsourced(GRAPH_ID_WITHOUT_CANONICAL_CELL)
-            ),
+            provenance=Derived(sources),
             mode=Mode.REVISE,
         )
         self.ssa_value_objects[int(value.id)] = value
@@ -16126,7 +16202,9 @@ class _ControlSSABuilder(TiledObject):
             tuple(named_returns), tuple(parameter_value_names), tuple(returned),
         )
         sequence_table = SSASequenceTable(owner=self.function_name)
-        for descriptor in self.sequence_descriptors.values():
+
+        def register_sequence(table, descriptor):
+            # A descriptor stands on the cells of the values it names.
             source_cells = self._cells(
                 self._sequence_contract_cell(int(descriptor.sequence_id)),
                 *(
@@ -16143,11 +16221,14 @@ class _ControlSSABuilder(TiledObject):
                     if value_id is not None
                 ),
             )
-            sequence_table.register(
+            return table.register(
                 descriptor,
                 sources=source_cells or (self._function_root(),),
                 stage=self._stage(),
             )
+
+        for descriptor in self.sequence_descriptors.values():
+            register_sequence(sequence_table, descriptor)
         function = Function(
                 self.function_name,
                 self.arguments,
@@ -16305,8 +16386,8 @@ class _ControlSSABuilder(TiledObject):
             function.metadata['source_object_constructors'] = tuple(self.native_object_constructor_receipts)
             function.metadata['native_object_type_tests'] = tuple(self.native_object_type_test_receipts)
             function.metadata['native_object_requires_member_storage'] = self.native_object_requires_member_storage
-            function.metadata['sequence_table'].register(context.objects)
-            function.metadata['sequence_table'].register(context.members)
+            register_sequence(function.metadata['sequence_table'], context.objects)
+            register_sequence(function.metadata['sequence_table'], context.members)
             from .ssa_object_context import context_values
             function.metadata['sequence_array_argument_ids'] = tuple(dict.fromkeys((
                 *function.metadata['sequence_array_argument_ids'],
@@ -17249,6 +17330,7 @@ def _inject_field_slot_access(
     field_dtypes: Mapping[int, str] | None = None,
     separate_field_storage: bool = False,
     field_accounting: Mapping[int, Mapping[str, Any]] | None = None,
+    receiver_accounting: Mapping[str, Any] | None = None,
     field_write_state_cells: tuple[Any, ...] = (),
     lexical_read_scope: Any = None,
 ) -> tuple[Function, dict[int, tuple[int, int, str]]]:
@@ -17358,7 +17440,11 @@ def _inject_field_slot_access(
             shape=(len(slots_by_column[key]),),
             accounting=(
                 dict((field_accounting or {}).get(int(key[1]), {}))
-                if key[1] is not None else {}
+                # A shared receiver column holds several slots, so no single
+                # field names it; it is still the authored ``self`` formal.
+                # Declare that (``program_abi_parameter``) instead of leaving
+                # the formal with no parameter, ABI or frame claim at all.
+                if key[1] is not None else dict(receiver_accounting or {})
             ),
         )
     field_locations = {
@@ -20206,8 +20292,10 @@ def lower_control_sections_to_ssa(
                     f"already resolves to {incumbent}, operand resolves to "
                     f"{resident_root}"
                 )
-            value_concordance.bind_alias(
-                control_name, alias_id, resident_root
+            _bind_planning_alias(
+                value_concordance, control_name, alias_id, resident_root,
+                (_graph_cell(alias_id), _graph_cell(resident_root)),
+                root_scope=tensor_shape_concordance_scope,
             )
     alias_neighbors: dict[int, set[int]] = {}
     for left, right in control.value_aliases:
@@ -20268,8 +20356,11 @@ def lower_control_sections_to_ssa(
         if value_concordance.latest(
             (control_name, int(alias_id))
         ) != int(resident_id):
-            value_concordance.bind_alias(
-                control_name, int(alias_id), int(resident_id)
+            _bind_planning_alias(
+                value_concordance, control_name, int(alias_id),
+                int(resident_id),
+                (_graph_cell(alias_id), _graph_cell(resident_id)),
+                root_scope=tensor_shape_concordance_scope,
             )
 
     def bind_resident(alias_id: int, resident_id: int) -> None:
@@ -20292,8 +20383,10 @@ def lower_control_sections_to_ssa(
                 f"{control_name!r}: alias {alias_id} already resolves to "
                 f"{alias_root}, cannot bind it to {resident_root}"
             )
-        value_concordance.bind_alias(
-            control_name, alias_id, resident_root
+        _bind_planning_alias(
+            value_concordance, control_name, alias_id, resident_root,
+            (_graph_cell(alias_id), _graph_cell(resident_root)),
+            root_scope=tensor_shape_concordance_scope,
         )
         region_value_aliases[alias_id] = resident_root
 
@@ -21520,13 +21613,17 @@ def lower_control_sections_to_ssa(
                 if region_dtype_page.latest(row) != str(result.dtype):
                     # REVISE DERIVED(the value's canonical cell, the
                     # incumbent dtype cell): a later region's different
-                    # dtype is a retype the audit sees.
+                    # dtype is a retype the audit sees.  A value with
+                    # neither (a planned region's own result) stands on the
+                    # control function's root, as its region signature does.
                     _post_derived_or_raw(
                         _book(), REGION_VALUE_DTYPE, row, str(result.dtype),
-                        (
+                        tuple(cell for cell in (
                             _book().latest_ref(REGION_VALUE_DTYPE, row),
                             _graph_cell(result.id),
-                        ),
+                        ) if cell is not None) or (_function_root_cell(
+                            _book(), str(tensor_shape_concordance_scope),
+                        ),),
                         stage=CONTROL_SSA_REGION, mode=Mode.REVISE,
                     )
             effective_captures = _split_region_captures_by_binding(
@@ -22305,6 +22402,13 @@ def lower_control_sections_to_ssa(
             field_dtypes=scalar_slot_dtypes,
             separate_field_storage=bool(declared_contracts),
             field_accounting=scalar_field_accounting,
+            receiver_accounting=(
+                {
+                    "program_abi_record": str(record_identity),
+                    "program_abi_parameter": "self",
+                }
+                if record_identity is not None else None
+            ),
         )
         # Field injection rebuilds the function but preserves its sequence
         # metadata, so refresh the table/function correlation after rewriting.
@@ -22472,15 +22576,13 @@ def lower_control_sections_to_ssa(
                 if str(receipt.get("identity") or "")
                 == str(record_identity or "")
             ), {})
-            schema_row = declared_record.get("source_record_view_schema")
+            from .frame_identity_book import _record_field_declaration_cell
+
             declaration_cells = tuple(
-                book.latest_ref(
-                    CLASS_FIELD_DECLARATION,
-                    (*tuple(schema_row), str(field.name)),
+                _record_field_declaration_cell(
+                    declared_record, field.name, identity=record_identity,
                 )
                 for field in record_fields
-                if isinstance(schema_row, (tuple, list))
-                and len(schema_row) == 2
             )
             value_scope = control_function.metadata.get(
                 "tensor_shape_concordance_scope"

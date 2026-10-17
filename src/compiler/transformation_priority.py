@@ -91,43 +91,48 @@ class TransformationLedger:
     def _decision(self, identity: Hashable):
         return self._decision_page.latest((self.scope, identity))
 
-    def _record_event(self, event: dict, sources: tuple = ()) -> None:
+    def _record_event(self, event: dict, decision) -> None:
+        """One event row, DERIVED from the decision cell it records (the
+        accepted decision just written, or the incumbent a rejection lost
+        to)."""
+
         self._write(
             "transformation_event", (self.scope, len(self.events)), event,
-            sources, concord=True,
+            (decision,) if decision is not None else (), concord=True,
         )
 
     def _write(self, page_name: str, row: tuple, fact, sources: tuple, *,
-               concord: bool) -> None:
-        """One ledger write: through ``IdentityBook.post`` DERIVED(sources)
-        when the proposer named its source cells (concordance step 7), else
-        the raw primitive as before.  ``transformation_decision`` is a
-        REVISE row; events and rejections are CONCORD rows."""
+               concord: bool):
+        """One ledger write, through ``IdentityBook.post``: DERIVED(sources)
+        when the writer has cells to stand on, else NOVEL(root) -- a ledger
+        claim whose proof is not on the book is the root of its chain.
+        ``transformation_decision`` is a REVISE row; events and rejections
+        are CONCORD rows.  Returns the written cell."""
 
-        page = self.book.page(page_name)
-        if not sources:
-            if concord:
-                page.concord(row, fact)
-            else:
-                page.revise(row, fact)
-            return
-        from .concordance_declarations import FRAME_LINK
-        from .identity_concordance import (
-            ConcordanceRefusal, Derived, Mode, Unsourced,
+        from .concordance_declarations import (
+            FRAME_LINK, PLANNER_OUTPUT_UNROUTED, TRANSFORMATION_LEDGER_ROOT,
         )
-        from .concordance_declarations import PLANNER_OUTPUT_UNROUTED
+        from .identity_concordance import (
+            ConcordanceRefusal, Derived, Mode, Novel, Unsourced,
+        )
 
         declared = self.book.registry.page(page_name)
         mode = Mode.CONCORD if concord else Mode.REVISE
-        try:
-            self.book.post(
+        cells = tuple(dict.fromkeys(cell for cell in sources if cell is not None))
+        if not cells:
+            return self.book.post(
                 declared, row, fact, stage=FRAME_LINK,
-                provenance=Derived(tuple(sources)), mode=mode,
+                provenance=Novel(TRANSFORMATION_LEDGER_ROOT, ()), mode=mode,
+            )
+        try:
+            return self.book.post(
+                declared, row, fact, stage=FRAME_LINK,
+                provenance=Derived(cells), mode=mode,
             )
         except ConcordanceRefusal:
             # A revision none of the named cells caused (the same sources,
             # unchanged): recorded as unsourced, never dropped.
-            self.book.post(
+            return self.book.post(
                 declared, row, fact, stage=FRAME_LINK,
                 provenance=Unsourced(PLANNER_OUTPUT_UNROUTED), mode=mode,
             )
@@ -141,6 +146,7 @@ class TransformationLedger:
 
         self.rules[rule]  # Reject unregistered rules even on a first decision.
         sources = tuple(sources or ())
+        incumbent_cell = self.decision_cell(identity)
         decision = self._decision(identity)
         previous = None if decision is None else (decision[0], decision[1])
         if previous is not None:
@@ -159,27 +165,32 @@ class TransformationLedger:
                     self.scope, identity, rule, proof, old_rule, old_proof,
                 )
                 if self._rejection_page.latest(rejection) is None:
+                    # The rejected claim stood on its proof cells and lost to
+                    # the incumbent decision: both are its causes.
                     self._write(
                         "transformation_rejection", rejection,
-                        len(self.events), sources, concord=True,
+                        len(self.events), (*sources, incumbent_cell),
+                        concord=True,
                     )
                     self._record_event(dict(identity=identity, rule=rule,
                         proof=proof, accepted=False, retained=previous,
                         priority=rank, retained_priority=old_rank,
                         reason="incumbent_tie" if rank == old_rank else "stronger_incumbent",
-                        before=before, after=after), sources)
+                        before=before, after=after), incumbent_cell)
                 return False
             if rule not in self._successors.get(old_rule, ()):
                 raise TransformationConflict(
                     f"Undeclared transformation for {identity!r}: {old_rule} -> {rule}")
-        self._write(
+        # A decision stands on the competing claims it chose between: the
+        # proposed fact's cells and the incumbent decision it supersedes.
+        accepted_cell = self._write(
             "transformation_decision", (self.scope, identity),
-            (rule, proof, after), sources, concord=False,
+            (rule, proof, after), (*sources, incumbent_cell), concord=False,
         )
         self._record_event(dict(identity=identity, rule=rule, proof=proof,
                                 priority=self.rules[rule].priority,
                                 accepted=True, previous=previous,
-                                before=before, after=after), sources)
+                                before=before, after=after), accepted_cell)
         return True
 
     def decision_cell(self, identity: Hashable):

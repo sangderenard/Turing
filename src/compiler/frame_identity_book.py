@@ -64,8 +64,18 @@ def _frame_graph_cell(graph: Any, value_id: Any) -> Any:
     read_scope = (getattr(graph, "graph", None) or {}).get("lexical_read_scope")
     if read_scope is None:
         return None
+    node_id = int(value_id)
+    if node_id not in graph:
+        # ``canonical_value`` rows are keyed by node; a value minted on a
+        # node (a JoinedStr's resident sequence) is named by ``value_id``.
+        node_id = next((
+            node for node, data in graph.nodes(data=True)
+            if data.get("value_id") == node_id
+        ), None)
+        if node_id is None:
+            return None
     return current_identity_book().latest_ref(
-        CANONICAL_VALUE, (tuple(read_scope), int(value_id)),
+        CANONICAL_VALUE, (tuple(read_scope), node_id),
     )
 
 
@@ -79,6 +89,81 @@ def _frame_table_cell(table: Any, value_id: Any, page: Any) -> Any:
     if table is None or owner is None or value_id is None:
         return None
     return current_identity_book().latest_ref(page, (owner, int(value_id)))
+
+
+def _frame_register_sequence(
+    function: Any, table: Any, descriptor: Any, *extra: Any, stage: Any = None,
+    revise: bool = False,
+) -> Any:
+    """Publish a sequence descriptor on the book, DERIVED from the cells it
+    stands on: ``extra`` (the descriptor it is mapped from), the incumbent
+    row it revises, and the ``ssa_value`` cells of the values it names in
+    ``function``; the function root when none has a cell (``_frame_mint``'s
+    rule).
+
+    ``revise`` replaces the incumbent row (``table.sequences.assign``);
+    otherwise ``table.register`` publishes it and refuses disagreement.
+    """
+
+    from .concordance_declarations import SEQUENCE_DESCRIPTOR
+    from .identity_concordance import current_identity_book
+    from .precompile_to_ssa import _function_root_cell
+
+    named = (
+        descriptor.sequence_id, *descriptor.column_value_ids,
+        descriptor.length_address_id, descriptor.capacity_value_id,
+        descriptor.status_address_id, descriptor.live_flags_value_id,
+        descriptor.heap_owner_value_id,
+    )
+    sources = _frame_cells(
+        *extra,
+        _frame_table_cell(table, descriptor.sequence_id, SEQUENCE_DESCRIPTOR),
+        *(_frame_value_cell(function, value_id) for value_id in named),
+    ) or (_function_root_cell(
+        current_identity_book(), _frame_book_scope(function),
+    ),)
+    if revise:
+        table.sequences.assign(
+            int(descriptor.sequence_id), descriptor, sources=sources,
+            stage=stage,
+        )
+        return descriptor
+    return table.register(descriptor, sources=sources, stage=stage)
+
+
+def _record_field_declaration_cell(
+    record: Any, field_name: Any, identity: Any = None,
+) -> Any:
+    """The ``class_field_declaration`` cell of ``field_name`` of a declared
+    ProgramABI ``record``: the row its ``source_record_view_schema`` names
+    when it carries one, else the declaration row whose class identity is
+    the record's identity (``identity`` overrides it).  None when ingestion
+    posted neither."""
+
+    from .concordance_declarations import CLASS_FIELD_DECLARATION
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    record = record or {}
+    schema_row = record.get("source_record_view_schema")
+    if isinstance(schema_row, (tuple, list)) and len(schema_row) == 2:
+        cell = book.latest_ref(
+            CLASS_FIELD_DECLARATION, (*tuple(schema_row), str(field_name)),
+        )
+        if cell is not None:
+            return cell
+    class_identity = str(
+        record.get("identity") if identity is None else identity
+    )
+    page = book.pages.get(CLASS_FIELD_DECLARATION.name)
+    for row in () if page is None else page.rows():
+        if (
+            len(row) == 3 and str(row[1]) == class_identity
+            and str(row[2]) == str(field_name)
+            and page.latest(row) is not None
+        ):
+            return book.latest_ref(CLASS_FIELD_DECLARATION, row)
+    return None
 
 
 def _frame_call_cells(graph: Any, callsite_id: Any) -> tuple[Any, ...]:

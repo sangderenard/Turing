@@ -1158,6 +1158,32 @@ def _closure_graphs(planned: PlanClosure, shell: Any) -> dict[int, Any]:
     return graphs
 
 
+def _closure_call_nodes(
+    planned: PlanClosure, shell: Any,
+) -> dict[int, tuple[Any, int]]:
+    """closure id -> (the caller's process graph, the call node) that
+    instantiates it; the root closure has none."""
+
+    calls: dict[int, tuple[Any, int]] = {}
+
+    def visit(closure: PlanClosure, owner: Any) -> None:
+        graph = getattr(owner, "process_graph", None)
+        children = getattr(owner, "callsite_function_shells", {}) or {}
+        for item in closure.items:
+            if isinstance(item, PlanCall):
+                if graph is not None:
+                    calls[int(item.callee.closure_id)] = (
+                        graph, int(item.callsite_id),
+                    )
+                child = children.get(int(item.callsite_id))
+                visit(item.callee, child if child is not None else owner)
+            elif isinstance(item, PlanClosure):
+                visit(item, owner)
+
+    visit(planned, shell)
+    return calls
+
+
 def _post_hierarchy_values(
     planned: PlanClosure, shell: Any, correlations: list, find: Any,
 ) -> tuple:
@@ -1173,6 +1199,7 @@ def _post_hierarchy_values(
     book = current_identity_book()
     scope = book.mint_scope("hierarchy", PLANNER_SCOPE)
     graphs = _closure_graphs(planned, shell)
+    call_nodes = _closure_call_nodes(planned, shell)
     class_cells: dict[tuple[int, int], list] = {}
     local_cells: dict[tuple[int, int], Any] = {}
     # A call binding makes caller and callee locals one equivalence class.
@@ -1200,6 +1227,17 @@ def _post_hierarchy_values(
             (() if local_cells.get(key) is None else (local_cells[key],))
             or class_cells.get(find(key), ())
         ))
+        if not sources and key[0] in call_nodes:
+            # A callee value with no node of its own (a native-interface
+            # formal, a sequence address the callee declares) exists because
+            # the call instantiates its closure: it derives from that call
+            # node's identity cell in the caller's graph.
+            call_graph, call_node = call_nodes[key[0]]
+            if call_node in call_graph.G:
+                try:
+                    sources = (node_identity_cell(call_graph, call_node),)
+                except ValueError:
+                    sources = ()
         if not sources:
             # A planner-minted value with no row of its own (a projection
             # leaf, an expanded identity body): the correlation is recorded

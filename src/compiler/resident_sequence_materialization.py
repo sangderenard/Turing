@@ -47,16 +47,49 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
     """
 
     from .concordance_declarations import (
+        CONTROL_PROGRAM_BUILD,
+        GLYPH_SEQUENCE_STEP,
         SOURCE_GLYPH_SEQUENCE,
         SourceGlyphSequence,
     )
     from .control_source import ControlSequenceMutation
-    from .identity_concordance import current_identity_book
+    from .identity_concordance import Derived, Mode, current_identity_book
 
     book = current_identity_book()
     declarations: list[tuple[int, str, int, bool]] = []
     initializations: list[tuple[int, str, int]] = []
     mutations: list[ControlSequenceMutation] = []
+    step_counts: dict[tuple, int] = {}
+
+    def glyph_step(
+        destination_id, operator, arguments, *, argument_kind, cell,
+    ):
+        """One composition step as a mutation owning its own control block.
+
+        The clear and each extend of one destination share an effect node;
+        each is a ``glyph_sequence_step`` row derived from the recipe cell,
+        and that cell owns the step's block.
+        """
+
+        destination_id = int(destination_id)
+        arguments = tuple(map(int, arguments))
+        count_key = (cell.row[0], destination_id)
+        ordinal = step_counts.get(count_key, 0)
+        step_counts[count_key] = ordinal + 1
+        row = (cell.row[0], destination_id, ordinal)
+        fact = (operator, arguments, argument_kind)
+        step_cell = book.latest_ref(GLYPH_SEQUENCE_STEP, row)
+        if step_cell is None or book.page(GLYPH_SEQUENCE_STEP).latest(row) != fact:
+            step_cell = book.post(
+                GLYPH_SEQUENCE_STEP, row, fact, stage=CONTROL_PROGRAM_BUILD,
+                provenance=Derived((cell,)), mode=Mode.REVISE,
+            )
+        return ControlSequenceMutation(
+            destination_id, operator, arguments, destination_id,
+            policy="duplicates", argument_kind=argument_kind,
+            source_contract_cell=cell, step_cell=step_cell,
+        )
+
     nodes_by_value = {
         int(data.get("value_id", node_id)): (int(node_id), data)
         for node_id, data in graph_obj.nodes(data=True)
@@ -102,10 +135,9 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
             continue
         declarations.append((joined_id, "duplicates", 1, True))
         initializations.append((joined_id, "duplicates", 1))
-        mutations.append(ControlSequenceMutation(
-            joined_id, "clear", (), joined_id, policy="duplicates",
-            argument_kind="glyph_sequence_clear",
-            source_contract_cell=cell,
+        mutations.append(glyph_step(
+            joined_id, "clear", (),
+            argument_kind="glyph_sequence_clear", cell=cell,
         ))
         def materialize_component(component):
             if component.union_alternatives:
@@ -140,19 +172,16 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
                 destination_id = int(component.component_value_id)
                 declarations.append((destination_id, "duplicates", 1, True))
                 initializations.append((destination_id, "duplicates", 1))
-                mutations.append(ControlSequenceMutation(
-                    destination_id, "clear", (), destination_id,
-                    policy="duplicates",
-                    argument_kind="glyph_projection_clear",
-                    source_contract_cell=cell,
+                mutations.append(glyph_step(
+                    destination_id, "clear", (),
+                    argument_kind="glyph_projection_clear", cell=cell,
                 ))
                 for child in component.projection_components:
                     child_id = materialize_component(child)
-                    mutations.append(ControlSequenceMutation(
+                    mutations.append(glyph_step(
                         destination_id, "extend", (child_id,),
-                        destination_id, policy="duplicates",
                         argument_kind="glyph_projection_component",
-                        source_contract_cell=cell,
+                        cell=cell,
                     ))
                 return destination_id
             if (
@@ -187,10 +216,9 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
 
         for component in fact.components:
             component_id = materialize_component(component)
-            mutations.append(ControlSequenceMutation(
-                joined_id, "extend", (component_id,), joined_id,
-                policy="duplicates", argument_kind="glyph_sequence_component",
-                source_contract_cell=cell,
+            mutations.append(glyph_step(
+                joined_id, "extend", (component_id,),
+                argument_kind="glyph_sequence_component", cell=cell,
             ))
     return (
         tuple(dict.fromkeys(declarations)),
