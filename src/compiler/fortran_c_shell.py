@@ -26717,6 +26717,15 @@ def _class_surface_ssa_program(
     compile_substage("record field access and mutation survey")
     for source_symbol, source_graph in compile_iter(source_graphs_by_symbol.items(),
             "record-access-survey", label="Source record access surveyed"):
+        if all_functions.get(source_symbol) is None:
+            # ``source_graphs_by_symbol`` also indexes each graph under its
+            # authored instance identity (``_index_source_graph_spellings``);
+            # that alias is a lookup spelling, not a compiled symbol.  The
+            # survey writes its rows under the compiled symbol -- the one
+            # ``record_field_role_cells`` and the forwarding stage read back
+            # -- exactly as every other per-symbol pass here acts only on the
+            # function its symbol names.
+            continue
         identities = source_graph.graph.get("identity_table") or {}
         declared = dict(
             source_graph.graph.get("parameter_record_abi") or {}
