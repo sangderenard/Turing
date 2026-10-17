@@ -233,6 +233,155 @@ def test_source_acceptance_projects_sort_contract_named_by_graph_view():
     assert projected.stamp_of(cell) == book.stamp_of(cell)
 
 
+def _record_declaration_book():
+    """A book holding one declared record ``Page`` with an optional field
+    ``book``: the ``class_declaration``, ``class_field_declaration`` and
+    ``source_record_view_schema`` cells ingestion posts, and the ProgramABI
+    receipt that names the schema row."""
+    from src.compiler.concordance_declarations import (
+        CLASS_DECLARATION,
+        CLASS_FIELD_DECLARATION,
+        INGESTION,
+        INGEST_SOURCE,
+        SOURCE_RECORD_VIEW_SCHEMA,
+        ClassFact,
+        FieldFact,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        IdentityBook,
+        Mode,
+        Novel,
+    )
+
+    book = IdentityBook()
+    schema_row = ("compiler_probe", "Page")
+    class_cell = book.post(
+        CLASS_DECLARATION, schema_row, ClassFact("Page", ()),
+        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+    field_cell = book.post(
+        CLASS_FIELD_DECLARATION, (*schema_row, "book"),
+        FieldFact("record", "Book | None", ()),
+        stage=INGESTION, provenance=Derived((class_cell,)),
+        mode=Mode.CONCORD,
+    )
+    schema_fact = (
+        "Page",
+        (("book", (("optional", True), ("storage", "record"))),),
+        "projection_complete",
+    )
+    schema_cell = book.post(
+        SOURCE_RECORD_VIEW_SCHEMA, schema_row, schema_fact,
+        stage=INGESTION, provenance=Derived((class_cell, field_cell)),
+        mode=Mode.CONCORD,
+    )
+    record = {
+        "identity": "Page",
+        "fields": {
+            "book": {
+                "storage": "record", "record": "Book", "rank": 0,
+                "mutable": False, "optional": True,
+            },
+        },
+        "source_record_view_schema": schema_row,
+    }
+    return book, schema_row, (class_cell, field_cell, schema_cell), record
+
+
+def _record_abi_project(record, *, parameter_record_abi=None):
+    import networkx as nx
+
+    body_graph = nx.DiGraph()
+    body_graph.graph.update({
+        "function_name": "thaw",
+        "program_abi": {
+            "records": {str(record["identity"]): record},
+            "bindings": [], "values": {},
+        },
+    })
+    if parameter_record_abi is not None:
+        body_graph.graph["parameter_record_abi"] = parameter_record_abi
+    body = SimpleNamespace(G=body_graph)
+    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(
+        graph=body, qualified_name="compiler_probe.thaw",
+    ))
+    return SimpleNamespace(function_table=table, G=SimpleNamespace(graph={}))
+
+
+def test_source_acceptance_projects_record_declarations_named_by_program_abi():
+    """A ProgramABI record names its ``source_record_view_schema`` row by
+    key, not by Ref: the worker reads the schema cell and the field
+    declaration cells back from that row (an optional field's presence
+    Input is posted DERIVED from its ``class_field_declaration`` cell), so
+    the cut's book carries them.  Dropping them left the worker a receipt
+    naming rows its book did not hold, and the presence Input it then
+    added had no identity row (``node_identity_cell`` refused the read)."""
+    from src.compiler.concordance_declarations import (
+        CLASS_DECLARATION,
+        CLASS_FIELD_DECLARATION,
+        SOURCE_RECORD_VIEW_SCHEMA,
+    )
+    from src.compiler.frame_identity_book import (
+        _record_field_declaration_cell,
+    )
+    from src.compiler.identity_concordance import (
+        begin_identity_book,
+        end_identity_book,
+    )
+
+    book, schema_row, (class_cell, field_cell, schema_cell), record = (
+        _record_declaration_book()
+    )
+    graph = _record_abi_project(record)
+
+    projected = project_process_graph_acceptance(graph, (0,), book=book)
+
+    assert projected.latest_ref(SOURCE_RECORD_VIEW_SCHEMA, schema_row) == (
+        schema_cell
+    )
+    assert projected.latest_ref(CLASS_DECLARATION, schema_row) == class_cell
+    assert projected.latest_ref(
+        CLASS_FIELD_DECLARATION, (*schema_row, "book"),
+    ) == field_cell
+    assert projected.stamp_of(field_cell) == book.stamp_of(field_cell)
+    _book, token = begin_identity_book(projected)
+    try:
+        assert _record_field_declaration_cell(record, "book") == field_cell
+    finally:
+        end_identity_book(token)
+
+
+def test_source_acceptance_projects_record_declarations_of_parameter_abi():
+    from src.compiler.concordance_declarations import CLASS_FIELD_DECLARATION
+
+    book, schema_row, (_class_cell, field_cell, _schema_cell), record = (
+        _record_declaration_book()
+    )
+    unrelated = {"identity": "Other", "fields": {}}
+    graph = _record_abi_project(unrelated, parameter_record_abi={
+        "page": record,
+    })
+
+    projected = project_process_graph_acceptance(graph, (0,), book=book)
+
+    assert projected.latest_ref(
+        CLASS_FIELD_DECLARATION, (*schema_row, "book"),
+    ) == field_cell
+
+
+def test_source_acceptance_refuses_a_record_naming_a_schema_the_owner_lacks():
+    import pytest
+
+    book, _schema_row, _cells, record = _record_declaration_book()
+    record = {**record, "source_record_view_schema": ("compiler_probe", "Gone")}
+    graph = _record_abi_project(record)
+
+    with pytest.raises(ValueError, match="names no source record view schema"):
+        project_process_graph_acceptance(graph, (0,), book=book)
+
+
 def test_source_acceptance_projects_sort_contract_carried_by_loop_effect():
     import networkx as nx
 

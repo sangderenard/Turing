@@ -4927,12 +4927,52 @@ def project_process_graph_acceptance(graph, references, book=None):
 
     owner = book or graph.G.graph.get("compilation_unit_identity_book") or current_identity_book()
     from .concordance_declarations import (
-        CANONICAL_VALUE, FUNCTION_ADDRESS, INGESTION_VALUE,
+        CANONICAL_VALUE, CLASS_DECLARATION, CLASS_FIELD_DECLARATION,
+        FUNCTION_ADDRESS, INGESTION_VALUE,
         LEXICAL_READ_BINDING, NAME_BINDING, SCOPE_ORIGIN, SCOPE_REGISTRY,
         SOURCE_AGGREGATE_LAYOUT, SOURCE_GLYPH_SEQUENCE,
-        SOURCE_PYTHON_IDENTITY, SOURCE_SORT_CONTRACT, SOURCE_VALUE_CLASS,
-        VALUE_TYPE_ABI,
+        SOURCE_PYTHON_IDENTITY, SOURCE_RECORD_VIEW_SCHEMA,
+        SOURCE_SORT_CONTRACT, SOURCE_VALUE_CLASS, VALUE_TYPE_ABI,
     )
+
+    def root_record_declarations(records: Any) -> None:
+        """Root the declaration cells a ProgramABI record names by row.
+
+        A record receipt carries ``source_record_view_schema``, the
+        ``(module, class)`` row of the ``source_record_view_schema`` cell
+        ingestion posted DERIVED from the class's ``class_declaration`` and
+        ``class_field_declaration`` cells.  The worker reads those cells back
+        from the receipt's row (an optional field's presence Input is posted
+        DERIVED from its field declaration); the row is a key, not a Ref,
+        so ``visit`` did not see it and the cut's book omitted the rows while
+        the receipt still named them.  A receipt that names a row the owner
+        does not hold is refused here, as a sort or glyph row is.
+        """
+        for record in dict(records or {}).values():
+            if not isinstance(record, Mapping):
+                continue
+            schema_row = record.get("source_record_view_schema")
+            if not (
+                isinstance(schema_row, (tuple, list)) and len(schema_row) == 2
+            ):
+                continue
+            schema_row = tuple(schema_row)
+            schema_cell = owner.latest_ref(SOURCE_RECORD_VIEW_SCHEMA, schema_row)
+            if schema_cell is None:
+                raise ValueError(
+                    "ProgramABI record names no source record view schema "
+                    f"cell: {schema_row!r}"
+                )
+            roots.add(schema_cell)
+            class_cell = owner.latest_ref(CLASS_DECLARATION, schema_row)
+            if class_cell is not None:
+                roots.add(class_cell)
+            for field_name in dict(record.get("fields") or {}):
+                field_cell = owner.latest_ref(
+                    CLASS_FIELD_DECLARATION, (*schema_row, str(field_name)),
+                )
+                if field_cell is not None:
+                    roots.add(field_cell)
     from ..common.tensors.topological_reducer import (
         _source_numeric_scope, node_ingestion_scopes,
     )
@@ -4944,6 +4984,13 @@ def project_process_graph_acceptance(graph, references, book=None):
         visit(body.G.graph)
         for _node_id, data in body.G.nodes(data=True):
             visit(data)
+        root_record_declarations(
+            dict(body.G.graph.get("program_abi") or {}).get("records")
+        )
+        for key in (
+            "parameter_record_abi", "parameter_sequence_record_abi",
+        ):
+            root_record_declarations(body.G.graph.get(key))
         # Numeric identity lookups are acceptance roots too. A graph's
         # canonical IDs and a declaration's function address contain no Ref
         # object for the generic visitor to discover. Dropping these cells

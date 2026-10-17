@@ -805,6 +805,55 @@ def test_synthesized_optional_presence_derives_from_field_and_receiver():
     assert node_identity_cell(graph, page_input) in incoming
 
 
+def test_synthesized_optional_presence_refuses_a_field_with_no_declaration():
+    """The presence Input is posted DERIVED from the field's
+    ``class_field_declaration`` cell.  A record whose field declaration the
+    book does not hold is refused BEFORE a node is added: an Input added
+    with no identity row was a creation that skipped the book, named by
+    ``node_identity_cell`` only at the first read, far from its cause."""
+    import pytest
+
+    from src.compiler.fortran_c_shell import (
+        _lower_optional_record_presence_graph,
+    )
+    from src.compiler.identity_concordance import ConcordanceRefusal
+
+    graph = _function_graph(
+        "class Book:\n"
+        "    pass\n"
+        "class Page:\n"
+        "    book: Book\n"
+        "def thaw(page: Page):\n"
+        "    return page.__dict__\n",
+        "thaw",
+    )
+    graph.G.graph["parameter_record_abi"] = {
+        "page": {
+            "identity": "Ledger",
+            "fields": {
+                "book": {
+                    "storage": "record", "record": "Book", "rank": 0,
+                    "mutable": False, "optional": True,
+                },
+            },
+            "source_record_view_schema": ("<string>", "Ledger"),
+        },
+    }
+    nodes_before = set(graph.G.nodes)
+
+    with pytest.raises(
+        ConcordanceRefusal, match="no class_field_declaration cell",
+    ):
+        _lower_optional_record_presence_graph(graph.G)
+
+    assert set(graph.G.nodes) == nodes_before
+    assert not any(
+        str(data.get("label") or "").endswith(".__present")
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+    assert graph.G.graph.get("optional_record_presence_lowered") is None
+
+
 def test_structural_fold_follows_keyed_record_row_schema():
     graph = _function_graph(
         "def read_kind(graph, node_id):\n"

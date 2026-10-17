@@ -785,6 +785,16 @@ STRING_TABLE_ENTRY = declare_page("string_table_entry", (
 STRING_GLYPH_VOCABULARY = declare_page("string_glyph_vocabulary", (
     RowField("function_scope", K.SCOPE), RowField("sequence", K.VALUE_ID),
 ), tuple)
+#: The vocabulary's sequence id is minted by the book: a NOVEL
+#: ``string_glyph_vocabulary`` row on ``(source scope, NEW)`` whose operand
+#: is the cell the table was built from (the Enum's source glyph table; for
+#: string tokens, one ``cell_set`` of every ``string_table_entry`` cell and
+#: every recipe cell the vocabulary serves).  A direct mint left the id with
+#: no mint edge, which the SSA composition audit lists as
+#: ``unsourced-identity`` against the function that declares the table.
+STRING_GLYPH_VOCABULARY_MINT = declare_transform(
+    "string_glyph_vocabulary_mint", 1,
+)
 #: One step of a resident glyph sequence's composition (its clear or one
 #: extend), a row of its own so each control-program mutation block has its
 #: own owner cell.  Fact ``(operator, argument value ids, argument kind)``,

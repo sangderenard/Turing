@@ -141,6 +141,34 @@ class Outer:
     ) == []
 
 
+def test_resident_vocabulary_ids_are_minted_through_the_book():
+    """``_string_token_glyph_materializations`` mints each glyph vocabulary
+    table's sequence id as a NOVEL ``string_glyph_vocabulary`` row under
+    ``string_glyph_vocabulary_mint``, from the cell the table was built from
+    (the Enum's source glyph table; for string tokens one ``cell_set`` of
+    the ``string_table_entry`` cells and the recipe cells it serves).  A
+    direct ``GLOBAL_MONOTONIC_IDS.mint()`` left the id with no mint edge,
+    and the SSA composition audit refused the function that declared the
+    table as a dependency: ``unsourced-identity`` (``Registry.page``)."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "compiler"
+    source = (root / "resident_sequence_materialization.py").read_text(
+        encoding="utf-8",
+    )
+    assert not re.search(
+        r"import GLOBAL_MONOTONIC_IDS|GLOBAL_MONOTONIC_IDS\.mint", source,
+    )
+    assert re.search(
+        r"STRING_GLYPH_VOCABULARY, \(source_scope, NEW\)", source,
+    )
+    assert re.search(
+        r"provenance=Novel\(STRING_GLYPH_VOCABULARY_MINT, \(operand,\)\)",
+        source,
+    )
+
+
 def test_record_pages_have_no_raw_page_writers():
     import re
     from pathlib import Path

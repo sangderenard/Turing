@@ -17,6 +17,7 @@ from src.compiler.concordance_declarations import (
     ANNOTATION_DECLARATION,
     CALL_BINDING,
     CLASS_FIELD_DECLARATION,
+    STRING_GLYPH_VOCABULARY_MINT,
     CallResolution,
     IDENTITY_TRANSITION,
     INGESTION,
@@ -1391,10 +1392,12 @@ def test_enum_name_projection_uses_authored_resident_lookup_table_after_rehydrat
         assert str(string_token("left")) in table
         assert str(string_token("L")) in table
         vocabulary_cell = mutation.vocabulary_contract_cell
-        incoming = {
-            source for source, _stage in book.edges_into(vocabulary_cell)
-        }
-        assert enum_cell in incoming
+        # The vocabulary's id is minted by the book from the Enum's source
+        # glyph table: the mint edge, not a Derived edge, names the cell.
+        assert book.mint_of(vocabulary_cell) == (
+            STRING_GLYPH_VOCABULARY_MINT, (enum_cell,),
+        )
+        assert book.edges_into(vocabulary_cell) == ()
 
         # Compilation-unit control can cross a tile/pickle boundary after the
         # exact vocabulary Ref is minted.  Its Page is rehydrated by value;
