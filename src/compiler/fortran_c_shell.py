@@ -18875,6 +18875,20 @@ def _class_surface_ssa_program(
                 for node_id, data in owner.nodes(data=True)
             ):
                 storage = "scalar"
+            primitive_receipt = None
+            if not storage and identity.startswith("builtins."):
+                # A primitive class owns its physical storage: ``int`` is a
+                # scalar int64, ``float`` a scalar float64, ``bool`` a scalar
+                # bool, ``str`` a resident int64 span.  The receipt is the one
+                # the ProgramABI states for an annotation naming that class
+                # (fields and parameters), so a value whose class the
+                # concordance has settled needs no second declaration.
+                primitive_class = identity.rsplit(".", 1)[-1]
+                primitive_receipt = _authored_annotation_field_receipt(
+                    ast.Name(id=primitive_class, ctx=ast.Load()),
+                )
+                if primitive_receipt is not None:
+                    storage = str(primitive_receipt["storage"])
             if storage in {"keyed", "table"}:
                 # Keyed/table are ProgramABI access policies over the existing
                 # descriptor-backed resident sequence storage.  A semantic
@@ -18883,12 +18897,20 @@ def _class_surface_ssa_program(
                 storage = "sequence"
             dtype = str(
                 contract.get("dtype") or node_abi.get("program_abi_dtype")
+                or (primitive_receipt or {}).get("dtype")
                 or ""
             )
             shape = tuple(map(int, contract.get("shape") or ()))
             rank = int(contract.get(
-                "rank", node_abi.get("program_abi_rank", len(shape)),
+                "rank",
+                node_abi.get(
+                    "program_abi_rank",
+                    (primitive_receipt or {}).get("rank", len(shape)),
+                ),
             ))
+            if primitive_receipt is not None and rank and not shape:
+                # A primitive span has one dynamic extent.
+                shape = (-1,) * rank
             storage_identity = tuple(
                 (key, repr(contract[key]))
                 for key in (
@@ -18899,6 +18921,9 @@ def _class_surface_ssa_program(
             ) + (
                 (("program_abi_record", str(declared_record)),)
                 if declared_record is not None else ()
+            ) + (
+                (("primitive_class_abi", primitive_class),)
+                if primitive_receipt is not None else ()
             )
             if len(identities) > 1 and not storage:
                 raise ValueError(

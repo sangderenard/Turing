@@ -305,3 +305,40 @@ unset, now removed): `tests/test_process_graph_function_linking.py` already fail
 rest).  At the checkpoint tree it failed 57; the 34 extra are the value-union
 errors above.  Nothing that failed at `6d3450ea` passes now, and nothing new
 beyond the union errors was found.  That file is not a clean gate.
+
+## Follow-up, 21:00: topology and compilation units pass; unit SSA lowering
+
+The user's run on the commit that fixed the ProgramABI field classes reached the
+end of stage 4: topology reduction done, 322 compilation units, stage 4 in 3m54s.
+Four units (001 `decimal_digit_glyph_token`, 026 `IdentityPage._fork_of_scope`,
+042 `_merge_partitions.<locals>.resident`, 043 `_reindex_in_place`) then failed in
+SSA lowering with "type ABI alternative requires physical storage".
+
+Replaying each unit from its frozen plan with a read-only wrapper on the
+alternative's constructor showed the first failing value in every one was a
+primitive-class value with a contract of only `python_type`: literals `0`,
+`0`, `'read_through'`, `'column_positions'`.  Later cases in the test suites were
+computed primitives (a `Call` returning `int`, a `float(...)` node).
+
+Decision (value-union open question, resolved by the data, not by a table of my
+own): a primitive class owns its physical storage, taken from
+`_authored_annotation_field_receipt` applied to the class (`int` -> scalar
+int64, `float` -> scalar float64, `bool` -> scalar bool, `str` -> int64 span
+rank 1, one dynamic extent), recorded in the arm's `storage_identity` as
+`primitive_class_abi`.  That is the same receipt the ProgramABI states for an
+annotation naming the class.  Left refused, deliberately: an undeclared user
+class instance (`page: IdentityPage` with no ProgramABI record) has no such
+rule, and `Any`/`object` is already handled elsewhere.
+
+Evidence: the public-entry probe of the failing function (real function, the
+bootstrap's own contract) reproduced the error in seconds and passes ABI
+settlement after the change; `tests/test_process_graph_function_linking.py` went
+from 57 failures to 25 (23 at `6d3450ea`), 32 newly passing and none newly
+failing; `tests/test_sequence_contract_concordance.py` 3 -> 2; sequence tables
+47 pass.  NOT verified: the four units themselves (the edited toolchain refuses
+the frozen-plan replay) -- the next whole-program run is the check.
+
+Next layers seen in probes, not in the four units' own text: `extend` with a
+non-resident argument in the new `quoted_string_glyph_tokens`; and an f-string
+whose `!r` component is an unclassified scalar (`_replace_cells`), which the
+new design leaves unresolved by intent.
