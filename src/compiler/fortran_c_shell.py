@@ -29073,8 +29073,16 @@ def _class_surface_ssa_program(
                     leaf_shape = (int(leaf_field["fixed_length"]),)
                 if leaf_storage == "scalar":
                     leaf_shape = ()
+                # The leaf's declared page row: a source-derived record's
+                # ``class_field_declaration`` cell (an external record has
+                # only its ``contract_demand`` row, read below).
+                leaf_declaration_cell = _record_field_declaration_cell(
+                    schema, leaf_name,
+                )
                 if leaf_storage not in {"scalar", "span"} or leaf_shape is None:
-                    deferred.append((leaf_path, leaf_storage))
+                    deferred.append((
+                        leaf_path, leaf_storage, leaf_declaration_cell,
+                    ))
                     continue
                 leaf_dtype = str(leaf_field.get("dtype") or "float64")
                 leaf_mutable = bool(leaf_field.get("mutable", False))
@@ -29083,14 +29091,18 @@ def _class_surface_ssa_program(
                     else (int(row_count), *leaf_shape)
                 )
                 # NOVEL(DECLARED_ROW_COLUMN, the value record's declaration
-                # cell) on this function's ``ssa_value`` page.
+                # cell and the leaf's declared page row) on this function's
+                # ``ssa_value`` page.
                 column = SSAValue(
                     _frame_mint(
                         function, DECLARED_ROW_COLUMN,
-                        (current_identity_book().latest_ref(
-                            CONTRACT_DEMAND_PAGE,
-                            (DemandKind.PARAMETER_RECORD, schema_identity),
-                        ),),
+                        (
+                            current_identity_book().latest_ref(
+                                CONTRACT_DEMAND_PAGE,
+                                (DemandKind.PARAMETER_RECORD, schema_identity),
+                            ),
+                            leaf_declaration_cell,
+                        ),
                         dtype=leaf_dtype, shape=column_shape,
                         stage=RECORD_ABI_MATERIALIZATION,
                     ),
@@ -29130,16 +29142,21 @@ def _class_surface_ssa_program(
                     dtype=leaf_dtype,
                     writable=leaf_mutable,
                 ))
-            for leaf_path, leaf_storage in deferred:
+            for leaf_path, leaf_storage, leaf_declaration_cell in deferred:
+                # DERIVED from what was read: the record's demand cell and
+                # the deferred leaf's declared page row.
                 _frame_post(
                     NUMERAL_LEAF_MATERIALIZATION,
                     (str(symbol), str(parameter_name), leaf_path),
                     f"declared_row_leaf_deferred:{leaf_storage}",
                     stage=RECORD_ABI_MATERIALIZATION, mode=Mode.CONCORD,
-                    cells=_frame_cells(current_identity_book().latest_ref(
-                        CONTRACT_DEMAND_PAGE,
-                        (DemandKind.PARAMETER_RECORD, schema_identity),
-                    )),
+                    cells=_frame_cells(
+                        current_identity_book().latest_ref(
+                            CONTRACT_DEMAND_PAGE,
+                            (DemandKind.PARAMETER_RECORD, schema_identity),
+                        ),
+                        leaf_declaration_cell,
+                    ),
                 )
                 report(
                     f"record abi: {symbol}: declared row leaf {leaf_path} "
