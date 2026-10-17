@@ -22606,8 +22606,27 @@ def lower_control_sections_to_ssa(
             value_scope = control_function.metadata.get(
                 "tensor_shape_concordance_scope"
             )
+
+            def member_cell(value_id: int) -> Ref | None:
+                cell = book.latest_ref(
+                    SSA_VALUE, (str(value_scope), int(value_id)),
+                )
+                if (
+                    cell is None
+                    and self_value_id is not None
+                    and int(value_id) == int(self_value_id)
+                ):
+                    # The receiver column (``_inject_field_slot_access``'s
+                    # arena 0) IS the receiver's id.  Its ``ssa_value`` row
+                    # is the parameter seed when the receiver was named a
+                    # parameter; when it was not, the slot mints stood on
+                    # the function root instead, and so does the record
+                    # read through them.
+                    cell = _function_root_cell(book, str(value_scope))
+                return cell
+
             member_cells = tuple(
-                book.latest_ref(SSA_VALUE, (str(value_scope), int(value_id)))
+                member_cell(value_id)
                 for field in record_fields
                 for value_id in field.value_ids
                 if value_scope is not None
