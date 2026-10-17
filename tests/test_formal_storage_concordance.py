@@ -309,3 +309,35 @@ def test_program_abi_field_retires_its_provisional_frame_lease():
         )
     finally:
         end_identity_book(token)
+
+
+def test_record_scalar_shape_is_derived_from_the_value_cell_and_declared_page():
+    from src.compiler.concordance_declarations import (
+        RECORD_RETURN_REPAIR, RECORD_SCALAR_SHAPE,
+    )
+    from src.compiler.frame_identity_book import _frame_post, _frame_value_cell
+    from src.compiler.page_lifecycle import PAGE_LIFECYCLE
+
+    assert RECORD_SCALAR_SHAPE.name in PAGE_LIFECYCLE
+    book, token = begin_identity_book()
+    try:
+        scope = "fn@control:0"
+        book.post(
+            SSA_VALUE, (scope, 7),
+            SSAValueFact("float64", (1,), SSAValueOrigin.ADOPTED_GRAPH_ID),
+            stage=CONTROL_SSA, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        function = Function("fn", [], {}, metadata={
+            "tensor_shape_concordance_scope": scope,
+        })
+        cell = _frame_value_cell(function, 7)
+        assert cell is not None
+        posted = _frame_post(
+            RECORD_SCALAR_SHAPE, ("fn", 7), ((1,), ()),
+            stage=RECORD_RETURN_REPAIR, cells=(cell,),
+        )
+        assert book.edges_into(posted) == ((cell, RECORD_RETURN_REPAIR),)
+        assert book.page(RECORD_SCALAR_SHAPE).latest(("fn", 7)) == ((1,), ())
+    finally:
+        end_identity_book(token)

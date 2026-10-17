@@ -130,3 +130,47 @@ def test_conflicting_effect_and_value_orders_are_a_diagnostic():
     message = str(caught.value)
     assert "('value', 50)" in message
     assert "('sequence_raw', 30)" in message
+
+
+def test_synthetic_device_scalar_nodes_are_named_in_the_graphs_own_scope():
+    """The throwaway Input/Item/Call chain is added to the real graph, so the
+    graph's own identity scope names each node DERIVED from the scratch-scope
+    cell that roots it -- ``node_identity_cell`` never needs its Unsourced
+    fallback for them."""
+    from src.common.tensors.topological_reducer import node_identity_cell
+    from src.compiler.concordance_declarations import (
+        INGESTION_VALUE, NodeFact, PLANNER_STRUCTURAL_FOLD,
+        SYNTHESIZED_NO_SOURCE,
+    )
+    from src.compiler.glsl_deployment_strategy import (
+        _synthetic_device_scalar_shell,
+    )
+    from src.compiler.identity_concordance import (
+        Mode, Novel, Unsourced, begin_identity_book, end_identity_book,
+    )
+    from src.transmogrifier.graph.memory_graph.helpers.networkx_emulation import (
+        NetworkxEmulation,
+    )
+
+    book, token = begin_identity_book()
+    try:
+        scope = book.mint_scope("synthetic_test_ingestion", PLANNER_STRUCTURAL_FOLD)
+        graph = NetworkxEmulation()
+        graph.graph["ingestion_value_scope"] = scope
+        graph.add_node(0, type="Const", op="Const", parents=[], children=[],
+                       attributes={}, expr_obj=None)
+        book.post(
+            INGESTION_VALUE, (scope, 0), NodeFact("Const", "Const", ""),
+            stage=PLANNER_STRUCTURAL_FOLD, provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
+            mode=Mode.CONCORD,
+        )
+        _synthetic_device_scalar_shell(graph, 0)
+        synthetic = [node for node in graph.nodes if node != 0]
+        assert len(synthetic) == 3
+        for node in synthetic:
+            cell = node_identity_cell(graph, node)
+            assert cell.page.name == INGESTION_VALUE.name
+            assert cell.row == (scope, node)
+            assert tuple(book.edges_into(cell)), node
+    finally:
+        end_identity_book(token)

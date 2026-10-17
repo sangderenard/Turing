@@ -264,6 +264,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "record_return_field_selection": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "record_return_layout": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "record_return_phi_input_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "record_scalar_shape_concordance": PageLifecycle(LOWERING, None, REPAIRS),
     "record_storage_alias": PageLifecycle(None, LOWERING, LOWERING),
     "reducer_field_state": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "region_capture_binding": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),

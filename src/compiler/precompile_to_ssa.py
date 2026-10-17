@@ -14244,8 +14244,14 @@ class _ControlSSABuilder(TiledObject):
                 },
                 claim_provisional_definition=True,
             )
+            # ``enumerate(source)`` over a single-column source authors its
+            # element binding with projection ``None`` (loop_composer): the
+            # element IS the source's only physical column, column zero, the
+            # same reading the GLSL binder gives it.  The tag column is keyed
+            # by that column, so ``None`` must not reach ``int()``.
             type_tag = self.projected_native_type_tag(
-                int(iterable_id), int(column_projection),
+                int(iterable_id),
+                0 if column_projection is None else int(column_projection),
                 projection_index, int(target_id),
             )
             if type_tag is not None:
@@ -22137,23 +22143,45 @@ def lower_control_sections_to_ssa(
     }
     # A nested record field is a descriptor correlation, never a slot: its
     # leaves are the physical storage (see ``nested_record_by_slot`` below).
+    from .concordance_declarations import (
+        CLASS_FIELD_DECLARATION, FIELD_SLOT_STORAGE,
+    )
+    from .frame_identity_book import _frame_post, _frame_value_cell
     from .identity_concordance import current_identity_book
 
-    slot_storage_page = current_identity_book().page(
-        "field_slot_storage_concordance"
-    )
-    nested_record_slots = {
-        int(slot)
-        for slot, identity, _value_id in nested_record_fields
-        if slot_storage_page.concord(
-            (
-                str(control_function.name),
-                str(field_names[int(slot)])
-                if 0 <= int(slot) < len(field_names) else int(slot),
+    nested_record_slots = set()
+    for slot, identity, nested_value_id in nested_record_fields:
+        slot_name = (
+            str(field_names[int(slot)])
+            if 0 <= int(slot) < len(field_names) else int(slot)
+        )
+        # The slot holds a nested record because the field is declared on its
+        # owning class and the value stored there is that record instance:
+        # read from the class field declaration and the value's own cell.
+        declaration_page = current_identity_book().pages.get(
+            CLASS_FIELD_DECLARATION.name
+        )
+        _frame_post(
+            FIELD_SLOT_STORAGE, (str(control_function.name), slot_name),
+            ("nested_record", str(identity)), stage=CONTROL_SSA_FINISH,
+            cells=(
+                _frame_value_cell(control_function, nested_value_id),
+                *(
+                    current_identity_book().latest_ref(
+                        CLASS_FIELD_DECLARATION, declaration_row,
+                    )
+                    for declaration_row in (
+                        () if declaration_page is None
+                        or record_identity is None
+                        else declaration_page.rows()
+                    )
+                    if len(declaration_row) == 3
+                    and str(declaration_row[1]) == str(record_identity)
+                    and str(declaration_row[2]) == str(slot_name)
+                ),
             ),
-            ("nested_record", str(identity)),
-        ) == ("nested_record", str(identity))
-    }
+        )
+        nested_record_slots.add(int(slot))
     scalar_slots = tuple(sorted({
         int(slot)
         for _kind, _value_id, slot in field_ops

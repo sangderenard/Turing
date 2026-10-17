@@ -633,6 +633,18 @@ def _synthetic_device_scalar_shell(graph: Any, predicate_id: int) -> Any:
             ),
             mode=Mode.CONCORD,
         )
+    # The three nodes were added to ``graph`` itself, so ``graph`` must name
+    # them too: each gets its ``ingestion_value`` row in graph's own identity
+    # scope, DERIVED from the scratch-scope cell that roots it (NOVEL from the
+    # predicate's cell).  Without it ``node_identity_cell`` posts the
+    # ``Unsourced(SYNTHESIZED_NO_SOURCE)`` fallback in graph's (fork) scope
+    # the first time anything names one of them.
+    from ..common.tensors.topological_reducer import post_derived_node_identity
+    for synthetic_id in (input_id, item_id, call_id):
+        post_derived_node_identity(
+            graph, synthetic_id, (rows[synthetic_id],),
+            stage=PLANNER_STRUCTURAL_FOLD,
+        )
     book.post(
         NAME_BINDING, (scope, "result", 0),
         BindingFact(int(call_id), False, (None,) * 4, ""),

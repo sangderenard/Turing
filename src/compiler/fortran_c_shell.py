@@ -27129,8 +27129,31 @@ def _class_surface_ssa_program(
                     (callee_key, str(callee_identity)),
                 ))
                 continue
-            record_forwarding_edges[(caller_key, callee_key)] = (
-                int(planned_call.callsite_id),
+            # The edge stands on the call's own binding cell and on the two
+            # formals' parameter receipts (or the caller actual's row handle).
+            from .concordance_declarations import RECORD_FORWARDING_EDGE
+
+            _frame_post(
+                RECORD_FORWARDING_EDGE,
+                (access_scope, (caller_key, callee_key)),
+                (int(planned_call.callsite_id),),
+                stage=RECORD_FORWARDING, mode=Mode.REVISE,
+                cells=(
+                    *_frame_call_cells(caller_graph, planned_call.callsite_id),
+                    access_book.latest_ref(
+                        RECORD_PARAMETER_VALUE,
+                        (access_scope, (str(caller_symbol), int(caller_id))),
+                    ),
+                    access_book.latest_ref(
+                        RECORD_PARAMETER_ROW_HANDLE,
+                        (access_scope, (str(caller_symbol), int(caller_id))),
+                    ),
+                    access_book.latest_ref(
+                        RECORD_PARAMETER_VALUE,
+                        (access_scope, (str(callee_symbol), int(callee_id))),
+                    ),
+                ),
+                reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
             )
 
     def caller_field_path(
@@ -27156,6 +27179,63 @@ def _class_surface_ssa_program(
             return None
         return str(field_path)[len(prefix):]
 
+    def forward_record_field_roles(
+        target_key: tuple[Any, ...],
+        incumbent: frozenset[str],
+        witnesses: Mapping[str, tuple[Any, ...]],
+        *,
+        edge_key: tuple[Any, ...],
+        source_key: tuple[Any, ...],
+        source_book: Any,
+        source_scope: Any,
+    ) -> None:
+        """Publish roles carried across one forwarding edge.
+
+        The new role set and each role's witness stand on the forwarding
+        edge's cell, the target row's incumbent cell, and -- when the source
+        row is on this book -- the source row's own cells.  An accepted
+        component's rows live on its own book; they are read as a view and
+        are not cells here, so the edge is the cell this book holds for them.
+        """
+
+        from .concordance_declarations import RECORD_FORWARDING_EDGE
+
+        local_source = source_book is access_book
+        edge_cell = access_book.latest_ref(
+            RECORD_FORWARDING_EDGE, (access_scope, edge_key),
+        )
+        source_cell = (
+            access_book.latest_ref(
+                RECORD_FIELD_ACCESS, (source_scope, source_key),
+            ) if local_source else None
+        )
+        access_cell = _frame_post(
+            RECORD_FIELD_ACCESS, (access_scope, target_key),
+            frozenset(incumbent) | frozenset(witnesses),
+            stage=RECORD_FORWARDING, mode=Mode.REVISE,
+            cells=(
+                access_book.latest_ref(
+                    RECORD_FIELD_ACCESS, (access_scope, target_key),
+                ),
+                edge_cell, source_cell,
+            ),
+            reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
+        )
+        for role, witness in witnesses.items():
+            _frame_post(
+                RECORD_FIELD_ACCESS_PATH,
+                (access_scope, target_key, role), tuple(witness),
+                stage=RECORD_FORWARDING, mode=Mode.CONCORD,
+                cells=(
+                    access_cell, edge_cell,
+                    access_book.latest_ref(
+                        RECORD_FIELD_ACCESS_PATH,
+                        (source_scope, source_key, role),
+                    ) if local_source else None,
+                ),
+                reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
+            )
+
     compile_substage("record forwarding fixed point")
     changed = True
     while changed:
@@ -27180,9 +27260,7 @@ def _class_surface_ssa_program(
                 incumbent = exact_record_access_roles(caller_access_key)
                 propagated = frozenset(map(str, receipts))
                 if propagated - incumbent:
-                    record_field_access[caller_access_key] = (
-                        incumbent | propagated
-                    )
+                    witnesses = {}
                     for role in sorted(propagated - incumbent):
                         callee_path_page = receipt_book.page(
                             "record_field_access_path"
@@ -27190,16 +27268,19 @@ def _class_surface_ssa_program(
                         callee_path = callee_path_page.latest(
                             (receipt_scope, access_key, role), ()
                         )
-                        record_field_access_path.concord(
-                            (access_scope, caller_access_key, role),
+                        witnesses[role] = (
                             (
-                                (
-                                    "callsite", str(caller_key[0]),
-                                    int(callsites[0]), str(callee_key[0]),
-                                ),
-                                *tuple(callee_path),
+                                "callsite", str(caller_key[0]),
+                                int(callsites[0]), str(callee_key[0]),
                             ),
+                            *tuple(callee_path),
                         )
+                    forward_record_field_roles(
+                        caller_access_key, incumbent, witnesses,
+                        edge_key=(caller_key, callee_key),
+                        source_key=access_key, source_book=receipt_book,
+                        source_scope=receipt_scope,
+                    )
                     changed = True
 
             # Representation demand is symmetric across a forwarding edge.
@@ -27225,21 +27306,21 @@ def _class_surface_ssa_program(
                 incumbent = exact_record_access_roles(callee_access_key)
                 if "sequence" in incumbent:
                     continue
-                record_field_access[callee_access_key] = (
-                    incumbent | {"sequence"}
-                )
                 caller_path = receipt_book.page(
                     "record_field_access_path"
                 ).latest((receipt_scope, access_key, "sequence"), ())
-                record_field_access_path.concord(
-                    (access_scope, callee_access_key, "sequence"),
-                    (
+                forward_record_field_roles(
+                    callee_access_key, incumbent,
+                    {"sequence": (
                         (
                             "callsite-sequence-view", str(caller_key[0]),
                             int(callsites[0]), str(callee_key[0]),
                         ),
                         *tuple(caller_path),
-                    ),
+                    )},
+                    edge_key=(caller_key, callee_key),
+                    source_key=access_key, source_book=receipt_book,
+                    source_scope=receipt_scope,
                 )
                 changed = True
 
@@ -45406,7 +45487,21 @@ def _class_surface_ssa_program(
                             )
                             recorded_layout = record_field_concordance.latest(row)
                             if recorded_layout is None:
-                                record_field_concordance.set(row, 0, incumbent_layout)
+                                # The caller's own record descriptor is the
+                                # cell this layout is read from.
+                                from .concordance_declarations import (
+                                    FRAME_LINK as _LAYOUT_STAGE,
+                                    RECORD_DESCRIPTOR as _LAYOUT_DESCRIPTOR,
+                                    RECORD_FIELD_LAYOUT as _LAYOUT_PAGE,
+                                )
+                                _frame_post(
+                                    _LAYOUT_PAGE, row, incumbent_layout,
+                                    stage=_LAYOUT_STAGE,
+                                    cells=(_frame_table_cell(
+                                        caller_records, int(caller_record_id),
+                                        _LAYOUT_DESCRIPTOR,
+                                    ),),
+                                )
                             elif recorded_layout != incumbent_layout:
                                 raise ValueError(
                                     "record field concordance disagrees with "
@@ -47276,15 +47371,32 @@ def _class_surface_ssa_program(
     # channel checks).  A declared-scalar record field is a scalar even while
     # its field-slot arena still carries the one-element column shape, so the
     # descriptor's shape is settled first; the later seam call is idempotent.
-    from .identity_concordance import identity_book as _module_book
-
-    _scalar_shape_page = _module_book(lowered_module).page(
-        "record_scalar_shape_concordance"
+    from .concordance_declarations import (
+        RECORD_DESCRIPTOR as _SCALAR_SHAPE_DESCRIPTOR,
+        RECORD_RETURN_REPAIR as _SCALAR_SHAPE_STAGE,
+        RECORD_SCALAR_SHAPE as _SCALAR_SHAPE_PAGE,
     )
+
     for _receipt in _declared_scalar_shapes(lowered_module):
-        _scalar_shape_page.concord(
-            (str(_receipt["function"]), int(_receipt["value_id"])),
+        _scalar_symbol = str(_receipt["function"])
+        _scalar_function = lowered_module.functions[_scalar_symbol]
+        _scalar_table = lowered_module.record_tables.get(_scalar_symbol)
+        # Read from the value's own identity cell and from the descriptor of
+        # every record whose declared scalar field names it.
+        _frame_post(
+            _SCALAR_SHAPE_PAGE,
+            (_scalar_symbol, int(_receipt["value_id"])),
             (tuple(_receipt["prior_shape"]), ()),
+            stage=_SCALAR_SHAPE_STAGE,
+            cells=(
+                _frame_value_cell(_scalar_function, _receipt["value_id"]),
+                *(
+                    _frame_table_cell(
+                        _scalar_table, int(_record_id), _SCALAR_SHAPE_DESCRIPTOR,
+                    )
+                    for _record_id, _name, _identity in _receipt["record_fields"]
+                ),
+            ),
         )
     compile_substage("apply numeric feature pipeline")
     apply_numeric_feature_pipeline(lowered_module)

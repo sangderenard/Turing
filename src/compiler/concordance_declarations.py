@@ -1628,6 +1628,14 @@ RECORD_FIELD_LAYOUT = declare_page("record_field_layout_concordance", (
     RowField("symbol", K.SCOPE), RowField("result", K.VALUE_ID),
     RowField("storage_identity", K.NAME),
 ), tuple)
+#: ``normalize_declared_scalar_record_shapes``: the shape a value carried
+#: before its declared scalar record storage settled it to ``()``.  One row
+#: per ``(function symbol, value id)`` -> (prior shape, ()); CONCORD,
+#: DERIVED(the value's ``ssa_value`` cell and the ``record_descriptor`` cells
+#: of the declared scalar fields that name it).
+RECORD_SCALAR_SHAPE = declare_page("record_scalar_shape_concordance", (
+    RowField("symbol", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), tuple)
 #: (old physical layout, new layout, "record_loop_phi"); CONCORD.
 LOOP_RECORD_LAYOUT = declare_page("loop_record_layout_concordance", (
     RowField("symbol", K.SCOPE), RowField("loop_node", K.VALUE_ID),

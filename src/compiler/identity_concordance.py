@@ -2065,10 +2065,39 @@ class CorrelationTable:
             group = (page_name, stage_name, "raw row")
             groups[group] += 1
             sample(group, _row)
+        # An imported (accepted) SSA body keeps the book that accepted it: its
+        # ids were minted by Novel posts in THAT book, so their mint edges are
+        # read there, not in the composing unit's book (which owns only the
+        # current unit).
+        owner_mints: dict[int, set[int]] = {id(book): minted_with_edge}
+
+        def minted_in_owner(function_name: str) -> set[int]:
+            function = (getattr(module, "functions", None) or {}).get(
+                function_name
+            )
+            owner = dict(
+                (getattr(function, "metadata", None) or {}).get(
+                    "accepted_ssa_component"
+                ) or {}
+            ).get("identity_book")
+            if owner is None or owner is book:
+                return minted_with_edge
+            found = owner_mints.get(id(owner))
+            if found is None:
+                found = owner_mints[id(owner)] = set()
+                owner_page = owner.pages.get(MINT_PAGE.name)
+                if owner_page is not None:
+                    found.update(
+                        int(row[1]) for row in owner_page.rows()
+                        if row[1] is not None
+                    )
+            return found
+
         identities = [
             (function, value_id)
             for function, value_id in self.rows
-            if has_flag(value_id, MINTED) and value_id not in minted_with_edge
+            if has_flag(value_id, MINTED)
+            and value_id not in minted_in_owner(function)
         ]
         return dict(groups), identities
 

@@ -963,6 +963,46 @@ class Page:
     assert sorted_sequence.column_dtypes == ("int64",)
 
 
+def test_enumerate_element_projection_none_lowers_in_keyed_reindex():
+    # ``enumerate(self.columns)`` binds its element with projection None
+    # (the source's only column); lowering the loop must not int() it.
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        """
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass
+class Page:
+    cells: dict[tuple[Any, int], Any] = field(default_factory=dict)
+    columns: list[int] = field(default_factory=list)
+    column_positions: dict[int, int] = field(default_factory=dict)
+    row_columns: dict[Any, list[int]] = field(default_factory=dict)
+
+    def reindex(self):
+        self.column_positions = {
+            column: position for position, column in enumerate(self.columns)
+        }
+        self.row_columns = {}
+        for row, column in self.cells:
+            if column not in self.column_positions:
+                self.column_positions[column] = len(self.columns)
+                self.columns.append(column)
+            self.row_columns.setdefault(row, []).append(column)
+        for columns in self.row_columns.values():
+            columns.sort(key=self.column_positions.__getitem__)
+""",
+        name="enumerate_none_projection_contract",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts"
+            / "program_extraction.yaml"
+        ),
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _message: None,
+    )
+    assert module.functions
+
+
 def test_mapping_values_generator_retains_record_and_nested_span_contracts():
     module, _outputs, exports = lower_ast_source_to_ssa(
         """
