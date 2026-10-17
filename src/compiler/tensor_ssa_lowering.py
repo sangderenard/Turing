@@ -417,6 +417,59 @@ def _post_scalar_kernel_operand(
     )
 
 
+def _concord_scalar_kernel_operand(
+    module: IRModule, function: Any, row: tuple, fact: Any, values: Any,
+) -> Any:
+    """``IdentityPage.concord`` for ``scalar_kernel_operand_concordance``,
+    written through the book: the first statement owns the row (posted by
+    ``_post_scalar_kernel_operand``), a repeat records its edge, a different
+    proposal is a disagreement (``ValueError``).  Returns the committed
+    fact, which callers use as the decision."""
+
+    from .concordance_declarations import SCALAR_KERNEL_OPERAND
+
+    stored = identity_book(module).pages.get(SCALAR_KERNEL_OPERAND.name)
+    incumbent = None if stored is None else stored.latest(row)
+    if incumbent is not None and incumbent != fact:
+        raise ValueError(
+            f"{SCALAR_KERNEL_OPERAND.name} disagreement for {row!r}: "
+            f"recorded={incumbent!r}, proposed={fact!r}"
+        )
+    _post_scalar_kernel_operand(module, function, row, fact, values)
+    return fact
+
+
+def _post_reduction_domain(
+    module: IRModule, function: Any, row: tuple, fact: tuple, values: Any,
+) -> None:
+    """``tensor_reduction_domain_concordance`` CONCORD, DERIVED(the
+    ``ssa_value`` cells of the result and the reduced source)."""
+
+    from .concordance_declarations import (
+        TENSOR_REDUCTION_DOMAIN, TENSOR_SSA_LOWERING,
+    )
+    from .identity_concordance import Derived, Mode
+    from .ssa_record_return_state import ssa_value_identity_cell
+
+    book = identity_book(module)
+    cells = tuple(dict.fromkeys(
+        cell for cell in (
+            ssa_value_identity_cell(function, int(value.id), book=book)
+            for value in values
+        )
+        if cell is not None
+    ))
+    if not cells:
+        raise ValueError(
+            f"{TENSOR_REDUCTION_DOMAIN.name}: no source cell for {row!r} -- "
+            "neither the result nor the reduced source has an ssa_value cell"
+        )
+    book.post(
+        TENSOR_REDUCTION_DOMAIN, row, fact, stage=TENSOR_SSA_LOWERING,
+        provenance=Derived(cells), mode=Mode.CONCORD,
+    )
+
+
 def _post_call_edge_fact(
     module: IRModule, page: Any, row: tuple, fact: Any, cells: Any,
 ) -> None:
@@ -2326,12 +2379,15 @@ def settle_repository_ssa_shape_metadata(module: IRModule) -> bool:
 def _post_scalar_kernel_input_conversion(
     book: Any, function: Any, block_name: str, consumer_id: int,
     operand_position: int, source: SSAValue, converted: SSAValue,
+    callee: str = "binary_scalar_double",
 ) -> None:
     """One ``kernel_input_conversion`` row for a scalar promoted at the
-    input of ``binary_scalar_double``: (function scope, block, consumer
-    result, operand position) -> (source id, converted id, source dtype,
-    target dtype, callee), DERIVED from the source's ``ssa_value`` cell;
-    ``Unsourced(KERNEL_OPERAND_NOT_ON_BOOK)`` when the book holds none."""
+    input of ``callee`` (``binary_scalar_double``, or ``broadcast_double``
+    for a scalar broadcast against an array): (function scope, block,
+    consumer result, operand position) -> (source id, converted id, source
+    dtype, target dtype, callee), REVISE, DERIVED from the source's
+    ``ssa_value`` cell and the converted value's (minted by ``fresh``);
+    a row already stating this fact is not restated."""
 
     from .concordance_declarations import (
         KERNEL_INPUT_CONVERSION, TENSOR_SSA_LOWERING,
@@ -2348,16 +2404,26 @@ def _post_scalar_kernel_input_conversion(
     )
     fact = (
         int(source.id), int(converted.id), str(source.dtype), "float64",
-        "binary_scalar_double",
+        str(callee),
     )
     if cell is None:
         raise ValueError(
             f"{KERNEL_INPUT_CONVERSION.name}: no source cell for {row!r} -- "
             "the source value has no ssa_value cell on the book"
         )
+    stored = book.pages.get(KERNEL_INPUT_CONVERSION.name)
+    if stored is not None and stored.latest(row) == fact:
+        return
     book.post(
         KERNEL_INPUT_CONVERSION, row, fact, stage=TENSOR_SSA_LOWERING,
-        provenance=Derived((cell,)), mode=Mode.REVISE,
+        provenance=Derived(tuple(dict.fromkeys(
+            found for found in (
+                cell,
+                ssa_value_identity_cell(function, converted.id, book=book),
+            )
+            if found is not None
+        ))),
+        mode=Mode.REVISE,
     )
 
 
@@ -5044,11 +5110,13 @@ def lower_tensor_calls_to_repository_ssa(
                     if not tuple(source.shape or ()) and int(
                         (source.accounting or {}).get("program_abi_rank", 0)
                         or 0
-                    ) == 0 and not shape_unknown(source) and identity_book(
-                        module
-                    ).page("scalar_kernel_operand_concordance").concord(
-                        (str(function_name), int(result.id)), "scalar_cast",
-                    ) == "scalar_cast":
+                    ) == 0 and not shape_unknown(source) and (
+                        _concord_scalar_kernel_operand(
+                            module, function,
+                            (str(function_name), int(result.id)),
+                            ("scalar_cast",), (result, source),
+                        ) == ("scalar_cast",)
+                    ):
                         # An exact scalar conversion (``float(flag)`` on a
                         # scalar record field) is ordinary scalar SSA, as a
                         # scalar reduction is above.  Sending it through the
@@ -5218,7 +5286,10 @@ def lower_tensor_calls_to_repository_ssa(
                                 f"{incumbent!r} != {domain_fact!r}"
                             )
                         if incumbent is None:
-                            domain_page.set(domain_row, 0, domain_fact)
+                            _post_reduction_domain(
+                                module, function, domain_row, domain_fact,
+                                (result, source),
+                            )
                         result.shape = ()
                         if str(result.dtype or "").casefold() in {"bool", "i1"}:
                             result.accounting = {
@@ -5568,12 +5639,11 @@ def lower_tensor_calls_to_repository_ssa(
                             "program_abi_rank", 0
                         ) or 0) == 0
                         and not shape_unknown(source)
-                        and identity_book(module).page(
-                            "scalar_kernel_operand_concordance"
-                        ).concord(
+                        and _concord_scalar_kernel_operand(
+                            module, function,
                             (str(function_name), int(result.id)),
-                            "scalar_fill",
-                        ) == "scalar_fill"
+                            ("scalar_fill",), (result, source),
+                        ) == ("scalar_fill",)
                     ):
                         # Broadcasting an exact scalar is a fill: the value
                         # crosses by value.  Passing it to the array kernel as
@@ -6104,27 +6174,19 @@ def lower_tensor_calls_to_repository_ssa(
                                                 )),
                                                 conversion,
                                             )
-                                            page = identity_book(module).page(
-                                                "kernel_input_conversion"
-                                            )
-                                            row = (
-                                                str(function_name),
-                                                str(block_name),
+                                            # The conversion at THIS
+                                            # kernel's input, DERIVED from
+                                            # the operand's ``ssa_value``
+                                            # cell and the converted
+                                            # value's.
+                                            _post_scalar_kernel_input_conversion(
+                                                identity_book(module),
+                                                function, str(block_name),
                                                 int(result.id),
                                                 int(operand_position),
+                                                operand, broadcast_source,
+                                                callee="broadcast_double",
                                             )
-                                            history = page.history(row)
-                                            column = (
-                                                history[-1][0] + 1
-                                                if history else 0
-                                            )
-                                            page.set(row, column, (
-                                                int(operand.id),
-                                                int(broadcast_source.id),
-                                                str(operand.dtype),
-                                                "float64",
-                                                "broadcast_double",
-                                            ))
                                         if shape_unknown(operand) or shape_unknown(result):
                                             # Shapes unknown statically: conforming
                                             # is a runtime decision, so route the

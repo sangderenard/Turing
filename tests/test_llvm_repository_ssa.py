@@ -40,9 +40,61 @@ from src.compiler.ssa_features import (
     XOROSHIRO128SS_FILL,
     link_required_ssa_features,
 )
-from src.compiler.identity_concordance import identity_book
+from src.compiler.concordance_declarations import (
+    INGESTION,
+    INGEST_SOURCE,
+    SSA_VALUE,
+    SSAValueFact,
+    SSAValueOrigin,
+)
+from src.compiler.identity_concordance import (
+    Mode,
+    Novel,
+    begin_identity_book,
+    end_identity_book,
+    identity_book,
+)
+from src.compiler.ssa_record_return_state import function_scope_of
 from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
 from src.transmogrifier.ssa_registry import Handler
+
+
+@pytest.fixture(autouse=True)
+def _isolated_repository_ssa_book():
+    """Each test's book is its own: a hand-built module's seeded roots and
+    the lowering's rows about them must not be read by the next test's
+    report as rows of a function it never had."""
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
+
+
+def _seed_values(module, function):
+    """The ``ssa_value`` roots of a function this test authored by hand:
+    the test is their ingestion, as a source construct's span is a root
+    (``Novel(INGEST_SOURCE)``), so the lowering's statements about them
+    (shape edges, scalar-operand and reduction-domain concordance) have a
+    cell to derive from."""
+
+    book = identity_book(module)
+    scope = function_scope_of(function)
+    values = {int(value.id): value for value in function.args}
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            for value in (*instruction.args, instruction.res):
+                if value is not None:
+                    values.setdefault(int(value.id), value)
+    for value_id, value in sorted(values.items()):
+        book.post(
+            SSA_VALUE, (scope, value_id),
+            SSAValueFact(
+                value.dtype, tuple(value.shape or ()), SSAValueOrigin.MINTED,
+            ),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
 
 
 def test_real_llvm_tensor_algorithms_import_to_fundamental_repository_ssa():
@@ -192,6 +244,7 @@ def test_left_integer_literal_uses_double_scalar_tensor_abi():
         ])},
     )
     module = IRModule({caller.name: caller})
+    _seed_values(module, caller)
 
     shortfalls = lower_tensor_calls_to_repository_ssa(
         module, c_backend_repository_ssa_reference(),
@@ -231,6 +284,7 @@ def test_integer_scalar_broadcast_gets_concordant_double_value_conversion():
         ])},
     )
     module = IRModule({caller.name: caller})
+    _seed_values(module, caller)
 
     assert lower_tensor_calls_to_repository_ssa(
         module, c_backend_repository_ssa_reference(),
@@ -287,6 +341,7 @@ def test_whole_module_tensor_recipes_expand_views_transpose_reduction_cast_and_c
         Instr(Handler.Ret.value, [cube_root], None),
     ])})
     module = IRModule({caller.name: caller})
+    _seed_values(module, caller)
 
     shortfalls = lower_tensor_calls_to_repository_ssa(
         module, c_backend_repository_ssa_reference()
@@ -362,6 +417,7 @@ def test_all_axis_reduction_publishes_flat_domain_to_concordance(
         ])
     })
     module = IRModule({function.name: function})
+    _seed_values(module, function)
 
     assert lower_tensor_calls_to_repository_ssa(
         module, c_backend_repository_ssa_reference()
