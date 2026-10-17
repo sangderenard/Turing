@@ -224,6 +224,11 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "numeral_leaf_materialization_concordance": PageLifecycle(None, LOWERING, LOWERING),
     "numeral_record_literal_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "numeral_return_leaves_concordance": PageLifecycle(None, LOWERING, LOWERING),
+    # Written under ``_class_surface_ssa_program`` (record ABI
+    # materialization / frame binding; the access survey); read by nothing
+    # after.
+    "numeral_leaf_width_concordance": PageLifecycle(LOWERING, None, LOWERING),
+    "record_field_demand_concordance": PageLifecycle(LOWERING, None, LOWERING),
     "operator_result_type_concordance": PageLifecycle(FUNCTIONS, REPAIRS, REPAIRS),
     "output_identity_concordance": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "page_spill_receipt": PageLifecycle(None, None, None),
@@ -338,6 +343,13 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     # declaration page's rule.
     "source_numeric_method_dependency_concordance": PageLifecycle(CLOSURE, None, CLOSURE),
     "source_numeric_parameter_abi_concordance": PageLifecycle(CLOSURE, None, CLOSURE),
+    # Written at the compile's entry from the annotations and again from the
+    # formals' propagated descriptors after reduction; read by the record
+    # return / linked literal lowering under ``_class_surface_ssa_program``.
+    "source_numeric_record_abi_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    # Written from the formals' propagated descriptors after reduction; read
+    # by nothing after.
+    "source_numeric_parameter_record_view_concordance": PageLifecycle(LOWERING, None, LOWERING),
     # Published as the normalized source enters ``_class_surface_ssa_program``;
     # read by nothing after.
     "assignment_projection_source_concordance": PageLifecycle(LOWERING, None, LOWERING),

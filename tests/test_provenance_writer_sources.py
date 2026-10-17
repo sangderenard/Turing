@@ -264,6 +264,10 @@ def test_precision_and_compile_entry_pages_are_declared_and_classified():
         declared.SOURCE_NUMERIC_TYPE_DEPENDENCY,
         declared.SOURCE_NUMERIC_METHOD_DEPENDENCY,
         declared.SOURCE_NUMERIC_PARAMETER_ABI,
+        declared.SOURCE_NUMERIC_RECORD_ABI,
+        declared.SOURCE_NUMERIC_PARAMETER_RECORD_VIEW,
+        declared.NUMERAL_LEAF_WIDTH,
+        declared.RECORD_FIELD_DEMAND,
         declared.ASSIGNMENT_PROJECTION_SOURCE,
     ):
         assert REGISTRY.pages[page.name] is page
