@@ -697,3 +697,47 @@ def test_other_record_field_projection_is_not_the_selected_fields_storage():
     function.blocks['merge'].instrs.insert(-1, Instr('Call', [record], None,
                                                    attributes={'callee': 'unknown_record_writer'}))
     assert scalar_return_field_versions(function, graph)(100, 'flag', 'merge', initial) is initial
+
+
+def test_return_site_cells_reads_the_graphs_own_join_past_the_worker_boundary():
+    """A worker receives the reducer's return receipts as the plain span-keyed
+    dicts the ``_ReturnSiteView``s pickle to; the cell -> span join that names
+    each authored exit is the graph's own ``return_site_spans`` record and
+    survives the pickle, so the control builder can still stamp every return
+    edge with its site (observed lost on ``prefixed_lower_hex_integer_glyph_
+    tokens``: three ``return result`` sites, no site on any edge)."""
+    from src.compiler.concordance_declarations import (
+        INGESTION, INGESTION_VALUE, INGEST_SOURCE, NodeFact,
+    )
+    from src.compiler.identity_concordance import IdentityBook, Mode, Novel
+    from src.compiler.ssa_record_return_state import (
+        return_site_cell_for, return_site_cells,
+    )
+
+    book = IdentityBook()
+    ingestion_scope = ("ingestion:returner", 0)
+    sites = [
+        book.post(
+            INGESTION_VALUE, (ingestion_scope, node),
+            NodeFact("Name", "result", "value"), stage=INGESTION,
+            provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+        )
+        for node in (7, 11)
+    ]
+    import ast
+    from src.compiler.ssa_record_return_state import return_site_span
+    returned = ast.parse(
+        "def f():\n    pass\n    pass\n    return result\n"
+    ).body[0].body[-1].value
+    spans = [return_site_span(returned), (6, 11, 6, 17)]
+    metadata = pickle.loads(pickle.dumps({
+        "return_site_spans": dict(zip(sites, spans)),
+        "return_slot_values": {span: (1,) for span in spans},
+        "return_record_field_states": {span: ((1, "append", 2),) for span in spans},
+    }))
+    assert isinstance(metadata["return_slot_values"], dict)
+    assert return_site_cells(metadata) == dict(zip(spans, sites))
+    graph = nx.DiGraph()
+    graph.graph.update(metadata)
+    assert return_site_cell_for(graph, returned) == sites[0]
+    assert return_site_cells({"return_slot_values": {span: (1,) for span in spans}}) == {}

@@ -4936,6 +4936,26 @@ def project_process_graph_acceptance(graph, references, book=None):
     from ..common.tensors.topological_reducer import (
         _source_numeric_scope, node_ingestion_scopes,
     )
+    from .concordance_declarations import (
+        RETURN_SITE_CONTAINER, RETURN_SITE_FIELD_STATE, RETURN_SITE_SLOT,
+    )
+    return_site_pages = (
+        RETURN_SITE_SLOT, RETURN_SITE_CONTAINER, RETURN_SITE_FIELD_STATE,
+    )
+
+    def return_site_scopes(body):
+        """The scopes a function body's return-site rows are keyed by: its
+        read scope (the canonical relabel's rows) and its ingestion scopes
+        (the reducer's rows before it)."""
+        scopes = []
+        read_scope = body.G.graph.get("lexical_read_scope")
+        if read_scope is not None:
+            scopes.append(tuple(read_scope))
+        for ingestion_scope in node_ingestion_scopes(body):
+            if ingestion_scope not in scopes:
+                scopes.append(ingestion_scope)
+        return tuple(scopes)
+
     for reference in references:
         entry = graph.function_table.entry(int(reference))
         body = entry.graph
@@ -4967,6 +4987,27 @@ def project_process_graph_acceptance(graph, references, book=None):
             if reads is not None:
                 for row in reads.scope_rows(tuple(scope)):
                     cell = owner.latest_ref(LEXICAL_READ_BINDING, row)
+                    if cell is not None:
+                        roots.add(cell)
+        # The reducer's return-site rows (``return_site_slot`` /
+        # ``return_site_container`` / ``return_site_field_state``, keyed by
+        # the site's node cell under the read scope the canonical relabel
+        # posted them to, and under the ingestion scope before it) are the
+        # record the worker's control builder stamps on each return edge and
+        # the composed-SSA audit reads the edge against.  They are successors
+        # of the graph's cells, so the predecessor projection never reached
+        # them: a worker held the span-keyed receipt dicts and no site rows,
+        # and every early-return edge of a record-returning function was
+        # refused at the link ("return-site-edge-disagreement", observed on
+        # ``prefixed_lower_hex_integer_glyph_tokens``).  Root them exactly as
+        # the lexical binding rows above.
+        for return_page in return_site_pages:
+            stored = owner.pages.get(return_page.name)
+            if stored is None:
+                continue
+            for return_scope in return_site_scopes(body):
+                for row in stored.scope_rows(return_scope):
+                    cell = owner.latest_ref(return_page, row)
                     if cell is not None:
                         roots.add(cell)
         # Source-value classes are the accepted type facts consumed by

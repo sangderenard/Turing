@@ -4423,6 +4423,20 @@ def _normalize_lexical_values(
     # The legacy return receipts are read views over the return-site pages,
     # keyed by span through ``return_site_spans`` and read under the graph's
     # current operand-position scope (plan 70, section 2).
+    #
+    # The site cell -> span join is the graph's own record, not only the
+    # views': the views pickle as the plain span-keyed dicts they present,
+    # and a ``return <name>`` site's occurrence node (the cell's node) is
+    # removed when the name resolves, so across the worker boundary
+    # (``_dump_scoped_resolved_process_graph``) nothing else carried which
+    # authored exit each span is.  Observed on ``prefixed_lower_hex_
+    # integer_glyph_tokens`` (census 2026-10-17, unit 47): its three
+    # ``return result`` sites reached the worker with no site cell, the
+    # control builder stamped no ``return_site_cell`` on the early-return
+    # edges, and the composing unit's audit refused the product
+    # ("return-site-edge-disagreement").  ``return_site_cells`` reads this
+    # join first; the scoped-input acceptance roots its cells.
+    graph.G.graph["return_site_spans"] = return_site_spans
     graph.G.graph["return_slot_values"] = _ReturnSiteView(
         field_state_book, graph, _RETURN_SITE_SLOT, return_site_spans,
         _return_slot_receipt,
