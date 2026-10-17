@@ -597,9 +597,18 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                         module, SSA_CALL_SHAPE_EVIDENCE, row, evidence,
                         edge_cells,
                     )
+                    # The formal's proven extents ARE this call edge's fact:
+                    # the proof derives from the ``ssa_call_shape`` cell just
+                    # posted and the actual's / formal's ``ssa_value`` cells.
                     record_proven_shape(
                         shape_scope_of(callee), int(formal.id), extents,
                         actual.dtype,
+                        sources=(
+                            identity_book(module).latest_ref(
+                                SSA_CALL_SHAPE, row,
+                            ),
+                            *edge_cells,
+                        ),
                     )
                     contracts.setdefault(
                         (callee_name, int(formal.id)), []
@@ -6215,11 +6224,21 @@ def lower_tensor_calls_to_repository_ssa(
                     descriptor, storage="output", writable=True
                 )
 
+    from ..common.tensors.accelerator_backends.llvm_repository_ssa import (
+        post_repository_kernel_identity,
+    )
+
     for name, function in reference.dependency_closure(*sorted(linked_roots)).items():
         existing = module.functions.get(name)
         if existing is not None and existing is not function:
             raise ValueError(f"repository SSA function collision for {name!r}")
         module.functions[name] = function
+        # A repository kernel enters the module here, and the metadata
+        # settlement below reads and writes about its values at once: its
+        # definition root and per-value ``ssa_value`` rows are posted on
+        # this book as it is linked (the same writer ``ir_indexing`` runs
+        # before its own decisions; posting twice reads the existing rows).
+        post_repository_kernel_identity(function, identity_book(module))
         reference_table = getattr(reference.module, "tensor_tables", {}).get(name)
         if reference_table is not None:
             existing_table = module.tensor_tables.get(name)
