@@ -53,30 +53,28 @@ def _frame_value_cell(function: Any, value_id: Any) -> Any:
 
 
 def _frame_graph_cell(graph: Any, value_id: Any) -> Any:
-    """The ``canonical_value`` cell of graph id ``value_id`` in the source
-    graph ``graph`` (its ``lexical_read_scope``), or None."""
+    """The identity cell of graph id ``value_id`` in the source graph
+    ``graph``: its ``canonical_value`` row under the graph's lexical read
+    scope, else its ``ingestion_value`` row under the graph's ingestion
+    scope (a specialized or instance copy keeps its nodes there) -- the one
+    reader ``node_identity_cell`` is -- or None when ``value_id`` names no
+    node of ``graph``."""
 
-    from .concordance_declarations import CANONICAL_VALUE
-    from .identity_concordance import current_identity_book
+    from ..common.tensors.topological_reducer import node_identity_cell
 
     if graph is None or value_id is None:
         return None
-    read_scope = (getattr(graph, "graph", None) or {}).get("lexical_read_scope")
-    if read_scope is None:
-        return None
     node_id = int(value_id)
     if node_id not in graph:
-        # ``canonical_value`` rows are keyed by node; a value minted on a
-        # node (a JoinedStr's resident sequence) is named by ``value_id``.
+        # Rows are keyed by node; a value minted on a node (a JoinedStr's
+        # resident sequence) is named by ``value_id``.
         node_id = next((
             node for node, data in graph.nodes(data=True)
             if data.get("value_id") == node_id
         ), None)
         if node_id is None:
             return None
-    return current_identity_book().latest_ref(
-        CANONICAL_VALUE, (tuple(read_scope), node_id),
-    )
+    return node_identity_cell(graph, node_id)
 
 
 def _frame_table_cell(table: Any, value_id: Any, page: Any) -> Any:
