@@ -4986,14 +4986,17 @@ class IdentityPage:
             )
         return incumbent
 
-    def mapping(self, scope: Any) -> "PageMapping":
+    def mapping(self, scope: Any, *, stage: Any = None) -> "PageMapping":
         """This page's rows under ``scope`` as a mutable mapping.
 
         ``mapping[key]`` is row ``(scope, key)``'s latest fact; assignment
         is a revision and deletion a ``None`` revision, so a pass that keeps
         its working state here keeps it on the book with its full history.
+        On a book's page every revision is posted DERIVED from the cell it
+        revises, under ``stage`` (the book's active stage when none is
+        named); a key with no row cannot be revised through the mapping.
         """
-        return PageMapping(self, scope)
+        return PageMapping(self, scope, stage=stage)
 
     def bind_alias(self, scope: Any, alias: int, resident: int) -> None:
         """Concord one planning value occurrence with its resident identity.
@@ -5105,9 +5108,12 @@ class IdentityPage:
 class PageMapping(MutableMapping):
     """Rows ``(scope, key)`` of one page, read and written as a mapping."""
 
-    def __init__(self, page: IdentityPage, scope: Any) -> None:
+    def __init__(
+        self, page: IdentityPage, scope: Any, stage: Any = None,
+    ) -> None:
         self.page = page
         self.scope = scope
+        self.stage = stage
 
     def __getitem__(self, key: Any) -> Any:
         try:
@@ -5118,6 +5124,36 @@ class PageMapping(MutableMapping):
             raise KeyError(key)
         return fact
 
+    def _revise(self, row: Any, fact: Any) -> None:
+        """``row``'s next revision.  On a book's page it is posted through
+        the book DERIVED from the cell it revises (the row's latest cell);
+        a row with no cell is not revised here but registered by the writer
+        that read it, with its cells.  A standalone page keeps its own
+        ``revise``."""
+
+        book = self.page.book
+        if book is None:
+            self.page.revise(row, fact)
+            return
+        page = book.registry.page(self.page.name)
+        incumbent = book.latest_ref(page, row)
+        if incumbent is None:
+            raise ValueError(
+                f"{self.page.name} row {row!r}: no incumbent to revise; a "
+                "new row is posted by its writer with the cells it was read "
+                "from"
+            )
+        stage = self.stage
+        if stage is None:
+            stage = (
+                book.active_stage if book.active_stage is not None
+                else RAW_STAGE
+            )
+        book.post(
+            page, row, fact, stage=stage,
+            provenance=Derived((incumbent,)), mode=Mode.REVISE,
+        )
+
     def __setitem__(self, key: Any, value: Any) -> None:
         if value is None:
             raise ValueError(
@@ -5125,12 +5161,12 @@ class PageMapping(MutableMapping):
             )
         row = (self.scope, key)
         if self.page.latest(row) != value:
-            self.page.revise(row, value)
+            self._revise(row, value)
 
     def __delitem__(self, key: Any) -> None:
         if self.page.latest((self.scope, key)) is None:
             raise KeyError(key)
-        self.page.revise((self.scope, key), None)
+        self._revise((self.scope, key), None)
 
     def __iter__(self):
         for row in self.page.scope_rows(self.scope):
@@ -6885,33 +6921,33 @@ def concord_sequence_row_dtypes(
             )
         resolved.append(next(iter(known), "unknown"))
     result = tuple(resolved)
-    declared_sources = tuple(dict.fromkeys(
-        cell for cell in sources if isinstance(cell, Ref)
-    ))
+    from .concordance_declarations import CONTROL_SSA, SEQUENCE_ROW_DTYPE
+
+    book = page.book
+    # ``result`` was resolved across every row the call equates: each row's
+    # fact derives from the declared sources and from the incumbent cell of
+    # every row in the arena (a known column on one side refined the other).
+    incumbent_cells = tuple(
+        cell for cell in (
+            book.latest_ref(SEQUENCE_ROW_DTYPE, (scope, int(sequence_id)))
+            for sequence_id in normalized
+        )
+        if cell is not None
+    )
+    source_cells = tuple(dict.fromkeys((
+        *(cell for cell in sources if isinstance(cell, Ref)),
+        *incumbent_cells,
+    )))
     for sequence_id in normalized:
         row = (scope, int(sequence_id))
         fact = (result, str(source))
-        prior_cell = page.book.latest_ref(
-            page.book.registry.page("sequence_row_dtype_concordance"), row,
+        # No raw path: a first statement with no source is refused by the
+        # book, naming the writer that read the dtypes from nothing.
+        book.post(
+            SEQUENCE_ROW_DTYPE, row, fact,
+            stage=CONTROL_SSA if stage is None else stage,
+            provenance=Derived(source_cells), mode=Mode.REVISE,
         )
-        source_cells = tuple(dict.fromkeys((
-            *declared_sources,
-            *((prior_cell,) if prior_cell is not None else ()),
-        )))
-        if source_cells:
-            from .concordance_declarations import (
-                CONTROL_SSA, SEQUENCE_ROW_DTYPE,
-            )
-
-            page.book.post(
-                SEQUENCE_ROW_DTYPE, row, fact,
-                stage=CONTROL_SSA if stage is None else stage,
-                provenance=Derived(source_cells), mode=Mode.REVISE,
-            )
-        else:
-            history = page.history(row)
-            column = history[-1][0] + 1 if history else 0
-            page.set(row, column, fact)
     return result
 
 
@@ -6993,27 +7029,23 @@ def commit_sequence_contract(
         resolved.writable,
         str(source),
     )
-    prior_cell = page.book.latest_ref(
-        page.book.registry.page("sequence_contract_concordance"), row,
+    from .concordance_declarations import (
+        CONTROL_SSA, SEQUENCE_CONTRACT_CONCORDANCE,
     )
+
+    prior_cell = page.book.latest_ref(SEQUENCE_CONTRACT_CONCORDANCE, row)
     source_cells = tuple(dict.fromkeys((
         *(cell for cell in sources if isinstance(cell, Ref)),
         *((prior_cell,) if prior_cell is not None else ()),
     )))
-    if source_cells:
-        from .concordance_declarations import (
-            CONTROL_SSA, SEQUENCE_CONTRACT_CONCORDANCE,
-        )
-
-        page.book.post(
-            SEQUENCE_CONTRACT_CONCORDANCE, row, fact,
-            stage=CONTROL_SSA if stage is None else stage,
-            provenance=Derived(source_cells), mode=Mode.REVISE,
-        )
-    else:
-        history = page.history(row)
-        column = history[-1][0] + 1 if history else 0
-        page.set(row, column, fact)
+    # The contract derives from the cells the statement was read from and
+    # the incumbent it repeats or refines; no raw path.  A first statement
+    # that names no source is refused by the book at the writer.
+    page.book.post(
+        SEQUENCE_CONTRACT_CONCORDANCE, row, fact,
+        stage=CONTROL_SSA if stage is None else stage,
+        provenance=Derived(source_cells), mode=Mode.REVISE,
+    )
     return resolved
 
 
@@ -8161,25 +8193,27 @@ def record_proven_shape(
         tuple(deepest[1][1]) == extents
         or target_level > deepest_level
     ):
-        # The exact shape-state cell is the authority for this projection.
-        # Repeating the same assertion over an unchanged cell adds no causal
-        # information, while a newer state cell records an ordinary revision.
+        # The exact shape-state cell and the caller's cells are the
+        # authority for this projection.  Repeating the same assertion over
+        # unchanged cells (every cell it would derive from is already an
+        # edge into the row's latest cell) adds no causal information and is
+        # not restated; a newer cell records an ordinary revision.
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         latest_ref = book.latest_ref(PROVEN_SHAPE_PAGE, row)
+        cells = (*sources, *(() if state_ref is None else (state_ref,)))
         if (
             latest_ref is not None
+            and cells
             and page.latest(row) == fact
-            and state_ref is not None
-            and any(
-                source == state_ref
-                for source, _stage in book.edges_into(latest_ref)
-            )
         ):
-            return
+            recorded_sources = {
+                source for source, _stage in book.edges_into(latest_ref)
+            }
+            if all(cell in recorded_sources for cell in cells):
+                return
         _post_or_unsourced(
             book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
-            (*sources, *(() if state_ref is None else (state_ref,))),
-            PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
+            cells, PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
         )
         return
     state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
