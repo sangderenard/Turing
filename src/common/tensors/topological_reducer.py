@@ -18813,10 +18813,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 _replace_inputs(
                     target_wrapper, int(node_id), ((value_id, "operand"),)
                 )
+                # The class and width are read off the ``Precision.of`` call
+                # node and the value it promotes: DERIVED from both cells.
                 _concord_source_value_class(
                     scope, int(node_id), class_identity,
                     precision_limbs=limbs,
                     source="Precision.of boundary",
+                    provenance=_Derived(_node_identity_cells(
+                        target_wrapper, node_id, value_id,
+                    )),
                 )
                 _concord_source_precision_boundary(
                     scope,
@@ -18888,6 +18893,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 class_identity = str(precision[0][0]) if isinstance(
                     expression, ast.BinOp
                 ) else str(class_identity)
+                # The operands the class and width were read from (their
+                # ``source_value_class`` rows, under this graph's scope).
+                read_ids = (
+                    tuple(int(value_id) for value_id in operand_ids)
+                    if isinstance(expression, ast.BinOp)
+                    else (int(operand_id),)
+                )
                 data["type"] = operation
                 data["op"] = operation
                 attributes.update({
@@ -18899,6 +18911,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     scope, int(node_id), class_identity,
                     precision_limbs=int(limbs),
                     source=f"Precision {type(expression).__name__}",
+                    provenance=_Derived(_source_cells((
+                        *_node_identity_cells(
+                            target_wrapper, node_id, *read_ids,
+                        ),
+                        *(
+                            current_identity_book().latest_ref(
+                                _SOURCE_VALUE_CLASS, (scope, int(value_id)),
+                            )
+                            for value_id in read_ids
+                        ),
+                    ))),
                 )
                 receiver_id = (
                     int(operand_ids[0]) if isinstance(expression, ast.BinOp)
@@ -18962,10 +18985,21 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     int(node_id),
                     ((int(receiver_id), "operand"),),
                 )
+                # The class and width are the receiver's, read from its
+                # ``source_value_class`` row: DERIVED from the call node,
+                # the receiver node and that row.
                 _concord_source_value_class(
                     scope, int(node_id), str(receiver_class),
                     precision_limbs=int(receiver_limbs),
                     source=f"Precision {expression.func.attr}",
+                    provenance=_Derived(_source_cells((
+                        *_node_identity_cells(
+                            target_wrapper, node_id, receiver_id,
+                        ),
+                        current_identity_book().latest_ref(
+                            _SOURCE_VALUE_CLASS, (scope, int(receiver_id)),
+                        ),
+                    ))),
                 )
                 concord_operator(
                     int(node_id), source_operation, int(receiver_id),

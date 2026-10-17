@@ -211,6 +211,70 @@ def test_reducer_and_region_pages_have_no_raw_page_writers():
     assert 'page("source_precision_region_concordance")' not in planner
 
 
+def test_precision_pipeline_and_sympy_ingestion_have_no_raw_page_writers():
+    """The precision pipeline's channel-shape, declared-formal-width and
+    single-input-Phi rows, and every node row the SymPy law ingestion posts,
+    go through the book DERIVED from the value, operand, boundary and
+    expression cells each fact was read from.  No ``IdentityPage.set`` /
+    ``concord`` / ``revise`` call survives in ``ir_identities`` or
+    ``symbolic_process_graph``, and neither names a page by its string to
+    write it."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "compiler"
+    for module in ("ir_identities.py", "symbolic_process_graph.py"):
+        source = (root / module).read_text(encoding="utf-8")
+        raw = [
+            source.count("\n", 0, match.start()) + 1
+            for match in re.finditer(
+                r"\w*page\.(set|concord|revise)\(", source,
+            )
+        ]
+        assert raw == [], (module, raw)
+        written_by_name = [
+            source.count("\n", 0, match.start()) + 1
+            for match in re.finditer(
+                r'\.page\(\s*"[^"]+"\s*\)\s*\.(set|concord|revise)\(', source,
+            )
+        ]
+        assert written_by_name == [], (module, written_by_name)
+    pipeline = (root / "ir_identities.py").read_text(encoding="utf-8")
+    for page in (
+        "precision_channel_shape_concordance",
+        "precision_declared_formal_width_concordance",
+        "single_input_phi_descriptor_concordance",
+    ):
+        assert f'page("{page}")' not in pipeline, page
+
+
+def test_precision_and_compile_entry_pages_are_declared_and_classified():
+    """The pages this session's writers post are ``declare_page`` objects
+    with a spill lifecycle: the precision pipeline's three, the compile
+    entry's numeric type / method / parameter pages and the destructuring
+    projection page."""
+    from src.compiler import concordance_declarations as declared
+    from src.compiler.identity_concordance import REGISTRY
+    from src.compiler.page_lifecycle import PAGE_LIFECYCLE
+
+    for page in (
+        declared.PRECISION_CHANNEL_SHAPE,
+        declared.PRECISION_DECLARED_FORMAL_WIDTH,
+        declared.SINGLE_INPUT_PHI_DESCRIPTOR,
+        declared.SOURCE_NUMERIC_TYPE_DEPENDENCY,
+        declared.SOURCE_NUMERIC_METHOD_DEPENDENCY,
+        declared.SOURCE_NUMERIC_PARAMETER_ABI,
+        declared.ASSIGNMENT_PROJECTION_SOURCE,
+    ):
+        assert REGISTRY.pages[page.name] is page
+        assert page.name in PAGE_LIFECYCLE, page
+    for stage in (
+        declared.PRECISION_CARRY, declared.PRECISION_EXPANSION,
+        declared.SINGLE_INPUT_PHI_SETTLEMENT,
+    ):
+        assert REGISTRY.stages[stage.name] is stage
+
+
 def test_reducer_pages_are_declared_and_classified():
     """Each page the reducer posts is a ``declare_page`` object with the
     ``(numeric scope, value id)`` row shape its readers index by, and has a

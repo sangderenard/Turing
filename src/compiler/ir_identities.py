@@ -30,7 +30,6 @@ import contextlib as _contextlib
 import dataclasses
 from collections.abc import Mapping
 
-from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 from ..transmogrifier.ssa import Instr, SSAValue
 
 _POW = ("Pow", "pow")
@@ -92,8 +91,18 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
         inexact = active_contract().inexact_identities
     allowed = _EXACT_EXPONENTS + (_INEXACT_EXPONENTS if inexact else ())
 
-    def fresh() -> SSAValue:
-        return SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="float64")
+    from .concordance_declarations import (
+        PRECISION_IDENTITIES, PRECISION_IDENTITY_VALUE,
+    )
+    from .ssa_record_return_state import mint_ssa_value
+
+    def fresh(function, *operands) -> SSAValue:
+        # Minted through the book: a NOVEL ``ssa_value`` row from the cell of
+        # the operand the identity makes it from (``mint_ssa_value``).
+        return SSAValue(mint_ssa_value(
+            function, PRECISION_IDENTITY_VALUE, operands,
+            dtype="float64", shape=(), stage=PRECISION_IDENTITIES,
+        ), dtype="float64")
 
     counts = {"pow_to_mul": 0, "pow_to_reciprocal": 0, "pow_to_sqrt": 0}
 
@@ -113,10 +122,10 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
         # it is itself being rebuilt would be overwritten by its new list.
         one_value: SSAValue | None = None
 
-        def unit() -> SSAValue:
+        def unit(base) -> SSAValue:
             nonlocal one_value
             if one_value is None:
-                one_value = fresh()
+                one_value = fresh(function, base)
             return one_value
 
         def stripped(instruction) -> dict:
@@ -157,7 +166,7 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
                     counts["pow_to_mul"] += 1
                 elif exponent == -1.0:
                     rewritten.append(dataclasses.replace(
-                        instruction, op="Div", args=[unit(), base],
+                        instruction, op="Div", args=[unit(base), base],
                         attributes=attributes,
                     ))
                     counts["pow_to_reciprocal"] += 1
@@ -168,23 +177,23 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
                     ))
                     counts["pow_to_sqrt"] += 1
                 elif exponent == -0.5:
-                    root = fresh()
+                    root = fresh(function, base)
                     rewritten.append(
                         Instr("Sqrt", [base], root, attributes=dict(attributes))
                     )
                     rewritten.append(dataclasses.replace(
-                        instruction, op="Div", args=[unit(), root],
+                        instruction, op="Div", args=[unit(base), root],
                         attributes=attributes,
                     ))
                     counts["pow_to_reciprocal"] += 1
                 elif exponent == -2.0:
-                    square = fresh()
+                    square = fresh(function, base)
                     rewritten.append(
                         Instr("Mul", [base, base], square,
                               attributes=dict(attributes))
                     )
                     rewritten.append(dataclasses.replace(
-                        instruction, op="Div", args=[unit(), square],
+                        instruction, op="Div", args=[unit(base), square],
                         attributes=attributes,
                     ))
                     counts["pow_to_reciprocal"] += 1
@@ -683,6 +692,45 @@ def _is_predicate_derived(instruction, definitions, predicates,
     return False
 
 
+def _source_numeric_scopes(function) -> tuple:
+    """The numeric scopes the reducer keyed ``function``'s source facts by
+    (its authored identity and its source numeric scope), as
+    ``lower_precision_operations`` reads them."""
+
+    metadata = dict(getattr(function, "metadata", {}) or {})
+    return tuple(dict.fromkeys(
+        scope for scope in (
+            metadata.get("authored_function_identity"),
+            metadata.get("source_numeric_scope"),
+        )
+        if scope is not None
+    ))
+
+
+def _source_precision_fact_cells(book, function, *values) -> tuple:
+    """The reducer's precision facts on ``values`` under ``function``'s
+    numeric scopes: the ``source_precision_boundary`` row a promoted value
+    entered at and the ``source_precision_operator`` row a result was
+    declared with.  These are the cells a width read off a value or an
+    instruction attribute was written from."""
+
+    from .concordance_declarations import (
+        SOURCE_PRECISION_BOUNDARY, SOURCE_PRECISION_OPERATOR,
+    )
+
+    return tuple(dict.fromkeys(
+        cell
+        for scope in _source_numeric_scopes(function)
+        for value in values
+        if value is not None
+        for cell in (
+            book.latest_ref(SOURCE_PRECISION_BOUNDARY, (scope, int(value.id))),
+            book.latest_ref(SOURCE_PRECISION_OPERATOR, (scope, int(value.id))),
+        )
+        if cell is not None
+    ))
+
+
 def carry_precision_through_ssa(functions) -> int:
     """Make a precision result self-describing, then rename what reads it.
 
@@ -720,11 +768,14 @@ def carry_precision_through_ssa(functions) -> int:
     singular = dict(PRECISION_SINGULAR_NAMES)
     planted = {name: operation for operation, name in singular.items()}
     changed_total = 0
-    from .identity_concordance import current_identity_book
-
-    channel_shape_page = current_identity_book().page(
-        "precision_channel_shape_concordance"
+    from .concordance_declarations import (
+        PRECISION_CARRY, PRECISION_CHANNEL_SHAPE,
     )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_record_return_state import identity_cells
+
+    book = current_identity_book()
+    channel_shape_page = book.page(PRECISION_CHANNEL_SHAPE)
 
     def limbs_of(value) -> int:
         try:
@@ -735,12 +786,14 @@ def carry_precision_through_ssa(functions) -> int:
 
     def carry(
         function_name: str,
-        value,
+        function,
+        instruction,
         limbs: int,
         element: str | None,
     ) -> bool:
         """Give one result value the limb channel and the fact."""
 
+        value = instruction.res
         if value is None or limbs <= 1 or limbs_of(value) == limbs:
             return False
         value.accounting["precision_limbs"] = int(limbs)
@@ -770,8 +823,21 @@ def carry_precision_through_ssa(functions) -> int:
                 "precision channel shape concordance disagreement for "
                 f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
             )
-        if incumbent is None:
-            channel_shape_page.set(row, 0, proposed)
+        # The channel is read from the value and from the operands whose
+        # limbs decided it, and those limbs entered at the reducer's
+        # boundary / operator facts: DERIVED from exactly those cells.  A
+        # same-fact re-post is CONCORD (the edge is recorded, no cell
+        # written); a disagreeing fact raised above.
+        book.post(
+            PRECISION_CHANNEL_SHAPE, row, proposed, stage=PRECISION_CARRY,
+            provenance=Derived(tuple(dict.fromkeys((
+                *identity_cells(function, value, *instruction.args),
+                *_source_precision_fact_cells(
+                    book, function, value, *instruction.args,
+                ),
+            )))),
+            mode=Mode.CONCORD,
+        )
         value.accounting["precision_logical_shape"] = existing
         value.shape = channel_shape
         return True
@@ -816,7 +882,8 @@ def carry_precision_through_ssa(functions) -> int:
                     else:
                         continue
                     if carry(
-                        str(function_name), instruction.res, limbs, element,
+                        str(function_name), function, instruction, limbs,
+                        element,
                     ):
                         changed += 1
             # The backward half of the same fact: a value CONSUMED at width
@@ -1163,9 +1230,20 @@ def reduce_precision_operations(functions) -> dict:
         "scaling_by_power_of_two": 0,
         "single_renormalisation_per_chain": 0,
     }
-    def fresh(like) -> SSAValue:
+    from .concordance_declarations import (
+        PRECISION_IDENTITIES, PRECISION_IDENTITY_VALUE,
+    )
+    from .ssa_record_return_state import mint_ssa_value
+
+    def fresh(function, like) -> SSAValue:
+        # Minted through the book from the cell of the value it is made
+        # like (the subtrahend the identity negates).
         value = SSAValue(
-            GLOBAL_MONOTONIC_IDS.mint(),
+            mint_ssa_value(
+                function, PRECISION_IDENTITY_VALUE, (like,),
+                dtype=like.dtype, shape=tuple(like.shape or ()),
+                stage=PRECISION_IDENTITIES,
+            ),
             dtype=like.dtype,
             shape=tuple(like.shape or ()),
             device=like.device, accounting=dict(like.accounting or {}),
@@ -1203,7 +1281,7 @@ def reduce_precision_operations(functions) -> dict:
                     rewritten.append(instruction)
                     continue
                 left, right = instruction.args
-                negated = fresh(right)
+                negated = fresh(function, right)
                 rewritten.append(Instr(
                     neg_name, [right], negated,
                     attributes={
@@ -1444,8 +1522,19 @@ def contract_multiply_add_to_fma(functions, licensed: bool | None = None) -> dic
 
                 factors = list(product.args)
                 if operation == "Sub":
+                    from .concordance_declarations import (
+                        PRECISION_IDENTITIES, PRECISION_IDENTITY_VALUE,
+                    )
+                    from .ssa_record_return_state import mint_ssa_value
+
+                    # Minted through the book from the addend it negates.
                     negated = SSAValue(
-                        GLOBAL_MONOTONIC_IDS.mint(),
+                        mint_ssa_value(
+                            function, PRECISION_IDENTITY_VALUE, (addend,),
+                            dtype=addend.dtype,
+                            shape=tuple(addend.shape or ()),
+                            stage=PRECISION_IDENTITIES,
+                        ),
                         dtype=addend.dtype,
                         shape=tuple(addend.shape or ()),
                         device=addend.device,
@@ -1975,14 +2064,17 @@ def lower_precision_operations(
     original_formals = {
         str(name): tuple(function.args) for name, function in functions.items()
     }
-    from .identity_concordance import current_identity_book
+    from .concordance_declarations import (
+        PRECISION_CHANNEL_SHAPE, PRECISION_CONSTANT,
+        PRECISION_DECLARED_FORMAL_WIDTH, PRECISION_EXPANSION,
+        PRECISION_FORMAL_LIMB, PRECISION_LIMB, SOURCE_PRECISION_BOUNDARY,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_record_return_state import identity_cells, mint_ssa_value
 
-    promotion_page = current_identity_book().page(
-        "source_precision_boundary_concordance"
-    )
-    channel_shape_page = current_identity_book().page(
-        "precision_channel_shape_concordance"
-    )
+    book = current_identity_book()
+    promotion_page = book.page(SOURCE_PRECISION_BOUNDARY)
+    channel_shape_page = book.page(PRECISION_CHANNEL_SHAPE)
     promoted_scalar_formals: dict[str, set[int]] = {}
     for name, function in functions.items():
         metadata = dict(getattr(function, "metadata", {}) or {})
@@ -2136,18 +2228,36 @@ def lower_precision_operations(
         # A formal whose declared type is a Precision value of some width
         # (for example a numeral's coefficient leaf) is that many limbs,
         # whether or not a Precision operation in this body touches it.
-        declared_width_page = current_identity_book().page(
-            "precision_declared_formal_width_concordance"
-        )
-        widths: dict[int, int] = {
-            int(value.id): int(declared_width_page.concord(
-                (str(name), int(value.id)),
-                int((value.accounting or {})["precision_limbs"]),
-            ))
-            for value in function.args
-            if int((value.accounting or {}).get("precision_limbs") or 1) > 1
-            and int(value.id) not in promoted_scalar_formals[str(name)]
-        }
+        declared_width_page = book.page(PRECISION_DECLARED_FORMAL_WIDTH)
+        widths: dict[int, int] = {}
+        for value in function.args:
+            declared = int((value.accounting or {}).get("precision_limbs") or 1)
+            if (
+                declared <= 1
+                or int(value.id) in promoted_scalar_formals[str(name)]
+            ):
+                continue
+            row = (str(name), int(value.id))
+            incumbent = declared_width_page.latest(row)
+            if incumbent is not None and int(incumbent) != declared:
+                raise ValueError(
+                    f"{PRECISION_DECLARED_FORMAL_WIDTH.name} disagreement "
+                    f"for {row!r}: recorded={incumbent!r}, "
+                    f"proposed={declared!r}"
+                )
+            # The width is read off the formal's own accounting: DERIVED
+            # from the formal's ``ssa_value`` cell and the reducer's facts
+            # that put the width there.
+            book.post(
+                PRECISION_DECLARED_FORMAL_WIDTH, row, declared,
+                stage=PRECISION_EXPANSION,
+                provenance=Derived(tuple(dict.fromkeys((
+                    *identity_cells(function, value),
+                    *_source_precision_fact_cells(book, function, value),
+                )))),
+                mode=Mode.CONCORD,
+            )
+            widths[int(value.id)] = declared
         for block in function.blocks.values():
             for instruction in block.instrs:
                 if str(instruction.op) not in expandable:
@@ -2227,8 +2337,13 @@ def lower_precision_operations(
                 continue
             row = [formal]
             for limb_index in range(1, width):
+                # Minted through the book from the declared formal's cell.
                 extra = SSAValue(
-                    GLOBAL_MONOTONIC_IDS.mint(),
+                    mint_ssa_value(
+                        function, PRECISION_FORMAL_LIMB, (formal,),
+                        dtype=formal.dtype, shape=tuple(formal.shape or ()),
+                        stage=PRECISION_EXPANSION,
+                    ),
                     dtype=formal.dtype,
                     shape=tuple(formal.shape or ()),
                     device=formal.device,
@@ -2333,8 +2448,14 @@ def lower_precision_operations(
                     and logical_shape[-1] == carried_width
                 ):
                     logical_shape = logical_shape[:-1]
+                # Minted through the book from the cells of the value it is
+                # shaped like and the one whose extent it carries.
                 value = SSAValue(
-                    GLOBAL_MONOTONIC_IDS.mint(),
+                    mint_ssa_value(
+                        function, PRECISION_LIMB, (like, extent_like),
+                        dtype=dtype, shape=logical_shape,
+                        stage=PRECISION_EXPANSION,
+                    ),
                     dtype=dtype,
                     shape=logical_shape,
                     device=like.device,
@@ -2407,8 +2528,12 @@ def lower_precision_operations(
                 return result
 
             def scalar_constant(number, like):
+                # Minted through the book from the value it is emitted for.
                 result = SSAValue(
-                    GLOBAL_MONOTONIC_IDS.mint(),
+                    mint_ssa_value(
+                        function, PRECISION_CONSTANT, (like,),
+                        dtype=like.dtype, shape=(), stage=PRECISION_EXPANSION,
+                    ),
                     dtype=like.dtype,
                     shape=(),
                     device=like.device,
@@ -2785,9 +2910,13 @@ def lower_precision_operations(
             # pointer value id -> (base array id, index value)
             addressed: dict[int, tuple] = {}
 
-            def constant(number: int):
+            def constant(number: int, like):
+                # Minted through the book from the index it strides.
                 value = SSAValue(
-                    GLOBAL_MONOTONIC_IDS.mint(),
+                    mint_ssa_value(
+                        function, PRECISION_CONSTANT, (like,),
+                        dtype="int", shape=(), stage=PRECISION_EXPANSION,
+                    ),
                     dtype="int",
                     shape=(),
                 )
@@ -2806,10 +2935,10 @@ def lower_precision_operations(
                 implement.
                 """
 
-                scaled = put("Mul", (index, constant(width)), index)
+                scaled = put("Mul", (index, constant(width, index)), index)
                 flat = (
                     scaled if position == 0
-                    else put("Add", (scaled, constant(position)), index)
+                    else put("Add", (scaled, constant(position, index)), index)
                 )
                 return put("GetElementPtr", (base, flat), index)
 
@@ -3343,11 +3472,14 @@ def settle_single_input_phi_descriptors(functions) -> int:
     is authoritative.  This runs after precision collapse because that is
     when the incoming logical shape is restored.
     """
-    from .identity_concordance import current_identity_book
-
-    page = current_identity_book().page(
-        "single_input_phi_descriptor_concordance"
+    from .concordance_declarations import (
+        SINGLE_INPUT_PHI_DESCRIPTOR, SINGLE_INPUT_PHI_SETTLEMENT,
     )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_record_return_state import identity_cells
+
+    book = current_identity_book()
+    page = book.page(SINGLE_INPUT_PHI_DESCRIPTOR)
     changed = 0
     for function_name, function in functions.items():
         for block in function.blocks.values():
@@ -3373,8 +3505,14 @@ def settle_single_input_phi_descriptors(functions) -> int:
                         f"for {row!r}: recorded={incumbent!r}, "
                         f"proposed={proposed!r}"
                     )
-                if incumbent is None:
-                    page.set(row, 0, proposed)
+                # The descriptor is the sole arm's, read off that value for
+                # this Phi: DERIVED from both values' ``ssa_value`` cells.
+                book.post(
+                    SINGLE_INPUT_PHI_DESCRIPTOR, row, proposed,
+                    stage=SINGLE_INPUT_PHI_SETTLEMENT,
+                    provenance=Derived(identity_cells(function, result, source)),
+                    mode=Mode.CONCORD,
+                )
                 result_shape = tuple(result.shape or ())
                 if result_shape and result_shape != source_shape:
                     raise ValueError(

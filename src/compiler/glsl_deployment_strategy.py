@@ -16460,6 +16460,22 @@ def _child_signature_results(book: Any) -> dict:
     return held[1]
 
 
+def _callsite_return_decision_cells(caller: Any, callee: Any, node_id: int) -> tuple:
+    """The ``callsite_return_specialization`` cell of one callsite -- the
+    round's published return decision ``call_result_descriptor`` posted,
+    DERIVED from the callee's return cells (or the call node) -- as a
+    one-cell tuple, empty when no round has posted it."""
+
+    from .concordance_declarations import CALLSITE_RETURN_SPECIALIZATION_PAGE
+    from .identity_concordance import current_identity_book, shape_scope_of
+
+    cell = current_identity_book().latest_ref(
+        CALLSITE_RETURN_SPECIALIZATION_PAGE,
+        (shape_scope_of(caller), shape_scope_of(callee), int(node_id)),
+    )
+    return () if cell is None else (cell,)
+
+
 def _propagate_callsite_tensor_specializations(
     graph: Any,
     *,
@@ -17091,6 +17107,20 @@ def _propagate_callsite_tensor_specializations(
                                 shape_scope_of,
                             )
 
+                            # Read off the callee's return cells and the
+                            # round's published return decision
+                            # (``callsite_return_specialization``), which is
+                            # what ``call_result_descriptor`` stated the
+                            # exact shape from.
+                            callee_return_cells = tuple(dict.fromkeys(
+                                cell for cells in return_cells_by_call.get(
+                                    (id(caller.G), int(_node_id)), (),
+                                ) for cell in (
+                                    cells if isinstance(cells, tuple)
+                                    else (cells,)
+                                )
+                                if cell is not None
+                            ))
                             # Publish on every fixed-point observation, not
                             # only when the graph-node dictionary changes.
                             # Another callsite later in the same round may
@@ -17106,6 +17136,12 @@ def _propagate_callsite_tensor_specializations(
                                 int(_dependency_levels(caller).get(
                                     int(_node_id), 0,
                                 )),
+                                sources=(
+                                    *callee_return_cells,
+                                    *_callsite_return_decision_cells(
+                                        caller, callee, int(_node_id),
+                                    ),
+                                ),
                             )
                             # The restoration is itself a morph of the call
                             # value: record it as the callee-return edge so
@@ -17208,6 +17244,8 @@ def _propagate_callsite_tensor_specializations(
                                 replacement.get("shape") or ()
                             )
                             if replacement_shape:
+                                # Read off the same cells as the exact
+                                # observation above.
                                 record_proven_shape(
                                     shape_scope_of(caller),
                                     int(data.get("value_id", _node_id)),
@@ -17216,6 +17254,22 @@ def _propagate_callsite_tensor_specializations(
                                     int(_dependency_levels(caller).get(
                                         int(_node_id), 0,
                                     )),
+                                    sources=(
+                                        *tuple(dict.fromkeys(
+                                            cell for cells in
+                                            return_cells_by_call.get(
+                                                (id(caller.G), int(_node_id)),
+                                                (),
+                                            ) for cell in (
+                                                cells if isinstance(cells, tuple)
+                                                else (cells,)
+                                            )
+                                            if cell is not None
+                                        )),
+                                        *_callsite_return_decision_cells(
+                                            caller, callee, int(_node_id),
+                                        ),
+                                    ),
                                 )
                             record_shape_transformation(
                                 shape_scope_of(callee),

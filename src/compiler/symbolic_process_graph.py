@@ -729,6 +729,11 @@ class _SympyIngestionProvenance:
     when it is authored, else those of the innermost authored subexpression
     whose ingestion made it (``context``).  Membership is SymPy structural
     equality (the memo's own key), never a spelling.
+
+    ``envelope`` is the construction ``Tuple`` ``ingest_sympy_expressions``
+    wraps an expression set in: it is no authored construct, and the one
+    node it makes derives from every expression's own
+    ``symbolic_ingested_expression`` cell (``expression_cells``).
     """
 
     def __init__(
@@ -737,6 +742,8 @@ class _SympyIngestionProvenance:
         expressions: Sequence[sympy.Basic],
         output_names: Sequence[str],
         sources: Sequence[Any] | None,
+        *,
+        envelope: sympy.Basic | None = None,
     ) -> None:
         from .concordance_declarations import (
             INGEST_SOURCE, INGESTION, SYMBOLIC_INGESTED_EXPRESSION,
@@ -760,6 +767,8 @@ class _SympyIngestionProvenance:
         self.scope = scope
         self.context: list[sympy.Basic] = []
         self.occurrences: dict[sympy.Basic, list[Any]] = {}
+        self.envelope = envelope
+        self.expression_cells: list[Any] = []
         base = book.page(SYMBOLIC_INGESTED_EXPRESSION).scope_row_count(scope)
         for offset, (expression, output) in enumerate(
             zip(expressions, output_names)
@@ -775,6 +784,7 @@ class _SympyIngestionProvenance:
                 ),
                 mode=Mode.CONCORD,
             )
+            self.expression_cells.append(expression_cell)
             seen: set[sympy.Basic] = set()
             pending = [(sympy.sympify(expression), (), expression_cell)]
             while pending:
@@ -800,6 +810,8 @@ class _SympyIngestionProvenance:
 
     def node_cells(self, value: sympy.Basic) -> tuple[Any, ...]:
         cells = self.occurrences.get(value)
+        if cells is None and self.envelope is not None and value == self.envelope:
+            cells = self.expression_cells
         if cells is None and self.context:
             cells = self.occurrences[self.context[-1]]
         return tuple(cells or ())
@@ -1491,7 +1503,8 @@ def ingest_sympy_expressions(
     cell each expression is the output of -- the law's equation, as
     ``compile_sympy_equations`` posts it.  Each expression's ingestion row
     is DERIVED from it; without it the expression is its own NOVEL root.
-    The envelope is the one node with no source.
+    The envelope is no authored construct: its one node derives from every
+    expression's row.
     """
 
     authored = tuple(sympy.sympify(expression) for expression in expressions)
@@ -1507,11 +1520,13 @@ def ingest_sympy_expressions(
     if len(names) != len(set(names)):
         raise ValueError("SymPy output names must be unique")
 
+    envelope = sympy.Tuple(*authored)
     tuple_root = ingest_sympy_expression(
-        graph, sympy.Tuple(*authored), strict=strict,
+        graph, envelope, strict=strict,
         _provenance=_SympyIngestionProvenance(
             graph, authored, names,
             None if expression_sources is None else tuple(expression_sources),
+            envelope=envelope,
         ),
     )
     tuple_data = graph.G.nodes[tuple_root]

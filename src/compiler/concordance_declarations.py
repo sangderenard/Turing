@@ -1378,9 +1378,46 @@ KERNEL_INPUT_CONVERSION = declare_page("kernel_input_conversion", (
 #: A scalar operand promoted at a repository kernel's input whose
 #: ``ssa_value`` cell the book does not hold.
 KERNEL_OPERAND_NOT_ON_BOOK = declare_reason("kernel_operand_not_on_book")
+#: ``ir_identities.carry_precision_through_ssa``: a precision result is given
+#: its limb channel, and the ordinary operations reading a limbed operand are
+#: renamed, to a fixed point.
+PRECISION_CARRY = declare_stage("precision_carry")
+#: ``ir_identities.lower_precision_operations``: the exact limb expansion of
+#: the precision operations and of the formals they read.
+PRECISION_EXPANSION = declare_stage("precision_expansion")
+#: ``ir_identities.settle_single_input_phi_descriptors``: a structural Phi
+#: with one surviving arm takes that arm's descriptor.
+SINGLE_INPUT_PHI_SETTLEMENT = declare_stage("single_input_phi_settlement")
+#: ``ir_identities.reduce_precision_operations`` /
+#: ``reduce_constant_exponent_pow`` / ``contract_multiply_add_to_fma``: the
+#: exact catalogue identities rewriting repository SSA in place.
+PRECISION_IDENTITIES = declare_stage("precision_identities")
+#: A value an exact identity introduces beside the instruction it rewrites
+#: (the negation of a subtrahend, the root or square of a constant-exponent
+#: Pow, its unit constant): from the cell of the operand it is made from.
+PRECISION_IDENTITY_VALUE = declare_transform("precision_identity_value", 1)
+#: ``lower_precision_operations``: an appended low-limb formal of a declared
+#: wide parameter, from the declared formal's ``ssa_value`` cell.
+PRECISION_FORMAL_LIMB = declare_transform("precision_formal_limb", 1)
+#: ``lower_precision_operations``: one limb or intermediate of the exact
+#: expansion of a precision operation, from the cell of the value it is
+#: shaped like (the operation's result or the operand whose extent it
+#: carries).
+PRECISION_LIMB = declare_transform("precision_limb", 1)
+#: ``lower_precision_operations``: a constant the expansion needs (a split
+#: constant, a zero limb, a limb index), from the cell of the value it is
+#: emitted for.
+PRECISION_CONSTANT = declare_transform("precision_constant", 1)
+#: ``carry_precision_through_ssa``: ``(function scope, value)`` -> ``(logical
+#: shape, channel shape, limbs)``, CONCORD, DERIVED(the value's and its
+#: operands' ``ssa_value`` cells and the reducer's precision boundary /
+#: operator cells the limbs entered with).
 PRECISION_CHANNEL_SHAPE = declare_page("precision_channel_shape_concordance", (
     RowField("function", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), tuple)                              # mode CONCORD
+#: ``lower_precision_operations``: ``(function scope, formal)`` -> limbs,
+#: CONCORD, DERIVED(the formal's ``ssa_value`` cell and its boundary /
+#: operator cells).
 PRECISION_DECLARED_FORMAL_WIDTH = declare_page(
     "precision_declared_formal_width_concordance", (
         RowField("function", K.SCOPE), RowField("formal", K.VALUE_ID),
@@ -3664,6 +3701,47 @@ SOURCE_PARAMETER_IDENTITY = declare_page(
     "source_parameter_identity_concordance", (
         RowField("function_scope", K.SCOPE), RowField("parameter", K.NAME),
     ), tuple,
+)
+#: ``_lower_ast_source_to_ssa_impl``: the coefficient closure of a numeric
+#: type an authored parameter annotation names, ``(type name, limbs)`` ->
+#: the closure's descriptor receipts, CONCORD, DERIVED(the
+#: ``static_symbol_definition`` cells of the wrapper classes the closure
+#: names, read from the numeric feature type registry).
+SOURCE_NUMERIC_TYPE_DEPENDENCY = declare_page(
+    "source_numeric_type_dependency_concordance", (
+        RowField("type_name", K.NAME), RowField("limbs", K.INDEX),
+    ), tuple,
+)
+#: ``_lower_ast_source_to_ssa_impl``: the authored same-type ``_binary_same``
+#: bodies a numeric type's arithmetic delegates to, ``(type name, limbs)``
+#: -> ``("Owner._binary_same", ...)`` down the class's MRO, CONCORD,
+#: DERIVED(the ``static_symbol_definition`` cells of the class and of each
+#: ``_binary_same`` it names).
+SOURCE_NUMERIC_METHOD_DEPENDENCY = declare_page(
+    "source_numeric_method_dependency_concordance", (
+        RowField("type_name", K.NAME), RowField("limbs", K.INDEX),
+    ), tuple,
+)
+#: ``_lower_ast_source_to_ssa_impl``: an authored parameter whose composite
+#: numeric annotation is materialized as a physical record, ``(function
+#: name, parameter)`` -> ``(schema name, type name, limbs)``, CONCORD,
+#: DERIVED(the annotation's ``source_span`` cell and the numeric type's
+#: ``static_symbol_definition`` cell).
+SOURCE_NUMERIC_PARAMETER_ABI = declare_page(
+    "source_numeric_parameter_abi_concordance", (
+        RowField("function", K.NAME), RowField("parameter", K.NAME),
+    ), tuple,
+)
+#: ``_class_surface_ssa_program``: which authored target each evaluate-once
+#: aggregate position of a destructuring assignment denotes, as
+#: ``assignment_normalization`` rewrote it, ``(source scope, aggregate
+#: temporary, position)`` -> target name, CONCORD, DERIVED(the
+#: ``source_span`` cell of the projection statement the normalizer wrote).
+ASSIGNMENT_PROJECTION_SOURCE = declare_page(
+    "assignment_projection_source_concordance", (
+        RowField("source_scope", K.NAME), RowField("aggregate", K.NAME),
+        RowField("projection", K.INDEX),
+    ), str,
 )
 
 # -- operation-owned result domains and scalar kernel operands ---------------
