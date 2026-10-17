@@ -4758,10 +4758,9 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
     from ..common.tensors.topological_reducer import (
         _set_operands, node_identity_cell, post_derived_node_identity,
     )
-    from .concordance_declarations import (
-        CLASS_FIELD_DECLARATION, PLANNER_STRUCTURAL_FOLD,
-    )
-    from .identity_concordance import current_identity_book
+    from .concordance_declarations import PLANNER_STRUCTURAL_FOLD
+    from .frame_identity_book import _record_field_declaration_cell
+    from .identity_concordance import ConcordanceRefusal
 
     view = SimpleNamespace(G=graph)
 
@@ -4837,6 +4836,24 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
                         compare_id, isinstance(expression.ops[0], ast.IsNot),
                     ))
             comparisons = list(dict.fromkeys(comparisons))
+            # The presence Input stands for the optional field of the
+            # parameter's record: its identity row is posted DERIVED from
+            # the receiver nodes and the field's ``class_field_declaration``
+            # cell (the row the record's ``source_record_view_schema``
+            # names, else the declaration of the record's identity).  A
+            # record whose field declaration the book does not hold is
+            # refused before any node is added: a node with no row is a
+            # creation that skipped the book, which ``node_identity_cell``
+            # would name at the first read, far from its cause.
+            field_cell = _record_field_declaration_cell(record, field_name)
+            if field_cell is None:
+                raise ConcordanceRefusal(
+                    "optional record field has no class_field_declaration "
+                    f"cell: parameter={parameter!r} "
+                    f"record={record.get('identity')!r} "
+                    f"field={field_name!r} "
+                    f"schema_row={record.get('source_record_view_schema')!r}"
+                )
             positive = next((
                 node_id for node_id, present_when in comparisons if present_when
             ), None)
@@ -4857,27 +4874,16 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
             else:
                 detach_inputs(positive)
             positive_data = graph.nodes[positive]
-            schema_row = record.get("source_record_view_schema")
-            field_cell = (
-                current_identity_book().latest_ref(
-                    CLASS_FIELD_DECLARATION,
-                    (*tuple(schema_row), str(field_name)),
-                )
-                if isinstance(schema_row, (tuple, list))
-                and len(schema_row) == 2
-                else None
+            owner_cells = tuple(
+                node_identity_cell(view, owner_id)
+                for owner_id in sorted(owner_ids)
+                if owner_id in graph
             )
-            if field_cell is not None:
-                owner_cells = tuple(
-                    node_identity_cell(view, owner_id)
-                    for owner_id in sorted(owner_ids)
-                    if owner_id in graph
-                )
-                post_derived_node_identity(
-                    view, positive,
-                    (*owner_cells, field_cell),
-                    stage=PLANNER_STRUCTURAL_FOLD,
-                )
+            post_derived_node_identity(
+                view, positive,
+                (*owner_cells, field_cell),
+                stage=PLANNER_STRUCTURAL_FOLD,
+            )
             _set_operands(view, positive, [], cause="optional_presence_input")
             positive_data.update({
                 "label": f"{parameter}.{field_name}.__present",
