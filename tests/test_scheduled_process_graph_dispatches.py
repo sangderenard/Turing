@@ -77,16 +77,16 @@ def graph_cut_book():
 def _scope_dispatch_fixture(graph, book):
     """Enter synthetic nodes through the same identity API as scoped cuts."""
     from src.compiler.concordance_declarations import (
-        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, SYNTHESIZED_NO_SOURCE,
+        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, INGEST_SOURCE,
     )
-    from src.compiler.identity_concordance import Mode, Unsourced
+    from src.compiler.identity_concordance import Mode, Novel
     scope = book.mint_scope('dispatch_fixture', READ_SCOPE_FORK)
     graph.G.graph.update(ingestion_value_scope=scope, lexical_read_scope=scope,
                          operand_position_scope=scope)
     for node_id, data in graph.G.nodes(data=True):
         book.post(INGESTION_VALUE, (scope, node_id),
                   NodeFact(data.get('type'), data.get('op'), data.get('label')),
-                  stage=READ_SCOPE_FORK, provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
+                  stage=READ_SCOPE_FORK, provenance=Novel(INGEST_SOURCE, ()),
                   mode=Mode.CONCORD)
 
 
@@ -97,9 +97,9 @@ def test_dispatch_cuts_share_one_edge_index_without_rescanning_other_members(mon
     Its external consumer must still force publication from region (2, 3).
     """
     from src.compiler.concordance_declarations import (
-        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, SYNTHESIZED_NO_SOURCE,
+        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, INGEST_SOURCE,
     )
-    from src.compiler.identity_concordance import Mode, Unsourced
+    from src.compiler.identity_concordance import Mode, Novel
 
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "Input")
@@ -121,7 +121,7 @@ def test_dispatch_cuts_share_one_edge_index_without_rescanning_other_members(mon
             INGESTION_VALUE, (scope, node_id),
             NodeFact(data["type"], data["op"], data["label"]),
             stage=READ_SCOPE_FORK,
-            provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+            provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
         )
     queries = []
     original = graph.G.predecessors
@@ -542,10 +542,10 @@ def test_region_fork_of_read_scope_holds_its_own_nodes_rows_as_a_declared_projec
 
     from src.compiler.concordance_declarations import (
         INGESTION_VALUE, LEXICAL_READ_BINDING, NodeFact, READ_SCOPE_FORK,
-        ROW_PROJECTED_OUT_OF_SCOPE, SYNTHESIZED_NO_SOURCE,
+        ROW_PROJECTED_OUT_OF_SCOPE, INGEST_SOURCE,
     )
     from src.compiler.identity_concordance import (
-        Mode, ProjectedScopeRead, Unresolved, Unsourced, begin_identity_book,
+        Mode, ProjectedScopeRead, Unresolved, Novel, begin_identity_book,
         end_identity_book,
     )
 
@@ -562,14 +562,14 @@ def test_region_fork_of_read_scope_holds_its_own_nodes_rows_as_a_declared_projec
             book.post(
                 INGESTION_VALUE, (ingestion, node_id), NodeFact("t", "t", "t"),
                 stage=READ_SCOPE_FORK,
-                provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+                provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
             )
         graph.G.graph["ingestion_value_scope"] = ingestion
         for consumer in (1, 2, 3, 4, "return"):
             book.post(
                 LEXICAL_READ_BINDING, (scope, consumer, "arg0", 0), "x",
                 stage=READ_SCOPE_FORK,
-                provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+                provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
             )
         graph.G.graph["lexical_read_scope"] = scope
         page = book.page(LEXICAL_READ_BINDING)
@@ -625,10 +625,10 @@ def test_region_projections_share_one_node_universe_and_refuse_the_complement():
     node set, which every region of that source shares as ONE object (not a
     source-sized set per region), and a copy of a region inherits it."""
     from src.compiler.concordance_declarations import (
-        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, SYNTHESIZED_NO_SOURCE,
+        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, INGEST_SOURCE,
     )
     from src.compiler.identity_concordance import (
-        Mode, Unsourced, begin_identity_book, end_identity_book,
+        Mode, Novel, begin_identity_book, end_identity_book,
     )
 
     book, token = begin_identity_book()
@@ -642,7 +642,7 @@ def test_region_projections_share_one_node_universe_and_refuse_the_complement():
             book.post(
                 INGESTION_VALUE, (ingestion, node_id), NodeFact("t", "t", "t"),
                 stage=READ_SCOPE_FORK,
-                provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+                provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
             )
         graph.G.graph["ingestion_value_scope"] = ingestion
         graph.G.graph["lexical_read_scope"] = book.mint_scope(

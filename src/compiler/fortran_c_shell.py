@@ -39008,6 +39008,10 @@ def _class_surface_ssa_program(
                             all_sequence_tables.get(str(record.callee_symbol)),
                             all_sequence_tables.get(str(caller_symbol)),
                             {int(value.id) for value in caller.args},
+                            callee_cell=_frame_value_cell(
+                                all_functions.get(str(record.callee_symbol)),
+                                int(callee_id),
+                            ),
                         )
                         owner = (
                             ("linked_member", int(linked_owner))

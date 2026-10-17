@@ -140,13 +140,13 @@ def test_synthetic_device_scalar_nodes_are_named_in_the_graphs_own_scope():
     from src.common.tensors.topological_reducer import node_identity_cell
     from src.compiler.concordance_declarations import (
         INGESTION_VALUE, NodeFact, PLANNER_STRUCTURAL_FOLD,
-        SYNTHESIZED_NO_SOURCE,
+        INGEST_SOURCE,
     )
     from src.compiler.glsl_deployment_strategy import (
         _synthetic_device_scalar_shell,
     )
     from src.compiler.identity_concordance import (
-        Mode, Novel, Unsourced, begin_identity_book, end_identity_book,
+        Mode, Novel, begin_identity_book, end_identity_book,
     )
     from src.transmogrifier.graph.memory_graph.helpers.networkx_emulation import (
         NetworkxEmulation,
@@ -161,7 +161,7 @@ def test_synthetic_device_scalar_nodes_are_named_in_the_graphs_own_scope():
                        attributes={}, expr_obj=None)
         book.post(
             INGESTION_VALUE, (scope, 0), NodeFact("Const", "Const", ""),
-            stage=PLANNER_STRUCTURAL_FOLD, provenance=Unsourced(SYNTHESIZED_NO_SOURCE),
+            stage=PLANNER_STRUCTURAL_FOLD, provenance=Novel(INGEST_SOURCE, ()),
             mode=Mode.CONCORD,
         )
         _synthetic_device_scalar_shell(graph, 0)

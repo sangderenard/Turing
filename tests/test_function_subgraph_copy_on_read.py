@@ -21,11 +21,11 @@ from src.compiler.concordance_declarations import (
     CONSUMER_OPERAND, FUNCTION_SUBGRAPH, FUNCTION_SUBGRAPH_FILTER,
     IDENTITY_TRANSITION, INGESTION_VALUE, LEXICAL_READ_BINDING,
     OPERAND_POSITION, READ_SCOPE_FORK, ROW_PROJECTED_OUT_OF_SCOPE,
-    SCOPE_ORIGIN, SCOPE_REGISTRY, SYNTHESIZED_NO_SOURCE, NodeFact,
+    SCOPE_ORIGIN, SCOPE_REGISTRY, INGEST_SOURCE, NodeFact,
     OperandAppend, OperandMove, OperandRetire, ScopeFork,
 )
 from src.compiler.identity_concordance import (
-    Derived, Mode, ProjectedScopeRead, Ref, Unresolved, Unsourced,
+    Derived, Mode, ProjectedScopeRead, Ref, Unresolved, Novel,
     begin_identity_book, end_identity_book,
 )
 
@@ -71,7 +71,7 @@ def book():
 def _root(book, page, row, fact, mode=Mode.CONCORD):
     return book.post(
         page, row, fact, stage=READ_SCOPE_FORK,
-        provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=mode,
+        provenance=Novel(INGEST_SOURCE, ()), mode=mode,
     )
 
 

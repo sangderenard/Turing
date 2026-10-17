@@ -15,11 +15,11 @@ from src.common.tensors.topological_reducer import fork_read_scope
 from src.compiler.concordance_declarations import (
     CONSUMER_OPERAND, LEXICAL_READ_BINDING, OPERAND_POSITION,
     READ_SCOPE_FORK, ROW_PROJECTED_OUT_OF_SCOPE, SCOPE_ORIGIN, SCOPE_REGISTRY,
-    SYNTHESIZED_NO_SOURCE, ScopeFork,
+    INGEST_SOURCE, ScopeFork,
 )
 from src.compiler.identity_concordance import (
     RAW_PRIMITIVE, Derived, Mode, ProjectedScopeRead, Ref, Unresolved,
-    Unsourced, begin_identity_book, end_identity_book,
+    Novel, begin_identity_book, end_identity_book,
 )
 
 LRB = LEXICAL_READ_BINDING
@@ -48,7 +48,7 @@ def book():
 def _root(book, page, row, fact):
     return book.post(
         page, row, fact, stage=READ_SCOPE_FORK,
-        provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+        provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
     )
 
 
@@ -704,7 +704,7 @@ def test_an_unresolved_fact_and_a_raw_fact_on_a_declared_page_are_copied_as_they
     receipt = Unresolved(ROW_PROJECTED_OUT_OF_SCOPE)
     book.post(
         LRB, (source, 1, "arg0", 0), receipt, stage=READ_SCOPE_FORK,
-        provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+        provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
     )
     # A declared page whose writer still writes a fact of another shape.
     book.page(LRB).set((source, 2, "arg0", 0), 0, ("not", "a", "str"))

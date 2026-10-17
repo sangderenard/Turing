@@ -217,17 +217,11 @@ def _frame_post(
                 unchanged = recorded is fact
             if unchanged:
                 return previous
-    if cells:
-        try:
-            return book.post(
-                page, row, fact, stage=stage, provenance=Derived(cells),
-                mode=mode,
-            )
-        except ConcordanceRefusal:
-            if mode is not Mode.REVISE:
-                raise
+    # No unsourced path: the post derives from ``cells`` or is refused at
+    # the writer that handed it none (``reason`` is kept for its callers).
+    del reason
     return book.post(
-        page, row, fact, stage=stage, provenance=Unsourced(reason), mode=mode,
+        page, row, fact, stage=stage, provenance=Derived(cells), mode=mode,
     )
 
 
