@@ -88,7 +88,7 @@ def test_a_second_node_for_one_identity_is_duplicate_material():
         end_identity_book(token)
 
 
-def test_a_property_getter_and_setter_are_one_authored_identity():
+def test_the_last_authored_definition_of_a_name_is_the_held_one():
     book, token = begin_identity_book()
     try:
         tree = _module()
@@ -97,7 +97,53 @@ def test_a_property_getter_and_setter_are_one_authored_identity():
         held = _HeldDefinitions()
         identity = ("probe.module", "Holder.scope")
         assert held.hold_authored(identity, getter) is True
-        assert held.hold_authored(identity, setter) is False
-        assert held[identity] is getter
+        assert held.hold_authored(identity, setter) is True
+        assert held[identity] is setter
+        # one book row for the one identity
+        assert book.page(SOURCE_DEFINITION).latest(identity) == "FunctionDef"
+    finally:
+        end_identity_book(token)
+
+
+def test_an_overload_stub_is_not_held():
+    book, token = begin_identity_book()
+    try:
+        tree = ast.parse(
+            "from typing import overload\n"
+            "@overload\n"
+            "def f(x: int) -> int: ...\n"
+            "def f(x):\n"
+            "    return x\n"
+        )
+        tree._turing_source_module = "probe.module"
+        _annotate_visual_source_owners(tree)
+        stub, real = tree.body[1], tree.body[2]
+        held = _HeldDefinitions()
+        identity = ("probe.module", "f")
+        assert held.hold_authored(identity, stub) is False
+        assert identity not in held
+        assert held.hold_authored(identity, real) is True
+        assert held[identity] is real
+    finally:
+        end_identity_book(token)
+
+
+def test_a_discovered_incumbent_may_be_replaced_but_an_authored_one_may_not():
+    book, token = begin_identity_book()
+    try:
+        authored = _module().body[0]
+        copy = _module().body[0]
+        held = _HeldDefinitions()
+        identity = ("probe.module", "Stage")
+        held.hold_authored(identity, authored)
+        with pytest.raises(ValueError, match="already held"):
+            held[identity] = copy
+        discovered = _module().body[1]
+        discovered._python_source_identity = ("probe.module", "Holder")
+        replacement = _module().body[1]
+        replacement._python_source_identity = ("probe.module", "Holder")
+        held[("probe.module", "Holder")] = discovered
+        held[("probe.module", "Holder")] = replacement
+        assert held[("probe.module", "Holder")] is replacement
     finally:
         end_identity_book(token)

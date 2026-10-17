@@ -255,3 +255,53 @@ the real closure stage.  Also failing in the linking suite, and not part of this
 change: the value-union errors above, and an `UnboundLocalError` for
 `program_abi_receipt` at `fortran_c_shell.py:49725` (a line added with
 `_typed_parameter_record_receipts`).
+
+## Follow-up, 20:00: four narrow agents, one review, and what is left
+
+Four Sonnet agents were fanned out (no bootstrap, no contract edits, no repo-wide
+runs, no commits).  Results, verified against their diffs and the focused gate:
+
+* **Union table picklable + lifecycle** (done).  `SSAValueUnionTable` gained
+  `__reduce__`/`__setstate__` mirroring `SSARecordTable` and `_SSALayoutTable`
+  (a pickle carries the owner label and descriptors; `__init__` rebuilds the
+  `_BookRows` and the member-claims callback on the book current at load).
+  `class_subtype`, `union_alternative_state`, `value_union_descriptor` and
+  `value_union_member` are classified in `page_lifecycle.py`.  The lifecycle
+  audit and `tests/test_native_reference_boundary.py` (8) pass.
+* **`program_abi_receipt` UnboundLocalError** (done).  `_lower_ast_source_to_ssa_impl`
+  read the receipt in its first loop over `graph.function_table` (via
+  `_typed_parameter_record_receipts`) before it was built; the construction moved
+  ahead of that loop, unchanged.
+* **Empty union-alternative storage** (partly done).  `_physical_type_arms` in
+  `fortran_c_shell.py` now takes `storage` from data the compiler already holds: a
+  ProgramABI record receipt for the class identity (`"record"`), else the value
+  node's own `program_abi_storage/dtype/rank`, else an authored scalar parameter
+  (`"scalar"`).  `__post_init__` is unchanged.  `tests/test_ir_sequence_tables.py`
+  47 pass; `tests/test_sequence_contract_concordance.py` 34 pass, 3 fail (was 10).
+  OPEN DESIGN QUESTION for the value-union author: the remaining cases have no
+  authored physical declaration at all: Python `Constant` literals of
+  `builtins.int/bool/float/str`, a user-class parameter with no record receipt
+  (`page: IdentityPage`), and a `GetAttr` of a dict-typed record field.  (a)
+  declare the compiler's own representation per class (scalar for a numeric
+  literal, sequence for `str`, record for a user class), or (b) do not build a
+  per-class alternative for an exact, non-union value, which also relaxes the
+  "one physical alternative per class" check near `fortran_c_shell.py:19385`.
+  Not decided; nothing written for these.
+* **Cold review of `b06202e1`** found three real defects in the held-definition
+  change, all fixed: (1) installing bindings on a held authored class walked and
+  overwrote every method's own bindings (`self`/`cls`, locals), so a construction
+  now only activates an authored class; (2) `__setitem__` raised when a class
+  discovery re-registered a method already held from discovery, so it now refuses
+  only a copy laid over an AUTHORED holder; (3) the later authored definition of a
+  qualified name is the live one (`hold_authored` replaces), and `@overload` stubs
+  are not held.  `tests/test_held_definitions.py`: 6 pass.  The reviewer also
+  noted a nested function's live qualname contains `<locals>`, so it still misses
+  the held lookup and falls to discovery as before; unchanged, not a regression.
+
+Baseline discipline (a short-path worktree at `6d3450ea`, `NODUS_TENSOR_CORE`
+unset, now removed): `tests/test_process_graph_function_linking.py` already failed
+23 tests there (the `KeyError`s on callee names such as
+`write_only_record_field_inout__update`, `span_cross__root` set mismatch, and the
+rest).  At the checkpoint tree it failed 57; the 34 extra are the value-union
+errors above.  Nothing that failed at `6d3450ea` passes now, and nothing new
+beyond the union errors was found.  That file is not a clean gate.

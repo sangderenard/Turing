@@ -2846,6 +2846,17 @@ def _mark_source_pursuit_active(definition, *, demand):
     definition._source_pursuit_active = True
 
 
+def _is_overload_stub(definition) -> bool:
+    return any(
+        (isinstance(decorator, ast.Name) and decorator.id == "overload")
+        or (
+            isinstance(decorator, ast.Attribute)
+            and decorator.attr == "overload"
+        )
+        for decorator in getattr(definition, "decorator_list", ())
+    )
+
+
 class _HeldDefinitions:
     """Identity -> definition, answered by the concordance.
 
@@ -2901,7 +2912,14 @@ class _HeldDefinitions:
 
         row = self._row(identity)
         incumbent = self._nodes.get(row)
-        if incumbent is not None and incumbent is not definition:
+        if (
+            incumbent is not None and incumbent is not definition
+            and getattr(incumbent, "_python_source_identity", None) is None
+        ):
+            # The incumbent is the submitted text's own definition (pursuit
+            # stamps only what it discovers): a second node for it is a live
+            # object's source laid over the authored text.  A discovered
+            # incumbent may be replaced by the class that contains it.
             raise ValueError(
                 f"definition {row!r} is already held by another node; "
                 "a second copy of one authored identity is duplicate material"
@@ -2922,12 +2940,20 @@ class _HeldDefinitions:
         self._nodes[row] = definition
 
     def hold_authored(self, identity, definition) -> bool:
-        """Hold a definition the submitted text defines.  A second
-        definition of one qualified name (a property getter and its setter)
-        is the same identity; the first stays held."""
+        """Hold a definition the submitted text defines.
 
-        if self._nodes.get(self._row(identity)) is not None:
+        Python rebinds a name: of several definitions of one qualified name
+        (a redefinition, a property getter and its setter) the LAST is the
+        live one, so it replaces the earlier one under the same row.  A
+        ``typing.overload`` stub is a signature, not a body, and is not held.
+        """
+
+        if _is_overload_stub(definition):
             return False
+        row = self._row(identity)
+        if self._nodes.get(row) is not None:
+            self._nodes[row] = definition
+            return True
         self[identity] = definition
         return True
 
@@ -3824,8 +3850,18 @@ def _expand_unresolved_ast_parents(
                     definition,
                     combined,
                 )
-                target_bindings[identity] = combined
-                install_definition_bindings(definition, combined)
+                # Installing bindings walks the whole definition.  A class
+                # the submitted text defines keeps each method's own
+                # bindings (self/cls and its locals were seeded per method);
+                # a construction only activates it.  A discovered class
+                # carries its owner in its class-level bindings, as before.
+                if not (
+                    isinstance(definition, ast.ClassDef)
+                    and getattr(definition, "_python_source_identity", None)
+                    is None
+                ):
+                    target_bindings[identity] = combined
+                    install_definition_bindings(definition, combined)
                 if id(node) not in latent_call_ids:
                     requeue_definition(definition, demand=call_demand(node))
             if isinstance(definition, ast.ClassDef):

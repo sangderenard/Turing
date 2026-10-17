@@ -894,6 +894,17 @@ class SSAValueUnionTable:
             dict(self.unions), owner=self.owner[0], book=self.book,
         )
 
+    def __reduce__(self):
+        # The book scope's serial is not content; a pickle carries the label
+        # and the descriptors and is rebuilt on the book current at load
+        # (same contract as ``SSARecordTable.__reduce__``).
+        return (SSAValueUnionTable, (dict(self.unions),), {"owner": self.owner[0]})
+
+    def __setstate__(self, state: dict) -> None:
+        unions = (self.unions if "unions" in self.__dict__
+                  else state.get("unions", {}))
+        self.__init__(dict(unions), owner=state.get("owner"))
+
 
 @dataclass(frozen=True)
 class SSAValueUnionFrameMember:

@@ -18833,15 +18833,62 @@ def _class_surface_ssa_program(
                 ))
                 continue
             storage = str(contract.get("storage") or "")
+            declared_record = None
+            if not storage:
+                # A value whose semantic class identity IS a ProgramABI record
+                # receipt owns that record's physical storage: the receipt is
+                # the authored declaration, so the arm states "record" from it
+                # rather than from an absent dtype/storage on the contract.
+                declared_record = next((
+                    record_name
+                    for record_name, record in dict(
+                        (program_abi or {}).get("records") or {}
+                    ).items()
+                    if identity in {
+                        str(record_name), str(record.get("identity") or ""),
+                    }
+                ), None)
+                if declared_record is not None:
+                    storage = "record"
+            # The value's own node retains the ProgramABI view it was read
+            # through (``program_abi_storage/dtype/rank``): that is the
+            # authored declaration for a record-field read whose contract
+            # carries only a semantic class identity.
+            node_abi = next((
+                data.get("attributes") or {}
+                for node_id, data in owner.nodes(data=True)
+                if int(data.get("value_id", node_id)) == int(value_id)
+                and (data.get("attributes") or {}).get(
+                    "program_abi_storage"
+                ) is not None
+            ), {})
+            if not storage and node_abi:
+                storage = str(node_abi["program_abi_storage"])
+            if not storage and any(
+                # The value is an authored scalar parameter: its Input's
+                # ``value_kind`` is the read view of the ``scalar_parameter``
+                # row posted from the parameter annotation/default span.
+                (data.get("attributes") or {}).get("value_kind") == "scalar"
+                and (data.get("attributes") or {}).get("binding_kind")
+                == "parameter"
+                and int(data.get("value_id", node_id)) == int(value_id)
+                for node_id, data in owner.nodes(data=True)
+            ):
+                storage = "scalar"
             if storage in {"keyed", "table"}:
                 # Keyed/table are ProgramABI access policies over the existing
                 # descriptor-backed resident sequence storage.  A semantic
                 # union arm records the physical kind, while storage_identity
                 # below retains the exact authored table/key declaration.
                 storage = "sequence"
-            dtype = str(contract.get("dtype") or "")
+            dtype = str(
+                contract.get("dtype") or node_abi.get("program_abi_dtype")
+                or ""
+            )
             shape = tuple(map(int, contract.get("shape") or ()))
-            rank = int(contract.get("rank", len(shape)))
+            rank = int(contract.get(
+                "rank", node_abi.get("program_abi_rank", len(shape)),
+            ))
             storage_identity = tuple(
                 (key, repr(contract[key]))
                 for key in (
@@ -18849,6 +18896,9 @@ def _class_surface_ssa_program(
                     "value_record", "key_encoding",
                 )
                 if contract.get(key) is not None
+            ) + (
+                (("program_abi_record", str(declared_record)),)
+                if declared_record is not None else ()
             )
             if len(identities) > 1 and not storage:
                 raise ValueError(
@@ -49688,6 +49738,21 @@ def _lower_ast_source_to_ssa_impl(
         # Python object, infer a convenient shape, or authorize new source
         # pursuit. Every pursued function receives only the record bindings
         # whose function/parameter rules explicitly match the contract.
+        # The compilation's schema receipt is established first: the typed
+        # parameter join below (_typed_parameter_record_receipts) reads it.
+        program_abi_receipt = (
+            {"records": {}, "bindings": (), "values": ()}
+            if extraction_policy is None else
+            extraction_policy.program_abi.receipt()
+        )
+        # Explicit contracts remain authoritative. Source-derived schemas fill
+        # only classes whose complete dataclass layout is present in this
+        # authored compilation unit, making their constructors structural SSA
+        # without adding project-specific entries to the extraction contract.
+        program_abi_receipt["records"] = {
+            **inferred_record_schemas,
+            **dict(program_abi_receipt.get("records") or {}),
+        }
         for entry in graph.function_table:
             function_graph = getattr(getattr(entry, "graph", None), "G", None)
             if function_graph is None:
@@ -49793,19 +49858,6 @@ def _lower_ast_source_to_ssa_impl(
             })
             if selected_values:
                 function_graph.graph["parameter_value_abi"] = selected_values
-        program_abi_receipt = (
-            {"records": {}, "bindings": (), "values": ()}
-            if extraction_policy is None else
-            extraction_policy.program_abi.receipt()
-        )
-        # Explicit contracts remain authoritative. Source-derived schemas fill
-        # only classes whose complete dataclass layout is present in this
-        # authored compilation unit, making their constructors structural SSA
-        # without adding project-specific entries to the extraction contract.
-        program_abi_receipt["records"] = {
-            **inferred_record_schemas,
-            **dict(program_abi_receipt.get("records") or {}),
-        }
         graph.G.graph["program_abi"] = program_abi_receipt
         for entry in graph.function_table:
             function_graph = getattr(getattr(entry, "graph", None), "G", None)
