@@ -331,6 +331,16 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "source_numeric_component_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "source_numeric_intrinsic_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "source_numeric_operator_specialization_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    # Written at the compile's entry from the authored annotations, read by
+    # the compile-tail detector: the source span page's rule.
+    "source_numeric_type_dependency_concordance": PageLifecycle(CLOSURE, REPAIRS, REPAIRS),
+    # Written at the compile's entry, read by nothing after: the annotation
+    # declaration page's rule.
+    "source_numeric_method_dependency_concordance": PageLifecycle(CLOSURE, None, CLOSURE),
+    "source_numeric_parameter_abi_concordance": PageLifecycle(CLOSURE, None, CLOSURE),
+    # Published as the normalized source enters ``_class_surface_ssa_program``;
+    # read by nothing after.
+    "assignment_projection_source_concordance": PageLifecycle(LOWERING, None, LOWERING),
     "source_operator_dispatch_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "source_parameter_identity_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "source_precision_boundary_concordance": PageLifecycle(LOWERING, REPAIRS, REPAIRS),

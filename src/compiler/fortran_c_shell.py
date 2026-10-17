@@ -17865,6 +17865,10 @@ def _class_surface_ssa_program(
         CONTRACT_DEMAND_PAGE, DemandKind, SOURCE_AGGREGATE_LAYOUT,
         SourceAggregateLayout,
         NUMERAL_LEAF_MATERIALIZATION, PROGRAM_ABI_KEYED_ROW_RECORD,
+        ASSIGNMENT_PROJECTION_SOURCE, INGESTION, SOURCE_SPAN,
+    )
+    from ..transmogrifier.graph.graph_express2 import (
+        source_span_row as _source_span_row,
     )
     from .string_table import StringTable
 
@@ -17877,6 +17881,19 @@ def _class_surface_ssa_program(
         )
         for item in getattr(receipt, "projections", ())
     )
+    # The projection statement the normalizer wrote for each relation: the
+    # authored construct its page row derives from (by its span row).
+    assignment_projection_statements = {
+        (str(getattr(receipt, "scope", "<module>")), *tuple(item)): statement
+        for receipt in getattr(
+            compilation, "assignment_normalization", ()
+        )
+        for item, statement in zip(
+            getattr(receipt, "projections", ()),
+            getattr(receipt, "projection_statements", ()),
+            strict=True,
+        )
+    }
 
     def report(message: str) -> None:
         nonlocal previous_report
@@ -17934,16 +17951,50 @@ def _class_surface_ssa_program(
     # may attach SSA identities to it, but must not rediscover the relation
     # from graph traversal order.
     assignment_projection_source = module_metadata["identity_book"].page(
-        "assignment_projection_source_concordance"
+        ASSIGNMENT_PROJECTION_SOURCE
     )
     for source_scope, aggregate_name, projection, target_name in (
         assignment_projections
     ):
-        assignment_projection_source.concord(
-            (
-                str(source_scope), str(aggregate_name), int(projection),
-            ),
+        projection_row = (
+            str(source_scope), str(aggregate_name), int(projection),
+        )
+        projection_incumbent = assignment_projection_source.latest(
+            projection_row,
+        )
+        if (
+            projection_incumbent is not None
+            and str(projection_incumbent) != str(target_name)
+        ):
+            raise ValueError(
+                f"{ASSIGNMENT_PROJECTION_SOURCE.name} disagreement for "
+                f"{projection_row!r}: recorded={projection_incumbent!r}, "
+                f"proposed={target_name!r}"
+            )
+        # DERIVED from the ``source_span`` cell of the projection statement
+        # the normalizer wrote (stamped and posted when the rewritten tree
+        # was ingested); a same-fact re-post is CONCORD.
+        projection_statement = assignment_projection_statements.get((
+            str(source_scope), str(aggregate_name), int(projection),
             str(target_name),
+        ))
+        projection_span_row = (
+            None if projection_statement is None
+            else _source_span_row(None, projection_statement)
+        )
+        module_metadata["identity_book"].post(
+            ASSIGNMENT_PROJECTION_SOURCE, projection_row, str(target_name),
+            stage=INGESTION,
+            provenance=Derived(tuple(
+                cell for cell in (
+                    None if projection_span_row is None
+                    else module_metadata["identity_book"].latest_ref(
+                        SOURCE_SPAN, projection_span_row,
+                    ),
+                )
+                if cell is not None
+            )),
+            mode=Mode.CONCORD,
         )
     argument_binding_page = module_metadata["identity_book"].page(
         "argument_binding"
@@ -48781,15 +48832,22 @@ def _lower_ast_source_to_ssa_impl(
         numeric_registry[descriptor.type_name]
         for descriptor in numeric_dependency_descriptors
     ))
-    from .identity_concordance import current_identity_book
+    from ..common.tensors.topological_reducer import (
+        _static_symbol_definition_cell,
+    )
+    from .concordance_declarations import (
+        INGESTION, SOURCE_NUMERIC_TYPE_DEPENDENCY,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
 
-    numeric_dependency_page = current_identity_book().page(
-        "source_numeric_type_dependency_concordance"
+    numeric_dependency_book = current_identity_book()
+    numeric_dependency_page = numeric_dependency_book.page(
+        SOURCE_NUMERIC_TYPE_DEPENDENCY
     )
     for descriptor in numeric_descriptors:
+        closure = numeric_descriptor_dependencies(descriptor)
         dependencies = tuple(
-            dependency.receipt()
-            for dependency in numeric_descriptor_dependencies(descriptor)
+            dependency.receipt() for dependency in closure
         )
         row = (str(descriptor.type_name), int(descriptor.limbs))
         incumbent = numeric_dependency_page.latest(row)
@@ -48799,8 +48857,24 @@ def _lower_ast_source_to_ssa_impl(
                 f"for {row!r}: recorded={incumbent!r}, "
                 f"proposed={dependencies!r}"
             )
-        if incumbent is None:
-            numeric_dependency_page.set(row, 0, dependencies)
+        # The closure is the wrapper classes' own component structure, read
+        # from the numeric feature type registry: DERIVED from the
+        # ``static_symbol_definition`` cell of each class it names (a
+        # declaration ingested by reference, as the builtins' class topology
+        # is).  A same-fact re-post is CONCORD; a disagreement raised above.
+        numeric_dependency_book.post(
+            SOURCE_NUMERIC_TYPE_DEPENDENCY, row, dependencies,
+            stage=INGESTION,
+            provenance=Derived(tuple(dict.fromkeys(
+                cell
+                for dependency in closure
+                for cell in (_static_symbol_definition_cell(
+                    numeric_registry[dependency.type_name],
+                ),)
+                if cell is not None
+            ))),
+            mode=Mode.CONCORD,
+        )
     numeric_source_classes = tuple(dict.fromkeys(
         source_class
         for numeric_type in numeric_runtime_types
@@ -49047,16 +49121,28 @@ def _lower_ast_source_to_ssa_impl(
     # descriptor in the coefficient spine.  Once seeded, ordinary source
     # pursuit follows its self-methods and global helpers; no algebra or
     # helper list is recreated here.
-    numeric_method_dependency_page = current_identity_book().page(
-        "source_numeric_method_dependency_concordance"
+    from ..common.tensors.topological_reducer import (
+        _static_symbol_definition_cell,
+    )
+    from .concordance_declarations import (
+        INGESTION, SOURCE_NUMERIC_METHOD_DEPENDENCY,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    numeric_method_dependency_book = current_identity_book()
+    numeric_method_dependency_page = numeric_method_dependency_book.page(
+        SOURCE_NUMERIC_METHOD_DEPENDENCY
     )
     for descriptor in numeric_dependency_descriptors:
         numeric_type = numeric_registry[descriptor.type_name]
-        same_type_roots = tuple(dict.fromkeys(
-            f"{owner.__name__}._binary_same"
+        same_type_owners = tuple(
+            owner
             for owner in numeric_type.__mro__
             if owner is not object
             and "_binary_same" in getattr(owner, "__dict__", {})
+        )
+        same_type_roots = tuple(dict.fromkeys(
+            f"{owner.__name__}._binary_same" for owner in same_type_owners
         ))
         row = (str(descriptor.type_name), int(descriptor.limbs))
         incumbent = numeric_method_dependency_page.latest(row)
@@ -49066,8 +49152,28 @@ def _lower_ast_source_to_ssa_impl(
                 f"for {row!r}: recorded={incumbent!r}, "
                 f"proposed={same_type_roots!r}"
             )
-        if incumbent is None:
-            numeric_method_dependency_page.set(row, 0, same_type_roots)
+        # The roots are read off the class's MRO: DERIVED from the
+        # ``static_symbol_definition`` cells of the class and of each
+        # ``_binary_same`` the fact names (declarations ingested by
+        # reference).  A same-fact re-post is CONCORD.
+        numeric_method_dependency_book.post(
+            SOURCE_NUMERIC_METHOD_DEPENDENCY, row, same_type_roots,
+            stage=INGESTION,
+            provenance=Derived(tuple(dict.fromkeys(
+                cell
+                for target in (
+                    numeric_type,
+                    *(
+                        getattr(method, "__func__", method)
+                        for owner in same_type_owners
+                        for method in (owner.__dict__["_binary_same"],)
+                    ),
+                )
+                for cell in (_static_symbol_definition_cell(target),)
+                if cell is not None
+            ))),
+            mode=Mode.CONCORD,
+        )
         numeric_source_roots.extend(same_type_roots)
     numeric_source_roots = list(dict.fromkeys(numeric_source_roots))
     # A binding that is an LLVM-compiled piece is a callee the program may
@@ -49773,8 +49879,18 @@ def _lower_ast_source_to_ssa_impl(
         inferred_record_schemas[schema_name] = receipt
         return schema_name, receipt
 
-    numeric_parameter_page = current_identity_book().page(
-        "source_numeric_parameter_abi_concordance"
+    from ..common.tensors.topological_reducer import (
+        _static_symbol_definition_cell,
+    )
+    from ..transmogrifier.graph.graph_express2 import post_source_span
+    from .concordance_declarations import (
+        INGESTION, SOURCE_NUMERIC_PARAMETER_ABI,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    numeric_parameter_book = current_identity_book()
+    numeric_parameter_page = numeric_parameter_book.page(
+        SOURCE_NUMERIC_PARAMETER_ABI
     )
     for definition in (
         node for node in ast.walk(tree)
@@ -49805,8 +49921,23 @@ def _lower_ast_source_to_ssa_impl(
                     "numeric parameter ABI concordance disagreement for "
                     f"{row!r}: recorded={incumbent!r}, proposed={fact!r}"
                 )
-            if incumbent is None:
-                numeric_parameter_page.set(row, 0, fact)
+            # The fact is read from the authored annotation (its
+            # ``source_span`` root: the tree was stamped by the record-view
+            # discovery above, and the first post of a span owns it) and
+            # from the numeric type whose record schema it materializes.
+            numeric_parameter_book.post(
+                SOURCE_NUMERIC_PARAMETER_ABI, row, fact, stage=INGESTION,
+                provenance=Derived(tuple(dict.fromkeys(
+                    cell for cell in (
+                        post_source_span(definition, argument.annotation),
+                        _static_symbol_definition_cell(
+                            numeric_registry[descriptor.type_name],
+                        ),
+                    )
+                    if cell is not None
+                ))),
+                mode=Mode.CONCORD,
+            )
             function_views[str(argument.arg)] = copy.deepcopy(receipt)
     # ``with_sources`` is an explicit admission of complete authored source
     # files.  Their class annotations are ABI declarations even when runtime
