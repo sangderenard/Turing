@@ -4068,6 +4068,18 @@ def _expand_unresolved_ast_parents(
             and len(source_identity) == 2
         )
     }
+    # The submitted source's own definitions answer for their stamped
+    # authored identity too.  A class whose every call site sits in a method
+    # pursuit never activated was previously linked only if some reachable
+    # site had registered it (or a second copy was ingested for it); the
+    # source's own ClassDef is the definition the call names.  A definition
+    # pursuit discovered keeps its identity; this only fills absences.
+    for definition in definitions:
+        authored_identity = _source_definition_identity(definition)
+        if authored_identity is not None:
+            definitions_by_source_identity.setdefault(
+                tuple(map(str, authored_identity)), definition,
+            )
     for call in tuple(dict.fromkeys(all_calls)):
         call_bindings = node_bindings.get(id(call), root_bindings)
         target = call_target(call, call_bindings)

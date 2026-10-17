@@ -176,3 +176,36 @@ to the memory-graph, unit 026/031 or retention work (those suites pass):
 Not touched: these are design decisions of the value-union feature (what an
 alternative's storage is for each producer; how the table is made picklable;
 when the new pages may be released).
+
+## Follow-up, 19:05: source closure now fails on eight authored classes
+
+The user's next run (`--provenance-only --output build/compiler-partitions`, tree
+`d9cc04ba`) passed the import, then failed stage 2/11 (source closure, 1m15s):
+`RuntimeError: AST parent ingestion did not reach a source-definition fixed point`
+for constructor calls to `PageMapping`, `_PageTable`, `LiveScopeProjection`,
+`ProjectedScopeRead`, `CellNeighborhood`, `NeighborhoodNode`, `Unresolved` and
+`Stage`, all `missing_source_parent`, all defined in the submitted
+`identity_concordance.py`.  The same call sites existed in the tree that passed
+this stage earlier, so reachability, not new code, changed.
+
+What the log and code show: the final linking pass in
+`_expand_unresolved_ast_parents` resolves a Name call to a class only through
+`target_definitions[identity]` (filled while pursuit walks reachable call sites)
+or `definitions_by_source_identity` (only definitions pursuit discovered, keyed
+by `_python_source_identity`).  `lexical_definition` matches functions only.  The
+submitted source's own `ClassDef`s were never consulted, so a class whose every
+call site sits in a method pursuit did not activate stayed unresolved (`Ref`
+links; `Stage` at line 6088 fails even though `Stage(...)` at 4305 is the same
+class).  Before pursuit dedupe a re-ingested duplicate happened to be registered
+by some reachable site.
+
+Change: the linking pass now also fills `definitions_by_source_identity` from the
+stamped authored identity of every definition in the tree (`setdefault`; a
+discovered definition keeps its identity).  UNVERIFIED: a probe module with the
+same shape (a dataclass whose only construction is in an uncalled method) passes
+with and without the change, so it does not reproduce the failure and this fix is
+a hypothesis about the mechanism, not a demonstrated cure.  The authoritative
+check is the closure stage of the real bootstrap (about 75 s).  If it still
+fails, the open question is why pursuit no longer activates the methods that
+construct these classes; compare `graph.G.graph["activated"]`-style activation
+state against the earlier passing run.
