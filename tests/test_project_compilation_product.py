@@ -3186,3 +3186,61 @@ def test_source_acceptance_projects_return_site_rows_of_the_read_scope():
     assert projected.stamp_of(slot) == book.stamp_of(slot)
     assert projected.stamp_of(container) == book.stamp_of(container)
     assert projected.stamp_of(site) == book.stamp_of(site)
+
+
+STRUCTURAL_RETURN_SOURCE = '''
+def excludes(value: int) -> bool:
+    return value < 0
+
+
+def reaches(value: int) -> bool:
+    if excludes(value):
+        return False
+    return not value > 7 or value == 9
+'''
+
+
+def test_recovered_structural_values_are_ssa_value_rows_of_their_function():
+    """``LiveScopeProjection.reaches`` cut to seconds: the fall-through
+    ``return not ... or ...`` is structural, the control builder lowers no
+    region for it, and ``recover_structural_source_outputs`` rebuilds the
+    LNot / Eq / LOr chain from the graph.  Every value that pass defines is
+    an ``ssa_value`` row of the function (ADOPTED_GRAPH_ID from its node
+    cell), which is what the composing unit checks before it links the
+    product ("lost its value producers: [6, 7, 10]" on census 2026-10-17
+    unit 30)."""
+    from src.compiler.concordance_declarations import (
+        SSA_VALUE, SSAValueOrigin,
+    )
+    from src.compiler.ssa_record_return_state import function_scope_of
+
+    contract = ExtractionContract(
+        "extraction_contracts/program_extraction.yaml",
+    ).with_program_abi({
+        "values": [{"function": name, "parameter": "value", "storage": "scalar",
+                    "dtype": "int64", "rank": 0, "shape": [],
+                    "python_type": "builtins.int"}
+                   for name in ("excludes", "reaches")],
+        "records": {}, "bindings": [],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        STRUCTURAL_RETURN_SOURCE, extraction_contract=contract,
+        progress=lambda message: None,
+    )
+    function = module.functions["whole_source__reaches"]
+    recovered = tuple(function.metadata.get("recovered_structural_outputs") or ())
+    assert recovered, "the fall-through return expression was not recovered structurally"
+    book = module.metadata["identity_book"]
+    scope = function_scope_of(function)
+    page = book.pages[SSA_VALUE.name]
+    missing = [
+        int(value.id) for value in (
+            *function.args,
+            *(instruction.res for block in function.blocks.values()
+              for instruction in block.instrs if instruction.res is not None),
+        )
+        if book.latest_ref(SSA_VALUE, (scope, int(value.id))) is None
+    ]
+    assert missing == []
+    for value_id in recovered:
+        assert page.latest((scope, int(value_id))).origin is SSAValueOrigin.ADOPTED_GRAPH_ID
