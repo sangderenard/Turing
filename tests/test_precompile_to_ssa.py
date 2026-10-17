@@ -46,13 +46,37 @@ from src.compiler.precompile_to_ssa import (
     merge_repository_ssa_modules,
     resolve_sequence_schemas,
 )
+from src.compiler.concordance_declarations import (
+    INGESTION,
+    INGEST_SOURCE,
+    SOURCE_SPAN,
+    SSA_VALUE,
+    SSAValueFact,
+    SSAValueOrigin,
+    SpanFact,
+)
 from src.compiler.identity_concordance import (
+    Mode,
+    Novel,
     Ref,
     begin_identity_book,
     commit_sequence_row_layout,
+    current_identity_book,
     end_identity_book,
     record_proven_shape,
 )
+
+
+def _seed_value(scope, value_id, dtype="float64"):
+    """A test-authored value's ``ssa_value`` root: the test is its
+    ingestion, as a source construct's span is a root."""
+
+    return current_identity_book().post(
+        SSA_VALUE, (scope, int(value_id)),
+        SSAValueFact(dtype, (), SSAValueOrigin.MINTED),
+        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
 from src.compiler.ssa_fortran_backend import emit_module
 from src.compiler.ssa_self_check import check_definition_dominance
 from src.compiler.shell_reference_tables import (
@@ -654,6 +678,14 @@ def test_class_navigation_has_general_ssa_semantic_procedures():
         "turing.repository-ssa-class-table.v1"
     )
     assert emitted.api.metadata["class_table"][0]["identity"] == "Vault"
+    # The declaration derives from the method's source span; the test
+    # authors that span as a root.
+    span = current_identity_book().post(
+        SOURCE_SPAN, ("vault_module", "Vault.read", ""),
+        SpanFact("FunctionDef", 1, 0, 2, 0, "test"),
+        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
     reference = module.function_table.declare(
         "read",
         qualified_name="Vault.read",
@@ -661,6 +693,7 @@ def test_class_navigation_has_general_ssa_semantic_procedures():
             "self", transfer="alias", access="inout", storage="record",
             scope="caller",
         ),),
+        source=span,
     )
     emitted = emit_module(module, name="class_navigation_function_probe")
     assert emitted.api.metadata["function_table_schema"] == (
@@ -1165,12 +1198,15 @@ def test_repository_module_merge_retains_numerical_and_object_surfaces():
         ),),
     )
     primary = IRModule({numerical.name: numerical})
+    # The record descriptor stands on its field value's cell.
+    record_table = SSARecordTable(owner=method.name)
+    record_table.register(record, sources=(_seed_value(method.name, 10),))
     objects = IRModule(
         {method.name: method},
         class_table=SSAClassTable((SSAClassDefinition(
             "Thing", (SSAClassField("value", 0),), (),
         ),)),
-        record_tables={method.name: SSARecordTable({10: record})},
+        record_tables={method.name: record_table},
     )
 
     merged = merge_repository_ssa_modules(primary, objects)
@@ -4669,6 +4705,7 @@ def test_sequence_row_contract_follows_proven_append_value_identity():
     try:
         record_proven_shape(
             ("row_sequence|shape", 0), 12, (3,), "float64", level=2,
+            sources=(_seed_value(("row_sequence|shape", 0), 12),),
         )
         function, shortfalls = lower_control_program_to_ssa(
             control,
@@ -4695,6 +4732,7 @@ def test_declared_sequence_reads_row_layout_from_identity_book():
         commit_sequence_row_layout(
             ("row_sequence|shape", 0), 30, ((3,),), ("float64",),
             source="collection value edge",
+            sources=(_seed_value(("row_sequence|shape", 0), 30),),
         )
         function, shortfalls = lower_control_program_to_ssa(
             ControlProgram(SequenceBlock(())),

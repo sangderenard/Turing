@@ -19,6 +19,8 @@ from src.compiler.concordance_declarations import (
     CLASS_FIELD_DECLARATION,
     CallResolution,
     IDENTITY_TRANSITION,
+    INGESTION,
+    INGEST_SOURCE,
     NAME_BINDING,
     PARAMETER_ANNOTATION,
     SOURCE_AGGREGATE_LAYOUT,
@@ -58,6 +60,9 @@ from src.compiler.glyph_sequence_format import (
 )
 from src.compiler.identity_concordance import (
     CorrelationTable,
+    Derived,
+    Mode,
+    Novel,
     PROVEN_SHAPE_PAGE,
     SHAPE_STATE_PAGE,
     begin_identity_book,
@@ -119,12 +124,14 @@ def test_value_union_glyph_recipe_retains_exact_per_arm_sequences():
         graph.G.graph["source_glyph_sequence_scope"] = scope
         for value_id in (10, 20, 21, 30, 40):
             graph.G.add_node(value_id, value_id=value_id, attributes={})
-        book.page(SOURCE_VALUE_CLASS).revise(
-            (scope, 10), ("builtins.tuple",),
-        )
-        book.page(SOURCE_VALUE_CLASS).revise(
-            (scope, 30), ("builtins.NoneType",),
-        )
+        # The test is the ingestion of these two values: each class fact is
+        # a root, as a source construct's span is.
+        for value_id, classes in ((10, ("builtins.tuple",)), (30, ("builtins.NoneType",))):
+            book.post(
+                SOURCE_VALUE_CLASS, (scope, value_id), classes,
+                stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+                mode=Mode.CONCORD,
+            )
         tuple_source = book.latest_ref(SOURCE_VALUE_CLASS, (scope, 10))
         none_source = book.latest_ref(SOURCE_VALUE_CLASS, (scope, 30))
         fact = SourceGlyphSequence((SourceGlyphComponent(
@@ -141,7 +148,12 @@ def test_value_union_glyph_recipe_retains_exact_per_arm_sequences():
                 ),
             ),
         ),))
-        book.page(SOURCE_GLYPH_SEQUENCE).revise((scope, 40), fact)
+        # The recipe stands on the two class facts it names.
+        book.post(
+            SOURCE_GLYPH_SEQUENCE, (scope, 40), fact, stage=INGESTION,
+            provenance=Derived((tuple_source, none_source)),
+            mode=Mode.CONCORD,
+        )
         declarations, _initializations, mutations = (
             _source_glyph_sequence_materializations(graph.G)
         )
@@ -1301,6 +1313,9 @@ def test_borrowed_page_latest_is_record_after_exact_none_arm_refinement():
                 "@dataclass(frozen=True)\n"
                 "class Fact:\n"
                 "    count: int\n"
+                "from src.compiler.identity_concordance import (\n"
+                "    RowField, RowFieldKind as K, declare_page,\n"
+                ")\n"
                 "FACTS = declare_page(\n"
                 "    'facts', (RowField('index', K.INDEX),), Fact,\n"
                 ")\n"
@@ -1338,6 +1353,9 @@ def test_page_rows_and_isinstance_else_arm_carry_declared_schema():
                 "@dataclass(frozen=True)\n"
                 "class Fact:\n"
                 "    count: int\n"
+                "from src.compiler.identity_concordance import (\n"
+                "    RowField, RowFieldKind as K, declare_page,\n"
+                ")\n"
                 "FACTS = declare_page(\n"
                 "    'facts', (RowField('scope', K.SCOPE), "
                 "RowField('index', K.INDEX)), Fact,\n"
@@ -1399,6 +1417,9 @@ def test_page_scope_str_call_builds_resident_tuple_glyph_recipe():
                 "@dataclass(frozen=True)\n"
                 "class Fact:\n"
                 "    count: int\n"
+                "from src.compiler.identity_concordance import (\n"
+                "    RowField, RowFieldKind as K, declare_page,\n"
+                ")\n"
                 "FACTS = declare_page(\n"
                 "    'facts', (RowField('scope', K.SCOPE), "
                 "RowField('index', K.INDEX)), Fact,\n"
@@ -1446,6 +1467,9 @@ def test_page_latest_key_declares_exact_optional_field_tuple_repr():
                 "@dataclass(frozen=True)\n"
                 "class Publication:\n"
                 "    read_scope: tuple | None\n"
+                "from src.compiler.identity_concordance import (\n"
+                "    RowField, RowFieldKind as K, declare_page,\n"
+                ")\n"
                 "PUBLICATIONS = declare_page(\n"
                 "    'publications', (RowField('index', K.INDEX),), "
                 "Publication,\n"
@@ -1519,6 +1543,9 @@ def test_page_latest_or_absence_repr_owns_nested_optional_glyph_carry():
                 "class Region:\n"
                 "    schedule_preference: str\n"
                 "    serial: int\n"
+                "from src.compiler.identity_concordance import (\n"
+                "    RowField, RowFieldKind as K, declare_page,\n"
+                ")\n"
                 "REGIONS = declare_page(\n"
                 "    'regions', (RowField('index', K.INDEX),), Region,\n"
                 ")\n"

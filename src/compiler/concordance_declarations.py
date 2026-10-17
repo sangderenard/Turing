@@ -414,6 +414,10 @@ RECORD_RETURN_FIELD_CONVERSION = declare_transform("record_return_field_conversi
 OPERAND_APPEND = declare_transform("operand_append", 1)
 OPERAND_MOVE = declare_transform("operand_move", 1)
 OPERAND_RETIRE = declare_transform("operand_retire", 1)
+#: The ``Unresolved`` revision of an operand-position row (a
+#: ``lexical_read_binding``) whose operand was moved or retired: it reads as
+#: absence and derives from the transition that vacated it.
+OPERAND_POSITION_VACATED = declare_reason("operand_position_vacated")
 OPERAND_FORK = declare_transform("operand_fork", 1)
 
 
@@ -1994,6 +1998,12 @@ FORMAL_ACTUAL_OCCURRENCE = declare_page("formal_actual_occurrence_concordance", 
 FORMAL_STORAGE_RESOLUTION = declare_page("formal_storage_resolution", (
     RowField("function", K.SCOPE), RowField("formal", K.VALUE_ID),
 ), tuple)                              # DERIVED(incoming occurrences); REVISE
+#: ``concord_program_abi_frame_transitions``: a formal's provisional frame
+#: lease retired by its ProgramABI field, ``(record, field, retired keys)``;
+#: CONCORD, DERIVED(the formal's ``ssa_value`` cell).
+PROGRAM_ABI_FRAME_TRANSITION = declare_page("program_abi_frame_transition", (
+    RowField("function", K.SCOPE), RowField("formal", K.VALUE_ID),
+), tuple)
 #: ``TransformationLedger`` (routed by ``propose(..., sources=)``): the
 #: retained (rule, proof, target) per identity, REVISE; every proposal as an
 #: event dict, CONCORD; each rejection once, by its full key, CONCORD.
@@ -3627,6 +3637,21 @@ CALLSITE_TENSOR_RESULT_SPECIALIZATION = declare_page(
         RowField("caller", K.SCOPE), RowField("call", K.VALUE_ID),
     ), tuple,
 )
+#: ``tensor_ssa_lowering``'s shape/dtype enrichment log: one row per
+#: (function, value, field), one revision per write, fact ``(round, step,
+#: old, new, authoritative, source value id)``; REVISE, DERIVED(the value's
+#: ``ssa_value`` cell, the source value's cell).  ``oscillating_rows`` over
+#: it names a value that left a shape and came back to it.
+TENSOR_SHAPE_ENRICHMENT = declare_page("tensor_shape_enrichment", (
+    RowField("function", K.NAME), RowField("value", K.VALUE_ID),
+    RowField("field", K.LABEL),
+), tuple)
+#: ``_call_result_bindings``: the Indexed projection node of one output path
+#: of a call, ``(call node, projection node)`` -> path; CONCORD, DERIVED(the
+#: call node's cell, the projection node's cell).
+CALL_RESULT_PROJECTION = declare_page("call_result_projection_concordance", (
+    RowField("call", K.VALUE_ID), RowField("projection", K.VALUE_ID),
+), tuple)
 #: The settlement pass's first receipt for a re-proved value, ``(function,
 #: value)`` -> ``(extents, dtype)``, CONCORD, DERIVED(the value's identity cell).
 TENSOR_SHAPE_SETTLEMENT = declare_page("tensor_shape_settlement_concordance", (

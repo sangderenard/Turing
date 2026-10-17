@@ -579,6 +579,30 @@ def _class_field_reference(owner, attribute, seen):
     )
 
 
+def ingest_class_declaration_by_reference(owner):
+    """Post the class, field and method declarations of a class that exists
+    only as an imported Python object, through the same ingestion a
+    submitted ``ClassDef`` gets (``_class_schema_from_ast``), and return its
+    schema; ``None`` when ``owner`` is no class or its source cannot be read.
+
+    Its span rows live in the class's own module under its live qualified
+    name (plan 60, section 1.1), as a class field's constructor reference
+    does in ``_class_field_reference``.
+    """
+
+    if not inspect.isclass(owner):
+        return None
+    definition = _source_ast_definition(owner)
+    if not isinstance(definition, ast.ClassDef):
+        return None
+    if _source_definition_identity(definition) is None:
+        definition._turing_source_module = str(getattr(owner, "__module__", ""))
+        definition._turing_source_qualname = str(
+            getattr(owner, "__qualname__", getattr(owner, "__name__", ""))
+        )
+    return _class_schema_from_ast(definition)
+
+
 def _source_class_field_reference(definition, attribute, bindings, seen):
     """The same inference for a class that exists only as submitted source.
 

@@ -26,6 +26,20 @@ sites = collections.Counter()
 DEPTH = int(os.environ.get("UNSOURCED_DEPTH", "4"))
 
 
+def _book_class_lines():
+    """Line range of ``class IdentityPage`` .. the first module-level ``def``
+    after ``class IdentityBook`` in identity_concordance.py."""
+
+    lines = open(ic.__file__, encoding="utf-8").read().splitlines()
+    start = next(i for i, l in enumerate(lines, 1) if l.startswith("class IdentityPage"))
+    book = next(i for i, l in enumerate(lines, 1) if l.startswith("class IdentityBook"))
+    end = next(i for i, l in enumerate(lines, 1) if i > book and l.startswith("def "))
+    return start, end
+
+
+BOOK_CLASSES = _book_class_lines()
+
+
 def where():
     """The first ``DEPTH`` frames outside the book and this script, innermost
     first, plus the test that was running."""
@@ -33,7 +47,13 @@ def where():
     here = os.path.abspath(__file__)
     frames = []
     for frame in reversed(traceback.extract_stack()):
-        if frame.filename.endswith("identity_concordance.py"):
+        if (
+            frame.filename.endswith("identity_concordance.py")
+            and BOOK_CLASSES[0] <= frame.lineno < BOOK_CLASSES[1]
+        ):
+            # Inside ``IdentityPage`` / ``IdentityBook`` themselves: the
+            # writer is the caller.  Module-level helpers of the same file
+            # (``declare_loop_scope``, ``record_proven_shape``) are writers.
             continue
         if os.path.abspath(frame.filename) == here:
             continue

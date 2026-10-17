@@ -1861,6 +1861,24 @@ def _static_symbol_definition_cell(target: Any) -> Any:
     )
 
 
+def _authored_node_cell(graph: Any, node: Any) -> Any:
+    """The identity cell of the graph node that carries the authored AST
+    ``node``: by the AST's id when the graph still keys nodes by it, else
+    by the AST object the node's ``expr_obj`` holds (a function subgraph
+    relabels its nodes but keeps the authored object).  ``None`` when no
+    node carries it."""
+
+    if not isinstance(node, ast.AST):
+        return None
+    if id(node) in graph.G:
+        return node_identity_cell(graph, id(node))
+    carrier = next((
+        candidate for candidate, data in graph.G.nodes(data=True)
+        if data.get("expr_obj") is node
+    ), None)
+    return None if carrier is None else node_identity_cell(graph, carrier)
+
+
 def _occurrence_cell(graph: Any, occurrence: Any) -> Any:
     """The cell of an authored occurrence (the AST node a use resolved
     from): its posted ingestion / canonical cell, else its ``source_span``
@@ -2999,8 +3017,8 @@ def _set_operands(
         return
     from ...compiler.concordance_declarations import (
         IDENTITY_TRANSITION, LEXICAL_READ_BINDING, OPERAND_FORK, OPERAND_MOVE,
-        OPERAND_POSITION, OPERAND_RETIRE, OperandAppend, OperandFork,
-        OperandMove, OperandRetire,
+        OPERAND_POSITION, OPERAND_POSITION_VACATED, OPERAND_RETIRE,
+        OperandAppend, OperandFork, OperandMove, OperandRetire,
     )
     from ...compiler.identity_concordance import Novel as _Novel
 
@@ -3104,10 +3122,18 @@ def _set_operands(
                 arriving[target] = fact
         for source, fact in facts.items():
             if fact is not None and source not in arriving:
-                # The vacated position: a None revision, as today.  The
-                # declared page holds ``str`` facts, so the withdrawal stays
-                # a raw (tagged) write until readers admit ``Unresolved``.
-                page.revise((scope, node_id, *source), None)
+                # The vacated position: an ``Unresolved`` revision (readers
+                # take it as absence) DERIVED from the transition (move,
+                # retire) that vacated it -- every moved source has one
+                # above.
+                vacated_by = transitions[source]
+                book.post(
+                    book.registry.page(name), (scope, node_id, *source),
+                    _Unresolved(OPERAND_POSITION_VACATED, read=(vacated_by,)),
+                    stage=OPERAND_POSITION,
+                    provenance=_Derived((vacated_by,)),
+                    mode=_Mode.REVISE,
+                )
         for target, fact in arriving.items():
             if page.latest((scope, node_id, *target)) != fact:
                 if isinstance(fact, _Unresolved) or not isinstance(fact, str):
@@ -3644,15 +3670,17 @@ def _operand_positions(parents: Any):
 def lexical_read_binding(
     graph: Any, consumer: int, role: Any, ordinal: int = 0,
 ) -> str | None:
-    """The authored binding one operand of ``consumer`` read, if any."""
+    """The authored binding one operand of ``consumer`` read, if any (a
+    vacated position's ``Unresolved`` revision reads as none)."""
 
     scope = (getattr(graph, "graph", None) or {}).get("lexical_read_scope")
     if scope is None:
         return None
     consumer = consumer if isinstance(consumer, str) else int(consumer)
-    return current_identity_book().page("lexical_read_binding").latest(
+    fact = current_identity_book().page("lexical_read_binding").latest(
         (tuple(scope), consumer, role, int(ordinal))
     )
+    return fact if isinstance(fact, str) else None
 
 
 def _redirect_value(
@@ -4164,6 +4192,19 @@ def _normalize_lexical_values(
         ):
             return None
         return fact
+
+    def page_fact_class_name(cell: Any) -> str | None:
+        """The page's fact class as the class table names it: the
+        ``class_declaration`` row the page declaration derives from (its
+        ``class_identity`` is the module-qualified spelling)."""
+
+        if source_page_declaration(cell) is None:
+            return None
+        class_cell = next((
+            source for source, _stage in current_identity_book().edges_into(cell)
+            if source.page == _CLASS_DECLARATION
+        ), None)
+        return None if class_cell is None else str(class_cell.row[1])
     for owner in ast.walk(statement):
         if not isinstance(owner, (ast.With, ast.AsyncWith)):
             continue
@@ -6087,9 +6128,7 @@ def _normalize_lexical_values(
                             carried = (
                                 class_identity,
                                 tuple(dict.fromkeys(filter(None, (
-                                    node_identity_cell(
-                                        graph, id(condition),
-                                    ),
+                                    _authored_node_cell(graph, condition),
                                     current_identity_book().latest_ref(
                                         _CLASS_DECLARATION,
                                         (module_identity, class_identity),
@@ -6126,7 +6165,7 @@ def _normalize_lexical_values(
                             )
                             return class_identity, tuple(dict.fromkeys(filter(
                                 None, (
-                                    node_identity_cell(graph, id(condition)),
+                                    _authored_node_cell(graph, condition),
                                     class_cell,
                                 ),
                             )))
@@ -6179,7 +6218,7 @@ def _normalize_lexical_values(
                 if none_comparison is None:
                     continue
                 return str(optional_class), tuple(dict.fromkeys(filter(None, (
-                    node_identity_cell(graph, id(none_comparison)),
+                    _authored_node_cell(graph, none_comparison),
                     receiver_attributes.get("source_page_declaration_cell"),
                 ))))
         return None, ()
@@ -8127,8 +8166,11 @@ def _normalize_lexical_values(
                         # ``latest`` remains optional.  This is the exact
                         # class carried by a control arm that proves presence,
                         # never a global claim that the result is non-None.
-                        page_attributes["optional_result_class_ref"] = str(
-                            page_fact_class
+                        # The class as the class table (and every record
+                        # projection) names it.
+                        page_attributes["optional_result_class_ref"] = (
+                            page_fact_class_name(page_declaration_cell)
+                            or str(page_fact_class)
                         )
                         key_value_id = next((
                             int(parent)
@@ -8488,7 +8530,20 @@ def _normalize_lexical_values(
                     ),
                     "source_page_declaration_cell": page_declaration_cell,
                 })
-                if str(field_kind) in {"INDEX", "VALUE_ID"}:
+                if str(field_kind) == "SCOPE":
+                    # A scope key is the book's ``(label, serial)`` pair:
+                    # a two-column tuple whose row fields are the label
+                    # (a string) and the serial (an integer).
+                    projected.update({
+                        "aggregate_kind": "tuple",
+                        "sequence_key_columns": (),
+                        "sequence_column_count": 2,
+                        "sequence_writable": False,
+                        "source_tuple_row_fields": (
+                            ("label", "LABEL"), ("serial", "INDEX"),
+                        ),
+                    })
+                elif str(field_kind) in {"INDEX", "VALUE_ID"}:
                     graph.G.nodes[node_id]["tensor"] = {
                         "shape": (), "dtype": "int64",
                     }
@@ -8795,9 +8850,7 @@ def _normalize_lexical_values(
                                 ):
                                     return str(optional_identity), tuple(
                                         dict.fromkeys(filter(None, (
-                                            node_identity_cell(
-                                                graph, id(condition),
-                                            ),
+                                            _authored_node_cell(graph, condition),
                                             optional_declaration_cell,
                                         )))
                                     )
@@ -8904,22 +8957,43 @@ def _normalize_lexical_values(
                     return None, ()
                 non_none_cell = None
                 for member in statements[:target_index]:
+                    # ``if x is None: return`` and ``if x is None or <more
+                    # on x>: return`` both prove ``x`` present below: the
+                    # ``is None`` test is the first operand of the ``or``.
+                    presence_test = member.test if isinstance(member, ast.If) else None
+                    if (
+                        isinstance(presence_test, ast.BoolOp)
+                        and isinstance(presence_test.op, ast.Or)
+                        and presence_test.values
+                    ):
+                        presence_test = presence_test.values[0]
                     if not (
                         isinstance(member, ast.If)
                         and not member.orelse
                         and member.body
                         and isinstance(member.body[-1], (ast.Return, ast.Raise))
-                        and isinstance(member.test, ast.Compare)
-                        and isinstance(member.test.left, ast.Name)
-                        and member.test.left.id == binding
-                        and len(member.test.ops) == 1
-                        and isinstance(member.test.ops[0], ast.Is)
-                        and len(member.test.comparators) == 1
-                        and isinstance(member.test.comparators[0], ast.Constant)
-                        and member.test.comparators[0].value is None
+                        and isinstance(presence_test, ast.Compare)
+                        and isinstance(presence_test.left, ast.Name)
+                        and presence_test.left.id == binding
+                        and len(presence_test.ops) == 1
+                        and isinstance(presence_test.ops[0], ast.Is)
+                        and len(presence_test.comparators) == 1
+                        and isinstance(presence_test.comparators[0], ast.Constant)
+                        and presence_test.comparators[0].value is None
                     ):
                         continue
-                    non_none_cell = node_identity_cell(graph, id(member.test))
+                    # The test's node in THIS graph: a function subgraph
+                    # relabels its nodes, so the authored ``Compare`` is
+                    # found by the AST object the node still carries.
+                    test_node = next((
+                        candidate for candidate, candidate_data
+                        in graph.G.nodes(data=True)
+                        if candidate_data.get("expr_obj") is member.test
+                    ), None)
+                    non_none_cell = (
+                        None if test_node is None
+                        else node_identity_cell(graph, test_node)
+                    )
                 if non_none_cell is None:
                     return None, ()
                 page_name = None
@@ -8945,9 +9019,18 @@ def _normalize_lexical_values(
                 ) or {}).get(str(page_name))
                 if declared is None:
                     return None, ()
-                class_identity, page_cell, _row_fields = declared
-                return str(class_identity), tuple(dict.fromkeys((
-                    page_cell, non_none_cell,
+                _class_identity, page_cell, _row_fields = declared
+                # The class as the class table names it: the declared
+                # class's own row (the page declaration derives from it),
+                # not the module-qualified spelling of the page fact class.
+                class_cell = next((
+                    source for source, _stage in book.edges_into(page_cell)
+                    if source.page == _CLASS_DECLARATION
+                ), None)
+                if class_cell is None:
+                    return None, ()
+                return str(class_cell.row[1]), tuple(dict.fromkeys((
+                    page_cell, class_cell, non_none_cell,
                 )))
 
             def projected_literal_component(
@@ -9180,6 +9263,16 @@ def _normalize_lexical_values(
                     )
                     else None
                 )
+                if declared_identity is None and operand_attributes.get(
+                    "optional_result_class_ref"
+                ) is not None:
+                    # A page ``latest`` result: its declared class is the
+                    # page's fact class; whether this use proves it present
+                    # is the control arm's (or the optional dispatch's)
+                    # decision below.
+                    declared_identity = str(
+                        operand_attributes["optional_result_class_ref"]
+                    )
                 source_operand = (
                     expression.args[0]
                     if lone_string_projection else component.value
@@ -9486,9 +9579,27 @@ def _normalize_lexical_values(
                     """Project one Page key only through its declaration Ref."""
 
                     declaration = source_page_declaration(declaration_cell)
-                    if (
-                        declaration is None
-                        or tuple(declaration.row_fields) != tuple(row_fields)
+                    # The tuple is the page's whole key, or one SCOPE
+                    # column of it: a scope key is the book's ``(label,
+                    # serial)`` pair, declared by that column's kind.
+                    page_row_field = operand_attributes.get(
+                        "source_page_row_field"
+                    )
+                    scope_column = (
+                        declaration is not None
+                        and isinstance(page_row_field, tuple)
+                        and len(page_row_field) == 3
+                        and str(page_row_field[1]) == "SCOPE"
+                        and 0 <= int(page_row_field[2]) < len(declaration.row_fields)
+                        and str(declaration.row_fields[int(page_row_field[2])][1])
+                        == "SCOPE"
+                        and tuple(row_fields) == (
+                            ("label", "LABEL"), ("serial", "INDEX"),
+                        )
+                    )
+                    if declaration is None or (
+                        tuple(declaration.row_fields) != tuple(row_fields)
+                        and not scope_column
                     ):
                         raise ValueError(
                             "Page tuple glyph projection lacks its exact "
@@ -9886,6 +9997,53 @@ def _normalize_lexical_values(
                                 _PARAMETER_ANNOTATION,
                                 (*tuple(value_class_scope), str(leaf_binding_name)),
                             )
+                        # A field read off an annotated parameter
+                        # (``fact.left`` with ``fact: Publication``): the
+                        # leaf's class is the declared field's annotation,
+                        # read through the parameter's annotation cell and
+                        # the class field declaration cell.
+                        leaf_field_cell = None
+                        leaf_field_annotation = None
+                        if (
+                            isinstance(leaf_expression, ast.Attribute)
+                            and isinstance(leaf_expression.value, ast.Name)
+                        ):
+                            leaf_receiver_cell = book.latest_ref(
+                                _PARAMETER_ANNOTATION,
+                                (
+                                    *tuple(value_class_scope),
+                                    str(leaf_expression.value.id),
+                                ),
+                            )
+                            if leaf_receiver_cell is not None:
+                                leaf_receiver_class = str(book.page(
+                                    _PARAMETER_ANNOTATION
+                                ).cell(
+                                    leaf_receiver_cell.row,
+                                    leaf_receiver_cell.column,
+                                ))
+                                leaf_field_cell = book.latest_ref(
+                                    _CLASS_FIELD_DECLARATION,
+                                    (
+                                        str(value_class_scope[0])
+                                        if isinstance(value_class_scope, tuple)
+                                        and value_class_scope else "",
+                                        leaf_receiver_class,
+                                        str(leaf_expression.attr),
+                                    ),
+                                )
+                                if leaf_field_cell is not None:
+                                    leaf_field_annotation = str(getattr(
+                                        book.page(_CLASS_FIELD_DECLARATION).cell(
+                                            leaf_field_cell.row,
+                                            leaf_field_cell.column,
+                                        ),
+                                        "annotation", "",
+                                    ))
+                                    leaf_parameter_cell = (
+                                        leaf_field_cell if leaf_parameter_cell is None
+                                        else leaf_parameter_cell
+                                    )
                         leaf_integer = (
                             runtime_field_kind in {"INDEX", "VALUE_ID"}
                             or
@@ -9893,10 +10051,12 @@ def _normalize_lexical_values(
                             and isinstance(leaf_expression.value, int)
                             and not isinstance(leaf_expression.value, bool)
                             or leaf_parameter_cell is not None
+                            and leaf_parameter_cell.page == _PARAMETER_ANNOTATION
                             and book.page(_PARAMETER_ANNOTATION).cell(
                                 leaf_parameter_cell.row,
                                 leaf_parameter_cell.column,
                             ) == "int"
+                            or leaf_field_annotation in {"int", "builtins.int"}
                         )
                         if (
                             leaf_kind == "scalar"
@@ -10017,7 +10177,7 @@ def _normalize_lexical_values(
                 declaration_cell = operand_attributes[
                     "source_page_declaration_cell"
                 ]
-                absence_cell = node_identity_cell(graph, id(absence_test))
+                absence_cell = _authored_node_cell(graph, absence_test)
                 present_id = new_node(
                     "FormattedGlyphSequence",
                     "optional present glyph sequence",
@@ -11060,10 +11220,13 @@ def _normalize_lexical_values(
                         else index
                     )
                     binding_target = element
+                # Both stand for the authored target element they
+                # destructure into.
                 index_id = new_node(
                     "Constant",
                     repr(projection),
                     attributes={"value": projection},
+                    source=element,
                 )
                 projected_id = new_node(
                     "Indexed",
@@ -11072,6 +11235,7 @@ def _normalize_lexical_values(
                         (value, "base"),
                         (index_id, "index"),
                     ),
+                    source=element,
                 )
                 if isinstance(projection, int):
                     # The direct ProcessGraph path lowers destructuring here;
@@ -13988,8 +14152,10 @@ def _normalize_lexical_values(
     # previous reduction's facts.
     read_page = current_identity_book().page("lexical_read_binding")
     for row in read_page.scope_rows(ingestion_read_scope):
-        # A position an operand rewrite vacated holds None: no fact to carry.
-        if read_page.latest(row) is None:
+        # A position an operand rewrite vacated holds an ``Unresolved``
+        # revision (None before the withdrawal named its cause): no fact to
+        # carry.
+        if not isinstance(read_page.latest(row), str):
             continue
         if len(row) == 4 and (row[1] == "return" or row[1] in mapping):
             # The canonical row is the ingestion row relabeled: DERIVED
@@ -16375,6 +16541,181 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         }
         for class_name, definition in class_definitions.items()
     }
+    def _resolve_python_bindings():
+        """Resolve the authored imports into ``graph.python_bindings``
+        (and the contextual requirements): run once before the
+        module-level page declarations are read (an imported page
+        factory is bound here) and again at the static-binding stage.
+        Returns the import bindings by local name and the static bindings."""
+
+        compile_substage("topology: resolve imports and lexical static bindings")
+        contextual_requirements = list(
+            graph.G.graph.get("contextual_requirements", ())
+        )
+        # local name -> (qualified name, imported name, requirement, the import
+        # statement's ``source_span`` cell)
+        import_bindings: dict[
+            str,
+            tuple[str, str, dict[str, Any], Any],
+        ] = {}
+        for node_id, data in graph.G.nodes(data=True):
+            statement = data.get("expr_obj")
+            if not isinstance(statement, (ast.Import, ast.ImportFrom)):
+                continue
+            requirement = {
+                "kind": (
+                    "import_from"
+                    if isinstance(statement, ast.ImportFrom)
+                    else "import"
+                ),
+                "module": (
+                    statement.module
+                    if isinstance(statement, ast.ImportFrom)
+                    else None
+                ),
+                "level": (
+                    int(statement.level)
+                    if isinstance(statement, ast.ImportFrom)
+                    else 0
+                ),
+                "names": tuple(
+                    (imported.name, imported.asname)
+                    for imported in statement.names
+                ),
+            }
+            if requirement not in contextual_requirements:
+                contextual_requirements.append(requirement)
+            data.setdefault("attributes", {})[
+                "contextual_requirement"
+            ] = requirement
+            for imported in statement.names:
+                local_name = imported.asname or imported.name.split(".")[0]
+                if isinstance(statement, ast.ImportFrom):
+                    module = "." * int(statement.level) + (
+                        statement.module or ""
+                    )
+                    qualified_name = (
+                        f"{module}.{imported.name}"
+                        if module
+                        else imported.name
+                    )
+                else:
+                    qualified_name = imported.name
+                # The import statement's span cell: the source an external
+                # declaration made for this binding derives from.
+                import_bindings[local_name] = (
+                    qualified_name,
+                    imported.name,
+                    requirement,
+                    _post_source_span(statement),
+                )
+                imported_id = id(imported)
+                if imported_id in graph.G:
+                    graph.G.nodes[imported_id].setdefault("attributes", {})[
+                        "contextual_requirement"
+                    ] = requirement
+            logger.info(
+                "retaining ProcessGraph import as a contextual requirement: %s",
+                requirement,
+            )
+        graph.G.graph["contextual_requirements"] = tuple(
+            contextual_requirements
+        )
+        static_bindings = dict(getattr(graph, "python_bindings", {}) or {})
+        # Parent-source expansion is optional, but literal module constants are
+        # required static bindings in either ingestion mode.  Recover only
+        # assignments outside function/class bodies; locals remain SSA values.
+        scoped_member_ids = {
+            id(member)
+            for _owner_id, owner_data in graph.G.nodes(data=True)
+            for owner in (owner_data.get("expr_obj"),)
+            if isinstance(
+                owner,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+            )
+            for member in source_walk(owner)
+            if member is not owner
+        }
+        for _node_id, node_data in graph.G.nodes(data=True):
+            expression = node_data.get("expr_obj")
+            if id(expression) in scoped_member_ids:
+                continue
+            if isinstance(expression, ast.Assign):
+                targets = expression.targets
+                value_node = expression.value
+            elif isinstance(expression, ast.AnnAssign):
+                targets = (expression.target,)
+                value_node = expression.value
+            else:
+                continue
+            if value_node is None:
+                continue
+            try:
+                literal = ast.literal_eval(value_node)
+            except (TypeError, ValueError, SyntaxError):
+                if not (
+                    isinstance(value_node, ast.Call)
+                    and isinstance(value_node.func, ast.Name)
+                    and value_node.func.id in {
+                        "tuple", "list", "set", "frozenset", "dict",
+                    }
+                    and not value_node.keywords
+                    and len(value_node.args) <= 1
+                ):
+                    continue
+                try:
+                    argument = (
+                        () if not value_node.args
+                        else ast.literal_eval(value_node.args[0])
+                    )
+                    literal = {
+                        "tuple": tuple,
+                        "list": list,
+                        "set": set,
+                        "frozenset": frozenset,
+                        "dict": dict,
+                    }[value_node.func.id](argument)
+                except (TypeError, ValueError, SyntaxError):
+                    continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    static_bindings[target.id] = literal
+        python_package = getattr(graph, "python_package", None)
+        for local_name, (
+            qualified_name,
+            imported_name,
+            requirement,
+            _import_cell,
+        ) in import_bindings.items():
+            try:
+                if requirement["kind"] == "import_from":
+                    module_name = (
+                        "." * int(requirement.get("level", 0))
+                        + str(requirement.get("module") or "")
+                    )
+                    module = importlib.import_module(
+                        module_name,
+                        package=python_package,
+                    )
+                    static_bindings[local_name] = getattr(
+                        module,
+                        imported_name,
+                    )
+                elif requirement["kind"] == "import":
+                    static_bindings[local_name] = importlib.import_module(
+                        qualified_name,
+                        package=python_package,
+                    )
+            except (ImportError, AttributeError, TypeError, ValueError):
+                # The contextual requirement remains available to deployment even
+                # when it cannot be resolved in the compiler's current process.
+                continue
+        for builtin_name, value in vars(builtins).items():
+            static_bindings.setdefault(builtin_name, value)
+        graph.python_bindings = static_bindings
+        return import_bindings, static_bindings
+
+    _resolve_python_bindings()
     # A named concordance page declares the class of every fact it can hold.
     # Retain that source relation before function subgraphs split away from
     # the module-level ``declare_page`` call.  A later ``book.borrowed(name)``
@@ -16385,6 +16726,32 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     ] = {}
     declared_page_bindings: dict[str, _Ref] = {}
     declaration_book = current_identity_book()
+    # The page factory and its row-field classes may be present only by
+    # reference -- an import this reduction resolved into
+    # ``python_bindings``, not source submitted to the compile.  Their
+    # declarations are then ingested by reference, as a class field's
+    # constructor is, before the exact cells are read below.
+    factory_module_identity = "src.compiler.identity_concordance"
+    bound_page_factory = next((
+        value for value in (getattr(graph, "python_bindings", {}) or {}).values()
+        if inspect.ismethod(value)
+        and getattr(value.__func__, "__module__", "") == factory_module_identity
+        and getattr(value.__func__, "__qualname__", "") == "Registry.declare_page"
+    ), None)
+    if bound_page_factory is not None:
+        from ...transmogrifier.graph.graph_express2 import (
+            ingest_class_declaration_by_reference,
+        )
+
+        factory_module = inspect.getmodule(bound_page_factory.__func__)
+        for factory_class_name in ("Registry", "RowField", "RowFieldKind"):
+            if declaration_book.latest_ref(
+                _CLASS_DECLARATION,
+                (factory_module_identity, factory_class_name),
+            ) is None:
+                ingest_class_declaration_by_reference(
+                    getattr(factory_module, factory_class_name, None),
+                )
     row_field_class_cell = declaration_book.latest_ref(
         _CLASS_DECLARATION,
         ("src.compiler.identity_concordance", "RowField"),
@@ -16497,9 +16864,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         """Follow the exact callee node's concordance edge to its symbol."""
 
         call_data = graph.G.nodes[int(declaration_node_id)]
+        # ``callee`` is the reducer's role for the position; a module-level
+        # call the reduction never visited still carries ingestion's ``func``.
         callee_ids = tuple(
             int(parent) for parent, role in call_data.get("parents") or ()
-            if str(role) == "callee" and int(parent) in graph.G
+            if str(role) in {"callee", "func"} and int(parent) in graph.G
         )
         if len(callee_ids) != 1:
             return None
@@ -16513,7 +16882,33 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if source.page == _STATIC_SYMBOL_DEFINITION
             and tuple(source.row) == page_factory_identity
         )
-        return direct[0] if len(direct) == 1 else None
+        if len(direct) == 1:
+            return direct[0]
+        if direct:
+            return None
+        # A module-level callee name the reduction never turned into a
+        # StaticReference: when the import bound it to the page factory,
+        # the callee node derives from the factory's definition cell (the
+        # same edge a StaticReference node carries from its mint).
+        expression = graph.G.nodes[callee_ids[0]].get("expr_obj")
+        bound = (
+            (getattr(graph, "python_bindings", {}) or {}).get(expression.id)
+            if isinstance(expression, ast.Name) else None
+        )
+        if bound is not bound_page_factory or bound is None:
+            return None
+        definition_cell = exact_page_factory_definition_cell()
+        if definition_cell is None:
+            return None
+        fact = declaration_book.page(callee_cell.page).cell(
+            callee_cell.row, callee_cell.column,
+        )
+        declaration_book.post(
+            callee_cell.page, callee_cell.row, fact, stage=_REDUCTION,
+            provenance=_Derived((callee_cell, definition_cell)),
+            mode=_Mode.REVISE,
+        )
+        return definition_cell
 
     def exact_fact_class(
         expression: ast.AST, module_identity: str,
@@ -18506,165 +18901,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # this graph now that those identities are available.
     propagate_returned_receiver_types(graph.G)
 
-    compile_substage("topology: resolve imports and lexical static bindings")
-    contextual_requirements = list(
-        graph.G.graph.get("contextual_requirements", ())
-    )
-    import_bindings: dict[
-        str,
-        tuple[str, str, dict[str, Any]],
-    ] = {}
-    for node_id, data in graph.G.nodes(data=True):
-        statement = data.get("expr_obj")
-        if not isinstance(statement, (ast.Import, ast.ImportFrom)):
-            continue
-        requirement = {
-            "kind": (
-                "import_from"
-                if isinstance(statement, ast.ImportFrom)
-                else "import"
-            ),
-            "module": (
-                statement.module
-                if isinstance(statement, ast.ImportFrom)
-                else None
-            ),
-            "level": (
-                int(statement.level)
-                if isinstance(statement, ast.ImportFrom)
-                else 0
-            ),
-            "names": tuple(
-                (imported.name, imported.asname)
-                for imported in statement.names
-            ),
-        }
-        if requirement not in contextual_requirements:
-            contextual_requirements.append(requirement)
-        data.setdefault("attributes", {})[
-            "contextual_requirement"
-        ] = requirement
-        for imported in statement.names:
-            local_name = imported.asname or imported.name.split(".")[0]
-            if isinstance(statement, ast.ImportFrom):
-                module = "." * int(statement.level) + (
-                    statement.module or ""
-                )
-                qualified_name = (
-                    f"{module}.{imported.name}"
-                    if module
-                    else imported.name
-                )
-            else:
-                qualified_name = imported.name
-            import_bindings[local_name] = (
-                qualified_name,
-                imported.name,
-                requirement,
-            )
-            imported_id = id(imported)
-            if imported_id in graph.G:
-                graph.G.nodes[imported_id].setdefault("attributes", {})[
-                    "contextual_requirement"
-                ] = requirement
-        logger.info(
-            "retaining ProcessGraph import as a contextual requirement: %s",
-            requirement,
-        )
-    graph.G.graph["contextual_requirements"] = tuple(
-        contextual_requirements
-    )
-    static_bindings = dict(getattr(graph, "python_bindings", {}) or {})
-    # Parent-source expansion is optional, but literal module constants are
-    # required static bindings in either ingestion mode.  Recover only
-    # assignments outside function/class bodies; locals remain SSA values.
-    scoped_member_ids = {
-        id(member)
-        for _owner_id, owner_data in graph.G.nodes(data=True)
-        for owner in (owner_data.get("expr_obj"),)
-        if isinstance(
-            owner,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
-        )
-        for member in source_walk(owner)
-        if member is not owner
-    }
-    for _node_id, node_data in graph.G.nodes(data=True):
-        expression = node_data.get("expr_obj")
-        if id(expression) in scoped_member_ids:
-            continue
-        if isinstance(expression, ast.Assign):
-            targets = expression.targets
-            value_node = expression.value
-        elif isinstance(expression, ast.AnnAssign):
-            targets = (expression.target,)
-            value_node = expression.value
-        else:
-            continue
-        if value_node is None:
-            continue
-        try:
-            literal = ast.literal_eval(value_node)
-        except (TypeError, ValueError, SyntaxError):
-            if not (
-                isinstance(value_node, ast.Call)
-                and isinstance(value_node.func, ast.Name)
-                and value_node.func.id in {
-                    "tuple", "list", "set", "frozenset", "dict",
-                }
-                and not value_node.keywords
-                and len(value_node.args) <= 1
-            ):
-                continue
-            try:
-                argument = (
-                    () if not value_node.args
-                    else ast.literal_eval(value_node.args[0])
-                )
-                literal = {
-                    "tuple": tuple,
-                    "list": list,
-                    "set": set,
-                    "frozenset": frozenset,
-                    "dict": dict,
-                }[value_node.func.id](argument)
-            except (TypeError, ValueError, SyntaxError):
-                continue
-        for target in targets:
-            if isinstance(target, ast.Name):
-                static_bindings[target.id] = literal
-    python_package = getattr(graph, "python_package", None)
-    for local_name, (
-        qualified_name,
-        imported_name,
-        requirement,
-    ) in import_bindings.items():
-        try:
-            if requirement["kind"] == "import_from":
-                module_name = (
-                    "." * int(requirement.get("level", 0))
-                    + str(requirement.get("module") or "")
-                )
-                module = importlib.import_module(
-                    module_name,
-                    package=python_package,
-                )
-                static_bindings[local_name] = getattr(
-                    module,
-                    imported_name,
-                )
-            elif requirement["kind"] == "import":
-                static_bindings[local_name] = importlib.import_module(
-                    qualified_name,
-                    package=python_package,
-                )
-        except (ImportError, AttributeError, TypeError, ValueError):
-            # The contextual requirement remains available to deployment even
-            # when it cannot be resolved in the compiler's current process.
-            continue
-    for builtin_name, value in vars(builtins).items():
-        static_bindings.setdefault(builtin_name, value)
-    graph.python_bindings = static_bindings
+    import_bindings, static_bindings = _resolve_python_bindings()
     function_parameters_by_address = {}
     for function_node_id, reference in function_nodes.items():
         definition = graph.G.nodes[function_node_id].get("expr_obj")
@@ -19191,6 +19428,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         qualified_name,
                         imported_name,
                         requirement,
+                        import_cell,
                     ) = import_bindings[
                         callee_name
                     ]
@@ -19202,6 +19440,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             "contextual_requirement": requirement,
                             "imported_name": imported_name,
                         },
+                        source=import_cell,
                     )
                     data.setdefault("attributes", {})[
                         "external_callee_ref"

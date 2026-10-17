@@ -2825,8 +2825,13 @@ def _linked_caller_member(
     caller_sequences: Any,
     caller_formal_ids: Collection[int] = (),
     linked_sequence_members: set[int] | None = None,
+    callee_cell: Any = None,
 ) -> int | None:
     """The caller value a callee record member is, by recorded ids only.
+
+    ``callee_cell``: the callee formal's own ``ssa_value`` cell; the
+    decision that the formal is a member of no bound record stands on it
+    when the formal has no membership cell to stand on.
 
     The callee formal's identity was written when it was minted: the record
     descriptor (or that field's sequence descriptor) names it as one member
@@ -2864,6 +2869,7 @@ def _linked_caller_member(
     source_cells: list = list(_frame_cells(
         _frame_table_cell(callee_records, callee_id, RECORD_MEMBER),
         _frame_table_cell(callee_sequences, callee_id, SEQUENCE_MEMBER),
+        callee_cell,
     ))
 
     def record_decision(member: int | None) -> int | None:
@@ -15474,6 +15480,7 @@ def _propagate_record_field_demand(
             all_sequence_tables.get(str(callee_symbol)),
             all_sequence_tables.get(str(caller_symbol)),
             {int(value.id) for value in caller.args},
+            callee_cell=_frame_value_cell(callee, formal.id),
         )
         return None if member_id is None else caller_values.get(int(member_id))
 
@@ -19275,11 +19282,39 @@ def _class_surface_ssa_program(
                                 incoming_arm.row_shape,
                             )
                             if incumbent_physical != incoming_physical:
-                                raise ValueError(
-                                    "native union alternative has conflicting "
-                                    "physical ProgramABI: "
-                                    f"{identity!r}: {incumbent_physical!r} != "
-                                    f"{incoming_physical!r}"
+                                # Two callsites binding the same class to
+                                # this formal from different declared
+                                # fields (``fact.left`` and ``fact.right``)
+                                # agree on the physical arm and differ only
+                                # in the field identity their storage
+                                # identity carries: the formal's field is
+                                # then ambiguous, as the contract rule
+                                # above decides, and the arm keeps what the
+                                # callsites share.
+                                incumbent_rest = (
+                                    *incumbent_physical[:5], *incumbent_physical[6:],
+                                )
+                                incoming_rest = (
+                                    *incoming_physical[:5], *incoming_physical[6:],
+                                )
+                                if incumbent_rest != incoming_rest or not (
+                                    isinstance(incumbent_physical[5], tuple)
+                                    and isinstance(incoming_physical[5], tuple)
+                                ):
+                                    raise ValueError(
+                                        "native union alternative has conflicting "
+                                        "physical ProgramABI: "
+                                        f"{identity!r}: {incumbent_physical!r} != "
+                                        f"{incoming_physical!r}"
+                                    )
+                                shared_storage_identity = tuple(
+                                    item for item in incumbent_physical[5]
+                                    if item in incoming_physical[5]
+                                )
+                                incoming_physical = (
+                                    *incoming_physical[:5],
+                                    shared_storage_identity,
+                                    *incoming_physical[6:],
                                 )
                             incoming_arm = _ValueTypeABIAlternative(
                                 *incoming_physical[:6],
@@ -20677,7 +20712,8 @@ def _class_surface_ssa_program(
             glyph_sequence_declarations,
             glyph_sequence_initializations,
             glyph_sequence_mutations,
-        ) = _source_glyph_sequence_materializations(graph_obj)
+            glyph_sequence_declaration_cells,
+        ) = _source_glyph_sequence_materializations(graph_obj, with_cells=True)
         (
             optional_glyph_declarations,
             optional_glyph_initializations,
@@ -21111,9 +21147,16 @@ def _class_surface_ssa_program(
                     "control sequence mutation "
                     f"{mutation.effect_node_id}:{mutation.operator}"
                 ),
+                # The effect node's and sequence's graph cells; a
+                # compiler-authored mutation (a glyph composition step, a
+                # token lookup copy) has none and stands on the contract
+                # cells it was made from.
                 sources=(
                     _frame_graph_cell(graph_obj, int(mutation.effect_node_id)),
                     _frame_graph_cell(graph_obj, sequence_id),
+                    mutation.step_cell,
+                    mutation.source_contract_cell,
+                    mutation.vocabulary_contract_cell,
                 ),
                 stage=SHELL_HANDOFF,
             )
@@ -22113,21 +22156,50 @@ def _class_surface_ssa_program(
         planning_concordance = current_identity_book().page(
             "planning_value_concordance"
         )
+        from .precompile_to_ssa import _function_root_cell as _planning_root
+
         for alias_id, resident_id in planning_value_aliases.items():
             alias_reason = planning_alias_reasons[int(alias_id)]
+            # The alias stands on the two values' graph cells; a planner
+            # output with no graph cell (a minted resident) stands on the
+            # function's root, as every mint without a more specific cell.
             _frame_post(
                 PLANNING_VALUE, (str(symbol), int(alias_id)), int(resident_id),
                 stage=SHELL_HANDOFF, mode=Mode.REVISE,
-                cells=() if alias_reason is not None else (
+                cells=_frame_cells(
                     _frame_graph_cell(graph_obj, alias_id),
                     _frame_graph_cell(graph_obj, resident_id),
-                ),
+                ) or (_planning_root(current_identity_book(), str(symbol)),),
                 reason=(
                     GRAPH_ID_WITHOUT_CANONICAL_CELL if alias_reason is None
                     else alias_reason
                 ),
             )
         concorded_sequence_declarations = []
+        # A compiler-authored sequence (a glyph composition destination, a
+        # token vocabulary) has no graph cell: its declaration stands on the
+        # contract cells of the mutations that made it.
+        from .identity_concordance import Ref as _DeclarationRef
+
+        authored_declaration_cells: dict[int, list] = {
+            int(sequence_id): list(cells)
+            for sequence_id, cells in glyph_sequence_declaration_cells.items()
+        }
+        for mutation in (*glyph_sequence_mutations, *token_glyph_mutations):
+            for cell in (
+                mutation.step_cell, mutation.source_contract_cell,
+                mutation.vocabulary_contract_cell,
+            ):
+                if not isinstance(cell, _DeclarationRef):
+                    continue
+                authored_declaration_cells.setdefault(
+                    int(mutation.sequence_value_id), [],
+                ).append(cell)
+                if cell is mutation.vocabulary_contract_cell:
+                    for argument_id in mutation.argument_value_ids[1:]:
+                        authored_declaration_cells.setdefault(
+                            int(argument_id), [],
+                        ).append(cell)
         for sequence_id, policy, column_count, writable in sequence_declarations:
             contract = commit_sequence_contract(
                 symbol,
@@ -22136,7 +22208,10 @@ def _class_surface_ssa_program(
                 int(column_count),
                 bool(writable),
                 source="shell control handoff",
-                sources=(_frame_graph_cell(graph_obj, int(sequence_id)),),
+                sources=(
+                    _frame_graph_cell(graph_obj, int(sequence_id)),
+                    *authored_declaration_cells.get(int(sequence_id), ()),
+                ),
                 stage=SHELL_HANDOFF,
             )
             concorded_sequence_declarations.append((
@@ -35698,6 +35773,7 @@ def _class_surface_ssa_program(
                 all_sequence_tables.get(caller_symbol),
                 {int(argument.id) for argument in caller_function.args},
                 sequence_members,
+                callee_cell=_frame_value_cell(callee_function, callee_formal.id),
             )
             if member is None:
                 return None
@@ -37971,6 +38047,7 @@ def _class_surface_ssa_program(
                                 all_sequence_tables.get(str(caller_symbol)),
                                 {int(value.id) for value in caller.args},
                                 linked_sequence_members,
+                                callee_cell=_frame_value_cell(callee, callee_id),
                             )
                             # These labels describe how the incumbent source
                             # was first obtained, not whether the callee
@@ -38071,6 +38148,9 @@ def _class_surface_ssa_program(
                                     all_sequence_tables.get(str(caller_symbol)),
                                     {int(value.id) for value in caller.args},
                                     linked_sequence_members,
+                                    callee_cell=_frame_value_cell(
+                                        callee, argument_id,
+                                    ),
                                 )
                             if linked_member is not None:
                                 caller_storage = values.get(int(linked_member))

@@ -1171,9 +1171,10 @@ def _concord_consumer_operands(
     orphan_page = book.page("operand_position_orphan")
     read_rows: dict[int, list[tuple[Any, int]]] = {}
     for row in read_page.scope_rows(tuple(scope)):
+        # A vacated position holds an ``Unresolved`` revision: no read.
         if (
             len(row) == 4 and isinstance(row[1], int)
-            and read_page.latest(row) is not None
+            and isinstance(read_page.latest(row), str)
         ):
             read_rows.setdefault(int(row[1]), []).append((row[2], row[3]))
     for node_id in consumer_nodes:
@@ -1379,10 +1380,27 @@ def _call_result_bindings(graph, node_id, output_paths):
             collect(projection_path, int(successor))
 
     collect((), int(node_id))
-    from .identity_concordance import current_identity_book
-    page = current_identity_book().page("call_result_projection_concordance")
+    from .concordance_declarations import (
+        CALL_RESULT_PROJECTION, PLANNER_HIERARCHY,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    book = current_identity_book()
+    # Each projection derives from the call node's cell and its own.
     for path, value_id in caller_paths.items():
-        page.concord((int(node_id), value_id), path)
+        book.post(
+            CALL_RESULT_PROJECTION, (int(node_id), int(value_id)), tuple(path),
+            stage=PLANNER_HIERARCHY,
+            provenance=Derived(tuple(dict.fromkeys(
+                cell for cell in (
+                    node_identity_cell(graph, int(node_id)),
+                    node_identity_cell(graph, int(value_id)),
+                )
+                if cell is not None
+            ))),
+            mode=Mode.CONCORD,
+        )
     if tuple(output_paths) == ((0,),) and not (
         graph.G.nodes[int(node_id)].get("attributes") or {}
     ).get("authored_return_container"):
@@ -1745,8 +1763,11 @@ def _build_shell_hierarchy_plan(
             # binding from the FunctionTable declaration graph; it is
             # provenance for the authored call and does not undo the child's
             # specialization.
-            declaration_graph = getattr(
-                graph.function_table.entry(int(reference)).graph, "G", None,
+            function_table = getattr(graph, "function_table", None)
+            declaration_graph = (
+                None if function_table is None else getattr(
+                    function_table.entry(int(reference)).graph, "G", None,
+                )
             )
             declaration_identities = (
                 {}
@@ -16171,17 +16192,20 @@ def _invalidate_tensor_descriptor_dependents(
         data.pop("tensor", None)
         try:
             from .identity_concordance import invalidate_proven_shape, shape_scope_of
+            from ..common.tensors.topological_reducer import node_identity_cell
 
             arguments = (
                 shape_scope_of(graph), int(data.get("value_id", node_id)),
                 int(causes[0]), str(reason),
             )
-            if source_cells:
-                invalidate_proven_shape(
-                    *arguments, source_cells=source_cells,
-                )
-            else:
-                invalidate_proven_shape(*arguments)
+            # The withdrawal stands on the cells the caller changed, else
+            # on the identity cell of the operand whose descriptor changed
+            # (the cause): that node is where the change came from.
+            cells = tuple(source_cells) or tuple(
+                cell for cell in (node_identity_cell(graph, int(causes[0])),)
+                if cell is not None
+            )
+            invalidate_proven_shape(*arguments, source_cells=cells)
         except Exception:
             pass
 
@@ -16590,14 +16614,23 @@ def _propagate_callsite_tensor_specializations(
             )
             _stored = _book.pages.get(CALLSITE_RETURN_SPECIALIZATION_PAGE.name)
             # The round's published return shape is read off the callee's
-            # return cells: DERIVED from them.
+            # return cells: DERIVED from them; a callee that publishes no
+            # return (an empty fact) is read off the call node itself.
             if _stored is None or _stored.latest(_row) != _fact:
+                from ..common.tensors.topological_reducer import (
+                    node_identity_cell as _node_cell,
+                )
+
+                _cells = tuple(dict.fromkeys(
+                    cell for cells in output_cells for cell in cells
+                )) or tuple(
+                    cell for cell in (_node_cell(caller, int(node_id)),)
+                    if cell is not None
+                )
                 _post_or_unsourced(
                     _book, CALLSITE_RETURN_SPECIALIZATION_PAGE, _row, _fact,
                     PLANNER_TENSOR_SPECIALIZATION,
-                    tuple(dict.fromkeys(
-                        cell for cells in output_cells for cell in cells
-                    )),
+                    _cells,
                     SPECIALIZATION_ROUND_CAUSE_NOT_ON_BOOK,
                 )
             return_cells_by_call[(id(caller.G), int(node_id))] = tuple(
@@ -17291,11 +17324,16 @@ def _propagate_callsite_tensor_specializations(
                         if publish_to_function_table and (
                             descriptor_states_a_shape(descriptor)
                         ):
+                            # DERIVED(the caller argument's identity cell),
+                            # as the planner-specialization publication is.
                             formal_shape_changed = _publish_formal_shape(
                                 str(callee.G.graph.get("function_name")),
                                 str(parameter),
                                 descriptor,
                                 str(caller.G.graph.get("function_name")),
+                                _argument_identity_cells(
+                                    caller, int(parent),
+                                )[:1],
                             )
                             changed |= formal_shape_changed
                             mutation_counts["formal_shapes"] += int(
@@ -18538,19 +18576,27 @@ def _tensor_descriptor(
                         int(node_id), ("descriptor_root", int(node_id)),
                         "root",
                     ),)
-                for _source_node, source_value, source_role in semantic_sources:
-                    # The descriptor was read off the source node: the edge
-                    # derives from that node's identity cell.
-                    from ..common.tensors.topological_reducer import (
-                        node_identity_cell as _descriptor_source_cell,
-                    )
+                # The descriptor was computed from EVERY semantic source
+                # (a binary operator's lhs and rhs together), so each edge
+                # derives from all their identity cells: a change on one
+                # operand is the cause of the other operand's edge changing
+                # its target state too.
+                from ..common.tensors.topological_reducer import (
+                    node_identity_cell as _descriptor_source_cell,
+                )
 
+                operand_cells: list = []
+                for _source_node, _source_value, _source_role in semantic_sources:
                     try:
-                        edge_source_cells = source_cells or (
-                            _descriptor_source_cell(graph, int(_source_node)),
+                        operand_cell = _descriptor_source_cell(
+                            graph, int(_source_node),
                         )
                     except ValueError:
-                        edge_source_cells = source_cells
+                        operand_cell = None
+                    if operand_cell is not None and operand_cell not in operand_cells:
+                        operand_cells.append(operand_cell)
+                for _source_node, source_value, source_role in semantic_sources:
+                    edge_source_cells = source_cells or tuple(operand_cells)
                     record_shape_transformation(
                         row[0], source_value, row[0], row[1],
                         stage="graph_tensor_descriptor",
@@ -24411,6 +24457,16 @@ class ProcessGraphGLSLDeployment(TiledObject):
                         "constructor" if attributes.get("constructor_ref")
                         is not None else "callsite_shell",
                     )
+                    # A call with no binding row stands on the call node's
+                    # own identity cell.
+                    if binding_cell is None:
+                        from ..common.tensors.topological_reducer import (
+                            node_identity_cell as _call_node_cell,
+                        )
+
+                        binding_cell = _call_node_cell(
+                            owner.process_graph, int(node_id),
+                        )
                     _post_callsite_activation(
                         identity_row, activation_fact, binding_cell,
                     )

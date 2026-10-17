@@ -35,7 +35,9 @@ def _source_contract_rows(graph_obj: Any, page: Any) -> tuple[tuple, ...]:
     ))
 
 
-def _source_glyph_sequence_materializations(graph_obj: Any):
+def _source_glyph_sequence_materializations(
+    graph_obj: Any, *, with_cells: bool = False,
+):
     """Read exact JoinedStr recipes into incumbent resident-sequence work.
 
     The reducer owns component order, glyph identities, conversions and value
@@ -44,6 +46,10 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
     components are resident sequences produced by their source-linked helper
     calls.  The JoinedStr destination is cleared and extended in recipe order
     through the ordinary sequence ABI.
+
+    ``with_cells`` adds a fourth result: sequence id -> the recipe cells each
+    declaration was read from, so a declaration's contract can derive from
+    them (a compiler-authored sequence has no graph cell of its own).
     """
 
     from .concordance_declarations import (
@@ -60,6 +66,16 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
     initializations: list[tuple[int, str, int]] = []
     mutations: list[ControlSequenceMutation] = []
     step_counts: dict[tuple, int] = {}
+    declaration_cells: dict[int, list] = {}
+
+    def declare(cell, entry):
+        """One declaration, remembered with the recipe cell it was read
+        from."""
+
+        declarations.append(entry)
+        cells = declaration_cells.setdefault(int(entry[0]), [])
+        if cell not in cells:
+            cells.append(cell)
 
     def glyph_step(
         destination_id, operator, arguments, *, argument_kind, cell,
@@ -125,7 +141,7 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
                     "literal glyph alternate has no exact literal recipe: "
                     f"value={joined_id} row={row!r}"
                 )
-            declarations.append((joined_id, "duplicates", 1, False))
+            declare(cell, (joined_id, "duplicates", 1, False))
             initializations.append((
                 joined_id,
                 "literal_glyphs="
@@ -133,7 +149,7 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
                 1,
             ))
             continue
-        declarations.append((joined_id, "duplicates", 1, True))
+        declare(cell, (joined_id, "duplicates", 1, True))
         initializations.append((joined_id, "duplicates", 1))
         mutations.append(glyph_step(
             joined_id, "clear", (),
@@ -156,7 +172,7 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
                         "value-union glyph alternatives share an arm recipe: "
                         f"value={destination_id}"
                     )
-                declarations.append((destination_id, "duplicates", 1, True))
+                declare(cell, (destination_id, "duplicates", 1, True))
                 initializations.append((destination_id, "duplicates", 1))
                 mutations.append(ControlSequenceMutation(
                     destination_id,
@@ -170,7 +186,7 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
                 return destination_id
             if component.projection_components:
                 destination_id = int(component.component_value_id)
-                declarations.append((destination_id, "duplicates", 1, True))
+                declare(cell, (destination_id, "duplicates", 1, True))
                 initializations.append((destination_id, "duplicates", 1))
                 mutations.append(glyph_step(
                     destination_id, "clear", (),
@@ -201,7 +217,7 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
                 if component.formatted_sequence_value_id is not None
                 else component.component_value_id
             )
-            declarations.append((
+            declare(cell, (
                 component_id, "duplicates", 1,
                 str(component.kind) != "literal",
             ))
@@ -220,11 +236,17 @@ def _source_glyph_sequence_materializations(graph_obj: Any):
                 joined_id, "extend", (component_id,),
                 argument_kind="glyph_sequence_component", cell=cell,
             ))
-    return (
+    result = (
         tuple(dict.fromkeys(declarations)),
         tuple(dict.fromkeys(initializations)),
         tuple(mutations),
     )
+    if with_cells:
+        return (*result, {
+            sequence_id: tuple(cells)
+            for sequence_id, cells in declaration_cells.items()
+        })
+    return result
 
 
 def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):

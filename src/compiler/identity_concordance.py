@@ -753,12 +753,21 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                     "shape": tuple(result_shape), "rank": len(result_shape),
                     "dtype": str(result_dtype or "unknown"),
                 }
+                # The layout is read off the call's result value: the edge
+                # derives from its ``ssa_value`` cell.
+                from .concordance_declarations import SSA_VALUE as _SSA_VALUE
+                from .ssa_record_return_state import function_scope_of
+
+                result_cell = current_identity_book().latest_ref(
+                    _SSA_VALUE, (function_scope_of(function), result_id),
+                )
                 record_shape_transformation(
                     shape_scope_of(callee), ("return", str(callee_name)),
                     shape_scope_of(function), result_id,
                     stage="projected_iterable_layout",
                     operation="call_result", source_state=state,
                     target_state=state, role="return",
+                    source_cells=() if result_cell is None else (result_cell,),
                 )
             source_receipt = call.attributes.get("plan_callsite_id")
             if source_receipt is None:
@@ -5217,10 +5226,13 @@ class IdentityBook:
         #: the proof that no writer bypasses ``post``.
         import os
 
+        # CLOSED by default: a fact is recorded only with the cells it was
+        # read from.  ``TURING_IDENTITY_LATCH=open`` is the diagnostic mode
+        # that tags unsourced writes instead of refusing them.
         self.latch: Latch = (
-            Latch.CLOSED
-            if os.environ.get(LATCH_ENV, "").strip().lower() == "closed"
-            else Latch.OPEN
+            Latch.OPEN
+            if os.environ.get(LATCH_ENV, "").strip().lower() == "open"
+            else Latch.CLOSED
         )
         #: When a pass sets this, raw writes made while it is set are tagged
         #: with that stage instead of ``RAW_STAGE``.
@@ -7957,7 +7969,26 @@ def concord_program_abi_frame_transitions(module: Any) -> tuple[dict, ...]:
             )
             incumbent = page.latest(row)
             if incumbent is None:
-                page.set(row, 0, fact)
+                # The transition stands on the formal's own ``ssa_value``
+                # cell under the function's control scope.
+                from .concordance_declarations import (
+                    FRAME_BINDING, FRAME_SOURCE_CELL_ABSENT,
+                    PROGRAM_ABI_FRAME_TRANSITION, SSA_VALUE,
+                )
+                from .ssa_record_return_state import function_scope_of
+
+                formal_cell = book.latest_ref(
+                    SSA_VALUE, (function_scope_of(function), formal_id),
+                )
+                book.post(
+                    PROGRAM_ABI_FRAME_TRANSITION, row,
+                    fact, stage=FRAME_BINDING,
+                    provenance=(
+                        Derived((formal_cell,)) if formal_cell is not None
+                        else Unsourced(FRAME_SOURCE_CELL_ABSENT)
+                    ),
+                    mode=Mode.CONCORD,
+                )
             elif tuple(incumbent) != fact:
                 raise ValueError(
                     "ProgramABI/frame transition disagreement for "
@@ -8074,7 +8105,7 @@ def materializing_binding_kind(
 
 def record_proven_shape(
     function: Any, value_id: int, extents: Any, dtype: Any,
-    level: int | None = 0,
+    level: int | None = 0, *, sources: Iterable[Ref] = (),
 ) -> None:
     """Record extents proven for one value identity at one causal level.
 
@@ -8084,6 +8115,10 @@ def record_proven_shape(
     shallower one because it was derived from more of the program; the same
     answer arriving deeper is recorded at its own level so the page shows how
     far it has been confirmed.
+
+    The proof is posted DERIVED from ``sources`` (the cells the caller proved
+    the extents from) and the value's shape-state cell; with neither it is
+    recorded ``Unsourced``.
     """
 
     extents = tuple(int(extent) for extent in (extents or ()))
@@ -8092,6 +8127,7 @@ def record_proven_shape(
     book = current_identity_book()
     page = book.page(PROVEN_SHAPE_PAGE)
     row = (_shape_key(function), int(value_id))
+    sources = tuple(cell for cell in sources if isinstance(cell, Ref))
     recorded = page.history(row)
     recorded_levels = tuple(
         int(stored[3])
@@ -8113,7 +8149,7 @@ def record_proven_shape(
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         _post_or_unsourced(
             book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
-            () if state_ref is None else (state_ref,),
+            (*sources, *(() if state_ref is None else (state_ref,))),
             PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
         )
         return
@@ -8129,7 +8165,7 @@ def record_proven_shape(
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         _post_or_unsourced(
             book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
-            () if state_ref is None else (state_ref,),
+            (*sources, *(() if state_ref is None else (state_ref,))),
             PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
         )
         return
@@ -8159,7 +8195,7 @@ def record_proven_shape(
             return
         _post_or_unsourced(
             book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
-            () if state_ref is None else (state_ref,),
+            (*sources, *(() if state_ref is None else (state_ref,))),
             PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
         )
         return
@@ -8168,7 +8204,7 @@ def record_proven_shape(
         book, PROVEN_SHAPE_PAGE, row,
         ("conflicting", extents, str(dtype or ""), target_level),
         PROVEN_SHAPE_STAGE,
-        () if state_ref is None else (state_ref,),
+        (*sources, *(() if state_ref is None else (state_ref,))),
         PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,
     )
 
@@ -8303,8 +8339,9 @@ def row_value_id(row: Any) -> int | None:
     return None
 
 
-#: ``closed`` closes every new book: a raw write, or a post that names no
-#: source, is refused at the line that makes it.
+#: Every new book is closed: a raw write, or a post that names no source,
+#: is refused at the line that makes it.  ``open`` tags such writes on the
+#: unsourced page instead (diagnostic only).
 LATCH_ENV = "TURING_IDENTITY_LATCH"
 LOG_LEVEL_ENV = "TURING_IDENTITY_LOG_LEVEL"
 LOG_PRESET_ENV = "TURING_IDENTITY_LOG_LZMA_PRESET"

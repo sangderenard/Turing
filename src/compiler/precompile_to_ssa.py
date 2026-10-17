@@ -12129,6 +12129,10 @@ class _ControlSSABuilder(TiledObject):
             logical_shapes = tuple(destination.column_shapes or (
                 () for _value in destination.column_value_ids
             ))
+            # The per-column walk exists for heterogeneous (tagged) columns
+            # only; a row written as one deferred record value (expanded
+            # at link time into its field columns) has no value per column
+            # and the call below passes ``mutation_values`` as they are.
             for column, (logical_column_id, logical_dtype, logical_shape,
                          mutation_value) in enumerate(zip(
                 destination.column_value_ids,
@@ -12136,7 +12140,7 @@ class _ControlSSABuilder(TiledObject):
                 logical_shapes,
                 mutation_values,
                 strict=True,
-            )):
+            ) if tag_columns else ()):
                 tagged = tag_columns.get(int(column))
                 if tagged is None:
                     physical_column_ids.append(int(logical_column_id))
@@ -13941,11 +13945,17 @@ class _ControlSSABuilder(TiledObject):
         try:
             from .identity_concordance import declare_loop_scope
 
+            # A loop the reducer never saw (no lexical read scope) stands on
+            # the function root, as every other construct without a more
+            # specific cell does.
             declare_loop_scope(
                 self.function_name, loop.source_loop_node_id,
                 header.name, latch.name, exit_block.name,
                 self._loop_scope_rebinds(loop, carried),
-                boundary_cells=(loop_cell,),
+                boundary_cells=(
+                    (loop_cell,) if loop_cell is not None
+                    else (self._function_root(),)
+                ),
                 rebind_cells=self._loop_scope_value_cells,
             )
         except Exception:
@@ -14938,11 +14948,17 @@ class _ControlSSABuilder(TiledObject):
         try:
             from .identity_concordance import declare_loop_scope
 
+            # A loop the reducer never saw (no lexical read scope) stands on
+            # the function root, as every other construct without a more
+            # specific cell does.
             declare_loop_scope(
                 self.function_name, loop.source_loop_node_id,
                 header.name, latch.name, exit_block.name,
                 self._loop_scope_rebinds(loop, carried),
-                boundary_cells=(loop_cell,),
+                boundary_cells=(
+                    (loop_cell,) if loop_cell is not None
+                    else (self._function_root(),)
+                ),
                 rebind_cells=self._loop_scope_value_cells,
             )
         except Exception:
@@ -16234,6 +16250,11 @@ class _ControlSSABuilder(TiledObject):
                 self.arguments,
                 self.blocks,
                 metadata={
+                    # The control scope this lowering's ``ssa_value`` rows
+                    # are keyed by (``function_scope_of`` reads it): a
+                    # later pass that posts about these values posts under
+                    # the scope that holds them.
+                    "tensor_shape_concordance_scope": self._scope(),
                     "recursion_table": dict(self.ssa_recursion_table),
                     "named_outputs": page_metadata["named_outputs"],
                     # port id -> the carried phi VALUE standing at that
@@ -21991,17 +22012,21 @@ def lower_control_sections_to_ssa(
                         ),
                     }
                 # REVISE DERIVED(the incumbent contract cell when merged
-                # over one, the value's canonical cell).
+                # over one, the value's canonical cell); a value with
+                # neither (a planned program's own value) stands on the
+                # control function's root, as its region signature does.
                 _post_derived_or_raw(
                     _book(), TENSOR_SHAPE_CONCORDANCE,
                     (tensor_shape_concordance_scope, value_id), committed,
-                    (
+                    tuple(cell for cell in (
                         _book().latest_ref(
                             TENSOR_SHAPE_CONCORDANCE,
                             (tensor_shape_concordance_scope, value_id),
                         ),
                         _graph_cell(value_id),
-                    ),
+                    ) if cell is not None) or (_function_root_cell(
+                        _book(), str(tensor_shape_concordance_scope),
+                    ),),
                     stage=CONTROL_SSA_REGION, mode=Mode.REVISE,
                 )
     control = place_loop_carried_region_producers(

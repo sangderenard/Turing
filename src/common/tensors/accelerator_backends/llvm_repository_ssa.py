@@ -485,14 +485,19 @@ def post_repository_kernel_identity(function: Any, book: Any = None) -> bool:
     digest, origins = record
     kernel = str(function.name)
     root_row = ("llvm_repository", kernel)
-    if book.latest_ref(REPOSITORY_KERNEL_DEFINITION, root_row) is not None:
-        return True
-    root = book.post(
-        REPOSITORY_KERNEL_DEFINITION, root_row,
-        RepositoryKernelDefinitionFact(str(digest)),
-        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
-        mode=Mode.CONCORD,
-    )
+    # The root is posted once per book; the value rows are posted for every
+    # numbering of the kernel that reaches this book (the import is cached
+    # by text, and a second import of the same kernel numbers its values
+    # from a different first id), so an existing root is read, not a
+    # reason to return.
+    root = book.latest_ref(REPOSITORY_KERNEL_DEFINITION, root_row)
+    if root is None:
+        root = book.post(
+            REPOSITORY_KERNEL_DEFINITION, root_row,
+            RepositoryKernelDefinitionFact(str(digest)),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
     values: dict[int, SSAValue] = {int(value.id): value for value in function.args}
     for block in function.blocks.values():
         for instruction in block.instrs:
@@ -509,7 +514,9 @@ def post_repository_kernel_identity(function: Any, book: Any = None) -> bool:
         value = values.get(int(value_id))
         if value is None:
             continue
-        cell = book.post(
+        cell = book.latest_ref(
+            REPOSITORY_KERNEL_VALUE, (root_row, int(position)),
+        ) or book.post(
             REPOSITORY_KERNEL_VALUE, (root_row, int(position)),
             RepositoryKernelValueFact(str(kind), str(text)),
             stage=INGESTION, provenance=Derived((root,)), mode=Mode.CONCORD,

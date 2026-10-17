@@ -1229,15 +1229,67 @@ def propagate_repository_ssa_call_metadata(
     # fortran_c_shell.py) and its shape-enrichment history (written here)
     # sit on the same book and can be read against each other by anything
     # that shares the same row-key convention.
-    mutation_page = identity_book(module).page("tensor_shape_enrichment")
+    enrichment_book = identity_book(module)
+    mutation_page = enrichment_book.page("tensor_shape_enrichment")
     # Two writes can land in the SAME round (the fill, then the revert that
     # produced tonight's paradox both did) -- round alone is not a unique
-    # column, so pair it with a monotonic step to keep every individual
-    # write its own cell instead of the second silently overwriting the
-    # first.  The round is still the primary label; it rides along in the
-    # column tuple and in the fact itself.
+    # label, so pair it with a monotonic step so every individual write is
+    # its own revision instead of the second silently overwriting the
+    # first.  The round is the primary label; it rides along in the fact.
     import itertools
     mutation_step = itertools.count()
+
+    def _log_enrichment(
+        function: Any, function_name: Any, value_id: int, field: str,
+        old: Any, new: Any, authoritative: bool, source_id: int,
+        fixed_point_round: int,
+    ) -> None:
+        """One enrichment write, posted DERIVED from the value's and the
+        source value's ``ssa_value`` cells in ``function``'s scope."""
+
+        from .concordance_declarations import (
+            TENSOR_SHAPE_ENRICHMENT, TENSOR_SSA_LOWERING,
+        )
+        from .identity_concordance import Derived, Mode
+        from .ssa_record_return_state import ssa_value_identity_cell
+
+        row = (str(function_name), int(value_id), str(field))
+        incumbent_cell = enrichment_book.latest_ref(
+            TENSOR_SHAPE_ENRICHMENT, row,
+        )
+        incumbent = (
+            None if incumbent_cell is None
+            else mutation_page.latest(row)
+        )
+        transition = (old, new, bool(authoritative), int(source_id))
+        if (
+            isinstance(incumbent, tuple) and len(incumbent) == 6
+            and tuple(incumbent[2:]) == transition
+        ):
+            # The same transition from the same cause, repeated by a
+            # fixed-point round that changed nothing: no new fact.
+            return
+        # Each write derives from the value's and the source's cells and
+        # from the row's previous write, which is what a later write
+        # revises (a round-trip is a revision of the write it undoes).
+        cells = tuple(dict.fromkeys(
+            cell for cell in (
+                ssa_value_identity_cell(
+                    function, int(value_id), book=enrichment_book,
+                ),
+                ssa_value_identity_cell(
+                    function, int(source_id), book=enrichment_book,
+                ),
+                incumbent_cell,
+            )
+            if cell is not None
+        ))
+        enrichment_book.post(
+            TENSOR_SHAPE_ENRICHMENT, row,
+            (int(fixed_point_round), next(mutation_step), *transition),
+            stage=TENSOR_SSA_LOWERING, provenance=Derived(cells),
+            mode=Mode.REVISE,
+        )
 
     def values(function) -> tuple[SSAValue, ...]:
         key = id(function)
@@ -1350,13 +1402,10 @@ def propagate_repository_ssa_call_metadata(
                 ("canonical_identity_exact_writer",),
             }
             def _log(field: str, old: Any, new: Any) -> None:
-                mutation_page.set(
-                    (
-                        function_names_by_id.get(id(function), "?"),
-                        int(value.id), field,
-                    ),
-                    (fixed_point_round, next(mutation_step)),
-                    (old, new, authoritative, int(source.id)),
+                _log_enrichment(
+                    function, function_names_by_id.get(id(function), "?"),
+                    int(value.id), field, old, new, authoritative,
+                    int(source.id), fixed_point_round,
                 )
 
             if retained_view and tuple(value.shape or ()) != declared_view_shape:
@@ -1533,10 +1582,10 @@ def propagate_repository_ssa_call_metadata(
             reversed_strides.append(stride)
             stride *= int(extent)
         dtype_bytes = dtype_byte_size(str(source.dtype or descriptor.dtype))
-        mutation_page.set(
-            (callee_name, int(formal.id), "descriptor.shape"),
-            (fixed_point_round, next(mutation_step)),
-            (tuple(descriptor.shape), shape, True, int(source.id)),
+        _log_enrichment(
+            module.functions.get(callee_name), callee_name, int(formal.id),
+            "descriptor.shape", tuple(descriptor.shape), shape, True,
+            int(source.id), fixed_point_round,
         )
         table.tensors[int(formal.id)] = dataclasses.replace(
             descriptor,
@@ -1818,14 +1867,11 @@ def propagate_repository_ssa_call_metadata(
                                 tuple(semantic_actual.shape or ())
                                 and not tuple(actual.shape or ())
                             ):
-                                mutation_page.set(
-                                    (function_name, int(actual.id), "shape"),
-                                    (fixed_point_round, next(mutation_step)),
-                                    (
-                                        tuple(actual.shape or ()),
-                                        tuple(semantic_actual.shape),
-                                        False, int(semantic_actual.id),
-                                    ),
+                                _log_enrichment(
+                                    function, function_name, int(actual.id),
+                                    "shape", tuple(actual.shape or ()),
+                                    tuple(semantic_actual.shape), False,
+                                    int(semantic_actual.id), fixed_point_round,
                                 )
                                 actual.shape = tuple(semantic_actual.shape)
                                 changed = True
@@ -1833,13 +1879,11 @@ def propagate_repository_ssa_call_metadata(
                                 semantic_actual.dtype is not None
                                 and actual.dtype is None
                             ):
-                                mutation_page.set(
-                                    (function_name, int(actual.id), "dtype"),
-                                    (fixed_point_round, next(mutation_step)),
-                                    (
-                                        actual.dtype, semantic_actual.dtype,
-                                        False, int(semantic_actual.id),
-                                    ),
+                                _log_enrichment(
+                                    function, function_name, int(actual.id),
+                                    "dtype", actual.dtype,
+                                    semantic_actual.dtype, False,
+                                    int(semantic_actual.id), fixed_point_round,
                                 )
                                 actual.dtype = semantic_actual.dtype
                                 changed = True
@@ -2120,17 +2164,18 @@ def propagate_repository_ssa_call_metadata(
             # (`step_1__restore__specialized_*`: filled from a shared
             # template formal, then authoritatively reverted using a stale
             # copy of itself as the "source of truth").
+            # Fact: (round, step, old, new, authoritative, source id).
             repeated_writes = mutation_page.oscillating_rows(
-                key=lambda fact: fact[1], old_key=lambda fact: fact[0],
+                key=lambda fact: fact[3], old_key=lambda fact: fact[2],
             )
             module.metadata["call_metadata_fixed_point_repeated_writes"] = {
                 str(target): entries for target, entries in repeated_writes.items()
             }
             repeated_report = "; ".join(
                 f"{target}: " + " -> ".join(
-                    f"round{column[0]}.{column[1]} {fact[0]}->{fact[1]} "
-                    f"(authoritative={fact[2]}, source={fact[3]})"
-                    for column, fact in mutation_page.history(target)
+                    f"round{fact[0]}.{fact[1]} {fact[2]}->{fact[3]} "
+                    f"(authoritative={fact[4]}, source={fact[5]})"
+                    for _column, fact in mutation_page.history(target)
                 )
                 for target in list(repeated_writes)[:5]
             )

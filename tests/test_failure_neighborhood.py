@@ -112,19 +112,32 @@ def test_a_source_value_class_disagreement_carries_its_claim():
         begin_identity_book, end_identity_book,
     )
 
+    from src.compiler.concordance_declarations import (
+        INGESTION, INGEST_SOURCE, SOURCE_SPAN, SpanFact,
+    )
+    from src.compiler.identity_concordance import Derived, Mode, Novel
+
     book, token = begin_identity_book()
     try:
+        # The test authors the value's span: the root both writers stand on.
+        span = book.post(
+            SOURCE_SPAN, ("module", "function", "value-7"),
+            SpanFact("Name", 1, 0, 1, 0, "test"),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
         _concord_source_value_class(
             ("module", "function"), 7, "builtins.int", source="first writer",
+            provenance=Derived((span,)),
         )
         with pytest.raises(ValueError) as caught:
             _concord_source_value_class(
                 ("module", "function"), 7, "_PageTable",
-                source="second writer",
+                source="second writer", provenance=Derived((span,)),
             )
         claim, = caught.value.concordance_claims
         assert claim.page == "source_value_class_concordance"
-        assert [role for role, _ref in claim.seeds] == ["incumbent"]
+        assert [role for role, _ref in claim.seeds] == ["incumbent", "source"]
         lines = annotate_failure_with_neighborhood(caught.value, book)
         assert any("failed post source_value_class_concordance" in line
                    for line in lines)

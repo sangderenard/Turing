@@ -28,6 +28,32 @@ from src.transmogrifier.ssa import (
 )
 
 
+def _seed_values(book, module):
+    """Every value of a test-authored module gets its ``ssa_value`` root
+    under the function's scope: the test is their ingestion."""
+
+    from src.compiler.ssa_record_return_state import function_scope_of
+
+    for function in module.functions.values():
+        scope = function_scope_of(function)
+        values = list(function.args)
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                values.extend(instruction.args)
+                if instruction.res is not None:
+                    values.append(instruction.res)
+        for value in values:
+            row = (scope, int(value.id))
+            if book.latest_ref(SSA_VALUE, row) is None:
+                book.post(
+                    SSA_VALUE, row,
+                    SSAValueFact(value.dtype, tuple(value.shape or ()),
+                                 SSAValueOrigin.MINTED),
+                    stage=CONTROL_SSA, provenance=Novel(INGEST_SOURCE, ()),
+                    mode=Mode.CONCORD,
+                )
+
+
 def test_hidden_formal_is_accounted_when_every_call_supplies_frame_storage():
     formal = SSAValue(3, "float64")
     callee = Function(
@@ -48,6 +74,7 @@ def test_hidden_formal_is_accounted_when_every_call_supplies_frame_storage():
     book, token = begin_identity_book()
     module.metadata["identity_book"] = book
     try:
+        _seed_values(book, module)
         receipts = concord_compiler_frame_formals(module)
 
         assert receipts == ({
@@ -248,6 +275,7 @@ def test_constructor_field_value_keeps_proven_compiler_frame_ownership():
     book, token = begin_identity_book()
     module.metadata["identity_book"] = book
     try:
+        _seed_values(book, module)
         receipts = concord_compiler_frame_formals(module)
 
         assert receipts[0]["formal_id"] == 3
@@ -282,6 +310,7 @@ def test_program_abi_field_retires_its_provisional_frame_lease():
     book, token = begin_identity_book()
     module.metadata["identity_book"] = book
     try:
+        _seed_values(book, module)
         before = CorrelationTable.build(module).findings(module)
         assert any(
             finding.kind == "conflicting-storage-claims"

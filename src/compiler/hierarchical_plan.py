@@ -441,12 +441,17 @@ def plan_region_to_ssa_instrs(
                     (tuple(lexical_read_scope), int(item.outputs[0])),
                 )
             )
+            if output_cell is None:
+                # A planned program the reducer never saw: the claim stands
+                # on the control function's root, as its regions do.
+                from .precompile_to_ssa import _function_root_cell
+
+                output_cell = _function_root_cell(
+                    current_identity_book(), str(function_scope),
+                )
             current_identity_book().post(
                 OPERATOR_RESULT_TYPE, row, claim, stage=PLANNER_HIERARCHY,
-                provenance=(
-                    Derived((output_cell,)) if output_cell is not None
-                    else Unsourced(SYNTHESIZED_NO_SOURCE)
-                ),
+                provenance=Derived((output_cell,)),
                 mode=Mode.CONCORD,
             )
         elif incumbent != claim:

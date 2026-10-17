@@ -71,7 +71,14 @@ def make_book():
     }
     stage = registry.declare_stage("spill_test")
     root = registry.declare_transform("spill_root", 0)
-    return IdentityBook(registry=registry), pages, stage, root
+    book = IdentityBook(registry=registry)
+    # These tests exercise the spill machinery on raw and unsourced rows
+    # too (the tagged unsourced page is part of what a cold page owns), so
+    # the book is opened explicitly: the diagnostic latch state.
+    from src.compiler.identity_concordance import Latch
+
+    book.latch = Latch.OPEN
+    return book, pages, stage, root
 
 
 def test_acceptance_cell_projection_preserves_exact_predecessors_without_siblings():
@@ -806,6 +813,11 @@ def test_a_copy_on_read_fork_of_a_spilled_origin_reads_and_materialises():
             self.G.graph["lexical_read_scope"] = scope
 
     book, token = begin_identity_book()
+    # This test seeds unsourced rows on purpose (the fork must carry them):
+    # the diagnostic latch state, opened explicitly.
+    from src.compiler.identity_concordance import Latch
+
+    book.latch = Latch.OPEN
     try:
         source = book.mint_scope("fn", READ_SCOPE_FORK)
         for consumer, fact in ((1, "a"), (2, "b"), (3, "c")):

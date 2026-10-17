@@ -1179,10 +1179,18 @@ def _describe_control_block(
             block.extraction_identity,
         )
     elif isinstance(block, SequenceMutationBlock):
+        # The step cell of a composition step, else the effect node's cell,
+        # else the source contract the compiler-authored mutation (a glyph
+        # token lookup copy) was made from.
         owner = (
             block.mutation.step_cell
             if isinstance(block.mutation.step_cell, Ref)
             else cell(block.mutation.effect_node_id)
+            or (
+                block.mutation.source_contract_cell
+                if isinstance(block.mutation.source_contract_cell, Ref)
+                else None
+            )
         )
         extra = (str(block.mutation.operator),)
     elif isinstance(block, ScalarFieldWriteBlock):
@@ -1320,7 +1328,13 @@ def post_control_program(
     G = getattr(graph, "G", graph)
     metadata = getattr(G, "graph", None) or {}
     book = current_identity_book()
-    scope = metadata.get("lexical_read_scope")
+    # A function graph is keyed by its lexical read scope; the module's own
+    # graph (the root deployment, no function) by its ingestion scope, the
+    # scope its nodes' rows already live under.
+    scope = (
+        metadata.get("lexical_read_scope")
+        or metadata.get("ingestion_value_scope")
+    )
     if scope is None:
         book.post(
             CONTROL_PROGRAM,
@@ -1595,12 +1609,26 @@ def post_control_program(
         ),
         root_blocks=root_cells,
     )
-    if latest_fact(CONTROL_PROGRAM, program_row) != program_fact:
+    incumbent_program = latest_fact(CONTROL_PROGRAM, program_row)
+    if incumbent_program != program_fact:
+        # A rewrite derives from what it rewrote as well as from what it
+        # made: the incumbent program cell and the root block cells it
+        # held (a rewrite that only removes blocks has no new cell of its
+        # own; the removed blocks are its cause).
+        incumbent_cells = (
+            () if not isinstance(incumbent_program, ControlProgramFact)
+            else tuple(
+                item for item in incumbent_program.root_blocks
+                if isinstance(item, Ref)
+            )
+        )
         program_cell = revise(
             CONTROL_PROGRAM, program_row, program_fact,
             (
                 *root_cells, *cause,
                 *(item for item in program_fact.regions if isinstance(item, Ref)),
+                book.latest_ref(CONTROL_PROGRAM, program_row),
+                *incumbent_cells,
             ),
         )
     if unrouted:

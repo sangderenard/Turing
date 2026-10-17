@@ -47,6 +47,32 @@ from src.compiler.control_source import (
 from src.compiler.hierarchical_control import compose_hierarchical_control
 
 
+def _ingested(process, label="hand-built"):
+    """Give a hand-built graph the identity a ``build_from_ast`` graph has:
+    one ingestion scope and one ``ingestion_value`` root per node (the
+    test is the ingestion), so the planner's rewrites post their operand
+    transitions under a scope, derived from the nodes' cells."""
+
+    from src.compiler.concordance_declarations import (
+        INGESTION, INGESTION_VALUE, INGEST_SOURCE, NodeFact,
+    )
+    from src.compiler.identity_concordance import Mode, Novel
+
+    book = current_identity_book()
+    scope = book.mint_scope(label)
+    process.graph["ingestion_value_scope"] = scope
+    for node_id, data in process.nodes(data=True):
+        node_type = str(data.get("type", ""))
+        book.post(
+            INGESTION_VALUE, (scope, int(node_id)),
+            NodeFact(node_type, str(data.get("op", node_type.lower())),
+                     str(data.get("label", node_id))),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+    return process
+
+
 def test_shell_hierarchy_plan_lists_mixed_operator_without_capture():
     process = nx.DiGraph()
     process.add_node(
@@ -323,7 +349,9 @@ def test_exact_peer_descriptor_folds_shape_with_unsettled_parameter():
         for parent, _role in data.get("parents") or ():
             process.add_edge(int(parent), int(node_id))
 
-    _fold_callsite_structural_values(SimpleNamespace(G=process, roots=[10]))
+    _fold_callsite_structural_values(
+        SimpleNamespace(G=_ingested(process), roots=[10]),
+    )
 
     assert process.nodes[10]["tensor"]["shape"] == (8, 4, 128, 3)
 
@@ -367,7 +395,7 @@ def test_call_result_projection_is_not_also_owned_by_numeric_region():
     region = nx.DiGraph()
     region.graph["deployment_nodes"] = (6, 7)
     shell = SimpleNamespace(
-        process_graph=SimpleNamespace(G=process),
+        process_graph=SimpleNamespace(G=_ingested(process)),
         dispatch_subgraphs=(SimpleNamespace(G=region),),
         callsite_function_shells={5: child},
         loop_plans=(),
@@ -893,7 +921,7 @@ def test_sequence_concat_identity_keeps_bytes_out_of_numeric_addition():
         if entry.name == "packet"
     )
 
-    operations, aliases = _sequence_concat_ops(packet.G)
+    operations, aliases, _singletons = _sequence_concat_ops(packet.G)
 
     assert len(operations) == 1
     result_id, prefix_id, payload_id, kind, prefix_scalar, payload_scalar = (
@@ -953,7 +981,9 @@ def test_structural_boolean_fold_returns_selected_operand(operator, left, right,
     process.add_node(2, type='BoolOp', parents=((0, 'value:0'), (1, 'value:1')),
                      expr_obj=ast.parse(f'a {operator} b', mode='eval').body, attributes={})
     process.add_edges_from(((0, 2), (1, 2)))
-    _fold_callsite_structural_values(SimpleNamespace(G=process, roots=[2]))
+    _fold_callsite_structural_values(
+        SimpleNamespace(G=_ingested(process), roots=[2]),
+    )
     assert process.nodes[2]['attributes']['value'] == expected
 
 
@@ -968,7 +998,9 @@ def test_later_boolean_constant_cannot_erase_unknown_operand(operator, constant)
                      expr_obj=ast.parse(f'effect() {operator} flag', mode='eval').body, attributes={})
     process.add_node(3, type='If', parents=((2, 'test'),), attributes={})
     process.add_edges_from(((0, 2), (1, 2), (2, 3)))
-    _fold_callsite_structural_values(SimpleNamespace(G=process, roots=[3]))
+    _fold_callsite_structural_values(
+        SimpleNamespace(G=_ingested(process), roots=[3]),
+    )
     assert process.nodes[2]['type'] == 'BoolOp'
     assert process.has_edge(0, 2)
 
