@@ -5749,11 +5749,20 @@ def _normalize_lexical_values(
         )
         if definition_cell is None:
             definition_cell = _static_symbol_definition_cell(target)
+        # An object that declares no identity (an instance held by a class
+        # attribute: ``registry.handler``) has no definition row.  The node
+        # then stands for the authored occurrence that resolved it, exactly
+        # as a free-name Input stands for the read that binds it: its row
+        # derives from that occurrence's cell (edges lane C).  The shared
+        # node takes no lexical ``source_span`` from one of its uses.
         node_id = new_node(
             "StaticReference",
             reference.path,
             attributes=attributes,
-            source_cell=definition_cell,
+            source_cell=(
+                definition_cell if definition_cell is not None
+                else _occurrence_cell(graph, reference.occurrence)
+            ),
         )
         if definition_cell is not None:
             static_reference_definition_cells[int(node_id)] = definition_cell
