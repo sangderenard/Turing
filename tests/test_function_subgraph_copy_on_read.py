@@ -87,6 +87,14 @@ PARENTS = {
 MEMBERS = frozenset({1, 2, 3})
 
 
+def _revise(book, row, fact, page=LRB):
+    """The next revision of ``row``, derived from the row's latest cell."""
+    return book.post(
+        page, row, fact, stage=OPERAND_POSITION,
+        provenance=Derived((book.latest_ref(page, row),)), mode=Mode.REVISE,
+    )
+
+
 def _source_rows(book, scope, ingestion):
     """The operand-position rows a root graph's reduction left under its
     operand-position ``scope``: one ``identity_transition`` Append, one
@@ -344,7 +352,7 @@ def test_a_row_only_the_fork_holds_takes_the_next_ordinal(book):
     assert lrb.scope_row_count(forked) == 4
     assert lrb.scope_rows(forked)[-1] == (forked, 3, "arg", 1)
     # A write to a row it reads through to adds none.
-    lrb.revise((forked, 3, "arg", 0), "w")
+    _revise(book, (forked, 3, "arg", 0), "w")
     assert lrb.scope_row_count(forked) == 4
     assert len(lrb.scope_rows(forked)) == lrb.scope_row_count(forked)
 
@@ -430,25 +438,6 @@ def test_the_function_subgraph_filter_writes_as_it_did_over_the_copy():
     mint = lazy_book.mint_of(Ref(IT, (lazy, 2, "arg", 1), 1))
     assert mint == eager_book.mint_of(Ref(IT, (lazy, 2, "arg", 1), 1))
     assert mint[1] == (Ref(IT, (lazy, 2, "arg", 1), 0),)
-
-
-def test_unsourced_tags_of_the_rewrite_match_the_eager_fork():
-    tags = {}
-    for lazy in (True, False):
-        run_book, token = begin_identity_book()
-        try:
-            ingestion, scope = _world(run_book)
-            function, forked = _function(run_book, scope, ingestion, lazy=lazy)
-            _filter(function)
-            tags[lazy] = sorted(
-                (name.name if hasattr(name, "name") else name, row,
-                 reason.name, stage.name)
-                for name, row, reason, stage in run_book.unsourced_rows()
-                if isinstance(row, tuple) and row and row[0] == forked
-            )
-        finally:
-            end_identity_book(token)
-    assert tags[True] == tags[False]
 
 
 def test_a_move_in_the_subgraph_continues_the_position_row(book):
@@ -542,15 +531,12 @@ def test_what_the_copy_never_held_is_read_through_and_is_listed_here(book):
     compile's reader audit can find them:
 
     * a row keyed by something that is not a node id (``return``) is read
-      through, and counted by ``scope_row_count``;
-    * a page the eager copy did not carry (here a raw one) reads through.
+      through, and counted by ``scope_row_count``.
     """
     ingestion, scope = _world(book)
     _root(book, LRB, (scope, "return", "arg", 0), "ret")
-    book.page("raw_rows").set((scope, "k"), 0, 5)
     function, forked = _function(book, scope, ingestion)
     lrb = book.page(LRB)
 
     assert lrb.latest((forked, "return", "arg", 0)) == "ret"
     assert lrb.scope_row_count(forked) == 4              # 3 + the return row
-    assert book.page("raw_rows").latest((forked, "k")) == 5

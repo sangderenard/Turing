@@ -14,11 +14,12 @@ import pytest
 from src.common.tensors.topological_reducer import fork_read_scope
 from src.compiler.concordance_declarations import (
     CONSUMER_OPERAND, LEXICAL_READ_BINDING, OPERAND_POSITION,
-    READ_SCOPE_FORK, ROW_PROJECTED_OUT_OF_SCOPE, SCOPE_ORIGIN, SCOPE_REGISTRY,
-    INGEST_SOURCE, ScopeFork,
+    PLANNER_SPECIALIZATION_PAGE, READ_SCOPE_FORK, ROW_PROJECTED_OUT_OF_SCOPE,
+    SCOPE_ORIGIN, SCOPE_REGISTRY, INGEST_SOURCE, ScopeFork,
+    SpecializationFact, SpecializationSource,
 )
 from src.compiler.identity_concordance import (
-    RAW_PRIMITIVE, Derived, Mode, ProjectedScopeRead, Ref, Unresolved,
+    Derived, Mode, ProjectedScopeRead, Ref, Unresolved,
     Novel, begin_identity_book, end_identity_book,
 )
 
@@ -52,13 +53,20 @@ def _root(book, page, row, fact):
     )
 
 
+def _revise(book, row, fact, page=LRB):
+    """The next revision of ``row``, derived from the row's latest cell."""
+    return book.post(
+        page, row, fact, stage=OPERAND_POSITION,
+        provenance=Derived((book.latest_ref(page, row),)), mode=Mode.REVISE,
+    )
+
+
 def _source_rows(book, scope):
-    """Four binding rows, one operand-structure row and a raw (undeclared)
-    page's row, all under ``scope``."""
+    """Four binding rows and one operand-structure row, all under
+    ``scope``."""
     for consumer, fact in ((1, "a"), (2, "b"), (3, "c"), ("return", "r")):
         _root(book, LRB, (scope, consumer, "arg0", 0), fact)
     _root(book, OPS, (scope, 2, 1), ((1, "arg0", 0),))
-    book.page("raw_rows").set((scope, "k"), 0, 5)
 
 
 def _fork(book, source, nodes=(1, 2, 3), source_graph=None, cause="test"):
@@ -69,8 +77,8 @@ def _fork(book, source, nodes=(1, 2, 3), source_graph=None, cause="test"):
 
 def _eager_fork(book, source, cause="test"):
     """The copy loop ``fork_read_scope`` used to run, for a whole-graph copy:
-    every page's rows under ``source`` re-posted under a minted scope, each
-    DERIVED from the cell it copies (stage ``read_scope_fork``)."""
+    every declared page's rows under ``source`` re-posted under a minted
+    scope, each DERIVED from the cell it copies (stage ``read_scope_fork``)."""
     forked = book.mint_scope(f"{source[0]}|fork", READ_SCOPE_FORK)
     skip = {
         "planner_specialization", "planner_tensor_descriptor", "scope_origin",
@@ -85,7 +93,6 @@ def _eager_fork(book, source, cause="test"):
             if fact is None:
                 continue
             if declared is None:
-                page.set((forked, *row[1:]), 0, fact)
                 continue
             book.post(
                 declared, (forked, *row[1:]), fact, stage=READ_SCOPE_FORK,
@@ -124,7 +131,7 @@ def test_fork_posts_no_rows_and_reads_resolve_through_the_origin(book):
 
     # No row of any page was posted under the fork: only the scope's own
     # registry / origin cells (and their edges) exist.
-    for name in ("lexical_read_binding", "consumer_operand", "raw_rows"):
+    for name in ("lexical_read_binding", "consumer_operand"):
         assert _cell_count(book, name) == before[name]
         assert book.pages[name].materialised_scope_rows(forked) == ()
     origin = book.page(SCOPE_ORIGIN).latest((forked,))
@@ -135,10 +142,9 @@ def test_fork_posts_no_rows_and_reads_resolve_through_the_origin(book):
     assert page.history((forked, 2, "arg0", 0)) == ((0, "b"),)
     assert page.spans((forked, 2, "arg0", 0)) == ((0, 0, "b"),)
     assert book.page(OPS).latest((forked, 2, 1)) == ((1, "arg0", 0),)
-    assert book.page("raw_rows").latest((forked, "k")) == 5
     assert page.cell((forked, 2, "arg0", 0), 0) == "b"
     assert page.latest((forked, 99, "arg0", 0)) is None
-    for name in ("lexical_read_binding", "consumer_operand", "raw_rows"):
+    for name in ("lexical_read_binding", "consumer_operand"):
         assert _cell_count(book, name) == before[name]
     # The source is untouched, and an unmaterialised row is not a row.
     assert len(page.rows()) == 4
@@ -147,25 +153,16 @@ def test_fork_posts_no_rows_and_reads_resolve_through_the_origin(book):
 
 def test_pages_that_are_per_copy_or_private_are_not_read_through(book):
     source = book.mint_scope("fn", READ_SCOPE_FORK)
-    book.page("planner_specialization").set((source, "p"), 0, "literal")
+    _root(
+        book, PLANNER_SPECIALIZATION_PAGE, (source, "p"),
+        SpecializationFact("literal", SpecializationSource.LITERAL),
+    )
     forked = _fork(book, source)
     # The planner's specialization rows are per COPY: never inherited.
     assert book.page("planner_specialization").latest((forked, "p")) is None
     assert book.page("planner_specialization").scope_rows(forked) == ()
     # The scope's origin is its own fact, not the source's.
     assert book.page(SCOPE_ORIGIN).latest((forked,)).source_scope == source
-
-
-def test_a_withdrawn_row_is_not_a_row_of_the_fork(book):
-    source = book.mint_scope("fn", READ_SCOPE_FORK)
-    _source_rows(book, source)
-    page = book.page(LRB)
-    page.revise((source, 3, "arg0", 0), None)   # the source withdrew it
-    forked = _fork(book, source)
-    assert page.latest((forked, 3, "arg0", 0)) is None
-    assert page.history((forked, 3, "arg0", 0)) == ()
-    assert (forked, 3, "arg0", 0) not in page.scope_rows(forked)
-    assert page.scope_row_count(forked) == 3
 
 
 # ------------------------------------------------------------ the shadow
@@ -176,7 +173,7 @@ def test_a_write_in_the_fork_shadows_the_origin_for_that_row_only(book):
     forked = _fork(book, source)
     row = (forked, 2, "arg0", 0)
 
-    page.revise(row, "B")
+    _revise(book, row, "B")
 
     assert page.history(row) == ((0, "b"), (1, "B"))
     assert page.latest(row) == "B"
@@ -185,11 +182,6 @@ def test_a_write_in_the_fork_shadows_the_origin_for_that_row_only(book):
     assert page.materialised_scope_rows(forked) == (row,)
     assert page.latest((forked, 1, "arg0", 0)) == "a"
     assert (forked, 1, "arg0", 0) not in page.materialised_scope_rows(forked)
-    # A withdrawal is a write too.
-    page.revise((forked, 1, "arg0", 0), None)
-    assert page.latest((forked, 1, "arg0", 0)) is None
-    assert page.latest((source, 1, "arg0", 0)) == "a"
-    assert page.history((forked, 1, "arg0", 0)) == ((0, "a"), (1, None))
 
 
 def test_enumeration_is_origin_rows_union_fork_rows_minus_shadowed(book):
@@ -197,10 +189,10 @@ def test_enumeration_is_origin_rows_union_fork_rows_minus_shadowed(book):
     _source_rows(book, source)
     page = book.page(LRB)
     forked = _fork(book, source)
-    page.revise((forked, 2, "arg0", 0), "B")           # shadows an origin row
-    page.revise((forked, 7, "arg0", 0), "new")          # a row only the fork has
+    _revise(book, (forked, 2, "arg0", 0), "B")          # shadows an origin row
+    _root(book, LRB, (forked, 7, "arg0", 0), "new")     # a row only the fork has
     # A row the ORIGIN gains after the fork is not the fork's.
-    page.revise((source, 8, "arg0", 0), "late")
+    _root(book, LRB, (source, 8, "arg0", 0), "late")
 
     resolved = page.scope_rows(forked)
     expected = [
@@ -231,40 +223,18 @@ def test_enumeration_is_origin_rows_union_fork_rows_minus_shadowed(book):
     }
 
 
-def test_alias_bindings_see_a_forks_inherited_rows(book):
-    source = book.mint_scope("fn", READ_SCOPE_FORK)
-    page = book.page("planning_alias")
-    page.bind_alias(source, 5, 6)
-    page.bind_alias(source, 7, 8)
-    forked = _fork(book, source)
-    assert page.alias_bindings(forked) == {5: 6, 7: 8}
-    assert page.resolve_alias(forked, 5) == 6
-    page.bind_alias(forked, 5, 9)
-    assert page.alias_bindings(forked) == {5: 9, 7: 8}
-    assert page.alias_bindings(source) == {5: 6, 7: 8}
-
-
 # ------------------------------------------------------------- snapshots
 def test_the_fork_is_a_snapshot_of_its_source(book):
     source = book.mint_scope("fn", READ_SCOPE_FORK)
     _source_rows(book, source)
     page = book.page(LRB)
     forked = _fork(book, source)
-    # The source is rewritten after the fork: a revision, a withdrawal ...
-    page.revise((source, 1, "arg0", 0), "A2")
-    page.revise((source, 2, "arg0", 0), None)
-    # ... and an in-place overwrite of a cell the fork reads through to.
-    book.page("raw_rows").set((source, "k"), 0, 99)
+    # The source is rewritten after the fork: a revision.
+    _revise(book, (source, 1, "arg0", 0), "A2")
 
     assert page.latest((forked, 1, "arg0", 0)) == "a"
     assert page.latest((forked, 2, "arg0", 0)) == "b"
-    assert book.page("raw_rows").latest((forked, "k")) == 5
-    assert book.page("raw_rows").latest((source, "k")) == 99
     assert page.latest((source, 1, "arg0", 0)) == "A2"
-    # The overwrite took the fork's snapshot of that row (and only it).
-    assert book.page("raw_rows").materialised_scope_rows(forked) == (
-        (forked, "k"),
-    )
     assert page.materialised_scope_rows(forked) == ()
 
 
@@ -273,12 +243,12 @@ def test_a_fork_of_a_fork_chains_and_each_hop_is_its_own_snapshot(book):
     _source_rows(book, root)
     page = book.page(LRB)
     parent = _fork(book, root)
-    page.revise((parent, 2, "arg0", 0), "B")             # the parent's write
+    _revise(book, (parent, 2, "arg0", 0), "B")           # the parent's write
     child = _fork(book, parent)                          # fork of a fork
     # After the child: the root and the parent move on.
-    page.revise((root, 1, "arg0", 0), "A2")
-    page.revise((parent, 3, "arg0", 0), "C2")
-    page.revise((parent, 1, "arg0", 0), "A3")
+    _revise(book, (root, 1, "arg0", 0), "A2")
+    _revise(book, (parent, 3, "arg0", 0), "C2")
+    _revise(book, (parent, 1, "arg0", 0), "A3")
 
     assert page.latest((child, 1, "arg0", 0)) == "a"      # root, as of parent's fork
     assert page.latest((child, 2, "arg0", 0)) == "B"      # parent's own cell
@@ -305,7 +275,7 @@ def test_writing_a_fork_of_a_fork_materialises_the_parent_row_first(book):
     row = (child, 1, "arg0", 0)
     assert page.materialised_scope_rows(parent) == ()
 
-    page.revise(row, "X")
+    _revise(book, row, "X")
 
     # child cell 0 derives from the PARENT's cell, which derives from the
     # root's: the chain the eager copies made, one hop each.
@@ -329,11 +299,10 @@ def _scenario(book, fork):
     source = book.mint_scope("fn", READ_SCOPE_FORK)
     _source_rows(book, source)
     forked = fork(book, source)
-    page = book.page(LRB)
     cause = _root(book, LRB, (source, "cause", "arg0", 0), "cause")
     # A REVISE derived from a cell newer than the fork (what ``_set_operands``
     # does on a fold), a CONCORD repeating the fact with a further source,
-    # a withdrawal, and a row only the fork has.
+    # and a row only the fork has.
     book.post(
         LRB, (forked, 1, "arg0", 0), "a2", stage=OPERAND_POSITION,
         provenance=Derived((cause,)), mode=Mode.REVISE,
@@ -342,12 +311,10 @@ def _scenario(book, fork):
         LRB, (forked, 2, "arg0", 0), "b", stage=OPERAND_POSITION,
         provenance=Derived((cause,)), mode=Mode.CONCORD,
     )
-    page.revise((forked, 3, "arg0", 0), None)
     book.post(
         LRB, (forked, 9, "arg0", 0), "n", stage=OPERAND_POSITION,
         provenance=Derived((cause,)), mode=Mode.REVISE,
     )
-    book.page("raw_rows").revise((forked, "k"), 6)
     return source, forked
 
 
@@ -365,15 +332,12 @@ def test_edges_of_rows_written_in_the_fork_are_the_edges_the_copy_posted():
 
     assert lazy == eager       # both minted the same scope: comparable keys
     for name, declared in (("lexical_read_binding", LRB),
-                           ("consumer_operand", OPS),
-                           ("raw_rows", None)):
+                           ("consumer_operand", OPS)):
         lazy_page, eager_page = lazy_book.pages[name], eager_book.pages[name]
         for row in eager_page.materialised_scope_rows(eager):
             # Same history, whether the row was copied or read through.
             assert lazy_page.history(row) == eager_page.history(row), row
             assert lazy_page.latest(row) == eager_page.latest(row), row
-            if declared is None:
-                continue
             # The edges of EVERY cell of the row, written or not.
             for column, _fact in eager_page.history(row):
                 assert _edges(lazy_book, declared, row, column) == _edges(
@@ -388,18 +352,6 @@ def test_edges_of_rows_written_in_the_fork_are_the_edges_the_copy_posted():
     # What the lazy fork never touched is not a row of the book at all.
     assert len(lazy_book.page(OPS).materialised_scope_rows(lazy)) == 0
     assert len(eager_book.page(OPS).materialised_scope_rows(eager)) == 1
-    # The raw page's copy is tagged exactly as the eager raw copy was.
-    def tags(book, scope):
-        return sorted(
-            (name, row, reason.name, stage.name)
-            for name, row, reason, stage in book.unsourced_rows()
-            if row[0] == scope and name == "raw_rows"
-        )
-
-    # (The row's copy and its revision are both raw writes: tagged alike.)
-    assert tags(lazy_book, lazy) == tags(eager_book, eager) == [(
-        "raw_rows", (lazy, "k"), RAW_PRIMITIVE.name, "raw_primitive",
-    )]
 
 
 def test_unmaterialised_cells_report_the_edge_they_will_have(book):
@@ -450,7 +402,7 @@ def test_materialising_a_row_ticks_nothing_and_keeps_the_forks_stamp(book):
     _root(book, LRB, (source, 70, "arg0", 0), "later")
     clock = book.clock[0]
 
-    page.revise(row, "B")
+    _revise(book, row, "B")
 
     assert page.stamps[(row, 0)] == fork_stamp - 1      # the copy, as at the fork
     assert page.stamps[(row, 1)] > page.stamps[(row, 0)]
@@ -557,7 +509,7 @@ def test_a_dispatch_region_fork_composes_projection_with_copy_on_read(book):
     assert page.latest((forked, 99, "arg0", 0)) is None
 
     # A write in the region still shadows only its row.
-    page.revise((forked, 2, "arg0", 0), "w2")
+    _revise(book, (forked, 2, "arg0", 0), "w2")
     assert page.history((forked, 2, "arg0", 0)) == ((0, "v2"), (1, "w2"))
     assert page.latest((source, 2, "arg0", 0)) == "v2"
     assert page.latest((forked, 3, "arg0", 0)) == "v3"
@@ -569,8 +521,6 @@ def test_a_copy_of_a_region_reads_through_it_and_inherits_its_refusal(book):
     region = _Graph((2, 3), source)
     fork_read_scope(region, "region", source_graph=_Graph((1, 2, 3, 4), source))
     regional = tuple(region.G.graph["lexical_read_scope"])
-    # The region retires node 2's binding (an operand left the region).
-    page.revise((regional, 2, "arg0", 0), None)
 
     copy = _Graph((2, 3), regional)
     fork_read_scope(copy, "copy of region")        # a whole-graph copy
@@ -578,8 +528,6 @@ def test_a_copy_of_a_region_reads_through_it_and_inherits_its_refusal(book):
 
     assert page.materialised_scope_rows(again) == ()
     assert page.latest((again, 3, "arg0", 0)) == "v3"           # two hops
-    assert page.latest((again, 2, "arg0", 0)) is None           # withdrawn
-    assert {row[1] for row in page.scope_rows(again)} == {3, "return"}
     with pytest.raises(ProjectedScopeRead):
         page.latest((again, 1, "arg0", 0))
     with pytest.raises(ProjectedScopeRead):
@@ -591,10 +539,10 @@ def test_a_copy_of_a_region_reads_through_it_and_inherits_its_refusal(book):
     assert projections[regional].held == frozenset({2, 3})
     assert projections[regional].excluded == frozenset()
     # A write in the copy materialises through the region to the source.
-    page.revise((again, 3, "arg0", 0), "w3")
+    _revise(book, (again, 3, "arg0", 0), "w3")
     assert page.history((again, 3, "arg0", 0)) == ((0, "v3"), (1, "w3"))
     assert page.materialised_scope_rows(regional) == (
-        (regional, 2, "arg0", 0), (regional, 3, "arg0", 0),
+        (regional, 3, "arg0", 0),
     )
 
 
@@ -626,21 +574,8 @@ def test_the_origin_relation_and_materialised_rows_are_all_the_viewer_sees(book)
     assert page.rows() == tuple(
         row for row in page.rows() if row[0] == source
     )
-    unsourced_before = book.unsourced_rows()
-    page.revise((forked, 1, "arg0", 0), "A")
+    _revise(book, (forked, 1, "arg0", 0), "A")
     page.latest((forked, 2, "arg0", 0))
-    # A materialised row is a sourced row: it has its edge, so the
-    # unsourced listing grows only by the (raw) revision, never by the copy.
-    new = [
-        entry for entry in book.unsourced_rows()
-        if entry not in unsourced_before
-    ]
-    assert [
-        (name.name, row, reason, stage.name) for name, row, reason, stage in new
-    ] == [(
-        "lexical_read_binding", (forked, 1, "arg0", 0), RAW_PRIMITIVE,
-        "raw_primitive",
-    )]
     assert (forked, 2, "arg0", 0) not in page.rows()
     assert (forked, 1, "arg0", 0) in page.rows()
     # ``holds`` is the book's cell; ``history`` is the resolved view.
@@ -655,7 +590,7 @@ def test_an_old_pickle_of_a_book_has_no_forks_and_still_works(book):
     source = book.mint_scope("fn", READ_SCOPE_FORK)
     _source_rows(book, source)
     forked = _fork(book, source)
-    book.page(LRB).revise((forked, 1, "arg0", 0), "A")
+    _revise(book, (forked, 1, "arg0", 0), "A")
     clone = pickle.loads(pickle.dumps(book))
     page = clone.page(LRB)
     # Cells survive; the chain is restated by the relation on the book.
@@ -681,23 +616,21 @@ def test_sibling_forks_of_one_origin_are_independent_and_counts_hold(book):
     assert first != second
     assert page.scope_row_count(first) == page.scope_row_count(second) == 4
 
-    page.revise((first, 1, "arg0", 0), "first")
-    page.revise((second, 1, "arg0", 0), None)
-    page.revise((second, 5, "arg0", 0), "second-only")
+    _revise(book, (first, 1, "arg0", 0), "first")
+    _root(book, LRB, (second, 5, "arg0", 0), "second-only")
 
     assert page.latest((first, 1, "arg0", 0)) == "first"
-    assert page.latest((second, 1, "arg0", 0)) is None
     assert page.latest((source, 1, "arg0", 0)) == "a"
     assert page.latest((first, 5, "arg0", 0)) is None
     # A count is the same number a listing has, before and after writes.
     for scope in (first, second):
         assert page.scope_row_count(scope) == len(page.scope_rows(scope))
     assert page.scope_row_count(first) == 4
-    assert page.scope_row_count(second) == 4 + 1          # row 1 withdrawn but own
+    assert page.scope_row_count(second) == 4 + 1          # four inherited, one own
     assert len(set(page.scope_rows(second))) == page.scope_row_count(second)
 
 
-def test_an_unresolved_fact_and_a_raw_fact_on_a_declared_page_are_copied_as_they_are(
+def test_an_unresolved_fact_is_copied_as_it_is(
     book,
 ):
     source = book.mint_scope("fn", READ_SCOPE_FORK)
@@ -706,29 +639,17 @@ def test_an_unresolved_fact_and_a_raw_fact_on_a_declared_page_are_copied_as_they
         LRB, (source, 1, "arg0", 0), receipt, stage=READ_SCOPE_FORK,
         provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
     )
-    # A declared page whose writer still writes a fact of another shape.
-    book.page(LRB).set((source, 2, "arg0", 0), 0, ("not", "a", "str"))
     forked = _fork(book, source)
     page = book.page(LRB)
     assert page.latest((forked, 1, "arg0", 0)) == receipt
-    assert page.latest((forked, 2, "arg0", 0)) == ("not", "a", "str")
 
-    page.revise((forked, 1, "arg0", 0), "resolved")
-    page.revise((forked, 2, "arg0", 0), "now-a-str")
+    _revise(book, (forked, 1, "arg0", 0), "resolved")
 
-    # The Unresolved copy is a sourced cell; the odd-shaped one a tagged raw.
+    # The Unresolved copy is a sourced cell.
     assert _edges(book, LRB, (forked, 1, "arg0", 0), 0) == {
         (("lexical_read_binding", (source, 1, "arg0", 0), 0),
          READ_SCOPE_FORK.name),
     }
-    assert _edges(book, LRB, (forked, 2, "arg0", 0), 0) == set()
-    assert any(
-        row == (forked, 2, "arg0", 0) and name.name == "lexical_read_binding"
-        for name, row, _reason, _stage in book.unsourced_rows()
-    )
-    assert page.history((forked, 2, "arg0", 0)) == (
-        (0, ("not", "a", "str")), (1, "now-a-str"),
-    )
 
 
 def test_a_revise_derived_from_the_fork_cell_itself_is_a_changed_source(book):

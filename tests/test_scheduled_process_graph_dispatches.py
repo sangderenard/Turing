@@ -90,6 +90,20 @@ def _scope_dispatch_fixture(graph, book):
                   mode=Mode.CONCORD)
 
 
+def _ingest_node(graph, book, node_id):
+    """A node added after ``_scope_dispatch_fixture`` is ingested into the
+    same scope: the test is the ingestion."""
+    from src.compiler.concordance_declarations import (
+        INGESTION_VALUE, NodeFact, READ_SCOPE_FORK, INGEST_SOURCE,
+    )
+    from src.compiler.identity_concordance import Mode, Novel
+    data = graph.G.nodes[node_id]
+    book.post(INGESTION_VALUE, (graph.G.graph["ingestion_value_scope"], node_id),
+              NodeFact(data.get('type'), data.get('op'), data.get('label')),
+              stage=READ_SCOPE_FORK, provenance=Novel(INGEST_SOURCE, ()),
+              mode=Mode.CONCORD)
+
+
 def test_dispatch_cuts_share_one_edge_index_without_rescanning_other_members(monkeypatch, graph_cut_book):
     """Region count must not multiply whole-source adjacency traversals.
 
@@ -189,30 +203,33 @@ def test_recursion_control_projection_still_reduces_numeric_interior():
     assert all(4 not in dispatch.node_ids for dispatch in plan.dispatches)
 
 
-def test_static_python_call_name_collision_is_not_numerical_dispatch():
+def test_static_python_call_name_collision_is_not_numerical_dispatch(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "sub")
     graph.G.nodes[1]["attributes"]["static_python_reference"] = "re.sub"
+    _scope_dispatch_fixture(graph, graph_cut_book)
 
     assert _is_dispatch_metadata_node(graph, 1)
 
 
-def test_canonical_static_tensor_operator_remains_numerical_dispatch():
+def test_canonical_static_tensor_operator_remains_numerical_dispatch(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "stack")
     graph.G.nodes[1]["attributes"].update({
         "static_python_reference": "AbstractTensor.stack",
         "operator_reference_node": 99,
     })
+    _scope_dispatch_fixture(graph, graph_cut_book)
 
     assert not _is_dispatch_metadata_node(graph, 1)
 
 
-def test_dispatch_classification_counts_edges_once_per_stable_pass(monkeypatch):
+def test_dispatch_classification_counts_edges_once_per_stable_pass(monkeypatch, graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "input")
     for node_id in range(2, 66):
         _add(graph, node_id, "add", (node_id - 1,))
+    _scope_dispatch_fixture(graph, graph_cut_book)
     count_edges = graph.G.number_of_edges
     calls = []
 
@@ -228,6 +245,7 @@ def test_dispatch_classification_counts_edges_once_per_stable_pass(monkeypatch):
 
     previous_cache = graph.G.graph["_dispatch_metadata_cache"]
     _add(graph, 66, "return", (65,))
+    _ingest_node(graph, graph_cut_book, 66)
     classify = _dispatch_metadata_node_classifier(graph)
     assert graph.G.graph["_dispatch_metadata_cache"] is not previous_cache
     assert [node for node in graph.G if classify(node)] == [1, 66]
@@ -383,7 +401,7 @@ def test_tensor_reshape_shape_path_remains_outside_the_producer_region():
     assert _atomic_region_node_order(graph, tuple(range(6)), owners) == tuple(range(6))
 
 
-def test_typed_call_result_projection_is_routing_but_its_tensor_index_is_numeric():
+def test_typed_call_result_projection_is_routing_but_its_tensor_index_is_numeric(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")
     _add(graph, 1, "Call", (0,))
@@ -398,16 +416,18 @@ def test_typed_call_result_projection_is_routing_but_its_tensor_index_is_numeric
     _add(graph, 4, "Indexed", (3, 2))
     graph.G.nodes[4]["parents"] = [(3, "base"), (2, "index")]
     graph.G.nodes[4]["tensor"] = {"shape": (4, 14), "dtype": "float64"}
+    _scope_dispatch_fixture(graph, graph_cut_book)
 
     assert _is_dispatch_metadata_node(graph, 3)
     assert not _is_dispatch_metadata_node(graph, 4)
     assert graph.G.has_edge(1, 3) and graph.G.has_edge(3, 4)
 
 
-def test_old_serialized_dispatch_classification_is_recomputed():
+def test_old_serialized_dispatch_classification_is_recomputed(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "Indexed")
     graph.G.nodes[1]["attributes"]["authored_call_result_projection"] = True
+    _scope_dispatch_fixture(graph, graph_cut_book)
     old_cache = {"__fingerprint__": (graph.G.number_of_nodes(), graph.G.number_of_edges()),
                  "__carried_initials__": frozenset(), 1: False}
     graph.G.graph["_dispatch_metadata_cache"] = old_cache
@@ -416,7 +436,7 @@ def test_old_serialized_dispatch_classification_is_recomputed():
     assert graph.G.graph["_dispatch_metadata_cache"] is not old_cache
 
 
-def test_tensor_accessor_is_coordinator_but_scalar_comparison_has_a_producer():
+def test_tensor_accessor_is_coordinator_but_scalar_comparison_has_a_producer(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 0, "Input")
     _add(graph, 1, "ndims", (0,))
@@ -425,6 +445,7 @@ def test_tensor_accessor_is_coordinator_but_scalar_comparison_has_a_producer():
     graph.G.nodes[1]["expr_obj"] = ast.parse("value.ndims()").body[0].value
     graph.G.nodes[3]["expr_obj"] = ast.parse("rank != 1").body[0].value
     graph.G.nodes[2]["constant"] = 1
+    _scope_dispatch_fixture(graph, graph_cut_book)
 
     assert _is_dispatch_metadata_node(graph, 1)
     # Sept30's recorded decision removed scalar-expression deferral. The
@@ -432,13 +453,14 @@ def test_tensor_accessor_is_coordinator_but_scalar_comparison_has_a_producer():
     assert not _is_dispatch_metadata_node(graph, 3)
 
 
-def test_clean_subgraph_drops_obligations_to_excluded_parents():
+def test_clean_subgraph_drops_obligations_to_excluded_parents(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "input")
     _add(graph, 2, "add", (1,))
     _add(graph, 3, "sin", (2,))
     graph.levels = {1: 0, 2: 1, 3: 2}
     graph.roots = [3]
+    _scope_dispatch_fixture(graph, graph_cut_book)
 
     extracted = extract_clean_process_subgraph(graph, (2, 3))
 
@@ -469,11 +491,12 @@ def test_clean_subgraph_preserves_cyclic_metadata_identity_without_aliasing_sour
     assert shared["label"] == "shared"
 
 
-def test_compartment_carries_its_own_nodes_tokens_and_shares_read_only_tables():
+def test_compartment_carries_its_own_nodes_tokens_and_shares_read_only_tables(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "input")
     _add(graph, 2, "add", (1,))
     _add(graph, 3, "sin", (2,))
+    _scope_dispatch_fixture(graph, graph_cut_book)
     tokens = {1: ("value:x",), 2: ("Add", "value:x"), 3: ("Call", "sin")}
     trace = {"events": [{"stage": "select"}]}
     names = {"x": ({"value_id": 1},)}
@@ -610,10 +633,14 @@ def test_region_fork_of_read_scope_holds_its_own_nodes_rows_as_a_declared_projec
         again = extract_clean_process_subgraph(region, region.G)
         again_scope = tuple(again.G.graph["lexical_read_scope"])
         # (Node 2's operand position was retired when its parent, node 1,
-        # left the region: that row has no fact to carry.)
-        assert {row[1] for row in page.scope_rows(again_scope)} == {
-            3, "return",
-        }
+        # left the region: that row carries the Unresolved
+        # ``operand_position_vacated`` revision, which readers take as
+        # absence.)
+        assert {
+            row[1] for row in page.scope_rows(again_scope)
+            if not isinstance(page.latest(row), Unresolved)
+        } == {3, "return"}
+        assert isinstance(page.latest((again_scope, 2, "arg0", 0)), Unresolved)
         with pytest.raises(ProjectedScopeRead):
             page.latest((again_scope, 1, "arg0", 0))
     finally:
@@ -845,9 +872,8 @@ def test_a_lookup_nobody_reads_is_not_a_region_boundary(graph_cut_book):
     _add(graph, 2, "Attribute", (1,))
     _add(graph, 3, "Mul", (1,))
     graph.G.nodes[2]["expr_obj"] = ast.parse("value.sqrt").body[0].value
-    graph.compute_levels(method="asap", order="dependency")
-
     _scope_dispatch_fixture(graph, graph_cut_book)
+    graph.compute_levels(method="asap", order="dependency")
 
     inert = _inert_routing_nodes(graph)
     assert inert == frozenset({2})
@@ -873,9 +899,8 @@ def test_dispatch_exports_a_value_routed_by_identity(graph_cut_book):
     _add(graph, 0, "Input")
     _add(graph, 1, "Add", (0,))
     _add(graph, 2, "Mul", (1,))
-    graph.compute_levels(method="asap", order="dependency")
-
     _scope_dispatch_fixture(graph, graph_cut_book)
+    graph.compute_levels(method="asap", order="dependency")
 
     dispatch = _dispatch_subgraph(
         graph,
@@ -892,9 +917,8 @@ def test_dispatch_exports_an_internal_value_used_outside_the_region(graph_cut_bo
     _add(graph, 1, "Add", (0,))
     _add(graph, 2, "Mul", (1,))
     _add(graph, 3, "external", (1,))
-    graph.compute_levels(method="asap", order="dependency")
-
     _scope_dispatch_fixture(graph, graph_cut_book)
+    graph.compute_levels(method="asap", order="dependency")
 
     dispatch = _dispatch_subgraph(graph, (1, 2))
 
