@@ -1082,7 +1082,14 @@ def _precision_indivisible_node_groups(
             if int(parent) in members:
                 semantic.add_edge(int(parent), node_id)
 
-    region_page = book.page("source_precision_region_concordance")
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        PLANNER_REGION_CARVE, SOURCE_PRECISION_BOUNDARY,
+        SOURCE_PRECISION_REGION,
+    )
+    from .identity_concordance import Derived, Mode
+
+    region_page = book.page(SOURCE_PRECISION_REGION)
     groups = []
     order = {
         int(node_id): index
@@ -1125,8 +1132,25 @@ def _precision_indivisible_node_groups(
                 "source precision region concordance disagreement for "
                 f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
             )
-        if incumbent is None:
-            region_page.set(row, 0, proposed)
+        # The region is its members and the boundary facts they were grouped
+        # by: DERIVED from the members' node cells and the boundary cells.
+        book.post(
+            SOURCE_PRECISION_REGION, row, proposed,
+            stage=PLANNER_REGION_CARVE,
+            provenance=Derived(tuple(dict.fromkeys((
+                *(node_identity_cell(graph, node_id) for node_id in ordered),
+                *(
+                    cell for cell in (
+                        book.latest_ref(
+                            SOURCE_PRECISION_BOUNDARY, (scope, int(node_id)),
+                        )
+                        for node_id in sorted(component_boundaries)
+                    )
+                    if cell is not None
+                ),
+            )))),
+            mode=Mode.CONCORD,
+        )
         for node_id in ordered:
             graph.G.nodes[node_id].setdefault("attributes", {})[
                 "source_precision_region"

@@ -69,6 +69,16 @@ from ...compiler.concordance_declarations import (
     SourceAggregateMember as _SourceAggregateMember,
     SourcePageFactClass as _SourcePageFactClass,
     SOURCE_VALUE_CLASS as _SOURCE_VALUE_CLASS,
+    SOURCE_NUMERIC_COMPONENT as _SOURCE_NUMERIC_COMPONENT,
+    SOURCE_NUMERIC_INTRINSIC as _SOURCE_NUMERIC_INTRINSIC,
+    SOURCE_NUMERIC_OPERATOR_SPECIALIZATION as _SOURCE_NUMERIC_OPERATOR_SPECIALIZATION,
+    SOURCE_OPERATOR_DISPATCH as _SOURCE_OPERATOR_DISPATCH,
+    SOURCE_PARAMETER_IDENTITY as _SOURCE_PARAMETER_IDENTITY,
+    SOURCE_PRECISION_BOUNDARY as _SOURCE_PRECISION_BOUNDARY,
+    SOURCE_PRECISION_OPERATOR as _SOURCE_PRECISION_OPERATOR,
+    SOURCE_PRECISION_PACK as _SOURCE_PRECISION_PACK,
+    SOURCE_RECEIVER_CONSTRUCTOR as _SOURCE_RECEIVER_CONSTRUCTOR,
+    SOURCE_TYPE_NORMALIZATION as _SOURCE_TYPE_NORMALIZATION,
     STATIC_SYMBOL_DEFINITION as _STATIC_SYMBOL_DEFINITION,
     StaticSymbolFact as _StaticSymbolFact,
     StaticSymbolKind as _StaticSymbolKind,
@@ -715,6 +725,24 @@ def _posted_node_identity_cell(graph: Any, node_id: int) -> Any:
     return None
 
 
+def _node_identity_cells(graph: Any, *node_ids: Any) -> tuple:
+    """The identity cells of graph nodes ``node_ids`` (``node_identity_cell``
+    each: a node with no row raises there), deduplicated in order -- the
+    ``Derived`` cells of a fact a reducer pass read from those nodes."""
+
+    return tuple(dict.fromkeys(
+        node_identity_cell(graph, int(node_id)) for node_id in node_ids
+    ))
+
+
+def _source_cells(cells: Iterable[Any]) -> tuple:
+    """``cells`` as ``Derived`` takes them: deduplicated in order, without
+    the ``None`` of an optional secondary cell that is absent.  An empty
+    set is the book's refusal to make, not this module's."""
+
+    return tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+
+
 def post_indexed_store_site(
     graph: Any, scope: Any, target: Any, effect_node_ids: Iterable[int],
 ) -> Any:
@@ -971,6 +999,12 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             _concord_source_precision_boundary(
                 scope, int(node_id), "pack", int(node_id),
                 precision_limbs=max(int(fact[1]), 1),
+                cells=(
+                    *_node_identity_cells(target_wrapper, node_id),
+                    specialization_book.latest_ref(
+                        _SOURCE_VALUE_CLASS, (scope, int(node_id)),
+                    ),
+                ),
             )
 
     def static_int(expression: ast.AST) -> int | None:
@@ -1205,6 +1239,7 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             _concord_source_precision_boundary(
                 scope, int(node_id), "promote", int(value_id),
                 precision_limbs=int(width),
+                cells=_node_identity_cells(target_wrapper, node_id, value_id),
             )
             source_tensor = tensor_descriptor(int(value_id))
             if source_tensor is not None:
@@ -1236,9 +1271,8 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                         for index, leaf in enumerate(leaves)
                     )
                 )
-                pack_page = current_identity_book().page(
-                    "source_precision_pack_concordance"
-                )
+                pack_book = current_identity_book()
+                pack_page = pack_book.page(_SOURCE_PRECISION_PACK)
                 pack_row = (scope, int(node_id))
                 pack_fact = (leaves, int(width), int(value_id))
                 incumbent_pack = pack_page.latest(pack_row)
@@ -1251,11 +1285,19 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                         f"{pack_row!r}: recorded={incumbent_pack!r}, "
                         f"proposed={pack_fact!r}"
                     )
-                if incumbent_pack is None:
-                    pack_page.set(pack_row, 0, pack_fact)
+                # The pack is the aggregate's limbs: DERIVED from the pack
+                # node, the aggregate and every limb it was cut into.
+                pack_cells = _node_identity_cells(
+                    target_wrapper, node_id, value_id, *leaves,
+                )
+                pack_book.post(
+                    _SOURCE_PRECISION_PACK, pack_row, pack_fact,
+                    stage=_REDUCTION, provenance=_Derived(pack_cells),
+                    mode=_Mode.CONCORD,
+                )
                 _concord_source_precision_boundary(
                     scope, int(node_id), "pack", int(value_id),
-                    precision_limbs=int(width),
+                    precision_limbs=int(width), cells=pack_cells,
                 )
                 source_tensor = tensor_descriptor(int(leaves[0]))
                 if source_tensor is not None:
@@ -1383,9 +1425,7 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             )
             changed = True
 
-    operator_page = current_identity_book().page(
-        "source_precision_operator_concordance"
-    )
+    operator_page = current_identity_book().page(_SOURCE_PRECISION_OPERATOR)
     settled = True
     while settled:
         settled = False
@@ -1476,8 +1516,14 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                     "source precision operator concordance disagreement for "
                     f"{row!r}: recorded={incumbent!r}, proposed={fact!r}"
                 )
-            if incumbent is None:
-                operator_page.set(row, 0, fact)
+            # The operation is read off the operator node and its operands.
+            current_identity_book().post(
+                _SOURCE_PRECISION_OPERATOR, row, fact, stage=_REDUCTION,
+                provenance=_Derived(_node_identity_cells(
+                    target_wrapper, node_id, *operand_ids,
+                )),
+                mode=_Mode.CONCORD,
+            )
             now = (str(operation), int(width))
             if prior != now:
                 settled = True
@@ -1548,6 +1594,7 @@ def specialize_python_precision_widths(graph: Any) -> bool:
         _concord_source_precision_boundary(
             scope, int(node_id), str(boundary), int(operand_id),
             precision_limbs=int(width),
+            cells=_node_identity_cells(target_wrapper, node_id, operand_id),
         )
         changed = changed or prior != int(width)
     return changed
@@ -1591,12 +1638,18 @@ def _concord_numeric_feature_projection(
     attribute: str,
     component_path: tuple[str, ...],
     descriptor: NumericFeatureDescriptor | None,
+    *,
+    cells: Iterable[Any],
 ) -> tuple[Any, ...]:
-    """Commit one structural numeric field projection to the identity book."""
+    """Commit one structural numeric field projection to the identity book.
 
-    page = current_identity_book().page(
-        "source_numeric_component_concordance"
-    )
+    ``cells``: the identity cells of the projected result and its receiver
+    (the caller's graph wrapper names them); the row is DERIVED from them.
+    A same-fact re-post is CONCORD: the edge is recorded, no cell written.
+    """
+
+    book = current_identity_book()
+    page = book.page(_SOURCE_NUMERIC_COMPONENT)
     row = (scope, int(result_id))
     fact = (
         int(receiver_id), str(attribute), tuple(map(str, component_path)),
@@ -1608,8 +1661,10 @@ def _concord_numeric_feature_projection(
             "source numeric component concordance disagreement for "
             f"{row!r}: recorded={incumbent!r}, proposed={fact!r}"
         )
-    if incumbent is None:
-        page.set(row, 0, fact)
+    book.post(
+        _SOURCE_NUMERIC_COMPONENT, row, fact, stage=_REDUCTION,
+        provenance=_Derived(_source_cells(cells)), mode=_Mode.CONCORD,
+    )
     return fact
 
 
@@ -1620,12 +1675,17 @@ def _concord_source_precision_boundary(
     operand_id: int,
     *,
     precision_limbs: int,
+    cells: Iterable[Any],
 ) -> tuple[str, int, int]:
-    """Commit one authored Precision boundary independently of graph copies."""
+    """Commit one authored Precision boundary independently of graph copies.
 
-    page = current_identity_book().page(
-        "source_precision_boundary_concordance"
-    )
+    ``cells``: the identity cells of the boundary value and its operand (the
+    caller's graph wrapper names them); the row is DERIVED from them.  A
+    same-fact re-post is CONCORD: the edge is recorded, no cell written.
+    """
+
+    book = current_identity_book()
+    page = book.page(_SOURCE_PRECISION_BOUNDARY)
     row = (scope, int(value_id))
     proposed = (
         str(boundary),
@@ -1638,8 +1698,10 @@ def _concord_source_precision_boundary(
             "source precision boundary concordance disagreement for "
             f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
         )
-    if incumbent is None:
-        page.set(row, 0, proposed)
+    book.post(
+        _SOURCE_PRECISION_BOUNDARY, row, proposed, stage=_REDUCTION,
+        provenance=_Derived(_source_cells(cells)), mode=_Mode.CONCORD,
+    )
     return proposed
 
 
@@ -1686,19 +1748,27 @@ def _concorded_static_parameter_bindings(
         str(getattr(value, "__module__", "")),
         str(getattr(value, "__qualname__", getattr(value, "__name__", ""))),
     )
-    page = current_identity_book().page(
-        "source_parameter_identity_concordance"
-    )
+    book = current_identity_book()
+    page = book.page(_SOURCE_PARAMETER_IDENTITY)
     row = (scope, receiver_name)
     incumbent = page.latest(row)
-    if incumbent is not None and incumbent != descriptor:
+    if incumbent is not None and tuple(incumbent) != descriptor:
         raise ValueError(
             "source parameter identity concordance disagreement for "
             f"{scope!r}.{receiver_name}: recorded={incumbent!r}, "
             f"resolved={descriptor!r}"
         )
-    if incumbent is None:
-        page.set(row, 0, descriptor)
+    # The binding is a fact of the authored parameter and of the class
+    # pursuit bound it to: DERIVED from the parameter's ``source_span`` cell
+    # and the class's ``static_symbol_definition`` cell.
+    book.post(
+        _SOURCE_PARAMETER_IDENTITY, row, descriptor, stage=_REDUCTION,
+        provenance=_Derived(_source_cells((
+            _post_source_span(positional[0]),
+            _static_symbol_definition_cell(value),
+        ))),
+        mode=_Mode.CONCORD,
+    )
     return {receiver_name: value}
 
 
@@ -3632,20 +3702,16 @@ def _concord_lexical_reads(
     )
 
     book = current_identity_book()
-    page = book.page("lexical_read_binding")
 
     def commit(row: tuple, *cells: Any) -> None:
-        """One read: DERIVED(the cells of the nodes it relates)."""
+        """One read: DERIVED(the cells of the nodes it relates) -- the
+        binding cell is always among them (see below)."""
 
-        sources = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
-        if sources:
-            book.post(
-                LEXICAL_READ_BINDING, row, str(binding),
-                stage=OPERAND_POSITION, provenance=_Derived(sources),
-                mode=_Mode.CONCORD,
-            )
-        else:
-            page.concord(row, str(binding))
+        book.post(
+            LEXICAL_READ_BINDING, row, str(binding),
+            stage=OPERAND_POSITION, provenance=_Derived(_source_cells(cells)),
+            mode=_Mode.CONCORD,
+        )
 
     # The read is a fact of the occurrence before it is one of any consumer:
     # a keyword argument's wrapper (and with it the Name node) can be absent
@@ -4470,8 +4536,10 @@ def _normalize_lexical_values(
         return _cell_fact(field_state_book, cell)
 
     #: A bare ``return name`` has no consumer edge: its value becomes a root.
-    #: The bindings each returned root value was returned under.
-    return_root_bindings: dict[int, set[str]] = {}
+    #: The bindings each returned root value was returned under, each with
+    #: the ``Name`` occurrences that returned it (their span cells stand for
+    #: the read when the root node is gone from the graph).
+    return_root_bindings: dict[int, dict[str, list[ast.Name]]] = {}
     # A parameter annotated with an ingested class name gives a
     # receiver a real, known class identity at ingestion -- enough to
     # resolve ``receiver.attr`` through the class's own navigation table
@@ -6610,8 +6678,9 @@ def _normalize_lexical_values(
                             str(ensured_type),
                             str(guarded_type),
                         )
-                        normalization_page = current_identity_book().page(
-                            "source_type_normalization_concordance"
+                        normalization_book = current_identity_book()
+                        normalization_page = normalization_book.page(
+                            _SOURCE_TYPE_NORMALIZATION
                         )
                         normalization_row = (
                             value_class_scope, int(node_id)
@@ -6630,12 +6699,16 @@ def _normalize_lexical_values(
                                 f"recorded={normalization_incumbent!r}, "
                                 f"resolved={normalization_descriptor!r}"
                             )
-                        if normalization_incumbent is None:
-                            normalization_page.set(
-                                normalization_row,
-                                0,
-                                normalization_descriptor,
-                            )
+                        # The guard relates the ifexp, its subject and the
+                        # normalizing call: DERIVED from those nodes.
+                        normalization_book.post(
+                            _SOURCE_TYPE_NORMALIZATION, normalization_row,
+                            normalization_descriptor, stage=_REDUCTION,
+                            provenance=_Derived(_node_identity_cells(
+                                graph, node_id, subject_id, normalized_id,
+                            )),
+                            mode=_Mode.CONCORD,
+                        )
                         graph.G.nodes[normalized_id].setdefault(
                             "attributes", {}
                         )["source_type_normalization"] = {
@@ -7186,6 +7259,9 @@ def _normalize_lexical_values(
                         str(expression.attr),
                         component_path,
                         projected_numeric,
+                        cells=_node_identity_cells(
+                            graph, attribute_id, receiver,
+                        ),
                     )
                 declared_callable_field = None
                 declared_receiver_field = None
@@ -11718,8 +11794,10 @@ def _normalize_lexical_values(
                     )[id(body_statement)] = value
                     if isinstance(expressions[0], ast.Name):
                         return_root_bindings.setdefault(
-                            int(value), set()
-                        ).add(str(expressions[0].id))
+                            int(value), {}
+                        ).setdefault(str(expressions[0].id), []).append(
+                            expressions[0]
+                        )
                 return value
             # Preserve the structural tuple/list node for callers that consume
             # it as one Python-shaped value while the output identities above
@@ -13341,7 +13419,6 @@ def _normalize_lexical_values(
         # The function's return is a consumer of its roots: row
         # ``(scope, "return", "root", position)`` names the binding returned
         # there, when every return of that value names one binding.
-        return_page = current_identity_book().page("lexical_read_binding")
         for position, root in enumerate(graph.roots):
             names = return_root_bindings.get(int(root)) if isinstance(root, int) else None
             if names and len(names) == 1:
@@ -13349,20 +13426,23 @@ def _normalize_lexical_values(
                     ingestion_read_scope, "return", "root", position,
                 )
                 # The returned binding is read at the root node: DERIVED
-                # from the root's identity cell.
-                root_cell = (
-                    node_identity_cell(graph, root) if root in graph.G
-                    else None
-                )
-                if root_cell is None:
-                    return_page.concord(return_row, next(iter(names)))
-                else:
-                    current_identity_book().post(
-                        _LEXICAL_READ_BINDING, return_row,
-                        next(iter(names)), stage=_REDUCTION,
-                        provenance=_Derived((root_cell,)),
-                        mode=_Mode.CONCORD,
+                # from the root's identity cell; a root no longer in the
+                # graph stands on the span cells of the ``Name``
+                # occurrences that returned it.
+                name, occurrences = next(iter(names.items()))
+                root_cells = (
+                    (node_identity_cell(graph, root),) if root in graph.G
+                    else tuple(
+                        _post_source_span(occurrence)
+                        for occurrence in occurrences
                     )
+                )
+                current_identity_book().post(
+                    _LEXICAL_READ_BINDING, return_row, name,
+                    stage=_REDUCTION,
+                    provenance=_Derived(_source_cells(root_cells)),
+                    mode=_Mode.CONCORD,
+                )
 
     # A source-linked unbound method can arrive with its receiver absent from
     # the owned subgraph even though the Attribute load itself is owned.
@@ -18065,7 +18145,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             return False
         changed = False
         page = current_identity_book().page(
-            "source_numeric_operator_specialization_concordance"
+            _SOURCE_NUMERIC_OPERATOR_SPECIALIZATION
         )
         for node_id, data in tuple(target_graph.nodes(data=True)):
             attributes = data.setdefault("attributes", {})
@@ -18103,8 +18183,16 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     f"disagreement for {row!r}: recorded={incumbent!r}, "
                     f"proposed={fact!r}"
                 )
-            if incumbent is None:
-                page.set(row, 0, fact)
+            # DERIVED from the call and the three operands it relates.
+            current_identity_book().post(
+                _SOURCE_NUMERIC_OPERATOR_SPECIALIZATION, row, fact,
+                stage=_REDUCTION,
+                provenance=_Derived(_node_identity_cells(
+                    target_wrapper, node_id, receiver_id, other_id,
+                    operation_id,
+                )),
+                mode=_Mode.CONCORD,
+            )
             for field in ("static_python_reference", "reference_kind"):
                 attributes.pop(field, None)
             attributes.update({
@@ -18148,9 +18236,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         class_page = current_identity_book().page(
             "source_value_class_concordance"
         )
-        page = current_identity_book().page(
-            "source_receiver_constructor_concordance"
-        )
+        page = current_identity_book().page(_SOURCE_RECEIVER_CONSTRUCTOR)
         changed = False
         for node_id, data in tuple(target_graph.nodes(data=True)):
             if str(data.get("type") or "") != "Call":
@@ -18194,8 +18280,18 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "source receiver constructor concordance disagreement "
                     f"for {row!r}: recorded={incumbent!r}, proposed={fact!r}"
                 )
-            if incumbent is None:
-                page.set(row, 0, fact)
+            # DERIVED from the call, its receiver and the receiver's class
+            # cell the constructed class was read from.
+            current_identity_book().post(
+                _SOURCE_RECEIVER_CONSTRUCTOR, row, fact, stage=_REDUCTION,
+                provenance=_Derived(_source_cells((
+                    *_node_identity_cells(target_wrapper, node_id, receiver_id),
+                    current_identity_book().latest_ref(
+                        _SOURCE_VALUE_CLASS, (scope, int(receiver_id)),
+                    ),
+                ))),
+                mode=_Mode.CONCORD,
+            )
             attributes.update({
                 "class_ref": class_identity,
                 "result_class_ref": class_identity,
@@ -18281,7 +18377,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 )
                 attributes = data.setdefault("attributes", {})
                 page = current_identity_book().page(
-                    "source_numeric_intrinsic_concordance"
+                    _SOURCE_NUMERIC_INTRINSIC
                 )
                 row = (scope, int(node_id))
                 fact = (int(receiver_id), method, results)
@@ -18292,8 +18388,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         f"for {row!r}: recorded={incumbent!r}, "
                         f"proposed={fact!r}"
                     )
-                if incumbent is None:
-                    page.set(row, 0, fact)
+                # DERIVED from the call and the receiver it projects.
+                current_identity_book().post(
+                    _SOURCE_NUMERIC_INTRINSIC, row, fact, stage=_REDUCTION,
+                    provenance=_Derived(_node_identity_cells(
+                        target_wrapper, node_id, receiver_id,
+                    )),
+                    mode=_Mode.CONCORD,
+                )
                 if attributes.get("numeric_component_results") != results:
                     attributes["numeric_component_results"] = results
                     changed = settling = True
@@ -18346,6 +18448,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 _concord_numeric_feature_projection(
                     scope, int(node_id), int(base_id), f"result[{index}]",
                     path, descriptor,
+                    cells=_node_identity_cells(target_wrapper, node_id, base_id),
                 )
                 if any(attributes.get(key) != value
                        for key, value in proposed.items()):
@@ -18420,6 +18523,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 _concord_numeric_feature_projection(
                     scope, int(node_id), int(receiver_id), str(attribute),
                     path, projected,
+                    cells=_node_identity_cells(
+                        target_wrapper, node_id, receiver_id,
+                    ),
                 )
                 if any(attributes.get(key) != value
                        for key, value in proposed.items()):
@@ -18442,9 +18548,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         target_graph = target_wrapper.G
         scope = _source_numeric_scope(target_graph)
         class_table = graph.G.graph.get("class_table", {})
-        page = current_identity_book().page(
-            "source_operator_dispatch_concordance"
-        )
+        page = current_identity_book().page(_SOURCE_OPERATOR_DISPATCH)
 
         def descriptor(value_id: Any) -> tuple[str | None, int]:
             return _resolved_source_value_class(target_graph, value_id)
@@ -18468,8 +18572,19 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "source operator dispatch concordance disagreement for "
                     f"{row!r}: recorded={incumbent!r}, proposed={fact!r}"
                 )
-            if incumbent is None:
-                page.set(row, 0, fact)
+            # DERIVED from the operator, its receiver and the receiver's
+            # class cell the dispatch was decided from.
+            book = current_identity_book()
+            book.post(
+                _SOURCE_OPERATOR_DISPATCH, row, fact, stage=_REDUCTION,
+                provenance=_Derived(_source_cells((
+                    *_node_identity_cells(target_wrapper, node_id, receiver_id),
+                    book.latest_ref(
+                        _SOURCE_VALUE_CLASS, (scope, int(receiver_id)),
+                    ),
+                ))),
+                mode=_Mode.CONCORD,
+            )
 
         changed = True
         while changed:
@@ -18611,9 +18726,8 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         ) -> None:
             """Commit the exact source operation carried by a wide value."""
 
-            page = current_identity_book().page(
-                "source_precision_operator_concordance"
-            )
+            book = current_identity_book()
+            page = book.page(_SOURCE_PRECISION_OPERATOR)
             row = (scope, int(node_id))
             proposed = (
                 str(operation), int(receiver_id), str(class_identity),
@@ -18625,8 +18739,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "source precision operator concordance disagreement for "
                     f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
                 )
-            if incumbent is None:
-                page.set(row, 0, proposed)
+            # DERIVED from the operator node and the receiver it reads.
+            book.post(
+                _SOURCE_PRECISION_OPERATOR, row, proposed, stage=_REDUCTION,
+                provenance=_Derived(_node_identity_cells(
+                    target_wrapper, node_id, receiver_id,
+                )),
+                mode=_Mode.CONCORD,
+            )
 
         for node_id, data in tuple(target_graph.nodes(data=True)):
             expression = data.get("expr_obj")
@@ -18695,6 +18815,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "promote",
                     int(value_id),
                     precision_limbs=limbs,
+                    cells=_node_identity_cells(
+                        target_wrapper, node_id, value_id,
+                    ),
                 )
 
         precision_methods = {
@@ -18894,6 +19017,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 "collapse",
                 int(receiver_id),
                 precision_limbs=int(receiver_limbs),
+                cells=_node_identity_cells(
+                    target_wrapper, node_id, receiver_id,
+                ),
             )
 
     compile_substage("topology: propagate exact receiver types")

@@ -325,6 +325,20 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "source_sort_contract": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "source_span": PageLifecycle(CLOSURE, REPAIRS, REPAIRS),
     "source_value_class_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    # The reducer's numeric source facts (written in topology reduction and
+    # callsite specialization, read by the deployment strategy, the tensor
+    # SSA lowering and the precision expansion): the value-class page's rule.
+    "source_numeric_component_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_numeric_intrinsic_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_numeric_operator_specialization_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_operator_dispatch_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_parameter_identity_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_precision_boundary_concordance": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
+    "source_precision_operator_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_precision_pack_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_precision_region_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_receiver_constructor_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_type_normalization_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "ssa_block": PageLifecycle(FUNCTIONS, LOWERING, LOWERING),
     "ssa_block_geometry": PageLifecycle(FUNCTIONS, REPAIRS, REPAIRS),
     "ssa_constant_materialization": PageLifecycle(LOWERING, LOWERING, LOWERING),

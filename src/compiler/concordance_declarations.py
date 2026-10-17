@@ -3566,6 +3566,106 @@ SOURCE_PYTHON_IDENTITY = declare_page("source_python_identity_concordance", (
     RowField("numeric_scope", K.SCOPE), RowField("node", K.VALUE_ID),
 ), tuple)
 
+# -- the reducer's numeric source facts, one row per (numeric scope, node) ---
+#: ``_concord_source_precision_boundary``: an authored Precision boundary,
+#: ``(numeric scope, value)`` -> ``(boundary kind, operand, limbs)``, CONCORD,
+#: DERIVED(the value's and the operand's node identity cells).
+SOURCE_PRECISION_BOUNDARY = declare_page(
+    "source_precision_boundary_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``specialize_python_precision_widths``: a ``Precision(aggregate, n)``
+#: lowered to a limb pack, ``(numeric scope, pack)`` -> ``(limb ids, limbs,
+#: aggregate)``, CONCORD, DERIVED(the pack's, the aggregate's and each
+#: limb's node identity cells).
+SOURCE_PRECISION_PACK = declare_page("source_precision_pack_concordance", (
+    RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), tuple)
+#: ``specialize_python_precision_widths`` / ``lower_python_precision``: the
+#: exact source operation a wide value carries, ``(numeric scope, value)``
+#: -> ``(operation, receiver, class, limbs)``, CONCORD, DERIVED(the value's
+#: and its operands' node identity cells).
+SOURCE_PRECISION_OPERATOR = declare_page(
+    "source_precision_operator_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``_precision_indivisible_node_groups``: one non-separable Precision region,
+#: ``(numeric scope, closing value)`` -> ``(members, promotes, collapses,
+#: widths)``, CONCORD, DERIVED(the members' node identity cells and the
+#: boundary cells they were grouped from).
+SOURCE_PRECISION_REGION = declare_page(
+    "source_precision_region_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``_concord_numeric_feature_projection``: a structural numeric field
+#: projection, ``(numeric scope, result)`` -> ``(receiver, attribute, path,
+#: descriptor receipt)``, CONCORD, DERIVED(the result's and the receiver's
+#: node identity cells).
+SOURCE_NUMERIC_COMPONENT = declare_page(
+    "source_numeric_component_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``propagate_numeric_field_projections``: a numeric intrinsic's component
+#: results, ``(numeric scope, call)`` -> ``(receiver, method, results)``,
+#: CONCORD, DERIVED(the call's and the receiver's node identity cells).
+SOURCE_NUMERIC_INTRINSIC = declare_page(
+    "source_numeric_intrinsic_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``specialize_concorded_same_type_numeric_operator``: a ``_composed_binary``
+#: bound to the receiver class's ``_binary_same``, ``(numeric scope, call)``
+#: -> ``(receiver, other, operation, descriptor receipt, method)``, CONCORD,
+#: DERIVED(the call's and its three operands' node identity cells).
+SOURCE_NUMERIC_OPERATOR_SPECIALIZATION = declare_page(
+    "source_numeric_operator_specialization_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``resolve_concorded_receiver_constructor``: ``type(receiver)(...)`` bound
+#: to the receiver's concorded class, ``(numeric scope, call)`` ->
+#: ``(receiver, class, limbs)``, CONCORD, DERIVED(the call's and the
+#: receiver's node identity cells and the receiver's ``source_value_class``
+#: cell the class was read from).
+SOURCE_RECEIVER_CONSTRUCTOR = declare_page(
+    "source_receiver_constructor_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``lower_class_operator_calls``: an authored operator dispatched through
+#: the receiver's class table, ``(numeric scope, operator)`` -> ``(receiver,
+#: class, method, method reference, reflected)``, CONCORD, DERIVED(the
+#: operator's and the receiver's node identity cells and the receiver's
+#: ``source_value_class`` cell).
+SOURCE_OPERATOR_DISPATCH = declare_page(
+    "source_operator_dispatch_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``resolve_expression``: a schema-type-guard ``IfExp`` whose body is its
+#: own subject, ``(numeric scope, ifexp)`` -> ``(subject, normalized,
+#: ensured type, guarded type)``, CONCORD, DERIVED(the ifexp's, the
+#: subject's and the normalizing call's node identity cells).
+SOURCE_TYPE_NORMALIZATION = declare_page(
+    "source_type_normalization_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``_concorded_static_parameter_bindings``: a parameter whose identity
+#: source pursuit proved static (a classmethod's receiver is its class),
+#: ``(authored function identity, parameter)`` -> ``("static_class",
+#: module, qualname)``, CONCORD, DERIVED(the parameter's ``source_span``
+#: cell and the bound class's ``static_symbol_definition`` cell).
+SOURCE_PARAMETER_IDENTITY = declare_page(
+    "source_parameter_identity_concordance", (
+        RowField("function_scope", K.SCOPE), RowField("parameter", K.NAME),
+    ), tuple,
+)
+
 # -- operation-owned result domains and scalar kernel operands ---------------
 #: ``plan_region_to_ssa_instrs``: the truth type a predicate operation owns,
 #: ``(function scope, closure, region name, output value)`` -> ``(opcode,
