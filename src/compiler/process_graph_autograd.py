@@ -1714,11 +1714,16 @@ def _post_copied_node(
     ``Unsourced(FORWARD_GRAPH_UNSCOPED)``."""
 
     from .concordance_declarations import (
-        FORWARD_GRAPH_UNSCOPED, FORWARD_LOSS_BACKWARD_FUSION, INGESTION_VALUE,
-        NodeFact,
+        FORWARD_LOSS_BACKWARD_FUSION, INGESTION_VALUE, NodeFact,
     )
-    from .identity_concordance import Derived, Mode, Unsourced
+    from .identity_concordance import Derived, Mode
 
+    if source_cell is None:
+        raise ValueError(
+            f"{INGESTION_VALUE.name}: no source cell for "
+            f"{(scope, int(node_id))!r} -- the copied node's forward graph "
+            "has no identity scope"
+        )
     return book.post(
         INGESTION_VALUE, (scope, int(node_id)),
         NodeFact(
@@ -1726,11 +1731,7 @@ def _post_copied_node(
             str(data.get("label") or ""),
         ),
         stage=FORWARD_LOSS_BACKWARD_FUSION,
-        provenance=(
-            Derived((source_cell,)) if source_cell is not None
-            else Unsourced(FORWARD_GRAPH_UNSCOPED)
-        ),
-        mode=Mode.CONCORD,
+        provenance=Derived((source_cell,)), mode=Mode.CONCORD,
     )
 
 
@@ -1899,10 +1900,9 @@ class _AdjointBuilder:
         ``Unsourced(FORWARD_GRAPH_UNSCOPED)``."""
 
         from .concordance_declarations import (
-            ADJOINT, ADJOINT_OF, FORWARD_GRAPH_UNSCOPED, INGESTION_VALUE,
-            NodeFact,
+            ADJOINT, ADJOINT_OF, INGESTION_VALUE, NodeFact,
         )
-        from .identity_concordance import Mode, Novel, Unsourced
+        from .identity_concordance import Mode, Novel
 
         if source_forward_id is None:
             raise ProcessGraphAutogradError(
@@ -1915,15 +1915,17 @@ class _AdjointBuilder:
                 self.forward, forward_id,
             )
         forward_cell = self.forward_cells[forward_id]
+        if forward_cell is None:
+            raise ValueError(
+                f"{INGESTION_VALUE.name}: no source cell for adjoint node "
+                f"{int(node_id)} -- the forward graph has no identity scope"
+            )
         return self.book.post(
             INGESTION_VALUE,
             (self.backward.G.graph["ingestion_value_scope"], int(node_id)),
             NodeFact(str(op), str(op), str(label)),
             stage=ADJOINT,
-            provenance=(
-                Novel(ADJOINT_OF, (forward_cell,)) if forward_cell is not None
-                else Unsourced(FORWARD_GRAPH_UNSCOPED)
-            ),
+            provenance=Novel(ADJOINT_OF, (forward_cell,)),
             mode=Mode.CONCORD,
         )
 
@@ -2136,10 +2138,10 @@ class _AdjointBuilder:
 
         from .concordance_declarations import (
             ADJOINT, ArgumentRole, ArgumentRoleFact, CALLSITE_ARGUMENT_ROLE,
-            FORWARD_GRAPH_UNSCOPED, INGESTION_VALUE,
+            INGESTION_VALUE,
         )
         from .glsl_deployment_strategy import _formal_identity_cells
-        from .identity_concordance import Derived, Mode, Unsourced
+        from .identity_concordance import Derived, Mode
 
         scope = self.backward.G.graph["ingestion_value_scope"]
         for index, source in enumerate(argument_forward_sources):
@@ -2164,15 +2166,17 @@ class _AdjointBuilder:
             else:
                 role = ArgumentRole.METADATA
                 cells = (self._forward_cell(forward_id),)
+            if not all(cell is not None for cell in cells):
+                raise ValueError(
+                    f"{CALLSITE_ARGUMENT_ROLE.name}: no source cell for "
+                    f"{(scope, int(call), int(index))!r} -- the forward graph "
+                    "has no identity scope"
+                )
             self.book.post(
                 CALLSITE_ARGUMENT_ROLE, (scope, int(call), int(index)),
                 ArgumentRoleFact(role),
                 stage=ADJOINT,
-                provenance=(
-                    Derived(cells) if all(cell is not None for cell in cells)
-                    else Unsourced(FORWARD_GRAPH_UNSCOPED)
-                ),
-                mode=Mode.CONCORD,
+                provenance=Derived(cells), mode=Mode.CONCORD,
             )
 
     def unary(self, op: str, value: int, source: int) -> int:

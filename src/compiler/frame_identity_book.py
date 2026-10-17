@@ -200,7 +200,7 @@ def _frame_post(
 
     from .concordance_declarations import FRAME_SOURCE_CELL_ABSENT
     from .identity_concordance import (
-        ConcordanceRefusal, Derived, Mode, Unsourced, current_identity_book,
+        Derived, Mode, current_identity_book,
     )
 
     book = current_identity_book()
@@ -217,9 +217,12 @@ def _frame_post(
                 unchanged = recorded is fact
             if unchanged:
                 return previous
-    # No unsourced path: the post derives from ``cells`` or is refused at
-    # the writer that handed it none (``reason`` is kept for its callers).
-    del reason
+    # No unsourced path: a writer that hands no cell is named here, with
+    # the reason it passed, instead of being tagged.
+    if not cells:
+        raise ValueError(
+            f"{page.name}: no source cell for {row!r} -- {reason}"
+        )
     return book.post(
         page, row, fact, stage=stage, provenance=Derived(cells), mode=mode,
     )

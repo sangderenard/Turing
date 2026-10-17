@@ -110,11 +110,9 @@ class TransformationLedger:
         are CONCORD rows.  Returns the written cell."""
 
         from .concordance_declarations import (
-            FRAME_LINK, PLANNER_OUTPUT_UNROUTED, TRANSFORMATION_LEDGER_ROOT,
+            FRAME_LINK, TRANSFORMATION_LEDGER_ROOT,
         )
-        from .identity_concordance import (
-            ConcordanceRefusal, Derived, Mode, Novel, Unsourced,
-        )
+        from .identity_concordance import Derived, Mode, Novel
 
         declared = self.book.registry.page(page_name)
         mode = Mode.CONCORD if concord else Mode.REVISE
@@ -124,18 +122,10 @@ class TransformationLedger:
                 declared, row, fact, stage=FRAME_LINK,
                 provenance=Novel(TRANSFORMATION_LEDGER_ROOT, ()), mode=mode,
             )
-        try:
-            return self.book.post(
-                declared, row, fact, stage=FRAME_LINK,
-                provenance=Derived(cells), mode=mode,
-            )
-        except ConcordanceRefusal:
-            # A revision none of the named cells caused (the same sources,
-            # unchanged): recorded as unsourced, never dropped.
-            return self.book.post(
-                declared, row, fact, stage=FRAME_LINK,
-                provenance=Unsourced(PLANNER_OUTPUT_UNROUTED), mode=mode,
-            )
+        return self.book.post(
+            declared, row, fact, stage=FRAME_LINK,
+            provenance=Derived(cells), mode=mode,
+        )
 
     def propose(self, identity: Hashable, rule: str, proof: Hashable,
                 *, before=None, after=None, sources: tuple = ()) -> bool:

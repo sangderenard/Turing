@@ -338,7 +338,7 @@ def _post_control_specialization(
         SOURCE_CONTROL_SPECIALIZATION,
     )
     from .identity_concordance import (
-        Mode, RAW_PRIMITIVE, Unresolved, Unsourced, current_identity_book,
+        Unresolved, current_identity_book,
     )
 
     book = current_identity_book()
@@ -373,10 +373,10 @@ def _post_control_specialization(
     page = book.pages.get(SOURCE_CONTROL_SPECIALIZATION.name)
     if page is not None and page.latest(row) == fact:
         return ()
-    return (book.post(
-        SOURCE_CONTROL_SPECIALIZATION, row, fact, stage=PLANNER_STRUCTURAL_FOLD,
-        provenance=Unsourced(RAW_PRIMITIVE), mode=Mode.REVISE,
-    ),)
+    raise ValueError(
+        f"{SOURCE_CONTROL_SPECIALIZATION.name}: no source cell for {row!r} -- "
+        "the fold read neither a control identity cell nor a proven_literal"
+    )
 
 
 def _post_pruned_return_sites(
@@ -705,9 +705,7 @@ def _post_callsite_return_member(
     """
 
     from .concordance_declarations import CALLSITE_RETURN_MEMBER
-    from .identity_concordance import (
-        Mode, RAW_PRIMITIVE, Unsourced, current_identity_book,
-    )
+    from .identity_concordance import current_identity_book
 
     scope = caller.G.graph.get("lexical_read_scope")
     scope = (
@@ -727,7 +725,7 @@ def _post_callsite_return_member(
         CALLSITE_RETURN_MEMBER.name
     ].latest(row) == fact:
         return latest
-    return book.post(
-        CALLSITE_RETURN_MEMBER, row, fact, stage=stage,
-        provenance=Unsourced(RAW_PRIMITIVE), mode=Mode.REVISE,
+    raise ValueError(
+        f"{CALLSITE_RETURN_MEMBER.name}: no source cell for {row!r} -- the "
+        "member's shape was read from no cell"
     )

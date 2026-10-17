@@ -25,15 +25,14 @@ def _publish_formal_literal(
         FORMAL_LITERAL, FORMAL_LITERAL_CONFLICT, PLANNER_SPECIALIZATION,
     )
     from .identity_concordance import (
-        Derived, Mode, RAW_PRIMITIVE, Unresolved, Unsourced,
-        current_identity_book,
+        Derived, Mode, Unresolved, current_identity_book,
     )
 
     book = current_identity_book()
     row = (str(function), str(parameter))
     previous = book.latest_ref(FORMAL_LITERAL, row)
     cells = tuple(cells)
-    provenance = Derived(cells) if cells else Unsourced(RAW_PRIMITIVE)
+    provenance = Derived(cells)
     if previous is None:
         book.post(
             FORMAL_LITERAL, row, ("proven", value, caller),
@@ -53,8 +52,7 @@ def _publish_formal_literal(
     read = (previous, *cells)
     book.post(
         FORMAL_LITERAL, row, Unresolved(FORMAL_LITERAL_CONFLICT, read=read),
-        stage=PLANNER_SPECIALIZATION,
-        provenance=Derived(read) if cells else Unsourced(RAW_PRIMITIVE),
+        stage=PLANNER_SPECIALIZATION, provenance=Derived(read),
         mode=Mode.REVISE,
     )
 
@@ -75,8 +73,8 @@ def _publish_formal_shape(
         FORMAL_SHAPE, FORMAL_SHAPE_CONFLICT, PLANNER_TENSOR_SPECIALIZATION,
     )
     from .identity_concordance import (
-        Derived, Mode, RAW_PRIMITIVE, Unresolved, Unsourced,
-        authored_function_name, current_identity_book,
+        Derived, Mode, Unresolved, authored_function_name,
+        current_identity_book,
     )
 
     extents = tuple(int(e) for e in (descriptor.get("shape") or ()))
@@ -89,7 +87,7 @@ def _publish_formal_shape(
         book.post(
             FORMAL_SHAPE, row, ("proven", extents, dtype, caller),
             stage=PLANNER_TENSOR_SPECIALIZATION,
-            provenance=Derived(cells) if cells else Unsourced(RAW_PRIMITIVE),
+            provenance=Derived(cells),
             mode=Mode.REVISE,
         )
         return True
@@ -116,8 +114,7 @@ def _publish_formal_shape(
     ):
         book.post(
             FORMAL_SHAPE, row, Unresolved(FORMAL_SHAPE_CONFLICT, read=read),
-            stage=PLANNER_TENSOR_SPECIALIZATION,
-            provenance=Derived(read) if cells else Unsourced(RAW_PRIMITIVE),
+            stage=PLANNER_TENSOR_SPECIALIZATION, provenance=Derived(read),
             mode=Mode.REVISE,
         )
         return True

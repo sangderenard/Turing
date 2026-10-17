@@ -138,11 +138,10 @@ def _record_aggregate_ledger_lookup(
         resident = sum(1 for leaf in leaves if int(leaf) in graph.G)
         from ..common.tensors.topological_reducer import node_identity_cell
         from .concordance_declarations import (
-            AGGREGATE_LEDGER, AGGREGATE_LEDGER_CAUSE_NOT_ON_BOOK,
-            PLANNER_HIERARCHY,
+            AGGREGATE_LEDGER, PLANNER_HIERARCHY,
         )
         from .identity_concordance import (
-            ConcordanceRefusal, Derived, Mode, Unsourced,
+            ConcordanceRefusal, Derived, Mode,
         )
 
         ledger_book = current_identity_book()
@@ -184,11 +183,9 @@ def _record_aggregate_ledger_lookup(
                 return
             except ConcordanceRefusal:
                 pass
-        ledger_book.post(
-            AGGREGATE_LEDGER, ledger_row, ledger_fact,
-            stage=PLANNER_HIERARCHY,
-            provenance=Unsourced(AGGREGATE_LEDGER_CAUSE_NOT_ON_BOOK),
-            mode=Mode.REVISE,
+        raise ValueError(
+            f"aggregate_ledger: no source cell for {ledger_row!r} -- the "
+            "ledger lookup read nodes with no identity cell on the book"
         )
     except Exception:  # noqa: BLE001 -- diagnostics never fail a build
         pass

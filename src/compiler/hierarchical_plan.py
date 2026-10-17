@@ -430,9 +430,8 @@ def plan_region_to_ssa_instrs(
         if incumbent is None:
             from .concordance_declarations import (
                 CANONICAL_VALUE, OPERATOR_RESULT_TYPE, PLANNER_HIERARCHY,
-                SYNTHESIZED_NO_SOURCE,
             )
-            from .identity_concordance import Derived, Mode, Unsourced
+            from .identity_concordance import Derived, Mode
 
             output_cell = (
                 None if lexical_read_scope is None else
@@ -1195,10 +1194,10 @@ def _post_hierarchy_values(
     from ..common.tensors.topological_reducer import node_identity_cell
     from .concordance_declarations import (
         HIERARCHY_GLOBAL_VALUE, HIERARCHY_VALUE, PLANNER_HIERARCHY,
-        PLANNER_SCOPE, SYNTHESIZED_NO_SOURCE,
+        PLANNER_SCOPE,
     )
     from .identity_concordance import (
-        Derived, Mode, Unsourced, current_identity_book,
+        Derived, Mode, current_identity_book,
     )
 
     book = current_identity_book()
@@ -1244,19 +1243,15 @@ def _post_hierarchy_values(
                 except ValueError:
                     sources = ()
         if not sources:
-            # A planner-minted value with no row of its own (a projection
-            # leaf, an expanded identity body): the correlation is recorded
-            # and the audit lists which writer still mints without a row
-            # (plan 80, R4).
-            ref = book.post(
-                HIERARCHY_VALUE, row, int(global_id), stage=PLANNER_HIERARCHY,
-                provenance=Unsourced(SYNTHESIZED_NO_SOURCE), mode=Mode.CONCORD,
+            raise ValueError(
+                f"{HIERARCHY_VALUE.name}: no source cell for {row!r} -- a "
+                "planner-minted value with no row of its own and no bound "
+                "class member"
             )
-        else:
-            ref = book.post(
-                HIERARCHY_VALUE, row, int(global_id), stage=PLANNER_HIERARCHY,
-                provenance=Derived(sources), mode=Mode.CONCORD,
-            )
+        ref = book.post(
+            HIERARCHY_VALUE, row, int(global_id), stage=PLANNER_HIERARCHY,
+            provenance=Derived(sources), mode=Mode.CONCORD,
+        )
         members.setdefault(int(global_id), []).append(ref)
     for global_id, refs in members.items():
         book.post(

@@ -243,11 +243,10 @@ class FunctionTable(TiledObject):
         qualified: str, reference: FunctionReference, source: Any, external: bool,
     ) -> str:
         from ..compiler.concordance_declarations import (
-            EXTERNAL_DECLARATION, FUNCTION_ADDRESS, FUNCTION_TABLE,
-            HELPER_CALLER_UNROUTED,
+            FUNCTION_ADDRESS, FUNCTION_TABLE,
         )
         from ..compiler.identity_concordance import (
-            Derived, Mode, Ref, Unsourced, current_identity_book,
+            Derived, Mode, Ref, current_identity_book,
         )
 
         if isinstance(source, Ref):
@@ -259,12 +258,12 @@ class FunctionTable(TiledObject):
             # A bare spelling such as ``run`` is therefore never asked to
             # concord two unrelated tables' dense local addresses.
             address_identity = repr((source.row[0], str(qualified)))
-        elif external:
-            provenance = Unsourced(EXTERNAL_DECLARATION)
-            address_identity = str(qualified)
         else:
-            provenance = Unsourced(HELPER_CALLER_UNROUTED)
-            address_identity = str(qualified)
+            raise ValueError(
+                f"{FUNCTION_ADDRESS.name}: no source cell for {str(qualified)!r}"
+                " -- the caller named no source span"
+                + (" (external declaration)" if external else "")
+            )
         current_identity_book().post(
             FUNCTION_ADDRESS, (address_identity,), int(reference.address),
             stage=FUNCTION_TABLE, provenance=provenance, mode=Mode.CONCORD,

@@ -1314,14 +1314,12 @@ def post_control_program(
         return None
     from .concordance_declarations import (
         Arm, CALL_BINDING, COLLAPSED_EMPTY_CONSTRUCT, CONTROL_BLOCK,
-        CONTROL_BLOCK_PLACEMENT, CONTROL_BLOCK_REVISION_UNCAUSED,
-        CONTROL_FUNCTION_SCOPE_UNKNOWN, CONTROL_OWNER_UNKNOWN,
-        CONTROL_PROGRAM, ControlBlockFact, ControlProgramFact,
+        CONTROL_BLOCK_PLACEMENT, CONTROL_PROGRAM, ControlBlockFact, ControlProgramFact,
         DEPLOYMENT_REGION, Placement, REGION_CELL_UNROUTED, ROOT, SHELL,
         SCOPE_REGISTRY,
     )
     from .identity_concordance import (
-        Derived, Mode, Ref, Unresolved, Unsourced, current_identity_book,
+        Derived, Mode, Ref, Unresolved, current_identity_book,
     )
     from ..common.tensors.topological_reducer import node_identity_cell
 
@@ -1336,17 +1334,11 @@ def post_control_program(
         or metadata.get("ingestion_value_scope")
     )
     if scope is None:
-        book.post(
-            CONTROL_PROGRAM,
-            (_UNSCOPED_CONTROL, (
-                str(metadata.get("function_name")),
-                SHELL if label is None else label,
-            )),
-            ControlProgramFact((), (), (), None, (), ()),
-            stage=stage, provenance=Unsourced(CONTROL_FUNCTION_SCOPE_UNKNOWN),
-            mode=Mode.REVISE,
+        raise ValueError(
+            f"control_program: no source cell for "
+            f"{str(metadata.get('function_name'))!r} -- the graph has no "
+            "lexical_read_scope"
         )
-        return None
     scope = tuple(scope)
     resolvable = bool(
         metadata.get("canonical_value_ids")
@@ -1423,14 +1415,13 @@ def post_control_program(
 
     def revise(page: Any, row: tuple, fact: Any, sources: tuple) -> Any:
         sources = tuple(dict.fromkeys(item for item in sources if isinstance(item, Ref)))
-        if sources and admissible_revision(page, row, sources):
-            return book.post(
-                page, row, fact, stage=stage, provenance=Derived(sources),
-                mode=Mode.REVISE,
+        if not (sources and admissible_revision(page, row, sources)):
+            raise ValueError(
+                f"{page.name}: no source cell for {row!r} -- the revision "
+                "names no cause the api would admit"
             )
         return book.post(
-            page, row, fact, stage=stage,
-            provenance=Unsourced(CONTROL_BLOCK_REVISION_UNCAUSED),
+            page, row, fact, stage=stage, provenance=Derived(sources),
             mode=Mode.REVISE,
         )
 
@@ -1466,10 +1457,7 @@ def post_control_program(
             CONTROL_PROGRAM, program_row,
             ControlProgramFact((), (), (), None, (), ()),
             stage=stage,
-            provenance=(
-                Derived(seeds) if seeds else Unsourced(CONTROL_OWNER_UNKNOWN)
-            ),
-            mode=Mode.REVISE,
+            provenance=Derived(seeds), mode=Mode.REVISE,
         )
     unrouted = 0
     posted_block_cells: set = set()
@@ -1491,10 +1479,7 @@ def post_control_program(
         if latest is None:
             return book.post(
                 CONTROL_BLOCK, row, fact, stage=stage,
-                provenance=(
-                    Unsourced(reason) if reason is not None else Derived(sources)
-                ),
-                mode=Mode.CONCORD,
+                provenance=Derived(sources), mode=Mode.CONCORD,
             )
         if latest_fact(CONTROL_BLOCK, row) == fact:
             if reason is None:
