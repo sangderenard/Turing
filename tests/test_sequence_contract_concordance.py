@@ -28,6 +28,8 @@ from src.compiler.fortran_c_shell import (
 )
 from src.compiler.identity_concordance import (
     IdentityPage,
+    Mode,
+    Novel,
     begin_identity_book,
     concord_sequence_row_dtypes,
     commit_sequence_contract,
@@ -35,6 +37,7 @@ from src.compiler.identity_concordance import (
     committed_sequence_row_dtypes,
     committed_sequence_row_layout,
     committed_sequence_contract,
+    current_identity_book,
     end_identity_book,
     resolved_concordant_alias_bindings,
 )
@@ -43,7 +46,11 @@ from src.compiler.ir_sequence_tables import (
     lower_sequence_equal,
 )
 from src.compiler.concordance_declarations import (
-    SOURCE_SORT_CONTRACT, SourceSortContract,
+    INGEST_SOURCE, INGESTION, OUTPUT_IDENTITY, PLANNING_VALUE,
+    RECORD_FIELD_ACCESS, RECORD_FIELD_ACCESS_PATH,
+    RECORD_FIELD_SEQUENCE_VIEW, RECORD_PARAMETER_VALUE,
+    SEQUENCE_DESCRIPTOR, SEQUENCE_MEMBER, SOURCE_SORT_CONTRACT, SSA_VALUE,
+    SSAValueFact, SSAValueOrigin, SourceSortContract,
 )
 from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
@@ -57,6 +64,32 @@ from src.transmogrifier.ssa import (
     SSASequenceDescriptor,
     SSASequenceTable,
 )
+
+
+def _seed_root(book, page, row, fact):
+    """A row the test authors by hand, posted as a root: the test is its
+    ingestion, as a source construct's span is a root."""
+
+    return book.post(
+        page, row, fact, stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+    )
+
+
+def _seed_value(scope, value_id, dtype="float64"):
+    """A test-authored value's ``ssa_value`` root under ``scope``."""
+
+    return _seed_root(
+        current_identity_book(), SSA_VALUE, (scope, int(value_id)),
+        SSAValueFact(dtype, (), SSAValueOrigin.MINTED),
+    )
+
+
+def _seed_alias(book, page, scope, alias, resident):
+    """What ``bind_alias`` once wrote raw -- alias -> resident on a planning
+    or output page -- as the root the test authors."""
+
+    return _seed_root(book, page, (str(scope), int(alias)), int(resident))
 
 
 def test_single_column_resident_membership_scans_the_value_column():
@@ -154,13 +187,16 @@ def test_sort_policy_is_published_at_source_and_carried_through_relabel():
 def test_sequence_contract_concordance_keeps_one_physical_row_contract():
     book, token = begin_identity_book()
     try:
+        # The test authors the sequence: both statements derive from its
+        # value root (the second also from the first, which it refines).
+        authored = _seed_value("kernel", 3)
         first = commit_sequence_contract(
             "kernel", 3, "unique", 2, False,
-            source="authored Mapping[str, float]",
+            source="authored Mapping[str, float]", sources=(authored,),
         )
         repeated = commit_sequence_contract(
             "kernel", 3, "unique", 2, True,
-            source="SSA sequence declaration",
+            source="SSA sequence declaration", sources=(authored,),
         )
         assert first.policy == repeated.policy == "unique"
         assert first.column_count == repeated.column_count == 2
@@ -176,16 +212,17 @@ def test_sequence_contract_concordance_keeps_one_physical_row_contract():
 def test_sequence_contract_concordance_refuses_width_redefinition():
     _book, token = begin_identity_book()
     try:
+        authored = _seed_value("kernel", 3)
         commit_sequence_contract(
             "kernel", 3, "unique", 2, False,
-            source="authored Mapping[str, float]",
+            source="authored Mapping[str, float]", sources=(authored,),
         )
         with pytest.raises(ValueError, match=(
             "authored Mapping.*committed unique/2.*runtime.*duplicates/1"
         )):
             commit_sequence_contract(
                 "kernel", 3, "duplicates", 1, False,
-                source="runtime tuple view",
+                source="runtime tuple view", sources=(authored,),
             )
     finally:
         end_identity_book(token)
@@ -194,13 +231,18 @@ def test_sequence_contract_concordance_refuses_width_redefinition():
 def test_sequence_row_dtype_concordance_refines_equivalent_unknown_arena():
     book, token = begin_identity_book()
     try:
+        # Each statement derives from the value root the test authors for
+        # the arena it claims; the equated arena 33 also derives from 29's
+        # recorded dtypes inside the helper.
         assert concord_sequence_row_dtypes(
-            "kernel", {29: ("float64",)}, source="declaration"
+            "kernel", {29: ("float64",)}, source="declaration",
+            sources=(_seed_value("kernel", 29),),
         ) == ("float64",)
         assert concord_sequence_row_dtypes(
             "kernel",
             {29: ("float64",), 33: ("unknown",)},
             source="conditional replace",
+            sources=(_seed_value("kernel", 33),),
         ) == ("float64",)
         assert committed_sequence_row_dtypes(
             "kernel", 33
@@ -260,8 +302,12 @@ def test_function_alias_publication_commits_transitive_terminal_resident():
     book, token = begin_identity_book()
     try:
         page = book.page("planning_value_concordance")
-        page.bind_alias("solve", 64, 58)
-        page.bind_alias("solve", 69, 64)
+        # The test authors the values and the two planning rows as roots;
+        # the publication then derives its revisions from the value cells.
+        for value_id in (58, 64, 69, 71, 86):
+            _seed_value("solve", value_id)
+        _seed_alias(book, PLANNING_VALUE, "solve", 64, 58)
+        _seed_alias(book, PLANNING_VALUE, "solve", 69, 64)
 
         assert _concordant_function_aliases(function) == {64: 58, 69: 58}
         published = _publish_concordant_function_aliases(
@@ -282,6 +328,7 @@ def test_sequence_row_layout_is_one_direct_identity_book_row():
         committed = commit_sequence_row_layout(
             scope, 264, ((3,),), ("float64",),
             source="collection value edge",
+            sources=(_seed_value(scope, 264),),
         )
 
         assert committed_sequence_row_layout(scope, 264) == committed
@@ -301,15 +348,25 @@ def test_concordant_sequence_descriptor_alias_retires_duplicate_members():
         sequences = SSASequenceTable(owner="solve", book=book)
         resident = SSASequenceDescriptor(10, (11,), 12, 13)
         duplicate = SSASequenceDescriptor(20, (21,), 22, 23)
-        sequences.register(resident)
-        sequences.register(duplicate)
+        # The test authors every value: each descriptor stands on the
+        # ``ssa_value`` roots of the values it names.
+        values = {
+            value_id: _seed_value("solve", value_id)
+            for value_id in (10, 11, 12, 13, 20, 21, 22, 23, 30)
+        }
+        sequences.register(
+            resident, sources=tuple(values[i] for i in (10, 11, 12, 13)),
+        )
+        sequences.register(
+            duplicate, sources=tuple(values[i] for i in (20, 21, 22, 23)),
+        )
         records = SSARecordTable(owner="solve", book=book)
         records.register(SSARecordDescriptor(30, "State", (
             SSARecordFieldDescriptor(
                 "items", SSARecordFieldStorage.SEQUENCE,
                 storage_identity="State.items", sequence_id=20,
             ),
-        )))
+        )), sources=(values[30],))
         _publish_concordant_function_aliases(
             function, {20: 10, 21: 11, 22: 12, 23: 13},
             provenance="exact_sequence_argument",
@@ -356,6 +413,9 @@ def test_finalization_closes_terminal_alias_with_no_surviving_identity():
     book, token = begin_identity_book()
     try:
         function = Function("solve", [], {})
+        # The alias the test authors derives from its two values' roots.
+        _seed_value("solve", 20)
+        _seed_value("solve", 21)
         _publish_concordant_function_aliases(
             function, {20: 21}, provenance="provisional_aggregate_slot",
         )
@@ -374,10 +434,8 @@ def test_finalization_closes_terminal_alias_with_no_surviving_identity():
 def test_imported_function_aliases_use_the_accepted_component_book():
     owner, owner_token = begin_identity_book()
     try:
-        planning = owner.page("planning_value_concordance")
-        planning.bind_alias("imported", 5, 7)
-        outputs = owner.page("output_identity_concordance")
-        outputs.bind_alias("imported", 3, 7)
+        _seed_alias(owner, PLANNING_VALUE, "imported", 5, 7)
+        _seed_alias(owner, OUTPUT_IDENTITY, "imported", 3, 7)
     finally:
         end_identity_book(owner_token)
 
@@ -415,24 +473,30 @@ def test_imported_record_demand_reads_only_the_accepted_owner_book():
         "local-sequence-view", symbol, 1, 4,
     ),)
     sequence_view = (("opaque_ref",), 1, (0,), False, "fixed", False)
-    owner.page("record_parameter_value").concord(
-        (scope, (symbol, 1)), parameter_key,
+    # The test is the owner book's ingestion: every row is a root.
+    _seed_root(
+        owner, RECORD_PARAMETER_VALUE, (scope, (symbol, 1)), parameter_key,
     )
-    owner.page("record_field_access").concord(
-        (scope, field_key), frozenset({"read", "sequence"}),
+    _seed_root(
+        owner, RECORD_FIELD_ACCESS, (scope, field_key),
+        frozenset({"read", "sequence"}),
     )
-    owner.page("record_field_access_path").concord(
-        (scope, field_key, "read"), read_path,
+    _seed_root(
+        owner, RECORD_FIELD_ACCESS_PATH, (scope, field_key, "read"),
+        read_path,
     )
-    owner.page("record_field_access_path").concord(
-        (scope, field_key, "sequence"), sequence_path,
+    _seed_root(
+        owner, RECORD_FIELD_ACCESS_PATH, (scope, field_key, "sequence"),
+        sequence_path,
     )
-    owner.page("record_field_sequence_view").concord(
+    _seed_root(
+        owner, RECORD_FIELD_SEQUENCE_VIEW,
         (scope, "LiveScopeProjection.excluded"), sequence_view,
     )
     sequence_scope = (symbol, 0)
-    owner.page("sequence_descriptor").concord(
-        (sequence_scope, 4), ("accepted-descriptor", 4),
+    _seed_root(
+        owner, SEQUENCE_DESCRIPTOR, (sequence_scope, 4),
+        ("accepted-descriptor", 4),
     )
     for value_id, roles in {
         4: ((4, ("column", 0)), (4, ("handle",))),
@@ -441,9 +505,7 @@ def test_imported_record_demand_reads_only_the_accepted_owner_book():
         12: ((4, ("status_address_id",)),),
         13: ((4, ("live_flags_value_id",)),),
     }.items():
-        owner.page("sequence_member").concord(
-            (sequence_scope, value_id), roles,
-        )
+        _seed_root(owner, SEQUENCE_MEMBER, (sequence_scope, value_id), roles)
     function = Function(
         symbol, [
             SSAValue(4, "opaque_ref", shape=()),
@@ -502,9 +564,7 @@ def test_imported_output_alias_audit_uses_accepted_component_book():
     from src.transmogrifier.ssa import IRModule
 
     owner = IdentityBook()
-    owner.page("output_identity_concordance").bind_alias(
-        "imported", 40, 2305843010213693979,
-    )
+    _seed_alias(owner, OUTPUT_IDENTITY, "imported", 40, 2305843010213693979)
     function = Function(
         "imported", [], {},
         metadata={
@@ -538,8 +598,11 @@ def test_sequence_alias_with_live_length_reads_rebinds_all_descriptor_members(tm
         function = Function('solve', list(values.values()), {
             'entry': BasicBlock('entry', [call, Instr('Ret', [output], None)])})
         sequences = SSASequenceTable(owner='solve', book=book)
-        sequences.register(resident)
-        sequences.register(duplicate)
+        # The test authors the values; each descriptor stands on the roots
+        # of the values it names.
+        roots = {i: _seed_value('solve', i, 'int64') for i in (10, 12, 13, 20, 22, 23, 30)}
+        sequences.register(resident, sources=(roots[10], roots[12], roots[13]))
+        sequences.register(duplicate, sources=(roots[20], roots[10], roots[22], roots[23]))
         _publish_concordant_function_aliases(function, {20: 10}, provenance='exact_handle')
         assert _retire_concordant_sequence_aliases(
             {'solve': function}, {'solve': sequences}, {},
@@ -583,6 +646,9 @@ def test_finalization_does_not_mistake_callee_output_identity_for_local_alias():
         function = Function('solve', [], {'entry': BasicBlock('entry', [
             Instr('Load', [SSAValue(99, 'ptr')], projected),
             Instr('Ret', [projected], None)])})
+        # The test authors both values: the alias derives from their roots.
+        _seed_value('producer', 1040)
+        _seed_value('solve', 1041)
         _publish_concordant_function_aliases(function, {1041: 1040}, provenance='region_output')
         assert _retire_dead_planning_aliases(
             {'solve': function, 'producer': producer}, {}, {}, {}, book,
@@ -603,8 +669,9 @@ def test_output_settlement_keeps_frame_arena_as_physical_resident():
     book, token = begin_identity_book()
     try:
         page = book.page("planning_value_concordance")
+        # The test authors the planning rows as roots.
         for alias, resident in function.metadata["value_aliases"].items():
-            page.bind_alias("get_state", alias, resident)
+            _seed_alias(book, PLANNING_VALUE, "get_state", alias, resident)
 
         assert _concordant_function_resident(function, 60) == 2
         published = _publish_concordant_function_aliases(
