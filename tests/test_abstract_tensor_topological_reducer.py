@@ -164,9 +164,12 @@ def inspect_page(row):
     program_module._turing_source_module = "probe.concordance_declarations"
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(program_module)
+    # The record as the ProgramABI survey of a declared source module keys
+    # it (_authored_complete_record_schemas: a class's record identity is
+    # its class name), the spelling every record projection looks up.
     graph.G.graph["program_abi"] = {"records": {
-        "probe.concordance_declarations.Publication": {
-            "identity": "probe.concordance_declarations.Publication",
+        "Publication": {
+            "identity": "Publication",
             "fields": {
                 "digest": {
                     "storage": "span", "dtype": "int64", "rank": 1,
@@ -250,7 +253,7 @@ def inspect_page(row):
     ] == declaration_cell
     assert latest["attributes"][
         "optional_result_class_ref"
-    ] == "probe.concordance_declarations.Publication"
+    ] == "Publication"
     projected = {
         data["expr_obj"].attr: data
         for _node_id, data in inspected.nodes(data=True)
@@ -326,7 +329,7 @@ def test_concorded_primitive_class_has_one_canonical_identity():
 
     book = current_identity_book()
     assert book.page(SOURCE_VALUE_CLASS).latest((scope, 0))[:2] == (
-        "str", 1,
+        "builtins.str", 1,
     )
     target = book.latest_ref(SOURCE_VALUE_CLASS, (scope, 0))
     assert {annotation, call_actual}.issubset({
@@ -367,7 +370,7 @@ def run(table: Table, name: str, value):
     assert helper.graph["method_binding"] == "static"
     assert current_identity_book().page(SOURCE_VALUE_CLASS).latest((
         _source_numeric_scope(helper), name_id,
-    ))[:2] == ("str", 1)
+    ))[:2] == ("builtins.str", 1)
 
 
 def test_python_named_integer_becomes_plain_constant_with_origin_metadata():
@@ -1094,10 +1097,15 @@ def kernel(max_iters):
 
     reduce_abstract_tensor_topology(graph)
 
-    loop = module.body[0].body[1]
-    carried = (
-        graph.G.nodes[id(loop)].get("attributes") or {}
-    ).get("loop_carried_bindings", {})
+    executable = graph.function_table.entry("kernel").graph.G
+    loop = next(
+        data
+        for _node_id, data in executable.nodes(data=True)
+        if data.get("type") == "While"
+    )
+    carried = (loop.get("attributes") or {}).get(
+        "loop_carried_bindings", {}
+    )
     assert "iters" in carried
     initial, updated = carried["iters"]
     assert initial != updated
@@ -1120,10 +1128,15 @@ def kernel(max_iters):
 
     reduce_abstract_tensor_topology(graph)
 
-    loop = module.body[0].body[1]
-    carried = (
-        graph.G.nodes[id(loop)].get("attributes") or {}
-    ).get("loop_carried_bindings", {})
+    executable = graph.function_table.entry("kernel").graph.G
+    loop = next(
+        data
+        for _node_id, data in executable.nodes(data=True)
+        if data.get("type") == "While"
+    )
+    carried = (loop.get("attributes") or {}).get(
+        "loop_carried_bindings", {}
+    )
     assert "result" in carried
     initial, updated = carried["result"]
     assert initial != updated
@@ -1560,11 +1573,12 @@ def check(field: Field, value):
     formal = book.latest_ref(
         SOURCE_VALUE_CLASS, (_source_numeric_scope(callee), formal_id),
     )
+    module_scope = module._turing_source_module
     declared = book.latest_ref(
-        CLASS_DECLARATION, ("<string>", "Field"),
+        CLASS_DECLARATION, (module_scope, "Field"),
     )
     field = book.latest_ref(
-        CLASS_FIELD_DECLARATION, ("<string>", "Field", "limit"),
+        CLASS_FIELD_DECLARATION, (module_scope, "Field", "limit"),
     )
     assert actual is not None
     assert formal is not None
@@ -1601,10 +1615,10 @@ def check(field: Field, value):
         SOURCE_VALUE_CLASS, (_source_numeric_scope(caller), actual_id),
     ) is not None
     assert projected.latest_ref(
-        CLASS_DECLARATION, ("<string>", "Field"),
+        CLASS_DECLARATION, (module_scope, "Field"),
     ) is not None
     assert projected.latest_ref(
-        CLASS_FIELD_DECLARATION, ("<string>", "Field", "limit"),
+        CLASS_FIELD_DECLARATION, (module_scope, "Field", "limit"),
     ) is not None
 
 
@@ -2489,7 +2503,11 @@ def test_static_reference_cache_recovers_after_projection_eviction(monkeypatch):
         def cat(values):
             raise AssertionError('compiler must not execute static methods')
 
-    original_add = nx.DiGraph.add_node
+    from src.transmogrifier.graph.memory_graph.helpers.networkx_emulation import (
+        NetworkxEmulation,
+    )
+
+    original_add = NetworkxEmulation.add_node
     evicted = []
 
     def add_and_evict(graph, node, **data):
@@ -2511,7 +2529,7 @@ def test_static_reference_cache_recovers_after_projection_eviction(monkeypatch):
                 evicted.append(reference)
                 break
 
-    monkeypatch.setattr(nx.DiGraph, 'add_node', add_and_evict)
+    monkeypatch.setattr(NetworkxEmulation, 'add_node', add_and_evict)
     graph = ProcessGraph(materialize_memory=False)
     graph.python_bindings = {'StaticTensorAPI': StaticTensorAPI}
     with contextlib.redirect_stdout(io.StringIO()):
