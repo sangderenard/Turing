@@ -262,6 +262,8 @@ def source_native_type_tests(graph):
     """
 
     from .concordance_declarations import (
+        SOURCE_PYTHON_IDENTITY,
+        STATIC_REFERENCE_USE,
         canonical_python_subtype_identities,
         canonical_python_type_identity,
     )
@@ -312,7 +314,7 @@ def source_native_type_tests(graph):
             ),
             "intrinsic": "builtins.isinstance",
             "intrinsic_cell": book.latest_ref(
-                "source_python_identity_concordance", tuple(identity_row),
+                SOURCE_PYTHON_IDENTITY, tuple(identity_row),
             ),
             "target_definition_cell": target_cell,
             "predicate_kind": "subtype",
@@ -334,7 +336,7 @@ def source_native_type_tests(graph):
                 isinstance(row, tuple) and len(row) == 3
                 and int(row[2]) == int(reference_node_id)
             ):
-                use_cell = book.latest_ref("static_reference_use", row)
+                use_cell = book.latest_ref(STATIC_REFERENCE_USE, row)
                 cells.extend(
                     source for source, _stage in book.edges_into(use_cell)
                     if source.page.name == "static_symbol_definition"
@@ -391,7 +393,7 @@ def source_native_type_tests(graph):
             ),
             "intrinsic": "builtins.type",
             "intrinsic_cell": book.latest_ref(
-                "source_python_identity_concordance", intrinsic_row,
+                SOURCE_PYTHON_IDENTITY, intrinsic_row,
             ),
             "target_definition_cell": target_cell,
             "predicate_kind": "exact",
