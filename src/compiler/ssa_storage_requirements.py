@@ -319,13 +319,35 @@ def module_storage_requirements(
             # override an exact descriptor gave a (8,4,2,3) temporary the
             # storage of an unrelated (3,800,1600) leaf, and every multi-axis
             # address into it then had no extent origin.
-            own = None if table is None else table.by_id(int(value_id))
-            if (
-                own is not None
-                and own.metadata_state == "static"
-                and tuple(own.shape)
-            ):
-                shape = tuple(map(int, own.shape))
+            # ``SSATensorTable.by_id`` is keyed by TENSOR id; the value-keyed
+            # reader is ``by_data_value``.  Reading ``by_id(value_id)`` here
+            # handed ``catalog_clamp``'s count Const (value 2, shape ``()``)
+            # the descriptor of tensor 2 (data value 6, shape ``(4,)``), and
+            # the Fortran lane then refused the ``binary_scalar_double`` call
+            # whose ``n`` operand it saw as a four-element array.  A value's
+            # own storage is the allocation-owning static descriptor over it;
+            # a view shares the owner's data value with its own shape and
+            # ``owns_allocation=False``, so it is not the storage.
+            own_storage = (
+                set()
+                if table is None
+                else {
+                    tuple(map(int, own.shape))
+                    for own in table.by_data_value(int(value_id))
+                    if own.metadata_state == "static"
+                    and tuple(own.shape)
+                    and own.owns_allocation
+                }
+            )
+            if len(own_storage) > 1:
+                raise ValueError(
+                    f"{function_name}: value {value_id} has "
+                    f"{len(own_storage)} allocation-owning static tensor "
+                    f"descriptors with different shapes "
+                    f"{sorted(own_storage)}"
+                )
+            if own_storage:
+                shape = next(iter(own_storage))
                 if shape not in ordered_views:
                     ordered_views = (*ordered_views, shape)
             dtype = next((
