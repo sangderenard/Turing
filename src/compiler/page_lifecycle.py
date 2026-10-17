@@ -312,6 +312,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "source_numeric_specialization_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "source_optional_glyph_carry": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "source_page_fact_class": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "source_definition_concordance": PageLifecycle(CLOSURE, CLOSURE, CLOSURE),
     "source_pursuit_activation_concordance": PageLifecycle(CLOSURE, CLOSURE, CLOSURE),
     "source_python_identity_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "source_record_class_concordance": PageLifecycle(CLOSURE, LOWERING, LOWERING),

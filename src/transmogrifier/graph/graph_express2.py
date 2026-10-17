@@ -2846,6 +2846,92 @@ def _mark_source_pursuit_active(definition, *, demand):
     definition._source_pursuit_active = True
 
 
+class _HeldDefinitions:
+    """Identity -> definition, answered by the concordance.
+
+    A definition is HELD when the book has a ``source_definition_concordance``
+    row for its ``(module, qualname)``: the row is posted once, DERIVED from
+    the definition's own ``source_span`` cell, whether the submitted text
+    defines it or pursuit ingested it.  Membership and lookup ask the book
+    first; the node handle kept here only lets pursuit reach the AST object
+    the book's row stands for, and is never consulted without the row.  Two
+    different nodes under one held identity are refused: that is the
+    duplicate-material fault, and the refusal names it where it happens.
+    """
+
+    def __init__(self) -> None:
+        self._nodes: dict[tuple[str, str], Any] = {}
+
+    @staticmethod
+    def _row(identity) -> tuple[str, str]:
+        return (str(identity[0]), str(identity[1]))
+
+    def _held(self, identity):
+        from ...compiler.concordance_declarations import SOURCE_DEFINITION
+        from ...compiler.identity_concordance import current_identity_book
+
+        row = self._row(identity)
+        node = self._nodes.get(row)
+        if node is None:
+            return None
+        if current_identity_book().latest_ref(SOURCE_DEFINITION, row) is None:
+            return None
+        return node
+
+    def __contains__(self, identity) -> bool:
+        return self._held(identity) is not None
+
+    def get(self, identity, default=None):
+        node = self._held(identity)
+        return default if node is None else node
+
+    def __getitem__(self, identity):
+        node = self._held(identity)
+        if node is None:
+            raise KeyError(identity)
+        return node
+
+    def __setitem__(self, identity, definition) -> None:
+        from ...compiler.concordance_declarations import (
+            PURSUIT, SOURCE_DEFINITION,
+        )
+        from ...compiler.identity_concordance import (
+            Derived, Mode, current_identity_book,
+        )
+
+        row = self._row(identity)
+        incumbent = self._nodes.get(row)
+        if incumbent is not None and incumbent is not definition:
+            raise ValueError(
+                f"definition {row!r} is already held by another node; "
+                "a second copy of one authored identity is duplicate material"
+            )
+        span = post_source_span(definition, definition, stage=PURSUIT)
+        if span is None:
+            raise ValueError(
+                f"definition {row!r} has no source span row, so its "
+                "provenance cannot be held"
+            )
+        book = current_identity_book()
+        if book.latest_ref(SOURCE_DEFINITION, row) is None:
+            book.post(
+                SOURCE_DEFINITION, row, type(definition).__name__,
+                stage=PURSUIT, provenance=Derived((span,)),
+                mode=Mode.CONCORD,
+            )
+        self._nodes[row] = definition
+
+    def hold_authored(self, identity, definition) -> bool:
+        """Hold a definition the submitted text defines.  A second
+        definition of one qualified name (a property getter and its setter)
+        is the same identity; the first stays held."""
+
+        if self._nodes.get(self._row(identity)) is not None:
+            return False
+        self[identity] = definition
+        return True
+
+
 def _expand_unresolved_ast_parents(
     tree,
     bindings,
@@ -3022,6 +3108,9 @@ def _expand_unresolved_ast_parents(
         if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     definitions_by_name = {}
+    unavailable_identities = set()
+    target_definitions = _HeldDefinitions()
+    target_bindings = {}
     for definition in definitions:
         seed = dict(
             getattr(definition, "_python_bindings", None)
@@ -3051,10 +3140,17 @@ def _expand_unresolved_ast_parents(
         for member in ast.walk(definition):
             node_bindings[id(member)] = definition_bindings
         definitions_by_name.setdefault(definition.name, []).append(definition)
+        # The submitted text's own definitions are HELD from the start: a
+        # call that resolves to one of them finds the book's row, not a
+        # second copy fetched from the live object.
+        authored_identity = _source_definition_identity(definition)
+        if authored_identity is not None and target_definitions.hold_authored(
+            authored_identity, definition,
+        ):
+            target_bindings[tuple(map(str, authored_identity))] = (
+                definition_bindings
+            )
 
-    unavailable_identities = set()
-    target_definitions = {}
-    target_bindings = {}
     started = time.perf_counter()
     def lexical_calls(definition):
         """Calls executed by one definition, excluding nested definitions.
@@ -3563,6 +3659,39 @@ def _expand_unresolved_ast_parents(
             target_bindings[member_identity] = definition_bindings
         return definition
 
+    def activate_construction_methods(class_definition):
+        """Constructing a held class demands its construction methods.
+
+        A class pursuit discovers has them activated at discovery; a class
+        the submitted text defines is held without being discovered, so the
+        same demand is made when a call first constructs it.  The class's
+        own span is the demand.
+        """
+
+        for member in class_definition.body:
+            if not (
+                isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and member.name in {"__new__", "__init__"}
+            ):
+                continue
+            member_identity = _source_definition_identity(member)
+            if member_identity is None or id(member) in activated_definitions:
+                continue
+            member_key = tuple(map(str, member_identity))
+            constructor_bindings = _ast_local_constructor_bindings(
+                member,
+                target_bindings.get(member_key)
+                or node_bindings.get(id(member), root_bindings),
+            )
+            target_bindings[member_key] = constructor_bindings
+            install_definition_bindings(member, constructor_bindings)
+            requeue_definition(
+                member,
+                demand=post_source_span(
+                    class_definition, class_definition, stage=PURSUIT,
+                ),
+            )
+
     while pending_calls:
         if max_work_items and work_items >= max_work_items:
             raise RuntimeError(
@@ -3699,6 +3828,8 @@ def _expand_unresolved_ast_parents(
                 install_definition_bindings(definition, combined)
                 if id(node) not in latent_call_ids:
                     requeue_definition(definition, demand=call_demand(node))
+            if isinstance(definition, ast.ClassDef):
+                activate_construction_methods(definition)
             continue
         if identity in unavailable_identities:
             continue
@@ -3709,21 +3840,11 @@ def _expand_unresolved_ast_parents(
             call_name = node.func.attr
         else:
             call_name = None
-        # (A call spelled ``cls(...)`` or through an alias names its target
-        # by the target's own name, not by the call's spelling.)
-        existing = tuple(dict.fromkeys((
-            *definitions_by_name.get(call_name, ()),
-            *definitions_by_name.get(identity[1].rsplit(".", 1)[-1], ()),
-        )))
-        # A definition already in the tree answers for its live identity,
-        # whether pursuit discovered it or the submitted source defines it:
-        # the source-owner stamp is that identity for the latter.  Ingesting
-        # the live object's source again would lay a second copy of the same
-        # authored function over the first.
+        existing = definitions_by_name.get(call_name, ())
         exact_existing = tuple(
             definition
             for definition in existing
-            if _source_definition_identity(definition) == identity
+            if getattr(definition, "_python_source_identity", None) == identity
         )
         if len(exact_existing) == 1:
             definition = exact_existing[0]
@@ -4068,18 +4189,6 @@ def _expand_unresolved_ast_parents(
             and len(source_identity) == 2
         )
     }
-    # The submitted source's own definitions answer for their stamped
-    # authored identity too.  A class whose every call site sits in a method
-    # pursuit never activated was previously linked only if some reachable
-    # site had registered it (or a second copy was ingested for it); the
-    # source's own ClassDef is the definition the call names.  A definition
-    # pursuit discovered keeps its identity; this only fills absences.
-    for definition in definitions:
-        authored_identity = _source_definition_identity(definition)
-        if authored_identity is not None:
-            definitions_by_source_identity.setdefault(
-                tuple(map(str, authored_identity)), definition,
-            )
     for call in tuple(dict.fromkeys(all_calls)):
         call_bindings = node_bindings.get(id(call), root_bindings)
         target = call_target(call, call_bindings)

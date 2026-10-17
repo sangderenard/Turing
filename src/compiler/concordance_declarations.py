@@ -377,6 +377,16 @@ SOURCE_METHOD_IDENTITY = declare_page("source_method_identity_concordance", (
 SOURCE_RECORD_CLASS = declare_page("source_record_class_concordance", (
     RowField("qualified_class_identity", K.SCOPE),
 ), ast.AST)
+#: The definitions the compiler HOLDS: a function or class whose source is in
+#: the graph being built, whether the submitted text defines it or pursuit
+#: ingested it.  One row per authored identity; the fact is the node kind, and
+#: the row is DERIVED from the definition's own ``source_span`` cell, so a
+#: held definition is never separable from where it came from.  Pursuit and
+#: AST-parent linking ask this page whether an identity is held; they never
+#: keep a private table that could disagree with it.
+SOURCE_DEFINITION = declare_page("source_definition_concordance", (
+    RowField("module", K.SCOPE), RowField("qualname", K.NAME),
+), str)
 SOURCE_PURSUIT_ACTIVATION = declare_page("source_pursuit_activation_concordance", (
     RowField("module", K.SCOPE), RowField("qualname", K.NAME),
 ), bool)

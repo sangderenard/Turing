@@ -209,3 +209,49 @@ check is the closure stage of the real bootstrap (about 75 s).  If it still
 fails, the open question is why pursuit no longer activates the methods that
 construct these classes; compare `graph.G.graph["activated"]`-style activation
 state against the earlier passing run.
+
+## Follow-up, 19:40: pursuit holds definitions in the concordance
+
+Principle (the user's): the concordance is the registry.  Putting material up
+and pulling it down are asks of the book, with an unbroken chain of provenance;
+code that keeps its own table beside the book is a regression, and the fix is to
+route it through the book.  The two stopgaps above (a stamp-reading widening of
+`exact_existing` in pursuit, and a `setdefault` pass in AST-parent linking) were
+that regression and are removed.
+
+What replaces them (`graph_express2.py`, `concordance_declarations.py`,
+`page_lifecycle.py`):
+
+* New page `source_definition_concordance` `(module, qualname) -> node kind`.  A
+  definition is HELD when the book has its row.  The row is posted once,
+  DERIVED from the definition's own `source_span` cell (`path == ()`), stage
+  `PURSUIT`.  Lifecycle: CLOSURE, like the activation page.
+* `target_definitions`, pursuit's identity -> definition table, is now a
+  `_HeldDefinitions`: setting an entry is the one put-up path (it posts the row);
+  `in`, `get` and `[]` ask the book first.  The node handle it keeps only lets
+  pursuit reach the AST object the row stands for; it is never consulted without
+  the row.  A second, different node for a held identity is refused
+  ("duplicate material"); a property getter and setter, one qualified name,
+  hold the first (`hold_authored`).
+* The submitted text's own definitions are held when pursuit starts, with their
+  seeded bindings, so the existing `identity in target_definitions` branch answers
+  for them.  Authored classes also get their constructors demanded when a call
+  first constructs them (`activate_construction_methods`), as pursuit already did
+  for classes it discovered; the class's span is the demand.
+* The final linking pass resolves through `target_definitions` as before, which
+  now includes every authored definition.  `definitions_by_source_identity` and
+  `definitions_by_name` remain as the old notebooks for discovered definitions;
+  `unavailable_identities`, `activated_definitions` and `latent_call_ids` are
+  still process-local although the book has an activation page.  Those are the
+  next routings, not done.
+
+Verification: `tests/test_held_definitions.py` (4): row + provenance edge to the
+`source_span` cell, the book (not the handle) decides, duplicate refusal, property
+pair.  A probe module compiled with the real contract in the bootstrap's shape (a
+class built only in an uncalled method, `cls(...)`, a property pair) finished
+without failure, discovered nothing from the live object, left nothing
+unresolved, and showed a book row for every authored definition.  NOT verified:
+the real closure stage.  Also failing in the linking suite, and not part of this
+change: the value-union errors above, and an `UnboundLocalError` for
+`program_abi_receipt` at `fortran_c_shell.py:49725` (a line added with
+`_typed_parameter_record_receipts`).
