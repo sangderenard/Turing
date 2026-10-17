@@ -174,11 +174,21 @@ class _FunctionImporter:
         for block in self.llvm_function.blocks:
             for instruction in block.instructions:
                 # Terminators have LLVM type ``void`` but still carry scalar
-                # operands: switch case literals and ``ret`` values are the
-                # two important examples.  Register their constants before
-                # deciding whether the instruction itself defines a value.
+                # operands: ``ret`` values are the important example.
+                # Register their constants before deciding whether the
+                # instruction itself defines a value.
                 for operand in instruction.operands:
                     self._register_constant(operand)
+                if str(instruction.opcode) == "switch":
+                    # A switch's case literals are not in ``.operands``
+                    # (see ``_switch_cases``); register them from the
+                    # instruction's own text so each ``Eq`` the switch
+                    # expands to compares against a ``Const`` this
+                    # function produces.
+                    for case_type, literal, _target in self._switch_cases(
+                        instruction,
+                    )[1]:
+                        self._register_constant_literal(case_type, literal)
                 if str(instruction.type) == "void":
                     continue
                 self.values[self._value_key(instruction)] = self.fresh(
@@ -199,6 +209,60 @@ class _FunctionImporter:
         self.constant_attributes[value.id] = {
             "llvm_literal": str(operand).strip(),
         }
+
+    def _register_constant_literal(self, llvm_type: str, literal: str) -> None:
+        """Register an integer constant spelled ``<llvm_type> <literal>`` in
+        the instruction text, under the same key, dtype, origin and
+        ``llvm_literal`` attribute ``_register_constant`` gives the same
+        constant when the binding hands it over as an operand, so a switch
+        case ``i32 0`` and an ``add ..., 0`` elsewhere in the function share
+        one ``Const``."""
+        spelled = f"{llvm_type} {literal}"
+        key = ("constant_int", spelled)
+        if key in self.constants:
+            return
+        value = self.fresh(str(llvm_type), "constant", spelled)
+        self.constants[key] = value
+        self.constant_attributes[value.id] = {"llvm_literal": spelled}
+
+    _SWITCH_HEAD = re.compile(
+        r"switch\s+(?P<type>\S+)\s+(?P<selector>[^,]+),\s*label\s+%"
+        r"(?P<default>\"[^\"]*\"|[^\s,\[\]]+)\s*\["
+    )
+    _SWITCH_CASE = re.compile(
+        r"(?P<type>i\d+)\s+(?P<literal>-?\d+)\s*,\s*label\s+%"
+        r"(?P<target>\"[^\"]*\"|[^\s,\[\]]+)"
+    )
+
+    @classmethod
+    def _switch_cases(
+        cls, instruction: Any,
+    ) -> tuple[str, list[tuple[str, str, str]]]:
+        """``(default_label, [(case_type, literal, target_label), ...])`` of
+        a ``switch``, read from the instruction's own text.
+
+        The binding's ``.operands`` of a switch is version-dependent: LLVM
+        lists ``(selector, default, value0, block0, value1, block1, ...)``,
+        but llvmlite 0.50 yields only ``(selector, default, block0,
+        block1, ...)``, the case VALUES absent.  Reading the pairs by
+        position from that list paired blocks with blocks and minted every
+        destination block as a dangling "global" value (the ``binary_value``
+        kernel carried eleven operands no instruction produced).  The text
+        is the one spelling every version agrees on; the block list that
+        IS exposed is checked against it in ``_switch``."""
+        text = str(instruction)
+        head = cls._SWITCH_HEAD.search(text)
+        if head is None:
+            raise ValueError(
+                f"switch instruction text is not readable: {text.strip()}"
+            )
+        body = text[head.end():]
+        cases = [
+            (match.group("type"), match.group("literal"),
+             match.group("target").strip('"'))
+            for match in cls._SWITCH_CASE.finditer(body)
+        ]
+        return head.group("default").strip('"'), cases
 
     def operand_value(self, operand: Any) -> SSAValue:
         key = self._value_key(operand)
@@ -318,10 +382,25 @@ class _FunctionImporter:
     def _switch(self, instruction: Any, block: BasicBlock) -> None:
         operands = list(instruction.operands)
         selector = self.operand_value(operands[0])
-        default_target = str(operands[1].name)
+        default_target, spelled_cases = self._switch_cases(instruction)
+        # The destination blocks the binding does expose must be the ones
+        # the text names, in order; a disagreement is a reader fault, not
+        # something to lower around.
+        exposed_blocks = [
+            str(operand.name)
+            for operand in operands[1:]
+            if operand.value_kind.name == "basic_block"
+        ]
+        named_blocks = [default_target, *(target for _, _, target in spelled_cases)]
+        if exposed_blocks != named_blocks:
+            raise ValueError(
+                f"switch in {self.llvm_function.name}:{block.name} names "
+                f"blocks {named_blocks} but the binding exposes "
+                f"{exposed_blocks}: {str(instruction).strip()}"
+            )
         cases = [
-            (self.operand_value(operands[index]), str(operands[index + 1].name))
-            for index in range(2, len(operands), 2)
+            (self.constants[("constant_int", f"{case_type} {literal}")], target)
+            for case_type, literal, target in spelled_cases
         ]
         current = block
         for index, (literal, target) in enumerate(cases):
