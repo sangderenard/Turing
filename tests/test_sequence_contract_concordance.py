@@ -28,6 +28,8 @@ from src.compiler.fortran_c_shell import (
 )
 from src.compiler.identity_concordance import (
     IdentityPage,
+    Mode,
+    Novel,
     begin_identity_book,
     concord_sequence_row_dtypes,
     commit_sequence_contract,
@@ -43,7 +45,8 @@ from src.compiler.ir_sequence_tables import (
     lower_sequence_equal,
 )
 from src.compiler.concordance_declarations import (
-    SOURCE_SORT_CONTRACT, SourceSortContract,
+    INGEST_SOURCE, INGESTION, SOURCE_SORT_CONTRACT, SSA_VALUE,
+    SourceSortContract, SSAValueFact, SSAValueOrigin,
 )
 from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
@@ -327,13 +330,30 @@ def test_concordant_sequence_descriptor_alias_retires_duplicate_members():
         end_identity_book(token)
 
 
+def _seed_value(book, scope, value_id, dtype="int64"):
+    """A test-authored value's ``ssa_value`` root: the test is its
+    ingestion, as a source construct's span is a root.  A descriptor a
+    test registers stands on the cells of the values it names."""
+
+    return book.post(
+        SSA_VALUE, (scope, int(value_id)),
+        SSAValueFact(dtype, (), SSAValueOrigin.MINTED),
+        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+
+
 def test_output_concordance_closes_nonphysical_record_planning_alias():
     book, token = begin_identity_book()
     try:
         function = Function("solve", [], {})
         records = SSARecordTable(owner="solve", book=book)
         for record_id in (1, 2, 3):
-            records.register(SSARecordDescriptor(record_id, "State"))
+            # A fieldless record stands on its own record value's cell.
+            records.register(
+                SSARecordDescriptor(record_id, "State"),
+                sources=(_seed_value(book, "solve", record_id),),
+            )
         _publish_concordant_function_aliases(
             function, {2: 1}, provenance="linked_record_projection",
         )

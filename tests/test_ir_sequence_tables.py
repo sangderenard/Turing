@@ -49,10 +49,17 @@ from src.compiler.fortran_c_shell import (
 from src.compiler.concordance_declarations import (
     CLASS_DECLARATION,
     CLASS_FIELD_DECLARATION,
+    INGEST_SOURCE,
+    INGESTION,
     SOURCE_RECORD_VIEW_SCHEMA,
+    SSA_VALUE,
+    SSAValueFact,
+    SSAValueOrigin,
 )
 from src.compiler.identity_concordance import (
     ConcordanceRefusal,
+    Mode,
+    Novel,
     current_identity_book,
 )
 from src.transmogrifier.ssa import (
@@ -72,6 +79,19 @@ from src.transmogrifier.ssa import (
 )
 
 
+def _seed_value(scope, value_id, dtype="int64"):
+    """A test-authored value's ``ssa_value`` root: the test is its
+    ingestion, as a source construct's span is a root.  A descriptor a
+    test registers stands on the cells of the values it names."""
+
+    return current_identity_book().post(
+        SSA_VALUE, (scope, int(value_id)),
+        SSAValueFact(dtype, (), SSAValueOrigin.MINTED),
+        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+
+
 def _ops(function):
     return [
         instruction.op
@@ -89,8 +109,14 @@ def test_record_table_merges_complementary_views_of_same_record_identity():
         "right", SSARecordFieldStorage.SCALAR, value_ids=(3,), dtype="int64",
     )
 
-    table.register(SSARecordDescriptor(1, "Frame", (first,)))
-    merged = table.register(SSARecordDescriptor(1, "Frame", (second,)))
+    table.register(
+        SSARecordDescriptor(1, "Frame", (first,)),
+        sources=(_seed_value(table.owner, 2),),
+    )
+    merged = table.register(
+        SSARecordDescriptor(1, "Frame", (second,)),
+        sources=(_seed_value(table.owner, 3),),
+    )
 
     assert merged.fields == (first, second)
     assert table.records[1] is merged
@@ -103,7 +129,7 @@ def test_record_table_still_rejects_conflicting_views_of_same_field():
             "value", SSARecordFieldStorage.SCALAR,
             value_ids=(2,), dtype="int64",
         ),
-    )))
+    )), sources=(_seed_value(table.owner, 2),))
 
     with pytest.raises(ValueError, match="conflicting SSA record descriptor 1"):
         table.register(SSARecordDescriptor(1, "Frame", (
@@ -111,7 +137,7 @@ def test_record_table_still_rejects_conflicting_views_of_same_field():
                 "value", SSARecordFieldStorage.SCALAR,
                 value_ids=(3,), dtype="int64",
             ),
-        )))
+        )), sources=(_seed_value(table.owner, 3),))
 
 
 def test_joined_sequence_update_is_scheduled_after_concat_source():
@@ -1157,8 +1183,12 @@ def test_record_table_merges_access_capability_over_exact_storage():
         writable=True,
     )
 
-    table.register(SSARecordDescriptor(1, "Frame", (readonly,)))
-    merged = table.register(SSARecordDescriptor(1, "Frame", (writable,)))
+    # Both views stand on the one field value's cell.
+    value = _seed_value(table.owner, 2)
+    table.register(SSARecordDescriptor(1, "Frame", (readonly,)), sources=(value,))
+    merged = table.register(
+        SSARecordDescriptor(1, "Frame", (writable,)), sources=(value,),
+    )
 
     assert len(merged.fields) == 1
     assert merged.fields[0].writable
