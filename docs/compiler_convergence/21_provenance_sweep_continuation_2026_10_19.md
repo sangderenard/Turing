@@ -214,3 +214,34 @@ All are refused unconditionally by `_admit_raw_write` when reached.
 ## Prompt history
 
 > I want you to use agents, audits, focused corrections of each blocker, and occasional conference between these dispersed goals to attempt to build the most sweeping corrective measures possible while respecting the architecture and timing as working in many cases, so worth considering before changing
+
+## Addendum: first bootstrap on 64bed83a (user run, fingerprint 0e06287c...)
+
+Observed: admitted=10/330, compiled-unverified=8, failed=2 (stop-after-failure).
+
+- **Unit 032 `IdentityPage._reindex`** failed with a control-effect cycle:
+  the ConditionalBlock sits at its `If` statement's authored position and
+  now carries its body's `column_positions[column] = ...` store (arena 53),
+  while the membership query that is its predicate sits at the later
+  position of the `in` expression; the arena RAW edge opposed the value
+  edge. Fixed in `_schedule_loop_callsites`: an arena edge is oriented by
+  the exact value/hierarchy dependencies when they already prove the
+  earlier-listed block executes later. Unit 032 compiles again
+  (compiled-unverified). Preferable follow-up: attribute a nested region's
+  accesses at the region's own authored position, as mutation blocks are.
+- **Unit 042 `identity_spill._detached_ordinals`** (`if not detached:
+  return []` then `return sorted(...)`): OBSERVED on the old compiler the
+  guard If was silently dropped (no CondBr, `return []` gone), so
+  "compiled-unverified" was wrong. The return-arms change makes it loud.
+  Two findings: (a) the tail return edge (function ending in `return`)
+  carried no `return_site_cell`, so `finish` dropped the arms record for
+  every mixed-arity function ending in a return; fixed by a declared
+  `ReturnArm.tail` the reducer posts from `statement.body[-1]` and the
+  fallthrough terminator now carries that site cell. (b) the reducer
+  flattens `ast.List` like `ast.Tuple` into slots (topological_reducer
+  ~12131, ~5322), so `return []` is arity 0 and the function is VARIADIC;
+  existing programs (vehicle tick `return [t1, t2, ...]`) rely on the list
+  aggregate reading. When a list display at a return site is a SEQUENCE
+  VALUE (one slot) versus an aggregate is an undeclared rule: a decision
+  for the user (the `-> list` return annotation is the declared candidate).
+  Until then unit 042 stops on `return_arms_variadic_unlowered`.

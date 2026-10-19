@@ -4174,7 +4174,7 @@ def _relabel_field_state_pages(book: Any, read_scope: Any, mapping: Any) -> None
                         _RETURN_SITE_CONTAINER,
                         (read_scope, *arm.container.row[1:]),
                     ) or arm.container,
-                    arm.length, arm.absent,
+                    arm.length, arm.absent, arm.tail,
                 )
                 for arm in fact.arms
             )
@@ -5339,6 +5339,9 @@ def _normalize_lexical_values(
     # returned, collected only so ``post_return_output_arms`` can derive the
     # arms record from them at the end of the walk.
     return_arm_posts: list = []
+    # Site cells of the returns that are the function's final top-level
+    # statement (the lexical epilogue's edge; see ``ReturnArm.tail``).
+    return_tail_sites: set = set()
     if return_expression_lists:
         arities = {len(expressions) for expressions in return_expression_lists}
         if len(arities) != 1:
@@ -12249,6 +12252,8 @@ def _normalize_lexical_values(
                     provenance=_Derived((return_construct_cell,)),
                     mode=_Mode.CONCORD,
                 )
+                if body_statement is statement.body[-1]:
+                    return_tail_sites.add(return_site_cell)
                 if return_arms_kind is not None or return_arms_unclassified:
                     return_arm_posts.append((
                         return_site_cell, container_cell,
@@ -13964,6 +13969,7 @@ def _normalize_lexical_values(
         ):
             arms.append(_ReturnArm(
                 site, container, 0 if absent else len(values), bool(absent),
+                site in return_tail_sites,
             ))
         width = max(arm.length for arm in arms)
         derived = tuple(dict.fromkeys((*container_cells, *all_slot_cells)))

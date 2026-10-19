@@ -497,6 +497,11 @@ class ReturnArm:
     container: Ref
     length: int
     absent: bool
+    # The arm's return is the function's final top-level statement: control
+    # reaches ``function_exit`` from the lexical epilogue, not from a control
+    # block, so no control construct stamps this site on its edge.  Declared
+    # by the reducer, which walks the function body.
+    tail: bool = False
 
 
 @dataclass(frozen=True)
