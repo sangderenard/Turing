@@ -689,6 +689,29 @@ class _EllipsisExpander(ast.NodeTransformer):
     declared full-extent access and stays as authored (see ``visit_Subscript``).
     """
 
+    # Annotation positions are declarations, not indexing: ``tuple[T, ...]``
+    # is a type spelling and must reach the reducer as authored.
+    def _visit_skipping(self, node, field):
+        held = getattr(node, field)
+        setattr(node, field, None)
+        try:
+            node = self.generic_visit(node)
+        finally:
+            setattr(node, field, held)
+        return node
+
+    def visit_FunctionDef(self, node):  # noqa: N802
+        return self._visit_skipping(node, "returns")
+
+    def visit_AsyncFunctionDef(self, node):  # noqa: N802
+        return self._visit_skipping(node, "returns")
+
+    def visit_arg(self, node):  # noqa: N802
+        return node
+
+    def visit_AnnAssign(self, node):  # noqa: N802
+        return self._visit_skipping(node, "annotation")
+
     def visit_Subscript(self, node):  # noqa: N802
         node = self.generic_visit(node)
         index = node.slice

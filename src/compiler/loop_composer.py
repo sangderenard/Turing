@@ -2313,6 +2313,19 @@ def materialize_retained_loop_ports(
                 collection_id,
                 owned_nodes,
             )
+            # The same move supersedes the materializer in every binding
+            # history that names it (a returned slot's ``result_0`` among
+            # them): the history entry is the version the port now carries,
+            # not a second value beside it.
+            for superseded_name, superseded_versions in identities.items():
+                if int(output.materializer_node_id) in superseded_versions:
+                    superseded_versions[:] = [
+                        collection_id
+                        if int(version) == int(output.materializer_node_id)
+                        else version
+                        for version in superseded_versions
+                    ]
+                    post_port_version(superseded_name, collection_id)
             planned_iteration_outputs.append(LoopIterationOutput(
                 value_id=int(output.value_id),
                 result_value_id=collection_id,

@@ -245,3 +245,59 @@ Observed: admitted=10/330, compiled-unverified=8, failed=2 (stop-after-failure).
   VALUE (one slot) versus an aggregate is an undeclared rule: a decision
   for the user (the `-> list` return annotation is the declared candidate).
   Until then unit 042 stops on `return_arms_variadic_unlowered`.
+
+## Addendum 2: census, the declared-sequence return rule (commit after 1719fd10)
+
+Second user run on 1719fd10 (fingerprint c0c303d9...): admitted=10,
+compiled-unverified=9, failed=1 (unit 042 on `return_arms_variadic_unlowered`).
+The bootstrap pruned the older fingerprints, so no unit-by-unit comparison
+with the 28-unit run exists any more.
+
+Census over the 348 functions of the bootstrap program (AST replica of the
+reducer's return rule; scripts t2-t5 in the session scratchpad):
+single arity 233 (untouched by the arms lane); mixed 39 = 3 OPTIONAL_AGGREGATE
+(`_resolved`, `proven_shape_contract_of`, `shape_transformation_state`) +
+36 VARIADIC. Of the 36: 27 annotated `list[...]` returning `[]` on one arm
+(25 are `CorrelationTable._*_findings`), 7 annotated `tuple[T, ...]`
+returning `()` on one arm (incl. `_virtual_edges_into`), 2 undeclared
+(`shape_scope_of`: `Any`, spill `reduce`: none). 36 of 39 end in a tail
+return. Effects inside control flow: 109 functions, 45 of which also read
+the same container (the unit 032 shape).
+
+Decided and implemented (user): when the DECLARED return annotation is a
+sequence type (list / list[...] / List / Sequence / top-level
+`tuple[T, ...]`, outer `| None` tolerated), a Tuple/List display at a
+return site is ONE sequence value (arity 1), not flattened into slots.
+Measured blast radius: 0 of the 233 single-arity functions change; 34 of
+36 VARIADIC become single-arity. Implementation:
+`topological_reducer._declared_sequence_return` /
+`_return_display_flattens`, consulted at the four sites that flattened
+displays (return_expression_lists, arm shapes, Return reduction, container
+kind). `shape_transformation_state` now declares its fixed width.
+
+Two faults found and fixed on the way:
+- `_EllipsisExpander` (node_special_cases.py) rewrote `...` inside type
+  annotations as tensor indexing, so `tuple[T, ...]` never reached the
+  reducer intact. Annotation positions are now skipped.
+- `loop_composer.materialize_retained_loop_ports`: when a loop's
+  materializer (e.g. `sorted(<genexpr>)`) is superseded by its collection
+  port, the function's `result_0` binding history kept the superseded id,
+  so precompile saw two returned values for a one-slot function
+  (`identity_spill._detached_ordinals`, unit 042). The history now moves
+  to the port as the carried-binding path already did.
+
+Observed: `_findings`-shaped and `return []` probes lower with the guard If
+retained and the empty sequence value; fixed-tuple optional probes
+unchanged. Known gap: a NON-EMPTY tuple display under a `tuple[T, ...]`
+annotation (`return ((x, x + 1),)`, the `_virtual_edges_into` shape) still
+becomes a structural aggregate with leaves, so the `()` arm cannot supply
+them; affects 2 functions; needs the tuple-display-as-sequence-literal
+lowering. Unit 042's growth pickle carries the old arms rows, so only the
+next bootstrap (a fresh plan) shows the rule on real units.
+
+Pre-existing failures classified against clean worktrees (fail at the
+checkpoint 2b94890e, pass at 7c560b04; not from this session):
+`test_abstract_tensor_topological_reducer.py::test_classmethod_receiver_uses_concorded_static_class_identity`
+and four `test_ellipsis_store_ingestion.py` variants ([3],[5] x 2).
+Gate on this tree: six files + reducer + ast ingestion = 313 passed,
+5 failed (the four audit fixtures and the classmethod test).

@@ -4568,6 +4568,80 @@ def _relink_settled_glyph_formatters(graph: Any, function_table: Any) -> None:
 
 
 
+def _declared_sequence_return(definition: Any) -> bool:
+    """True when the function's DECLARED return annotation is a sequence type.
+
+    ``list``, ``list[...]``, ``List[...]``, ``Sequence[...]`` or a variadic
+    ``tuple[T, ...]`` (the Ellipsis ends the TOP-LEVEL parameters), with one
+    outer ``| None`` / ``Optional[...]`` tolerated.  A Tuple/List display at a
+    return site of such a function is ONE sequence value (arity 1), not
+    flattened into structural output slots; fixed ``tuple[A, B]``, ``Any`` and
+    no annotation keep the flattening.
+    """
+
+    annotation = getattr(definition, "returns", None)
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        try:
+            annotation = ast.parse(annotation.value, mode="eval").body
+        except SyntaxError:
+            return False
+
+    def is_none(member: Any) -> bool:
+        return (
+            isinstance(member, ast.Constant) and member.value is None
+        ) or (isinstance(member, ast.Name) and member.id == "None")
+
+    def container_name(node: Any) -> str:
+        return (
+            node.id if isinstance(node, ast.Name)
+            else node.attr if isinstance(node, ast.Attribute)
+            else ""
+        )
+
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        concrete = tuple(
+            member for member in (annotation.left, annotation.right)
+            if not is_none(member)
+        )
+        if len(concrete) != 1:
+            return False
+        annotation = concrete[0]
+    elif (
+        isinstance(annotation, ast.Subscript)
+        and container_name(annotation.value) == "Optional"
+    ):
+        annotation = annotation.slice
+    name = container_name(
+        annotation.value if isinstance(annotation, ast.Subscript) else annotation
+    )
+    if name in {"list", "List"}:
+        return True
+    if not isinstance(annotation, ast.Subscript):
+        return False
+    if name == "Sequence":
+        return True
+    if name in {"tuple", "Tuple"}:
+        parameters = (
+            tuple(annotation.slice.elts)
+            if isinstance(annotation.slice, ast.Tuple)
+            else (annotation.slice,)
+        )
+        return (
+            len(parameters) == 2
+            and isinstance(parameters[-1], ast.Constant)
+            and parameters[-1].value is Ellipsis
+        )
+    return False
+
+
+def _return_display_flattens(definition: Any, returned: Any) -> bool:
+    """Whether a returned Tuple/List display is flattened into output slots."""
+
+    return isinstance(returned, (ast.Tuple, ast.List)) and not (
+        _declared_sequence_return(definition)
+    )
+
+
 def _normalize_lexical_values(
     function_graph: Any,
     statement: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -5321,7 +5395,7 @@ def _normalize_lexical_values(
     return_expression_lists = tuple(
         (
             tuple(returned.elts)
-            if isinstance(returned, (ast.Tuple, ast.List))
+            if _return_display_flattens(statement, returned)
             else (returned,)
         )
         for return_statement in function_return_statements(statement)
@@ -5370,7 +5444,7 @@ def _normalize_lexical_values(
                     absent_arm,
                     0 if absent_arm
                     else len(returned_arm.elts)
-                    if isinstance(returned_arm, (ast.Tuple, ast.List))
+                    if _return_display_flattens(statement, returned_arm)
                     else 1,
                 ))
             present_lengths = {
@@ -12133,7 +12207,7 @@ def _normalize_lexical_values(
             returned = body_statement.value
             expressions = (
                 tuple(returned.elts)
-                if isinstance(returned, (ast.Tuple, ast.List))
+                if _return_display_flattens(statement, returned)
                 else (returned,)
             )
             output_names = tuple(
@@ -12245,7 +12319,9 @@ def _normalize_lexical_values(
                 container_cell = field_state_book.post(
                     _RETURN_SITE_CONTAINER,
                     (ingestion_read_scope, return_site_cell),
-                    _ContainerKind.TUPLE if isinstance(returned, ast.Tuple)
+                    _ContainerKind.VALUE
+                    if not _return_display_flattens(statement, returned)
+                    else _ContainerKind.TUPLE if isinstance(returned, ast.Tuple)
                     else _ContainerKind.LIST if isinstance(returned, ast.List)
                     else _ContainerKind.VALUE,
                     stage=_REDUCER_RETURN,

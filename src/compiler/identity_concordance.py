@@ -6477,7 +6477,10 @@ class SequenceRowLayout:
     column_dtypes: tuple[str, ...]
 
 
-def shape_transformation_state(descriptor: Any) -> tuple[Any, ...] | None:
+# The fixed 5-element width is the declared ABI of this state.
+def shape_transformation_state(
+    descriptor: Any,
+) -> tuple[tuple[int, ...], str, int, str, tuple[int, ...] | None] | None:
     """Canonical, lossless shape state carried by one transformation edge.
 
     ``shape=()`` is retained: rank and metadata state distinguish a scalar
