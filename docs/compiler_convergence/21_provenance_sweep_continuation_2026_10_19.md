@@ -381,3 +381,22 @@ Pre-existing (fail on clean 380c80d7): three
 double/float64 refusal). `test_loop_composer.py` has no baseline here
 (one failure seen at ~290 s, `formal_shape ('tick','state')` Derived names
 no source cell; unclassified).
+
+## Addendum 5: record-covered optional output at finalization (after 7d7b2c63)
+
+User run on 7d7b2c63 (fingerprint 735f91dc...): cumulative 28/330,
+compiled-unverified=27, partial=1, failed=0. Units 041 and 065 (the
+original adaptation-loop blockers) and 042 are admitted. Blocker: unit 033
+`IdentityPage._resolved`, `native-result-layout-mismatch`: authored paths
+`((0,0),56), ((0,1),57)` vs published `56, q, 57, q`.
+
+Cause: `_accepted_physical_output_paths` (project_compilation_product.py
+~6574) admitted optional layouts only as two-element entries keyed by
+payload id (the old per-Phi receipts); the record-covered output publishes
+ONE entry keyed by the semantic output, `(p0, q0, p1, q1)`. Added the
+derived view: when the function has one semantic output whose layout is
+twice the authored leaf count and whose even positions are exactly the
+authored leaves in order, each leaf's physical ABI is its (payload,
+presence) pair at `(*path, component)`. Observed: unit 033 compiled from
+the live growth with no shortfalls, `repository_ssa_complete: True`.
+Gate (ten files): 457 passed / 9 failed, all nine pre-existing.

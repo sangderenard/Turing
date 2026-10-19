@@ -6615,6 +6615,41 @@ def _accepted_physical_output_paths(
         # Optional lowering turns one authored scalar/record slot into its
         # exact physical (payload, presence) return ABI.
         return ({(0,): int(layout[0]), (1,): int(layout[1])}, "tuple")
+    # A function whose return sites disagree in arity (RETURN_OUTPUT_ARMS,
+    # kind OPTIONAL_AGGREGATE: ``IdentityPage._resolved`` returning
+    # ``row, column`` or ``None``) declares ONE semantic output whose
+    # accepted layout interleaves the presence companion after each payload
+    # leaf: ``aggregate_return_layouts == ((output, (p0, q0, p1, q1)),)``.
+    # The authored paths are that output's SOURCE_AGGREGATE_LAYOUT leaves,
+    # ``(0, k) -> p_k``.  The two per-Phi branches above read only
+    # two-element layouts keyed by payload id, so this one entry was
+    # invisible and the unit was reported ``native-result-layout-mismatch``
+    # (authored 56, 57; published 56, q, 57, q).  The record's even
+    # positions ARE the authored leaves, in order; each leaf's physical
+    # return ABI is its (payload, presence) pair.
+    semantic_output_ids = tuple(
+        int(value_id)
+        for value_id in function.metadata.get("semantic_output_ids") or ()
+    )
+    if resolved and len(semantic_output_ids) == 1:
+        output_layout = dict(
+            (int(output_id), tuple(map(int, layout)))
+            for output_id, layout in tuple(
+                function.metadata.get("aggregate_return_layouts", ())
+            )
+        ).get(semantic_output_ids[0])
+        if (
+            output_layout is not None
+            and len(output_layout) == 2 * len(resolved)
+            and tuple(resolved.values()) == output_layout[0::2]
+            and len(output_layout) == len(set(output_layout))
+            and set(output_layout) == published_ids
+        ):
+            return ({
+                (*path, component): int(output_layout[2 * leaf + component])
+                for leaf, path in enumerate(resolved)
+                for component in (0, 1)
+            }, "tuple")
     if not resolved and optional_layouts:
         ordered_layouts = tuple(optional_layouts.values())
         flattened = tuple(
