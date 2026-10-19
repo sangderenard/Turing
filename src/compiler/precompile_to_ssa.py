@@ -17384,6 +17384,72 @@ class _ControlSSABuilder(TiledObject):
                 return int(row[1]), fact
         return None
 
+    def _return_merge_sequence_destination(
+        self, merged: SSAValue, incoming_values: Iterable[SSAValue],
+    ) -> SSAValue:
+        """Make a return merge whose arms are ALL sequence arenas ONE sequence.
+
+        Program: ``_detached_ordinals`` -- ``if not d: return []`` then
+        ``return sorted(chain.from_iterable(...))``.  Both returns are
+        resident sequences, so the reducer minted no merge value and the
+        guard keeps two return edges.
+        Wrong record: the ``return_merge`` Phi was a bare minted value with
+        dtype 'unknown', no frame accounting and no key in the sequence
+        table, so the published output was an ``unresolved-boundary-types``
+        shortfall even though both arms (and ``output_identity_aliases``,
+        arm -> Phi) already name it as their one output.
+        Rule now holding: the merge OWNS a sequence descriptor (the same
+        ``_sequence_descriptor`` helper every destination uses, with the
+        arms' policy/width and the first known element dtype per column), its
+        data arena is claimed by the Phi exactly as the ``conditional_result``
+        merge claims its graph id, and the arms reach it through the
+        existing ``output_identity_aliases`` edges.  A merge with any
+        non-sequence arm, or arms that disagree on policy/width, is returned
+        unchanged (mixed merges stay on the bare-Phi path).
+        """
+
+        arms = [
+            self.sequence_descriptors.get(int(value.id))
+            for value in incoming_values
+        ]
+        if not arms or any(arm is None for arm in arms):
+            return merged
+        policies = {"unique" if arm.key_columns else "duplicates" for arm in arms}
+        widths = {len(arm.column_value_ids) for arm in arms}
+        if (
+            len(policies) != 1 or len(widths) != 1
+            or any(arm.child_table_pool is not None for arm in arms)
+        ):
+            return merged
+        width = next(iter(widths))
+        column_dtypes = tuple(
+            next((
+                str(arm.column_dtypes[column]) for arm in arms
+                if column < len(arm.column_dtypes)
+                and str(arm.column_dtypes[column]) not in {
+                    "", "None", "unknown",
+                }
+            ), "unknown")
+            for column in range(width)
+        )
+        descriptor = self._sequence_descriptor(
+            int(merged.id),
+            policy=next(iter(policies)),
+            writable=True,
+            location=f"{self.function_name}.return_merge",
+            column_count=width,
+            retains_deleted_rows=any(
+                arm.live_flags_value_id is not None for arm in arms
+            ),
+            column_dtypes=column_dtypes,
+        )
+        if descriptor is None:
+            return merged
+        return self.produced_value(
+            int(merged.id), claim_provisional_definition=True,
+            cause=tuple(incoming_values),
+        )
+
     def finish(self) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
         self.active_stage = CONTROL_SSA_FINISH
         self.settle_selected_child_element_dtypes()
@@ -18072,6 +18138,9 @@ class _ControlSSABuilder(TiledObject):
                     merged = self.fresh_value(
                         dtype=dtype, transform=PHI_RETURN_MERGE,
                         operands=tuple(incoming_values),
+                    )
+                    merged = self._return_merge_sequence_destination(
+                        merged, incoming_values,
                     )
                 if len(edges) != 1:
                     self.emit(

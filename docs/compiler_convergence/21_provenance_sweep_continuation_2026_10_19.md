@@ -301,3 +301,51 @@ checkpoint 2b94890e, pass at 7c560b04; not from this session):
 and four `test_ellipsis_store_ingestion.py` variants ([3],[5] x 2).
 Gate on this tree: six files + reducer + ast ingestion = 313 passed,
 5 failed (the four audit fixtures and the classmethod test).
+
+## Addendum 3: sequence return merge; the dropped sort (commit after 11fb3fab)
+
+User run on 11fb3fab (fingerprint a609d2a3...): admitted=14,
+compiled-unverified=13, partial=1, failed=0. Unit 042 passed SSA lowering
+and was partial at finalization with one shortfall,
+`unresolved-boundary-types` on its single published output.
+
+Traced: the output is the return-merge Phi of two sequence arenas (`[]`
+and the `sorted(...)` result). Finalization accepts a value only if it owns
+a sequence descriptor (a key of `module.sequence_tables`); the
+`conditional_result` path (single-exit folding) already gives its merge
+one, the `return_merge` path minted a bare Phi. Fixed in precompile
+(`_return_merge_sequence_destination`): when every arm of a return merge
+is a sequence arena of one policy/width, the merge is minted as a
+sequence descriptor through the existing `_sequence_descriptor` helper and
+claimed as the Phi's data arena exactly as the conditional merge does; the
+arms reach it through the existing `output_identity_aliases`. Observed:
+`p1.py e8` predicate False, Ret width 1, both CondBr present; unit 042
+compiles from the growth pickle with no shortfall; the optional-tuple
+repros unchanged; gate 313 passed / 5 failed, same ids.
+
+Not done: element dtype. The destination's column dtype stays 'unknown',
+as it does for the single-exit precedent. The declared return annotation
+is not on the book (ingestion posts only PARAMETER_ANNOTATION), and the
+append lowering sets no element dtype from its argument; a return
+annotation row would be the record to add, and the audit must learn it.
+
+FOUND, PRE-EXISTING, SILENT: `sorted(<generator expression>)` loses its
+sort everywhere (old compiler too, observed on 7c560b04). The reducer
+materializes the generator into the `sorted` call's own result arena and
+stamps the loop's append with the call node as effect id
+(loop_composer ~5609 via `materializer_node_id`, reducer ~11404/11470);
+`post_source_sort_contract` posts the sort with the same effect id;
+`_install_lexical_sequence_mutations` (fortran_c_shell ~12580) dedups
+mutations by effect id and discards the sort as already placed. One
+identity, two effects. `sorted(x)` over a plain sequence keeps its sort.
+Unit 042's compiled form therefore returns UNSORTED ordinals; its
+`compiled-unverified` status is wrong code until this is fixed. Owner: the
+writer that gives the loop's append the call node's identity (the
+materialization is the loop's effect; the sort is the call's).
+
+Pre-existing failures introduced by the checkpoint commit 2b94890e (pass
+at 7c560b04): three `test_ir_sequence_tables.py` tests
+(`..._keeps_tuple_slots_and_object_references`,
+`test_bare_tuple_constructor_field_is_an_opaque_native_reference`,
+`..._keeps_literal_vocabulary_and_optional_scalar_tag`), in addition to
+the classmethod and ellipsis-store tests already listed.
