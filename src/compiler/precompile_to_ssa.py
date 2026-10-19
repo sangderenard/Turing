@@ -12372,7 +12372,7 @@ class _ControlSSABuilder(TiledObject):
                     arguments = publication['source_argument_value_ids']
                 if (arguments != (receipt['source_value_id'],)
                         or mutation.predicate_expression is not None
-                        or int(mutation.effect_node_id) != receipt['materializer_node_id']):
+                        or int(mutation.effect_node_id) != receipt['loop_node_id']):
                     raise ValueError(f'{location}: native collection publication differs from its loop edge')
                 item = self.external_value(receipt['member_value_id'])
                 if item.dtype not in {None, 'unknown', 'opaque_ref'} or item.shape:

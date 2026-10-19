@@ -349,3 +349,35 @@ at 7c560b04): three `test_ir_sequence_tables.py` tests
 `test_bare_tuple_constructor_field_is_an_opaque_native_reference`,
 `..._keeps_literal_vocabulary_and_optional_scalar_tag`), in addition to
 the classmethod and ellipsis-store tests already listed.
+
+## Addendum 4: sorted(<generator>) keeps its sort (commit after 380c80d7)
+
+Two writers, one identity each:
+- loop_composer ~5609: the materializing loop's append now carries the
+  LOOP's own node as its effect identity (`loop.node_id`), not the sorted
+  call's; precompile's native-collection check compares against the
+  receipt's `loop_node_id`. The placement filter in
+  `_install_lexical_sequence_mutations` therefore no longer discards the
+  sort as "already placed".
+- loop_composer, after `rewire_continuation(materializer -> collection)`:
+  the SOURCE_SORT_CONTRACT row posted by the reducer for the sorted call
+  is REVISED so destination and source are the LoopResult (the collected
+  arena), Derived from the old contract cell and the port row. The sort
+  mutation's `argument_value_ids` then name the collection, which the
+  existing `dependency_signature` ordering treats as a value feed produced
+  by the loop block, so the sort is placed after the loop by dependency,
+  not by authored position. `sorted(real_sequence)` is unchanged.
+
+Observed: `gen_sort` and `e8` lower with append in `loop_body`, then
+`replace`+`sort` on the SAME arena in `loop_exit`; unit 042 from the
+growth pickle holds `..._20_append`, `..._20_replace_20`, `..._20_sort`,
+no shortfalls, `repository_ssa_complete: True`. Nine-file gate 359
+passed / 8 failed, the known ids. Not observed: native runtime of the
+in-place `replace` on identical storage (documented as valid by
+`lower_sequence_replace`); needs the user's bootstrap.
+
+Pre-existing (fail on clean 380c80d7): three
+`test_symbolic_law_batch_materialization.py` tests (shape concordance
+double/float64 refusal). `test_loop_composer.py` has no baseline here
+(one failure seen at ~290 s, `formal_shape ('tick','state')` Derived names
+no source cell; unclassified).

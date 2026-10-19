@@ -2326,6 +2326,47 @@ def materialize_retained_loop_ports(
                         for version in superseded_versions
                     ]
                     post_port_version(superseded_name, collection_id)
+            if materializer_attributes.get("source_sorted_call"):
+                # ``sorted(<generator>)``: the sorted Call is the
+                # materializer, and the LoopResult superseded it above, so
+                # the loop's collected arena IS the call's result.  The sort
+                # contract (row keyed by the call) must say so: the
+                # collection is both source and destination, and the sort is
+                # in place on it (the ``list.sort`` form, no self-copy).
+                from .concordance_declarations import (
+                    SOURCE_SORT_CONTRACT, SourceSortContract,
+                )
+
+                sort_row = materializer_attributes.get(
+                    "source_sort_contract_row"
+                )
+                sort_cell = (
+                    None if sort_row is None else
+                    book.latest_ref(SOURCE_SORT_CONTRACT, tuple(sort_row))
+                )
+                sort_fact = (
+                    None if sort_cell is None else
+                    book.page(SOURCE_SORT_CONTRACT).cell(
+                        sort_cell.row, sort_cell.column,
+                    )
+                )
+                if isinstance(sort_fact, SourceSortContract):
+                    book.post(
+                        SOURCE_SORT_CONTRACT, tuple(sort_row),
+                        SourceSortContract(
+                            sort_fact.argument_kind,
+                            sort_fact.argument_value_ids,
+                            sort_fact.key_column, sort_fact.reverse,
+                            int(collection_id), sort_fact.operation,
+                            sort_fact.policy,
+                            int(collection_id),
+                        ),
+                        stage=LOOP_COMPOSER,
+                        provenance=Derived(tuple(filter(None, (
+                            sort_cell, port_rows.get(int(collection_id)),
+                        )))),
+                        mode=Mode.REVISE,
+                    )
             planned_iteration_outputs.append(LoopIterationOutput(
                 value_id=int(output.value_id),
                 result_value_id=collection_id,
@@ -5606,7 +5647,10 @@ def analyze_shader_loop_reductions(
                 sequence_value_id=int(output.result_value_id),
                 operator=("update" if kind == "dict" else "add" if kind == "set" else "append"),
                 argument_value_ids=arguments,
-                effect_node_id=int(output.materializer_node_id),
+                # The append is this loop's effect (the generator collecting
+                # into the materializer's result arena); the materializer
+                # node stays the destination and may own its own effect.
+                effect_node_id=int(loop.node_id),
                 policy="unique" if kind in {"dict", "set"} else "duplicates",
                 argument_kind="mapping_items" if kind == "dict" else "value",
                 predicate_expression=output_predicate,
