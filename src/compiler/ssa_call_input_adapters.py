@@ -241,9 +241,45 @@ def _concord_exact_region_feed_dtypes(
                     actual_physical = actual_accounting.get('physical_dtype')
                     if resident is not None:
                         resident_type = (resident.accounting or {}).get('physical_dtype') or resident.dtype
+                        # Unit 065 ``SSASequenceDescriptor.to_mapping``: feed
+                        # id 0 (int64 resident) enters
+                        # ``to_mapping__planned_region_2`` formal 0 (float64).
+                        # The operand is the Cast minted for that edge; it is
+                        # a recorded converted view of the resident, owned by
+                        # the CALL_INPUT_CONVERSION row (caller, resident id,
+                        # callee, formal id) and by its own
+                        # ``call_input_conversion`` accounting.  Restoring the
+                        # int64 resident over it, uncounted, made the
+                        # conversion mint (counted) re-run every round, so
+                        # round 1 returned to round 0 with changes > 0.
+                        # Rule: a conversion view owned by that record that
+                        # already carries the exact dtype is kept; a stale one
+                        # (dtype != exact_dtype) is still restored so the
+                        # adapter mints the correct Cast.
+                        owned_conversion = False
+                        if actual is not resident:
+                            conversion_row = (
+                                str(caller.name), int(resident.id),
+                                str(callee.name), int(formal.id),
+                            )
+                            recorded = book.page('call_input_conversion').latest(
+                                conversion_row)
+                            owned_conversion = (
+                                recorded is not None
+                                and int(recorded[0]) == int(actual.id)
+                                and (actual.accounting or {}).get(
+                                    'call_input_conversion'
+                                ) == conversion_row
+                                and str(actual.dtype) == exact_dtype
+                            )
                         if resident_type in _NUMERIC_DTYPES:
                             actual_physical = resident_type
-                            if resident_type != exact_dtype:
+                            if owned_conversion:
+                                actual_physical = (
+                                    actual_accounting.get('physical_dtype')
+                                    or actual.dtype
+                                )
+                            elif resident_type != exact_dtype:
                                 instruction.args[position] = resident
                                 actual = resident
                                 actual_accounting = dict(resident.accounting or {})

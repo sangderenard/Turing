@@ -476,6 +476,41 @@ RETURN_SITE_FIELD_STATE = declare_page("return_site_field_state", (
 SSA_FIELD_VERSION = declare_page("ssa_field_version", (
     RowField("function_scope", K.SCOPE), RowField("field_state_cell", K.PAGE_REF),
 ), object)                             # the SSA value published for a field-state cell
+# The arms of a function whose return statements disagree on arity.
+#
+# Programs: ``-> tuple[int, int] | None`` returning ``None`` or ``n, n + 1``
+# (``IdentityPage._resolved``) and ``-> tuple[int, ...]`` returning ``()`` or
+# ``(n,)``.  The wrong record was ``function_output_shortfall`` (written,
+# never read): the function had no semantic output, so every return became
+# its own Phi layout.  The rule now holding: ONE output value, posted here,
+# whose row is DERIVED from every arm's return-site container cell and slot
+# cells; ``length`` is the arm's slot count (``return None`` is length 0 and
+# ``absent``, read from the authored ``None`` constant, never from a name).
+class ReturnArmsKind(Enum):
+    OPTIONAL_AGGREGATE = "optional_aggregate"
+    VARIADIC = "variadic"
+
+
+@dataclass(frozen=True)
+class ReturnArm:
+    site: Ref
+    container: Ref
+    length: int
+    absent: bool
+
+
+@dataclass(frozen=True)
+class ReturnOutputArms:
+    kind: ReturnArmsKind
+    arms: tuple
+    width: int
+    member_cells: tuple
+
+
+RETURN_OUTPUT_ARMS = declare_page("return_output_arms", (
+    RowField("reduction_scope", K.SCOPE), RowField("output", K.VALUE_ID),
+), ReturnOutputArms)                   # mode CONCORD; Unresolved when unclassified
+RETURN_ARMS_UNCLASSIFIED = declare_reason("return_arms_unclassified")
 RECORD_RETURN_FIELD_SELECTION = declare_page("record_return_field_selection", (
     RowField("function_scope", K.SCOPE), RowField("return_merge_phi", K.PAGE_REF),
     RowField("field", K.NAME), RowField("position", K.INDEX),
@@ -3843,6 +3878,14 @@ CALL_ARGUMENT_OPERAND = declare_page("call_argument_operand", (
     RowField("position", K.INDEX),
 ), tuple)
 
+#: ``_concord_item_operands``: the operand position a captured ``item()`` node
+#: reads, ``(read scope, item id)`` -> ``(operand id, role, ordinal)``, CONCORD,
+#: DERIVED(the operand position's transition / lexical read binding cell, else
+#: the item node's identity cell; and the operand node's identity cell).
+ITEM_OPERAND = declare_page("item_operand", (
+    RowField("read_scope", K.SCOPE), RowField("item", K.VALUE_ID),
+), tuple)
+
 #: ``_record_aggregate_ledger_lookup``: every aggregate-ledger lookup, found or
 #: not, ``(owner, value, "ledger_lookup")`` -> ``(state, leaf count, resident
 #: count, node type, expression type, ledger keys, ...)``.  REVISE (each lookup
@@ -3904,6 +3947,18 @@ TENSOR_SHAPE_ENRICHMENT = declare_page("tensor_shape_enrichment", (
 CALL_RESULT_PROJECTION = declare_page("call_result_projection_concordance", (
     RowField("call", K.VALUE_ID), RowField("projection", K.VALUE_ID),
 ), tuple)
+#: ``_class_surface_ssa_program``: an assignment target's projection of a call
+#: result (``a, b = f(n)``), ``(caller symbol, call node, projection node)`` ->
+#: ``(aggregate temporary, target name, projection node, target identity
+#: history)``; CONCORD, DERIVED(the ``assignment_projection_source`` cell of the
+#: target, the ``call_result_projection`` cell of the projection, the call
+#: node's and projection node's identity cells), stage FRAME_BINDING.
+ASSIGNMENT_PROJECTION_IDENTITY = declare_page(
+    "assignment_projection_identity_concordance", (
+        RowField("caller", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("projection", K.INDEX),
+    ), tuple,
+)
 #: The settlement pass's first receipt for a re-proved value, ``(function,
 #: value)`` -> ``(extents, dtype)``, CONCORD, DERIVED(the value's identity cell).
 TENSOR_SHAPE_SETTLEMENT = declare_page("tensor_shape_settlement_concordance", (

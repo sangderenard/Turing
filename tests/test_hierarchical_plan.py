@@ -511,6 +511,92 @@ def test_native_optional_aggregate_return_binds_one_semantic_call_result():
     assert call.result_bindings == ((11, 3),)
 
 
+def test_native_record_covered_optional_aggregate_binds_member_projections():
+    """One output over returns of different arity: ``r[k]`` is payload ``k``.
+
+    The physical return interleaves presence (``p0, q0, p1, q1``); the
+    caller's projection path ``(k,)`` is the aggregate position, so
+    ``Indexed(call, 1)`` binds payload 1 and never presence 0.
+    """
+
+    from src.transmogrifier.ssa import (
+        BasicBlock, Function, IRModule, Instr, SSAValue,
+    )
+
+    process = nx.DiGraph()
+    process.add_node(
+        3, type="Call", op="call", parents=(),
+        attributes={"callee_ref": 62},
+        expr_obj=ast.parse("maybe_pair()", mode="eval").body,
+    )
+    for index_id, value, projection_id in ((4, 0, 6), (5, 1, 7)):
+        process.add_node(index_id, type="Const", op="const", constant=value,
+                         parents=(), attributes={"value": value})
+        process.add_node(
+            projection_id, type="Indexed", op="indexed",
+            parents=((3, "base"), (index_id, "index")), attributes={},
+        )
+        process.add_edge(3, projection_id)
+    process.graph["identity_table"] = {}
+    _ingested(process, "record-covered-optional")
+
+    def pair(payload_id, presence_id):
+        return (
+            SSAValue(payload_id, "int64", accounting={
+                "ssa_optional_payload": True,
+                "ssa_optional_presence_id": presence_id,
+            }),
+            SSAValue(presence_id, "bool", accounting={
+                "ssa_optional_presence": True,
+                "ssa_optional_payload_id": payload_id,
+            }),
+        )
+
+    outputs = (*pair(17, 12), *pair(18, 14))
+    declaration = Function(
+        "maybe_pair", [],
+        {"entry": BasicBlock("entry", [Instr("Ret", list(outputs), None)])},
+        metadata={
+            "native_interface": {
+                "argument_ids": (),
+                "output_ids": (17, 12, 18, 14),
+                "output_paths": (
+                    ((0, 0), 17), ((0, 1), 12), ((1, 0), 18), ((1, 1), 14),
+                ),
+            },
+            "semantic_output_ids": (16,),
+            "aggregate_return_layouts": ((16, (17, 12, 18, 14)),),
+            "optional_return_contracts": tuple(
+                {"payload_value_id": payload, "presence_value_id": presence,
+                 "return_output_id": 16, "return_position": position}
+                for position, (payload, presence)
+                in enumerate(((17, 12), (18, 14)))
+            ),
+            "parameter_names": (),
+            "authored_parameters": (),
+        },
+    )
+    entry = SimpleNamespace(metadata={
+        "host_ssa_module": IRModule({"maybe_pair": declaration}),
+        "host_ssa_root": "maybe_pair",
+    })
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(
+            G=process,
+            function_table=SimpleNamespace(entry=lambda _reference: entry),
+        ),
+        dispatch_subgraphs=(),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    call, = _build_shell_hierarchy_plan(shell).items
+
+    assert isinstance(call, PlanCall)
+    assert call.result_bindings == ((16, 3), (17, 6), (18, 7))
+
+
 def test_exact_peer_descriptor_folds_shape_with_unsettled_parameter():
     process = nx.DiGraph()
     process.graph["function_name"] = "reshape_peer"

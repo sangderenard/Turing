@@ -3012,6 +3012,22 @@ class LoopComposer:
                             int(value_id) for value_id in reversed(slot_values)
                             if value_id is not None and int(value_id) in graph.G
                         ), None)
+                        if return_value_id is None:
+                            # ``return ()`` (TUPLE container, zero slots, in
+                            # ``-> tuple[int, ...]`` or the ``return ()`` arm
+                            # of ``-> ... | None``): no element survives, so
+                            # the hint is the site cell's own VALUE_ID, read
+                            # through the page's declared row shape.  Same
+                            # rule as glsl ``arm_return_control``.
+                            from .identity_concordance import RowFieldKind
+                            site_cell = return_site_cell_for(graph, returned)
+                            return_value_id = next((
+                                int(item) for declared, item in zip(
+                                    site_cell.page.row_fields, site_cell.row)
+                                if declared.kind is RowFieldKind.VALUE_ID
+                                and isinstance(item, int)
+                                and int(item) in graph.G
+                            ), None) if site_cell is not None else None
                     if slot_values is not None:
                         # The site is the return CONSTRUCT: its cell on the
                         # book (the ``return_site_*`` rows' key) and its

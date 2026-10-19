@@ -4979,10 +4979,12 @@ def project_process_graph_acceptance(graph, references, book=None):
         _source_numeric_scope, node_ingestion_scopes,
     )
     from .concordance_declarations import (
-        RETURN_SITE_CONTAINER, RETURN_SITE_FIELD_STATE, RETURN_SITE_SLOT,
+        RETURN_OUTPUT_ARMS, RETURN_SITE_CONTAINER, RETURN_SITE_FIELD_STATE,
+        RETURN_SITE_SLOT,
     )
     return_site_pages = (
         RETURN_SITE_SLOT, RETURN_SITE_CONTAINER, RETURN_SITE_FIELD_STATE,
+        RETURN_OUTPUT_ARMS,
     )
 
     def return_site_scopes(body):
@@ -7025,6 +7027,7 @@ def _compile_resolved_process_graph_unit_impl(
             shortfalls.append({
                 "kind": "unexplained-public-arguments",
                 "value_ids": list(unexplained_arguments),
+                "details": list(_unexplained_root_argument_details(function)),
             })
         if unresolved_calls:
             shortfalls.append({

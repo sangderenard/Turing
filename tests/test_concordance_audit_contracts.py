@@ -31,18 +31,28 @@ def test_record_handle_alias_is_owned_but_not_a_physical_operand():
 
 @pytest.mark.parametrize('unresolved_side', ['target', 'source', 'both'])
 def test_capture_audit_reports_unresolved_binding_instead_of_crashing(unresolved_side):
-    from src.compiler.identity_concordance import begin_identity_book, end_identity_book, Unresolved, NEW
-    from src.compiler.concordance_declarations import BindingFact
+    from src.compiler.identity_concordance import (
+        begin_identity_book, end_identity_book, Unresolved, Derived, Mode, Novel,
+    )
+    from src.compiler.concordance_declarations import (
+        BindingFact, BINDING_VERSION_REMOVED, CANONICAL_VALUE, INGESTION,
+        INGEST_SOURCE, NAME_BINDING, NAME_BINDING_CAPTURE,
+    )
     from src.transmogrifier.ssa import IRModule
     book, token = begin_identity_book()
     try:
+        scope = ('scope', 0)
+        value_cell = book.post(CANONICAL_VALUE, (scope, 7), ('value',), stage=INGESTION,
+                               provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD)
         fact = BindingFact(7, True, (), '')
-        unresolved = Unresolved(NEW)
-        book.page('name_binding').set(('scope', 'target', 0), 0,
-                                      unresolved if unresolved_side in {'target', 'both'} else fact)
-        book.page('name_binding').set(('scope', 'source', 0), 0,
-                                      unresolved if unresolved_side in {'source', 'both'} else fact)
-        book.page('name_binding_capture').set(('scope', 'target', 0), 0, ('source', 0, None))
+        unresolved = Unresolved(BINDING_VERSION_REMOVED, read=(value_cell,))
+        cells = {}
+        for name in ('target', 'source'):
+            posted = unresolved if unresolved_side in {name, 'both'} else fact
+            cells[name] = book.post(NAME_BINDING, (scope, name, 0), posted, stage=INGESTION,
+                                    provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD)
+        book.post(NAME_BINDING_CAPTURE, (scope, 'target', 0), ('source', 0, None), stage=INGESTION,
+                  provenance=Derived((cells['target'], cells['source'])), mode=Mode.CONCORD)
         module = IRModule({}, metadata={'identity_book': book})
         findings = CorrelationTable._name_binding_capture_findings(module)
         assert len(findings) == 1
@@ -200,8 +210,13 @@ def test_value_type_abi_accepts_direct_post_ssa_value_identity():
 def test_removed_binding_retires_its_capture_with_the_same_provenance(already_removed):
     from types import SimpleNamespace
     import networkx as nx
-    from src.compiler.identity_concordance import begin_identity_book, end_identity_book, Unresolved
-    from src.compiler.concordance_declarations import BindingFact, BINDING_VERSION_REMOVED
+    from src.compiler.identity_concordance import (
+        begin_identity_book, end_identity_book, Unresolved, Derived, Mode, Novel,
+    )
+    from src.compiler.concordance_declarations import (
+        BindingFact, BINDING_VERSION_REMOVED, CANONICAL_VALUE, INGESTION,
+        INGEST_SOURCE, NAME_BINDING, NAME_BINDING_CAPTURE,
+    )
     from src.compiler.planner_concordance_posts import _post_identity_table_mutation
     from src.transmogrifier.ssa import IRModule
     book, token = begin_identity_book()
@@ -209,13 +224,17 @@ def test_removed_binding_retires_its_capture_with_the_same_provenance(already_re
         graph = SimpleNamespace(G=nx.DiGraph())
         graph.G.graph['lexical_read_scope'] = ('scope', 0)
         scope = ('scope', 0)
+        value_cell = book.post(CANONICAL_VALUE, (scope, 310), ('removed',), stage=INGESTION,
+                               provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD)
+        cells = {}
         for name in ('target', 'source'):
-            book.page('name_binding').set((scope, name, 0), 0,
-                Unresolved(BINDING_VERSION_REMOVED) if already_removed
-                else BindingFact(310, True, (), ''))
+            posted = (Unresolved(BINDING_VERSION_REMOVED, read=(value_cell,)) if already_removed
+                      else BindingFact(310, True, (), ''))
+            cells[name] = book.post(NAME_BINDING, (scope, name, 0), posted, stage=INGESTION,
+                                    provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD)
         row = (scope, 'target', 0)
-        book.page('canonical_value').set((scope, 310), 0, ('removed',))
-        book.page('name_binding_capture').set(row, 0, ('source', 0, None))
+        book.post(NAME_BINDING_CAPTURE, row, ('source', 0, None), stage=INGESTION,
+                  provenance=Derived((cells['target'], cells['source'])), mode=Mode.CONCORD)
         _post_identity_table_mutation(graph, removed=(310,))
         retired = book.page('name_binding_capture').latest(row)
         assert isinstance(retired, Unresolved) and retired.reason == BINDING_VERSION_REMOVED

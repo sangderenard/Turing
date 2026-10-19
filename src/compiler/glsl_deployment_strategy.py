@@ -1365,13 +1365,23 @@ def _concord_item_operands(graph: Any, captures: Any) -> None:
     the value it reads.
     """
 
-    from ..common.tensors.topological_reducer import _operand_positions
-    from .identity_concordance import current_identity_book
+    from ..common.tensors.topological_reducer import (
+        _operand_positions, node_identity_cell,
+    )
+    from .concordance_declarations import (
+        IDENTITY_TRANSITION as _IDENTITY_TRANSITION,
+        ITEM_OPERAND as _ITEM_OPERAND,
+        LEXICAL_READ_BINDING as _LEXICAL_READ_BINDING,
+        OPERAND_POSITION as _OPERAND_POSITION,
+    )
+    from .identity_concordance import (
+        Derived as _Derived, Mode as _Mode, current_identity_book,
+    )
 
     scope = graph.G.graph.get("lexical_read_scope")
     if scope is None:
         return
-    page = current_identity_book().page("item_operand")
+    book = current_identity_book()
     for value_id in captures:
         if int(value_id) not in graph.G:
             continue
@@ -1388,10 +1398,33 @@ def _concord_item_operands(graph: Any, captures: Any) -> None:
         if len(operands) != 1:
             continue
         role, ordinal, operand = operands[0]
-        page.concord(
-            (tuple(scope), int(value_id)),
-            (int(operand), str(role), int(ordinal)),
-        )
+        # DERIVED from the cell of the item's operand position (its latest
+        # transition, else its lexical read binding), else the item node's
+        # identity cell; and the operand node's identity cell.
+        item_cells = []
+        for position_page in (_IDENTITY_TRANSITION, _LEXICAL_READ_BINDING):
+            position_cell = book.latest_ref(
+                position_page, (tuple(scope), int(value_id), role, ordinal),
+            )
+            if position_cell is not None:
+                item_cells.append(position_cell)
+                break
+        for cell_node in ((value_id,) if not item_cells else ()) + (operand,):
+            try:
+                item_cells.append(node_identity_cell(graph, int(cell_node)))
+            except ValueError:
+                pass
+        item_row = (tuple(scope), int(value_id))
+        item_fact = (int(operand), str(role), int(ordinal))
+        if item_cells:
+            book.post(
+                _ITEM_OPERAND, item_row, item_fact,
+                stage=_OPERAND_POSITION,
+                provenance=_Derived(tuple(dict.fromkeys(item_cells))),
+                mode=_Mode.CONCORD,
+            )
+        else:
+            book.page("item_operand").concord(item_row, item_fact)
 
 
 def _concord_call_argument_operands(
@@ -1477,8 +1510,13 @@ def _authored_output_paths(graph, outputs):
     return paths
 
 
-def _call_result_bindings(graph, node_id, output_paths):
-    """One projection operator for authored bodies and accepted native headers."""
+def _post_call_result_projections(graph, node_id):
+    """Find the call's ``Indexed`` projections and post their CALL_RESULT_PROJECTION rows.
+
+    The projection path is relative to the call's one result value.  Every
+    binding lane (authored body, accepted native header, declared union)
+    posts through here, so the rows exist whichever lane binds the call.
+    """
     caller_paths = {}
 
     def collect(path, value_id):
@@ -1522,6 +1560,12 @@ def _call_result_bindings(graph, node_id, output_paths):
             ))),
             mode=Mode.CONCORD,
         )
+    return caller_paths
+
+
+def _call_result_bindings(graph, node_id, output_paths):
+    """One projection operator for authored bodies and accepted native headers."""
+    caller_paths = _post_call_result_projections(graph, node_id)
     if tuple(output_paths) == ((0,),) and not (
         graph.G.nodes[int(node_id)].get("attributes") or {}
     ).get("authored_return_container"):
@@ -1530,7 +1574,86 @@ def _call_result_bindings(graph, node_id, output_paths):
                  for path in output_paths if path in caller_paths)
 
 
-def _accepted_semantic_result_bindings(declaration, output_paths, node_id):
+def _return_output_arms_members(child_graph, child_outputs):
+    """The member ids of the one output minted by RETURN_OUTPUT_ARMS, or None.
+
+    Read through the book: the output's SOURCE_AGGREGATE_LAYOUT row (named by
+    the output node's ``source_aggregate_layout_row``) shares its reduction
+    scope with the function's ``return_output_arms`` row for that output, and
+    an OPTIONAL_AGGREGATE record is the declaration that the output is one
+    value of varying arity.
+    """
+    if len(child_outputs) != 1:
+        return None
+    from .concordance_declarations import (
+        RETURN_OUTPUT_ARMS, ReturnArmsKind, ReturnOutputArms,
+        SOURCE_AGGREGATE_LAYOUT, SourceAggregateLayout,
+    )
+    from .identity_concordance import current_identity_book
+
+    output = int(child_outputs[0])
+    if output not in child_graph.G:
+        return None
+    layout_row = (child_graph.G.nodes[output].get("attributes") or {}).get(
+        "source_aggregate_layout_row"
+    )
+    if not isinstance(layout_row, (tuple, list)):
+        return None
+    book = current_identity_book()
+    arms_page = book.pages.get(RETURN_OUTPUT_ARMS.name)
+    if arms_page is None:
+        return None
+    arms = arms_page.latest((layout_row[0], output))
+    if not (
+        isinstance(arms, ReturnOutputArms)
+        and arms.kind is ReturnArmsKind.OPTIONAL_AGGREGATE
+    ):
+        return None
+    layout_cell = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, tuple(layout_row))
+    layout = (
+        None if layout_cell is None else
+        book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+            layout_cell.row, layout_cell.column
+        )
+    )
+    if not isinstance(layout, SourceAggregateLayout):
+        return None
+    return tuple(int(member.value_id) for member in layout.members)
+
+
+def _projection_result_bindings(graph, node_id, payload_ids):
+    """``(payload_k, Indexed_k)`` for one call whose single result is an
+    aggregate of ``payload_ids``, joined through CALL_RESULT_PROJECTION rows.
+
+    A projection row's path is ``(k,)`` relative to the call's result, and
+    ``k`` is the position in the aggregate layout, not in the physical
+    return (which interleaves presence flags).  Projections deeper than one
+    step or past the layout are not this aggregate's members and bind nothing.
+    """
+    from .concordance_declarations import CALL_RESULT_PROJECTION
+    from .identity_concordance import current_identity_book
+
+    _post_call_result_projections(graph, node_id)
+    page = current_identity_book().pages.get(CALL_RESULT_PROJECTION.name)
+    if page is None:
+        return ()
+    bindings = []
+    for row in page.rows():
+        if int(row[0]) != int(node_id):
+            continue
+        path = page.latest(row)
+        if (
+            isinstance(path, tuple) and len(path) == 1
+            and isinstance(path[0], int) and 0 <= path[0] < len(payload_ids)
+        ):
+            bindings.append((path[0], int(payload_ids[path[0]]), int(row[1])))
+    return tuple((payload, projection)
+                 for _position, payload, projection in sorted(bindings))
+
+
+def _accepted_semantic_result_bindings(
+    declaration, output_paths, node_id, graph=None,
+):
     """Recover a logical result from an accepted physical return layout.
 
     Optional SSA publishes ``(payload, presence)`` at the native boundary,
@@ -1571,7 +1694,28 @@ def _accepted_semantic_result_bindings(declaration, output_paths, node_id):
     pairs = tuple(zip(
         physical_outputs[0::2], physical_outputs[1::2], strict=True,
     ))
-    if int(pairs[0][0]) != semantic_output or not all(
+    # The payloads are either the semantic output itself (one optional
+    # value) or, for one output minted over a multi-arity return
+    # (RETURN_OUTPUT_ARMS), the aggregate's members in layout order: the
+    # per-position receipts ``optional_return_contracts`` carries for this
+    # output say which.
+    payload_ids = tuple(int(payload) for payload, _presence in pairs)
+    recorded_members = tuple(
+        int(contract["payload_value_id"])
+        for contract in sorted(
+            (
+                contract
+                for contract in declaration.metadata.get(
+                    "optional_return_contracts", ()
+                )
+                if contract.get("return_output_id") == semantic_output
+            ),
+            key=lambda contract: int(contract["return_position"]),
+        )
+    )
+    if int(pairs[0][0]) != semantic_output and recorded_members != payload_ids:
+        return None
+    if not all(
         values.get(int(payload_id)) is not None
         and values.get(int(presence_id)) is not None
         and (values[int(payload_id)].accounting or {}).get(
@@ -1583,7 +1727,12 @@ def _accepted_semantic_result_bindings(declaration, output_paths, node_id):
         for payload_id, presence_id in pairs
     ):
         return None
-    return ((semantic_output, int(node_id)),)
+    if recorded_members != payload_ids or graph is None:
+        return ((semantic_output, int(node_id)),)
+    return (
+        (semantic_output, int(node_id)),
+        *_projection_result_bindings(graph, node_id, payload_ids),
+    )
 
 
 def _build_shell_hierarchy_plan(
@@ -1916,7 +2065,7 @@ def _build_shell_hierarchy_plan(
                 )
             _concord_call_argument_operands(graph, int(node_id), dict(enumerate(edges)))
             result_bindings = _accepted_semantic_result_bindings(
-                declaration, output_paths, node_id,
+                declaration, output_paths, node_id, graph,
             )
             if result_bindings is None:
                 result_bindings = _call_result_bindings(
@@ -2216,6 +2365,7 @@ def _build_shell_hierarchy_plan(
                 # expand payloads and the tag later.
                 child_output_paths = {(0,): int(child_outputs[0])}
                 result_bindings = ((int(child_outputs[0]), int(node_id)),)
+                _post_call_result_projections(graph, node_id)
             else:
                 child_output_paths = _authored_output_paths(
                     child.process_graph, child_outputs,
@@ -2223,6 +2373,19 @@ def _build_shell_hierarchy_plan(
                 result_bindings = _call_result_bindings(
                     graph, node_id, child_output_paths,
                 )
+                arms_members = _return_output_arms_members(
+                    child.process_graph, child_outputs,
+                )
+                if arms_members is not None:
+                    # One output over returns of different arity: the call
+                    # result is that output, and the caller's ``r[k]`` is the
+                    # aggregate's member k.
+                    result_bindings = (
+                        (int(child_outputs[0]), int(node_id)),
+                        *_projection_result_bindings(
+                            graph, node_id, arms_members,
+                        ),
+                    )
             child_outputs = tuple(child_output_paths.values())
             _concord_call_argument_operands(graph, int(node_id), operand_edges)
             items.append(PlanCall(
@@ -8215,10 +8378,27 @@ def _ordinary_conditional_control_programs(
             sites = [int(node_id) for node_id, node_data in graph.G.nodes(data=True)
                      if isinstance(node_data.get("expr_obj"), ast.AST)
                      and signature(node_data["expr_obj"]) == signature(returned)]
-            site_id = min(sites) if sites else next((
-                int(value_id) for value_id in reversed(slots)
-                if value_id is not None and int(value_id) in graph.G
-            ), None)
+            # ``return ()`` (a TUPLE container, zero slots): the returned
+            # expression's node and every slot are gone, so the arm's own
+            # ``return_site_cell`` names the position hint -- the VALUE_ID of
+            # its row, read through the page's declared shape.  A zero-slot
+            # arm inside a loop otherwise has no hint and lost its
+            # control-owned return (the guard If dropped its CondBr).
+            from .identity_concordance import RowFieldKind
+            from .ssa_record_return_state import return_site_cell_for
+            site_cell = return_site_cell_for(graph, returned)
+            site_cell_node = next((
+                int(item) for declared, item in zip(
+                    site_cell.page.row_fields, site_cell.row)
+                if declared.kind is RowFieldKind.VALUE_ID
+                and isinstance(item, int) and int(item) in graph.G
+            ), None) if site_cell is not None else None
+            site_id = min(sites) if sites else (
+                site_cell_node if site_cell_node is not None else next((
+                    int(value_id) for value_id in reversed(slots)
+                    if value_id is not None and int(value_id) in graph.G
+                ), None)
+            )
             if inside_loop and site_id is None:
                 return None
             # The site's identity is the return construct's cell, the same

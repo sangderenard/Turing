@@ -228,6 +228,72 @@ _REGION_MARKER = re.compile(r"^__scheduled_region_(\d+)__$")
 _CALLSITE_MARKER = re.compile(r"^__plan_callsite_(\d+)__$")
 
 
+def _region_table_operations(
+    region_index: int,
+    table_region_operations: Mapping[int, Any] | None,
+    table_region_post_operations: Mapping[int, Any] | None,
+) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    """Every table/sequence operation recorded against one region.
+
+    PROGRAM SHAPE: ``buf = [1, 2]; buf += [3, 4]; buf.append(9)``.  The
+    instructions realising those effects are removed from the region's planned
+    instruction list and live ONLY in ``table_region_operations`` /
+    ``table_region_post_operations``.  WRONG RECORD (before): the scheduler
+    judged purity from the planned instructions, so a region carrying six
+    recorded effects was "pure" while the builder's ``_pure_region_index``
+    called the same region a barrier.  RULE NOW HOLDING: one predicate, this
+    record; a region with any recorded operation is an effect, not pure.
+    """
+
+    return (
+        *((table_region_operations or {}).get(int(region_index), ())),
+        *((table_region_post_operations or {}).get(int(region_index), ())),
+    )
+
+
+def _table_operation_sequence_accesses(
+    kind: str, arguments: tuple[Any, ...],
+) -> tuple[set[int], set[int]]:
+    """The arenas one recorded table operation reads and writes.
+
+    Positions follow the emitters' own signatures
+    (``emit_table_region_operations`` / ``_emit_*``); the sequence id is the
+    operation's own, never rediscovered.  Lookups and row loads read; stores,
+    deletes, fills, appends, prepends, resets, extends and bit packs write
+    their destination, and slice/extend/prepend_packed_bytes/pack_bits also
+    read their source arena.
+    """
+
+    reads: set[int] = set()
+    writes: set[int] = set()
+    if kind in ("lookup", "lookup_capture"):
+        reads.add(int(arguments[2]))
+    elif kind in ("row_load", "row_load_capture"):
+        reads.add(int(arguments[1]))
+    elif kind == "row_store":
+        writes.add(int(arguments[1]))
+    elif kind == "store":
+        writes.add(int(arguments[3]))
+    elif kind == "delete":
+        if arguments[2] is not None:
+            writes.add(int(arguments[2]))
+    elif kind in ("fill", "append_fill", "reset", "prepend"):
+        writes.add(int(arguments[0]))
+    elif kind in ("append_slice", "prepend_packed_bytes", "pack_bits"):
+        writes.add(int(arguments[0]))
+        reads.add(int(arguments[1]))
+    elif kind == "append_scalar":
+        writes.add(int(arguments[0]))
+    elif kind == "extend":
+        writes.add(int(arguments[1]))
+        reads.add(int(arguments[2]))
+    elif kind == "structural_consumed":
+        pass
+    else:
+        raise ValueError(f"unknown recorded table operation {kind!r}")
+    return reads, writes
+
+
 def _scoped_value_type_abi(
     lexical_read_scope: Any,
     supplied: Mapping[int, Any] | None = None,
@@ -8976,9 +9042,11 @@ class _ControlSSABuilder(TiledObject):
         region_index = int(match.group(1))
         if region_index not in self.region_signatures:
             return None
-        if self.table_region_operations.get(region_index):
-            return None
-        if self.table_region_post_operations.get(region_index):
+        if _region_table_operations(
+            region_index,
+            self.table_region_operations,
+            self.table_region_post_operations,
+        ):
             return None
         return region_index
 
@@ -17295,6 +17363,27 @@ class _ControlSSABuilder(TiledObject):
             "value_aliases": value_aliases,
         }
 
+    def _return_output_arms_record(self) -> Any:
+        """The function's ``return_output_arms`` fact and its output id, read
+        from the book by the function's read scope (one row per function
+        whose returns disagree on arity), or ``None``.  An ``Unresolved``
+        row is no record."""
+
+        from .concordance_declarations import RETURN_OUTPUT_ARMS, ReturnOutputArms
+
+        if self.lexical_read_scope is None:
+            return None
+        book = self._book()
+        page = book.pages.get(RETURN_OUTPUT_ARMS.name)
+        if page is None:
+            return None
+        for row in page.scope_rows(tuple(self.lexical_read_scope)):
+            cell = book.latest_ref(RETURN_OUTPUT_ARMS, row)
+            fact = None if cell is None else page.cell(cell.row, cell.column)
+            if isinstance(fact, ReturnOutputArms):
+                return int(row[1]), fact
+        return None
+
     def finish(self) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
         self.active_stage = CONTROL_SSA_FINISH
         self.settle_selected_child_element_dtypes()
@@ -17785,6 +17874,32 @@ class _ControlSSABuilder(TiledObject):
             # output slot, one Ret -- never "the last return's values on
             # every path".
             edges = list(self.function_return_edges)
+            # The record (``return_output_arms``) names each return site's
+            # arity and absence; an edge joins its arm by the site cell its
+            # own branch carries.  An edge no arm names (the open lexical
+            # epilogue, a site the record lacks) leaves the function on the
+            # unchanged path.
+            from .concordance_declarations import ReturnArmsKind
+
+            arms_record = self._return_output_arms_record()
+            edge_arms: dict[int, Any] = {}
+            if arms_record is not None:
+                for block, _values in edges:
+                    site = (
+                        block.instrs[-1].attributes.get("return_site_cell")
+                        if block.instrs else None
+                    )
+                    arm = next((
+                        candidate for candidate in arms_record[1].arms
+                        if site is not None and candidate.site == site
+                    ), None)
+                    if arm is None:
+                        arms_record = None
+                        break
+                    edge_arms[id(block)] = arm
+                if fallthrough_open:
+                    arms_record = None
+            record_kind = None if arms_record is None else arms_record[1].kind
             authored_edge_width = max(
                 (len(values) for _block, values in edges), default=0,
             )
@@ -17801,7 +17916,10 @@ class _ControlSSABuilder(TiledObject):
                             if isinstance(type_fact, Mapping)
                             else getattr(type_fact, "alternatives", ())
                         )
-                        if alternatives == ("builtins.NoneType",):
+                        if alternatives == ("builtins.NoneType",) or (
+                            record_kind is ReturnArmsKind.OPTIONAL_AGGREGATE
+                            and edge_arms[id(block)].absent
+                        ):
                             # A scalar ``None`` return is the payload-free arm
                             # of an aggregate union.  Every physical aggregate
                             # slot is absent on this edge; reusing the one
@@ -17841,11 +17959,54 @@ class _ControlSSABuilder(TiledObject):
                 for logical_slot, (name, _value_id) in enumerate(named_returns)
                 if logical_slot in logical_to_physical_return_slot
             }
+            variadic_recorded = False
             for slot in range(slot_count):
                 incoming_blocks = []
                 incoming_values = []
+                incoming_absent = []
                 for block, values in edges:
                     value = values[slot] if slot < len(values) else None
+                    arm = edge_arms.get(id(block))
+                    # Per-edge presence of slot ``slot`` is the record's:
+                    # absent iff the arm is absent or shorter than the slot.
+                    incoming_absent.append(
+                        arm is not None
+                        and (arm.absent or slot >= arm.length)
+                    )
+                    if value is None and record_kind is not None and (
+                        record_kind is ReturnArmsKind.VARIADIC
+                        or incoming_absent[-1]
+                    ):
+                        # The record covers this position: the arm declares
+                        # it absent (OPTIONAL_AGGREGATE) or the output is a
+                        # variable-length sequence (VARIADIC), whose real
+                        # lowering is the sequence lane
+                        # (SSASequenceDescriptor + ControlSequenceMutation
+                        # clear/extend), not a Phi per position.  Keep the
+                        # arity honest with an explicit absence; a VARIADIC
+                        # record is one named shortfall, not a raise here.
+                        value = self.fresh_value(
+                            dtype="none", transform=CONTROL_CONST,
+                        )
+                        self.current = block
+                        terminator = block.instrs.pop()
+                        self.emit(Handler.NoneValue, [], value)
+                        block.instrs.append(terminator)
+                        self.current = exit_block
+                        if (
+                            record_kind is ReturnArmsKind.VARIADIC
+                            and not variadic_recorded
+                        ):
+                            variadic_recorded = True
+                            self.shortfalls.append(SSALoweringShortfall(
+                                "control", "return_arms_variadic_unlowered",
+                                f"{self.function_name}.return_arms",
+                                "returns of differing arity form a "
+                                "variable-length output; the sequence lane "
+                                "(SSASequenceDescriptor + "
+                                "ControlSequenceMutation clear/extend) is "
+                                "the lowering and is not built",
+                            ))
                     if value is None:
                         # An unresolved slot on this return: keep the Phi
                         # arity honest with an explicit absence and record
@@ -17872,13 +18033,30 @@ class _ControlSSABuilder(TiledObject):
                      if value.dtype not in {None, "unknown", "none"}),
                     str(incoming_values[0].dtype or "unknown"),
                 )
+                member_phi = (
+                    record_kind is ReturnArmsKind.OPTIONAL_AGGREGATE
+                    and len(edges) > 1
+                    and slot < len(arms_record[1].member_cells)
+                )
                 if len(edges) == 1:
                     merged = incoming_values[0]
+                elif member_phi:
+                    # The join is the record: this slot's merge IS the
+                    # member Phi the reducer minted for position ``slot``
+                    # (its graph id; its ``ssa_value`` row DERIVED from the
+                    # member's canonical cell), as the conditional join
+                    # adopts the graph's merge id.
+                    merged = SSAValue(
+                        int(arms_record[1].member_cells[slot].row[1]),
+                        dtype=dtype,
+                    )
+                    self._value_cell(merged, *incoming_values)
                 else:
                     merged = self.fresh_value(
                         dtype=dtype, transform=PHI_RETURN_MERGE,
                         operands=tuple(incoming_values),
                     )
+                if len(edges) != 1:
                     self.emit(
                         Handler.Phi,
                         incoming_values,
@@ -17887,6 +18065,10 @@ class _ControlSSABuilder(TiledObject):
                             "incoming_blocks": tuple(incoming_blocks),
                             "binding": "return_merge",
                             "return_slot_index": slot,
+                            **(
+                                {"return_arm_absent": tuple(incoming_absent)}
+                                if member_phi else {}
+                            ),
                             **(
                                 {"output_name": slot_names[slot]}
                                 if slot in slot_names else {}
@@ -19822,6 +20004,8 @@ def _schedule_loop_callsites(
     ] | None = None,
     callsite_projection_ids: Mapping[int, tuple[int, ...]] | None = None,
     pure_region_indices: frozenset[int] = frozenset(),
+    table_region_operations: Mapping[int, Any] | None = None,
+    table_region_post_operations: Mapping[int, Any] | None = None,
 ) -> tuple[ControlProgram, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]]:
     """Install this closure's PlanCalls as ordinary scheduled statements.
 
@@ -20566,6 +20750,29 @@ def _schedule_loop_callsites(
                     values it writes in; a query reads.
                     """
                     reads, writes = set(), set()
+                    # PROGRAM SHAPE: a region ``StatementBlock`` whose effects
+                    # (append/extend/store/pack_bits/lookup ...) are recorded
+                    # in table_region_operations / _post_operations.  WRONG
+                    # RECORD (before): it yielded no arena access, so no
+                    # RAW/WAR/WAW edge ordered it against a mutation/query of
+                    # the same arena.  RULE NOW HOLDING: the region's accesses
+                    # are those of its recorded operations, by each
+                    # operation's own sequence id.
+                    if isinstance(candidate, StatementBlock):
+                        recorded_region = scheduled_region(candidate)
+                        if recorded_region is not None:
+                            for kind, arguments in _region_table_operations(
+                                recorded_region,
+                                table_region_operations,
+                                table_region_post_operations,
+                            ):
+                                operation_reads, operation_writes = (
+                                    _table_operation_sequence_accesses(
+                                        kind, arguments
+                                    )
+                                )
+                                reads |= operation_reads
+                                writes |= operation_writes
                     if isinstance(candidate, SequenceMutationBlock):
                         writes.add(int(candidate.mutation.sequence_value_id))
                         if candidate.mutation.operator == "replace":
@@ -22303,6 +22510,7 @@ def lower_control_sections_to_ssa(
     # the effect.  Such calls still execute at their authored position.  Use
     # the next retained region as the control anchor, exactly as hierarchical
     # call composition does, instead of waiting for a nonexistent data use.
+    trailing_inplace_pack_operations: list[tuple[str, tuple[Any, ...]]] = []
     if hierarchy_plan is not None and inplace_pack_by_result:
         planned_items = tuple(hierarchy_plan.items)
         consumed_result_ids = {
@@ -22332,6 +22540,26 @@ def lower_control_sections_to_ssa(
                 and item.name.startswith("region_")
             ), None)
             if next_region is None:
+                # PROGRAM SHAPE: an in-place pursued pack call
+                # (``pack(bits)`` whose result is never read) with no numerical
+                # region after its callsite, e.g. ``bits[0] = 1; pack(bits);
+                # return 3``.  WRONG RECORD: this branch used to ``continue``,
+                # so the ``pack_bits`` effect was recorded in no table
+                # operation list and only the ``__plan_callsite_N__`` marker
+                # survived, with nothing to decompose it.  RULE NOW HOLDING:
+                # the authored call effect is always recorded.  Its position is
+                # trailing, which the existing ``table_epilogue_operations``
+                # keying already expresses (same ``pack_bits`` entry shape as
+                # ``sequence_bit_packs``); it carries callee_reference and
+                # callsite_id so the frame linker matches the decomposition.
+                bind_resident(result_id, sequence_id)
+                trailing_inplace_pack_operations.append((
+                    "pack_bits",
+                    (
+                        sequence_id, sequence_id, width, True,
+                        callee_reference, callsite_id,
+                    ),
+                ))
                 continue
             region_index = int(next_region.name.rsplit("_", 1)[1])
             bind_resident(result_id, sequence_id)
@@ -23668,6 +23896,7 @@ def lower_control_sections_to_ssa(
             table_region_operations.setdefault(region_index, []).insert(0, ("delete", deletion))
         else:
             table_epilogue_operations.append(("delete", deletion))
+    table_epilogue_operations.extend(trailing_inplace_pack_operations)
     for destination_id, source_id, width_id, _consumed_ids in sequence_bit_packs:
         table_epilogue_operations.append((
             "pack_bits", (
@@ -23807,7 +24036,14 @@ def lower_control_sections_to_ssa(
         pure_region_indices=frozenset(
             index for index, instructions in planned_region_instructions.items()
             if all(instruction.op in _PURE_REGION_OPS for instruction in instructions)
+            # The builder's _pure_region_index predicate: recorded table
+            # operations are effects the planned instructions no longer show.
+            and not _region_table_operations(
+                index, table_region_operations, table_region_post_operations,
+            )
         ),
+        table_region_operations=table_region_operations,
+        table_region_post_operations=table_region_post_operations,
     )
     # Uniform types describe a control use (for example an integer loop
     # bound), not authority to reinterpret an explicitly typed ABI buffer.

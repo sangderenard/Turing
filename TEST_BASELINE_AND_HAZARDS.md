@@ -15,7 +15,13 @@ identity, topology cache invalidation, CFG entry selection, and Phi checks.
 The pre-commit six-file gate completed with 211 passing and nine failing tests.
 All failures are in test_concordance_audit_contracts.py: five raw-write fixture
 refusals and four missing optional Metrics.dt_limit declaration-cell refusals.
-Their introduction point is unclassified. This checkpoint does not claim a
+All nine fail identically at the pre-checkpoint baseline 7c560b04: the five
+raw-write fixtures were introduced by c0127eeb (2026-10-17) and the four
+class_field_declaration refusals by de5c10e4 (2026-10-17). They are fixture
+faults; the five raw-write fixtures are repaired through IdentityBook.post, and
+the four declaration refusals were the first link of a chain of compiler faults
+the raw-string fixtures had masked (docs/compiler_convergence/21_provenance_sweep_continuation_2026_10_19.md):
+six links are repaired and the four tests now stop at later, named gates listed there. This checkpoint does not claim a
 clean concordance gate or native self-host completion. No bootstrap was run
 while preparing the report and commit.
 The separate receiver/cache/receipt and bootstrap-policy batch passed 28 tests

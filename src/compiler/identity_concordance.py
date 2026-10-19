@@ -440,6 +440,36 @@ def publish_program_abi_graph_identities(
                             )),
                             "metadata_state": "static",
                         }
+                        # The declared span shape was read off the record's
+                        # field declaration (``class_field_declaration``
+                        # cell) and the edge carries it onto the getattr
+                        # node whose owner holds the record: it derives from
+                        # that declaration cell and the owner node's
+                        # identity cell.
+                        from .frame_identity_book import (
+                            _record_field_declaration_cell,
+                        )
+                        from ..common.tensors.topological_reducer import (
+                            _posted_node_identity_cell,
+                        )
+
+                        abi_source_cells = tuple(dict.fromkeys(
+                            cell for cell in (
+                                _record_field_declaration_cell(
+                                    schema_match[1], field_name,
+                                    owner_identity,
+                                ),
+                                _posted_node_identity_cell(
+                                    graph_obj, int(next(
+                                        parent for parent, role in parents
+                                        if role in {
+                                            "value", "object", "base",
+                                            "receiver",
+                                        }
+                                    )),
+                                ),
+                            ) if cell is not None
+                        ))
                         record_shape_transformation(
                             f"ProgramABI:{owner_identity}",
                             (str(owner_identity), field_name),
@@ -450,6 +480,7 @@ def publish_program_abi_graph_identities(
                             source_state=declared_state,
                             target_state=declared_state,
                             role=field_name,
+                            source_cells=abi_source_cells,
                         )
                     target_name = (
                         field.get("record") if storage == "record"

@@ -155,9 +155,26 @@ def _record_field_declaration_cell(
     )
     page = book.pages.get(CLASS_FIELD_DECLARATION.name)
     for row in () if page is None else page.rows():
+        # The declaration row is keyed ``(module, class_identity, field)``.
+        # A contract record names its class by the qualified identity
+        # ``module.Class`` (program_extraction.yaml:
+        # ``src.common.dt_system.dt_scaler.Metrics``), while ingestion posts
+        # the row as ``('src.common.dt_system.dt_scaler', 'Metrics',
+        # 'dt_limit')``.  Explicit contract records override the inferred
+        # schemas (fortran_c_shell ``program_abi_receipt["records"]``), so a
+        # contract record never carries ``source_record_view_schema`` and
+        # this join is its only route to the cell.  Comparing the bare
+        # ``row[1]`` to the qualified identity matched nothing, and the
+        # optional-field presence lowering refused ``Metrics.dt_limit`` /
+        # ``STController.dt_min`` although their cells were posted.  The
+        # row's own ``(module, class)`` pair IS the qualified identity.
+        if len(row) != 3 or str(row[2]) != str(field_name):
+            continue
+        row_identity = (
+            f"{row[0]}.{row[1]}" if str(row[0]) else str(row[1])
+        )
         if (
-            len(row) == 3 and str(row[1]) == class_identity
-            and str(row[2]) == str(field_name)
+            (row_identity == class_identity or str(row[1]) == class_identity)
             and page.latest(row) is not None
         ):
             return book.latest_ref(CLASS_FIELD_DECLARATION, row)

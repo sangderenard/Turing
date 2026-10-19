@@ -133,9 +133,9 @@ def _lower_toplevel(*, process_graph_sink=None):
         balloon_tire_managed_extraction_contract, BalloonTireManagedState,
     )
     from src.common.dt_system.dt_controller import (
-        _propose_dt_pen, _energy_time_limit,
+        _propose_dt_pen, _energy_time_limit, Targets,
     )
-    from src.common.dt_system.dt_scaler import _scalar
+    from src.common.dt_system.dt_scaler import _scalar, Metrics
     import numpy as np
 
     stub = BalloonTireManagedState.__new__(BalloonTireManagedState)
@@ -184,7 +184,12 @@ def _lower_toplevel(*, process_graph_sink=None):
     })
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_toplevel", extraction_contract=policy,
-        python_bindings={"AbstractTensor": AbstractTensor},
+        # Contract records bound by name: the compiler's own record-class
+        # ingestion declares their fields (see ``_lower_energy``).
+        python_bindings={
+            "AbstractTensor": AbstractTensor,
+            "Metrics": Metrics, "Targets": Targets,
+        },
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
     )
@@ -192,7 +197,8 @@ def _lower_toplevel(*, process_graph_sink=None):
 
 
 def _lower_energy(*, process_graph_sink=None):
-    from src.common.dt_system.dt_controller import _energy_time_limit
+    from src.common.dt_system.dt_controller import _energy_time_limit, Targets
+    from src.common.dt_system.dt_scaler import Metrics
     from src.common.tensors import AbstractTensor
     from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         c_backend_repository_ssa_reference,
@@ -223,7 +229,14 @@ def _lower_energy(*, process_graph_sink=None):
     })
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_energy",
-        python_bindings={"AbstractTensor": AbstractTensor},
+        # Metrics/Targets are the contract's records: binding the live classes
+        # by name hands them to the compiler's own record-class ingestion,
+        # which stamps the qualified source identity and declares every
+        # class-level field (``class_field_declaration``).
+        python_bindings={
+            "AbstractTensor": AbstractTensor,
+            "Metrics": Metrics, "Targets": Targets,
+        },
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         extraction_contract=policy,
         resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
@@ -242,7 +255,6 @@ def _lower_controller(*, declare_root_types: bool = True, process_graph_sink=Non
 
     source = "\n\n".join((
         inspect.getsource(_restore_type),
-        inspect.getsource(STController),
         "def root(ctrl, max_vel, dx, dt_prev, dt_pen, osc):\n"
         "    ctrl.update_dt_max(max_vel, dx)\n"
         "    return ctrl.pi_update(dt_prev, dt_pen, osc)\n",
@@ -278,7 +290,11 @@ def _lower_controller(*, declare_root_types: bool = True, process_graph_sink=Non
     })
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_controller",
-        python_bindings={"AbstractTensor": AbstractTensor},
+        # The contract record bound by name reaches the compiler's own
+        # record-class ingestion (qualified source identity, declared fields).
+        python_bindings={
+            "AbstractTensor": AbstractTensor, "STController": STController,
+        },
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         extraction_contract=policy,
         resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,

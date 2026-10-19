@@ -122,6 +122,11 @@ from ...compiler.concordance_declarations import (
     REDUCER_FIELD_STATE as _REDUCER_FIELD_STATE,
     REDUCER_FIELD_WRITE as _REDUCER_FIELD_WRITE,
     REDUCER_RETURN as _REDUCER_RETURN,
+    RETURN_ARMS_UNCLASSIFIED as _RETURN_ARMS_UNCLASSIFIED,
+    RETURN_OUTPUT_ARMS as _RETURN_OUTPUT_ARMS,
+    ReturnArm as _ReturnArm,
+    ReturnArmsKind as _ReturnArmsKind,
+    ReturnOutputArms as _ReturnOutputArms,
     RETURN_SITE_CONTAINER as _RETURN_SITE_CONTAINER,
     RETURN_SITE_FIELD_STATE as _RETURN_SITE_FIELD_STATE,
     RETURN_SITE_SLOT as _RETURN_SITE_SLOT,
@@ -3971,6 +3976,20 @@ class _ReturnSiteView(Mapping):
         by_site: dict = {}
         for row in stored.scope_rows(scope):
             by_site.setdefault(row[1], []).append(row)
+        if self._page is _RETURN_SITE_SLOT:
+            # ``def f(...) -> tuple[int, ...]: ... return ()`` (and the
+            # ``return ()`` arm of ``-> tuple[int,int] | None``): the site
+            # posts a RETURN_SITE_CONTAINER (TUPLE) row and zero
+            # RETURN_SITE_SLOT rows, so the slot view built its sites from
+            # the slot page alone and the zero-length arm was ABSENT, which
+            # ``arm_return_control`` and the loop composer read as "not a
+            # return" (the guard If lost its CondBr).  A site whose
+            # container row exists but has no slot rows is an authored
+            # return of zero slots: its slot span is ``()``.
+            container = self._book.pages.get(_RETURN_SITE_CONTAINER.name)
+            if container is not None:
+                for row in container.scope_rows(scope):
+                    by_site.setdefault(row[1], [])
         return by_site
 
     def _items(self):
@@ -4125,6 +4144,53 @@ def _relabel_field_state_pages(book: Any, read_scope: Any, mapping: Any) -> None
             book.post(
                 _RETURN_SITE_CONTAINER, (read_scope, *row[1:]), fact,
                 stage=stage, provenance=_Derived((source,)), mode=_Mode.CONCORD,
+            )
+    # ``return_output_arms`` (one row per function whose returns disagree on
+    # arity): the output's id follows ``mapping``; the arm cells (container
+    # cells, site cell, member cells) are re-pointed at the re-posts above.
+    arms_page = book.pages.get(_RETURN_OUTPUT_ARMS.name)
+    if arms_page is not None:
+        for row in arms_page.scope_rows(ingestion_scope):
+            output = row[1]
+            if output not in mapping:
+                continue
+            column, fact = arms_page.history(row)[-1]
+            source = _Ref(_RETURN_OUTPUT_ARMS, row, column)
+            canonical_row = (read_scope, mapping[output])
+            if isinstance(fact, _Unresolved):
+                book.post(
+                    _RETURN_OUTPUT_ARMS, canonical_row,
+                    _Unresolved(fact.reason, tuple(
+                        relabeled.get(cell, cell) for cell in fact.read
+                    )),
+                    stage=stage, provenance=_Derived((source,)),
+                    mode=_Mode.CONCORD,
+                )
+                continue
+            arms = tuple(
+                _ReturnArm(
+                    arm.site,
+                    book.latest_ref(
+                        _RETURN_SITE_CONTAINER,
+                        (read_scope, *arm.container.row[1:]),
+                    ) or arm.container,
+                    arm.length, arm.absent,
+                )
+                for arm in fact.arms
+            )
+            members = tuple(
+                canonical_cell(cell) for cell in fact.member_cells
+            )
+            if any(cell is None for cell in members):
+                continue
+            book.post(
+                _RETURN_OUTPUT_ARMS, canonical_row,
+                _ReturnOutputArms(fact.kind, arms, fact.width, members),
+                stage=stage,
+                provenance=_Derived(tuple(dict.fromkeys(
+                    (source, *(arm.container for arm in arms), *members)
+                ))),
+                mode=_Mode.CONCORD,
             )
     site_page = book.pages.get(_RETURN_SITE_FIELD_STATE.name)
     if site_page is not None:
@@ -5262,15 +5328,61 @@ def _normalize_lexical_values(
         for returned in (return_statement.value,)
         if returned is not None
     )
+    # ``return_arms_kind``: the classification of a function whose returns
+    # disagree on arity (None when they agree, or when they cannot be
+    # classified).  Read by the Return reduction (which then names the one
+    # output instead of binding per-slot) and by ``post_return_output_arms``.
+    return_arms_kind: _ReturnArmsKind | None = None
+    return_arms_unclassified = False
+    # In-flight cells of each reduced return site (site cell, container
+    # cell, slot cells, authored-None flag): the cells ``book.post``
+    # returned, collected only so ``post_return_output_arms`` can derive the
+    # arms record from them at the end of the walk.
+    return_arm_posts: list = []
     if return_expression_lists:
         arities = {len(expressions) for expressions in return_expression_lists}
         if len(arities) != 1:
-            # Returns that disagree on arity have no single output surface;
-            # that is a real shortfall to report, never a silent ``()``.
-            graph.G.graph["function_output_shortfall"] = (
-                "return arity disagrees across return statements: "
-                f"{sorted(arities)!r}"
-            )
+            # ``_resolved`` (``-> tuple[int, int] | None``: ``return None`` /
+            # ``return row, column``) and ``-> tuple[int, ...]`` (``return ()``
+            # / ``return (n,)``).  The record here was
+            # ``function_output_shortfall``, which nothing read, so no
+            # ``function_outputs`` existed and each return became its own
+            # Phi layout.  Rule now holding: the returns are the ARMS of one
+            # output ``result_0``, classified from the AUTHORED arms alone:
+            # an authored ``None`` constant arm (length 0, absent) makes it
+            # an OPTIONAL_AGGREGATE (present arms must agree in length >= 1);
+            # no absent arm and unequal lengths is VARIADIC; anything else is
+            # Unresolved(return_arms_unclassified), posted at the end of the
+            # walk.
+            arm_shapes = []
+            for return_statement in function_return_statements(statement):
+                returned_arm = return_statement.value
+                if returned_arm is None:
+                    continue
+                absent_arm = (
+                    isinstance(returned_arm, ast.Constant)
+                    and returned_arm.value is None
+                )
+                arm_shapes.append((
+                    absent_arm,
+                    0 if absent_arm
+                    else len(returned_arm.elts)
+                    if isinstance(returned_arm, (ast.Tuple, ast.List))
+                    else 1,
+                ))
+            present_lengths = {
+                length for absent_arm, length in arm_shapes if not absent_arm
+            }
+            if any(absent_arm for absent_arm, _length in arm_shapes):
+                if len(present_lengths) == 1 and min(present_lengths) >= 1:
+                    return_arms_kind = _ReturnArmsKind.OPTIONAL_AGGREGATE
+            elif len(present_lengths) > 1:
+                return_arms_kind = _ReturnArmsKind.VARIADIC
+            if return_arms_kind is None:
+                return_arms_unclassified = True
+            else:
+                graph.G.graph["function_outputs"] = ("result_0",)
+                graph.G.graph["positional_output_names"] = ("result_0",)
         else:
             arity = next(iter(arities))
             # A slot keeps its authored name only when EVERY return spells
@@ -12060,7 +12172,7 @@ def _normalize_lexical_values(
                 if value is None:
                     continue
                 resolved.append(value)
-                if index < len(output_names) and (
+                if return_arms_kind is None and index < len(output_names) and (
                     str(output_names[index]) in positional_names
                 ):
                     # A positional slot has no binding of its own; its
@@ -12127,7 +12239,7 @@ def _normalize_lexical_values(
                 # Physical output slots alone cannot distinguish `return x`
                 # from `return (x,)`. Preserve authored container semantics
                 # beside the same exact return-site receipt before flattening.
-                field_state_book.post(
+                container_cell = field_state_book.post(
                     _RETURN_SITE_CONTAINER,
                     (ingestion_read_scope, return_site_cell),
                     _ContainerKind.TUPLE if isinstance(returned, ast.Tuple)
@@ -12137,6 +12249,13 @@ def _normalize_lexical_values(
                     provenance=_Derived((return_construct_cell,)),
                     mode=_Mode.CONCORD,
                 )
+                if return_arms_kind is not None or return_arms_unclassified:
+                    return_arm_posts.append((
+                        return_site_cell, container_cell,
+                        tuple(slot_cells[index] for index in sorted(slot_cells)),
+                        isinstance(returned, ast.Constant)
+                        and returned.value is None,
+                    ))
                 # Record correlation alone does not describe the field state
                 # at this return.  For every field row whose receiver is a
                 # returned slot, the site names the cursor cell current here,
@@ -13792,11 +13911,123 @@ def _normalize_lexical_values(
                 resolve_expression(child)
         return id(body_statement) if id(body_statement) in graph.G else None
 
+    def post_return_output_arms() -> None:
+        """Mint the ONE output of a function whose returns disagree on arity
+        and post its ``return_output_arms`` row.
+
+        ``IdentityPage._resolved`` (``return None`` / ``return row, column``
+        in ``while True``): the wrong record was one Phi layout per return.
+        Rule now holding: one output Phi, one member Phi per position
+        ``k < width`` whose parents are the slot-``k`` values of the arms
+        longer than ``k``; the aggregate layout is SOURCE_AGGREGATE_LAYOUT on
+        the output; the row derives from every arm's container cell, slot
+        cells and the output's cell (slot values are never copied).  A
+        VARIADIC record is posted and NOT lowered further in this pass
+        (stage 5 is deferred): downstream behaviour for it is unchanged.
+        """
+
+        if not return_arm_posts:
+            return
+        book = current_identity_book()
+        container_cells = tuple(
+            container for _site, container, _slots, _absent in return_arm_posts
+        )
+        all_slot_cells = tuple(
+            cell for _site, _container, slots, _absent in return_arm_posts
+            for cell in slots
+        )
+        slot_values_by_arm = []
+        for _site, _container, slots, absent in return_arm_posts:
+            values = []
+            for cell in slots:
+                value = _cell_node_id(_cell_fact(book, cell))
+                values.append(value)
+            slot_values_by_arm.append(tuple(values))
+        if return_arms_kind is None or any(
+            value is None for values in slot_values_by_arm for value in values
+        ):
+            # Unclassified (or an Unresolved slot row): no output is minted;
+            # the row is keyed by the first site's node id.
+            key = _cell_node_id(return_arm_posts[0][0])
+            if key is not None:
+                book.post(
+                    _RETURN_OUTPUT_ARMS, (ingestion_read_scope, int(key)),
+                    _Unresolved(_RETURN_ARMS_UNCLASSIFIED, container_cells),
+                    stage=_REDUCER_RETURN,
+                    provenance=_Derived(container_cells),
+                    mode=_Mode.CONCORD,
+                )
+            return
+        arms = []
+        for (site, container, slots, absent), values in zip(
+            return_arm_posts, slot_values_by_arm
+        ):
+            arms.append(_ReturnArm(
+                site, container, 0 if absent else len(values), bool(absent),
+            ))
+        width = max(arm.length for arm in arms)
+        derived = tuple(dict.fromkeys((*container_cells, *all_slot_cells)))
+        output_id = new_node(
+            "Phi", "return output", source_cell=derived,
+            attributes={"producer_kind": "aggregate_phi",
+                        "aggregate_kind": "tuple"},
+        )
+        members = []
+        for position in range(width):
+            arm_slots = tuple(
+                (arm_index, return_arm_posts[arm_index][2][position],
+                 slot_values_by_arm[arm_index][position])
+                for arm_index, arm in enumerate(arms)
+                if arm.length > position
+            )
+            slot_cells_here = tuple(cell for _arm, cell, _value in arm_slots)
+            member_id = new_node(
+                "Phi", f"return output member {position}",
+                attributes={
+                    "aggregate_parent_value_id": int(output_id),
+                    "aggregate_index": int(position),
+                },
+                parents=tuple(
+                    (int(value), f"return_arm_{arm_index}")
+                    for arm_index, _cell, value in arm_slots
+                ),
+                source_cell=tuple(dict.fromkeys(
+                    (*slot_cells_here, node_identity_cell(graph, int(output_id)))
+                )),
+            )
+            members.append(_SourceAggregateMember(
+                int(member_id), node_identity_cell(graph, int(member_id)),
+                slot_cells_here,
+            ))
+        graph.G.nodes[int(output_id)]["attributes"][
+            "aggregate_leaf_value_ids"
+        ] = tuple(member.value_id for member in members)
+        post_source_aggregate_layout(
+            int(output_id), "tuple", tuple(members),
+        )
+        output_cell = node_identity_cell(graph, int(output_id))
+        book.post(
+            _RETURN_OUTPUT_ARMS, (ingestion_read_scope, int(output_id)),
+            _ReturnOutputArms(
+                return_arms_kind, tuple(arms), int(width),
+                tuple(member.value_cell for member in members),
+            ),
+            stage=_REDUCER_RETURN,
+            provenance=_Derived((*derived, output_cell)),
+            mode=_Mode.CONCORD,
+        )
+        identity_bindings.setdefault("result_0", []).append(int(output_id))
+        post_name_binding(
+            "result_0", int(output_id), authored=False,
+            span_positions=(None,) * 4, context_sha256="", cells=(),
+        )
+
     returned_values = []
     for body_statement in statement.body:
         value = reduce_statement(body_statement)
         if isinstance(body_statement, ast.Return) and value is not None:
             returned_values.append(value)
+    post_return_output_arms()
     if returned_values:
         graph.roots = list(dict.fromkeys(returned_values))
         # The function's return is a consumer of its roots: row

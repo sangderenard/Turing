@@ -6473,7 +6473,8 @@ def _annotated_parameter_record_identity(
     """
 
     from .concordance_declarations import (
-        CLASS_DECLARATION, ClassFact, INGESTION, PARAMETER_ANNOTATION,
+        CLASS_DECLARATION, CONTRACT_DEMAND_PAGE, ClassFact, DemandKind,
+        INGESTION, PARAMETER_ANNOTATION,
         PARAMETER_RECORD_CLASS, SOURCE_RECORD_CLASS, SOURCE_SPAN,
     )
     from .identity_concordance import Derived, Mode, current_identity_book
@@ -6497,6 +6498,70 @@ def _annotated_parameter_record_identity(
     record_classes = book.pages.get(SOURCE_RECORD_CLASS.name)
     class_row = (module, spelling)
     class_cell = book.latest_ref(CLASS_DECLARATION, class_row)
+    demand_cells: list = []
+    if class_cell is None:
+        # A record class bound from another module (``python_bindings`` /
+        # ``source_record_classes``) is declared in ITS defining module
+        # (``_turing_source_module``), not in the module whose annotation
+        # names it: program audit_identity_concordance
+        # ``_energy_time_limit(metrics: Metrics)`` annotates in
+        # ``<string:..>`` while the class is ``class_declaration``
+        # ``(src.common.dt_system.dt_scaler, Metrics)``.  The book has no
+        # annotation-name -> class edge for that case (``parameter_annotation``
+        # holds only the spelling).  The extraction contract's own binding
+        # of this function parameter does: its ``contract_demand``
+        # (parameter_record, ``<function>.<parameter>``) fact names the
+        # record IDENTITY, whose ``source_record_class_concordance`` row and
+        # ClassDef span are exact cells (the span also derives the
+        # ``class_declaration`` row).  Join through that identity; the
+        # authored spelling is only checked against the binding's declared
+        # record name, never used as the lookup key.
+        demand_page = book.pages.get(CONTRACT_DEMAND_PAGE.name)
+        bound = []
+        for demand_row in (() if demand_page is None else demand_page.rows()):
+            demand = demand_page.latest(demand_row)
+            record = getattr(demand, "record", None)
+            if (
+                demand_row[0] != DemandKind.PARAMETER_RECORD
+                or not isinstance(record, Mapping)
+                or str(record.get("parameter")) != str(parameter)
+                or not fnmatchcase(
+                    str(function_identity), str(record.get("function") or ""),
+                )
+            ):
+                continue
+            bound.append((demand_row, record))
+        identities = {str(record.get("identity")) for _row, record in bound}
+        if (
+            len(identities) == 1
+            and all(str(record.get("record")) == spelling for _r, record in bound)
+        ):
+            record_cell = book.latest_ref(
+                SOURCE_RECORD_CLASS, (next(iter(identities)),),
+            )
+            if record_cell is not None:
+                declaring_spans = [
+                    source for source, _stage in book.edges_into(record_cell)
+                    if source.page.name == SOURCE_SPAN.name
+                ]
+                declarations = list(dict.fromkeys(
+                    target
+                    for span_cell in declaring_spans
+                    for column, _fact in book.page(SOURCE_SPAN).history(
+                        span_cell.row
+                    )
+                    for target, _stage in book.edges_out_of(
+                        type(span_cell)(span_cell.page, span_cell.row, column)
+                    )
+                    if target.page.name == CLASS_DECLARATION.name
+                ))
+                if len(declaring_spans) == 1 and len(declarations) == 1:
+                    class_cell = declarations[0]
+                    class_row = class_cell.row
+                    demand_cells = [
+                        book.latest_ref(CONTRACT_DEMAND_PAGE, demand_row)
+                        for demand_row, _record in bound
+                    ]
     span_cells: list = []
     if class_cell is not None:
         span_cells = [
@@ -6548,7 +6613,7 @@ def _annotated_parameter_record_identity(
             PARAMETER_RECORD_CLASS, row, identity, stage=INGESTION,
             provenance=Derived((
                 book.latest_ref(PARAMETER_ANNOTATION, annotation_row),
-                class_cell, record_cells[0],
+                class_cell, record_cells[0], *demand_cells,
             )),
             mode=Mode.CONCORD,
         )
@@ -20143,6 +20208,36 @@ def _class_surface_ssa_program(
                     and field.get("fixed_length") is not None
                 ):
                     contract["shape"] = [int(field["fixed_length"])]
+                # One identity, one record.  The receiver-field read above
+                # already joined this value to its CLASS_FIELD_DECLARATION
+                # (STController.pi_update's ``self.dt_min`` declared
+                # ``float | None``: python_types NoneType+float, source cell
+                # the field declaration).  This ProgramABI record carries the
+                # physical carrier only; REPLACING the row dropped the exact
+                # class arms, so the ``floor = dt_min if dt_min is not None
+                # else 1e-30`` Phi (arms 13, 23) found no type evidence for
+                # arm 13 and refused.  Carry the prior semantic types over.
+                _prior_contract = value_contracts.get(
+                    int(data.get("value_id", node_id))
+                ) or {}
+                _carried_types = set(map(
+                    str, _prior_contract.get("python_types") or (),
+                ))
+                if _prior_contract.get("python_type") is not None:
+                    _carried_types.add(str(_prior_contract["python_type"]))
+                if _carried_types:
+                    _carried_types.update(map(
+                        str, contract.get("python_types") or (),
+                    ))
+                    if contract.get("python_type") is not None:
+                        _carried_types.add(str(contract["python_type"]))
+                    _ordered_types = tuple(sorted(_carried_types))
+                    if len(_ordered_types) == 1:
+                        contract["python_type"] = _ordered_types[0]
+                        contract.pop("python_types", None)
+                    else:
+                        contract["python_types"] = _ordered_types
+                        contract.pop("python_type", None)
                 value_contracts[int(data.get("value_id", node_id))] = contract
 
     # Source reduction has already concorded exact class identities for
@@ -20265,6 +20360,36 @@ def _class_surface_ssa_program(
                     "source value class fact has no exact concordance cell: "
                     f"scope={numeric_scope!r}, value={value_id}"
                 )
+            # ONE identity per authored class.  The reducer concords a
+            # parameter's class under the navigation-table spelling
+            # (``Metrics``) while every other writer of this contract (the
+            # ProgramABI record receipt) states ``module.Class``.  Left
+            # alone one record became a two-arm union (program:
+            # audit_identity_concordance ``_energy_time_limit``, parameter
+            # ``metrics``: 'Metrics' vs
+            # 'src.common.dt_system.dt_scaler.Metrics'), which the union
+            # parameter lowering refuses.  The book already owns the join
+            # annotation -> class declaration -> contract record
+            # (``parameter_record_class``): a parameter that join resolves
+            # keeps the record's identity, never its short spelling.
+            for parameter_name, parameter_value_ids in dict(
+                planned_graph.graph.get("identity_table") or {}
+            ).items():
+                if value_id not in set(map(int, parameter_value_ids or ())):
+                    continue
+                owner_name = planned_graph.graph.get("method_owner")
+                function_name = str(
+                    planned_graph.graph.get("function_name") or ""
+                )
+                joined_identity = _annotated_parameter_record_identity(
+                    f"{owner_name}.{function_name}"
+                    if owner_name else function_name,
+                    str(parameter_name),
+                )
+                if joined_identity is not None and (
+                    identity == joined_identity.rsplit(".", 1)[-1]
+                ):
+                    identity = joined_identity
             linked_value_type_source_cells_by_graph.setdefault(
                 id(planned_graph), {}
             )[value_id] = tuple(dict.fromkeys((
@@ -37450,12 +37575,41 @@ def _class_surface_ssa_program(
             caller_projection_id = caller_projections.get(int(projection))
             if caller_projection_id is None or not target_history:
                 continue
-            assignment_projection_identity_page.concord(
+            # The program ``a, b = f(n)``.  The wrong write was a raw
+            # ``assignment_projection_identity_page.concord`` carrying no
+            # provenance, which the book refuses.  The rule: this fact -- the
+            # target ``target_name`` projects position ``projection`` of the
+            # call's result -- is DERIVED from the cells it was read from:
+            # the target decision (``assignment_projection_source`` row), the
+            # projection of the call result (``call_result_projection`` row),
+            # and the identity cells of the call node and its projection node.
+            from .concordance_declarations import (
+                ASSIGNMENT_PROJECTION_IDENTITY as _ASSIGNMENT_PROJECTION_IDENTITY,
+                ASSIGNMENT_PROJECTION_SOURCE as _ASSIGNMENT_PROJECTION_SOURCE,
+                CALL_RESULT_PROJECTION as _CALL_RESULT_PROJECTION,
+            )
+            projection_book = current_identity_book()
+            projection_cells = _frame_cells(
+                projection_book.latest_ref(
+                    _ASSIGNMENT_PROJECTION_SOURCE, source_row,
+                ),
+                projection_book.latest_ref(
+                    _CALL_RESULT_PROJECTION,
+                    (callsite_id, int(caller_projection_id)),
+                ),
+                _frame_graph_cell(caller_graph, callsite_id),
+                _frame_graph_cell(caller_graph, int(caller_projection_id)),
+            )
+            projection_book.post(
+                _ASSIGNMENT_PROJECTION_IDENTITY,
                 (str(caller_symbol), callsite_id, int(projection)),
                 (
                     str(aggregate_name), str(target_name),
                     int(caller_projection_id), target_history,
                 ),
+                stage=FRAME_BINDING,
+                provenance=Derived(projection_cells),
+                mode=Mode.CONCORD,
             )
     from ..transmogrifier.ssa import SSACallTable
 

@@ -27,6 +27,182 @@ def _insert_before_terminator(block: Any, instructions: list[Instr]) -> None:
     block.instrs[index:index] = instructions
 
 
+def _record_covered_return_receipts(function: Any) -> tuple[dict[str, Any], ...]:
+    """The per-position receipts of a function whose ONE output is an
+    aggregate of varying arity (RETURN_OUTPUT_ARMS), in position order.
+
+    ``optional_return_contracts`` is written per output and per position by
+    this pass; a function without it, or with positions that are not
+    ``0..N-1`` of one output, is not record-covered.
+    """
+
+    receipts = tuple(
+        receipt for receipt in function.metadata.get(
+            "optional_return_contracts", ()
+        )
+        if receipt.get("return_output_id") is not None
+    )
+    if not receipts or len({r["return_output_id"] for r in receipts}) != 1:
+        return ()
+    ordered = tuple(sorted(receipts, key=lambda r: int(r["return_position"])))
+    if tuple(int(r["return_position"]) for r in ordered) != tuple(
+        range(len(ordered))
+    ):
+        return ()
+    return ordered
+
+
+def _lower_record_covered_call(
+    caller_name: str, caller: Any, block: Any, index: int, call: Any,
+    position_receipts: tuple[dict[str, Any], ...],
+    producers: dict[int, Any], receipts: list[dict[str, Any]],
+) -> int:
+    """Caller side of a record-covered optional aggregate return.
+
+    The callee returns ``(p0, q0, p1, q1, ...)``.  The linker bound the
+    caller's projection ``k`` to payload ``k`` (``call.attributes
+    ["output_ids"]``, loaded at aggregate index ``k``); the physical return
+    now interleaves presence, so payload ``k`` loads at ``2k`` and a fresh
+    presence value loads at ``2k + 1``.  The call's own result is the
+    optional aggregate: ``is None`` tests of it read presence ``0`` (the
+    kind OPTIONAL_AGGREGATE record says every arm is absent or full width,
+    so one presence speaks for all positions).
+    """
+
+    from .concordance_declarations import (
+        ADDRESS, CONTROL_CONST, OPTIONAL_PRESENCE, RECORD_RETURN_REPAIR,
+    )
+    from .ssa_record_return_state import mint_ssa_value
+
+    payload_ids = tuple(map(int, call.attributes.get("output_ids", ())))
+    if len(payload_ids) != len(position_receipts):
+        return index + 1
+    payloads = []
+    for payload_id in payload_ids:
+        load = producers.get(payload_id)
+        gep = None if load is None else producers.get(int(load.args[0].id))
+        const = None if gep is None else producers.get(int(gep.args[1].id))
+        if load is None or gep is None or const is None:
+            return index + 1
+        payloads.append((load, gep, const))
+    aggregate = call.res
+    presences = []
+    projection: list[Instr] = []
+    for position, ((load, gep, const), receipt) in enumerate(
+        zip(payloads, position_receipts, strict=True)
+    ):
+        payload = load.res
+        payload.dtype = str(receipt["dtype"])
+        payload.shape = tuple(receipt["shape"])
+        payload.accounting = {
+            **dict(payload.accounting or {}), "ssa_optional_payload": True,
+        }
+        slot = 2 * position
+        for instruction in (load, gep):
+            instruction.attributes["aggregate_index"] = slot
+        const.attributes["value"] = slot
+        presence = SSAValue(
+            mint_ssa_value(
+                caller, OPTIONAL_PRESENCE, (payload,),
+                dtype="bool", stage=RECORD_RETURN_REPAIR,
+            ),
+            dtype="bool",
+            accounting={
+                "ssa_optional_presence": True,
+                "ssa_optional_payload_id": int(payload.id),
+            },
+        )
+        presences.append(presence)
+        position_value = SSAValue(mint_ssa_value(
+            caller, CONTROL_CONST, (aggregate,), dtype="int",
+            stage=RECORD_RETURN_REPAIR,
+        ), dtype="int")
+        address = SSAValue(mint_ssa_value(
+            caller, ADDRESS, (aggregate, position_value),
+            dtype="ptr", stage=RECORD_RETURN_REPAIR,
+        ), dtype="ptr")
+        projection.extend((
+            Instr("Const", [], position_value,
+                  attributes={"value": slot + 1}),
+            Instr("GetElementPtr", [aggregate, position_value], address,
+                  attributes={"aggregate_index": slot + 1}),
+            Instr("Load", [address], presence, attributes={
+                "aggregate_index": slot + 1,
+                "source_output_id": int(presence.id),
+                "ssa_optional_result": True,
+            }),
+        ))
+    interleaved = tuple(
+        item
+        for payload_presence in zip(
+            (load.res for load, _g, _c in payloads), presences, strict=True,
+        )
+        for item in payload_presence
+    )
+    aggregate.dtype = "ssa.aggregate"
+    aggregate.shape = (len(interleaved),)
+    aggregate.accounting = {
+        **dict(aggregate.accounting or {}),
+        "ssa_aggregate_outputs": interleaved,
+        "ssa_optional_result": True,
+    }
+    call.attributes.update({
+        "output_ids": tuple(int(value.id) for value in interleaved),
+        "callee_output_ids": tuple(
+            int(item) for receipt in position_receipts
+            for item in (receipt["payload_value_id"],
+                         receipt["presence_value_id"])
+        ),
+        "native_result_contract": tuple(
+            item for receipt in position_receipts for item in (
+                (int(receipt["payload_value_id"]), str(receipt["dtype"]),
+                 tuple(receipt["shape"])),
+                (int(receipt["presence_value_id"]), "bool", ()),
+            )
+        ),
+        "ssa_optional_result": True,
+    })
+    block.instrs[index + 1:index + 1] = projection
+    presence = presences[0]
+    payload = payloads[0][0].res
+    for consumer_block in caller.blocks.values():
+        for consumer in consumer_block.instrs:
+            if consumer.op not in (_EQ_OPS | _NE_OPS):
+                continue
+            if not any(int(value.id) == int(aggregate.id)
+                       for value in consumer.args):
+                continue
+            other = tuple(
+                value for value in consumer.args
+                if int(value.id) != int(aggregate.id)
+            )
+            if len(other) != 1:
+                continue
+            none_producer = producers.get(int(other[0].id))
+            if none_producer is None or none_producer.op not in _NONE_OPS:
+                continue
+            consumer.args = [presence]
+            consumer.op = "LNot" if consumer.op in _EQ_OPS else "Cast"
+            consumer.attributes.update({
+                "target_dtype": "bool",
+                "optional_presence_test": True,
+                "payload_value_id": int(payload.id),
+                "presence_value_id": int(presence.id),
+                "priority": "exact_optional_call_result",
+                "tie_policy": "incumbent",
+            })
+    for position, presence_value in enumerate(presences):
+        receipts.append({
+            **position_receipts[position],
+            "caller": str(caller_name),
+            "callsite_id": call.attributes.get("plan_callsite_id"),
+            "caller_payload_value_id": int(payloads[position][0].res.id),
+            "caller_presence_value_id": int(presence_value.id),
+            "aggregate_value_id": int(aggregate.id),
+        })
+    return index + 1 + len(projection)
+
+
 def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
     """Split every proven scalar-or-None return into payload and presence.
 
@@ -376,13 +552,54 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                             layouts = dict(function.metadata.get(
                                 "aggregate_return_layouts", (),
                             ))
-                            layouts[int(instruction.res.id)] = (
-                                int(instruction.res.id), int(presence.id),
-                            )
+                            if "return_arm_absent" in instruction.attributes:
+                                # A ``return_output_arms`` member Phi: the
+                                # semantic output's own layout entry names
+                                # this payload as one leaf; its presence
+                                # follows it, so N positions give
+                                # ``(p0, q0, p1, q1, ...)``.  No per-Phi
+                                # layout and no whole-function scalar
+                                # contract: the contract is per output and
+                                # per position.
+                                payload_id = int(instruction.res.id)
+                                for output_id, leaves in tuple(
+                                    layouts.items()
+                                ):
+                                    if payload_id not in map(int, leaves):
+                                        continue
+                                    layouts[output_id] = tuple(
+                                        item
+                                        for leaf in map(int, leaves)
+                                        for item in (
+                                            (leaf, int(presence.id))
+                                            if leaf == payload_id else (leaf,)
+                                        )
+                                    )
+                                    receipt = {
+                                        **receipt,
+                                        "return_output_id": int(output_id),
+                                        "return_position": int(
+                                            instruction.attributes[
+                                                "return_slot_index"
+                                            ]
+                                        ),
+                                    }
+                                function.metadata[
+                                    "optional_return_contracts"
+                                ] = (
+                                    *tuple(function.metadata.get(
+                                        "optional_return_contracts", (),
+                                    )),
+                                    receipt,
+                                )
+                            else:
+                                layouts[int(instruction.res.id)] = (
+                                    int(instruction.res.id), int(presence.id),
+                                )
+                                contracts[str(function_name)] = receipt
                             function.metadata[
                                 "aggregate_return_layouts"
                             ] = tuple(layouts.items())
-                            contracts[str(function_name)] = receipt
                         lowered_one = True
                         break
                 if lowered_one:
@@ -517,6 +734,24 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
             while index < len(block.instrs):
                 call = block.instrs[index]
                 contract = contracts.get(str(call.attributes.get("callee") or ""))
+                if (
+                    contract is None
+                    and call.op in {"Call", "call"}
+                    and call.res is not None
+                ):
+                    callee_function = functions.get(
+                        str(call.attributes.get("callee") or "")
+                    )
+                    position_receipts = (
+                        () if callee_function is None
+                        else _record_covered_return_receipts(callee_function)
+                    )
+                    if position_receipts:
+                        index = _lower_record_covered_call(
+                            caller_name, caller, block, index, call,
+                            position_receipts, producers, receipts,
+                        )
+                        continue
                 if (
                     call.op not in {"Call", "call"}
                     or call.res is None
