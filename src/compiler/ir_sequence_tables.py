@@ -3033,7 +3033,7 @@ def lower_table_store(
     function_name: str | None = None,
     first_value_id: int | None = None,
 ) -> SSASequenceLowering:
-    """Build update-existing-or-insert for a two-column fixed table."""
+    """Build update-existing-or-insert for a fixed keyed row table."""
 
     unsupported = _unsupported_destination(descriptor, "table_store", allow_dynamic=True)
     if unsupported is not None:
@@ -3045,8 +3045,8 @@ def lower_table_store(
         column for column in range(len(descriptor.column_value_ids))
         if column not in descriptor.key_columns
     )
-    if not descriptor.key_columns or len(value_columns) != 1:
-        raise ValueError("table store requires key columns and one value column")
+    if not descriptor.key_columns or not value_columns:
+        raise ValueError("table store requires key and value columns")
     if descriptor.status_address_id is None:
         raise ValueError("table store requires a caller-visible status cell")
     storage = _storage_values(descriptor)
@@ -3057,10 +3057,11 @@ def lower_table_store(
     key_dtypes = tuple(
         descriptor.column_dtypes[column] for column in descriptor.key_columns
     )
-    value_column = value_columns[0]
-    value_dtype = descriptor.column_dtypes[value_column]
+    value_dtypes = tuple(
+        descriptor.column_dtypes[column] for column in value_columns
+    )
     queries = tuple(builder.fresh(dtype) for dtype in key_dtypes)
-    new_value = builder.fresh(value_dtype)
+    new_values = tuple(builder.fresh(dtype) for dtype in value_dtypes)
     entry = builder.block("entry")
     header = builder.block("store_header")
     body = builder.block("store_body")
@@ -3126,11 +3127,18 @@ def lower_table_store(
     builder.cond(body, matches, update, latch)
     builder.emit(latch, "Add", [index, one], next_index)
     builder.branch(latch, header)
-    update_address = builder.fresh("ptr")
-    builder.emit(update, "GetElementPtr", [
-        SSAValue(descriptor.column_value_ids[value_column], dtype=value_dtype), index
-    ], update_address)
-    builder.emit(update, "Store", [new_value, update_address])
+    for value_column, value_dtype, new_value in zip(
+        value_columns, value_dtypes, new_values, strict=True,
+    ):
+        update_address = builder.fresh("ptr")
+        builder.emit(update, "GetElementPtr", [
+            SSAValue(
+                descriptor.column_value_ids[value_column],
+                dtype=value_dtype,
+            ),
+            index,
+        ], update_address)
+        builder.emit(update, "Store", [new_value, update_address])
     builder.emit(update, "Store", [three, status_slot])
     builder.branch(update, complete)
     has_capacity = builder.fresh("bool")
@@ -3143,7 +3151,12 @@ def lower_table_store(
         for column, dtype, query in zip(
             descriptor.key_columns, key_dtypes, queries
         )
-    ) + ((descriptor.column_value_ids[value_column], value_dtype, new_value),)
+    ) + tuple(
+        (descriptor.column_value_ids[column], dtype, value)
+        for column, dtype, value in zip(
+            value_columns, value_dtypes, new_values, strict=True,
+        )
+    )
     for column_id, dtype, value in inserted_columns:
         address = builder.fresh("ptr")
         builder.emit(insert, "GetElementPtr", [
@@ -3167,7 +3180,7 @@ def lower_table_store(
     name = function_name or f"ssa_sequence_{descriptor.sequence_id}_store"
     function = Function(
         name,
-        [*storage, status_arena, *queries, new_value],
+        [*storage, status_arena, *queries, *new_values],
         builder.blocks,
         metadata={
             "ssa_sequence_operation": "table_store",

@@ -41,7 +41,9 @@ def call_input_rank_updates(callee, actual, formal, *, by_value_kernel_formal=Fa
     ) if own_rank != call_rank and call_rank != 0)
 
 
-def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
+def _concord_exact_region_feed_dtypes(
+    functions, changes=None, *, defer_unsettled_region_call_results=False,
+) -> int:
     """Restore exact region-feed views after result projection rewiring.
 
     A planned-region call records the dtype of every feed at the moment the
@@ -122,13 +124,17 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                 # capture identity itself (feed id == owner value id), not a
                 # reconstruction from a consumer or from the Phi downstream.
                 revised_feed_dtypes = list(feed_dtypes)
+                authoritative_residents = []
                 for position, (actual, feed_id) in enumerate(zip(
                     instruction.args, feed_ids,
                 )):
                     resident = residents.get(int(feed_id))
                     if resident is None:
                         resident = residents.get(int(actual.id))
+                    authoritative_residents.append(resident)
                     if (
+                        not defer_unsettled_region_call_results
+                        and
                         resident is not None
                         and (resident.accounting or {}).get(
                             'ssa_call_result_from'
@@ -136,12 +142,46 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                         and str(resident.dtype or '') in _NUMERIC_DTYPES
                     ):
                         revised_feed_dtypes[position] = str(resident.dtype)
+                    elif (
+                        resident is not None
+                        and (resident.accounting or {}).get(
+                            'program_abi_storage'
+                        ) == 'reference'
+                        and str(resident.dtype or '') == 'opaque_ref'
+                    ):
+                        # Region cutting precedes constructor-field ABI
+                        # settlement.  A declared reference capture can thus
+                        # retain the numerical planner's provisional dtype in
+                        # ``feed_dtypes`` even after the owner occurrence has
+                        # been correlated with its ProgramABI handle.  The
+                        # declared owner is the storage authority; carry that
+                        # exact handle contract into the region formal.
+                        revised_feed_dtypes[position] = 'opaque_ref'
                 feed_dtypes = tuple(revised_feed_dtypes)
                 instruction.attributes['feed_dtypes'] = feed_dtypes
-                for position, (actual, formal, feed_id, exact_dtype) in enumerate(zip(
+                for position, (actual, formal, feed_id, exact_dtype, resident) in enumerate(zip(
                     instruction.args, callee.args, feed_ids, feed_dtypes,
+                    authoritative_residents,
                 )):
-                    if exact_dtype not in _NUMERIC_DTYPES:
+                    declared_reference = bool(
+                        exact_dtype == 'opaque_ref'
+                        and resident is not None
+                        and (resident.accounting or {}).get(
+                            'program_abi_storage'
+                        ) == 'reference'
+                        and str(resident.dtype or '') == 'opaque_ref'
+                    )
+                    if (
+                        defer_unsettled_region_call_results
+                        and not declared_reference
+                    ):
+                        # The early frame pass has not settled numerical
+                        # result storage yet.  It must neither revise nor
+                        # publish those provisional cut-time views.  Declared
+                        # references are already authoritative and are the
+                        # only exact region feeds admitted in this phase.
+                        continue
+                    if exact_dtype not in _NUMERIC_DTYPES and not declared_reference:
                         continue
                     # Page ``exact_region_feed_dtype`` row ``(function, value
                     # id)``: the exact dtype the value is fed (or received) as.
@@ -150,7 +190,9 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                     facts = (
                         (
                             (str(caller.name), int(feed_id)),
-                            (exact_dtype,), caller, int(actual.id),
+                            (exact_dtype,), caller, int(
+                                resident.id if resident is not None else actual.id
+                            ),
                         ),
                         (
                             (str(callee.name), int(formal.id)),
@@ -179,7 +221,15 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                                     stage=PHYSICAL_CALL_INPUT_ADAPTATION,
                                     provenance=Derived(tuple(dict.fromkeys(cell for cell in (
                                         value_cell,
-                                        ssa_value_identity_cell(caller, int(actual.id), book=book),
+                                        ssa_value_identity_cell(
+                                            caller,
+                                            int(
+                                                resident.id
+                                                if resident is not None
+                                                else actual.id
+                                            ),
+                                            book=book,
+                                        ),
                                         ssa_value_identity_cell(caller, instruction.res.id, book=book)
                                         if instruction.res is not None else None,
                                     ) if cell is not None))),
@@ -189,7 +239,6 @@ def _concord_exact_region_feed_dtypes(functions, changes=None) -> int:
                     actual_accounting = dict(actual.accounting or {})
                     formal_accounting = dict(formal.accounting or {})
                     actual_physical = actual_accounting.get('physical_dtype')
-                    resident = residents.get(int(actual.id))
                     if resident is not None:
                         resident_type = (resident.accounting or {}).get('physical_dtype') or resident.dtype
                         if resident_type in _NUMERIC_DTYPES:
@@ -649,10 +698,12 @@ def _adapt_physical_call_inputs_round(
         f'elapsed={time.monotonic() - started:.1f}s'
     )
     region_changes = []
-    count = (
-        0
-        if defer_unsettled_region_call_results
-        else _concord_exact_region_feed_dtypes(functions, region_changes)
+    count = _concord_exact_region_feed_dtypes(
+        functions,
+        region_changes,
+        defer_unsettled_region_call_results=(
+            defer_unsettled_region_call_results
+        ),
     )
     report(
         f'physical-call adaptation round {round_index}: exact region feeds '

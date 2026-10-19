@@ -60,6 +60,17 @@ def _instructions(function: Any) -> Iterator[Any]:
         yield from block.instrs
 
 
+def _entry_block_name(function: Any, blocks: dict[str, Any]) -> str:
+    """Return the function's authored CFG entry, never insertion order by accident."""
+
+    declared = (getattr(function, "metadata", None) or {}).get("entry_block")
+    if declared in blocks:
+        return str(declared)
+    if "entry" in blocks:
+        return "entry"
+    return next(iter(blocks))
+
+
 def check_formal_parity(module: Any) -> list[Finding]:
     """Every formal is either named or accounted for; none appears from nowhere.
 
@@ -109,6 +120,18 @@ def check_formal_parity(module: Any) -> list[Finding]:
             if (getattr(argument, "accounting", None) or {}).get(
                 "program_abi_parameter"
             ) is not None
+        )
+        accounted.update(
+            int(argument.id)
+            for argument in getattr(function, "args", ())
+            if (
+                (getattr(argument, "accounting", None) or {}).get(
+                    "native_type_tag_for_value_id"
+                ) is not None
+                and (getattr(argument, "accounting", None) or {}).get(
+                    "source_parameter"
+                )
+            )
         )
         # Carried ports legitimately rename a parameter (the name follows the
         # phi); follow the accounting back so those do not read as unnamed.
@@ -317,7 +340,10 @@ def check_value_union_storage(module: Any) -> list[Finding]:
                         f"union {descriptor.union_id} arm {arm.name!r} has "
                         f"no record descriptor {arm.record_id}",
                     ))
-                if arm.storage.value == "reference":
+                if (
+                    arm.storage.value == "reference"
+                    and descriptor.layout != "shared"
+                ):
                     for value_id in arm.value_ids:
                         reference = static_references.get(int(value_id))
                         if reference is None or bool(
@@ -537,7 +563,7 @@ def check_definition_dominance(module: Any) -> list[Finding]:
         blocks = getattr(function, "blocks", {}) or {}
         if not blocks:
             continue
-        entry = next(iter(blocks))
+        entry = _entry_block_name(function, blocks)
         reachable, pending = set(), [entry]
         predecessors = {key: set() for key in blocks}
         while pending:
@@ -603,6 +629,57 @@ def check_definition_dominance(module: Any) -> list[Finding]:
     return findings
 
 
+def check_phi_cfg_contract(module: Any) -> list[Finding]:
+    """Require each reachable Phi to describe the CFG edges that can select it."""
+
+    findings: list[Finding] = []
+    for name, function in _functions(module):
+        blocks = getattr(function, "blocks", {}) or {}
+        if not blocks:
+            continue
+        entry = _entry_block_name(function, blocks)
+        reachable: set[str] = set()
+        pending = [entry]
+        predecessors = {key: set() for key in blocks}
+        while pending:
+            key = pending.pop()
+            if key in reachable or key not in blocks:
+                continue
+            reachable.add(key)
+            for successor in blocks[key].successors:
+                if successor in blocks:
+                    predecessors[successor].add(key)
+                    pending.append(successor)
+        for block_name in reachable:
+            saw_non_phi = False
+            for index, instruction in enumerate(blocks[block_name].instrs):
+                if str(instruction.op).casefold() != "phi":
+                    saw_non_phi = True
+                    continue
+                incoming = tuple((instruction.attributes or {}).get("incoming_blocks", ()))
+                problems = []
+                if saw_non_phi:
+                    problems.append("Phi follows a non-Phi instruction")
+                if len(incoming) != len(instruction.args):
+                    problems.append(
+                        f"{len(instruction.args)} operands but {len(incoming)} incoming labels"
+                    )
+                if len(set(incoming)) != len(incoming):
+                    problems.append("incoming labels are not unique")
+                expected = predecessors[block_name] & reachable
+                if set(incoming) != expected:
+                    problems.append(
+                        f"incoming labels {sorted(set(incoming))} do not equal "
+                        f"reachable predecessors {sorted(expected)}"
+                    )
+                if problems:
+                    findings.append(Finding(
+                        "phi_cfg_contract", str(name),
+                        f"{block_name}[{index}] Phi: {'; '.join(problems)}",
+                    ))
+    return findings
+
+
 def check_structural_outputs(module: Any) -> list[Finding]:
     """Missing source results are failures even when Ret is well formed."""
     findings = []
@@ -633,6 +710,7 @@ def run_all(module: Any) -> list[Finding]:
         *check_id_scale(module),
         *check_output_contract_agreement(module),
         *check_record_sequence_rows(module),
+        *check_phi_cfg_contract(module),
         *check_definition_dominance(module),
         *check_structural_outputs(module),
     ]
@@ -646,6 +724,7 @@ __all__ = [
     "check_structural_outputs",
     "check_formal_parity",
     "check_optional_merges",
+    "check_phi_cfg_contract",
     "check_value_union_storage",
     "check_id_scale",
     "check_output_contract_agreement",

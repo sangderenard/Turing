@@ -75,6 +75,7 @@ from .control_source import (
     overlay_scheduled_control,
     place_validations_after_region_producers,
     project_control_regions,
+    validation_diagnostic_value_ids,
 )
 from .hierarchical_control import compose_hierarchical_control
 from .process_graph_value_ids import next_process_value_id
@@ -706,7 +707,17 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             if (data.get("attributes") or {}).get("value_kind") != "scalar":
                 return None
             return ControlExpression("value", value_id=value_id)
-        operation = {
+        expression = data.get("expr_obj")
+        authored_operation = (
+            "and"
+            if isinstance(expression, ast.BoolOp)
+            and isinstance(expression.op, ast.And)
+            else "or"
+            if isinstance(expression, ast.BoolOp)
+            and isinstance(expression.op, ast.Or)
+            else None
+        )
+        operation = authored_operation or {
             "less": "lt", "lt": "lt",
             "lessequal": "le", "le": "le",
             "greater": "gt", "gt": "gt",
@@ -718,6 +729,7 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             "logical_not": "not", "lnot": "not",
             "add": "add", "sub": "sub", "mul": "mul",
             "div": "div", "truediv": "div", "neg": "neg",
+            "int": "int", "float": "float", "bool": "bool",
             "bitand": "bitand", "bitor": "bitor",
             "bitxor": "bitxor", "shl": "shl", "shr": "shr",
         }.get(str(data.get("op") or node_type).lower())
@@ -728,7 +740,12 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             for parent, role in data.get("parents") or ()
             if str(role) not in {"callee", "ops", "operator"}
         )
-        arity = 1 if operation in {"not", "neg"} else 2
+        arity = (
+            len(operands)
+            if operation in {"and", "or"}
+            else 1 if operation in {"not", "neg", "int", "float", "bool"}
+            else 2
+        )
         if len(operands) < arity or any(
             operand is None for operand in operands[:arity]
         ):
@@ -757,6 +774,42 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
         )) for statement in statements[:-1]):
             return None
         return statements[-1]
+
+    # A straight-line function ending in ``raise`` is the unconditional form
+    # of the same native validation contract as ``if predicate: raise``.  The
+    # frozen authored body is authoritative here; do not rediscover terminal
+    # ownership from graph reachability.  The raise node owns a compiler
+    # constant-false predicate, so native control always reports its typed
+    # error while the message values remain shell-only diagnostics.
+    direct_raise = terminal_raise(tuple(
+        graph.graph.get("function_body") or ()
+    ))
+    if direct_raise is not None:
+        raise_id = node_for_expression(direct_raise)
+        if raise_id is None:
+            raise ValueError(
+                "terminal function raise has no exact source node"
+            )
+        raised = direct_raise.exc
+        raised_name = (
+            raised.func.id
+            if isinstance(raised, ast.Call) and isinstance(raised.func, ast.Name)
+            else raised.id if isinstance(raised, ast.Name) else None
+        )
+        blocks.append(ValidationBlock(
+            int(raise_id),
+            int(raise_id),
+            expect_true=True,
+            predicate_expression=ControlExpression(
+                "const", value_id=int(raise_id), literal=False,
+            ),
+            extraction_identity=(
+                f"builtins.{raised_name}" if raised_name else None
+            ),
+            diagnostic_value_ids=validation_diagnostic_value_ids(
+                direct_raise, node_for_expression,
+            ),
+        ))
 
     # Planning a scalar predicate may attach a synthetic callsite shell to the
     # same graph.  Iterate a stable snapshot: validation discovery is allowed
@@ -833,6 +886,9 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             extraction_identity=(
                 f"builtins.{raised_name}" if raised_name else None
             ),
+            diagnostic_value_ids=validation_diagnostic_value_ids(
+                raised_statement, node_for_expression,
+            ),
         ))
     return tuple(blocks)
 
@@ -848,9 +904,30 @@ def _place_validation_blocks(
     validations = tuple(validations)
     if not validations:
         return control
-    wanted = {int(block.predicate_value_id) for block in validations}
+    def expression_value_ids(
+        expression: ControlExpression | None,
+    ) -> frozenset[int]:
+        if expression is None:
+            return frozenset()
+        values = (
+            set() if expression.value_id is None
+            else {int(expression.value_id)}
+        )
+        for operand in expression.operands:
+            values.update(expression_value_ids(operand))
+        return frozenset(values)
+
+    required_by_validation = {
+        int(block.predicate_value_id): (
+            {int(block.predicate_value_id)}
+            | set(expression_value_ids(block.predicate_expression))
+        )
+        for block in validations
+    }
+    wanted = set().union(*required_by_validation.values())
     producers: dict[int, int] = {}
-    for region_index in map(int, retained_regions):
+    region_order = tuple(map(int, retained_regions))
+    for region_index in region_order:
         subgraph = dispatch_subgraphs[region_index]
         produced_here = {
             int(node_id)
@@ -859,6 +936,9 @@ def _place_validation_blocks(
             int(subgraph.G.nodes[node_id].get("value_id", node_id))
             for node_id in subgraph.G.graph.get("deployment_nodes", ())
             if node_id in subgraph.G
+        } | {
+            int(value_id)
+            for value_id in subgraph.G.graph.get("deployment_outputs", ())
         }
         for predicate_id in sorted(wanted.intersection(produced_here)):
             previous = producers.get(predicate_id)
@@ -869,8 +949,23 @@ def _place_validation_blocks(
                     f"regions=({previous}, {region_index})"
                 )
             producers[predicate_id] = region_index
+    order = {region_index: index for index, region_index in enumerate(region_order)}
+    predicate_regions = {}
+    for predicate_id, required in required_by_validation.items():
+        scheduled = tuple(
+            producers[value_id]
+            for value_id in required
+            if value_id in producers
+        )
+        if scheduled:
+            # A structured predicate can be assembled in control lowering,
+            # while its scalar leaves are emitted by numerical regions.  The
+            # guard becomes valid only after its latest scheduled dependency.
+            predicate_regions[predicate_id] = max(
+                scheduled, key=order.__getitem__,
+            )
     return place_validations_after_region_producers(
-        control, validations, predicate_regions=producers,
+        control, validations, predicate_regions=predicate_regions,
     )
 
 
@@ -1435,6 +1530,62 @@ def _call_result_bindings(graph, node_id, output_paths):
                  for path in output_paths if path in caller_paths)
 
 
+def _accepted_semantic_result_bindings(declaration, output_paths, node_id):
+    """Recover a logical result from an accepted physical return layout.
+
+    Optional SSA publishes ``(payload, presence)`` at the native boundary,
+    but the source call still produces one value.  The reciprocal accounting
+    on those two accepted SSA values is the authority for that expansion; a
+    merely two-element tuple return has no such accounting and continues
+    through ordinary projection binding.
+    """
+
+    semantic_outputs = tuple(map(
+        int, declaration.metadata.get("semantic_output_ids", ()),
+    ))
+    if len(semantic_outputs) != 1:
+        return None
+    semantic_output = semantic_outputs[0]
+    layout = dict(
+        declaration.metadata.get("aggregate_return_layouts", ())
+    ).get(semantic_output)
+    if layout is None:
+        return None
+    physical_outputs = tuple(map(int, layout))
+    accepted_outputs = tuple(map(int, output_paths.values()))
+    if (
+        len(physical_outputs) < 2
+        or len(physical_outputs) % 2
+        or len(accepted_outputs) != len(physical_outputs)
+        or set(physical_outputs) != set(accepted_outputs)
+    ):
+        return None
+
+    values = {int(value.id): value for value in declaration.args}
+    for block in declaration.blocks.values():
+        for instruction in block.instrs:
+            if instruction.res is not None:
+                values[int(instruction.res.id)] = instruction.res
+            for argument in instruction.args:
+                values.setdefault(int(argument.id), argument)
+    pairs = tuple(zip(
+        physical_outputs[0::2], physical_outputs[1::2], strict=True,
+    ))
+    if int(pairs[0][0]) != semantic_output or not all(
+        values.get(int(payload_id)) is not None
+        and values.get(int(presence_id)) is not None
+        and (values[int(payload_id)].accounting or {}).get(
+            "ssa_optional_presence_id"
+        ) == int(presence_id)
+        and (values[int(presence_id)].accounting or {}).get(
+            "ssa_optional_payload_id"
+        ) == int(payload_id)
+        for payload_id, presence_id in pairs
+    ):
+        return None
+    return ((semantic_output, int(node_id)),)
+
+
 def _build_shell_hierarchy_plan(
     shell: Any,
     _memo: dict[int, PlanClosure] | None = None,
@@ -1764,7 +1915,13 @@ def _build_shell_hierarchy_plan(
                     f"defaults={tuple(sorted(defaults))!r}"
                 )
             _concord_call_argument_operands(graph, int(node_id), dict(enumerate(edges)))
-            result_bindings = _call_result_bindings(graph, node_id, output_paths)
+            result_bindings = _accepted_semantic_result_bindings(
+                declaration, output_paths, node_id,
+            )
+            if result_bindings is None:
+                result_bindings = _call_result_bindings(
+                    graph, node_id, output_paths,
+                )
             items.append(PlanCall(int(node_id), PlanClosure(str(root), expected_formals, ()),
                 tuple(parent for parent, _role in edges), tuple(caller for _callee, caller in result_bindings),
                 tuple(bindings), result_bindings,
@@ -2041,8 +2198,31 @@ def _build_shell_hierarchy_plan(
             # the projection path (1, 0).  Expanding the callee leaves and
             # zipping them against the caller's first-level projections
             # shifts every member after the aggregate onto the wrong result.
-            child_output_paths = _authored_output_paths(child.process_graph, child_outputs)
-            result_bindings = _call_result_bindings(graph, node_id, child_output_paths)
+            call_attributes = graph.G.nodes[int(node_id)].get("attributes") or {}
+            declared_return_alternatives = tuple(dict.fromkeys(map(
+                str, call_attributes.get("declared_return_class_refs", ()),
+            )))
+            if (
+                len(declared_return_alternatives) > 1
+                and len(child_outputs) == 1
+            ):
+                # A declared union is one logical call result even when one
+                # alternative is an aggregate.  Callsite tensor settlement
+                # may have materialized that aggregate's physical members,
+                # but those members cannot replace the source call identity:
+                # the VALUE_TYPE_ABI discriminant selects whether they are
+                # resident at runtime.  Bind the callee's declared logical
+                # output to the call node and let native-union frame linking
+                # expand payloads and the tag later.
+                child_output_paths = {(0,): int(child_outputs[0])}
+                result_bindings = ((int(child_outputs[0]), int(node_id)),)
+            else:
+                child_output_paths = _authored_output_paths(
+                    child.process_graph, child_outputs,
+                )
+                result_bindings = _call_result_bindings(
+                    graph, node_id, child_output_paths,
+                )
             child_outputs = tuple(child_output_paths.values())
             _concord_call_argument_operands(graph, int(node_id), operand_edges)
             items.append(PlanCall(
@@ -17171,7 +17351,14 @@ def _propagate_callsite_tensor_specializations(
                                 )),
                             )
                     return_kinds = set((callee.G.graph.get("return_container_kinds") or {}).values())
+                    declared_return_alternatives = tuple(dict.fromkeys(map(
+                        str, (data.get("attributes") or {}).get(
+                            "declared_return_class_refs", (),
+                        ),
+                    )))
                     if (
+                        len(declared_return_alternatives) <= 1
+                        and
                         len(return_kinds) == 1
                         and return_kinds <= {"tuple", "list"}
                         and result_descriptors
@@ -18012,6 +18199,11 @@ class _ProgramABIValueFact:
     # that distinction on the structural fact prevents ``payload is not
     # None`` from being folded merely because native storage exists.
     optional: bool = False
+    # Public API inputs may admit a closed union.  ``python_type`` remains
+    # the singleton spelling used by existing structural readers; a union is
+    # never collapsed to one convenient member and is settled by the native
+    # VALUE_TYPE_ABI/VALUE_TYPE_TAG ledger instead.
+    type_expectations: tuple[str, ...] = ()
 
 
 def _contains_program_abi_fact(value: Any) -> bool:
@@ -20869,8 +21061,14 @@ def _fold_callsite_structural_values(
                     if effective_abi.get("shape") is None
                     else tuple(map(int, effective_abi["shape"]))
                 )
+                expectations = tuple(map(str, (
+                    value_abi.get("type_expectations")
+                    or value_abi.get("python_types")
+                    or ((value_abi["python_type"],)
+                        if value_abi.get("python_type") is not None else ())
+                )))
                 return _ProgramABIValueFact(
-                    str(value_abi["python_type"]),
+                    expectations[0] if len(expectations) == 1 else "unknown",
                     str(effective_abi["storage"]),
                     effective_abi.get("dtype"),
                     shape=effective_shape,
@@ -20883,6 +21081,7 @@ def _fold_callsite_structural_values(
                             else int(effective_abi["rank"])
                         )
                     ),
+                    type_expectations=expectations,
                 )
             record_abi = (
                 graph.G.graph.get("parameter_record_abi") or {}
@@ -21537,6 +21736,11 @@ def _fold_callsite_structural_values(
                         and producer_attributes.get("aggregate_kind") == object_type.__name__):
                     return issubclass(object_type, accepted)
             if isinstance(values[0], _ProgramABIValueFact):
+                if len(values[0].type_expectations) > 1:
+                    # The API declares a runtime union.  The structural fold
+                    # cannot choose one arm; native type SSA consumes the
+                    # exact alternative table and its companion tag.
+                    return unresolved
                 if values[0].token_vocabulary:
                     # This is a runtime vocabulary token.  The SSA ABI pass
                     # lowers the accepted source types to positions in the

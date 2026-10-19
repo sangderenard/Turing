@@ -7590,9 +7590,11 @@ def _normalize_lexical_values(
                             graph.G.nodes[attribute_id].setdefault(
                                 "attributes", {}
                             )["attribute_slot"] = (class_identity, slot)
-                receiver_attributes = (
-                    graph.G.nodes[receiver].get("attributes") or {}
-                )
+                # ``resolve_expression`` may redirect an authored receiver to
+                # its canonical value and retire the occurrence node.  The
+                # safe lookup above is the exact post-redirection graph view;
+                # do not index the retired spelling again here.
+                receiver_attributes = receiver_data.get("attributes") or {}
                 receiver_fact = current_identity_book().page(
                     "source_value_class_concordance"
                 ).latest((value_class_scope, int(receiver)))
@@ -7612,6 +7614,88 @@ def _normalize_lexical_values(
                     )
                     else refined_class or receiver_class_identity(receiver)
                 )
+                if receiver_class is not None and expression.attr == "value":
+                    # Enum.value is an authored projection.  Its semantic
+                    # alternatives come from the Enum declaration itself;
+                    # its resident carrier is the declaration's fixed-width
+                    # token/value cell.  Do not inspect a host Enum member or
+                    # infer the result from the carrier dtype.
+                    module_identity = (
+                        str(value_class_scope[0])
+                        if isinstance(value_class_scope, tuple)
+                        and value_class_scope else ""
+                    )
+                    enum_class_identity = str(receiver_class)
+                    qualified_enum_identity = ".".join(filter(None, (
+                        module_identity,
+                        enum_class_identity,
+                    )))
+                    qualified_enum_class_cell = (
+                        current_identity_book().latest_ref(
+                            _CLASS_DECLARATION,
+                            (module_identity, qualified_enum_identity),
+                        )
+                        if qualified_enum_identity != enum_class_identity
+                        else None
+                    )
+                    if qualified_enum_class_cell is not None:
+                        enum_class_identity = qualified_enum_identity
+                    enum_value_cell = current_identity_book().latest_ref(
+                        _SOURCE_ENUM_GLYPH_TABLE,
+                        (module_identity, enum_class_identity),
+                    )
+                    enum_value_fact = (
+                        None if enum_value_cell is None else
+                        current_identity_book().page(
+                            _SOURCE_ENUM_GLYPH_TABLE
+                        ).cell(enum_value_cell.row, enum_value_cell.column)
+                    )
+                    enum_value_identities = tuple(sorted(dict.fromkeys(
+                        str(identity)
+                        for identity in getattr(
+                            enum_value_fact, "value_identities", (),
+                        )
+                        if str(identity)
+                    )))
+                    if enum_value_identities:
+                        enum_projection_attributes = graph.G.nodes[
+                            attribute_id
+                        ].setdefault("attributes", {})
+                        enum_projection_attributes.update({
+                            "value_kind": "scalar",
+                            "program_abi_storage": "scalar",
+                            "program_abi_dtype": "int64",
+                            "program_abi_rank": 0,
+                            "enum_value_identities": enum_value_identities,
+                            "enum_declaration_cell": enum_value_cell,
+                            # Enum.value projects the semantic base class but
+                            # reads the receiver's already resident fixed-
+                            # width token/value carrier.
+                            "enum_value_receiver_id": int(receiver),
+                        })
+                        graph.G.nodes[attribute_id]["tensor"] = {
+                            "shape": (), "dtype": "int64",
+                        }
+                        if len(enum_value_identities) == 1:
+                            enum_projection_attributes["result_class_ref"] = (
+                                enum_value_identities[0]
+                            )
+                            enum_value_sources = _source_cells((
+                                node_identity_cell(graph, int(attribute_id)),
+                                current_identity_book().latest_ref(
+                                    _SOURCE_VALUE_CLASS,
+                                    (value_class_scope, int(receiver)),
+                                ),
+                                qualified_enum_class_cell,
+                                enum_value_cell,
+                            ))
+                            _concord_source_value_class(
+                                value_class_scope,
+                                int(attribute_id),
+                                enum_value_identities[0],
+                                source="declared Enum.value projection",
+                                provenance=_Derived(enum_value_sources),
+                            )
                 if refined_class is not None:
                     graph.G.nodes[attribute_id].setdefault(
                         "attributes", {}
@@ -7822,6 +7906,12 @@ def _normalize_lexical_values(
                 refined_annotation = str(getattr(
                     refined_field_fact, "annotation", "",
                 )).rsplit(".", 1)[-1]
+                semantic_field_class = (
+                    (class_field_classes or {}).get((
+                        str(receiver_class), str(expression.attr)
+                    ))
+                    if receiver_class is not None else None
+                )
                 declared_field_class = None
                 if declared_receiver_field is not None:
                     declared_aggregate = str(
@@ -7861,10 +7951,15 @@ def _normalize_lexical_values(
                     )
                 if (
                     declared_field_class is not None
-                    and refined_annotation
-                    and not _canonical_source_class_identity(
-                        refined_annotation
-                    ).startswith("builtins.")
+                    and (
+                        semantic_field_class is not None
+                        or (
+                            refined_annotation
+                            and not _canonical_source_class_identity(
+                                refined_annotation
+                            ).startswith("builtins.")
+                        )
+                    )
                 ):
                     # The ProgramABI field describes the physical carrier (an
                     # Enum is a resident int64).  A declared non-primitive
@@ -7947,12 +8042,7 @@ def _normalize_lexical_values(
                 # so a method call on it resolves through the class table.
                 # Not ``class_ref``: that marks a construction, and the
                 # deployment side reads its presence as one.
-                field_class = (
-                    (class_field_classes or {}).get((
-                        str(receiver_class), str(expression.attr)
-                    ))
-                    if receiver_class is not None else None
-                )
+                field_class = semantic_field_class
                 if field_class is not None:
                     graph.G.nodes[attribute_id].setdefault(
                         "attributes", {}
@@ -8309,6 +8399,33 @@ def _normalize_lexical_values(
                         for parent, role in constructor.get("parents") or ()
                         if str(role).startswith(("arg", "kw:"))
                     ),
+                )
+                # The admitted builtin constructor is the semantic source
+                # declaration for its result.  Publish that declaration to
+                # the same concordance used by retained comprehension
+                # aggregates, so later ABI settlement does not have to infer
+                # a container class from element dtypes or inspect a live
+                # Python object.
+                aggregate_identity_cell = current_identity_book().latest_ref(
+                    _SOURCE_PYTHON_IDENTITY,
+                    (value_class_scope, int(node_id)),
+                )
+                aggregate_source_cell = (
+                    aggregate_identity_cell
+                    or node_identity_cell(graph, int(node_id))
+                )
+                if aggregate_source_cell is None:
+                    raise ValueError(
+                        "builtin aggregate constructor has no source cell: "
+                        f"value={int(node_id)} "
+                        f"identity=builtins.{aggregate_kind}"
+                    )
+                _concord_source_value_class(
+                    value_class_scope,
+                    int(node_id),
+                    f"builtins.{aggregate_kind}",
+                    source="resolved builtin aggregate result",
+                    provenance=_Derived((aggregate_source_cell,)),
                 )
             if isinstance(callee, int) and callee in graph.G:
                 callee_attributes = (
@@ -9210,6 +9327,23 @@ def _normalize_lexical_values(
                 ))
             post_source_aggregate_layout(
                 int(node_id), str(aggregate_kind), tuple(source_members),
+            )
+            aggregate_class_sources = tuple(filter(None, (
+                node_identity_cell(graph, int(node_id)),
+                current_identity_book().latest_ref(
+                    _SOURCE_AGGREGATE_LAYOUT,
+                    (ingestion_read_scope, int(node_id)),
+                ),
+            )))
+            _concord_source_value_class(
+                value_class_scope,
+                int(node_id),
+                f"builtins.{aggregate_kind}",
+                source="authored aggregate constructor",
+                provenance=(
+                    _Derived(aggregate_class_sources)
+                    if aggregate_class_sources else None
+                ),
             )
         lone_string_projection = (
             isinstance(expression, ast.Call)
@@ -14749,6 +14883,12 @@ def _normalize_lexical_values(
             initial_value_id = attributes["initial_value_id"]
             if initial_value_id in mapping:
                 attributes["initial_value_id"] = mapping[initial_value_id]
+        if "enum_value_receiver_id" in attributes:
+            enum_value_receiver_id = attributes["enum_value_receiver_id"]
+            if enum_value_receiver_id in mapping:
+                attributes["enum_value_receiver_id"] = mapping[
+                    enum_value_receiver_id
+                ]
         if "record_field_state" in attributes:
             receiver_id, attribute_name = attributes["record_field_state"]
             if receiver_id in mapping:
@@ -18106,8 +18246,26 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             owner_name,
             {"methods": {}, "fields": (), "field_defaults": {}},
         )
+        function_definition = graph.G.nodes[function_node_id].get(
+            "expr_obj"
+        )
         descriptor["fields"] = tuple(dict.fromkeys((
             *tuple(descriptor.get("fields") or ()),
+            *(
+                target.attr
+                for target in (
+                    source_walk(function_definition)
+                    if isinstance(
+                        function_definition,
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    )
+                    else ()
+                )
+                if isinstance(target, ast.Attribute)
+                and isinstance(target.ctx, ast.Store)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in {"self", "cls"}
+            ),
             *(
                 field_name
                 for (owner, field_name), _kind
@@ -18115,9 +18273,6 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 if owner == owner_name
             ),
         )))
-        function_definition = graph.G.nodes[function_node_id].get(
-            "expr_obj"
-        )
         if isinstance(
             function_definition,
             (ast.FunctionDef, ast.AsyncFunctionDef),
@@ -18131,6 +18286,68 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         if method_owners.get(function_node_id) is not None
     }
     returned_class_by_reference: dict[int, str] = {}
+
+    def authored_return_class_identities(annotation: ast.AST | None) -> tuple[str, ...]:
+        """Concrete source classes stated by one authored return annotation."""
+
+        if isinstance(annotation, ast.Constant) and isinstance(
+            annotation.value, str
+        ):
+            try:
+                annotation = ast.parse(annotation.value, mode="eval").body
+            except SyntaxError:
+                return ()
+        if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+            left = authored_return_class_identities(annotation.left)
+            right = authored_return_class_identities(annotation.right)
+            if not left or not right:
+                return ()
+            return tuple(sorted(dict.fromkeys((*left, *right))))
+        if isinstance(annotation, ast.Constant) and annotation.value is None:
+            return ("builtins.NoneType",)
+        if isinstance(annotation, ast.Name):
+            if annotation.id == "None":
+                return ("builtins.NoneType",)
+            if annotation.id in {"Any", "object"}:
+                return ()
+            if annotation.id in {
+                "bool", "bytearray", "bytes", "dict", "float",
+                "frozenset", "int", "list", "set", "str", "tuple",
+            }:
+                return (f"builtins.{annotation.id}",)
+            class_page = current_identity_book().page(_CLASS_DECLARATION)
+            matches = tuple(
+                row for row in class_page.rows()
+                if len(row) == 2
+                and (
+                    str(row[1]) == str(annotation.id)
+                    or str(row[1]).endswith(f".{annotation.id}")
+                )
+            )
+            return (str(annotation.id),) if len(matches) == 1 else ()
+        if isinstance(annotation, ast.Subscript):
+            container = (
+                annotation.value.id
+                if isinstance(annotation.value, ast.Name)
+                else annotation.value.attr
+                if isinstance(annotation.value, ast.Attribute)
+                else ""
+            )
+            if container == "Optional":
+                member = authored_return_class_identities(annotation.slice)
+                return (
+                    tuple(sorted(dict.fromkeys((*member, "builtins.NoneType"))))
+                    if member else ()
+                )
+            concrete = {
+                "Dict": "dict", "FrozenSet": "frozenset", "List": "list",
+                "Set": "set", "Tuple": "tuple", "dict": "dict",
+                "frozenset": "frozenset", "list": "list", "set": "set",
+                "tuple": "tuple",
+            }.get(container)
+            return () if concrete is None else (f"builtins.{concrete}",)
+        return ()
+
     def returned_class(definition: Any) -> str | None:
         if isinstance(definition, int) and definition in graph.G:
             definition = graph.G.nodes[definition].get("expr_obj")
@@ -18207,10 +18424,72 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             callee_reference = attributes.get(
                 "callee_ref", attributes.get("method_ref")
             )
+            return_declaration_cell = None
             returned_class = (
                 None if callee_reference is None
                 else returned_class_by_reference.get(int(callee_reference))
             )
+            if (
+                returned_class is None
+                and isinstance(expression.func, ast.Attribute)
+            ):
+                receiver_id = next((
+                    int(parent)
+                    for parent, role in call_data.get("parents") or ()
+                    if str(role) in {
+                        "operand", "receiver", "object", "base",
+                    }
+                ), None)
+                receiver_identity = ""
+                if receiver_id is not None and receiver_id in target_graph:
+                    receiver_attributes = (
+                        target_graph.nodes[receiver_id].get("attributes") or {}
+                    )
+                    receiver_identity = str(
+                        receiver_attributes.get("result_class_ref")
+                        or receiver_attributes.get("class_ref") or ""
+                    )
+                method_page = current_identity_book().page(
+                    _CLASS_METHOD_DECLARATION
+                )
+                method_rows = tuple(
+                    row for row in method_page.rows()
+                    if len(row) == 3
+                    and str(row[2]) == str(expression.func.attr)
+                    and (
+                        str(row[1]) == receiver_identity
+                        or str(row[1]).endswith(f".{receiver_identity}")
+                    )
+                    and str(getattr(
+                        method_page.latest(row), "return_annotation", "",
+                    ))
+                )
+                if len(method_rows) == 1:
+                    return_declaration_cell = current_identity_book().latest_ref(
+                        _CLASS_METHOD_DECLARATION, method_rows[0],
+                    )
+                    return_spelling = str(getattr(
+                        method_page.latest(method_rows[0]),
+                        "return_annotation", "",
+                    ))
+                    try:
+                        return_annotation = ast.parse(
+                            return_spelling, mode="eval",
+                        ).body
+                    except SyntaxError:
+                        return_annotation = None
+                    return_classes = authored_return_class_identities(
+                        return_annotation
+                    )
+                    attributes.update({
+                        "declared_return_annotation": return_spelling,
+                        "method_return_declaration_cell": (
+                            return_declaration_cell
+                        ),
+                        "declared_return_class_refs": return_classes,
+                    })
+                    if len(return_classes) == 1:
+                        returned_class = return_classes[0]
             if returned_class is not None:
                 attributes["result_class_ref"] = returned_class
                 carries_width = "precision" in (
@@ -18218,11 +18497,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         str(returned_class).rsplit(".", 1)[-1]
                     ) or ()
                 )
-                callee_entry = next((
-                    entry for entry in function_table
-                    if int(entry.reference.address)
-                    == int(callee_reference)
-                ), None)
+                callee_entry = (
+                    None if callee_reference is None else next((
+                        entry for entry in function_table
+                        if int(entry.reference.address)
+                        == int(callee_reference)
+                    ), None)
+                )
                 if (
                     not carries_width
                     and callee_entry is not None
@@ -18282,6 +18563,20 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             source="authored call result declaration",
                             provenance=_Derived((result_cell,)),
                         )
+                if return_declaration_cell is not None:
+                    caller_scope = _source_numeric_scope(target_graph)
+                    result_sources = tuple(dict.fromkeys(
+                        cell for cell in (
+                            node_identity_cell(target_graph, int(_node_id)),
+                            return_declaration_cell,
+                        ) if cell is not None
+                    ))
+                    _concord_source_value_class(
+                        caller_scope, int(_node_id), str(returned_class),
+                        precision_limbs=1,
+                        source="authored method return annotation",
+                        provenance=_Derived(result_sources),
+                    )
         for _node_id, call_data in calls:
             expression = call_data.get("expr_obj")
             attributes = call_data.setdefault("attributes", {})

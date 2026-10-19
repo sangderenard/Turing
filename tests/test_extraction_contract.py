@@ -141,6 +141,25 @@ def test_default_contract_draws_python_native_and_decompile_lines():
     )
 
 
+def test_program_abi_input_accepts_closed_type_expectation_union():
+    contract = ExtractionContract(CONTRACT).with_program_abi({
+        "records": {},
+        "bindings": [],
+        "values": [{
+            "function": "root",
+            "parameter": "value",
+            "storage": "reference",
+            "type_expectations": ["builtins.dict", "builtins.list"],
+        }],
+    })
+
+    binding = contract.program_abi.values_for_function("root")["value"]
+    assert binding.admitted_types == ("builtins.dict", "builtins.list")
+    assert binding.receipt()["type_expectations"] == [
+        "builtins.dict", "builtins.list",
+    ]
+
+
 def test_reference_field_normalizes_its_repository_physical_dtype():
     contract = ExtractionContract(CONTRACT).with_program_abi({
         "records": {

@@ -609,3 +609,20 @@ def test_dependency_order_cache_keys_on_node_identity():
     second = Graph((0, 1, 5))
     second.G.graph.update(dict(first.G.graph))
     assert planner._dependency_order(second) == (0, 1, 5)
+
+
+def test_dependency_order_cache_keys_on_exact_edges():
+    class Graph:
+        def __init__(self):
+            self.G = nx.DiGraph()
+            self.G.add_nodes_from(
+                (node_id, {"parents": []}) for node_id in range(4)
+            )
+            self.levels = {}
+
+    graph = Graph()
+    graph.G.add_edges_from(((0, 1), (1, 3)))
+    assert planner._dependency_order(graph) == (0, 1, 2, 3)
+    graph.G.remove_edges_from(tuple(graph.G.edges))
+    graph.G.add_edges_from(((0, 2), (2, 1)))
+    assert planner._dependency_order(graph) == (0, 2, 1, 3)

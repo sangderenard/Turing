@@ -66,16 +66,12 @@ def build_compartment(directory, *, lower_only=False, grow_stage=True, jobs=None
     worker_jobs = 12 if jobs is None else int(jobs)
     if worker_jobs < 1:
         raise ValueError('provenance worker count must be positive')
-    # Fail-fast stages remain intentionally small: once a worker reports a
-    # blocker, only the already-admitted peers drain.  A collecting run has a
-    # different policy.  With no explicit stage limit, admit the whole plan
-    # while `jobs` continues to bound concurrency, so one invocation reports
-    # every independent failure instead of five at a time.
-    stage_units = (
-        worker_jobs
-        if max_stage_units is None and stop_after_failure
-        else max_stage_units
-    )
+    # ``jobs`` controls concurrency only.  Fail-fast already stops admission
+    # when the first failed/partial receipt arrives and drains its admitted
+    # peers; using the worker count as an implicit stage limit made a clean
+    # run checkpoint after arbitrary groups of 12.  Only an explicit
+    # ``--stage-units`` request creates a clean checkpoint boundary.
+    stage_units = max_stage_units
     scheduling = dict(schedule_options or {})
     allowed = {'max_total_resident_bytes', 'minimum_total_resident_bytes',
                'system_reserve_bytes', 'adaptive_memory_ceiling',
@@ -384,7 +380,10 @@ def main(argv=None):
     parser.add_argument('--whole-module', action='store_true',
                         help='use the original indivisible whole-module lowering')
     parser.add_argument('--jobs', type=int, default=12, help='maximum concurrent isolated workers (default: 12)')
-    parser.add_argument('--stage-units', type=int, help='units admitted before draining and restarting (default: jobs)')
+    parser.add_argument(
+        '--stage-units', type=int,
+        help='explicit units admitted before draining and restarting',
+    )
     parser.add_argument(
         '--continue-after-failure', action='store_true',
         help='admit the complete scheduled stage and report every failed/partial unit',

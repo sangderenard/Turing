@@ -1200,6 +1200,27 @@ def test_unbound_variant_row_follows_unique_exact_region_feed_resident():
     assert aliases[53] == 41
 
 
+def test_unbound_variant_row_reuses_authoritative_scalar_source_abi():
+    source = SSAValue(7, dtype="opaque_ref", accounting={
+        "program_abi_parameter": "row",
+        "program_abi_storage": "reference",
+        "native_exact_type": "builtins.tuple",
+    })
+    row = SSAValue(53, dtype="opaque_ref", accounting={
+        "unbound_variant_source_id": 7,
+        "variant_column": "row",
+    })
+    function = Function(
+        "caller", [source, row],
+        {"entry": BasicBlock("entry", [Instr("Ret", [row], None)])},
+        metadata={},
+    )
+
+    aliases = _concord_unbound_variant_rows(function)
+
+    assert aliases[53] == 7
+
+
 def test_linker_fresh_ids_ignore_integer_frame_payloads():
     assert _frame_binding_value_ids((
         (1, "caller_value", 7),

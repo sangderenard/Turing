@@ -52,9 +52,11 @@ from src.compiler.glsl_deployment_strategy import (
 )
 from src.compiler.precompile_to_ssa import lower_control_sections_to_ssa
 from src.compiler.resident_sequence_materialization import (
+    _compiled_validation_diagnostic_sequence_ids,
     _promote_conditional_sequence_aliases,
     _sequence_append_call_mutations,
 )
+from src.compiler.concordance_declarations import CONTROL_PROGRAM_BUILD
 from src.compiler.loop_ir import (
     IterableAccess,
     IterableDomain,
@@ -72,6 +74,7 @@ from src.compiler.control_source import (
     StreamPublishBlock,
     ValidationBlock,
     WhileBlock,
+    post_control_program,
     render_control_program,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
@@ -1247,12 +1250,12 @@ def test_dynamic_range_bound_is_a_control_dependency_not_none_uniform():
 
 def test_raise_guard_inside_retained_loop_becomes_lexical_validation():
     graph = _function_graph(
-        "def kernel(values, count):\n"
+        "def kernel(values, seen, count):\n"
         "    value = 0\n"
         "    for index in range(count):\n"
         "        value = values[index]\n"
-        "        if value < 0:\n"
-        "            raise ValueError('negative')\n"
+        "        if value in seen:\n"
+        "            raise ValueError(f'negative {value!r}')\n"
         "        value = value + 1\n"
         "    return value\n",
         "kernel",
@@ -1276,6 +1279,14 @@ def test_raise_guard_inside_retained_loop_becomes_lexical_validation():
         if isinstance(block, ValidationBlock)
     )
     assert validation.expect_true is False
+    diagnostic_id, = validation.diagnostic_value_ids
+    assert isinstance(graph.G.nodes[diagnostic_id]["expr_obj"], ast.JoinedStr)
+    post_control_program(
+        graph.G, reduction.control_program, stage=CONTROL_PROGRAM_BUILD,
+    )
+    assert _compiled_validation_diagnostic_sequence_ids(
+        graph.G,
+    ) == frozenset((diagnostic_id,))
 
 
 def test_shape_index_range_is_recovered_as_bound_not_range_object():
@@ -1312,6 +1323,41 @@ def test_static_iterable_is_an_explicit_constant_loop_definition():
     assert plan.semantic.body_closure is not None
     assert reduction.control_program.static_iterable_bindings
     assert not reduction.control_program.iterable_bindings
+
+
+def test_reversed_resident_iterable_keeps_source_binding_and_reverse_bounds():
+    graph = _function_graph(
+        "def kernel(values):\n"
+        "    total = 0\n"
+        "    for value in reversed(values):\n"
+        "        total = total + value\n"
+        "    return total\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,)
+    )
+    reversed_node = graph.G.nodes[int(plan.loop.iterable_node)]
+    source_id, = (
+        int(parent)
+        for parent, role in reversed_node["parents"]
+        if str(role) in {"arg", "args", "arg:0", "arg0"}
+    )
+
+    assert reduction.control_program is not None
+    assert not reduction.control_program.iterable_bindings
+    assert reduction.control_program.projected_iterable_bindings == ((
+        source_id,
+        int(plan.loop.target_bindings[0][1]),
+        f"iteration_{int(plan.loop.node_id)}",
+        None,
+    ),)
+    assert reduction.control_program.root.start == (
+        f"(__iterable_extent_{source_id}__ - 1)"
+    )
+    assert reduction.control_program.root.stop == "-1"
+    assert reduction.control_program.root.step == "-1"
 
 
 def test_enumerate_resident_iterable_exports_projected_bindings():
@@ -1404,18 +1450,26 @@ def test_enumerate_zip_nested_target_preserves_each_source_column():
         for parent, role in enumerate_node["parents"]
         if str(role) in {"arg", "args", "arg:0", "arg0"}
     )
+    zip_sources = tuple(
+        int(parent)
+        for parent, role in graph.G.nodes[zip_id]["parents"]
+        if str(role).startswith("arg:")
+    )
 
     assert len(plan.loop.target_bindings) == 3
     assert reduction.control_program is not None
     assert tuple(
-        (int(target_id), projection)
+        (int(iterable_id), int(target_id), projection)
         for iterable_id, target_id, _induction, projection
         in reduction.control_program.projected_iterable_bindings
-        if int(iterable_id) == zip_id
     ) == (
-        (int(plan.loop.target_bindings[0][1]), "induction"),
-        (int(plan.loop.target_bindings[1][1]), 0),
-        (int(plan.loop.target_bindings[2][1]), 1),
+        (zip_id, int(plan.loop.target_bindings[0][1]), "induction"),
+        (zip_sources[0], int(plan.loop.target_bindings[1][1]), None),
+        (zip_sources[1], int(plan.loop.target_bindings[2][1]), None),
+    )
+    assert reduction.control_program.root.stop == (
+        f"min(__iterable_extent_{zip_sources[0]}__, "
+        f"__iterable_extent_{zip_sources[1]}__)"
     )
 
 
@@ -1489,6 +1543,10 @@ def test_materialized_closure_iterable_binds_resident_source_identities():
 
 
 def test_tuple_generator_materialization_owns_publication_storage():
+    from src.common.tensors.topological_reducer import _source_numeric_scope
+    from src.compiler.concordance_declarations import SOURCE_VALUE_CLASS
+    from src.compiler.identity_concordance import current_identity_book
+
     graph = _function_graph(
         "def kernel(values):\n"
         "    return AbstractTensor.stack(\n"
@@ -1538,6 +1596,12 @@ def test_tuple_generator_materialization_owns_publication_storage():
     assert graph.G.nodes[collection_id]["type"] == "LoopResult"
     assert graph.G.nodes[tuple_id]["attributes"]["collection_owner_id"] == (
         collection_id
+    )
+    aggregate_class = current_identity_book().page(
+        SOURCE_VALUE_CLASS
+    ).latest((_source_numeric_scope(graph), int(collection_id)))
+    assert aggregate_class[:3] == (
+        "builtins.tuple", 1, "retained comprehension aggregate result",
     )
 
 

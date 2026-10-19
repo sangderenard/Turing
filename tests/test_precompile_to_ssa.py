@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
@@ -33,6 +35,8 @@ from src.compiler.precompile_to_ssa import (
     _inject_field_slot_access,
     _install_loop_owned_table_queries,
     _materialize_control_constants,
+    _settle_child_pool_operation_dtypes,
+    _scoped_value_type_abi,
     _typed_region_occurrence,
     ResolvedSequenceSchema,
     find_ssa_cycles,
@@ -51,11 +55,32 @@ from src.compiler.concordance_declarations import (
     INGEST_SOURCE,
     SOURCE_SPAN,
     SSA_VALUE,
+    VALUE_TYPE_ABI,
     SSAValueFact,
     SSAValueOrigin,
     SpanFact,
+    ValueTypeABIAlternative,
+    ValueTypeABIFact,
 )
+
+
+def test_scoped_value_type_handoff_cannot_invent_a_missing_concordance_row():
+    scope = ("typed", 0)
+    fact = ValueTypeABIFact(("builtins.int",), (), (
+        ValueTypeABIAlternative(
+            "builtins.int", "scalar", "int64", (), 0,
+            (("primitive_class_abi", "int"),),
+            (Ref(VALUE_TYPE_ABI, (scope, 7), 0),),
+        ),
+    ))
+    _book, token = begin_identity_book()
+    try:
+        with pytest.raises(ValueError, match="no authoritative concordance row"):
+            _scoped_value_type_abi(scope, {7: fact})
+    finally:
+        end_identity_book(token)
 from src.compiler.identity_concordance import (
+    Derived,
     Mode,
     Novel,
     Ref,
@@ -2508,6 +2533,85 @@ def test_sequence_row_load_resolves_an_earlier_provisional_argument():
     assert load.res.dtype == "int64"
 
 
+def test_scheduled_row_type_tag_is_defined_at_its_earlier_predicate():
+    scope = ("late_projected_type_tag",)
+    target_id = 14
+    value_cell = _seed_value(scope, target_id, dtype="opaque_ref")
+    physical = tuple(
+        ValueTypeABIAlternative(
+            identity,
+            "reference",
+            "opaque_ref",
+            (),
+            0,
+            (),
+            (value_cell,),
+        )
+        for identity in ("builtins.bool", "builtins.int")
+    )
+    type_fact = ValueTypeABIFact(
+        tuple(arm.identity for arm in physical),
+        (("builtins.bool", 0), ("builtins.int", 1)),
+        physical,
+    )
+    current_identity_book().post(
+        VALUE_TYPE_ABI,
+        (scope, target_id),
+        type_fact,
+        stage=INGESTION,
+        provenance=Derived((value_cell,)),
+        mode=Mode.CONCORD,
+    )
+    program = ControlProgram(SequenceBlock(()))
+    builder = _ControlSSABuilder(
+        program,
+        function_name="late_projected_type_tag",
+        first_value_id=100,
+        region_callees=None,
+        region_signatures=None,
+        lexical_read_scope=scope,
+        sequence_declarations=((1, "duplicates", 1, False),),
+        sequence_column_dtypes={1: ("opaque_ref",)},
+        table_region_operations={
+            2: (("row_load", (target_id, 1, 7, 1, 0, target_id)),),
+        },
+        native_value_type_abi={target_id: type_fact},
+    )
+
+    predicate = builder._native_value_type_predicate(
+        target_id, ("builtins.int",), subtype=True,
+    )
+    predicate_block = builder.current
+    late_row_load = builder.new_block("if_merge")
+    builder.current = late_row_load
+    builder._emit_sequence_row_load(target_id, 1, 7, 1, 0, target_id)
+
+    tag_index, tag_load = next(
+        (index, instruction)
+        for index, instruction in enumerate(predicate_block.instrs)
+        if instruction.attributes.get("binding")
+        == "projected_native_type_tag"
+    )
+    predicate_index = next(
+        index
+        for index, instruction in enumerate(predicate_block.instrs)
+        if instruction.res is predicate
+    )
+    assert tag_index < predicate_index
+    assert all(
+        tag_load.res not in instruction.args
+        for instruction in late_row_load.instrs
+    )
+    assert not any(
+        instruction.attributes.get("binding")
+        == "projected_native_type_tag"
+        for instruction in late_row_load.instrs
+    )
+    assert all(
+        int(argument.id) != target_id for argument in builder.arguments
+    )
+
+
 def test_stream_publication_uses_retained_aggregate_members_not_tuple_formal():
     control = ControlProgram(StreamPublishBlock(
         stream_id=0,
@@ -2630,6 +2734,164 @@ def test_projected_enumerate_binding_lowers_extent_counter_and_element():
         and instruction.op == "Load"
         for instruction in body
     )
+
+
+def test_projected_selected_child_sequence_loads_declared_value_column():
+    control = ControlProgram(
+        SequenceBlock((
+            SequenceQueryBlock(
+                result_value_id=11,
+                sequence_value_id=5,
+                operation="lookup",
+                key_value_ids=(2,),
+            ),
+            LoopBlock(
+                "iteration_9",
+                "(__iterable_extent_11__ - 1)",
+                "-1",
+                "-1",
+                StatementBlock(("__scheduled_region_4__",)),
+            ),
+        )),
+        region_indices=(4,),
+        projected_iterable_bindings=((11, 42, "iteration_9", None),),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_callees={4: "numerical_region_4"},
+        region_signatures={4: ((42,), ())},
+        region_value_meta={
+            2: Meta((), "int64", "cpu"),
+            42: Meta((), "int64", "cpu"),
+        },
+        sequence_declarations=((5, "unique", 2, True),),
+        sequence_column_dtypes={5: ("int64", "int64")},
+        nested_sequence_ids=(5,),
+        table_lookups=((11, 2, 5),),
+    )
+
+    assert shortfalls == ()
+    descriptor = function.metadata["sequence_table"].by_id(5)
+    assert descriptor is not None
+    pool = descriptor.child_table_pool
+    assert pool is not None
+    value_column, = tuple(
+        column
+        for column in range(len(pool.column_value_ids))
+        if column not in pool.key_columns
+    )
+    assert pool.column_dtypes[value_column] == "int64"
+    element_address = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "GetElementPtr"
+        and instruction.attributes.get("binding") == "child_table_element"
+    )
+    assert element_address.args[0].id == pool.column_value_ids[value_column]
+    assert element_address.attributes["child_table_column"] == value_column
+    assert not any(
+        instruction.attributes.get("binding") == "projected_iterable"
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+
+
+def test_final_child_pool_dtype_comes_from_exact_element_load():
+    control = ControlProgram(
+        SequenceBlock((
+            SequenceQueryBlock(
+                result_value_id=11,
+                sequence_value_id=5,
+                operation="lookup",
+                key_value_ids=(2,),
+            ),
+            LoopBlock(
+                "iteration_9", "0", "__iterable_extent_11__", "1",
+                StatementBlock(("__scheduled_region_4__",)),
+            ),
+        )),
+        region_indices=(4,),
+        projected_iterable_bindings=((11, 42, "iteration_9", None),),
+    )
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_callees={4: "numerical_region_4"},
+        region_signatures={4: ((42,), ())},
+        region_value_meta={
+            2: Meta((), "int64", "cpu"),
+            42: Meta((), "int64", "cpu"),
+        },
+        sequence_declarations=((5, "unique", 2, True),),
+        sequence_column_dtypes={5: ("int64", "int64")},
+        nested_sequence_ids=(5,),
+        table_lookups=((11, 2, 5),),
+    )
+    assert shortfalls == ()
+    table = function.metadata["sequence_table"]
+    descriptor = table.by_id(5)
+    pool = descriptor.child_table_pool
+    value_column, = tuple(
+        column for column in range(len(pool.column_value_ids))
+        if column not in pool.key_columns
+    )
+    arena_id = pool.column_value_ids[value_column]
+    unknown_dtypes = list(pool.column_dtypes)
+    unknown_dtypes[value_column] = "unknown"
+    table.sequences[5] = replace(
+        descriptor,
+        child_table_pool=replace(
+            pool, column_dtypes=tuple(unknown_dtypes),
+        ),
+    )
+    arena = next(value for value in function.args if value.id == arena_id)
+    arena.dtype = "unknown"
+    pointer_view = SSAValue(arena_id, dtype="ptr")
+    address_consumer = Function(
+        "address_consumer", [pointer_view],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], None)])},
+    )
+    numeric_view = SSAValue(arena_id, dtype="float64")
+    numeric_consumer = Function(
+        "numeric_consumer", [numeric_view],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], None)])},
+    )
+    child_block, child_load = next(
+        (block, instruction)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Load"
+        and instruction.attributes.get("binding") == "child_table_element"
+    )
+    authored_integer = SSAValue(999_991, dtype="int")
+    function.args.append(authored_integer)
+    child_block.instrs.insert(
+        child_block.instrs.index(child_load),
+        Instr(
+            "Store", [authored_integer, child_load.args[0]], None,
+            attributes={"binding": "child_table_element"},
+        ),
+    )
+
+    _settle_child_pool_operation_dtypes(
+        {
+            function.name: function,
+            address_consumer.name: address_consumer,
+            numeric_consumer.name: numeric_consumer,
+        },
+        {function.name: table},
+    )
+
+    assert arena.dtype == "int64"
+    assert pointer_view.dtype == "ptr"
+    assert numeric_view.dtype == "float64"
+    assert authored_integer.dtype == "int64"
+    assert table.by_id(5).child_table_pool.column_dtypes[
+        value_column
+    ] == "int64"
 
 
 def test_nested_iterable_row_is_handle_stride_and_child_address():
@@ -3733,6 +3995,174 @@ def test_while_identity_assignment_is_a_defined_phi_backedge():
     assert carried_phi.res.accounting["ssa_identity_backedge"] is True
 
 
+def test_while_union_backedge_claims_its_reserved_exact_tag():
+    """A body-defined Optional update is a backedge definition, not a formal."""
+
+    scope = ("while_union_backedge",)
+
+    def type_fact(value_id, identities):
+        cell = _seed_value(scope, value_id, dtype="int64")
+        physical = tuple(
+            ValueTypeABIAlternative(
+                identity,
+                "none" if identity == "builtins.NoneType" else "scalar",
+                "" if identity == "builtins.NoneType" else "int64",
+                (), 0,
+                () if identity == "builtins.NoneType"
+                else (("primitive_class_abi", "int"),),
+                (cell,),
+            )
+            for identity in identities
+        )
+        fact = ValueTypeABIFact(
+            tuple(identities),
+            tuple((identity, index) for index, identity in enumerate(identities)),
+            physical,
+        )
+        current_identity_book().post(
+            VALUE_TYPE_ABI, (scope, value_id), fact,
+            stage=INGESTION, provenance=Derived((cell,)), mode=Mode.CONCORD,
+        )
+        return fact
+
+    optional_initial = type_fact(
+        1, ("builtins.NoneType", "builtins.int"),
+    )
+    optional_update = type_fact(
+        2, ("builtins.NoneType", "builtins.int"),
+    )
+    exact_integer = type_fact(3, ("builtins.int",))
+    control = ControlProgram(WhileBlock(
+        predicate_value_id=10,
+        condition=SequenceBlock(()),
+        body=ConditionalBlock(
+            predicate_value_id=30,
+            body=SequenceBlock(()),
+            orelse=SequenceBlock(()),
+            predicate_expression=ControlExpression("value", value_id=30),
+            result_aliases=((3, 1, 2),),
+            body_value_expressions=((
+                3, ControlExpression("const", value_id=3, literal=7),
+            ),),
+        ),
+        predicate_expression=ControlExpression("value", value_id=10),
+        carried_aliases=((2, 1),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="while_union_backedge",
+        lexical_read_scope=scope,
+        region_value_meta={
+            1: Meta((), "int64"), 2: Meta((), "int64"),
+            3: Meta((), "int64"), 10: Meta((), "bool"),
+            30: Meta((), "bool"),
+        },
+        value_name_histories={
+            "asof": (1, 2), "keep_going": (10,), "choose": (30,),
+        },
+        parameter_names=("asof", "keep_going", "choose"),
+        native_value_type_abi={
+            1: optional_initial, 2: optional_update, 3: exact_integer,
+        },
+    )
+
+    assert shortfalls == ()
+    header_tag = next(
+        instruction
+        for instruction in function.blocks["while_header"].instrs
+        if instruction.attributes.get("binding")
+        == "while_carried_native_type_tag"
+    )
+    body_tag = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding")
+        == "conditional_native_type_tag"
+    )
+    assert header_tag.args[1] is body_tag.res
+    assert body_tag.res not in function.args
+    assert check_definition_dominance(IRModule({function.name: function})) == []
+
+
+def test_conditional_consumes_concorded_pending_call_result_tag():
+    """A scheduled Optional result exposes its tag before frame linking."""
+
+    scope = ("conditional_call_union",)
+
+    def type_fact(value_id, identities):
+        cell = _seed_value(scope, value_id, dtype="opaque_ref")
+        physical = tuple(
+            ValueTypeABIAlternative(
+                identity,
+                "none" if identity == "builtins.NoneType" else "reference",
+                "" if identity == "builtins.NoneType" else "opaque_ref",
+                (), 0,
+                () if identity == "builtins.NoneType"
+                else (("primitive_class_abi", "tuple"),),
+                (cell,),
+            )
+            for identity in identities
+        )
+        fact = ValueTypeABIFact(
+            tuple(identities),
+            tuple((identity, index) for index, identity in enumerate(identities)),
+            physical,
+        )
+        current_identity_book().post(
+            VALUE_TYPE_ABI, (scope, value_id), fact,
+            stage=INGESTION, provenance=Derived((cell,)), mode=Mode.CONCORD,
+        )
+        return fact
+
+    type_fact(31, ("builtins.NoneType", "builtins.tuple"))
+    type_fact(32, ("builtins.NoneType",))
+    type_fact(63, ("builtins.NoneType", "builtins.tuple"))
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=10,
+        body=StatementBlock(("__plan_callsite_99__",)),
+        orelse=SequenceBlock(()),
+        predicate_expression=ControlExpression("value", value_id=10),
+        result_aliases=((31, 32, 63),),
+        orelse_value_expressions=((
+            32, ControlExpression("const", value_id=32, literal=None),
+        ),),
+    ))
+
+    # The sectional API receives the lexical scope, not a second manually
+    # curated list of that scope's type rows. VALUE_TYPE_ABI must supply the
+    # call arm even when a separate shell ABI view omits that value.
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="conditional_call_union",
+        lexical_read_scope=scope,
+        region_value_meta={
+            10: Meta((), "bool"), 12: Meta((), "int64"),
+            31: Meta((), "opaque_ref"), 32: Meta((), "none"),
+            63: Meta((), "opaque_ref"),
+        },
+        value_name_histories={"choose": (10,), "argument": (12,)},
+        parameter_names=("choose", "argument"),
+        plan_callsite_bindings={99: ((12,), (31,))},
+    )
+
+    assert shortfalls == ()
+    result_tag = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding")
+        == "conditional_native_type_tag"
+    )
+    provisional = result_tag.args[0]
+    assert provisional.accounting["native_type_tag_pending_call_result"] is True
+    assert provisional in function.args
+    assert function.metadata["native_value_type_tags"] == (
+        (31, int(provisional.id)), (63, int(result_tag.res.id)),
+    )
+
+
 def test_terminal_loop_return_runs_after_predicated_sequence_effects():
     predicate = ControlExpression("value", value_id=10)
     argument = ControlExpression(
@@ -3821,6 +4251,7 @@ def test_constant_true_while_does_not_create_a_synthetic_return_path():
     header_branch = function.blocks["while_header"].instrs[-1]
     assert header_branch.attributes["constant_predicate"] is True
     assert header_branch.attributes["source_value_id"] == 20
+    assert function.blocks["while_exit"].successors == []
     assert check_definition_dominance(IRModule({function.name: function})) == []
 
 
@@ -4841,6 +5272,44 @@ def test_resident_iterable_loop_uses_logical_length_not_storage_extent():
         and instruction.attributes.get("binding") == "iterable_extent"
         for block in function.blocks.values()
         for instruction in block.instrs
+    )
+
+
+def test_zip_loop_uses_minimum_of_resident_source_lengths():
+    control = ControlProgram(LoopBlock(
+        induction="iteration_9",
+        start="0",
+        stop="min(__iterable_extent_30__, __iterable_extent_40__)",
+        step="1",
+        body=SequenceBlock(()),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        sequence_declarations=(
+            (30, "duplicates", 1, False),
+            (40, "duplicates", 1, False),
+        ),
+        source_sequence_ids=(30, 40),
+    )
+
+    assert shortfalls == ()
+    entry = function.blocks["entry"].instrs
+    assert sum(
+        instruction.op == "Load"
+        and instruction.attributes.get("binding")
+        == "resident_iterable_length"
+        for instruction in entry
+    ) == 2
+    assert any(
+        instruction.op == "Lt"
+        and instruction.attributes.get("binding") == "control_minimum"
+        for instruction in entry
+    )
+    assert any(
+        instruction.op == "Select"
+        and instruction.attributes.get("binding") == "control_minimum"
+        for instruction in entry
     )
 
 

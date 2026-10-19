@@ -601,6 +601,7 @@ def compose_hierarchical_control(
                     block.expect_true,
                     rewrite_expression(block.predicate_expression),
                     block.extraction_identity,
+                    block.diagnostic_value_ids,
                 )
             if isinstance(block, StreamPublishBlock):
                 publication = StreamPublishBlock(

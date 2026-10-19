@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import sys
 import copy
 from dataclasses import dataclass, replace
@@ -34,6 +35,7 @@ from .control_source import (
     StreamPublishBlock,
     ValidationBlock,
     WhileBlock,
+    validation_diagnostic_value_ids,
 )
 from .loop_ir import (
     ConditionDomain,
@@ -2255,6 +2257,38 @@ def materialize_retained_loop_ports(
                             "sequence_column_count", "sequence_writable")
                 if key in materializer_attributes
             })
+            aggregate_kind = str(
+                materializer_attributes.get("aggregate_kind") or ""
+            )
+            if aggregate_kind in {
+                "list", "tuple", "dict", "set", "frozenset",
+                "bytes", "bytearray",
+            }:
+                # The comprehension's LoopResult is the resident collection
+                # that leaves the loop.  Its semantic class is declared by
+                # the materializer's aggregate contract, not inferred from
+                # a Python object or from the element dtype.
+                from ..common.tensors.topological_reducer import (
+                    _concord_source_value_class,
+                    _source_numeric_scope,
+                    node_identity_cell,
+                )
+
+                class_sources = tuple(filter(None, (
+                    port_rows.get(int(collection_id)),
+                    node_identity_cell(
+                        graph, int(output.materializer_node_id),
+                    ),
+                )))
+                _concord_source_value_class(
+                    _source_numeric_scope(graph),
+                    int(collection_id),
+                    f"builtins.{aggregate_kind}",
+                    source="retained comprehension aggregate result",
+                    provenance=(
+                        Derived(class_sources) if class_sources else None
+                    ),
+                )
             if loop.iterable_node is not None:
                 graph.G.nodes[collection_id]["attributes"]["collection_iterable_value_id"] = int(loop.iterable_node)
             materializer_attributes.update({
@@ -4633,6 +4667,37 @@ def analyze_shader_loop_reductions(
         # this graph, so every backend receives an identity-derived induction
         # symbol while the source name remains diagnostic metadata only.
         induction_name = f"iteration_{int(loop.node_id)}"
+        # ``reversed(source)`` changes iteration order, not storage identity.
+        # Preserve the exact operand as the resident iterable and express the
+        # reversal in the counted-loop bounds below.  There is no native
+        # Python iterator object to expose as another public input.
+        iterable_source_id = loop.iterable_node
+        reverse_iterable = False
+        if (
+            loop.stop is None
+            and loop.stop_node is None
+            and loop.iterable_node is not None
+            and loop.iterable_constant is None
+        ):
+            iterable_data = graph.G.nodes[int(loop.iterable_node)]
+            iterable_identity = str(
+                (iterable_data.get("attributes") or {}).get(
+                    "extraction_identity"
+                )
+                or (iterable_data.get("attributes") or {}).get(
+                    "static_python_reference"
+                )
+                or ""
+            )
+            if iterable_identity in {"reversed", "builtins.reversed"}:
+                reversed_sources = tuple(
+                    int(parent)
+                    for parent, role in iterable_data.get("parents", ())
+                    if re.fullmatch(r"arg(?::)?0", str(role))
+                )
+                if len(reversed_sources) == 1:
+                    iterable_source_id = reversed_sources[0]
+                    reverse_iterable = True
         # A range loop's lexical target is the induction value itself.  Record
         # that identity through the existing projected-iterable binding table
         # so region calls consuming the source target ID receive the loop
@@ -4650,7 +4715,19 @@ def analyze_shader_loop_reductions(
             loop.iterator_kind == "arithmetic_sequence"
             and len(loop.target_bindings) == 1
         ) else ()
+        if reverse_iterable and len(loop.target_bindings) == 1:
+            # Iterator wrappers do not own element storage.  Bind the lexical
+            # target as a projection of the exact operand, just as enumerate
+            # does for its element arm; the LoopBlock's negative induction
+            # supplies the reversed access order.
+            projected_iterable_bindings = ((
+                int(iterable_source_id),
+                int(loop.target_bindings[0][1]),
+                induction_name,
+                None,
+            ),)
         enumerated_source_id = None
+        iterable_extent_ids: tuple[int, ...] = ()
         if (
             loop.stop is None
             and loop.stop_node is None
@@ -4674,6 +4751,29 @@ def analyze_shader_loop_reductions(
                 )
                 enumerated_source_id = source_id
                 if source_id is not None and len(loop.target_bindings) >= 2:
+                    source_data = graph.G.nodes[source_id]
+                    source_reference = (
+                        source_data.get("attributes") or {}
+                    ).get("static_python_reference")
+                    zip_sources: tuple[int, ...] = ()
+                    if source_reference == "zip":
+                        numbered_sources: dict[int, int] = {}
+                        for parent, role in source_data.get("parents", ()):
+                            match = re.fullmatch(r"arg(?::)?(\d+)", str(role))
+                            if match is None:
+                                continue
+                            position = int(match.group(1))
+                            if position in numbered_sources:
+                                numbered_sources = {}
+                                break
+                            numbered_sources[position] = int(parent)
+                        if numbered_sources and set(numbered_sources) == set(
+                            range(len(numbered_sources))
+                        ):
+                            zip_sources = tuple(
+                                numbered_sources[position]
+                                for position in range(len(numbered_sources))
+                            )
                     # ``enumerate`` authors a two-member result whose first
                     # member is the induction and whose second member is one
                     # element of its exact source iterable.  When that source
@@ -4683,6 +4783,13 @@ def analyze_shader_loop_reductions(
                     # every binding in that case.  Preserve the first target
                     # as enumerate's induction, then project the remaining
                     # authored targets from the source row in lexical order.
+                    projected_sources = (
+                        zip_sources
+                        if len(zip_sources) == len(loop.target_bindings) - 1
+                        else tuple(
+                            source_id for _target in loop.target_bindings[1:]
+                        )
+                    )
                     projected_iterable_bindings = (
                         (
                             source_id,
@@ -4692,7 +4799,7 @@ def analyze_shader_loop_reductions(
                         ),
                         *tuple(
                             (
-                                source_id,
+                                projected_source,
                                 int(target_id),
                                 induction_name,
                                 (
@@ -4701,11 +4808,35 @@ def analyze_shader_loop_reductions(
                                     else int(position)
                                 ),
                             )
-                            for position, (_name, target_id) in enumerate(
-                                loop.target_bindings[1:]
-                            )
+                            for position, (
+                                projected_source, (_name, target_id),
+                            ) in enumerate(zip(
+                                projected_sources,
+                                loop.target_bindings[1:],
+                                strict=True,
+                            ))
                         ),
                     )
+                    if zip_sources:
+                        # ``zip`` does not author storage. Its row members
+                        # remain projections of the exact argument sequences,
+                        # and its cardinality is their shortest live length.
+                        projected_iterable_bindings = (
+                            projected_iterable_bindings[0],
+                            *tuple(
+                                (
+                                    int(projected_source), int(target_id),
+                                    induction_name, None,
+                                )
+                                for projected_source, (_name, target_id)
+                                in zip(
+                                    zip_sources,
+                                    loop.target_bindings[1:],
+                                    strict=True,
+                                )
+                            ),
+                        )
+                        iterable_extent_ids = tuple(map(int, zip_sources))
             else:
                 projected_iterable_bindings = tuple(
                     (
@@ -4722,8 +4853,10 @@ def analyze_shader_loop_reductions(
             if enumerated_source_id is not None
             else int(projected_iterable_bindings[0][0])
             if projected_iterable_bindings
-            else loop.iterable_node
+            else iterable_source_id
         )
+        if not iterable_extent_ids and iterable_extent_id is not None:
+            iterable_extent_ids = (int(iterable_extent_id),)
         dynamic_bounds = tuple(
             (
                 name,
@@ -4849,7 +4982,7 @@ def analyze_shader_loop_reductions(
         # terminal-branch skip in topological_reducer.py's ast.If
         # handling), so validating the raise here is enough on its own to
         # make the whole statement compile.
-        validations: list[tuple[int, int, bool]] = []
+        validations: list[tuple[int, int, bool, tuple[int, ...]]] = []
         validated_raise_signatures: set[tuple[Any, ...]] = set()
         for node_id in loop.body_nodes:
             if node_id not in graph.G:
@@ -4891,6 +5024,9 @@ def analyze_shader_loop_reductions(
                 int(raise_node_id),
                 int(predicate_id),
                 not raises_when_true,
+                validation_diagnostic_value_ids(
+                    raise_items[0], node_for_expression,
+                ),
             ))
             validated_raise_signatures.update(
                 expression_signature(item) for item in raise_items
@@ -5810,9 +5946,13 @@ def analyze_shader_loop_reductions(
                         and isinstance(expression.exc.func, ast.Name)
                         else None
                     ),
+                    diagnostic_value_ids=diagnostic_value_ids,
                 ),
             )
-            for node_id, predicate_value_id, expect_true in validations
+            for (
+                node_id, predicate_value_id, expect_true,
+                diagnostic_value_ids,
+            ) in validations
             if node_id in lexical_position
         )
         for yield_id, publish_value_id, publish_count_id in loop.publication_nodes:
@@ -5933,6 +6073,13 @@ def analyze_shader_loop_reductions(
                 bound_expressions.get("step", "1")
                 if loop.step is None else str(loop.step)
             )
+            if reverse_iterable:
+                step_expression = "-1"
+            iterable_extent_expression = (
+                _spliced_tuple_extent(
+                    graph.G, int(iterable_extent_id)
+                ) or f"__iterable_extent_{iterable_extent_id}__"
+            ) if iterable_extent_id is not None else None
             # A counted loop's exclusive bound is only a ceiling while the
             # step is positive.  ``range(n - 1, -1, -1)`` counts DOWN, and its
             # ``-1`` is a floor: the forward ``lt`` test is false on the first
@@ -5955,10 +6102,12 @@ def analyze_shader_loop_reductions(
                 control_site_ids=control_site_ids,
                 carried_seeds=carried_seeds,
                 start=(
+                    f"({iterable_extent_expression} - 1)"
+                    if reverse_iterable else
                     bound_expressions.get("start", "0")
                     if loop.start is None else str(loop.start)
                 ),
-                stop=str(loop.stop) if loop.stop is not None else (
+                stop="-1" if reverse_iterable else str(loop.stop) if loop.stop is not None else (
                     str(len(plan.semantic.domain.source_value_ids))
                     if (
                         plan.semantic is not None
@@ -5967,8 +6116,14 @@ def analyze_shader_loop_reductions(
                         is IterableAccess.CLOSURE_AGGREGATE
                         and plan.semantic.domain.source_value_ids
                     )
-                    else (_spliced_tuple_extent(graph.G, int(iterable_extent_id))
-                          or f"__iterable_extent_{iterable_extent_id}__")
+                    else (
+                        "min(" + ", ".join(
+                            f"__iterable_extent_{source_id}__"
+                            for source_id in iterable_extent_ids
+                        ) + ")"
+                        if len(iterable_extent_ids) > 1
+                        else iterable_extent_expression
+                    )
                     if loop.stop_node is None and loop.iterable_node is not None
                     and loop.iterable_constant is None
                     else str(len(loop.iterable_constant))
@@ -6062,7 +6217,7 @@ def analyze_shader_loop_reductions(
                     ),
                     iterable_bindings=(
                         (
-                            int(loop.iterable_node),
+                            int(iterable_source_id),
                             int(loop.target_bindings[0][1]),
                             induction_name,
                         ),
@@ -6073,6 +6228,7 @@ def analyze_shader_loop_reductions(
                         and loop.iterable_node is not None
                         and len(loop.target_bindings) == 1
                         and loop.iterable_constant is None
+                        and not reverse_iterable
                     )
                     else (),
                     static_iterable_bindings=tuple(

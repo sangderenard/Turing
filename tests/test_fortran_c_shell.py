@@ -39,6 +39,7 @@ from src.compiler.fortran_c_shell import (
     _resolved_source_graphs_by_symbol,
     _resolved_source_literals_by_symbol,
     _source_graph_for_lowered_function,
+    _without_plan_callsites,
 )
 from src.compiler.ssa_fortran_backend import FortranModule, fortran_compiler
 from src.compiler.ssa_fortran_backend import FortranEmissionError
@@ -312,6 +313,64 @@ def test_scalar_control_item_records_identity_instead_of_a_new_formal():
     ]
     assert builder.arguments == []
     assert not any(block.instrs for block in builder.blocks.values())
+
+
+def test_validation_only_plan_call_is_removed_by_exact_callsite_identity():
+    from src.compiler.hierarchical_plan import PlanCall, PlanClosure
+
+    retained = PlanCall(8, PlanClosure("retained", (), ()))
+    diagnostic = PlanCall(9, PlanClosure("diagnostic", (), ()))
+    plan = PlanClosure("root", (), (retained, diagnostic))
+
+    projected = _without_plan_callsites(plan, (9,))
+
+    assert tuple(item.callsite_id for item in projected.items) == (8,)
+
+
+def test_table_query_converts_declared_reference_to_descriptor_key_handle():
+    from src.compiler.control_source import ControlProgram, SequenceBlock
+    from src.compiler.precompile_to_ssa import _ControlSSABuilder
+    from src.transmogrifier.ssa import SSASequenceDescriptor, SSAValue
+
+    builder = _ControlSSABuilder(
+        ControlProgram(SequenceBlock(())),
+        function_name="reference_table_query",
+        first_value_id=100,
+        region_callees={},
+        region_signatures={},
+    )
+    reference = SSAValue(
+        7,
+        dtype="opaque_ref",
+        accounting={
+            "native_exact_type": "builtins.str",
+        },
+    )
+    builder.external_values[7] = reference
+    descriptor = SSASequenceDescriptor(
+        sequence_id=20,
+        column_value_ids=(21, 22),
+        length_address_id=23,
+        capacity_value_id=24,
+        status_address_id=25,
+        column_dtypes=("int64", "int64"),
+        key_columns=(0,),
+    )
+
+    (handle,) = builder._table_query_values(7, descriptor)
+
+    assert handle is not reference
+    assert handle.dtype == "int64"
+    assert handle.accounting["native_reference_handle_for_value_id"] == 7
+    cast = builder.current.instrs[-1]
+    assert cast.op == "Cast"
+    assert cast.args == [reference]
+    assert cast.res is handle
+    assert cast.attributes == {
+        "reference_cast": True,
+        "binding": "opaque_reference_identity",
+        "sequence_key_column": 0,
+    }
 
 
 def test_resolved_source_graph_index_uses_only_qualified_names():

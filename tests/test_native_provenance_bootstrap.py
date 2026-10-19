@@ -120,15 +120,18 @@ def test_interior_growth_restarts_without_publishing_an_unfinished_core(tmp_path
     monkeypatch.setattr("subprocess.run", stage)
     monkeypatch.setattr(runtime, "publish_native_provenance_core",
                         lambda *a, **k: pytest.fail("unfinished core published"))
-    with pytest.raises(runtime.ProvenanceCoreRestartRequired, match="interior stage"):
+    with pytest.raises(
+        runtime.ProvenanceCoreRestartRequired, match="interior stage",
+    ) as restart:
         runtime.ensure_native_provenance_core(tmp_path / "core", jobs=3,
             schedule_options={"max_total_resident_bytes": 4 << 30},
             stop_after_failure=False)
+    assert restart.value.requires_process_restart is False
 
 
 @pytest.mark.parametrize(
     "jobs,stage_units,stop_after_failure,expected_stage_units",
-    [(None, None, True, 12), (2, 3, False, 3), (2, None, False, None)],
+    [(None, None, True, None), (2, 3, False, 3), (2, None, False, None)],
 )
 def test_provenance_stage_plans_once_and_resumes_ssa_enclosures(
     tmp_path, monkeypatch, jobs, stage_units, stop_after_failure,

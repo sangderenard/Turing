@@ -37,6 +37,7 @@ def _source_contract_rows(graph_obj: Any, page: Any) -> tuple[tuple, ...]:
 
 def _source_glyph_sequence_materializations(
     graph_obj: Any, *, with_cells: bool = False,
+    compiled_validation_diagnostic_ids: Iterable[int] = (),
 ):
     """Read exact JoinedStr recipes into incumbent resident-sequence work.
 
@@ -46,6 +47,13 @@ def _source_glyph_sequence_materializations(
     components are resident sequences produced by their source-linked helper
     calls.  The JoinedStr destination is cleared and extended in recipe order
     through the ordinary sequence ABI.
+
+    ``compiled_validation_diagnostic_ids`` are exact JoinedStr values used
+    only as the message argument of a terminal raise guard already represented
+    by the control program's ``ValidationBlock``.  Native validation consumes
+    the predicate and exception identity; authored fallback retains the Python
+    diagnostic.  Those recipes therefore have no resident consumer and are not
+    materialised.  Unknown formatted values anywhere else remain a refusal.
 
     ``with_cells`` adds a fourth result: sequence id -> the recipe cells each
     declaration was read from, so a declaration's contract can derive from
@@ -62,6 +70,9 @@ def _source_glyph_sequence_materializations(
     from .identity_concordance import Derived, Mode, current_identity_book
 
     book = current_identity_book()
+    compiled_validation_diagnostic_ids = frozenset(map(
+        int, compiled_validation_diagnostic_ids,
+    ))
     declarations: list[tuple[int, str, int, bool]] = []
     initializations: list[tuple[int, str, int]] = []
     mutations: list[ControlSequenceMutation] = []
@@ -127,6 +138,8 @@ def _source_glyph_sequence_materializations(
                 f"source glyph sequence has invalid fact {fact!r} at {row!r}"
             )
         joined_id = int(row[1])
+        if joined_id in compiled_validation_diagnostic_ids:
+            continue
         literal_alternate = (
             len(fact.components) == 1
             and str(fact.components[0].kind) == "literal"
@@ -247,6 +260,103 @@ def _source_glyph_sequence_materializations(
             for sequence_id, cells in declaration_cells.items()
         })
     return result
+
+
+def _glyph_component_resident_sequence_ids(component: Any) -> tuple[int, ...]:
+    """Return exact resident recipes owned by one glyph component."""
+
+    nested = tuple(
+        value_id
+        for child in tuple(
+            getattr(component, "projection_components", ()) or ()
+        )
+        for value_id in _glyph_component_resident_sequence_ids(child)
+    )
+    alternatives = tuple(
+        int(arm.sequence_value_id)
+        for arm in tuple(
+            getattr(component, "union_alternatives", ()) or ()
+        )
+    )
+    formatted = getattr(component, "formatted_sequence_value_id", None)
+    return tuple(dict.fromkeys((
+        *nested,
+        *alternatives,
+        *(() if formatted is None else (int(formatted),)),
+    )))
+
+
+def _compiled_validation_diagnostic_sequence_ids(
+    graph_obj: Any,
+) -> frozenset[int]:
+    """Read glyph values owned only by compiled validation diagnostics.
+
+    The planner records those values as identity-bearing cells on each
+    ``ValidationBlock``'s ``control_block`` concordance fact.  Join those cells
+    back to this graph's identities; do not rediscover ownership from AST or
+    graph shape in the materializer.
+    """
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import CONTROL_BLOCK, ControlBlockKind
+    from .identity_concordance import current_identity_book
+
+    scope = graph_obj.graph.get("lexical_read_scope")
+    if scope is None:
+        return frozenset()
+    book = current_identity_book()
+    page = book.page(CONTROL_BLOCK)
+    diagnostic_cells = {
+        cell
+        for row in page.scope_rows(tuple(scope))
+        for fact in (page.latest(row),)
+        if getattr(fact, "kind", None) is ControlBlockKind.VALIDATION
+        for cell in tuple(getattr(fact, "diagnostics", ()))
+    }
+    if not diagnostic_cells:
+        return frozenset()
+    diagnostic_ids = {
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        if node_identity_cell(graph_obj, int(node_id)) in diagnostic_cells
+        and (data.get("attributes") or {}).get(
+            "source_glyph_sequence_row"
+        ) is not None
+    }
+
+    # A formatted component is a compiler-authored source-linked call whose
+    # result is referenced by the JoinedStr recipe through concordance, not a
+    # graph consumer edge.  When the JoinedStr is validation-only, those call
+    # results are validation-only too.  Return the complete recipe closure so
+    # call planning cannot strand formatter calls after the loop that owned
+    # their operands (for example ``position`` in ``_validate_row``).
+    source_page = book.page("source_glyph_sequence")
+
+    # Only the cells published by the ValidationBlock are top-level
+    # diagnostic glyphs.  Members added from one glyph recipe below are
+    # resident formatter sequences, not further JoinedStr owners.  Iterating
+    # the growing set made a later formatter node (``id_space.compose`` value
+    # 36) demand a second ``source_glyph_sequence`` row it cannot own.
+    diagnostic_glyph_ids = frozenset(diagnostic_ids)
+    for node_id, data in graph_obj.nodes(data=True):
+        value_id = int(data.get("value_id", node_id))
+        if value_id not in diagnostic_glyph_ids:
+            continue
+        row = (data.get("attributes") or {}).get(
+            "source_glyph_sequence_row"
+        )
+        fact = None if row is None else source_page.latest(tuple(row))
+        if fact is None:
+            raise ValueError(
+                "compiled validation diagnostic has no glyph concordance: "
+                f"value={value_id} row={row!r}"
+            )
+        diagnostic_ids.update(
+            member
+            for component in tuple(getattr(fact, "components", ()) or ())
+            for member in _glyph_component_resident_sequence_ids(component)
+        )
+    return frozenset(diagnostic_ids)
 
 
 def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
@@ -420,13 +530,26 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
                 "Enum name glyph projection has no exact source table cell: "
                 f"{component.record_identity!r}"
             )
-        if enum_cell.page is not SOURCE_ENUM_GLYPH_TABLE:
+        # Compilation-unit books cross the spill/pickle boundary before this
+        # reader runs.  A Ref's Page is a rehydrated schema value there, not
+        # necessarily the registry singleton.  Resolve the retained row
+        # through the active book and require the complete cell key to agree;
+        # the same rule guards rehydrated STRING_GLYPH_VOCABULARY refs during
+        # SSA lowering.  Unit 041 carried the exact RowFieldKind table cell,
+        # but an ``is`` test rejected its reconstructed Page object.
+        canonical_enum_cell = book.latest_ref(
+            SOURCE_ENUM_GLYPH_TABLE, tuple(enum_cell.row),
+        )
+        if (
+            canonical_enum_cell is None
+            or enum_cell.key != canonical_enum_cell.key
+        ):
             raise ValueError(
                 "Enum name glyph projection names a non-Enum source cell: "
                 f"{enum_cell.key!r}"
             )
         mode = "repr" if int(component.conversion) == ord("r") else "raw"
-        enum_grouped.setdefault((mode, enum_cell), []).append((
+        enum_grouped.setdefault((mode, canonical_enum_cell), []).append((
             recipe_cell, component,
         ))
     for (mode, enum_cell), mode_recipes in (

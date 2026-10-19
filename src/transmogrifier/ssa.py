@@ -1074,17 +1074,29 @@ def value_union_frame_members(
         finally:
             active_records.remove(int(record_id))
 
+    shared_members: set[tuple[int, tuple[Any, ...]]] = set()
     for arm in descriptor.alternatives:
         prefix = ("alternative", arm.name)
         if arm.storage is SSAValueUnionStorage.NONE:
             continue
         if arm.storage is SSAValueUnionStorage.SEQUENCE:
-            sequence_members(arm.name, int(arm.sequence_id), prefix)
+            if arm.sequence_id is not None:
+                sequence_members(arm.name, int(arm.sequence_id), prefix)
+            else:
+                for position, value_id in enumerate(arm.value_ids):
+                    members.append(SSAValueUnionFrameMember(
+                        arm.name,
+                        (*prefix, "descriptor_handle", int(position)),
+                        int(value_id),
+                    ))
         elif arm.storage is SSAValueUnionStorage.RECORD:
             record_members(arm.name, int(arm.record_id), prefix)
         else:
             for position, value_id in enumerate(arm.value_ids):
-                if arm.storage is SSAValueUnionStorage.REFERENCE:
+                if (
+                    arm.storage is SSAValueUnionStorage.REFERENCE
+                    and descriptor.layout != "shared"
+                ):
                     reference = (
                         None if reference_table is None else
                         reference_table.references.get(int(value_id))
@@ -1095,9 +1107,18 @@ def value_union_frame_members(
                             "native/non-host descriptor: "
                             f"{arm.name!r}/{int(value_id)}"
                         )
+                role = (
+                    ("shared", "value", int(position))
+                    if descriptor.layout == "shared" else
+                    (*prefix, "value", int(position))
+                )
+                member_key = (int(value_id), tuple(role))
+                if member_key in shared_members:
+                    continue
+                shared_members.add(member_key)
                 members.append(SSAValueUnionFrameMember(
-                    arm.name, (*prefix, "value", int(position)),
-                    int(value_id),
+                    "" if descriptor.layout == "shared" else arm.name,
+                    role, int(value_id),
                 ))
     return tuple(members)
 
@@ -2209,8 +2230,11 @@ class SSAValueUnionAlternative:
             if self.dtype or self.shape or self.value_ids or self.sequence_id is not None or self.record_id is not None:
                 raise ValueError("None value-union arm cannot own payload storage")
         elif self.storage is SSAValueUnionStorage.SEQUENCE:
-            if self.sequence_id is None:
-                raise ValueError("sequence value-union arm requires sequence_id")
+            if self.sequence_id is None and len(self.value_ids) != 1:
+                raise ValueError(
+                    "sequence value-union arm requires a resident sequence_id "
+                    "or one native descriptor-handle value"
+                )
         elif self.storage is SSAValueUnionStorage.RECORD:
             if self.record_id is None:
                 raise ValueError("record value-union arm requires record_id")
@@ -2234,7 +2258,14 @@ class SSAValueUnionAlternative:
 
 @dataclass(frozen=True)
 class SSAValueUnionDescriptor:
-    """Function-scoped side-by-side value union and its native tag."""
+    """Function-scoped value union and its native tag.
+
+    ``side-by-side`` owns distinct payload cells for each semantic arm.
+    ``shared`` owns one physical payload whose interpretation is selected by
+    the tag.  The latter is the native ABI for closed class domains carried
+    through one fixed-width native reference value: adding a class changes only the
+    tag vocabulary, never the number of payload parameters.
+    """
 
     union_id: int
     identity: str
@@ -2243,6 +2274,7 @@ class SSAValueUnionDescriptor:
     tag_dtype: str = "int64"
     metadata_state: str = "dynamic"
     writable: bool = True
+    layout: str = "side-by-side"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "union_id", int(self.union_id))
@@ -2256,6 +2288,22 @@ class SSAValueUnionDescriptor:
             raise ValueError("value-union tag must use the native int64 tag ABI")
         if self.metadata_state not in {"static", "dynamic", "unresolved"}:
             raise ValueError(f"unknown value-union metadata state {self.metadata_state!r}")
+        if self.layout not in {"side-by-side", "shared"}:
+            raise ValueError(f"unknown value-union layout {self.layout!r}")
+        if self.layout == "shared":
+            payloads = {
+                (
+                    arm.storage, arm.dtype, arm.shape, arm.value_ids,
+                    arm.sequence_id, arm.record_id, arm.storage_identity,
+                )
+                for arm in self.alternatives
+                if arm.storage is not SSAValueUnionStorage.NONE
+            }
+            if len(payloads) != 1:
+                raise ValueError(
+                    "shared value-union alternatives must name one exact "
+                    "physical payload"
+                )
 
     @property
     def tag_vocabulary(self) -> tuple[str, ...]:
@@ -2269,7 +2317,7 @@ class SSAValueUnionDescriptor:
             "tag_dtype": self.tag_dtype,
             "tag_vocabulary": list(self.tag_vocabulary),
             "alternatives": [arm.to_mapping() for arm in self.alternatives],
-            "layout": "side-by-side",
+            "layout": self.layout,
             "metadata_state": self.metadata_state,
             "writable": bool(self.writable),
         }

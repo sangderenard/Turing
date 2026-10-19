@@ -93,8 +93,15 @@ def prune_unused_phis(function, protected_value_ids=()) -> tuple[int, ...]:
         removed.extend(sorted(dead))
 
 
-def record_constant_hoists(function, moves):
-    """Record exact old geometry at the constant mover, before mutation."""
+def record_constant_hoists(function, moves, source_graph=None):
+    """Record exact old geometry at the constant mover, before mutation.
+
+    A constant produced during SSA construction is identified by its
+    ``ssa_value`` cell.  An authored literal can retain its source value id
+    directly; in that case its producer is the canonical/ingestion node cell
+    in the active source graph.  Both are recorded producers, and neither is
+    reconstructed from the literal's host value.
+    """
     if not moves:
         return
     from .concordance_declarations import CELL_SET, CONTROL_SSA_FINISH, SSA_CONSTANT_HOIST
@@ -110,7 +117,8 @@ def record_constant_hoists(function, moves):
             "accepted_ssa_component"
         ) or {}
     )
-    book = accepted.get("identity_book") or current_identity_book()
+    active_book = current_identity_book()
+    book = accepted.get("identity_book") or active_book
     scope = function_scope_of(function)
     geometry = _post_ssa_block_geometry(book, scope, function)
     # One shared proof of the geometry actually scanned by the mover, rather
@@ -123,6 +131,20 @@ def record_constant_hoists(function, moves):
                           stage=CONTROL_SSA_FINISH, provenance=Derived(inputs), mode=Mode.REVISE)
     for from_block, from_index, instruction, to_block, to_index in moves:
         value_cell = ssa_value_identity_cell(function, instruction.res.id, book=book)
+        if value_cell is None and source_graph is not None and book is active_book:
+            graph = getattr(source_graph, "G", source_graph)
+            value_id = int(instruction.res.id)
+            node_id = value_id if value_id in graph else None
+            if node_id is None:
+                for node, data in graph.nodes(data=True):
+                    candidate = data.get("value_id", node)
+                    if candidate is not None and int(candidate) == value_id:
+                        node_id = int(node)
+                        break
+            if node_id is not None:
+                from ..common.tensors.topological_reducer import node_identity_cell
+
+                value_cell = node_identity_cell(source_graph, node_id)
         if value_cell is None or instruction.args:
             raise ConcordanceRefusal(
                 f"constant hoist %{instruction.res.id} in {function.name!r} "

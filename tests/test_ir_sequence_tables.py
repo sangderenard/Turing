@@ -454,6 +454,23 @@ class Partial:
     }
 
 
+def test_bare_tuple_constructor_field_is_an_opaque_native_reference():
+    """No element layout is inferred when the annotation does not state one."""
+
+    schemas = _authored_complete_record_schemas(ast.parse("""
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Ref:
+    row: tuple
+"""))
+
+    assert schemas["Ref"]["fields"]["row"] == {
+        "storage": "reference", "dtype": "opaque_ref", "rank": 0,
+        "mutable": False,
+    }
+
+
 def test_partial_receiver_mapping_keeps_exact_projection_row_record():
     projection_schemas = {}
     views = _authored_dataclass_record_views(ast.parse("""
@@ -942,6 +959,26 @@ def test_multicolumn_table_key_compares_and_passes_every_component():
         assert _ops(function).count("Eq") == 3
         assert _ops(function).count("LAnd") >= 3
         assert function.metadata["key_columns"] == (0, 1, 2)
+
+
+def test_table_store_updates_every_physical_value_column():
+    descriptor = SSASequenceDescriptor(
+        sequence_id=10,
+        column_value_ids=(100, 101, 102, 103),
+        length_address_id=104,
+        capacity_value_id=105,
+        status_address_id=106,
+        column_dtypes=("int64", "bool", "int64", "int64"),
+        key_columns=(0,),
+    )
+
+    store = lower_table_store(descriptor).functions[0]
+
+    # Four storage columns + length/capacity + status + one key + three
+    # physical value components.
+    assert len(store.args) == 11
+    assert _ops(store).count("Store") >= 10
+    assert store.metadata["key_columns"] == (0,)
 
 
 def test_runtime_sequence_replication_is_fixed_arena_fill_cfg():

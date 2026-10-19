@@ -12,6 +12,7 @@ from src.compiler.concordance_declarations import (
     CONTROL_SSA,
     FORMAL_ACTUAL_OCCURRENCE,
     FRAME_BINDING,
+    FRAME_LINK,
     INGEST_SOURCE,
     SSA_VALUE,
     SSAValueFact,
@@ -26,6 +27,57 @@ from src.transmogrifier.ssa import (
     SSACallTable,
     SSAValue,
 )
+
+
+def test_linked_member_discovery_stands_on_planner_call_edge_before_record():
+    """Discovery precedes SSACallRecord publication but is still sourced."""
+
+    from types import SimpleNamespace
+
+    from src.compiler.concordance_declarations import (
+        LINKED_CALLER_MEMBER,
+        MEMBER_NOT_BOUND_AT_CALL,
+    )
+    from src.compiler.fortran_c_shell import _linked_caller_member
+    from src.compiler.identity_concordance import Unresolved
+
+    book, token = begin_identity_book()
+    try:
+        book.post(
+            SSA_VALUE, ("caller@control:0", 30),
+            SSAValueFact("int64", (), SSAValueOrigin.ADOPTED_GRAPH_ID),
+            stage=CONTROL_SSA, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        call_cell = book.latest_ref(
+            SSA_VALUE, ("caller@control:0", 30),
+        )
+        assert call_cell is not None
+
+        member = _linked_caller_member(
+            "caller",
+            SimpleNamespace(
+                callsite_id=30,
+                callee_symbol="callee",
+                argument_bindings=(),
+            ),
+            8,
+            None,
+            None,
+            None,
+            None,
+            call_cells=(call_cell,),
+        )
+
+        row = ("caller", 30, "callee", 8)
+        decision = book.page(LINKED_CALLER_MEMBER).latest(row)
+        decision_cell = book.latest_ref(LINKED_CALLER_MEMBER, row)
+        assert member is None
+        assert isinstance(decision, Unresolved)
+        assert decision.reason is MEMBER_NOT_BOUND_AT_CALL
+        assert book.edges_into(decision_cell) == ((call_cell, FRAME_LINK),)
+    finally:
+        end_identity_book(token)
 
 
 def _seed_values(book, module):

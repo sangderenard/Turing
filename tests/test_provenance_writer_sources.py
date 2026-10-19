@@ -11,6 +11,49 @@ def test_mapping_loop_producers_have_complete_sources():
     assert not groups and not identities
 
 
+def test_sequence_member_identity_is_local_to_its_compiler_frame():
+    """Equal local sequence numbers in two functions are not one storage."""
+    from src.transmogrifier.ssa import SSAValue
+
+    table = CorrelationTable()
+    table.sequence_roles[("caller", 10)].append((10, "handle"))
+    table.sequence_roles[("callee", 10)].append((10, "handle"))
+    caller = SSAValue(10, accounting={
+        "compiler_frame_storage": "caller",
+    })
+    callee = SSAValue(10, accounting={
+        "compiler_frame_storage": "callee",
+    })
+
+    assert table._abi_or_member_key("caller", caller) == (
+        "caller.seq10.handle"
+    )
+    assert table._abi_or_member_key("callee", callee) == (
+        "callee.seq10.handle"
+    )
+
+
+def test_program_abi_field_identity_remains_cross_functional():
+    from src.transmogrifier.ssa import SSAValue
+
+    table = CorrelationTable()
+    caller = SSAValue(10, accounting={
+        "compiler_frame_storage": "caller",
+        "program_abi_record": "Page",
+        "program_abi_parameter": "self",
+        "program_abi_field": "stamps",
+    })
+    callee = SSAValue(20, accounting={
+        "compiler_frame_storage": "callee",
+        "program_abi_record": "Page",
+        "program_abi_parameter": "self",
+        "program_abi_field": "stamps",
+    })
+
+    assert table._abi_or_member_key("caller", caller) == "self.stamps"
+    assert table._abi_or_member_key("callee", callee) == "self.stamps"
+
+
 def test_an_imported_function_is_measured_against_the_book_that_minted_its_ids():
     """An accepted SSA body keeps its own book: the composing unit's book
     holds no mint rows for the ids that body minted, and the detector reads

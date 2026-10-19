@@ -4930,7 +4930,9 @@ def project_process_graph_acceptance(graph, references, book=None):
         CANONICAL_VALUE, CLASS_DECLARATION, CLASS_FIELD_DECLARATION,
         FUNCTION_ADDRESS, INGESTION_VALUE,
         LEXICAL_READ_BINDING, NAME_BINDING, SCOPE_ORIGIN, SCOPE_REGISTRY,
+        PARAMETER_ANNOTATION,
         SOURCE_AGGREGATE_LAYOUT, SOURCE_GLYPH_SEQUENCE,
+        SOURCE_ENUM_GLYPH_TABLE, SourceEnumGlyphTable,
         SOURCE_PYTHON_IDENTITY, SOURCE_RECORD_VIEW_SCHEMA,
         SOURCE_SORT_CONTRACT, SOURCE_VALUE_CLASS, VALUE_TYPE_ABI,
     )
@@ -5011,6 +5013,23 @@ def project_process_graph_acceptance(graph, references, book=None):
             "parameter_record_abi", "parameter_sequence_record_abi",
         ):
             root_record_declarations(body.G.graph.get(key))
+        # Parameter annotations are source API declarations, not incidental
+        # graph attributes.  Their rows join authored union members to exact
+        # class-declaration cells and scalar/default spans during ingestion.
+        # Root each retained function's exact rows so a scoped worker cannot
+        # replace ``T | None`` with the default's ``NoneType`` arm merely
+        # because the declaration itself fell across the unit cut.
+        authored_identity = body.G.graph.get("authored_function_identity")
+        if isinstance(authored_identity, tuple) and len(authored_identity) == 2:
+            for parameter_name in tuple(
+                body.G.graph.get("function_parameters") or ()
+            ):
+                annotation_cell = owner.latest_ref(
+                    PARAMETER_ANNOTATION,
+                    (*authored_identity, str(parameter_name)),
+                )
+                if annotation_cell is not None:
+                    roots.add(annotation_cell)
         # Numeric identity lookups are acceptance roots too. A graph's
         # canonical IDs and a declaration's function address contain no Ref
         # object for the generic visitor to discover. Dropping these cells
@@ -5146,6 +5165,56 @@ def project_process_graph_acceptance(graph, references, book=None):
                         f"{tuple(glyph_row)!r}"
                     )
                 roots.add(glyph_cell)
+            # A same-module ``Enum.Member`` read carries its class as an
+            # external Input and its member as a GetAttr.  The graph keeps
+            # those exact source identities, while the declaration table is
+            # keyed by them and therefore is not embedded as a Ref.  Root the
+            # unique matching Enum table so the isolated worker can lower the
+            # member to its declared scalar instead of inventing a public
+            # Python-object formal.
+            if str(data.get("op") or data.get("type") or "").casefold() == "getattr":
+                graph_parents = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"value", "object", "base", "receiver"}
+                    and parent in body.G
+                )
+                if len(graph_parents) == 1:
+                    enum_owner = body.G.nodes[graph_parents[0]]
+                    enum_owner_attributes = enum_owner.get("attributes") or {}
+                    authored_identity = tuple(
+                        body.G.graph.get("authored_function_identity") or ()
+                    )
+                    enum_row = (
+                        str(authored_identity[0]),
+                        str(enum_owner_attributes.get("binding_name") or ""),
+                    ) if (
+                        len(authored_identity) == 2
+                        and str(enum_owner.get("op") or enum_owner.get("type") or "").casefold()
+                        == "input"
+                        and str(enum_owner_attributes.get("binding_kind") or "")
+                        == "external"
+                    ) else None
+                    enum_cell = (
+                        None if enum_row is None else owner.latest_ref(
+                            SOURCE_ENUM_GLYPH_TABLE, enum_row,
+                        )
+                    )
+                    if enum_cell is not None:
+                        enum_fact = owner.page(
+                            SOURCE_ENUM_GLYPH_TABLE
+                        ).cell(enum_cell.row, enum_cell.column)
+                        member_name = str(
+                            (data.get("attributes") or {}).get("attribute") or ""
+                        )
+                        if (
+                            isinstance(enum_fact, SourceEnumGlyphTable)
+                            and sum(
+                                str(member.member_identity) == member_name
+                                for member in enum_fact.members
+                            ) == 1
+                        ):
+                            roots.add(enum_cell)
         for ingestion_scope in node_ingestion_scopes(body):
             for page, row in ((SCOPE_REGISTRY, ingestion_scope), (SCOPE_ORIGIN, (ingestion_scope,))):
                 cell = owner.latest_ref(page, row)
@@ -6500,6 +6569,72 @@ def compile_project_call(
     return receipt
 
 
+def _accepted_physical_output_paths(
+    paths: Mapping[tuple[int, ...], int],
+    published_ids: set[int],
+    function: Any,
+    kind: str | None,
+) -> tuple[dict[tuple[int, ...], int], str | None]:
+    """Expand one authored output through its accepted physical receipt."""
+
+    resolved = dict(paths)
+    if len(resolved) == 1:
+        _path, authored_id = next(iter(resolved.items()))
+        record_layout = dict(
+            function.metadata.get("record_return_layouts", ())
+        ).get(int(authored_id))
+        if record_layout is not None:
+            layout = tuple(map(int, record_layout))
+            if layout and len(layout) == len(published_ids) and (
+                set(layout) == published_ids
+            ):
+                # RECORD_RETURN_LAYOUT is the accepted record descriptor's
+                # ordered physical leaf list. A native call transports those
+                # leaves, not a Python record object or the conceptual record
+                # handle that authored the return expression.
+                return (
+                    {(index,): value_id for index, value_id in enumerate(layout)},
+                    "tuple",
+                )
+    optional_layouts = {
+        int(payload_id): tuple(map(int, layout))
+        for payload_id, layout in tuple(
+            function.metadata.get("aggregate_return_layouts", ())
+        )
+        if len(tuple(layout)) == 2
+    }
+    if (
+        len(resolved) == 1
+        and len(published_ids) == 2
+        and len(optional_layouts) == 1
+        and (layout := next(iter(optional_layouts.values()))) is not None
+        and set(layout) == published_ids
+    ):
+        # Optional lowering turns one authored scalar/record slot into its
+        # exact physical (payload, presence) return ABI.
+        return ({(0,): int(layout[0]), (1,): int(layout[1])}, "tuple")
+    if not resolved and optional_layouts:
+        ordered_layouts = tuple(optional_layouts.values())
+        flattened = tuple(
+            value_id for layout in ordered_layouts for value_id in layout
+        )
+        if (
+            len(flattened) == len(set(flattened))
+            and set(flattened) == published_ids
+        ):
+            # Optional aggregate lowering publishes one reciprocal
+            # (payload, presence) receipt per logical return leaf.  Tuple
+            # return sites plus an absent arm have no single source-id tuple
+            # common to every site; these receipts are nevertheless their
+            # complete accepted physical return ABI.
+            return ({
+                (slot, component): int(value_id)
+                for slot, layout in enumerate(ordered_layouts)
+                for component, value_id in enumerate(layout)
+            }, "tuple")
+    return resolved, kind
+
+
 def _compile_resolved_process_graph_unit_impl(
     graph_path: str | Path,
     plan_path: str | Path,
@@ -6984,31 +7119,9 @@ def _compile_resolved_process_graph_unit_impl(
                 paths = {path: accepted_id(value_id) for path, value_id in paths.items()}
                 kinds = set((source.G.graph.get("return_container_kinds") or {}).values())
                 kind = next(iter(kinds)) if len(kinds) == 1 else None
-                optional_layouts = {
-                    int(payload_id): tuple(map(int, layout))
-                    for payload_id, layout in tuple(
-                        function.metadata.get("aggregate_return_layouts", ())
-                    )
-                    if len(tuple(layout)) == 2
-                }
-                if (
-                    len(paths) == 1
-                    and len(published_ids) == 2
-                    and len(optional_layouts) == 1
-                    and (layout := next(iter(optional_layouts.values())))
-                    is not None
-                    and set(layout) == published_ids
-                ):
-                    # Optional lowering turns one authored scalar/record slot
-                    # into its exact physical (payload, presence) return ABI.
-                    # ``aggregate_return_layouts`` is the lowering receipt;
-                    # publish that accepted layout rather than comparing the
-                    # two physical values to the pre-lowering source id.
-                    paths = {
-                        (0,): int(layout[0]),
-                        (1,): int(layout[1]),
-                    }
-                    kind = "tuple"
+                paths, kind = _accepted_physical_output_paths(
+                    paths, published_ids, function, kind,
+                )
                 if len(published_ids) == 1 and kind not in {"tuple", "list"}:
                     # A scalar Return/Phi is the one published value, even
                     # when several authored return sites feed that Phi.

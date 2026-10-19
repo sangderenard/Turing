@@ -7,7 +7,11 @@ import sys
 import pytest
 
 from tools.compiler_probes import probe_record_return_merge as probe
-from src.compiler.identity_concordance import CorrelationTable, concordance_report
+from src.compiler.identity_concordance import (
+    CorrelationTable,
+    IdentityBook,
+    concordance_report,
+)
 from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 
 
@@ -97,6 +101,55 @@ def test_return_site_receipts_survive_pickle_and_republication(lowered):
                       for block in root.blocks.values() for op in block.instrs if op.op == 'Phi']
     assert not [finding for finding in CorrelationTable.build(module).findings(module)
                 if finding.kind == 'return-site-edge-disagreement']
+
+
+def test_imported_return_sites_use_function_accepted_identity_book():
+    from src.compiler.concordance_declarations import (
+        INGESTION,
+        INGESTION_VALUE,
+        INGEST_SOURCE,
+        REDUCER_RETURN,
+        RETURN_SITE_SLOT,
+        NodeFact,
+    )
+    from src.compiler.identity_concordance import Derived, Mode, Novel
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, IRModule
+
+    owner = IdentityBook()
+    ingestion_scope = ("ingestion:linked", 0)
+    scope = ("return:linked", 0)
+    site = owner.post(
+        INGESTION_VALUE, (ingestion_scope, 7),
+        NodeFact("Name", "result", "value"), stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+    )
+    value = owner.post(
+        INGESTION_VALUE, (ingestion_scope, 1),
+        NodeFact("Name", "result", "value"), stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+    )
+    owner.post(
+        RETURN_SITE_SLOT, (scope, site, 0), value, stage=REDUCER_RETURN,
+        provenance=Derived((value, site)), mode=Mode.CONCORD,
+    )
+    function = Function("linked", [], {
+        "entry": BasicBlock("entry", [Instr("Ret", [], None, attributes={
+            "return_site_cell": site,
+            "return_source_value_ids": (1,),
+        })]),
+    }, metadata={
+        "record_return_state_scope": scope,
+        "accepted_ssa_component": {
+            "schema": "turing.accepted-ssa-component.v1",
+            "identity_book": owner,
+        },
+    })
+    module = IRModule(
+        {"linked": function},
+        metadata={"identity_book": IdentityBook(detached=True)},
+    )
+
+    assert CorrelationTable._return_site_edge_findings(module) == []
 
 
 @pytest.mark.parametrize('corruption', ['missing-site', 'wrong-slots'])

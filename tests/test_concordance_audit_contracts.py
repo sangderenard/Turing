@@ -52,6 +52,150 @@ def test_capture_audit_reports_unresolved_binding_instead_of_crashing(unresolved
         end_identity_book(token)
 
 
+def test_value_type_abi_ignores_an_unbased_dense_id_from_another_scope():
+    """A dense integer is not enough to associate two concordance rows."""
+    from src.compiler.concordance_declarations import (
+        CANONICAL_VALUE,
+        INGESTION,
+        INGEST_SOURCE,
+        LINKED_VALUE_ABI_SETTLEMENT,
+        PARAMETER_ANNOTATION,
+        REDUCTION,
+        SOURCE_VALUE_CLASS,
+        VALUE_TYPE_ABI,
+        ValueTypeABIAlternative,
+        ValueTypeABIFact,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        Mode,
+        Novel,
+        begin_identity_book,
+        end_identity_book,
+    )
+    from src.transmogrifier.ssa import IRModule
+
+    book, token = begin_identity_book()
+    try:
+        value_id = 7
+        unrelated_scope = ("unrelated", 0)
+        abi_scope = ("accepted", 0)
+        annotation_row = ("unrelated", "function", "value")
+        annotation_cell = book.post(
+            PARAMETER_ANNOTATION,
+            annotation_row,
+            "int",
+            stage=INGESTION,
+            provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        book.post(
+            SOURCE_VALUE_CLASS,
+            (unrelated_scope, value_id),
+            ("builtins.int", 1, "unrelated dense id"),
+            stage=REDUCTION,
+            provenance=Derived((annotation_cell,)),
+            mode=Mode.CONCORD,
+        )
+        canonical_row = (abi_scope, value_id)
+        canonical_cell = book.post(
+            CANONICAL_VALUE,
+            canonical_row,
+            ("value",),
+            stage=INGESTION,
+            provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        fact = ValueTypeABIFact(("builtins.int",), (), (
+            ValueTypeABIAlternative(
+                "builtins.int", "scalar", "int64", (), 0,
+                (("primitive_class_abi", "int"),),
+                (canonical_cell,),
+            ),
+        ))
+        book.post(
+            VALUE_TYPE_ABI,
+            canonical_row,
+            fact,
+            stage=LINKED_VALUE_ABI_SETTLEMENT,
+            provenance=Derived((canonical_cell,)),
+            mode=Mode.REVISE,
+        )
+        module = IRModule({}, metadata={"identity_book": book})
+
+        assert CorrelationTable._value_type_abi_findings(module) == []
+
+        book.post(
+            SOURCE_VALUE_CLASS,
+            (abi_scope, value_id),
+            ("builtins.int", 1, "same-scope declaration"),
+            stage=REDUCTION,
+            provenance=Derived((annotation_cell,)),
+            mode=Mode.CONCORD,
+        )
+        findings = CorrelationTable._value_type_abi_findings(module)
+        assert len(findings) == 1
+        assert findings[0].kind == "value-type-abi-disagreement"
+    finally:
+        end_identity_book(token)
+
+
+def test_value_type_abi_accepts_direct_post_ssa_value_identity():
+    """A transformed generation is identified by its exact SSA value cell."""
+    from src.compiler.concordance_declarations import (
+        CONTROL_SSA_FINISH,
+        INGEST_SOURCE,
+        LINKED_VALUE_ABI_SETTLEMENT,
+        SSA_VALUE,
+        VALUE_TYPE_ABI,
+        SSAValueFact,
+        SSAValueOrigin,
+        ValueTypeABIAlternative,
+        ValueTypeABIFact,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        Mode,
+        Novel,
+        begin_identity_book,
+        end_identity_book,
+    )
+    from src.transmogrifier.ssa import IRModule
+
+    book, token = begin_identity_book()
+    try:
+        value_id = 2305843010213693986
+        ssa_scope = "control"
+        abi_scope = ("lexical", 0)
+        value_cell = book.post(
+            SSA_VALUE,
+            (ssa_scope, value_id),
+            SSAValueFact("int64", (), SSAValueOrigin.MINTED),
+            stage=CONTROL_SSA_FINISH,
+            provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        fact = ValueTypeABIFact(("builtins.int",), (), (
+            ValueTypeABIAlternative(
+                "builtins.int", "scalar", "int64", (), 0,
+                (("primitive_class_abi", "int"),), (value_cell,),
+            ),
+        ))
+        book.post(
+            VALUE_TYPE_ABI,
+            (abi_scope, value_id),
+            fact,
+            stage=LINKED_VALUE_ABI_SETTLEMENT,
+            provenance=Derived((value_cell,)),
+            mode=Mode.REVISE,
+        )
+        module = IRModule({}, metadata={"identity_book": book})
+
+        assert CorrelationTable._value_type_abi_findings(module) == []
+    finally:
+        end_identity_book(token)
+
+
 @pytest.mark.parametrize('already_removed', [False, True])
 def test_removed_binding_retires_its_capture_with_the_same_provenance(already_removed):
     from types import SimpleNamespace

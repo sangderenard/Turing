@@ -1,9 +1,12 @@
 from src.compiler.ssa_call_input_adapters import (
     _adaptation_state_signature,
+    _concord_exact_region_feed_dtypes,
     adapt_physical_call_inputs as _adapt_physical_call_inputs,
     physical_call_input_conflicts,
 )
-from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+from src.compiler.identity_concordance import (
+    begin_identity_book, current_identity_book, end_identity_book,
+)
 from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock
 from tests.compiler_provenance_inputs import publish_authored_ssa
 import pytest
@@ -18,9 +21,9 @@ def provenance_transaction():
         end_identity_book(token)
 
 
-def adapt_physical_call_inputs(functions):
+def adapt_physical_call_inputs(functions, **kwargs):
     publish_authored_ssa(functions)
-    return _adapt_physical_call_inputs(functions)
+    return _adapt_physical_call_inputs(functions, **kwargs)
 
 
 def fixture():
@@ -241,6 +244,72 @@ def test_exact_region_feed_view_survives_formal_use_interning():
     assert call.args[0].dtype == 'float64'
     assert call.args[0].accounting['exact_region_feed_dtype'] == 'float64'
     assert adapt_physical_call_inputs(functions) == 0
+
+
+def test_declared_reference_revises_provisional_region_feed_dtype():
+    reference = SSAValue(19, 'opaque_ref', accounting={
+        'program_abi_record': 'Ref',
+        'program_abi_field': 'row',
+        'program_abi_storage': 'reference',
+        'record_constructor_value': 41,
+    })
+    formal = SSAValue(19, 'float64', accounting={
+        'program_abi_record': 'Ref',
+        'program_abi_storage': 'reference',
+        'record_constructor_value': 41,
+    })
+    region = Function('region', [formal], {
+        'entry': BasicBlock('entry', [Instr('Ret', [formal], None)]),
+    }, metadata={'source_region_integral': {'owner': 'caller'}})
+    call = Instr('Call', [reference], None, attributes={
+        'callee': 'region',
+        'feed_ids': (19,),
+        'feed_dtypes': ('float64',),
+    })
+    caller = Function('caller', [reference], {
+        'entry': BasicBlock('entry', [call, Instr('Ret', [], None)]),
+    })
+
+    functions = {'caller': caller, 'region': region}
+    assert adapt_physical_call_inputs(
+        functions, defer_unsettled_region_call_results=True,
+    ) == 1
+    assert call.attributes['feed_dtypes'] == ('opaque_ref',)
+    assert call.args[0].dtype == 'opaque_ref'
+    assert formal.dtype == 'opaque_ref'
+    assert formal.accounting['exact_region_feed_dtype'] == 'opaque_ref'
+    assert physical_call_input_conflicts(functions) == ()
+    assert adapt_physical_call_inputs(functions) == 0
+
+
+def test_deferred_region_settlement_does_not_publish_numeric_feed():
+    result = SSAValue(244, 'int64', accounting={
+        'ssa_call_result_from': 'producer',
+    })
+    formal = SSAValue(244, 'float64')
+    region = Function('region', [formal], {
+        'entry': BasicBlock('entry', [Instr('Ret', [formal], None)]),
+    }, metadata={'source_region_integral': {'owner': 'caller'}})
+    call = Instr('Call', [result], None, attributes={
+        'callee': 'region',
+        'feed_ids': (244,),
+        'feed_dtypes': ('float64',),
+    })
+    caller = Function('caller', [result], {
+        'entry': BasicBlock('entry', [call, Instr('Ret', [], None)]),
+    })
+    functions = {'caller': caller, 'region': region}
+    publish_authored_ssa(functions)
+
+    assert _concord_exact_region_feed_dtypes(
+        functions, defer_unsettled_region_call_results=True,
+    ) == 0
+    assert current_identity_book().page(
+        'exact_region_feed_dtype'
+    ).latest(('caller', 244)) is None
+    assert _concord_exact_region_feed_dtypes(functions) == 1
+    assert call.attributes['feed_dtypes'] == ('int64',)
+    assert formal.dtype == 'int64'
 
 
 def test_cycle_signature_quotients_fresh_conversion_temporary_ids():

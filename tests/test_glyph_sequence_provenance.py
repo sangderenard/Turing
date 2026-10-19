@@ -4,6 +4,7 @@ import ast
 import contextlib
 import io
 import pickle
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from src.compiler.concordance_declarations import (
     ANNOTATION_DECLARATION,
     CALL_BINDING,
     CLASS_FIELD_DECLARATION,
+    CONTROL_PROGRAM_BUILD,
     STRING_GLYPH_VOCABULARY_MINT,
     CallResolution,
     IDENTITY_TRANSITION,
@@ -42,6 +44,8 @@ from src.compiler.control_source import (
     ControlProgram,
     SequenceBlock,
     SequenceMutationBlock,
+    ValidationBlock,
+    post_control_program,
 )
 from src.compiler.ast_control_normalization import (
     _normalize_top_level_guard_returns,
@@ -52,6 +56,7 @@ from src.compiler.fortran_c_shell import (
 )
 from src.compiler.glsl_deployment_strategy import (
     _post_source_optional_glyph_carries,
+    _validation_control_blocks,
 )
 from src.compiler.glyph_sequence_format import (
     decimal_integer_glyph_tokens,
@@ -71,6 +76,8 @@ from src.compiler.identity_concordance import (
     end_identity_book,
 )
 from src.compiler.resident_sequence_materialization import (
+    _compiled_validation_diagnostic_sequence_ids,
+    _glyph_component_resident_sequence_ids,
     _source_glyph_sequence_materializations,
     _string_token_glyph_materializations,
 )
@@ -960,6 +967,266 @@ def test_unknown_runtime_tuple_repr_refuses_without_host_boundary():
         end_identity_book(token)
 
 
+def test_terminal_raise_diagnostic_does_not_demand_runtime_repr_storage():
+    """Native validation consumes its predicate, not its Python message.
+
+    The source fallback retains the exact ``RuntimeError`` text.  The resident
+    program therefore must not invent a formatter for the unclassified
+    ``value`` merely because it appears in that diagnostic.
+    """
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "def validate(value, reject: bool):\n"
+                "    if reject:\n"
+                "        raise RuntimeError(f'value={value!r}')\n"
+                "    return 0\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("validate").graph
+        guard_id, guard = next(
+            (int(node_id), data)
+            for node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.If)
+        )
+        predicate_id = next(
+            int(parent)
+            for parent, role in guard.get("parents") or ()
+            if str(role) == "test"
+        )
+        joined_id = next(
+            int(node_id)
+            for node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.JoinedStr)
+        )
+        with pytest.raises(
+            ValueError, match="formatted glyph component has no resident producer"
+        ):
+            _source_glyph_sequence_materializations(function.G)
+
+        control = ControlProgram(ValidationBlock(
+            predicate_id,
+            guard_id,
+            expect_true=False,
+            diagnostic_value_ids=(joined_id,),
+        ))
+        post_control_program(
+            function.G, control, stage=CONTROL_PROGRAM_BUILD,
+        )
+        diagnostic_ids = _compiled_validation_diagnostic_sequence_ids(
+            function.G,
+        )
+        assert diagnostic_ids == frozenset((joined_id,))
+        declarations, _initializations, mutations = (
+            _source_glyph_sequence_materializations(
+                function.G,
+                compiled_validation_diagnostic_ids=diagnostic_ids,
+            )
+        )
+        assert not any(
+            int(declaration[0]) == joined_id for declaration in declarations
+        )
+        assert not any(
+            int(mutation.destination_value_id) == joined_id
+            for mutation in mutations
+        )
+        assert book.page(SOURCE_GLYPH_SEQUENCE).latest(
+            function.G.nodes[joined_id]["attributes"][
+                "source_glyph_sequence_row"
+            ]
+        ) is not None
+    finally:
+        end_identity_book(token)
+
+
+def test_unconditional_terminal_raise_owns_its_diagnostic_glyphs():
+    """A function that always refuses uses the same native error contract."""
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "def refuse(value):\n"
+                "    raise RuntimeError(f'value={value!r}')\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("refuse").graph
+        joined_id = next(
+            int(node_id)
+            for node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.JoinedStr)
+        )
+        control, = _validation_control_blocks(SimpleNamespace(
+            process_graph=function,
+            callsite_function_shells={},
+        ))
+        assert control.predicate_expression.op == "const"
+        assert control.predicate_expression.value_id == control.error_code
+        assert control.predicate_expression.literal is False
+        assert control.diagnostic_value_ids == (joined_id,)
+
+        program = ControlProgram(control)
+        post_control_program(
+            function.G, program, stage=CONTROL_PROGRAM_BUILD,
+        )
+        diagnostic_ids = _compiled_validation_diagnostic_sequence_ids(
+            function.G,
+        )
+        assert diagnostic_ids == frozenset((joined_id,))
+        declarations, _initializations, mutations = (
+            _source_glyph_sequence_materializations(
+                function.G,
+                compiled_validation_diagnostic_ids=diagnostic_ids,
+            )
+        )
+        assert not any(
+            int(declaration[0]) == joined_id for declaration in declarations
+        )
+        assert not any(
+            int(mutation.destination_value_id) == joined_id
+            for mutation in mutations
+        )
+        assert book.page(SOURCE_GLYPH_SEQUENCE).latest(
+            function.G.nodes[joined_id]["attributes"][
+                "source_glyph_sequence_row"
+            ]
+        ) is not None
+    finally:
+        end_identity_book(token)
+
+
+def test_terminal_raise_unknown_repr_lowers_through_validation_end_to_end():
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {},
+        "bindings": [],
+        "values": [
+            {
+                "function": "validate", "parameter": "value",
+                "storage": "reference", "dtype": "opaque_ref", "rank": 0,
+                "python_type": "typing.Any",
+            },
+            {
+                "function": "validate", "parameter": "reject",
+                "storage": "scalar", "dtype": "bool", "rank": 0,
+                "python_type": "builtins.bool",
+            },
+        ],
+    })
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, _outputs, exports = lower_ast_source_to_ssa(
+            "from typing import Any\n"
+            "def validate(value: Any, reject: bool):\n"
+            "    if reject:\n"
+            "        raise RuntimeError(f'value={value!r}')\n"
+            "    return 0\n",
+            "validate",
+            name="validation_diagnostic_glyph",
+            extraction_contract=policy,
+            progress=lambda _message: None,
+        )
+    root = module.functions[exports[0]]
+    assert any(
+        instruction.attributes.get("callee") == "turing_validation_error"
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    )
+
+
+def test_validation_diagnostic_recipe_closes_over_formatter_sequences():
+    child = SourceGlyphComponent(
+        "formatted", 1, 1, (), -1, None, "scalar", None,
+        formatted_sequence_value_id=71,
+    )
+    component = SourceGlyphComponent(
+        "formatted", 2, 2, (), -1, None, "projection", None,
+        projection_components=(child,),
+        formatted_sequence_value_id=74,
+        union_alternatives=(
+            SourceGlyphUnionAlternative("left", 72, ()),
+            SourceGlyphUnionAlternative("right", 73, ()),
+        ),
+    )
+
+    assert _glyph_component_resident_sequence_ids(component) == (
+        71, 72, 73, 74,
+    )
+
+
+def test_validation_diagnostic_recipe_member_is_not_reopened_as_glyph_owner():
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(
+                "def validate(value, reject: bool):\n"
+                "    if reject:\n"
+                "        raise RuntimeError(f'value={value!r}')\n"
+                "    return 0\n"
+            ))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("validate").graph
+        guard_id, guard = next(
+            (int(node_id), data)
+            for node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.If)
+        )
+        predicate_id = next(
+            int(parent)
+            for parent, role in guard.get("parents") or ()
+            if str(role) == "test"
+        )
+        joined_id = next(
+            int(node_id)
+            for node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.JoinedStr)
+        )
+        formatter_id = next(
+            int(node_id)
+            for node_id, data in function.G.nodes(data=True)
+            if int(node_id) > joined_id
+            and (data.get("attributes") or {}).get(
+                "source_glyph_sequence_row"
+            ) is None
+        )
+        row = function.G.nodes[joined_id]["attributes"][
+            "source_glyph_sequence_row"
+        ]
+        page = book.page(SOURCE_GLYPH_SEQUENCE)
+        incumbent = book.latest_ref(SOURCE_GLYPH_SEQUENCE, row)
+        fact = page.cell(incumbent.row, incumbent.column)
+        components = tuple(
+            replace(component, formatted_sequence_value_id=formatter_id)
+            if component.kind == "formatted" else component
+            for component in fact.components
+        )
+        book.post(
+            SOURCE_GLYPH_SEQUENCE, row, replace(fact, components=components),
+            stage=CONTROL_PROGRAM_BUILD,
+            provenance=Derived((incumbent,)), mode=Mode.REVISE,
+        )
+        post_control_program(
+            function.G,
+            ControlProgram(ValidationBlock(
+                predicate_id, guard_id, expect_true=False,
+                diagnostic_value_ids=(joined_id,),
+            )),
+            stage=CONTROL_PROGRAM_BUILD,
+        )
+
+        assert _compiled_validation_diagnostic_sequence_ids(
+            function.G
+        ) == frozenset((joined_id, formatter_id))
+    finally:
+        end_identity_book(token)
+
+
 def test_unsupported_format_conversions_do_not_create_host_boundary():
     policy = ExtractionContract(
         Path(__file__).resolve().parents[1]
@@ -1375,6 +1642,40 @@ def test_enum_name_projection_uses_authored_resident_lookup_table_after_rehydrat
         assert component.projection_kind == "enum_name"
         assert component.record_identity == "Kind"
         assert component.enum_table_cell == enum_cell
+
+        # Compilation units rehydrate the whole identity book before resident
+        # materialization.  The Enum Ref keeps its exact key, while its Page
+        # is reconstructed by value rather than preserving Python identity.
+        # Materialization must resolve that key through the active book.
+        rehydrated_book = pickle.loads(pickle.dumps(book))
+        _active_book, rehydrated_token = begin_identity_book(rehydrated_book)
+        try:
+            rehydrated_enum_cell = rehydrated_book.latest_ref(
+                SOURCE_ENUM_GLYPH_TABLE, enum_row,
+            )
+            rehydrated_glyph_fact = rehydrated_book.page(
+                SOURCE_GLYPH_SEQUENCE
+            ).latest(joined["attributes"]["source_glyph_sequence_row"])
+            rehydrated_component, = rehydrated_glyph_fact.components
+            assert rehydrated_component.enum_table_cell.page is not (
+                SOURCE_ENUM_GLYPH_TABLE
+            )
+            assert rehydrated_component.enum_table_cell.key == (
+                rehydrated_enum_cell.key
+            )
+            restored_declarations, _restored_initializations, restored_mutations = (
+                _string_token_glyph_materializations(function.G, None)
+            )
+            restored_mutation, = restored_mutations
+            assert restored_mutation.argument_kind == (
+                "enum_name_glyph_projection"
+            )
+            assert any(
+                declaration[0] == restored_mutation.argument_value_ids[1]
+                for declaration in restored_declarations
+            )
+        finally:
+            end_identity_book(rehydrated_token)
 
         declarations, initializations, mutations = (
             _string_token_glyph_materializations(function.G, None)

@@ -222,6 +222,62 @@ def test_direct_aggregate_return_binds_call_from_source_span_and_backing_storage
     assert call.result_bindings == ((1, 5),)
 
 
+def test_declared_union_keeps_aggregate_alternative_as_one_call_result():
+    """Observed aggregate members cannot turn a declared union into a tuple."""
+
+    child_graph = nx.DiGraph()
+    child_graph.add_node(
+        10,
+        type="Input",
+        attributes={"aggregate_leaf_value_ids": (11, 12)},
+    )
+    child_graph.add_node(11, type="Input", attributes={})
+    child_graph.add_node(12, type="Input", attributes={})
+    child_graph.graph.update({
+        "function_name": "maybe_pair",
+        "identity_table": {"result": (10,)},
+        "function_outputs": ("result",),
+    })
+    child = SimpleNamespace(
+        process_graph=SimpleNamespace(G=child_graph, roots=[10]),
+        dispatch_subgraphs=(),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+        _captured_return_value_ids=(),
+    )
+    parent_graph = nx.DiGraph()
+    parent_graph.add_node(
+        5,
+        type="Call",
+        attributes={
+            "declared_return_class_refs": (
+                "builtins.NoneType", "builtins.tuple",
+            ),
+            # A prior tensor-specialization observation is physical evidence
+            # for the tuple arm only, not authority to erase the union.
+            "authored_return_container": "tuple",
+            "aggregate_leaf_value_ids": (6, 7),
+        },
+    )
+    parent_graph.add_node(6, type="Indexed", attributes={})
+    parent_graph.add_node(7, type="Indexed", attributes={})
+    parent_graph.graph["identity_table"] = {}
+    parent = SimpleNamespace(
+        process_graph=SimpleNamespace(G=parent_graph, roots=[5]),
+        dispatch_subgraphs=(),
+        callsite_function_shells={5: child},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    call = _build_shell_hierarchy_plan(parent).items[0]
+
+    assert isinstance(call, PlanCall)
+    assert call.result_value_ids == (5,)
+    assert call.result_bindings == ((10, 5),)
+
+
 def test_native_bound_method_selector_is_not_a_call_boundary():
     """Only the Call consumes an accepted native method interface.
 
@@ -293,6 +349,166 @@ def test_native_bound_method_selector_is_not_a_call_boundary():
     calls = tuple(item for item in plan.items if isinstance(item, PlanCall))
     assert tuple(call.callsite_id for call in calls) == (3,)
     assert set(calls[0].argument_bindings) == {(1, 10), (0, 11)}
+
+
+def test_native_optional_physical_return_binds_one_semantic_call_result():
+    """Accepted payload/presence ABI remains one source call value."""
+
+    from src.transmogrifier.ssa import (
+        BasicBlock,
+        Function,
+        IRModule,
+        Instr,
+        SSAValue,
+    )
+
+    process = nx.DiGraph()
+    process.add_node(
+        3,
+        type="Call",
+        op="call",
+        parents=(),
+        attributes={
+            "callee_ref": 62,
+            "authored_return_container": "tuple",
+        },
+        expr_obj=ast.parse("maybe_pair()", mode="eval").body,
+    )
+    process.graph["identity_table"] = {}
+
+    presence = SSAValue(12, "bool", accounting={
+        "ssa_optional_presence": True,
+        "ssa_optional_payload_id": 11,
+    })
+    payload = SSAValue(11, "opaque_ref", accounting={
+        "ssa_optional_payload": True,
+        "ssa_optional_presence_id": 12,
+    })
+    declaration = Function(
+        "maybe_pair",
+        [],
+        {"entry": BasicBlock("entry", [
+            Instr("Ret", [payload, presence], None),
+        ])},
+        metadata={
+            "native_interface": {
+                "argument_ids": (),
+                "output_ids": (11, 12),
+                "output_paths": (((0,), 11), ((1,), 12)),
+            },
+            "semantic_output_ids": (11,),
+            "aggregate_return_layouts": ((11, (11, 12)),),
+            "parameter_names": (),
+            "authored_parameters": (),
+        },
+    )
+    host = IRModule({"maybe_pair": declaration})
+    entry = SimpleNamespace(metadata={
+        "host_ssa_module": host,
+        "host_ssa_root": "maybe_pair",
+    })
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(
+            G=process,
+            function_table=SimpleNamespace(entry=lambda _reference: entry),
+        ),
+        dispatch_subgraphs=(),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    call, = _build_shell_hierarchy_plan(shell).items
+
+    assert isinstance(call, PlanCall)
+    assert call.result_value_ids == (3,)
+    assert call.result_bindings == ((11, 3),)
+
+
+def test_native_optional_aggregate_return_binds_one_semantic_call_result():
+    """Every payload/presence pair belongs to one logical optional tuple."""
+
+    from src.transmogrifier.ssa import (
+        BasicBlock,
+        Function,
+        IRModule,
+        Instr,
+        SSAValue,
+    )
+
+    process = nx.DiGraph()
+    process.add_node(
+        3,
+        type="Call",
+        op="call",
+        parents=(),
+        attributes={
+            "callee_ref": 62,
+            "authored_return_container": "tuple",
+        },
+        expr_obj=ast.parse("maybe_pair()", mode="eval").body,
+    )
+    process.graph["identity_table"] = {}
+
+    outputs = (
+        SSAValue(11, "opaque_ref", accounting={
+            "ssa_optional_payload": True,
+            "ssa_optional_presence_id": 12,
+        }),
+        SSAValue(12, "bool", accounting={
+            "ssa_optional_presence": True,
+            "ssa_optional_payload_id": 11,
+        }),
+        SSAValue(13, "int64", accounting={
+            "ssa_optional_payload": True,
+            "ssa_optional_presence_id": 14,
+        }),
+        SSAValue(14, "bool", accounting={
+            "ssa_optional_presence": True,
+            "ssa_optional_payload_id": 13,
+        }),
+    )
+    declaration = Function(
+        "maybe_pair",
+        [],
+        {"entry": BasicBlock("entry", [
+            Instr("Ret", list(outputs), None),
+        ])},
+        metadata={
+            "native_interface": {
+                "argument_ids": (),
+                "output_ids": (11, 12, 13, 14),
+                "output_paths": (
+                    ((0, 0), 11), ((0, 1), 12),
+                    ((1, 0), 13), ((1, 1), 14),
+                ),
+            },
+            "semantic_output_ids": (11,),
+            "aggregate_return_layouts": ((11, (11, 12, 13, 14)),),
+            "parameter_names": (),
+            "authored_parameters": (),
+        },
+    )
+    entry = SimpleNamespace(metadata={
+        "host_ssa_module": IRModule({"maybe_pair": declaration}),
+        "host_ssa_root": "maybe_pair",
+    })
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(
+            G=process,
+            function_table=SimpleNamespace(entry=lambda _reference: entry),
+        ),
+        dispatch_subgraphs=(),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    call, = _build_shell_hierarchy_plan(shell).items
+
+    assert isinstance(call, PlanCall)
+    assert call.result_value_ids == (3,)
+    assert call.result_bindings == ((11, 3),)
 
 
 def test_exact_peer_descriptor_folds_shape_with_unsettled_parameter():

@@ -241,7 +241,7 @@ def bootstrap_provenance_core(
     expansion_policy: Mapping[str, Any] | None = None,
     jobs: int | None = None,
     schedule_options: Mapping[str, Any] | None = None,
-    stop_after_failure: bool = True,
+    stop_after_failure: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Complete the bootstrap's blocking provenance stage and nothing later."""

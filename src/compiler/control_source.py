@@ -7,9 +7,10 @@ coordinator after planning has selected a compiled target.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .deployment_frame import DeploymentFrame, DeploymentJoin
 from .live_tiles import TiledObject
@@ -556,6 +557,38 @@ class ValidationBlock(TiledObject):
     expect_true: bool = True
     predicate_expression: ControlExpression | None = None
     extraction_identity: str | None = None
+    # Exact source values consumed only by the authored exception diagnostic.
+    # Native validation reports ``error_code`` and does not materialize them.
+    diagnostic_value_ids: tuple[int, ...] = ()
+
+
+def validation_diagnostic_value_ids(
+    statement: ast.Raise,
+    node_for_expression: Callable[[ast.AST], int | None],
+) -> tuple[int, ...]:
+    """Resolve the source values used only to author a validation message.
+
+    Validation discovery has two planner lanes: ordinary guards and guards
+    lexically owned by retained loops.  Both must publish the same identities
+    to ``control_block``; otherwise resident planning sees different use
+    contracts for the same authored raise depending on its nesting.
+    """
+
+    if not isinstance(statement, ast.Raise):
+        return ()
+    raised = statement.exc
+    expressions = (
+        (*raised.args, *(keyword.value for keyword in raised.keywords))
+        if isinstance(raised, ast.Call)
+        else (raised,) if isinstance(raised, ast.expr)
+        else ()
+    )
+    return tuple(dict.fromkeys(
+        int(value_id)
+        for expression in expressions
+        for value_id in (node_for_expression(expression),)
+        if value_id is not None
+    ))
 
 
 @dataclass(frozen=True)
@@ -602,6 +635,10 @@ class SequenceQueryBlock(TiledObject):
     # are defined at this lexical position (often by a loop projection), so a
     # backend must not hoist the lookup to function entry.
     key_value_ids: tuple[int, ...] = ()
+    # Membership is the same resident-table query as lookup, but publishes a
+    # boolean and may invert it for ``not in``.  It must remain a lexical
+    # block because its key can be a loop projection.
+    negate: bool = False
     # A first-or-default query over a derived record sequence yields a tagged
     # integer row handle.  The default arm uses -1 and subsequent source
     # ``is [not] None`` tests consume that tag.
@@ -615,13 +652,16 @@ class SequenceQueryBlock(TiledObject):
 
     def __post_init__(self) -> None:
         if self.operation not in {
-            "length", "truth", "first_or_default", "lookup", "maximum",
+            "length", "truth", "first_or_default", "lookup", "membership",
+            "maximum",
         }:
             raise ValueError("unknown resident sequence query")
         if self.operation == "first_or_default" and self.default_value_id is None:
             raise ValueError("first_or_default requires an explicit default")
-        if self.operation == "lookup" and not self.key_value_ids:
-            raise ValueError("lookup requires at least one exact key identity")
+        if self.operation in {"lookup", "membership"} and not self.key_value_ids:
+            raise ValueError(
+                f"{self.operation} requires at least one exact key identity"
+            )
         if self.operation == "maximum" and not self.reduction_prefix_value_ids:
             raise ValueError("maximum requires an incumbent before the starred sequence")
 
@@ -1097,6 +1137,7 @@ def _describe_control_block(
     regions: tuple = ()
     extra: tuple = ()
     cases: tuple = ()
+    diagnostics: tuple = ()
     if isinstance(block, StatementBlock):
         region = _region_marker(block)
         callsite_ordinal = _callsite_marker(block)
@@ -1174,6 +1215,7 @@ def _describe_control_block(
         )
     elif isinstance(block, ValidationBlock):
         owner = predicate = cell(block.predicate_value_id)
+        diagnostics = cells(block.diagnostic_value_ids)
         extra = (
             int(block.error_code), bool(block.expect_true),
             block.extraction_identity,
@@ -1230,6 +1272,7 @@ def _describe_control_block(
         reason = CONTROL_OWNER_UNKNOWN
     return kind, owner, reason, (
         predicate, carried, sites, regions, callsite, extra, cases,
+        diagnostics,
     )
 
 
@@ -1387,10 +1430,14 @@ def post_control_program(
         )
 
     def fact_cells(fields: tuple) -> tuple:
-        predicate, carried, sites, regions, callsite, _extra, cases = fields
+        (
+            predicate, carried, sites, regions, callsite, _extra, cases,
+            diagnostics,
+        ) = fields
         return tuple(
             item for item in (
                 predicate, *carried, *sites, *regions, callsite, *cases,
+                *diagnostics,
             )
             if isinstance(item, Ref)
         )
@@ -3544,6 +3591,10 @@ def project_control_regions(
         elif isinstance(block, SequenceBlock):
             for child in block.blocks:
                 gather_inductions(child)
+        elif isinstance(block, ConditionalBlock):
+            gather_inductions(block.body)
+            if block.orelse is not None:
+                gather_inductions(block.orelse)
         elif isinstance(block, StateMachineTick):
             for _value, body in block.cases:
                 gather_inductions(body)
@@ -3554,6 +3605,15 @@ def project_control_regions(
                 gather_inductions(lane)
         elif isinstance(block, CallBlock):
             gather_inductions(block.callee)
+        elif isinstance(block, ResourceScopeBlock):
+            gather_inductions(block.body)
+        elif isinstance(block, NativeTryBlock):
+            gather_inductions(block.body)
+            for handler in block.handlers:
+                gather_inductions(handler.body)
+            if block.orelse is not None:
+                gather_inductions(block.orelse)
+            gather_inductions(block.finalbody)
 
     gather_inductions(root)
     projected_deployments = []
@@ -4836,4 +4896,5 @@ __all__ = [
     "render_control_block",
     "render_control_program",
     "render_python_shell",
+    "validation_diagnostic_value_ids",
 ]

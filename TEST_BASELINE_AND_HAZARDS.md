@@ -1,3 +1,247 @@
+2026-10-19 PROVENANCE CHECKPOINT AND CONTINUATION (CURRENT):
+See docs/compiler_convergence/20_provenance_bootstrap_continuation_2026_10_19.md.
+The user's fingerprint
+`9a2048331e799d30ff626164904bb2b675184fa738ecd1f0dd21994e41fd0f71`
+admitted 28/327 units: 25 compiled-unverified, one partial, two failed, zero
+verified. Unit 049 (MonotonicIdSource.mint) now has complete accounting and
+no shortfalls; unit 033 (IdentityPage._resolved) also remains complete.
+Unit 034 still has an unresolved lookup, unexplained inputs, and no physical
+return publication. Units 041 and 065 now share the physical call adaptation
+repeated-state refusal. The exact writer causing that refusal is untraced.
+
+Independent review repaired function-scoped child-pool dtype ownership,
+scoped ABI authority, stale sequence-view receipts, region-feed resident
+identity, topology cache invalidation, CFG entry selection, and Phi checks.
+The pre-commit six-file gate completed with 211 passing and nine failing tests.
+All failures are in test_concordance_audit_contracts.py: five raw-write fixture
+refusals and four missing optional Metrics.dt_limit declaration-cell refusals.
+Their introduction point is unclassified. This checkpoint does not claim a
+clean concordance gate or native self-host completion. No bootstrap was run
+while preparing the report and commit.
+The separate receiver/cache/receipt and bootstrap-policy batch passed 28 tests
+with two skips in 133.73s. Combined packaging checks: 239 passed, two skipped,
+nine failed. See the continuation report for exact commands.
+
+2026-10-18 AUTHORITATIVE SCOPED TYPE-ABI HANDOFF (CURRENT):
+Checkpoint `3359a18b4f0303d162aba9ba3ab7223020e6051b452fd3fdcda03dfda0a4a33b`
+proved that the preceding provisional-tag implementation was loaded but did
+not receive the concordance row it needed.  Unit 033's scheduled callsite 31
+published result value 31, and `VALUE_TYPE_ABI` already held its exact
+`NoneType | tuple` contract.  The shell nevertheless constructed the control
+lowerer's type table by iterating the separate `linked_value_abi` dictionary;
+value 31 was absent from that physical shell view, so the authoritative page
+fact was silently omitted and no provisional tag could be reserved.
+
+The sectional handoff now projects every `VALUE_TYPE_ABI` row owned by the
+function copy's lexical scope directly from the concordance page.  The control
+builder performs the same projection at its API boundary and rejects any
+explicitly supplied row that disagrees with the page.  This is independent of
+function, callsite, value number, union members and control shape; no Python
+object, runtime type query, case list or fallback is involved.  The reported
+conditional-call regression now passes with no manually supplied type table,
+and the complete control-SSA/value-union focused gate passes 137 tests.  No
+bootstrap run was made; the user's next normal run is authoritative.  The
+older `LINKED NATIVE UNION CALL RESULT` receipt below records the provisional
+tag mechanism but its claim that the real handoff supplied value 31 is
+superseded by this receipt.
+
+2026-10-18 LINKED NATIVE UNION CALL RESULT (SUPERSEDED HANDOFF CLAIM):
+Checkpoint `1cd834105ead7644cbffbd892821ab162900f6f256ed56a329c63d27c33c40e6`
+confirmed that the loop-carried union blocker was cleared and advanced unit
+033 (`IdentityPage._resolved`) to its conditional Optional call result.  The
+scheduled `_fork_of_scope` call's semantic result (value 31) already had the
+authoritative `None | tuple` `VALUE_TYPE_ABI`, but control SSA was built before
+call-frame linking exposed the result's physical `int64` tag.  The conditional
+therefore refused value 31 rather than inventing type evidence.
+
+Scheduled union results now reserve a typed internal tag from that exact
+concordance row while the call marker is placed.  Native result propagation
+then registers the caller's union descriptor from the callee descriptor and
+physical result cells, rewrites consumers to the linked tag by SSA-object
+identity, updates the tag ledger, and removes the provisional frame value from
+the completed caller arguments.  No Python object, runtime class query,
+guessed tag, or public bootstrap input is introduced.  Regressions cover the
+reported conditional `None | tuple` shape and the complete provisional-to-
+physical link transaction.  The complete control-SSA and value-union focused
+gate passes 137 tests.  No bootstrap run was made; the user's next normal run
+will establish the new frontier under a new source fingerprint.
+
+2026-10-18 LOOP-CARRIED NATIVE UNION BACKEDGE (CURRENT):
+Checkpoint `05151695257c8f13addd6da57b0e3c147011171d01285bc24f2c1ebc62056710`
+advanced unit 033 (`IdentityPage._resolved`) to the loop-carried Optional
+`asof` value, then refused because its body-defined update (value 71) had an
+authoritative `None | int` ABI but no tag definition yet.  This was an SSA
+construction-order error: the loop already reserved the future payload, while
+the companion tag incorrectly had to exist before the loop body was lowered.
+
+Loop-carried unions now reserve their exact local tag and physical arm payloads
+with the backedge payload.  The body definition claims those same SSA objects;
+they never become Python objects or invented public formals.  The loop header's
+derived ABI is published under its minted SSA identity rather than replacing
+the input parameter's descriptor, deferred backedge shape-injection evidence is
+posted after the body definition becomes resident, and exact/remapped incoming
+tags are emitted on their Phi predecessor edges.  A focused Optional loop
+regression proves the header backedge is the body tag, is not a function
+argument, and passes SSA dominance.  The complete control-SSA and value-union
+focused gate passes 135 tests.  No bootstrap run was made; a normal next run
+must use a new source fingerprint rather than replaying the recorded failure.
+
+2026-10-18 COMPLETE PROVENANCE CENSUS + KEYED-REFERENCE REPAIRS (CURRENT):
+See docs/compiler_convergence/19_census_2026_10_16.md, Round 9.  The fresh
+`repair-20261018-0733` lower-only census admitted all 327 units: 41 compiled-
+unverified, 66 partial and 220 failed.  Dependency classification leaves 104
+independent non-clean roots (38 failed, 66 partial).  The most frequent exact
+independent failure is the seven-unit formatted-glyph resident-producer family;
+the frozen receipts prove that all seven operands lack an authoritative source
+class or value-type ABI, so a generic Python `repr` fallback would be unsound.
+
+Units 024, 038, 040 and 045 now compile in that census.  The next concrete
+failures showed two real contract bypasses.  Keyed sequence membership and
+delete/setdefault queries now pass through the existing descriptor-aware
+native reference-to-key conversion.  The REVISE publication used by table
+queries now cites the incumbent SSA cell through `revise_ssa_value`, preserving
+the exact concordance history.  Comprehension aggregate results also publish
+their authored builtin aggregate class from graph evidence.  These changes
+have focused regression coverage; a fresh fingerprint-consistent compiler run
+is still required for end-to-end status.
+
+Provenance growth is fail-fast by default.  `--jobs` controls concurrency and
+does not create a clean checkpoint after 12 units.  `--stage-units N` is the
+explicit admission bound; `--continue-after-failure` explicitly requests a
+complete remaining census.
+
+2026-10-17 GENERAL SECTION TYPE-EXPECTATION ABI (CURRENT):
+See docs/compiler_convergence/19_census_2026_10_16.md, Round 8.  Fresh
+bootstrap checkpoint
+`b21dabcf27cbe6c1f848f41ce2b4133f549ecb50b0a8a87cde83a08997f8b587`
+reached 20/327 admitted units.  Unit 030 (`IdentityPage._reaches_origin`) and
+unit 040 (`RowField.admits`) then exposed the census-selected missing native
+type-expectation family on an aggregate projection and an `Any` parameter.
+
+Every exact native type-predicate subject now has a sectional class ABI.
+Already-settled source classes remain exact.  Otherwise the accepted source
+concordance supplies the closed class vocabulary and one definition cell per
+identity; the physical boundary remains one ctypes-compatible `opaque_ref`
+word plus one `int64` class tag.  This covers parameters, loop inputs, field
+reads and aggregate projections without Python objects, live class inspection,
+dtype inference or a synthetic catch-all tag.  Authored `object`, like `Any`,
+is an open accepted domain rather than an exact-runtime-class assertion.
+
+Representative frozen replays clear the former refusal for direct `Any`,
+mixed parameter/loop, known-class, ordinary loop, and large multi-predicate
+audit functions.  The two reported units advance past SSA type lowering to a
+later linked-artifact accounting check in the diagnostic replay; only a fresh
+fingerprint-consistent bootstrap can establish their complete status.  The
+focused gate passes 18 tests with 2 skips.
+
+2026-10-17 PROVENANCE GROWTH HAS NO HIDDEN CLEAN CHECKPOINT (CURRENT):
+See docs/compiler_convergence/19_census_2026_10_16.md, Round 7.  `--jobs`
+limits concurrent isolated workers only.  With no explicit `--stage-units`, a
+clean run continues through the remaining dependency schedule instead of
+returning after an arbitrary worker-count batch.  The default remains
+fail-fast at the first failed/partial receipt; `--continue-after-failure`
+explicitly requests complete failure collection.
+The native-provenance bootstrap file passes 11 tests with 2 skips.
+
+2026-10-17 UNCONDITIONAL TERMINAL VALIDATION (CURRENT):
+See docs/compiler_convergence/19_census_2026_10_16.md, Round 6.  Fresh
+bootstrap checkpoint
+`cfabb41b09a7fd246f14caf2c04888f0af59fe3df9fe181354d8e851445e34fc`
+advanced through the declared-type frontier and compiled 16 units before unit
+024 (`IdentityBook._admit_raw_write`) exposed a resident-glyph refusal.  The
+unknown glyph was `row!r` inside the message of the function's unconditional
+terminal raise.  The exact authored function body and raise node were already
+retained, but validation discovery published diagnostic ownership only for
+conditional raise guards.
+
+A straight-line function ending in `raise` now uses the existing native
+`ValidationBlock` contract with a compiler constant-false predicate owned by
+the exact raise node.  Native control reports the typed error; the authored
+message remains shell-only and therefore does not invent a runtime `repr`.
+An exact frozen-unit replay completes with one validation call, zero repository
+SSA self-check findings and zero concordance findings.  The complete glyph-
+provenance file passes 58/58.  The full bootstrap still requires a fresh run.
+
+2026-10-17 SHARED NATIVE TYPE-EXPECTATION ABI + CENSUS SELECTION (CURRENT):
+See docs/compiler_convergence/19_census_2026_10_16.md, Round 5.  A closed
+semantic class domain whose alternatives share one physical representation now
+uses one `opaque_ref` payload plus one `int64` class token.  It no longer grows
+one reference formal per class.  The payload remains the authored ctypes-
+compatible native reference value; the source-class concordance supplies the
+closed class vocabulary and subtype identities.  No Python object, class object,
+PyObject or CPython ABI participates in the sectional contract.
+
+The actual frozen unit 038 input from checkpoint
+`67f802071546cf2702dd317446e4580d3b27bc1aa683756a2c8bfae3cefe3749`
+now lowers `_validate_fact` with 89 semantic alternatives, one shared payload
+row and one tag.  Repository SSA self-check reports zero findings and the
+identity concordance reports zero findings.  The focused shared-union/API gate
+passes 3/3.  This is an exact unit replay, not a claim that the full bootstrap
+or native verification completed.
+
+The requested continue-after-failure census used all 323 receipts in
+`build/census-2026-10-17`: 37 compiled-unverified, 237 failed and 49 partial.
+Of 286 non-clean units, 113 are independent and 173 inherit another failed
+dependency.  The largest independent exact semantic family is now 19 missing
+native type expectations, with 102 failed units in its reverse dependency
+closure; the glyph family is next at 16.  The shared declared-type repair is
+therefore the selected high-leverage lane rather than a one-function exception.
+
+2026-10-17 NATIVE DECLARED-TYPE EXPECTATIONS + CLEAN GROWTH STAGE (CURRENT):
+See docs/compiler_convergence/19_census_2026_10_16.md, Round 4.  Sectional
+ProgramABI inputs now admit one declared semantic type or a closed union.  The
+declaration is joined at compile time to source-class concordance and lowered
+as native payload plus an int64 type token; no Python class object, PyObject or
+CPython ABI crosses the bootstrap boundary.  `Page.fact_type` may itself be a
+class union, and dynamic `isinstance(fact, page.fact_type)` consumes the same
+native token/subtype join.  A real `_validate_fact` public-entry lowering moved
+past its former structural output failure.
+
+The continue-after-failure census was reclassified before choosing the next
+lane: 170 of 234 failures were incomplete-dependency cascades; the leading
+independent exact failure was 12 formatted-glyph resident-producer refusals.
+The current formatter/concordance state passes all 57 glyph provenance tests.
+The fresh bounded growth stage at checkpoint
+`63be20e60ea4e6ad709a3468cd141653f6ba5aab186e66f89043fafd537e60bd`
+compiled 10/10 selected units with zero partials and zero failures.  Its four
+glyph formatter units compiled, and unit 045 (`identity_spill._replace_cells`)
+advanced through the former glyph refusal.  Two subsequently exposed missing-
+source errors were repaired by deriving pre-record member discovery from the
+existing planner call edge and an unbound composed-callee frame lease from the
+existing `linked_caller_member` decision.  Formal-storage tests pass 7/7;
+declared-type/union focused tests pass 6/6.  This is a clean lower-only growth
+stage, not a claim that all 327 units or native verification are complete.
+
+2026-10-17 VALIDATION DIAGNOSTIC CONCORDANCE (CURRENT):
+See docs/compiler_convergence/19_census_2026_10_16.md, Round 3.  The fresh
+327-unit provenance run's two SSA failures (`_validate_fact` and
+`identity_spill._replace_cells`) were exception-message glyphs with no native
+consumer: their terminal raises were already compiled as `ValidationBlock`s.
+Validation planning now records the exact diagnostic source-value ids and
+`post_control_program` publishes their cells on the existing `control_block`
+concordance fact.  Resident glyph planning reads that fact and omits only the
+diagnostic `JoinedStr` owned by compiled validation; every other unknown
+formatted value still refuses.  `Any`/`object` retain the established
+reference/`opaque_ref` ABI; no generic repr or new handle was invented.  Glyph
+provenance passes 57 tests and control-source passes 24.  A fresh provenance
+run at fingerprint `70cae82e87bbb0d0a458a82ccbb04b04424e338aa9be1872db0802f2f6670528`
+confirmed `_validate_fact` now completes SSA lowering and reaches finalization.
+It also proved `_replace_cells` takes the retained-loop validation lane, whose
+`ValidationBlock` constructor did not yet carry the diagnostic ids.  Diagnostic
+extraction is now shared by ordinary and retained-loop planners; a membership-
+guard regression proves the loop block -> `control_block` concordance -> glyph
+reader chain.  The combined current gate passes 82 tests.  The next fresh
+provenance run is the authoritative verification of unit 045 because frozen
+unit plans correctly reject the latest compiler fingerprint change.
+Unit 038's remaining final-accounting shortfall is separately identified as the
+Boolean result of `isinstance(fact, page.fact_type)`.  `Unresolved` is already an
+explicit admitted concordance fact.  The dynamic class operand is only an
+`opaque_ref`; full-native lowering has no concorded class/type identity for it,
+and must not reinterpret opaque storage as subtype evidence.  The existing
+Python-shell-shaped regression for this case is still red, while the compiler's
+full-native execution contract rejects a CPython ABI.  This is a distinct open
+type-identity contract, not part of the diagnostic-glyph repair.
+
 2026-10-16 MEMORY GRAPH TAKEOVER + PROVENANCE BLOCKERS (CURRENT):
 See docs/compiler_convergence/17_memory_graph_bootstrap_repairs_continuation.md.
 The public source compiler now owns canonical topology through the independent
@@ -5444,3 +5688,33 @@ the executable gate: 13 formal-parity groups, three dominance findings, one
 optional result contract. The fresh v8 source build and real-engine 64-transition
 training run must be checked for their concrete results; neither is declared
 successful here. No full-suite run or baseline suppression was performed.
+2026-10-18 RESOLVED-UNIT FINAL CONCORDANCE + DIAGNOSTIC RECIPE CLOSURE (CURRENT):
+Checkpoint `dba86e34f1a9db226fb537b0e5b73e41a75aec7dc48fe81fc4270ff44e4fede1`
+exposed two independent finalization-boundary faults.  Unit 032 serialized
+`IdentityPage._reindex` with temporal sequence descriptors 41/44/48 sharing
+member 53 and the exact resident alias target 2305843010213700385, but without
+the `concordant_sequence_views` receipt.  The publisher existed only on the
+outer whole-source return path.  It now runs at the common class-surface
+finalization seam used by resolved units.  Applying that publisher in memory
+to the frozen unit 032 artifact changes its one `descriptor-member-shared`
+finding to none and records `(53, (41, 44, 48), 2305843010213700385)`.
+
+Unit 048's validation-owned JoinedStr correctly named formatter sequence 36
+through its `source_glyph_sequence` recipe.  Recipe closure then iterated its
+own growing result and incorrectly demanded that formatter sequence 36 own a
+second top-level glyph row.  Closure now expands only the original
+ValidationBlock-owned glyph IDs; derived formatter/projection/union sequences
+remain recipe members.  Focused compiler regressions pass 5/5 across the two
+repairs.  No bootstrap run was made; the next user run is authoritative.
+2026-10-18 CONDITIONAL UNION ARM PROVENANCE JOIN (CURRENT):
+Checkpoint `9b424c23baea9fc36d8901ea10690311dd72da8e38c8d32060c5b6fbe3c0db9b`
+confirmed the preceding descriptor/glyph blockers cleared: unit 048 compiled
+and unit 033 reached SSA lowering.  Its value 63 is the authored expression
+`self._fork_of_scope(row[0]) if ... else None`.  The call arm is declared
+`tuple[Any, int] | None`; the else arm is literal `None`.  Both establish the
+same payload-free `builtins.NoneType` physical ABI from different exact source
+cells.  Conditional settlement incorrectly compared `source_cells` as part of
+physical layout.  It now compares identity/storage/dtype/shape/rank/storage
+identity/metadata/row shape and, on agreement, retains the union of both source
+proofs.  A true physical disagreement still refuses.  Value-union and
+concordance-audit focused tests pass 11/11.  No bootstrap run was made.

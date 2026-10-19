@@ -23,6 +23,7 @@ from src.compiler.precompile_to_ssa import (
 )
 
 from src.compiler.project_compilation_product import (
+    _accepted_physical_output_paths,
     adaptive_worker_memory_ceiling,
     compilation_creep_frontier,
     compile_project_call,
@@ -54,6 +55,53 @@ from src.compiler.project_compilation_product import (
     verify_structural_resident_table_integral,
     verify_project_scalar_units_automatically,
 )
+
+
+def test_record_return_layout_expands_the_conceptual_output_path():
+    function = SimpleNamespace(metadata={
+        "record_return_layouts": ((12, (11, 6, 8)),),
+    })
+
+    paths, kind = _accepted_physical_output_paths(
+        {(0,): 12}, {6, 8, 11}, function, None,
+    )
+
+    assert paths == {(0,): 11, (1,): 6, (2,): 8}
+    assert kind == "tuple"
+
+
+def test_record_return_layout_does_not_mask_a_published_disagreement():
+    function = SimpleNamespace(metadata={
+        "record_return_layouts": ((12, (11, 6, 8)),),
+    })
+
+    paths, kind = _accepted_physical_output_paths(
+        {(0,): 12}, {6, 8, 13}, function, None,
+    )
+
+    assert paths == {(0,): 12}
+    assert kind is None
+
+
+def test_optional_tuple_return_layout_expands_all_physical_leaf_receipts():
+    function = SimpleNamespace(metadata={
+        "aggregate_return_layouts": (
+            (21, (21, 22)),
+            (31, (31, 32)),
+        ),
+    })
+
+    paths, kind = _accepted_physical_output_paths(
+        {}, {21, 22, 31, 32}, function, None,
+    )
+
+    assert paths == {
+        (0, 0): 21,
+        (0, 1): 22,
+        (1, 0): 31,
+        (1, 1): 32,
+    }
+    assert kind == "tuple"
 
 
 def test_source_acceptance_does_not_import_linked_repository_ssa_cells():
@@ -171,6 +219,65 @@ def test_source_acceptance_projects_concorded_value_classes():
         (scope, 1)
     ) == book.page(SOURCE_VALUE_CLASS.name).latest((scope, 1))
     assert projected.stamp_of(value_class) == book.stamp_of(value_class)
+
+
+def test_source_acceptance_projects_exact_parameter_annotation_declaration():
+    import networkx as nx
+
+    from src.compiler.concordance_declarations import (
+        CLASS_DECLARATION,
+        INGESTION,
+        INGEST_SOURCE,
+        PARAMETER_ANNOTATION,
+        ClassFact,
+    )
+    from src.compiler.identity_concordance import (
+        Derived,
+        IdentityBook,
+        Mode,
+        Novel,
+    )
+
+    identity = ("compiler_probe", "IdentityBook.__init__")
+    book = IdentityBook()
+    class_cell = book.post(
+        CLASS_DECLARATION,
+        ("compiler_probe", "Registry"),
+        ClassFact("Registry", ()),
+        stage=INGESTION,
+        provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+    annotation_row = (*identity, "registry")
+    annotation_cell = book.post(
+        PARAMETER_ANNOTATION,
+        annotation_row,
+        "Registry | None",
+        stage=INGESTION,
+        provenance=Derived((class_cell,)),
+        mode=Mode.CONCORD,
+    )
+    body_graph = nx.DiGraph()
+    body_graph.graph.update({
+        "authored_function_identity": identity,
+        "function_name": "IdentityBook.__init__",
+        "function_parameters": ("registry",),
+    })
+    body = SimpleNamespace(G=body_graph)
+    table = SimpleNamespace(entry=lambda _reference: SimpleNamespace(
+        graph=body,
+        qualified_name="compiler_probe.IdentityBook.__init__",
+    ))
+    graph = SimpleNamespace(function_table=table, G=SimpleNamespace(graph={}))
+
+    projected = project_process_graph_acceptance(graph, (0,), book=book)
+
+    assert projected.latest_ref(
+        PARAMETER_ANNOTATION, annotation_row,
+    ) == annotation_cell
+    assert projected.latest_ref(
+        CLASS_DECLARATION, ("compiler_probe", "Registry"),
+    ) == class_cell
 
 
 def test_source_acceptance_projects_sort_contract_named_by_graph_view():

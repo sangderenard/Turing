@@ -380,6 +380,16 @@ def test_release_dependency_levels_drops_recomputable_tables():
     assert scheduling._dependency_levels(graph) == {0: 0, 1: 1}
 
 
+def test_dependency_level_cache_invalidates_on_edge_rewrite():
+    from src.compiler import region_scheduling as scheduling
+
+    graph = SimpleNamespace(G=nx.DiGraph([(0, 1), (1, 2)]))
+    assert scheduling._dependency_levels(graph) == {0: 0, 1: 1, 2: 2}
+    graph.G.remove_edges_from(tuple(graph.G.edges))
+    graph.G.add_edges_from(((2, 1), (1, 0)))
+    assert scheduling._dependency_levels(graph) == {2: 0, 1: 1, 0: 2}
+
+
 def test_polymorphic_formal_scan_memo_holds_live_pages_only():
     from src.compiler import glsl_deployment_strategy as strategy
 

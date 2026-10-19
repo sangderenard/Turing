@@ -219,6 +219,37 @@ def test_provenance_child_failure_returns_its_status_without_parent_traceback(
     assert cli.main(["--provenance-only", "--output", str(tmp_path)]) == 1
 
 
+def test_provenance_cli_continues_clean_interior_stage_without_process_overlay(
+    tmp_path, monkeypatch, capsys,
+):
+    import tools.bootstrap_compiler_whole_program as cli
+    from src.compiler.compiler_bootstrap_runtime import (
+        ProvenanceCoreRestartRequired,
+    )
+
+    calls = []
+    plan = {"next_partition": {"version": "c" * 64}}
+
+    def staged(*args, **kwargs):
+        calls.append(kwargs["stop_after_failure"])
+        if len(calls) == 1:
+            raise ProvenanceCoreRestartRequired(
+                "interior stage",
+                requires_process_restart=False,
+            )
+        return plan, {"backend": "native", "library": "whole-module"}
+
+    monkeypatch.setattr(cli, "bootstrap_provenance_core", staged)
+    monkeypatch.setattr(
+        cli.os, "execve",
+        lambda *args, **kwargs: pytest.fail("clean stage used process overlay"),
+    )
+
+    assert cli.main(["--provenance-only", "--output", str(tmp_path)]) == 0
+    assert calls == [True, True]
+    assert "outer partition not started" in capsys.readouterr().out
+
+
 def test_outer_partition_is_an_authored_project_root():
     from src.compiler.project_compilation_product import discover_authored_calls
 

@@ -1133,6 +1133,15 @@ class CorrelationTable:
                     name, formal.id, "abi-parameter", abi_parameter,
                     "accounting.program_abi_parameter",
                 )
+            if (
+                accounting.get("native_type_tag_for_value_id") is not None
+                and accounting.get("source_parameter")
+            ):
+                self.claim(
+                    name, formal.id, "abi-parameter",
+                    f"{accounting['source_parameter']}.__type_tag",
+                    "accounting.native_type_tag_for_value_id",
+                )
             if accounting.get("program_abi_keyed_owner") is not None:
                 self.claim(
                     name, formal.id, "keyed-part",
@@ -1163,6 +1172,14 @@ class CorrelationTable:
         for label, value_id in metadata.get("parameter_names", ()) or ():
             self.claim(name, value_id, "parameter", label,
                        "metadata.parameter_names")
+        for value_id, source_name, transform in (
+            metadata.get("scalar_source_transforms", ()) or ()
+        ):
+            self.claim(
+                name, value_id, "source-transform",
+                f"{source_name}:{transform}",
+                "metadata.scalar_source_transforms",
+            )
         for entry in metadata.get("storage_formals", ()) or ():
             self.claim(name, entry["value_id"], "storage-formal",
                        entry.get("kind", "storage"), "metadata.storage_formals")
@@ -1499,7 +1516,7 @@ class CorrelationTable:
                         )
                     if not any(
                         source.page.name in {
-                            "canonical_value", "ingestion_value"
+                            "canonical_value", "ingestion_value", "ssa_value"
                         }
                         and isinstance(source.row, tuple)
                         and len(source.row) == 2
@@ -1516,7 +1533,8 @@ class CorrelationTable:
                     for source in sources:
                         if (
                             source.page.name in {
-                                "canonical_value", "ingestion_value"
+                                "canonical_value", "ingestion_value",
+                                "ssa_value",
                             }
                             and isinstance(source.row, tuple)
                             and len(source.row) == 2
@@ -1531,10 +1549,17 @@ class CorrelationTable:
                         in source_classes_by_value.get(int(value_id), ())
                         if identity in alternatives
                         and (
-                            not (class_bases := _identity_bases_of(
-                                book, source_ref, int(value_id),
-                            ))
-                            or class_bases & abi_bases
+                            (
+                                class_bases := _identity_bases_of(
+                                    book, source_ref, int(value_id),
+                                )
+                            ) & abi_bases
+                            or (
+                                not class_bases
+                                and isinstance(source_ref.row, tuple)
+                                and len(source_ref.row) == 2
+                                and source_ref.row[0] == scope
+                            )
                         )
                     )
                     if ordinary and not any(
@@ -3132,13 +3157,32 @@ class CorrelationTable:
         from .concordance_declarations import RETURN_SITE_SLOT
         from ..common.tensors.topological_reducer import _return_slot_receipt
 
-        book = identity_book(module)
-        page = book.pages.get(RETURN_SITE_SLOT.name)
+        module_book = identity_book(module)
+        function_books = dict(
+            (getattr(module, "metadata", {}) or {}).get(
+                "ssa_composition_function_books", {}
+            )
+            or {}
+        )
         found = []
         for name, function in module.functions.items():
             scope = function.metadata.get("record_return_state_scope")
             if not scope:
                 continue
+            # Imported SSA retains its accepting concordance owner.  The
+            # composing unit's book owns only the functions lowered in that
+            # unit; asking it about an imported return-site cell necessarily
+            # produces a false missing receipt.  Prefer the owner carried by
+            # the function, then the composition table, and use the module
+            # book only for locally lowered functions.
+            book = (
+                dict(function.metadata.get("accepted_ssa_component") or {}).get(
+                    "identity_book"
+                )
+                or function_books.get(str(name))
+                or module_book
+            )
+            page = book.pages.get(RETURN_SITE_SLOT.name)
             by_site: dict = {}
             if page is not None:
                 for row in page.scope_rows(tuple(scope)):
@@ -3491,6 +3535,7 @@ class CorrelationTable:
                 "abi-field", "abi-parameter", "keyed-part", "parameter",
                 "storage-formal", "closure-formal", "member-formal",
                 "frame-storage", "compiler-frame-storage", "projected-row",
+                "source-transform",
             }
         ]
 
@@ -3587,6 +3632,16 @@ class CorrelationTable:
             distinct = {(sequence_id, role.rstrip("0123456789"))
                         for sequence_id, role in roles}
             sequences = {sequence_id for sequence_id, _role in distinct}
+            view_receipts = {
+                int(member): set(map(int, sequence_ids))
+                for member, sequence_ids, _target
+                in metadata.get("concordant_sequence_views", ()) or ()
+            }
+            if (
+                len(sequences) > 1
+                and view_receipts.get(int(value_id)) == sequences
+            ):
+                continue
             if len(sequences) > 1 and not all(role == "heap_owner" for _, role in roles):
                 found.append(Finding(
                     "descriptor-member-shared", name, value_id,
@@ -3877,7 +3932,14 @@ class CorrelationTable:
         ))
         if roles:
             sequence_id, role = roles[0]
-            return f"seq{sequence_id}.{role}"
+            # Sequence ids are compile-time identities local to one lowered
+            # function.  The same integer can name unrelated residents in a
+            # caller and callee (for example ``stamps`` and ``forks``).  A
+            # record-backed sequence was already identified above by its
+            # stable ProgramABI field; every other sequence member must keep
+            # its compiler-frame owner in the comparison key.
+            owner = accounting.get("compiler_frame_storage") or function
+            return f"{owner}.seq{sequence_id}.{role}"
         return None
 
     @staticmethod
@@ -4262,7 +4324,11 @@ class Page:
 
     name: str
     row_fields: tuple[RowField, ...]
-    fact_type: Any = object
+    # The eager implementation accepts either one class or the tuple-of-
+    # classes form supported by ``isinstance``.  Native compilation lowers
+    # this API-declared expectation to concorded class identities and integer
+    # tags; no class object crosses a sectional ABI.
+    fact_type: type | tuple[type, ...] = object
     rows_level: IdentityLogLevel = field(
         default=IdentityLogLevel.FACTS, compare=False,
     )
@@ -4389,7 +4455,7 @@ class Registry:
         self,
         name: str,
         row_fields: Iterable[RowField],
-        fact_type: Any = object,
+        fact_type: type | tuple[type, ...] = object,
         *,
         private: bool = False,
         rows_level: IdentityLogLevel = IdentityLogLevel.FACTS,

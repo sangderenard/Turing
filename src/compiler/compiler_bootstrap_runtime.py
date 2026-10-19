@@ -211,6 +211,12 @@ def _provenance_core_surface_findings(module, source):
 class ProvenanceCoreRestartRequired(RuntimeError):
     """A stage is persisted; restart before the next compile or activation."""
 
+    def __init__(
+        self, message: str, *, requires_process_restart: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.requires_process_restart = bool(requires_process_restart)
+
 
 def ensure_native_provenance_core(
     directory, *, jobs=None, schedule_options=None,
@@ -253,7 +259,15 @@ def ensure_native_provenance_core(
                    cwd=Path(__file__).resolve().parents[2], env=environment, check=True)
     receipt = json.loads((destination / "compartment.json").read_text(encoding="utf-8"))
     if receipt.get("stage") == "native-growth-stage-persisted":
-        raise ProvenanceCoreRestartRequired("provenance interior stage persisted; restart to grow enclosing units")
+        # The compilation stage itself ran in the isolated child above, so
+        # this coordinator has no live IdentityBook or worker state to shed.
+        # Continue from the persisted receipts in this process.  A genuine
+        # process restart remains mandatory only after a native core is
+        # installed or selected.
+        raise ProvenanceCoreRestartRequired(
+            "provenance interior stage persisted; continue with enclosing units",
+            requires_process_restart=False,
+        )
     if receipt.get("stage") != "native-module-verified":
         raise RuntimeError("provenance-first bootstrap blocked: whole native module is not verified; "
                            f"stage={receipt.get('stage')!r}; receipt={destination / 'compartment.json'}")

@@ -1,5 +1,10 @@
 # Compiler convergence program
 
+Latest provenance bootstrap continuation:
+[2026-10-19 checkpoint and unresolved blockers](20_provenance_bootstrap_continuation_2026_10_19.md).
+This records the user's current receipts, independent-review repairs, and
+pre-commit test failures; it does not claim native verification.
+
 Baseline: `f18680ba9ad2b7d8470518dcde1616eae69f5de4` (2026-08-20).
 
 This directory is the execution plan for converging the compiler performance,

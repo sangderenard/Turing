@@ -211,6 +211,7 @@ class SourceEnumGlyphTable:
     enum_identity: str
     base_identity: str
     members: tuple
+    value_identities: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -280,6 +281,7 @@ class FieldFact:
 class MethodFact:
     graph_identity: Any
     parameters: tuple
+    return_annotation: str = ""
 
 
 @dataclass(frozen=True)
@@ -358,6 +360,10 @@ SCHEMA_NODE = declare_page("schema_node", (
 PARAMETER_ANNOTATION = declare_page("parameter_annotation", (
     RowField("module", K.SCOPE), RowField("function_identity", K.NAME),
     RowField("parameter", K.NAME),
+), str)
+METHOD_RETURN_ANNOTATION = declare_page("method_return_annotation", (
+    RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
+    RowField("method", K.NAME),
 ), str)
 SCALAR_PARAMETER = declare_page("scalar_parameter", (
     RowField("scope", K.SCOPE), RowField("input_id", K.VALUE_ID),
@@ -2217,7 +2223,9 @@ class ControlBlockFact:
     ``call_binding`` cell; ``extra``: the non-identity payload (``expect_true``,
     ``comparison``, ``schedule_preference``, ``dtype``, ``induction``, ...);
     ``cases``: for a ``StateMachineTick``, the case literals' node cells in
-    case order (a literal with no node has no cell here).
+    case order (a literal with no node has no cell here); ``diagnostics``: for
+    validation, source-value cells used only by the authored exception message
+    and not consumed by native control.
     """
 
     kind: ControlBlockKind
@@ -2228,6 +2236,7 @@ class ControlBlockFact:
     callsite: Any
     extra: tuple
     cases: tuple = ()
+    diagnostics: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -3192,6 +3201,12 @@ class ValueTypeABIFact:
 VALUE_TYPE_ABI = declare_page("value_type_abi", (
     RowField("copy_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), ValueTypeABIFact)                   # DERIVED(the value identity / incoming value_type_abi); REVISE
+
+
+SEQUENCE_COLUMN_TYPE_ABI = declare_page("sequence_column_type_abi", (
+    RowField("scope", K.SCOPE), RowField("sequence_id", K.VALUE_ID),
+    RowField("column", K.INDEX),
+), ValueTypeABIFact)                   # DERIVED(the authored row values' value_type_abi cells); CONCORD
 
 
 @dataclass(frozen=True)

@@ -143,31 +143,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     from src.compiler.compiler_bootstrap_runtime import (
         PROVENANCE_SOURCE_ONLY_ENV, ProvenanceCoreRestartRequired,
     )
-    try:
-        # The provenance subprocess inherits this terminal and owns its live
-        # compositor.  Do not open the outer compositor until it has returned.
-        plan, core = bootstrap_provenance_core(
-            arguments.output,
-            expansion_policy=expansion_policy,
-            jobs=arguments.jobs,
-            schedule_options=_provenance_schedule_options(arguments),
-            stop_after_failure=not getattr(
-                arguments, "continue_after_failure", False
-            ),
-            progress=None,
-        )
-    except ProvenanceCoreRestartRequired:
-        # A new interpreter imports the complete native module before any
-        # book or compiler worker exists; never replace a live Python book.
-        environment = os.environ.copy()
-        environment.pop(PROVENANCE_SOURCE_ONLY_ENV, None)
-        os.execve(sys.executable, [sys.executable, "-m",
-                  "tools.bootstrap_compiler_whole_program",
-                  *(argv if argv is not None else sys.argv[1:])], environment)
-    except subprocess.CalledProcessError as error:
-        # The child already closed its display and printed the durable failure
-        # rollup.  Preserve its status without adding a parent traceback.
-        return int(error.returncode or 1)
+    while True:
+        try:
+            # The provenance subprocess inherits this terminal and owns its
+            # live compositor.  Do not open the outer compositor until it has
+            # returned.
+            plan, core = bootstrap_provenance_core(
+                arguments.output,
+                expansion_policy=expansion_policy,
+                jobs=arguments.jobs,
+                schedule_options=_provenance_schedule_options(arguments),
+                stop_after_failure=not getattr(
+                    arguments, "continue_after_failure", False
+                ),
+                progress=None,
+            )
+            break
+        except ProvenanceCoreRestartRequired as restart:
+            if not restart.requires_process_restart:
+                continue
+            # A new interpreter imports the complete native module before any
+            # book or compiler worker exists; never replace a live Python
+            # book.  Windows cannot overlay the current process reliably, so
+            # keep the terminal attached while one fresh interpreter owns the
+            # remainder of the bootstrap.
+            environment = os.environ.copy()
+            environment.pop(PROVENANCE_SOURCE_ONLY_ENV, None)
+            command = [
+                sys.executable, "-m", "tools.bootstrap_compiler_whole_program",
+                *(argv if argv is not None else sys.argv[1:]),
+            ]
+            if os.name == "nt":
+                return int(subprocess.run(command, env=environment).returncode)
+            os.execve(sys.executable, command, environment)
+        except subprocess.CalledProcessError as error:
+            # The child already closed its display and printed the durable
+            # failure rollup. Preserve its status without a parent traceback.
+            return int(error.returncode or 1)
 
     if arguments.provenance_only:
         first = plan["next_partition"]

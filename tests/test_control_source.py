@@ -1,9 +1,11 @@
+import ast
 from types import SimpleNamespace
 
 import networkx as nx
 
 from src.compiler.control_source import (
     ConditionalBlock,
+    ControlExpression,
     ControlProgram,
     ControlTarget,
     LoopBlock,
@@ -13,6 +15,7 @@ from src.compiler.control_source import (
     SequenceBlock,
     StateMachineTick,
     StatementBlock,
+    ValidationBlock,
     WhileBlock,
     render_control_program,
     render_c_shell,
@@ -29,7 +32,11 @@ from src.common.tensors.accelerator_backends.c_primitive_program import (
     CapturedFusedProgram,
 )
 from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
-from src.compiler.glsl_deployment_strategy import _loop_reduction_nesting_hints
+from src.compiler.glsl_deployment_strategy import (
+    _loop_reduction_nesting_hints,
+    _place_validation_blocks,
+    _validation_control_blocks,
+)
 from src.compiler.loop_composer import LoopShaderReduction
 
 
@@ -82,6 +89,131 @@ def test_same_planned_loop_renders_as_python_c_and_glsl():
         "for (int iteration = 0; iteration < count; iteration += 1) {"
     )
     assert glsl == c
+
+
+def test_compound_validation_follows_latest_expression_leaf_producer():
+    """A structured predicate is ready only after every scheduled leaf."""
+
+    subgraphs = []
+    for value_id in (18, 19):
+        graph = nx.DiGraph()
+        graph.add_node(value_id, value_id=value_id)
+        graph.graph["deployment_nodes"] = (value_id,)
+        subgraphs.append(SimpleNamespace(G=graph))
+    expression = ControlExpression(
+        "or",
+        (
+            ControlExpression("value", value_id=18),
+            ControlExpression("value", value_id=19),
+        ),
+        value_id=20,
+    )
+    validation = ValidationBlock(
+        20, 100, predicate_expression=expression,
+    )
+    control = ControlProgram(StatementBlock((
+        "__scheduled_region_0__", "__scheduled_region_1__",
+    )), (0, 1))
+
+    placed = _place_validation_blocks(
+        control, (validation,), (0, 1), tuple(subgraphs),
+    )
+
+    assert isinstance(placed.root, SequenceBlock)
+    assert placed.root.blocks[-1] is validation
+    assert placed.root.blocks[0] == StatementBlock((
+        "__scheduled_region_0__", "__scheduled_region_1__",
+    ))
+
+
+def test_validation_uses_declared_region_output_as_its_producer():
+    """A region's public value can differ from its retained graph node."""
+
+    graph = nx.DiGraph()
+    graph.add_node(901)
+    graph.graph["deployment_nodes"] = (901,)
+    graph.graph["deployment_outputs"] = (18,)
+    validation = ValidationBlock(
+        20,
+        100,
+        predicate_expression=ControlExpression(
+            "or",
+            (
+                ControlExpression("value", value_id=18),
+                ControlExpression("value", value_id=19),
+            ),
+            value_id=20,
+        ),
+    )
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_0__",)), (0,),
+    )
+
+    placed = _place_validation_blocks(
+        control,
+        (validation,),
+        (0,),
+        (SimpleNamespace(G=graph),),
+    )
+
+    assert isinstance(placed.root, SequenceBlock)
+    assert placed.root.blocks == (
+        StatementBlock(("__scheduled_region_0__",)), validation,
+    )
+
+
+def test_validation_recovers_authored_boolop_for_schedule_dependencies():
+    """Authored BoolOp nodes retain every scalar scheduling dependency."""
+
+    statement = ast.parse(
+        "if int(serial) < 0 or int(serial) > limit:\n"
+        "    raise ValueError('outside range')\n"
+    ).body[0]
+    assert isinstance(statement, ast.If)
+    left, right = statement.test.values
+    graph = nx.DiGraph()
+    graph.add_node(1, type="Input", value_id=1, attributes={
+        "value_kind": "scalar",
+    })
+    graph.add_node(2, type="Constant", value_id=2, constant=0)
+    graph.add_node(3, type="Input", value_id=3, attributes={
+        "value_kind": "scalar",
+    })
+    graph.add_node(
+        17, type="int", op="int", value_id=17,
+        expr_obj=left.left, parents=((1, "arg:0"),),
+    )
+    graph.add_node(
+        18, type="less", op="less", value_id=18,
+        expr_obj=left, parents=((17, "lhs"), (2, "rhs")),
+    )
+    graph.add_node(
+        19, type="greater", op="greater", value_id=19,
+        expr_obj=right, parents=((17, "lhs"), (3, "rhs")),
+    )
+    graph.add_node(
+        20, type="BoolOp", value_id=20, expr_obj=statement.test,
+        parents=((18, "value:0"), (19, "value:1")),
+    )
+    graph.add_node(24, type="Raise", value_id=24, expr_obj=statement.body[0])
+    graph.add_node(
+        25, type="If", value_id=25, expr_obj=statement,
+        parents=((20, "test"), (24, "body")),
+    )
+    graph.graph["source_control_records"] = {
+        25: {"expression": statement, "predicate_id": 20},
+    }
+
+    block, = _validation_control_blocks(SimpleNamespace(
+        process_graph=SimpleNamespace(G=graph),
+        callsite_function_shells={},
+    ))
+
+    assert block.predicate_expression.op == "or"
+    assert tuple(
+        operand.value_id for operand in block.predicate_expression.operands
+    ) == (18, 19)
+    assert block.predicate_expression.operands[0].operands[0].op == "int"
 
 
 def test_state_machine_tick_is_one_transition_without_polling():
@@ -255,6 +387,32 @@ def test_project_control_regions_keeps_structural_binding_for_live_loop():
     )
 
     assert projected.iterable_bindings == ((40, 41, "iteration_9"),)
+
+
+def test_projection_keeps_projected_binding_for_loop_nested_in_conditional():
+    nested = LoopBlock(
+        "iteration_9",
+        "(__iterable_extent_40__ - 1)",
+        "-1",
+        "-1",
+        StatementBlock(("__scheduled_region_3__",)),
+        source_loop_node_id=90,
+    )
+    logical = ControlProgram(
+        ConditionalBlock(
+            predicate_value_id=10,
+            body=nested,
+            source_node_id=11,
+        ),
+        region_indices=(3,),
+        projected_iterable_bindings=((40, 41, "iteration_9", None),),
+    )
+
+    projected = project_control_regions(logical, (3,))
+
+    assert projected.projected_iterable_bindings == (
+        (40, 41, "iteration_9", None),
+    )
 
 
 def test_projection_keeps_control_defined_loop_update_without_numeric_region():

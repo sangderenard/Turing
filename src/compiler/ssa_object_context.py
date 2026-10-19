@@ -262,6 +262,7 @@ def source_native_type_tests(graph):
     """
 
     from .concordance_declarations import (
+        CLASS_DECLARATION,
         SOURCE_PYTHON_IDENTITY,
         STATIC_REFERENCE_USE,
         canonical_python_subtype_identities,
@@ -272,6 +273,80 @@ def source_native_type_tests(graph):
     book = current_identity_book()
     identity_page = book.page("source_python_identity_concordance")
     tests = {}
+
+    def authored_class_target(target_node_id):
+        """Resolve a same-source class input through its declaration cell."""
+
+        target = graph.nodes.get(int(target_node_id), {})
+        attributes = target.get("attributes") or {}
+        if not (
+            str(target.get("op") or target.get("type") or "").casefold()
+            == "input"
+            and str(attributes.get("binding_kind") or "") == "external"
+        ):
+            return None
+        authored = tuple(graph.graph.get("authored_function_identity") or ())
+        binding = str(attributes.get("binding_name") or "")
+        if len(authored) != 2 or not binding:
+            return None
+        declaration_cell = book.latest_ref(
+            CLASS_DECLARATION, (str(authored[0]), binding),
+        )
+        if declaration_cell is None:
+            return None
+        declaration = book.page(CLASS_DECLARATION).cell(
+            declaration_cell.row, declaration_cell.column,
+        )
+        identity = str(getattr(declaration, "class_name", ""))
+        if not identity:
+            return None
+        return canonical_python_type_identity(identity), declaration_cell
+
+    def dynamic_type_expectation(target_node_id):
+        """Read one API-declared runtime type target from its record edge."""
+
+        target = graph.nodes.get(int(target_node_id), {})
+        if str(target.get("op") or target.get("type") or "").casefold() != "getattr":
+            return None
+        field_name = str(
+            (target.get("attributes") or {}).get("attribute") or ""
+        )
+        owners = [
+            int(parent)
+            for parent, role in target.get("parents") or ()
+            if str(role) in {"value", "object", "base", "receiver"}
+            and parent in graph
+        ]
+        if len(owners) != 1:
+            return None
+        owner = graph.nodes[owners[0]]
+        binding_name = str(
+            (owner.get("attributes") or {}).get("binding_name") or ""
+        )
+        record = dict(
+            (graph.graph.get("parameter_record_abi") or {}).get(
+                binding_name
+            ) or {}
+        )
+        field = dict(
+            dict(record.get("fields") or {}).get(field_name) or {}
+        )
+        vocabulary = tuple(map(
+            str, field.get("token_vocabulary") or (),
+        ))
+        source_cells = tuple(
+            field.get("type_expectation_source_cells") or ()
+        )
+        if not field.get("type_expectation") or not vocabulary or not source_cells:
+            return None
+        return {
+            "target_value_id": int(target.get("value_id", target_node_id)),
+            "target_types": vocabulary,
+            "target_expectation_cells": source_cells,
+            "target_record": str(record.get("identity") or ""),
+            "target_field": field_name,
+        }
+
     for node_id, data in graph.nodes(data=True):
         attributes = data.get("attributes") or {}
         identity_row = attributes.get("source_python_identity_row")
@@ -285,6 +360,53 @@ def source_native_type_tests(graph):
         )
         target_cell = definition_cells.get("arg:1")
         if target_cell is None:
+            target_nodes = [
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) == "arg:1" and parent in graph
+            ]
+            dynamic_target = (
+                dynamic_type_expectation(target_nodes[0])
+                if len(target_nodes) == 1 else None
+            )
+            operands = [
+                int(graph.nodes[parent].get("value_id", parent))
+                for parent, role in data.get("parents") or ()
+                if str(role) == "arg:0" and parent in graph
+            ]
+            if dynamic_target is not None and len(operands) == 1:
+                value_id = int(data.get("value_id", node_id))
+                tests[value_id] = {
+                    "source_value_id": value_id,
+                    "subject_value_id": operands[0],
+                    **dynamic_target,
+                    "intrinsic": "builtins.isinstance",
+                    "intrinsic_cell": book.latest_ref(
+                        SOURCE_PYTHON_IDENTITY, tuple(identity_row),
+                    ),
+                    "predicate_kind": "dynamic_subtype",
+                }
+                continue
+            authored_target = (
+                authored_class_target(target_nodes[0])
+                if len(target_nodes) == 1 else None
+            )
+            if authored_target is not None and len(operands) == 1:
+                accepted, declaration_cell = authored_target
+                value_id = int(data.get("value_id", node_id))
+                tests[value_id] = {
+                    "source_value_id": value_id,
+                    "subject_value_id": operands[0],
+                    "accepted_types": canonical_python_subtype_identities(
+                        accepted, book=book,
+                    ),
+                    "intrinsic": "builtins.isinstance",
+                    "intrinsic_cell": book.latest_ref(
+                        SOURCE_PYTHON_IDENTITY, tuple(identity_row),
+                    ),
+                    "target_definition_cell": declaration_cell,
+                    "predicate_kind": "subtype",
+                }
             continue
         definition_page = book.pages.get(target_cell.page.name)
         if definition_page is None:

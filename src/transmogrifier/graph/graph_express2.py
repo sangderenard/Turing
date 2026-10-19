@@ -999,6 +999,190 @@ def _filter_discovered_definition(definition, module):
     return ast.copy_location(filtered, definition)
 
 
+def _source_owner_declaration_shell(value):
+    """Return only the source-declared fields of ``value``'s owner class.
+
+    Source pursuit intentionally admits one selected method rather than every
+    method on its class.  The class's annotated fields are nevertheless the
+    selected method's API: dropping them leaves ``self.field`` with a physical
+    carrier but no declared semantic union.  Retain a declaration-only AST
+    shell so ordinary class-field concordance sees those annotations without
+    executing or retaining a live class object in the compiled program.
+    """
+
+    if inspect.ismethod(value):
+        value = value.__func__
+    if not inspect.isfunction(value):
+        return None
+    module = inspect.getmodule(value)
+    owner = module
+    owner_parts = str(getattr(value, "__qualname__", "")).split(".")[:-1]
+    if not owner_parts or "<locals>" in owner_parts:
+        return None
+    for component in owner_parts:
+        owner = getattr(owner, component, None)
+        if owner is None:
+            return None
+    if not inspect.isclass(owner):
+        return None
+    definition = _source_ast_definition(owner)
+    if not isinstance(definition, ast.ClassDef):
+        return None
+    declarations = [
+        copy.deepcopy(member)
+        for member in definition.body
+        if isinstance(member, (ast.Assign, ast.AnnAssign))
+    ]
+    if not declarations:
+        return None
+    shell = ast.ClassDef(
+        name=definition.name,
+        bases=[], keywords=[], body=declarations,
+        decorator_list=[],
+        type_params=list(getattr(definition, "type_params", ())),
+    )
+    shell = ast.copy_location(shell, definition)
+    shell._python_source_identity = (
+        str(getattr(owner, "__module__", "")),
+        str(getattr(owner, "__qualname__", owner.__name__)),
+    )
+    return shell
+
+
+def _source_owner_annotation_declaration_shells(value):
+    """Declaration-only source classes named by an owner's field API."""
+
+    if inspect.ismethod(value):
+        value = value.__func__
+    if not inspect.isfunction(value):
+        return ()
+    module = inspect.getmodule(value)
+    owner = module
+    owner_parts = str(getattr(value, "__qualname__", "")).split(".")[:-1]
+    if module is None or not owner_parts or "<locals>" in owner_parts:
+        return ()
+    for component in owner_parts:
+        owner = getattr(owner, component, None)
+        if owner is None:
+            return ()
+    owner_definition = _source_ast_definition(owner)
+    if not isinstance(owner_definition, ast.ClassDef):
+        return ()
+
+    referenced_names = set()
+    for member in owner_definition.body:
+        if not isinstance(member, ast.AnnAssign):
+            continue
+        annotation = member.annotation
+        if isinstance(annotation, ast.Constant) and isinstance(
+            annotation.value, str
+        ):
+            try:
+                annotation = ast.parse(annotation.value, mode="eval").body
+            except SyntaxError:
+                continue
+        referenced_names.update(
+            node.id for node in ast.walk(annotation)
+            if isinstance(node, ast.Name)
+        )
+
+    shells = []
+    for name in sorted(referenced_names):
+        referenced = getattr(module, name, None)
+        if not inspect.isclass(referenced) or referenced is owner:
+            continue
+        definition = _source_ast_definition(referenced)
+        if not isinstance(definition, ast.ClassDef):
+            continue
+        _stamp_reference_class_identity(referenced, definition)
+        # Publish the class surface through the ordinary declaration path.
+        # This records method signatures (including their return annotations)
+        # without adding any method body to the executable source closure.
+        ingest_class_declaration_by_reference(referenced)
+        # A referenced field class contributes an API declaration even when
+        # none of its method bodies is admitted for compilation.  Preserve
+        # each authored return annotation in the concordance before reducing
+        # the class to its field-only shell.  Calls through the annotated
+        # receiver can then obtain a native result contract without retaining
+        # the method implementation or consulting a live Python object.
+        from ...compiler.concordance_declarations import (
+            CLASS_DECLARATION, ClassFact, INGESTION,
+            METHOD_RETURN_ANNOTATION,
+        )
+        from ...compiler.identity_concordance import (
+            Derived, Mode, current_identity_book,
+        )
+
+        book = current_identity_book()
+        class_identity = (
+            f"{getattr(referenced, '__module__', '')}."
+            f"{getattr(referenced, '__qualname__', referenced.__name__)}"
+        ).strip(".")
+        class_row = (
+            str(getattr(referenced, "__module__", "")),
+            str(class_identity),
+        )
+        class_cell = book.latest_ref(CLASS_DECLARATION, class_row)
+        if class_cell is None:
+            class_span = post_source_span(definition, definition)
+            if class_span is not None:
+                class_cell = book.post(
+                    CLASS_DECLARATION, class_row,
+                    ClassFact(str(definition.name), ()),
+                    stage=INGESTION,
+                    provenance=Derived((class_span,)),
+                    mode=Mode.CONCORD,
+                )
+        for method in definition.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if method.returns is None:
+                continue
+            method_span = post_source_span(definition, method)
+            if method_span is None:
+                continue
+            book.post(
+                METHOD_RETURN_ANNOTATION,
+                (
+                    str(getattr(referenced, "__module__", "")),
+                    str(class_identity), str(method.name),
+                ),
+                ast.unparse(method.returns),
+                stage=INGESTION,
+                provenance=Derived(tuple(
+                    cell for cell in (class_cell, method_span)
+                    if cell is not None
+                )),
+                mode=Mode.CONCORD,
+            )
+        declarations = [
+            copy.deepcopy(member)
+            for member in definition.body
+            if isinstance(member, (ast.Assign, ast.AnnAssign))
+        ]
+        if not declarations:
+            continue
+        shell = ast.ClassDef(
+            name=definition.name,
+            # Bases are declaration data for Enum classes: they distinguish
+            # an authored finite scalar domain from an ordinary record.
+            bases=copy.deepcopy(definition.bases),
+            keywords=copy.deepcopy(definition.keywords),
+            body=declarations,
+            decorator_list=[],
+            type_params=list(getattr(definition, "type_params", ())),
+        )
+        shell = ast.copy_location(shell, definition)
+        shell._python_source_identity = (
+            str(getattr(referenced, "__module__", "")),
+            str(getattr(
+                referenced, "__qualname__", referenced.__name__,
+            )),
+        )
+        shells.append(shell)
+    return tuple(shells)
+
+
 def instance_attribute_slot(attributes, attribute_name):
     """The deterministic instance-storage slot for one class field, or ``None``.
 
@@ -1420,11 +1604,35 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         method_span = post_source_span(definition, method)
         if method_span is None:
             continue
+        method_row = (
+            module_name, str(class_identity), str(method.name),
+        )
+        method_fact = MethodFact(
+            entry["graph_identity"], tuple(entry["parameters"]),
+            (
+                ast.unparse(method.returns)
+                if method.returns is not None else ""
+            ),
+        )
+        method_cells = (method_span,)
+        incumbent_cell = book.latest_ref(
+            CLASS_METHOD_DECLARATION, method_row,
+        )
+        incumbent_fact = (
+            None if incumbent_cell is None else
+            book.page(CLASS_METHOD_DECLARATION).cell(
+                incumbent_cell.row, incumbent_cell.column,
+            )
+        )
+        if carried_declarations and isinstance(incumbent_fact, MethodFact):
+            method_fact = incumbent_fact
+            method_cells = tuple(dict.fromkeys((
+                *method_cells, incumbent_cell,
+            )))
         declaration_cells.append(book.post(
             CLASS_METHOD_DECLARATION,
-            (module_name, str(class_identity), str(method.name)),
-            MethodFact(entry["graph_identity"], tuple(entry["parameters"])),
-            stage=INGESTION, provenance=Derived((method_span,)),
+            method_row, method_fact,
+            stage=INGESTION, provenance=Derived(method_cells),
             mode=Mode.CONCORD,
         ))
     enum_declaration = _source_enum_declaration(definition)
@@ -1458,6 +1666,13 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
                     enum_identity=str(class_identity),
                     base_identity=str(enum_base),
                     members=tuple(enum_members),
+                    value_identities=tuple(sorted({
+                        "builtins.str"
+                        if isinstance(authored_value, str)
+                        else "builtins.int"
+                        for _member_identity, authored_value, _member
+                        in authored_members
+                    })),
                 ),
                 stage=INGESTION,
                 provenance=Derived(tuple(dict.fromkeys(enum_sources))),
@@ -3168,6 +3383,12 @@ def _expand_unresolved_ast_parents(
     }
     definitions_by_name = {}
     unavailable_identities = set()
+    retained_owner_declarations = {
+        tuple(map(str, identity))
+        for definition in definitions
+        for identity in (_source_definition_identity(definition),)
+        if isinstance(definition, ast.ClassDef) and identity is not None
+    }
     target_definitions = _HeldDefinitions()
     target_bindings = {}
     for definition in definitions:
@@ -4175,6 +4396,35 @@ def _expand_unresolved_ast_parents(
             )
         target_bindings[identity] = definition_bindings
         install_definition_bindings(source_definition, definition_bindings)
+        owner_declaration = _source_owner_declaration_shell(source_target)
+        owner_declarations = tuple(filter(None, (
+            owner_declaration,
+            *_source_owner_annotation_declaration_shells(source_target),
+        )))
+        for owner_declaration in owner_declarations:
+            owner_identity = _source_definition_identity(owner_declaration)
+            if (
+                owner_identity is None
+                or tuple(map(str, owner_identity))
+                in retained_owner_declarations
+            ):
+                continue
+            # This shell is declaration evidence only.  It deliberately has
+            # no methods, so retaining a selected dependency method does not
+            # activate the rest of its owner's executable surface.
+            retained_owner_declarations.add(tuple(map(str, owner_identity)))
+            module.body.append(owner_declaration)
+            index_lexical_scopes(owner_declaration, module)
+            _annotate_visual_source_owners(owner_declaration)
+            definitions.append(owner_declaration)
+            definitions_by_name.setdefault(
+                owner_declaration.name, []
+            ).append(owner_declaration)
+            definition_depths[id(owner_declaration)] = source_depth
+            owner_bindings = dict(definition_bindings)
+            owner_bindings["self"] = definition_bindings.get("self")
+            owner_bindings["cls"] = definition_bindings.get("self")
+            install_definition_bindings(owner_declaration, owner_bindings)
         for new_definition in new_definitions:
             new_definition._python_bindings = definition_bindings
             new_definition._python_aggregate_binding_kinds = dict(

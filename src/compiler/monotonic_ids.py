@@ -33,6 +33,8 @@ class MonotonicIdSource:
     the raw id; the flag is applied on the way out.
     """
 
+    _next: int
+
     def __init__(self, first_id: int = 1_000_000_000) -> None:
         self._lock = Lock()
         self._next = int(first_id)

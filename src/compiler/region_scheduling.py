@@ -11,8 +11,8 @@ from .hierarchical_plan import PlanClosure, PlanLine
 def _dependency_order(graph: Any) -> tuple[int, ...]:
     """Return DAG order, or stable condensation order for retained loops.
 
-    The result is cached on the graph, keyed by a cheap (node count, edge
-    count) fingerprint. During deployment planning the same shell graph is
+    The result is cached on the graph, keyed by its exact node and dependency
+    edge identities. During deployment planning the same shell graph is
     dependency-ordered repeatedly (once per ``_build_shell_hierarchy_plan``,
     which runs on shell construction and on every ``refresh_hierarchy_plan``),
     yet it is only read there -- so re-running the topological sort each time
@@ -28,20 +28,10 @@ def _dependency_order(graph: Any) -> tuple[int, ...]:
         for parent, _role in (data.get("parents") or ())
         if int(parent) in G and int(parent) != int(node_id)
     )
-    semantic_fingerprint = sum(
-        ((left * 1_000_003) ^ right)
-        for left, right in semantic_parent_edges
-    )
-    # Counts alone collide: removing two dead constants and adding two
-    # edge-less member inputs leaves every count and the edge hash unchanged
-    # while the node identity set differs, so a stale order would name nodes
-    # that no longer exist.  The identity set is part of the fingerprint.
-    node_fingerprint = sum(
-        (int(node_id) * 1_000_003) ^ (int(node_id) >> 3) for node_id in G
-    )
     fingerprint = (
-        G.number_of_nodes(), G.number_of_edges(),
-        len(semantic_parent_edges), semantic_fingerprint, node_fingerprint,
+        tuple(sorted(map(int, G.nodes))),
+        tuple(sorted((int(left), int(right)) for left, right in G.edges)),
+        tuple(sorted(set(semantic_parent_edges))),
     )
     cached = G.graph.get("_dependency_order_cache")
     if cached is not None and cached[0] == fingerprint:
@@ -265,7 +255,9 @@ def _control_dependency_value_ids(control: Any) -> frozenset[int]:
 #: The entry is dropped when that graph dies (the weak reference's callback),
 #: so the cache holds levels for LIVE graphs only: it used to keep one dict
 #: per callsite copy ever made, for the life of the process.
-_DEPENDENCY_LEVEL_CACHE: dict[int, tuple[int, dict[int, int], Any]] = {}
+_DEPENDENCY_LEVEL_CACHE: dict[
+    int, tuple[tuple[tuple[int, ...], tuple[tuple[int, int], ...]], dict[int, int], Any]
+] = {}
 
 
 def release_dependency_levels() -> int:
@@ -291,11 +283,17 @@ def _dependency_levels(graph: Any) -> dict[int, int]:
     import weakref
 
     key = id(graph.G)
+    fingerprint = (
+        tuple(sorted(map(int, graph.G.nodes))),
+        tuple(sorted(
+            (int(left), int(right)) for left, right in graph.G.edges
+        )),
+    )
     cached = _DEPENDENCY_LEVEL_CACHE.get(key)
     if (
         cached is not None
         and cached[2]() is graph.G
-        and cached[0] == graph.G.number_of_nodes()
+        and cached[0] == fingerprint
     ):
         return cached[1]
     levels: dict[int, int] = {}
@@ -322,6 +320,6 @@ def _dependency_levels(graph: Any) -> dict[int, int]:
             del _DEPENDENCY_LEVEL_CACHE[key]
 
     _DEPENDENCY_LEVEL_CACHE[key] = (
-        graph.G.number_of_nodes(), levels, weakref.ref(graph.G, forget),
+        fingerprint, levels, weakref.ref(graph.G, forget),
     )
     return levels

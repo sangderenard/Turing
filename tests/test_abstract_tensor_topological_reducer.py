@@ -48,6 +48,34 @@ class _StaticClassMethodFactory:
     def __init__(self, value):
         self.value = value
 
+
+class _RetainedScalarFieldOwner:
+    def advance(self):
+        current = self.counter
+        self.counter += 1
+        return current
+
+
+def test_retained_method_scalar_store_declares_receiver_field():
+    """A pursued method has the same field catalogue as a retained ClassDef."""
+
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(""),
+            pursuit_roots=("_RetainedScalarFieldOwner.advance",),
+            retain=(_RetainedScalarFieldOwner,),
+        )
+    reduce_abstract_tensor_topology(graph)
+
+    entry = graph.function_table.entry("advance")
+    assert entry.graph.G.graph["method_owner"] == (
+        "_RetainedScalarFieldOwner"
+    )
+    assert graph.G.graph["class_table"][
+        "_RetainedScalarFieldOwner"
+    ]["fields"] == ("counter",)
+
     @classmethod
     def make(cls, value):
         return cls(value)

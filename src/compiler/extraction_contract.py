@@ -719,14 +719,25 @@ class ProgramABIValueBinding:
     parameter: str
     field: ProgramABIField
     python_type: str
+    type_expectations: tuple[str, ...] = ()
+
+    @property
+    def admitted_types(self) -> tuple[str, ...]:
+        """Canonical semantic alternatives admitted at this API input."""
+
+        return self.type_expectations or (self.python_type,)
 
     def receipt(self) -> dict[str, Any]:
-        return {
+        receipt = {
             "function": self.function,
             "parameter": self.parameter,
             **self.field.receipt(),
-            "python_type": self.python_type,
         }
+        if len(self.admitted_types) == 1:
+            receipt["python_type"] = self.admitted_types[0]
+        else:
+            receipt["type_expectations"] = list(self.admitted_types)
+        return receipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -924,28 +935,51 @@ class ProgramABIContract:
             location = f"program_abi.values[{index}]"
             if not isinstance(value_raw, Mapping):
                 raise ExtractionContractError(f"{location} must be a mapping")
-            required = {"function", "parameter", "storage", "python_type"}
-            if not required.issubset(value_raw):
+            required = {"function", "parameter", "storage"}
+            if not required.issubset(value_raw) or not any(
+                key in value_raw
+                for key in ("python_type", "type_expectations")
+            ):
                 raise ExtractionContractError(
                     f"{location} must define function, parameter, storage, "
-                    "and python_type"
+                    "and python_type or type_expectations"
+                )
+            if (
+                "python_type" in value_raw
+                and "type_expectations" in value_raw
+            ):
+                raise ExtractionContractError(
+                    f"{location} cannot define both python_type and "
+                    "type_expectations"
                 )
             field_raw = {
                 key: value
                 for key, value in value_raw.items()
-                if key not in {"function", "parameter", "python_type"}
+                if key not in {
+                    "function", "parameter", "python_type",
+                    "type_expectations",
+                }
             }
             field = ProgramABIField.from_mapping(location, field_raw)
-            python_type = str(value_raw.get("python_type") or "")
-            if not python_type:
+            raw_expectations = value_raw.get("type_expectations")
+            if raw_expectations is None:
+                expectations = (str(value_raw.get("python_type") or ""),)
+            elif not isinstance(raw_expectations, (list, tuple)):
                 raise ExtractionContractError(
-                    f"{location}.python_type must be a qualified identity"
+                    f"{location}.type_expectations must be a non-empty list"
+                )
+            else:
+                expectations = tuple(dict.fromkeys(map(str, raw_expectations)))
+            if not expectations or any(not identity for identity in expectations):
+                raise ExtractionContractError(
+                    f"{location} type expectations must be qualified identities"
                 )
             values.append(ProgramABIValueBinding(
                 str(value_raw["function"]),
                 str(value_raw["parameter"]),
                 field,
-                python_type,
+                expectations[0],
+                expectations,
             ))
         return cls(records, tuple(bindings), tuple(values))
 

@@ -21,6 +21,7 @@ from src.compiler.fortran_c_shell import (
     _concordant_function_resident,
     _field_slot_ops,
     _publish_concordant_function_aliases,
+    _publish_concordant_sequence_views,
     _retire_concordant_sequence_aliases,
     _retire_concorded_record_identity_aliases,
     _retire_dead_planning_aliases,
@@ -520,6 +521,10 @@ def test_imported_record_demand_reads_only_the_accepted_owner_book():
         ], {},
         metadata={"accepted_ssa_component": {"identity_book": owner}},
     )
+    sibling = Function(
+        f"{symbol}__helper", [], {},
+        metadata={"accepted_ssa_component": {"identity_book": owner}},
+    )
 
     ambient, ambient_token = begin_identity_book()
     try:
@@ -551,6 +556,9 @@ def test_imported_record_demand_reads_only_the_accepted_owner_book():
             (("live_flags_value_id",), 13, "bool", (1,)),
             (("status_address_id",), 12, "int", (1,)),
         )
+        assert _accepted_record_sequence_members(
+            sibling, "LiveScopeProjection.excluded",
+        ) == ()
         assert all(
             not ambient.page(page_name).rows()
             for page_name in (
@@ -1232,6 +1240,7 @@ class Page:
 
     root = module.functions[exports[0]]
     assert _unexplained_root_argument_ids(root) == ()
+    assert root.metadata.get("concordant_sequence_views")
     truth_id, source_name, transform = next(
         row for row in root.metadata["scalar_source_transforms"]
         if row[2] == "dict_truth:_compressed_ram"
@@ -1267,6 +1276,18 @@ class Page:
     assert not any(
         str(value.dtype or "unknown") == "unknown"
         for value in root.args
+    )
+    from src.compiler.identity_concordance import CorrelationTable
+
+    assert not tuple(
+        finding
+        for finding in CorrelationTable.build(module).findings(module)
+        if finding.function == root.name
+        and finding.kind in {
+            "unaccounted-formal",
+            "descriptor-member-shared",
+            "use-not-dominated",
+        }
     )
 
 
@@ -1573,3 +1594,72 @@ class ValueRow:
         "aggregate_kind": "list",
         "row_record": "Claim",
     }
+
+
+def test_record_row_table_uses_its_authored_physical_width():
+    source = """
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class RowField:
+    name: str
+    kind: int
+
+@dataclass(frozen=True)
+class Page:
+    row_fields: tuple[RowField, ...]
+
+def validate(page: Page):
+    for declared in page.row_fields:
+        if declared.name == "x":
+            return declared.kind
+    return 0
+"""
+    tree = ast.parse(source)
+    schemas = _authored_complete_record_schemas(tree)
+    _book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(tree)
+        reduce_abstract_tensor_topology(graph)
+        executable = graph.function_table.entry("validate").graph.G
+        executable.graph["program_abi"] = {"records": schemas}
+        executable.graph["parameter_record_abi"] = {
+            "page": schemas["Page"],
+        }
+        row_fields_id = next(
+            int(data.get("value_id", node_id))
+            for node_id, data in executable.nodes(data=True)
+            if str(data.get("op") or data.get("type") or "").casefold()
+            == "getattr"
+            and str((data.get("attributes") or {}).get("attribute"))
+            == "row_fields"
+        )
+
+        declarations = _field_slot_ops(
+            executable, contract_scope="validate-record-row-width"
+        )[8]
+
+        assert (
+            row_fields_id, "duplicates", 2, False
+        ) in declarations
+        assert not any(
+            int(value_id) == row_fields_id and int(column_count) != 2
+            for value_id, _policy, column_count, _writable in declarations
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_concordant_sequence_view_snapshot_clears_a_stale_receipt():
+    function = Function(
+        "solve", [SSAValue(11, "int64")], {},
+        metadata={"concordant_sequence_views": ((11, (10, 20), 30),)},
+    )
+    sequences = SSASequenceTable(owner="solve")
+
+    assert _publish_concordant_sequence_views(
+        {"solve": function}, {"solve": sequences},
+    ) == 0
+    assert function.metadata["concordant_sequence_views"] == ()
