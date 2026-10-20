@@ -41472,6 +41472,47 @@ def _class_surface_ssa_program(
                     () if callee is None
                     else emit_outputs(record.callee_symbol, callee)
                 )
+                if callee is not None and callee_outputs:
+                    # A callee compiled in an earlier unit arrives with its
+                    # optional-aggregate output already interleaved
+                    # ``(p0, q0, p1, q1, ...)``.  The caller binds the PAYLOAD
+                    # positions at link time; ``ssa_optional_values`` owns the
+                    # presence companions (it reads the same
+                    # ``optional_return_contracts`` receipts and rewrites the
+                    # call).  Present the link-time view an in-unit callee has
+                    # before that pass: drop exactly the presence leaves the
+                    # receipts name, and only when the output's layout record
+                    # is exactly that interleaving and every leaf is on the Ret.
+                    from .ssa_optional_values import (
+                        _record_covered_return_receipts,
+                    )
+                    optional_receipts = _record_covered_return_receipts(callee)
+                    if optional_receipts:
+                        optional_layout = tuple(map(int, dict(
+                            callee.metadata.get("aggregate_return_layouts")
+                            or ()
+                        ).get(int(optional_receipts[0]["return_output_id"]), ())))
+                        interleaved_layout = tuple(
+                            int(leaf)
+                            for receipt in optional_receipts
+                            for leaf in (
+                                receipt["payload_value_id"],
+                                receipt["presence_value_id"],
+                            )
+                        )
+                        emitted_ids = {int(output.id) for output in callee_outputs}
+                        if (
+                            optional_layout == interleaved_layout
+                            and set(interleaved_layout) <= emitted_ids
+                        ):
+                            optional_presence_ids = {
+                                int(receipt["presence_value_id"])
+                                for receipt in optional_receipts
+                            }
+                            callee_outputs = tuple(
+                                output for output in callee_outputs
+                                if int(output.id) not in optional_presence_ids
+                            )
                 callee_aggregate_outputs = (
                     tuple((callee_outputs[0].accounting or {}).get(
                         "ssa_aggregate_outputs", ()

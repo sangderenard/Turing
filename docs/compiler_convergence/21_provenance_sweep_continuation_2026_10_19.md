@@ -400,3 +400,37 @@ authored leaves in order, each leaf's physical ABI is its (payload,
 presence) pair at `(*path, component)`. Observed: unit 033 compiled from
 the live growth with no shortfalls, `repository_ssa_complete: True`.
 Gate (ten files): 457 passed / 9 failed, all nine pre-existing.
+
+## Addendum 6: linking a record-covered optional callee (after 0118f18e)
+
+User run on 0118f18e (fingerprint 61aaaf83...): cumulative 31/330, failed=2:
+units 034 `_virtual_edges_into` and 035 `_virtual_fact`, both callers of
+`_resolved`, at the linker: "linked callee lost an authored output from its
+return surface" (3 bindings vs a four-wide Ret; semantic output 55 unmapped).
+
+Cause: a separately compiled callee arrives with presence already
+interleaved into its Ret by `emit_outputs` from `aggregate_return_layouts`;
+the linker's ordered-window match then has no window, while an in-unit
+callee is linked on its payload-only Ret and `ssa_optional_values`
+delivers presence afterwards. Fix (fortran_c_shell ~41473): when the
+callee carries `optional_return_contracts` whose interleaving equals
+`aggregate_return_layouts[return_output_id]` and every leaf is on the Ret,
+the linker links against the payload-only view (drops exactly those
+presence ids from `callee_outputs`); the existing pass then mints the
+caller's presence values as in-unit. Observed on unit 034: call
+`output_ids=(35, q, 37, q)`, `is None` -> `LNot(presence0)`, projections
+35/37 bound. Gate 457 passed / 9 failed, the known ids.
+
+Remaining, by observation:
+- Unit 034 is `partial` on its pre-sweep shortfalls: unresolved source
+  value 43 (`Tuple` of `(origin, *ref.row[1:])`, the starred row) and
+  unexplained public inputs 13 and 19 (`arg:1`, `arg:0` of callsite 21;
+  the preceding `_fork_of_scope` call binds only `output_ids=(11,)`, so its
+  projections 12/13 have no producer). These predate the sweep (report 20).
+- Unit 035 uses the optional result WHOLE: `found is None` then
+  `self.cells[found]` with the tuple as dict key; no leaf projection exists,
+  one binding against two leaves, the refusal is correct. A whole-value
+  consumer of an optional aggregate needs the layout leaves bound to caller
+  values and a tuple-key lookup lowering: a design decision.
+- UNKNOWN: scalar-optional callees (the `contracts[...]` lane) linked from
+  another unit may need the same payload-only view.
