@@ -75,15 +75,43 @@ def _lower_record_covered_call(
     from .ssa_record_return_state import mint_ssa_value
 
     payload_ids = tuple(map(int, call.attributes.get("output_ids", ())))
+    # A record-covered call IS lowered completely or not at all.  For the
+    # program ``r = f(...); r[0]; cells[r]`` a skipped lowering leaves the
+    # raw call aggregate as ONE lookup query (a silent miscompile); the
+    # receipts say the call is record-covered, so a shortfall is refused here.
+    callee = str(call.attributes.get("callee") or "")
+    positions = tuple(int(r["return_position"]) for r in position_receipts)
+
+    def refuse(missing: str) -> ValueError:
+        return ValueError(
+            f"record-covered optional call %{int(call.res.id)} of "
+            f"{callee!r} in {caller_name!r} cannot be lowered: {missing}; "
+            f"the callee's optional_return_contracts receipts cover "
+            f"positions {positions} of return output "
+            f"%{position_receipts[0]['return_output_id']}, the call binds "
+            f"output_ids {payload_ids}"
+        )
+
     if len(payload_ids) != len(position_receipts):
-        return index + 1
+        raise refuse(
+            f"the call binds {len(payload_ids)} payload projections for "
+            f"{len(position_receipts)} receipts"
+        )
     payloads = []
     for payload_id in payload_ids:
         load = producers.get(payload_id)
         gep = None if load is None else producers.get(int(load.args[0].id))
         const = None if gep is None else producers.get(int(gep.args[1].id))
         if load is None or gep is None or const is None:
-            return index + 1
+            raise refuse(
+                f"projection of payload %{payload_id} lacks its "
+                + ", ".join(
+                    name for name, part in (
+                        ("Load", load), ("GetElementPtr", gep),
+                        ("Const", const),
+                    ) if part is None
+                )
+            )
         payloads.append((load, gep, const))
     aggregate = call.res
     presences = []

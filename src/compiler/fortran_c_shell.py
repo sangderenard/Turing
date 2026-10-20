@@ -9728,11 +9728,32 @@ def _field_slot_ops(
             f"{binding_kind}.{binding_name}",
         )
 
+    def tuple_value_leaves(node_id: Any) -> tuple[int, ...]:
+        # IdentityPage.cell: ``key = (row, column); self.cells[key]``.  The
+        # subscript has ONE index parent -- the tuple VALUE -- while
+        # ``cells[(row, column)]`` has two.  The tuple display already records
+        # its leaves (``aggregate_leaf_value_ids``); the membership lane above
+        # reads the same record.  Reading it here makes both spellings of one
+        # key the same query tuple (key_columns (0, 1)), not one-column and
+        # two-column descriptors of one table.
+        attributes = graph_obj.nodes[node_id].get("attributes") or {}
+        if str(attributes.get("aggregate_kind") or "") != "tuple":
+            return ()
+        return tuple(map(int, attributes.get("aggregate_leaf_value_ids", ())))
+
     def authored_index_values(data: Any) -> int | tuple[int, ...] | None:
-        values = tuple(
-            int(graph_obj.nodes[parent].get("value_id", parent))
+        parents = tuple(
+            parent
             for parent, role in (data.get("parents") or ())
             if str(role) == "index" and parent in graph_obj
+        )
+        if len(parents) == 1:
+            leaves = tuple_value_leaves(parents[0])
+            if len(leaves) > 1:
+                return leaves
+        values = tuple(
+            int(graph_obj.nodes[parent].get("value_id", parent))
+            for parent in parents
         )
         if not values:
             return None
@@ -10126,7 +10147,11 @@ def _field_slot_ops(
         if sequence_id is None:
             continue
         result_id = int(data.get("value_id", node_id))
-        key_id = int(graph_obj.nodes[key_id].get("value_id", key_id))
+        # ``d.get(key)`` with a tuple VALUE key: same leaves as ``d[key]``.
+        key_leaves = (tuple_value_leaves(key_id) if key_id in graph_obj
+                      else ())
+        key_id = (key_leaves if len(key_leaves) > 1 else
+                  int(graph_obj.nodes[key_id].get("value_id", key_id)))
         table_lookups.append((result_id, key_id, int(sequence_id)))
         default_node = by_role.get("arg:1")
         if default_node is not None and default_node in graph_obj:

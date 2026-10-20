@@ -434,3 +434,46 @@ Remaining, by observation:
   values and a tuple-key lookup lowering: a design decision.
 - UNKNOWN: scalar-optional callees (the `contracts[...]` lane) linked from
   another unit may need the same payload-only view.
+
+## Addendum 7: whole-value optional aggregate, stages 1 and 3 (after da4187de)
+
+Design (read-only, records only): a caller that consumes an optional
+tuple result whole (unit 035 `_virtual_fact`: `found is None`, then
+`self.cells[found]`) has no `Indexed` projections, so no
+CALL_RESULT_PROJECTION rows and one binding against two leaves; the
+linker's refusal is correct. The precedent for caller-side leaf values is
+`_publish_callsite_return_members` (CALLSITE_RETURN_MEMBER ledger,
+`aggregate_leaf_value_ids`), not the record lane.
+
+Found on the way, both silent and independent of optionals:
+- a tuple VALUE as a dict key (`key = (row, column); cells[key]`, the
+  shape of `IdentityPage.cell`) lowered as a one-column lookup while the
+  display form lowers two columns; units then disagree on `key_columns`.
+  FIXED (stage 1, fortran_c_shell ~9731 `tuple_value_leaves`,
+  `authored_index_values`, the `.get` collector): the index parent's
+  `aggregate_leaf_value_ids` are the queries, as the membership lane
+  already reads them. Observed: `keyc.py value` == `display`.
+- a mixed consumer (`r[0]` projected, `cells[r]` whole) compiled with the
+  raw call aggregate as a single query. FIXED (stage 3,
+  ssa_optional_values ~78-114): the two silent early returns of
+  `_lower_record_covered_call` are loud refusals naming the call, callee,
+  receipt positions and the missing projection.
+Gate 457 passed / 9 failed (known ids). Four keyed-lookup test files
+(`test_sequence_contract_concordance`, `test_source_object_context`,
+`test_ssa_object_context`, `test_ssa_owned_heap`) carry 10 failures that
+are identical with stage 1 reverted: pre-existing, unclassified against
+an older baseline.
+
+Stage 2 (mint members for an optional-aggregate accepted header) is
+BLOCKED on a cross-unit cell: the member rows must derive from the
+callee's `source_aggregate_layout` cell `((lexical_reads:(...,
+'IdentityPage._resolved'), 0), 55)`, posted in unit 033's book; the
+linked header carries only its Ref (`aggregate_return_layout_sources`),
+and the consuming book refuses a Ref whose cell it does not hold. Also:
+the member-publication loop (glsl ~17422) skips callees without a source
+graph, so a linked accepted header never reaches the gate; and for an
+in-unit callee the gate's `call_result_descriptor` is empty, so the
+member descriptors must come from the arms record's layout leaves. Open
+decision: how a callee's layout/arms facts cross the unit boundary (the
+plan carries a `source_concordance` archive; whether it should carry
+these rows, and who imports them, was not traced).
