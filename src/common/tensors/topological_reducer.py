@@ -16164,7 +16164,42 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "mapping": "dict",
                     "mutablemapping": "dict",
                 }.get(aggregate, aggregate)
-                return {"dtype": "int64", "aggregate_kind": normalized}
+                receipt: dict[str, Any] = {
+                    "dtype": "int64", "aggregate_kind": normalized,
+                }
+                # IdentityBook.read_through: ``dict[Any, tuple[Any, int]]``
+                # gave the mapping VALUE the one handle above, a handle to
+                # nothing (the tuple owns no child pool the table writes).
+                # A tuple annotation with fixed arity (no Ellipsis) states
+                # its element storage exactly; publish those receipts so the
+                # mapping can declare one value column per element (fixed
+                # arity = columns).  ``tuple[T, ...]`` and an element that is
+                # itself an aggregate or tensor keep the child-pool handle.
+                if normalized == "tuple":
+                    elements = (
+                        tuple(annotation.slice.elts)
+                        if isinstance(annotation.slice, ast.Tuple)
+                        else (annotation.slice,)
+                    )
+                    element_receipts = tuple(
+                        _annotation_storage(element) for element in elements
+                    )
+                    if (
+                        elements
+                        and not any(
+                            isinstance(element, ast.Constant)
+                            and element.value is Ellipsis
+                            for element in elements
+                        )
+                        and all(
+                            element_receipt.get("dtype") is not None
+                            and element_receipt.get("aggregate_kind") is None
+                            and not element_receipt.get("tensor")
+                            for element_receipt in element_receipts
+                        )
+                    ):
+                        receipt["columns"] = element_receipts
+                return receipt
         name = (
             annotation.id if isinstance(annotation, ast.Name)
             else annotation.attr if isinstance(annotation, ast.Attribute)
@@ -16259,6 +16294,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             **({
                 "mapping_value_record": str(value["record"]),
             } if value.get("record") is not None else {}),
+            # Fixed-arity tuple value: one receipt per element, the value
+            # counterpart of ``mapping_key_column_count`` (fixed arity =
+            # columns; ``mapping_value_aggregate_kind`` stays 'tuple').
+            **({
+                "mapping_value_column_count": len(value["columns"]),
+                "mapping_value_columns": tuple(value["columns"]),
+            } if value.get("columns") else {}),
             "mapping_value_optional": bool(value.get("optional", False)),
         }
 
