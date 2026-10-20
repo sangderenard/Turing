@@ -8880,49 +8880,6 @@ def compile_native_program_c_shell(
     )
 
 
-def _mapping_value_column_count(attributes: Mapping[str, Any]) -> int:
-    """Value columns of one mapping node: the fixed arity of its tuple value.
-
-    ``IdentityBook.read_through: dict[Any, tuple[Any, int]]`` stores
-    ``(origin, stamp)`` per key.  The reducer publishes the element receipts
-    (``mapping_value_column_count`` / ``mapping_value_columns``); fixed arity
-    is columns, so the table is key + two value columns, not a key and one
-    handle to nothing.  Every other mapping has the one value column.
-    """
-
-    return max(1, int(attributes.get("mapping_value_column_count") or 1))
-
-
-def _sequence_value_column_counts(
-    graph_obj: Any,
-    sequence_declarations: Iterable[tuple[int, str, int, bool]],
-) -> dict[int, int]:
-    """Per declared mapping: its trailing value-column count when above one.
-
-    The declaration tuple is read positionally at ~90 sites, so the key/value
-    split is carried beside it (like ``nested_sequence_ids``), derived from
-    the same mapping-node attribute ``_field_slot_ops`` declared the width
-    from; the resolved schema hands it to ``_sequence_descriptor``.
-    """
-
-    declared = {
-        int(item[0]): int(item[2]) for item in sequence_declarations
-        if str(item[1]) == "unique"
-    }
-    counts: dict[int, int] = {}
-    for node_id, data in graph_obj.nodes(data=True):
-        value_id = int(data.get("value_id", node_id))
-        if value_id not in declared:
-            continue
-        attributes = data.get("attributes") or {}
-        if attributes.get("aggregate_kind") != "dict":
-            continue
-        count = _mapping_value_column_count(attributes)
-        if count > 1 and declared[value_id] > count:
-            counts[value_id] = count
-    return counts
-
-
 def _nested_mapping_value_loop_contracts(
     graph_obj: Any,
 ) -> dict[int, tuple[str, int, bool, tuple[str, ...], int]]:
@@ -9608,10 +9565,7 @@ def _field_slot_ops(
             else "duplicates",
             (
                 (
-                    # key columns + the value columns: a fixed-arity tuple
-                    # value is one column per element, not one handle.
-                    int(attributes.get("mapping_key_column_count", 1))
-                    + _mapping_value_column_count(attributes)
+                    int(attributes.get("mapping_key_column_count", 1)) + 1
                 ) if aggregate_kind == "dict"
                 else max(
                     int(attributes.get("sequence_column_count", 1)),
@@ -9881,11 +9835,7 @@ def _field_slot_ops(
                             "set", "frozenset", "dict",
                         } else "duplicates",
                         (
-                            # key + the value columns (a fixed-arity tuple
-                            # value is one column per element).
-                            1 + _mapping_value_column_count(
-                                data.get("attributes") or {}
-                            ) if aggregate_kind == "dict" else
+                            2 if aggregate_kind == "dict" else
                             max(1, annotated_row_widths.get(
                                 int(sequence_id), 1,
                             ))
@@ -10479,9 +10429,6 @@ def _field_slot_ops(
             key_width_by_sequence.get(int(sequence_id), 1),
             len(key_ids) if isinstance(key_ids, tuple) else 1,
         )
-    value_column_counts = _sequence_value_column_counts(
-        graph_obj, sequence_declarations
-    )
     sequence_declarations = [
         (
             sequence_id,
@@ -10489,8 +10436,7 @@ def _field_slot_ops(
             (
                 max(
                     column_count,
-                    key_width_by_sequence.get(sequence_id, 1)
-                    + value_column_counts.get(sequence_id, 1),
+                    key_width_by_sequence.get(sequence_id, 1) + 1,
                 )
                 if policy == "unique" and column_count > 1
                 else column_count
@@ -16022,24 +15968,7 @@ def _sequence_column_dtype_contracts(
         ):
             contracts[value_id] = explicit_dtypes
         if attrs.get("mapping_key_dtype") and attrs.get("mapping_value_dtype"):
-            value_columns = tuple(attrs.get("mapping_value_columns") or ())
-            if (
-                _mapping_value_column_count(attrs) > 1
-                and len(value_columns) == _mapping_value_column_count(attrs)
-                and declared[value_id] > len(value_columns)
-            ):
-                # Fixed-arity tuple value: key dtype(s), then each element's
-                # declared dtype (``Any`` -> the int64 opaque identity the key
-                # lane uses for ``Any``).
-                key_count = declared[value_id] - len(value_columns)
-                contracts[value_id] = (
-                    *(
-                        (str(attrs["mapping_key_dtype"]),) if key_count == 1
-                        else ("unknown",) * key_count
-                    ),
-                    *(str(column["dtype"]) for column in value_columns),
-                )
-            elif declared[value_id] == 2:
+            if declared[value_id] == 2:
                 contracts[value_id] = (
                     str(attrs["mapping_key_dtype"]),
                     str(attrs["mapping_value_dtype"]),
@@ -21987,9 +21916,6 @@ def _class_surface_ssa_program(
                 for sequence_id, *_rest in sequence_declarations
             },
             "sequence_declarations": sequence_declarations,
-            "sequence_value_column_counts": _sequence_value_column_counts(
-                graph_obj, sequence_declarations
-            ),
             "sequence_initializations": sequence_initializations,
             "table_deletions": table_deletions,
             "deletion_sequence_ids": tombstone_sequence_ids,

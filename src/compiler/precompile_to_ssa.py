@@ -1045,12 +1045,6 @@ class ResolvedSequenceSchema:
     nested_table: bool
     nested_tensor: bool = False
     nested_value_dtype: str | None = None
-    # How many TRAILING columns of a ``unique`` table are values; the rest are
-    # keys.  ``IdentityBook.read_through: dict[Any, tuple[Any, int]]`` is one
-    # key column and two value columns (fixed arity = columns).  Every table
-    # that states no fixed-arity tuple value keeps the single value column
-    # (``range(column_count - 1)`` keys), byte-identical to before.
-    value_column_count: int = 1
 
 
 def resolve_sequence_schemas(
@@ -1069,7 +1063,6 @@ def resolve_sequence_schemas(
     Missing keys default to ``()``, so callers may pass only what they have.
     """
     column_counts: dict[int, int] = {}
-    value_column_counts: dict[int, int] = {}
     policies: dict[int, str] = {}
     origins: dict[int, str] = {}
     writable_union: dict[int, bool] = {}
@@ -1085,13 +1078,10 @@ def resolve_sequence_schemas(
         policy: object,
         writable: object,
         origin: object,
-        value_column_count: int = 1,
     ) -> None:
         sid = int(sequence_id)
         if sid in column_counts and (
-            column_counts[sid] != int(column_count)
-            or policies[sid] != str(policy)
-            or value_column_counts[sid] != int(value_column_count)
+            column_counts[sid] != int(column_count) or policies[sid] != str(policy)
         ):
             if sid not in conflicted:
                 shortfalls.append(SSALoweringShortfall(
@@ -1101,13 +1091,11 @@ def resolve_sequence_schemas(
                     f"in {origins[sid]} and "
                     f"{int(column_count)} column(s)/policy {str(policy)!r} "
                     f"in {str(origin)} -- every function touching a shared "
-                    "sequence must agree on its shape (value columns "
-                    f"{value_column_counts[sid]} vs {int(value_column_count)})",
+                    "sequence must agree on its shape",
                 ))
                 conflicted.add(sid)
             return
         column_counts[sid] = int(column_count)
-        value_column_counts[sid] = int(value_column_count)
         policies[sid] = str(policy)
         origins[sid] = str(origin)
         writable_union[sid] = writable_union.get(sid, False) or bool(writable)
@@ -1132,12 +1120,7 @@ def resolve_sequence_schemas(
         ):
             names = tuple(sequence_names.get(int(sequence_id), ()))
             origin = f"{function_name}{names!r}"
-            _observe(
-                sequence_id, column_count, policy, writable, origin,
-                int(dict(shell.get("sequence_value_column_counts") or {}).get(
-                    int(sequence_id), 1
-                )),
-            )
+            _observe(sequence_id, column_count, policy, writable, origin)
             sid = int(sequence_id)
             retains_union[sid] = retains_union.get(sid, False) or sid in deletion_ids
             nested_union[sid] = nested_union.get(sid, False) or sid in nested_ids
@@ -1178,7 +1161,6 @@ def resolve_sequence_schemas(
             retains_deleted_rows=retains_union.get(sid, False),
             nested_table=nested_union.get(sid, False),
             nested_tensor=nested_tensor_union.get(sid, False),
-            value_column_count=value_column_counts[sid],
         )
         for sid in column_counts
         if sid not in conflicted
@@ -9770,15 +9752,8 @@ class _ControlSSABuilder(TiledObject):
             nested_table = bool(nested_table or resolved.nested_table)
             nested_tensor = bool(nested_tensor or resolved.nested_tensor)
             nested_value_dtype = nested_value_dtype or resolved.nested_value_dtype
-        # Keys are every column before the declared trailing value columns
-        # (``ResolvedSequenceSchema.value_column_count``, 1 unless the table's
-        # value is a fixed-arity tuple): ``read_through`` is (key, origin,
-        # stamp), keys (0,), not the (0, 1) that ``count - 1`` would claim.
-        value_column_count = (
-            int(resolved.value_column_count) if resolved is not None else 1
-        )
         key_columns = (
-            tuple(range(max(1, int(column_count) - value_column_count)))
+            tuple(range(max(1, int(column_count) - 1)))
             if policy == "unique" else ()
         )
         def _canonicalize_column(raw_dtype: str | None, column: int) -> str | None:
