@@ -6736,6 +6736,29 @@ def _normalize_lexical_values(
                 "list", "tuple", "bytes", "bytearray",
             }:
                 source_policy = "duplicates"
+        if is_sorted_call and source_value_id is not None and any(
+            int(output["result_value_id"]) == int(source_value_id)
+            for _node, _data in graph.G.nodes(data=True)
+            for output in (_data.get("attributes") or {}).get(
+                "loop_iteration_outputs", ()
+            )
+        ):
+            # ``sorted(<comprehension>)``: the source of this sort is the
+            # collection the comprehension's loop writes, and that value's
+            # final identity is minted later, by the loop composer, as the
+            # loop's collection port (it supersedes the comprehension).
+            # Posting the contract here would name the superseded id.  The
+            # contract's policy and key are known now; its source identity is
+            # not.  Leave the call carrying them, and the composer posts the
+            # one contract (destination = this call, source = the port).
+            attributes["source_sort_contract_pending"] = {
+                "argument_kind": kind,
+                "argument_value_ids": tuple(int(a) for a in arguments),
+                "key_column": column,
+                "reverse": reverse,
+                "policy": source_policy,
+            }
+            return
         sources = [node_identity_cell(graph, int(call_id))]
         for value_id in (destination_value_id, source_value_id):
             if value_id is not None and int(value_id) in graph.G:
@@ -9057,13 +9080,6 @@ def _normalize_lexical_values(
                                 page_key_field_schemas[(
                                     int(key_receiver_id), str(key_field[1]),
                                 )] = page_declaration_cell
-                if (
-                    isinstance(expression.func, ast.Attribute)
-                    and expression.func.attr == "sort"
-                    or isinstance(expression.func, ast.Name)
-                    and expression.func.id == "sorted"
-                ):
-                    post_source_sort_contract(node_id, expression)
                 result_class = call_attributes.get(
                     "result_class_ref", call_attributes.get("class_ref")
                 )
@@ -11416,12 +11432,22 @@ def _normalize_lexical_values(
             and len(expression.args) == 1
             and node_id in graph.G
         ):
-            # A generator feeding ``sorted`` materializes directly into the
-            # result list before that list is ordered.  ``chain.from_iterable``
-            # is a transparent iterator wrapper for this purpose: its nested
-            # generator still owns the stream and the sorted Call owns the
-            # resident result.  Record that ownership while the exact AST
-            # topology is present, as the ordinary list(generator) path does.
+            # ``sorted(<generator>)`` / ``sorted(chain.from_iterable(<gen>))``:
+            # the generator's loop collects the ARGUMENT of ``sorted`` -- the
+            # generator (or ``from_iterable``) value, ``arg:0`` of the call --
+            # exactly as ``list(<generator>)`` collects into its own value.
+            # The sorted Call is a different value: a copy of that collection
+            # ordered by the source sort contract posted for it
+            # (destination = the call, source = the argument), the same
+            # replace + sort that ``sorted(d)`` on a real sequence makes.
+            # Naming the call as the loop's materializer gave the loop's
+            # arena the call's identity while the contract still named the
+            # argument as source and the call as destination: three ids for
+            # one Python value, and a sort ordered before the loop filled
+            # anything.  ``chain.from_iterable`` is a transparent iterator
+            # wrapper for this purpose: its nested generator still owns the
+            # stream.  Record that ownership while the exact AST topology is
+            # present.
             source_expression = expression.args[0]
             generator_expression = (
                 source_expression
@@ -11436,7 +11462,20 @@ def _normalize_lexical_values(
                 )
                 else None
             )
-            if generator_expression is not None:
+            argument_id = next((
+                int(parent)
+                for parent, role in graph.G.nodes[node_id].get("parents") or ()
+                if str(role) == "arg:0" and int(parent) in graph.G
+            ), None)
+            if generator_expression is not None and argument_id is not None:
+                graph.G.nodes[argument_id].setdefault("attributes", {}).update({
+                    "producer_kind": "loop_materialization",
+                    "aggregate_kind": "list",
+                    "sequence_key_columns": (),
+                    "sequence_column_count": 1,
+                    "sequence_writable": True,
+                    "materialization_axis": 0,
+                })
                 comprehension_target_names = {
                     name
                     for generator in generator_expression.generators
@@ -11466,8 +11505,8 @@ def _normalize_lexical_values(
                     ))
                     outputs.append({
                         "value_id": value_id,
-                        "result_value_id": node_id,
-                        "materializer_node_id": node_id,
+                        "result_value_id": argument_id,
+                        "materializer_node_id": argument_id,
                     })
                     attributes["loop_iteration_outputs"] = tuple(outputs)
                 for name in comprehension_target_names:
@@ -11475,6 +11514,21 @@ def _normalize_lexical_values(
                         environment[name] = shadowed_bindings[name]
                     else:
                         environment.pop(name, None)
+        if (
+            isinstance(expression, ast.Call)
+            and node_id in graph.G
+            and (
+                isinstance(expression.func, ast.Attribute)
+                and expression.func.attr == "sort"
+                or isinstance(expression.func, ast.Name)
+                and expression.func.id == "sorted"
+            )
+        ):
+            # Posted after the loop-materialization records of this
+            # expression are stamped: a sort whose source is materialized by
+            # a loop has its source identity minted by the loop composer,
+            # which posts the contract (see post_source_sort_contract).
+            post_source_sort_contract(node_id, expression)
         return node_id if node_id in graph.G else None
 
     def bind_target(
@@ -15269,6 +15323,16 @@ def _normalize_lexical_values(
                     )
                 )
             )
+        pending_sort = attributes.get("source_sort_contract_pending")
+        if pending_sort is not None:
+            attributes["source_sort_contract_pending"] = {
+                **pending_sort,
+                "argument_value_ids": tuple(
+                    mapping[value_id]
+                    for value_id in pending_sort["argument_value_ids"]
+                    if value_id in mapping
+                ),
+            }
         for key in (
             "aggregate_leaf_value_ids",
             "materialized_source_value_ids",

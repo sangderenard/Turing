@@ -524,3 +524,46 @@ linked case's `found is None` lowering to `LNot(presence)` inside unit
 (`planned_region_6` -> `_4`), not traced. Stage 4 (optional aggregate
 passed/returned/compared whole: `shape_transformation_state`, 4 sites)
 remains a separate decision.
+
+## Addendum 9: three consumer-side repairs redone at their generators (2026-10-20)
+
+Rule (user, absolute): never fix generated content after the fact; fix the
+generator. Three committed edits violated it and were reverted and redone:
+
+1. Linker payload-only view (da4187de) REVERTED. The callee's Ret stays as
+   generated (presence interleaved by `emit_outputs`); the linker's result
+   window now binds payload positions by reading the callee's
+   `optional_return_contracts` receipts (`callee_link_positions`), not by
+   editing `callee_outputs`. In-unit callees (no receipts yet at link time)
+   are unchanged. Chosen over moving the optional lowering before linking,
+   which runs once over the whole module after all links.
+2. Arena-edge orientation (1719fd10) REVERTED. The generated run order was
+   wrong: a ConditionalBlock sorted at its `if` keyword, before the hoisted
+   items of its own test. `_conditional_block_position` (fortran_c_shell
+   ~11961) places a conditional where its TEST ENDS, at all five
+   `block_position` sites; one lexical rule, test before body. Unit 032
+   compiles with no orientation rule.
+3. Sort-contract REVISE in the composer (7d7b2c63) REVERTED. The reducer
+   posted SOURCE_SORT_CONTRACT before the composer generated the final
+   source identity. Now: the reducer's `sorted(generator)` branch
+   materializes the call's ARGUMENT (one identity before composition);
+   `post_source_sort_contract` runs after loop stamps and DEFERS when the
+   sort's source value is a loop materialization target (the
+   `loop_iteration_outputs` record, not AST shape), leaving
+   `source_sort_contract_pending` on the call; the composer posts the
+   contract ONCE when it mints the collection port (dest=call,
+   source=collection, Derived from the port row and the call cell,
+   CONCORD). `sorted(d)` on a real sequence posts at the reducer as before.
+   Observed on gen_sort, lc_sort, nb_sort (name-bound comprehension), e8:
+   one post with final ids, append in loop_body, replace+sort in loop_exit.
+
+Also committed before this: a0072423 declares fixed-arity tuple mapping
+values as N value columns at the origin (reducer element schema,
+`ResolvedSequenceSchema.value_column_count`); the keyed-field ABI's single
+`values` part, the N-value lookup, and reducer-minted leaf identities for a
+lookup result are still to be generated from it; until then
+`dict[K, tuple[...]]` stops loudly at the lookup helper (unit 027).
+
+Gate on this tree: 457 passed / 9 failed, the known ids. Units 032, 034
+(partial on its pre-sweep shortfalls), 035, 042 verified from the live
+growth. Not run: a bootstrap.

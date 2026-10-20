@@ -20910,60 +20910,19 @@ def _schedule_loop_callsites(
                 #   WAR  a write after a read   -- last_access
                 #   WAW  a write after a write  -- last_access
                 #   RAR  a read after a read    -- NONE, reads commute
-                def depends_on(current: int, prerequisite: int) -> bool:
-                    """Whether exact value/effect edges already order these."""
-
-                    pending = list(dependencies[current])
-                    visited: set[int] = set()
-                    while pending:
-                        candidate = pending.pop()
-                        if candidate == prerequisite:
-                            return True
-                        if candidate in visited:
-                            continue
-                        visited.add(candidate)
-                        pending.extend(dependencies[candidate])
-                    return False
-
                 last_access: dict[int, int] = {}
                 last_write: dict[int, int] = {}
                 last_terminal = None
                 terminal_guard_candidates: list[tuple[int, int]] = []
                 for position, child in enumerate(run):
                     reads, writes = sequence_accesses(child)
-                    # PROGRAM SHAPE: ``if column not in self.column_positions:
-                    # self.column_positions[column] = ...``.  The ConditionalBlock
-                    # sits at its ``If`` statement's authored position and carries
-                    # its body's arena write; the membership query that IS its
-                    # predicate sits at the later position of the ``in`` expression.
-                    # WRONG RECORD: run position was taken as execution order, so
-                    # the query read became a RAW after the conditional's write,
-                    # against the exact value edge (the conditional consumes the
-                    # query result).  RULE NOW HOLDING: an earlier access that
-                    # already (transitively) depends on this block by value or
-                    # hierarchy executes AFTER it; that is the order, the arena
-                    # edge is oriented by it, and the tracked last access stays
-                    # the execution-later one.
-                    value_ordered: set[int] = set()
                     for arena in reads:
                         if arena in last_write:
-                            if depends_on(last_write[arena], position):
-                                require(last_write[arena], position, (
-                                    "sequence_war", int(arena)
-                                ))
-                                value_ordered.add(arena)
-                                continue
                             require(position, last_write[arena], (
                                 "sequence_raw", int(arena)
                             ))
                     for arena in writes:
                         if arena in last_access:
-                            if depends_on(last_access[arena], position):
-                                require(last_access[arena], position, (
-                                    "sequence_war", int(arena)
-                                ))
-                                value_ordered.add(arena)
-                                continue
                             access_kind = (
                                 "sequence_waw"
                                 if arena in last_write
@@ -20973,9 +20932,9 @@ def _schedule_loop_callsites(
                             require(position, last_access[arena], (
                                 access_kind, int(arena)
                             ))
-                    for arena in (reads | writes) - value_ordered:
+                    for arena in reads | writes:
                         last_access[arena] = position
-                    for arena in writes - value_ordered:
+                    for arena in writes:
                         last_write[arena] = position
                     # A source-placed call following a guarded continue/return
                     # must not execute on that terminal edge while waiting for
@@ -20996,6 +20955,21 @@ def _schedule_loop_callsites(
                             terminal_guard_candidates.append((
                                 position, last_terminal,
                             ))
+
+                def depends_on(current: int, prerequisite: int) -> bool:
+                    """Whether exact value/effect edges already order these."""
+
+                    pending = list(dependencies[current])
+                    visited: set[int] = set()
+                    while pending:
+                        candidate = pending.pop()
+                        if candidate == prerequisite:
+                            return True
+                        if candidate in visited:
+                            continue
+                        visited.add(candidate)
+                        pending.extend(dependencies[candidate])
+                    return False
 
                 for position, terminal in terminal_guard_candidates:
                     # ``if self.excludes(node): return False`` retained its

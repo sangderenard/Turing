@@ -2326,47 +2326,48 @@ def materialize_retained_loop_ports(
                         for version in superseded_versions
                     ]
                     post_port_version(superseded_name, collection_id)
-            if materializer_attributes.get("source_sorted_call"):
-                # ``sorted(<generator>)``: the sorted Call is the
-                # materializer, and the LoopResult superseded it above, so
-                # the loop's collected arena IS the call's result.  The sort
-                # contract (row keyed by the call) must say so: the
-                # collection is both source and destination, and the sort is
-                # in place on it (the ``list.sort`` form, no self-copy).
-                from .concordance_declarations import (
-                    SOURCE_SORT_CONTRACT, SourceSortContract,
-                )
+            # ``sorted(<comprehension>)``: the reducer could not post the
+            # sort contract, because the sort's source is this loop's
+            # collection and that identity is minted here (it supersedes
+            # the comprehension).  The call carries the contract's policy and
+            # key; this is the one place the final source is known, so the
+            # one contract is posted here: destination = the sorted call,
+            # source = the collection port.
+            from .concordance_declarations import (
+                SOURCE_SORT_CONTRACT, SourceSortContract,
+            )
+            from ..common.tensors.topological_reducer import (
+                _source_numeric_scope as _sort_scope,
+                node_identity_cell as _sort_identity_cell,
+            )
 
-                sort_row = materializer_attributes.get(
-                    "source_sort_contract_row"
+            for sort_call_id, sort_call in tuple(graph.G.nodes(data=True)):
+                sort_attributes = sort_call.get("attributes") or {}
+                pending = sort_attributes.get("source_sort_contract_pending")
+                if pending is None or not any(
+                    int(parent) == int(collection_id) and str(role) == "arg:0"
+                    for parent, role in sort_call.get("parents") or ()
+                ):
+                    continue
+                sort_cell = book.post(
+                    SOURCE_SORT_CONTRACT,
+                    (_sort_scope(graph), int(sort_call_id)),
+                    SourceSortContract(
+                        pending["argument_kind"],
+                        tuple(pending["argument_value_ids"]),
+                        pending["key_column"], pending["reverse"],
+                        int(sort_call_id), "sorted", pending["policy"],
+                        int(collection_id),
+                    ),
+                    stage=LOOP_COMPOSER,
+                    provenance=Derived(tuple(filter(None, (
+                        port_rows.get(int(collection_id)),
+                        _sort_identity_cell(graph, int(sort_call_id)),
+                    )))),
+                    mode=Mode.CONCORD,
                 )
-                sort_cell = (
-                    None if sort_row is None else
-                    book.latest_ref(SOURCE_SORT_CONTRACT, tuple(sort_row))
-                )
-                sort_fact = (
-                    None if sort_cell is None else
-                    book.page(SOURCE_SORT_CONTRACT).cell(
-                        sort_cell.row, sort_cell.column,
-                    )
-                )
-                if isinstance(sort_fact, SourceSortContract):
-                    book.post(
-                        SOURCE_SORT_CONTRACT, tuple(sort_row),
-                        SourceSortContract(
-                            sort_fact.argument_kind,
-                            sort_fact.argument_value_ids,
-                            sort_fact.key_column, sort_fact.reverse,
-                            int(collection_id), sort_fact.operation,
-                            sort_fact.policy,
-                            int(collection_id),
-                        ),
-                        stage=LOOP_COMPOSER,
-                        provenance=Derived(tuple(filter(None, (
-                            sort_cell, port_rows.get(int(collection_id)),
-                        )))),
-                        mode=Mode.REVISE,
-                    )
+                sort_attributes["source_sort_contract_row"] = sort_cell.row
+                del sort_attributes["source_sort_contract_pending"]
             planned_iteration_outputs.append(LoopIterationOutput(
                 value_id=int(output.value_id),
                 result_value_id=collection_id,

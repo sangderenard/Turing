@@ -11638,7 +11638,7 @@ def _nest_lexical_conditionals_in_loops(
             if line.startswith("__plan_callsite_") and line.endswith("__"):
                 return node_position(int(line[len("__plan_callsite_"):-2]))
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return node_position(int(block.source_node_id))
+            return _conditional_block_position(graph.G, int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
             return _loop_control_block_position(graph.G, block, node_position)
         if isinstance(block, (LoopBlock, WhileBlock)):
@@ -11958,6 +11958,41 @@ def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int
     )
 
 
+def _conditional_block_position(
+    graph_obj: Any, node_id: int,
+) -> tuple[int, int, int]:
+    """Authored position at which a ConditionalBlock EXECUTES its arms.
+
+    PROGRAM: ``for row, column in self.cells: if column not in
+    self.column_positions: self.column_positions[column] = ...``.  The
+    ConditionalBlock was placed at its ``If`` statement start (the ``if``
+    keyword), the membership query hoisted out of the test at the later
+    column of the ``in`` expression, so the run listed
+    ``[Conditional, Query, ...]``: the conditional (which carries its body's
+    arena write) ahead of the query that is its own predicate.
+    RULE (lexical): the test precedes the body.  A conditional is placed where
+    its TEST ends, so every item hoisted out of the test (which starts inside
+    it) sorts before the conditional and the arms follow it.
+    """
+
+    node_id = int(node_id)
+    position = _authored_node_position(graph_obj, node_id)
+    data = graph_obj.nodes.get(node_id) if node_id in graph_obj else None
+    expression = None if data is None else data.get("expr_obj")
+    if getattr(expression, "test", None) is None:
+        from .glsl_deployment_strategy import _source_control_expression
+        expression = _source_control_expression(graph_obj, node_id)
+    test = getattr(expression, "test", None)
+    end_line = getattr(test, "end_lineno", None)
+    if end_line is None:
+        return position
+    return (
+        int(end_line),
+        int(getattr(test, "end_col_offset", 0) or 0),
+        node_id,
+    )
+
+
 def _dispatch_region_completion_positions(
     graph_obj: Any,
     dispatch_subgraphs: Iterable[Any],
@@ -12022,7 +12057,7 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
             if line.startswith("__plan_callsite_") and line.endswith("__"):
                 return node_position(int(line[len("__plan_callsite_"):-2]))
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return node_position(int(block.source_node_id))
+            return _conditional_block_position(graph.G, int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
             return _loop_control_block_position(graph.G, block, node_position)
         if isinstance(block, (LoopBlock, WhileBlock)):
@@ -12255,7 +12290,7 @@ def _place_plan_callsites_lexically(
             if line.startswith("__plan_callsite_") and line.endswith("__"):
                 return node_position(int(line[len("__plan_callsite_"):-2]))
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return node_position(int(block.source_node_id))
+            return _conditional_block_position(graph.G, int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
             return _loop_control_block_position(graph.G, block, node_position)
         if isinstance(block, (LoopBlock, WhileBlock)):
@@ -12860,7 +12895,7 @@ def _install_lexical_sequence_mutations(
             if line.startswith("__plan_callsite_") and line.endswith("__"):
                 return node_position(int(line[len("__plan_callsite_"):-2]))
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return node_position(int(block.source_node_id))
+            return _conditional_block_position(graph.G, int(block.source_node_id))
         if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
             return _loop_control_block_position(graph.G, block, node_position)
         if isinstance(block, (LoopBlock, WhileBlock)):
@@ -13398,7 +13433,7 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
                     (1 << 30, 0, 0),
                 )
         if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return node_position(block.source_node_id)
+            return _conditional_block_position(graph.G, int(block.source_node_id))
         if isinstance(block, (LoopBlock, WhileBlock)):
             source_id = block.source_loop_node_id
             if source_id is not None:
@@ -41589,47 +41624,6 @@ def _class_surface_ssa_program(
                     () if callee is None
                     else emit_outputs(record.callee_symbol, callee)
                 )
-                if callee is not None and callee_outputs:
-                    # A callee compiled in an earlier unit arrives with its
-                    # optional-aggregate output already interleaved
-                    # ``(p0, q0, p1, q1, ...)``.  The caller binds the PAYLOAD
-                    # positions at link time; ``ssa_optional_values`` owns the
-                    # presence companions (it reads the same
-                    # ``optional_return_contracts`` receipts and rewrites the
-                    # call).  Present the link-time view an in-unit callee has
-                    # before that pass: drop exactly the presence leaves the
-                    # receipts name, and only when the output's layout record
-                    # is exactly that interleaving and every leaf is on the Ret.
-                    from .ssa_optional_values import (
-                        _record_covered_return_receipts,
-                    )
-                    optional_receipts = _record_covered_return_receipts(callee)
-                    if optional_receipts:
-                        optional_layout = tuple(map(int, dict(
-                            callee.metadata.get("aggregate_return_layouts")
-                            or ()
-                        ).get(int(optional_receipts[0]["return_output_id"]), ())))
-                        interleaved_layout = tuple(
-                            int(leaf)
-                            for receipt in optional_receipts
-                            for leaf in (
-                                receipt["payload_value_id"],
-                                receipt["presence_value_id"],
-                            )
-                        )
-                        emitted_ids = {int(output.id) for output in callee_outputs}
-                        if (
-                            optional_layout == interleaved_layout
-                            and set(interleaved_layout) <= emitted_ids
-                        ):
-                            optional_presence_ids = {
-                                int(receipt["presence_value_id"])
-                                for receipt in optional_receipts
-                            }
-                            callee_outputs = tuple(
-                                output for output in callee_outputs
-                                if int(output.id) not in optional_presence_ids
-                            )
                 callee_aggregate_outputs = (
                     tuple((callee_outputs[0].accounting or {}).get(
                         "ssa_aggregate_outputs", ()
@@ -42763,8 +42757,37 @@ def _class_surface_ssa_program(
                             int(callee_id), int(caller_id)
                         ))
                 physical_result_bindings = tuple(physical_result_bindings)
+                # Program: a record-covered optional-aggregate callee
+                # (``IdentityPage._resolved``, ``return_output_arms``) linked
+                # from an EARLIER unit.  Wrong generated record: its Ret is
+                # already the interleaved ``(p0, q0, p1, q1)`` while the
+                # caller's ``record.result_bindings`` name only the payload
+                # leaves ``(55, 56, 57)``; the in-unit form of the same callee
+                # is payload-only here because ``ssa_optional_values``
+                # interleaves presence AFTER linking.  Rule: the callee's
+                # ``optional_return_contracts`` receipts are the one authority
+                # for which Ret leaves are presence companions; the linker
+                # binds the PAYLOAD leaves of the Ret, at their own Ret
+                # positions, for both forms (``callee_outputs`` is read, not
+                # edited; the presence loads are minted by the optional pass).
+                from .ssa_optional_values import (
+                    _record_covered_return_receipts,
+                )
+                callee_presence_ids = frozenset(
+                    int(receipt["presence_value_id"])
+                    for receipt in (
+                        _record_covered_return_receipts(callee)
+                        if callee is not None else ()
+                    )
+                )
+                callee_link_positions = tuple(
+                    position
+                    for position, output in enumerate(callee_outputs)
+                    if int(output.id) not in callee_presence_ids
+                )
                 callee_output_id_sequence = tuple(
-                    int(output.id) for output in callee_outputs
+                    int(callee_outputs[position].id)
+                    for position in callee_link_positions
                 )
                 if (
                     os.environ.get("TURING_DEBUG_AGGREGATE_CALLSITE")
@@ -42843,8 +42866,10 @@ def _class_surface_ssa_program(
                     # An id->position dictionary necessarily collapses those
                     # occurrences; the exact ordered binding window above is
                     # the stronger ABI correlation.
-                    physical_result_positions = tuple(range(len(callee_outputs)))
-                    physical_result_slots = tuple(range(len(callee_outputs)))
+                    physical_result_positions = callee_link_positions
+                    physical_result_slots = tuple(
+                        range(len(callee_link_positions))
+                    )
                 mapped_result_rows = tuple(
                     (binding, position, slot)
                     for binding, position, slot in zip(
@@ -42893,7 +42918,8 @@ def _class_surface_ssa_program(
                 if (
                     lost_authored_bindings
                     and callee_outputs
-                    and len(physical_result_bindings) != len(callee_outputs)
+                    and len(physical_result_bindings)
+                    != len(callee_link_positions)
                 ):
                     raise FortranEmissionError(
                         "linked callee lost an authored output from its "
