@@ -16734,6 +16734,26 @@ def _publish_callsite_return_members(
                 else copy.deepcopy(dict(descriptor))
             ),
         )
+        # _virtual_fact: ``found = self._resolved(...)`` then ``cells[found]``
+        # (``found is None`` tested first).  The minted member and its index
+        # constant had no ``ingestion_value`` row, so ``_set_operands`` wrote
+        # the consumer edge with an Unsourced fallback: a member of the call
+        # result with no cause on the book.  The rule now holding: each
+        # minted node stands for the call's own result position, so its row
+        # is DERIVED from the CALLER's cells for that call (``call_binding``
+        # cell, else the call node's identity cell -- the cells the frame
+        # lane's ``_frame_mint`` derives from), posted before the operand
+        # edges.  A node that already has a row is left as it is.
+        from .frame_identity_book import _frame_call_cells
+        from ..common.tensors.topological_reducer import (
+            post_derived_node_identity as _post_member_node_identity,
+        )
+
+        for minted_id in (index_id, member_id):
+            _post_member_node_identity(
+                caller, minted_id, _frame_call_cells(caller.G, node_id),
+                stage=PLANNER_TENSOR_SPECIALIZATION,
+            )
         _set_operands(
             caller, member_id, [(node_id, "base"), (index_id, "index")],
             cause=_AGGREGATE_MEMBER,
@@ -16801,6 +16821,93 @@ def _publish_callsite_return_members(
     data["attributes"] = attributes
     data.pop("tensor", None)
     return True
+
+
+def _callee_optional_aggregate_members(callee: Any) -> tuple | None:
+    """The member value ids of an in-unit callee's one semantic output when
+    RETURN_OUTPUT_ARMS declared it OPTIONAL_AGGREGATE, else None.
+
+    The output is the one ``function_outputs`` names through the callee's
+    ``identity_table`` (the derivation the call planner uses for the same
+    callee); ``_return_output_arms_members`` reads the record."""
+
+    table = callee.G.graph.get("identity_table") or {}
+    outputs = tuple(
+        int(table[name][-1])
+        for name in callee.G.graph.get("function_outputs", ())
+        if table.get(name)
+    )
+    return _return_output_arms_members(callee, outputs)
+
+
+def _linked_optional_aggregate_record(entry: Any) -> tuple | None:
+    """``(descriptors, kind)`` of an accepted header's OPTIONAL_AGGREGATE
+    return, or None.
+
+    The facts are READ from the callee's accepted book: the layout cell the
+    header's ``aggregate_return_layout_sources`` names (``source_aggregate_
+    layout``), the ``return_output_arms`` row that shares its reduction
+    scope, and the header's ``optional_return_contracts`` receipts for each
+    member's dtype and shape (matched by the member's declared value id).
+    Presence is not a member: one flat descriptor per layout member.  The
+    caller-side posts derive from the CALLER's cells; no cell of the callee's
+    book is handed to a caller-book row.
+    """
+
+    host = entry.metadata.get("host_ssa_module")
+    root = entry.metadata.get("host_ssa_root")
+    declaration = None if host is None else host.functions.get(str(root))
+    if declaration is None:
+        return None
+    owner_book = (
+        (declaration.metadata.get("accepted_ssa_component") or {}).get(
+            "identity_book"
+        )
+        or host.metadata.get("identity_book")
+    )
+    semantic = tuple(declaration.metadata.get("semantic_output_ids", ()))
+    if owner_book is None or len(semantic) != 1:
+        return None
+    output = int(semantic[0])
+    source = dict(
+        declaration.metadata.get("aggregate_return_layout_sources", ())
+    ).get(output)
+    if source is None:
+        return None
+    from .concordance_declarations import (
+        RETURN_OUTPUT_ARMS, ReturnArmsKind, ReturnOutputArms,
+        SOURCE_AGGREGATE_LAYOUT, SourceAggregateLayout,
+    )
+
+    layout = owner_book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+        source.row, source.column
+    )
+    arms = owner_book.page(RETURN_OUTPUT_ARMS).latest(
+        (source.row[0], output)
+    )
+    if not (
+        isinstance(layout, SourceAggregateLayout)
+        and isinstance(arms, ReturnOutputArms)
+        and arms.kind is ReturnArmsKind.OPTIONAL_AGGREGATE
+    ):
+        return None
+    receipts = {
+        int(receipt["payload_value_id"]): receipt
+        for receipt in declaration.metadata.get("optional_return_contracts", ())
+        if receipt.get("return_output_id") is not None
+        and int(receipt["return_output_id"]) == output
+    }
+    descriptors = []
+    for member in layout.members:
+        receipt = receipts.get(int(member.value_id))
+        descriptors.append(
+            None if receipt is None else {
+                "shape": tuple(receipt.get("shape") or ()),
+                "dtype": str(receipt["dtype"]),
+                "rank": len(tuple(receipt.get("shape") or ())),
+            }
+        )
+    return tuple(descriptors), str(layout.aggregate_kind)
 
 
 #: Per compile book: the (callee graph, signature) answers a callsite-
@@ -17307,6 +17414,21 @@ def _propagate_callsite_tensor_specializations(
                         int(value_id),
                         repr(_callsite_descriptor_receipt(tensor)),
                     ))
+                # whole.py: the publication of an OPTIONAL_AGGREGATE call's
+                # member leaves (descriptors all None -- the leaves are
+                # scalars with no tensor fact) changes the graph and no
+                # descriptor, so the round's state equalled the seed state
+                # while ``changed`` was True: "repeated a completed state at
+                # round 1".  The member ledger is state the loop writes; the
+                # rule now holding: it is part of the digest the guard reads.
+                leaves = (node.get("attributes") or {}).get(
+                    "aggregate_leaf_value_ids"
+                )
+                if leaves:
+                    facts.append((
+                        function_name, int(value_id), "leaves",
+                        tuple(map(int, leaves)),
+                    ))
         digest = hashlib.sha256(repr(tuple(facts)).encode("utf-8")).hexdigest()
         return digest[:16], tensor_fact_count
 
@@ -17423,6 +17545,38 @@ def _propagate_callsite_tensor_specializations(
                 except (KeyError, TypeError, ValueError):
                     continue
                 if callee is None:
+                    # _virtual_fact: ``found = self._resolved(...)``, whose
+                    # accepted header returns one OPTIONAL_AGGREGATE.  The
+                    # call node carried one binding for the result and no
+                    # member ledger, while the arms record declares two
+                    # leaves; ``cells[found]`` (after ``found is None``)
+                    # then had nothing to index.  The rule now holding: the
+                    # one semantic output's leaves are the accepted layout's
+                    # members, all N positions, each an ``Indexed(call, k)``
+                    # minted through the member publication from the
+                    # caller's own cells.
+                    try:
+                        linked = _linked_optional_aggregate_record(
+                            function_table.entry(int(reference)),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        linked = None
+                    if linked is not None:
+                        from .frame_identity_book import _frame_call_cells
+
+                        linked_call_cells = _frame_call_cells(
+                            caller.G, int(_node_id)
+                        )
+                        linked_changed = _publish_callsite_return_members(
+                            caller, int(_node_id), linked[0], linked[1],
+                            return_cells=tuple(
+                                linked_call_cells for _ in linked[0]
+                            ),
+                        )
+                        changed |= linked_changed
+                        mutation_counts["return_members"] += int(
+                            linked_changed
+                        )
                     continue
                 callsites += 1
                 if _progress is not None and (
@@ -17451,6 +17605,35 @@ def _propagate_callsite_tensor_specializations(
                 result_descriptors = call_result_descriptor(
                     caller, int(_node_id), callee
                 )
+                # whole.py: ``r = f(n, 1); if r is None: ...; p.cells[r]``
+                # with ``f`` returning ``None`` or ``(a, b)``.  The callee's
+                # one semantic output is an OPTIONAL_AGGREGATE (its
+                # return_output_arms record); ``return_container_kinds`` is
+                # {value, tuple} -- no single kind -- and
+                # ``call_result_descriptor`` is empty for scalar arguments,
+                # so the call carried no member leaves.  The rule now
+                # holding: the record's layout members are the call's
+                # leaves, all N positions, descriptors from the leaf values.
+                arms_members = _callee_optional_aggregate_members(callee)
+                if arms_members is not None:
+                    from .frame_identity_book import _frame_call_cells
+
+                    arms_call_cells = _frame_call_cells(
+                        caller.G, int(_node_id)
+                    )
+                    arms_changed = _publish_callsite_return_members(
+                        caller, int(_node_id),
+                        tuple(
+                            _tensor_descriptor(callee, int(member))
+                            for member in arms_members
+                        ),
+                        "tuple",
+                        return_cells=tuple(
+                            arms_call_cells for _ in arms_members
+                        ),
+                    )
+                    changed |= arms_changed
+                    mutation_counts["return_members"] += int(arms_changed)
                 if result_descriptors:
                     if (
                         len(result_descriptors) == 1
@@ -17537,7 +17720,8 @@ def _propagate_callsite_tensor_specializations(
                         ),
                     )))
                     if (
-                        len(declared_return_alternatives) <= 1
+                        arms_members is None
+                        and len(declared_return_alternatives) <= 1
                         and
                         len(return_kinds) == 1
                         and return_kinds <= {"tuple", "list"}
@@ -19205,6 +19389,21 @@ def _tensor_descriptor_rule(
         contract = None if declaration is None else (declaration.metadata.get("native_interface")
                                                      or declaration.metadata.get("repository_ssa_signature"))
         if contract is not None:
+            # _virtual_fact: ``found = self._resolved(...)``.  This rule
+            # wrote the call's ``tensor_output_descriptors`` as the header's
+            # PHYSICAL paths ((payload, presence) per position) on every
+            # evaluation, while the member publication wrote the authored
+            # layout's flat members to the same ledger: two records of one
+            # value, rewritten against each other every round ("repeated a
+            # completed state").  The rule now holding: an OPTIONAL_AGGREGATE
+            # header's ledger is the accepted layout's members, the one fact
+            # the publication also states -- read from the same record.
+            optional_record = _linked_optional_aggregate_record(entry)
+            if optional_record is not None:
+                attributes["tensor_output_descriptors"] = optional_record[0]
+                attributes["authored_return_container"] = optional_record[1]
+                data["attributes"] = attributes
+                return None
             outputs = tuple(declaration.metadata.get("declared_native_outputs") or
                             entry.metadata["host_ssa_outputs"][str(root)])
             if len(outputs) != 1 or contract.get("return_container_kind") in {"tuple", "list"}:

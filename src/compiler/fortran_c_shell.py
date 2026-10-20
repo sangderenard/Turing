@@ -10939,6 +10939,12 @@ def _sequence_value_kinds(
     return kinds
 
 
+#: Aggregate kinds whose truthiness is "has members" (``if r:``).
+_TRUTHINESS_AGGREGATE_KINDS = frozenset({
+    "list", "set", "frozenset", "dict", "tuple", "bytes", "bytearray", "str",
+})
+
+
 def _graph_control_expression(
     graph_obj: Any, node_id: int, visiting: frozenset[int] = frozenset(),
     *, resident: frozenset[int] = frozenset(),
@@ -10970,10 +10976,7 @@ def _graph_control_expression(
         data.get("type") or ""
     ).casefold() in {"constant", "const"}:
         return ControlExpression("const", value_id=node_id, literal=literal)
-    if attributes.get("aggregate_kind") in {
-        "list", "set", "frozenset", "dict", "tuple", "bytes",
-        "bytearray", "str",
-    }:
+    if attributes.get("aggregate_kind") in _TRUTHINESS_AGGREGATE_KINDS:
         return ControlExpression(
             "sequence_nonempty",
             (ControlExpression("value", value_id=node_id),),
@@ -11022,10 +11025,25 @@ def _graph_control_expression(
         # contract. Preserve the authored identity comparison structurally;
         # _rewrite_optional_row_handle_none_predicate replaces only the exact
         # Page-query handle's None literal with that physical sentinel later.
+        # whole.py: ``r = f(n, 1)`` (f returns None or ``(a, b)``) then
+        # ``if r is None``.  Publishing the call's member leaves stamps
+        # ``aggregate_kind`` on the call, and the operand below was then read
+        # as ``if r:`` (``sequence_nonempty``): the identity test became
+        # ``(len(r) > 0) == None`` and the optional-presence rewrite
+        # (ssa_optional_values: ``Eq(aggregate, None)`` -> ``LNot(presence)``)
+        # no longer found the aggregate.  An identity test is on the value
+        # itself, never on its truthiness: the rule now holding.
         return ControlExpression(
             "ne" if isinstance(expression.ops[0], ast.IsNot) else "eq",
             tuple(
-                _graph_control_expression(
+                ControlExpression("value", value_id=int(parent))
+                if (
+                    int(parent) in graph_obj
+                    and (graph_obj.nodes[int(parent)].get("attributes") or {})
+                    .get("aggregate_kind") in _TRUTHINESS_AGGREGATE_KINDS
+                    and int(parent) not in visiting
+                )
+                else _graph_control_expression(
                     graph_obj, parent, visiting | {node_id}, resident=resident,
                 )
                 for parent in ordered[:2]

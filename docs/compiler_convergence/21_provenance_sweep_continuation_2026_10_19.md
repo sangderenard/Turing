@@ -477,3 +477,50 @@ member descriptors must come from the arms record's layout leaves. Open
 decision: how a callee's layout/arms facts cross the unit boundary (the
 plan carries a `source_concordance` archive; whether it should carry
 these rows, and who imports them, was not traced).
+
+## Addendum 8: whole-value optional aggregate, stage 2 (after 4f26ab89)
+
+Transport question answered by reading: a linked callee's concordance
+facts are READ from its accepted book
+(`function.metadata["accepted_ssa_component"]["identity_book"]`, the
+callee unit's own book, reached via `host_ssa_module`), and every
+caller-side post derives from the caller's own cells (call node identity
+cell, `call_binding` cell, else the caller root), as the record-return
+lane's `_frame_mint` does. No cross-book derivation exists and none was
+added; the plan's `source_concordance` archive has no reader.
+
+Implemented (glsl_deployment_strategy.py): an OPTIONAL_AGGREGATE callee's
+one semantic output has member leaves declared by RETURN_OUTPUT_ARMS +
+SOURCE_AGGREGATE_LAYOUT; the caller gets one `Indexed(call, k)` member
+per leaf through the existing `_publish_callsite_return_members`, all N
+positions, presence not a member. Linked header (`callee is None`
+branch): layout/arms read from the accepted book at the row
+`aggregate_return_layout_sources` names, descriptors from
+`optional_return_contracts`, rows derived from the caller's call cells.
+In-unit callee: members from `_return_output_arms_members`, replacing the
+single-kind proxy and the empty `call_result_descriptor` for that case.
+Minted member/index nodes get node-identity rows via
+`post_derived_node_identity` from the call cells.
+
+Two further faults found and fixed on the way:
+- the fixed-point digest omitted `aggregate_leaf_value_ids`, and
+  `_tensor_descriptor_rule` rewrote the pair-nested physical ledger every
+  round against the flat member ledger ("repeated a completed state");
+  both writers now state the one record for an OPTIONAL_AGGREGATE header.
+- `_graph_control_expression` (fortran_c_shell ~10942/11028) read an
+  aggregate operand of `is None` / `is not None` as TRUTHINESS
+  (`Eq(Gt(len(r), 0), None)`), so `ssa_optional_values` never found the
+  aggregate to rewrite into `LNot(presence)`; an identity comparison now
+  takes the aggregate as a value. This changes every aggregate compared
+  with `is None`, not only optional calls.
+
+Observed: unit 035 `compiled-unverified`, no shortfalls; `whole.py whole`
+and `partial` equal the projection oracle (Call output_ids (p0,q,p1,q),
+`LNot(q)` optional_presence_test, two-query lookup on key_columns (0,1));
+0 concordance findings, latch CLOSED; unit 034 unchanged (its pre-sweep
+shortfalls); gate 457 passed / 9 failed, known ids. Not observed: the
+linked case's `found is None` lowering to `LNot(presence)` inside unit
+035 (only the in-unit probes show it); the region ordinals shift
+(`planned_region_6` -> `_4`), not traced. Stage 4 (optional aggregate
+passed/returned/compared whole: `shape_transformation_state`, 4 sites)
+remains a separate decision.
