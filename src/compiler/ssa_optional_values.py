@@ -38,7 +38,29 @@ def _record_covered_return_receipts(function: Any) -> tuple[dict[str, Any], ...]
 
     from .structural_concordance import aggregate_return_layouts, optional_return_members
 
-    layouts = aggregate_return_layouts(function)
+    # Program: a function with an optional tuple return and a planned region
+    # (a loop body cut out of it).  The region's shape scope IS the parent's
+    # scope string, so aggregate_return_layouts(region) reached the PARENT's
+    # row (scope, 16) -- a row for a value the region never returns (its Ret
+    # is [4]) -- and the call to the region was treated as record-covered
+    # (1 payload projection for 2 receipts).  Rule: a layout row belongs to
+    # this function only if its output id is an argument of one of this
+    # function's own Ret instructions, either the output itself or (once the
+    # return is physically expanded) every member of that output's layout;
+    # rows for other outputs are not read.
+    returned = {
+        int(argument.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in _RETURN_OPS
+        for argument in instruction.args
+    }
+    layouts = {
+        output_id: layout
+        for output_id, layout in aggregate_return_layouts(function).items()
+        if output_id in returned
+        or (layout and set(map(int, layout)) <= returned)
+    }
     if len(layouts) != 1:
         return ()
     output_id = next(iter(layouts))

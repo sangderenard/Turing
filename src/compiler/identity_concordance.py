@@ -8877,7 +8877,15 @@ def record_proven_shape(
         # An upstream identity changed after this proof was derived.  The next
         # descriptor query is a new proof generation, not a disagreement with
         # the invalidated fact.  Keep both events in causal order.
+        # Program: a call edge re-visited by the second exact-shape
+        # publication.  Wrong record: a level bump over the same single cell
+        # (the query passed level 13, the row was posted at max+1 = 12, then
+        # 13 over the same cell: a level change is not a cause).  Rule: the
+        # row is posted at the passed level when it exceeds max+1, so the
+        # next query with that level is a true repeat.
         target_level = max(recorded_levels, default=-1) + 1
+        if level is not None:
+            target_level = max(target_level, int(level))
         fact = ("proven", extents, str(dtype or "float64"), target_level)
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         _post_or_unsourced(
@@ -8913,16 +8921,31 @@ def record_proven_shape(
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         latest_ref = book.latest_ref(PROVEN_SHAPE_PAGE, row)
         cells = (*sources, *(() if state_ref is None else (state_ref,)))
-        if (
-            latest_ref is not None
-            and cells
-            and page.latest(row) == fact
-        ):
+        # Program: a call edge re-visited by the second exact-shape
+        # publication (_publish_exact_ssa_call_shapes) with the same four
+        # cells.  Wrong record: the incumbent was ``conflicting`` and the
+        # repeat posted ``proven`` over the same cells (a re-observation of
+        # a conflict taken for a re-confirmation of a proof), which the book
+        # refuses as a causeless REVISE.  Rule: the same extents, dtype and
+        # level over cells that are already edges into the latest cell is
+        # not restated, whatever the latest tag; a repeat never flips
+        # ``conflicting`` to ``proven``; a NEW cell at the same level
+        # re-posts ``conflicting`` with the new cell set.
+        deepest_dtype = deepest[1][2] if len(deepest[1]) > 2 else None
+        repeats_incumbent = (
+            deepest[1][0] in {"proven", "conflicting"}
+            and tuple(deepest[1][1]) == extents
+            and deepest_dtype in {fact[2], str(dtype or "")}
+            and target_level == deepest_level
+        )
+        if repeats_incumbent and latest_ref is not None and cells:
             recorded_sources = {
                 source for source, _stage in book.edges_into(latest_ref)
             }
             if all(cell in recorded_sources for cell in cells):
                 return
+        if repeats_incumbent and deepest[1][0] == "conflicting":
+            fact = ("conflicting", extents, str(dtype or ""), target_level)
         _post_or_unsourced(
             book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
             cells, PROVEN_SHAPE_SOURCE_NOT_ON_BOOK,

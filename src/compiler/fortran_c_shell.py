@@ -26858,6 +26858,7 @@ def _class_surface_ssa_program(
         published = {int(value.id) for value in terminator.args}
         values = function_values(function)
         insertions = []
+        formals_before = {id(formal) for formal in function.args}
         structural_shortfalls = []
         structural_root_ids: set[int] = set()
         # Selection chains need their own intermediate results; a graph node id
@@ -29587,7 +29588,11 @@ def _class_surface_ssa_program(
                 argument for argument in terminator.args
                 if int(argument.id) not in stale_identities
             ]
-        if insertions:
+        # A recovery that only appended a formal has no insertions but still
+        # owes that formal its ``ssa_value`` row below.
+        if insertions or any(
+            id(formal) not in formals_before for formal in function.args
+        ):
             for block in function.blocks.values():
                 if terminator in block.instrs:
                     index = block.instrs.index(terminator)
@@ -29796,7 +29801,24 @@ def _class_surface_ssa_program(
             )
             from .id_space import MINTED, has_flag
             from .precompile_to_ssa import _function_root_cell
-            for recovered in insertions:
+            # Program: a planned region consuming only views of an authored
+            # tensor parameter (``singleton_snapshot__recover__specialized_*``,
+            # ``args=[3 (2,3) float64]``).  Wrong record: ``ensure_structural_
+            # value``'s "input" branch appended the parameter to
+            # ``function.args`` as a bare SSAValue; it is not an insertion, so
+            # this loop never posted its ``ssa_value`` row and the physical
+            # structure refused ``lacks SSA identity`` on that formal.  Rule:
+            # this loop is the single posting point of the pass; every value
+            # the pass created -- instruction result or formal appended to
+            # ``function.args`` -- gets its row here, DERIVED from its graph
+            # cell, before any reader asks.
+            from types import SimpleNamespace
+            recovered_formals = [
+                SimpleNamespace(res=formal, args=(), op="input")
+                for formal in function.args
+                if id(formal) not in formals_before
+            ]
+            for recovered in (*insertions, *recovered_formals):
                 if recovered.res is None or getattr(recovered.res, "id", None) is None:
                     continue
                 value_id = int(recovered.res.id)

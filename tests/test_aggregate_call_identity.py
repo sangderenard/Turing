@@ -570,6 +570,8 @@ def test_unpacked_call_results_carry_a_retained_loop(monkeypatch):
 
 
 def test_returned_record_parameter_keeps_its_field_formals():
+    from src.common.dt_system.dt_scaler import Metrics
+
     source = """
 def keep(metrics):
     metrics.max_vel = metrics.max_vel + 1.0
@@ -581,6 +583,8 @@ def tick(metrics):
 """
     module, _, _ = lower_ast_source_to_ssa(
         source, "tick", name="returned_record_parameter",
+        # The class the contract names must be ingested through the real route.
+        python_bindings={"Metrics": Metrics},
         extraction_contract=ExtractionContract(CONTRACTS / "program_extraction.yaml"),
         runtime_closure_only=True,
     )
