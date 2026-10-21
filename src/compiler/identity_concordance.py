@@ -1055,7 +1055,10 @@ class Finding:
 _INOUT_REDEFINED = ("program_abi_mutable", "program_abi_field_written")
 #: Finding kinds ``concordance_report`` counts on their own line rather than
 #: in its gating first line.
-_UNSOURCED_KINDS = frozenset({"unsourced-fact", "unsourced-identity"})
+# ssa-physical-unposted is the stage-3 migration worklist (accounting set, fact
+# unset); retire it from this set when the last producer posts its physical fields.
+_UNSOURCED_KINDS = frozenset({"unsourced-fact", "unsourced-identity",
+                              "ssa-physical-unposted"})
 
 
 _IDENTITY_PAGES = frozenset(("canonical_value", "ingestion_value"))
@@ -3295,9 +3298,19 @@ class CorrelationTable:
             scope = function_scope_of(function)
             occurrences = {}
 
+            accounted = {}
+
             def observe(value, position):
                 key = (int(value.id), value.dtype, tuple(value.shape or ()))
                 occurrences.setdefault(key, []).append(position)
+                # Rule: the resident's accounting view of its physical fields,
+                # read-only, compared below against the posted fact.
+                account = dict(getattr(value, "accounting", None) or {})
+                view = tuple(account.get(k) for k in (
+                    "physical_dtype", "program_abi_storage", "program_abi_rank",
+                    "sequence_arena", "device"))
+                if any(item not in (None, False) for item in view):
+                    accounted.setdefault((int(value.id), view), []).append(position)
 
             for index, value in enumerate(function.args):
                 observe(value, ("formal", index))
@@ -3326,6 +3339,40 @@ class CorrelationTable:
                         f"resident occurrence carries {(dtype, shape)!r} at "
                         f"{tuple(positions)!r}",
                     ))
+            # Rule: where BOTH the accounting key and the fact field are set
+            # they must agree (type-disagreement); where the accounting key is
+            # set and the fact field is not, report ssa-physical-unposted --
+            # the stage-3 migration worklist; reported, never refused.
+            fields = (
+                ("physical_dtype", "physical_dtype"),
+                ("program_abi_storage", "storage"),
+                ("program_abi_rank", "rank"),
+                ("sequence_arena", "arena"),
+                ("device", "device"),
+            )
+            for (value_id, view), positions in accounted.items():
+                cell = book.latest_ref(SSA_VALUE, (scope, value_id))
+                if cell is None:
+                    continue
+                fact = book.page(SSA_VALUE).cell(cell.row, cell.column)
+                if not isinstance(fact, SSAValueFact):
+                    continue
+                for (key, field), resident in zip(fields, view):
+                    posted = getattr(fact, field, None)
+                    if resident in (None, False):
+                        continue
+                    if posted in (None, False):
+                        found.append(Finding(
+                            "ssa-physical-unposted", str(name), value_id,
+                            f"{cell!r} has no {field}; resident accounting "
+                            f"{key}={resident!r} at {tuple(positions)!r}",
+                        ))
+                    elif posted != resident:
+                        found.append(Finding(
+                            "ssa-publication-type-disagreement", str(name), value_id,
+                            f"{cell!r} records {field}={posted!r}; resident "
+                            f"accounting {key}={resident!r} at {tuple(positions)!r}",
+                        ))
         return found
 
     @staticmethod
@@ -7887,22 +7934,43 @@ def _post_loop_scope_cell(
     """One generation cell of a ``loop_scope`` row: the page's COLUMN is the
     generation, so a cell is posted (REVISE, DERIVED from ``cells``) only
     when it is the row's next column; a cell already there with the same fact
-    says nothing new; anything else is written as before, raw."""
+    says nothing new.  Anything else is a ``ConcordanceRefusal`` naming the
+    row: there is no raw write."""
 
     page = book.page("loop_scope")
+    generation = _GENERATION_NAMES.get(column, f"column {column}")
     if (row, column) in page.cells:
+        # Program: a loop declared again with a different value id for a
+        # generation it already holds.  Wrong write: page.set over the cell
+        # (a raw write the book refuses, which the caller swallowed).  Rule:
+        # a generation already declared is revised only by a post.
         if page.cells[(row, column)] != fact:
-            page.set(row, column, fact)
+            raise ConcordanceRefusal(
+                f"loop_scope row {row!r} already holds {generation} "
+                f"{page.cells[(row, column)]!r}; {fact!r} is not a post "
+                "from new source cells"
+            )
         return
     sources = tuple(cell for cell in dict.fromkeys(cells or ()) if cell is not None)
-    if sources and column == len(page.history(row)):
-        book.post(
-            book.registry.page("loop_scope"), row, fact,
-            stage=book.registry.declare_stage("loop_scope_declaration"),
-            provenance=Derived(sources), mode=Mode.REVISE,
+    # Program: a loop declared with no source cell for a generation (the
+    # caller's cell lookup returned None, or no cells were passed).  Wrong
+    # write: page.set of the generation, unsourced.  Rule: every generation
+    # posts from the cell its value was read from, or the declaration refuses.
+    if not sources:
+        raise ConcordanceRefusal(
+            f"loop_scope row {row!r} {generation} {fact!r} has no source "
+            "cell: the value id has no posted identity cell to derive from"
         )
-    else:
-        page.set(row, column, fact)
+    if column != len(page.history(row)):
+        raise ConcordanceRefusal(
+            f"loop_scope row {row!r} {generation} (column {column}) is not "
+            f"the next column ({len(page.history(row))}); cannot post {fact!r}"
+        )
+    book.post(
+        book.registry.page("loop_scope"), row, fact,
+        stage=book.registry.declare_stage("loop_scope_declaration"),
+        provenance=Derived(sources), mode=Mode.REVISE,
+    )
 
 
 def declare_loop_scope(
@@ -7979,20 +8047,9 @@ def declare_loop_scope(
         _post_loop_scope_cell(
             book, row, INNER, int(inner_id), generation_sources[INNER],
         )
-        # Historical unsourced declarations stored graph/binding annotations
-        # as later columns.  A sourced row is strictly the three generations:
-        # those annotations are not later generations and therefore cannot
-        # truthfully revise the row from the same already-consumed cells.
-        # The binding identity is retained in the row key itself.
-        if not any(cell is not None for cell in generation_cells):
-            _post_loop_scope_cell(
-                book, row, INNER + 1,
-                ("graph", int(graph_outer), int(graph_inner)), (),
-            )
-            if source_bindings:
-                _post_loop_scope_cell(
-                    book, row, INNER + 2, ("bindings", source_bindings), (),
-                )
+        # A row is strictly the three generations.  The graph/binding
+        # annotation columns were written only by the unsourced (raw) path
+        # and are gone; the binding identity is retained in the row key.
 
 
 def rebind_loop_scope_inner(
@@ -8017,23 +8074,27 @@ def rebind_loop_scope_inner(
     """
 
     book = current_identity_book()
-    page = book.page("loop_scope_inner_transition")
     row = (
         authored_function_name(function), int(loop_node_id),
         int(declared_inner),
     )
     fact = (int(resident_inner), str(reason))
     sources = tuple(cell for cell in dict.fromkeys(cells or ()) if cell is not None)
-    if sources:
-        _post_or_unsourced(
-            book, book.registry.page("loop_scope_inner_transition"), row,
-            fact, book.registry.declare_stage("loop_scope_declaration"),
-            sources, LOOP_SCOPE_TRANSITION_CAUSE_NOT_ON_BOOK,
+    # Program: a latch resident minted for a declared inner generation whose
+    # ssa_value cells were not supplied.  Wrong write: page.set of the
+    # transition at the next column, unsourced.  Rule: the transition posts
+    # from the declared and resident cells, or it refuses by row.
+    if not sources:
+        raise ConcordanceRefusal(
+            f"loop_scope_inner_transition row {row!r} -> {fact!r} has no "
+            "source cell: the declared and resident values have no posted "
+            "identity cells to derive from"
         )
-        return
-    history = page.history(row)
-    column = history[-1][0] + 1 if history else 0
-    page.set(row, column, fact)
+    _post_or_unsourced(
+        book, book.registry.page("loop_scope_inner_transition"), row,
+        fact, book.registry.declare_stage("loop_scope_declaration"),
+        sources, LOOP_SCOPE_TRANSITION_CAUSE_NOT_ON_BOOK,
+    )
 
 
 def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
@@ -8080,14 +8141,9 @@ def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
                 "inner": resident_inner,
                 "declared_inner": declared_inner,
             }
-            binding_identity = generations.get(INNER + 2)
+            # source_bindings come only from the row key (the annotation
+            # column that once carried them is no longer written).
             if (
-                isinstance(binding_identity, tuple)
-                and len(binding_identity) == 2
-                and binding_identity[0] == "bindings"
-            ):
-                rebind["source_bindings"] = tuple(binding_identity[1])
-            elif (
                 isinstance(key, tuple)
                 and len(key) == 2
                 and isinstance(key[1], tuple)

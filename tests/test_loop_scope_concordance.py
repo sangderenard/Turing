@@ -19,9 +19,30 @@ from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAVal
 from tests.compiler_provenance_inputs import publish_authored_ssa
 
 
+def _value_roots(book, value_ids):
+    """One CANONICAL_VALUE root cell per value id, as the sanctioned
+    id-only fixture shape (see test_sourced_loop_generations_advance_from_
+    their_own_cells)."""
+
+    return {
+        value_id: book.post(
+            CANONICAL_VALUE, ("loop-scope-test", value_id),
+            ("test-value", value_id),
+            stage=INGESTION,
+            provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        for value_id in value_ids
+    }
+
+
 def test_loop_inner_transition_preserves_declaration_and_publishes_resident():
     book, token = begin_identity_book()
     try:
+        cells = _value_roots(book, (10, 11, 12, 99))
+        # Stands in for _ControlSSABuilder's declare_loop_scope call
+        # (precompile_to_ssa.py, loop lowering) and its
+        # complete_loop_latch_carried rebind_loop_scope_inner call.
         declare_loop_scope(
             "artifact__step__specialized_deadbeef",
             7,
@@ -29,6 +50,8 @@ def test_loop_inner_transition_preserves_declaration_and_publishes_resident():
             "loop_latch",
             "loop_exit",
             ((10, 11, 12, 100, 101),),
+            boundary_cells=(cells[10],),
+            rebind_cells=lambda *ids: tuple(cells[i] for i in ids),
         )
         rebind_loop_scope_inner(
             "artifact__step__specialized_deadbeef",
@@ -36,6 +59,7 @@ def test_loop_inner_transition_preserves_declaration_and_publishes_resident():
             12,
             99,
             "complete_loop_latch_carried",
+            cells=(cells[12], cells[99]),
         )
 
         declarations = loop_scope_declarations(book, "artifact__step")
@@ -49,9 +73,11 @@ def test_loop_inner_transition_preserves_declaration_and_publishes_resident():
                 "declared_inner": 12,
             }],
         }]
-        assert book.page("loop_scope").latest(
-            ("step", 7, 10)
-        ) == ("graph", 100, 101)
+        # The declaration stays the three authored generations, exactly;
+        # the resident is published on the transition page, not over it.
+        assert book.page("loop_scope").history(("step", 7, 10)) == (
+            (0, 10), (1, 11), (2, 12),
+        )
         assert book.page("loop_scope_inner_transition").latest(
             ("step", 7, 12)
         ) == (99, "complete_loop_latch_carried")
@@ -86,10 +112,22 @@ def test_completed_module_concords_latch_projection_with_declared_inner():
     book, token = begin_identity_book()
     module.metadata["identity_book"] = book
     try:
+        publish_authored_ssa(module.functions)
+        from src.compiler.ssa_record_return_state import ssa_value_identity_cell
+
+        # Stands in for _ControlSSABuilder's declare_loop_scope call: cells
+        # are the SSA_VALUE identity cells of the published values.
         declare_loop_scope(
             function.name, 7,
             "loop_header", "loop_latch", "loop_exit",
             ((outer.id, carried.id, declared_inner.id, 100, 101),),
+            boundary_cells=(
+                ssa_value_identity_cell(function, outer.id, book=book),
+            ),
+            rebind_cells=lambda *value_ids: tuple(
+                ssa_value_identity_cell(function, value_id, book=book)
+                for value_id in value_ids
+            ),
         )
 
         receipts = concord_loop_scope_latch_residents(module)
@@ -118,6 +156,8 @@ def test_shared_loop_seed_retains_each_authored_binding_row():
 
     book, token = begin_identity_book()
     try:
+        cells = _value_roots(book, (10, 11, 12, 13, 14))
+        # Stands in for _ControlSSABuilder's declare_loop_scope call.
         declare_loop_scope(
             "artifact__root", 7,
             "loop_header", "loop_latch", "loop_exit",
@@ -125,6 +165,8 @@ def test_shared_loop_seed_retains_each_authored_binding_row():
                 (10, 11, 12, 100, 101, ("cap",)),
                 (10, 13, 14, 100, 102, ("last",)),
             ),
+            boundary_cells=(cells[10],),
+            rebind_cells=lambda *ids: tuple(cells[i] for i in ids),
         )
 
         declaration = loop_scope_declarations(book, "artifact__root")[0]
@@ -278,12 +320,24 @@ def test_concordance_reports_shared_carried_identity_for_distinct_bindings():
     book, token = begin_identity_book()
     module.metadata["identity_book"] = book
     try:
+        publish_authored_ssa(module.functions)
+        from src.compiler.ssa_record_return_state import ssa_value_identity_cell
+
+        # Stands in for _ControlSSABuilder's declare_loop_scope call: cells
+        # are the SSA_VALUE identity cells of the published values.
         declare_loop_scope(
             function.name, 7,
             "loop_header", "loop_latch", "loop_exit",
             (
                 (10, 11, 12, 100, 101, ("cap",)),
                 (10, 11, 14, 100, 102, ("last",)),
+            ),
+            boundary_cells=(
+                ssa_value_identity_cell(function, outer.id, book=book),
+            ),
+            rebind_cells=lambda *value_ids: tuple(
+                ssa_value_identity_cell(function, value_id, book=book)
+                for value_id in value_ids
             ),
         )
 

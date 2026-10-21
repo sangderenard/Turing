@@ -111,8 +111,18 @@ def _ssa_structure(read, scope, value_id, shape_scope=None, storage_scope=None):
     kind = ("unresolved" if dtype is None or dtype == "ssa.aggregate"
             else "reference" if dtype in {"opaque_ref", "ptr"}
             else "span" if shape else "scalar")
+    # Rule: the view reads the posted row.  A declared storage of scalar/span/
+    # reference overrides the derived kind of a resolved leaf; sequence/table/
+    # keyed/record are never reinterpreted from ``declared_storage``.
+    declared = getattr(fact, "storage", None)
+    if kind != "unresolved" and declared in {"scalar", "span", "reference"}:
+        kind = declared
     return StructuralValue(kind, int(value_id), cell, dtype=dtype,
-                           shape=shape, storage=kind)
+                           shape=shape, storage=kind,
+                           physical_dtype=getattr(fact, "physical_dtype", None),
+                           rank=getattr(fact, "rank", None),
+                           arena=bool(getattr(fact, "arena", False)),
+                           declared_storage=declared)
 
 
 def _optional_structure(read, scope, value_id, shape_scope=None, storage_scope=None):
@@ -445,8 +455,13 @@ def _transport(read, producer_row, consumer_row, paths, binding_rows):
         source, target = produced[producer_path], consumed[consumer_path]
         if source.dtype is None or target.dtype is None:
             raise ConcordanceRefusal(f"unresolved physical transport at {producer_path!r}")
-        if (source.dtype, source.shape, source.storage) != (
-            target.dtype, target.shape, target.storage
+        # Rule: a leaf pair is transportable only if the semantic dtype, the
+        # PHYSICAL dtype, the shape and the declared storage (else derived
+        # kind) all agree; a physical difference refuses like a dtype one.
+        if (source.dtype, source.physical_dtype, source.shape,
+                source.declared_storage or source.storage) != (
+            target.dtype, target.physical_dtype, target.shape,
+            target.declared_storage or target.storage
         ):
             raise ConcordanceRefusal(
                 f"physical transport disagreement at {producer_path!r}: "

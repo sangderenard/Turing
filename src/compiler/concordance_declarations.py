@@ -206,6 +206,13 @@ class StructuralValue:
     shape: tuple = ()
     storage: str | None = None
     mutable: bool | None = None
+    # Stage 2 rule: the structural view carries the SSA fact's PHYSICAL fields
+    # verbatim (None/False = not posted); ``storage`` stays the derived kind and
+    # ``declared_storage`` is the fact's declared storage when set.
+    physical_dtype: str | None = None
+    rank: int | None = None
+    arena: bool = False
+    declared_storage: str | None = None
 
     def __post_init__(self):
         if self.kind not in {"scalar", "product", "record", "sequence",

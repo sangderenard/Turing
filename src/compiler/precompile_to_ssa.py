@@ -10208,6 +10208,22 @@ class _ControlSSABuilder(TiledObject):
             # exact source contract and must not leave the resident payload
             # opaque at the function boundary.
             data.dtype = str(first_dtype)
+        # Program: gen_sort.py (sorted-generator result) -- the sort scratch
+        # arena, minted 'unknown' by ``fresh_value`` and then taken through
+        # ``external_value(dtype=first_dtype)`` (whose ``_value_cell`` keeps
+        # the existing row), plus the write just above.  Wrong record: the
+        # resident arena carries the concorded dtype while its ``ssa_value``
+        # row kept 'unknown'.  Rule: the producer posts the change at the
+        # moment it makes it, derived from the cells the dtype was concorded
+        # from (the same cells ``concord_sequence_row_dtypes`` read); an
+        # unchanged fact posts nothing.
+        self._revise_value(
+            data,
+            self._sequence_contract_cell(value_id),
+            self.ssa_value_objects.get(value_id),
+            self._canonical_cell(value_id),
+            stage=self._stage(),
+        )
         # Every storage cell of the descriptor descends from the data arena
         # (the authored sequence's value) and its contract cell.
         descriptor_operands = (data, self._sequence_contract_cell(int(value_id)))
@@ -14558,6 +14574,18 @@ class _ControlSSABuilder(TiledObject):
             )
             if source is None:
                 return
+            _dtype_cells = self._cells(
+                self._sequence_contract_cell(
+                    int(destination.sequence_id)
+                ),
+                self._sequence_contract_cell(int(source.sequence_id)),
+                *self.sequence_storage_values.get(
+                    int(destination.sequence_id), ()
+                ),
+                *self.sequence_storage_values.get(
+                    int(source.sequence_id), ()
+                ),
+            ) or (self._function_root(),)
             concorded_dtypes = concord_sequence_row_dtypes(
                 self.function_name,
                 {
@@ -14565,18 +14593,7 @@ class _ControlSSABuilder(TiledObject):
                     int(source.sequence_id): source.column_dtypes,
                 },
                 source=f"{location}: {operation} equivalence",
-                sources=self._cells(
-                    self._sequence_contract_cell(
-                        int(destination.sequence_id)
-                    ),
-                    self._sequence_contract_cell(int(source.sequence_id)),
-                    *self.sequence_storage_values.get(
-                        int(destination.sequence_id), ()
-                    ),
-                    *self.sequence_storage_values.get(
-                        int(source.sequence_id), ()
-                    ),
-                ) or (self._function_root(),),
+                sources=_dtype_cells,
                 stage=self._stage(),
             )
             if tuple(destination.column_dtypes) != concorded_dtypes:
@@ -14599,7 +14616,20 @@ class _ControlSSABuilder(TiledObject):
                     if str(value.dtype or "unknown") in {
                         "", "None", "unknown",
                     }:
+                        # Program: gen_sort.py (sorted-generator result) --
+                        # value 7, the ``sorted_result`` arena argument.
+                        # Wrong record: its ``ssa_value`` row was adopted
+                        # 'unknown' at descriptor construction (no row dtype
+                        # concorded yet); this write set only the resident,
+                        # so settlement found resident float64 vs row
+                        # 'unknown'.  Rule: the producer posts the change at
+                        # the moment it makes it, derived from the cells the
+                        # concorded dtype was read from; the resident is a
+                        # view of its row.
                         value.dtype = str(dtype)
+                        self._revise_value(
+                            value, *_dtype_cells, stage=self._stage(),
+                        )
             destination_tags = self.sequence_native_type_tag_columns(
                 int(destination.sequence_id)
             )
@@ -16248,7 +16278,17 @@ class _ControlSSABuilder(TiledObject):
         # statement that these three names are one quantity at three
         # generations, which is why three of them could disagree in
         # silence.
-        try:
+        # Program: a loop whose carried value has no ssa_value cell.  Wrong
+        # write: the declaration refused and `except Exception: pass` hid it,
+        # leaving the loop_scope row half-written.  Rule: the refusal
+        # (row = function, loop, binding; fact = value id) propagates.
+        # A loop with no source_loop_node_id has no loop_scope row key (the
+        # row is (function, loop node id, ...)); rebind_loop_scope_inner is
+        # guarded the same way (existing precedent, ~8571).  This was the
+        # swallowed TypeError of int(None).  OPEN ITEM: a loop with no node id
+        # has no identity and should be refused once the hand-built fixtures
+        # declare their loops.
+        if loop.source_loop_node_id is not None:
             from .identity_concordance import declare_loop_scope
 
             # A loop the reducer never saw (no lexical read scope) stands on
@@ -16264,8 +16304,6 @@ class _ControlSSABuilder(TiledObject):
                 ),
                 rebind_cells=self._loop_scope_value_cells,
             )
-        except Exception:
-            pass
         break_bound_initials = {
             int(initial_id): self._break_bound_initial(
                 int(port_id), int(initial_id),
@@ -17298,7 +17336,17 @@ class _ControlSSABuilder(TiledObject):
         # statement that these three names are one quantity at three
         # generations, which is why three of them could disagree in
         # silence.
-        try:
+        # Program: a loop whose carried value has no ssa_value cell.  Wrong
+        # write: the declaration refused and `except Exception: pass` hid it,
+        # leaving the loop_scope row half-written.  Rule: the refusal
+        # (row = function, loop, binding; fact = value id) propagates.
+        # A loop with no source_loop_node_id has no loop_scope row key (the
+        # row is (function, loop node id, ...)); rebind_loop_scope_inner is
+        # guarded the same way (existing precedent, ~8571).  This was the
+        # swallowed TypeError of int(None).  OPEN ITEM: a loop with no node id
+        # has no identity and should be refused once the hand-built fixtures
+        # declare their loops.
+        if loop.source_loop_node_id is not None:
             from .identity_concordance import declare_loop_scope
 
             # A loop the reducer never saw (no lexical read scope) stands on
@@ -17314,8 +17362,6 @@ class _ControlSSABuilder(TiledObject):
                 ),
                 rebind_cells=self._loop_scope_value_cells,
             )
-        except Exception:
-            pass
         break_bound_initials = {
             int(initial_id): self._break_bound_initial(
                 int(port_id), int(initial_id),
@@ -22364,6 +22410,36 @@ def _materialize_control_constants(
             provenance=Derived(sources),
             mode=Mode.CONCORD,
         )
+        # Program: repro_opt_tuple.py (``return None``) -- value 6, a
+        # NoneValue.  Wrong record: the ``ssa_value`` row was adopted with
+        # dtype None from the graph object, while this pass materialized the
+        # resident as "none" (here and in the retained-instruction rewrite
+        # above) and posted only the materialization row, so row and resident
+        # disagreed and settlement refused.  Rule: the pass that makes a
+        # transformation posts it at that moment, derived from the cells it
+        # read; a resident's dtype is a view of its ``ssa_value`` row -- a
+        # REVISE of the existing row, a post when the id has none.
+        _row = (scope, value_id)
+        _shape = tuple(instruction.res.shape or ())
+        if book.latest_ref(SSA_VALUE, _row) is None:
+            book.post(
+                SSA_VALUE, _row,
+                SSAValueFact(
+                    instruction.res.dtype, _shape,
+                    SSAValueOrigin.ADOPTED_GRAPH_ID,
+                ),
+                stage=CONTROL_SSA_FINISH,
+                provenance=Derived(sources),
+                mode=Mode.REVISE,
+            )
+        else:
+            from .ssa_record_return_state import revise_ssa_value
+
+            revise_ssa_value(
+                function, value_id, dtype=instruction.res.dtype,
+                shape=_shape, stage=CONTROL_SSA_FINISH, sources=sources,
+                book=book,
+            )
     materialized = set(materialized_ids)
     function.args = [
         argument for argument in function.args

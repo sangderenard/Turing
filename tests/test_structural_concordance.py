@@ -105,3 +105,93 @@ def test_optional_semantics_do_not_expand_one_physical_operand():
         )
     finally:
         end_identity_book(token)
+
+
+def _post_fact(book, scope, value_id, **fields):
+    return book.post(
+        SSA_VALUE, (scope, value_id),
+        SSAValueFact(fields.pop("dtype", "bool"), (), SSAValueOrigin.ADOPTED_GRAPH_ID, **fields),
+        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+    )
+
+
+def _transport_pair(book, producer_fields, consumer_fields):
+    produced = _post_fact(book, "producer", 7, **producer_fields)
+    consumed = _post_fact(book, "consumer", 7, **consumer_fields)
+    _, source = ssa_structure("producer", 7, book=book)
+    _, target = ssa_structure("consumer", 7, book=book)
+    binding = book.post(CALL_EDGE, ("consumer", 7, "producer", 7), "argument",
+                        stage=INGESTION, provenance=Derived((produced, consumed)),
+                        mode=Mode.CONCORD)
+    return boundary_transport("owner", "physical", source, target, (((), ()),),
+                              bindings=(binding,), book=book)
+
+
+def test_transport_refuses_physical_dtype_difference():
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(ConcordanceRefusal, match="physical transport disagreement"):
+            _transport_pair(book, dict(physical_dtype="float64"), {})
+    finally:
+        end_identity_book(token)
+
+
+def test_transport_passes_equal_physical_fields():
+    book, token = begin_identity_book()
+    try:
+        fields = dict(physical_dtype="float64", storage="scalar", rank=0)
+        transport = _transport_pair(book, fields, dict(fields))
+        assert book.current_ref(BOUNDARY_TRANSPORT, transport.row) is not None
+    finally:
+        end_identity_book(token)
+
+
+def test_transport_refuses_declared_storage_difference():
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(ConcordanceRefusal, match="physical transport disagreement"):
+            _transport_pair(book, dict(dtype="float64", storage="reference"),
+                            dict(dtype="float64", storage="scalar"))
+    finally:
+        end_identity_book(token)
+
+
+def test_revise_of_physical_dtype_invalidates_transport():
+    book, token = begin_identity_book()
+    try:
+        transport = _transport_pair(book, dict(physical_dtype="float64"),
+                                    dict(physical_dtype="float64"))
+        previous = book.latest_ref(SSA_VALUE, ("producer", 7))
+        book.post(SSA_VALUE, ("producer", 7),
+                  SSAValueFact("bool", (), SSAValueOrigin.ADOPTED_GRAPH_ID,
+                               physical_dtype="int32"),
+                  stage=INGESTION, provenance=Derived((previous,)), mode=Mode.REVISE)
+        with pytest.raises(ConcordanceRefusal, match="physical transport disagreement"):
+            book.current_ref(BOUNDARY_TRANSPORT, transport.row)
+    finally:
+        end_identity_book(token)
+
+
+def _audited(accounting, **fact_fields):
+    from src.transmogrifier.ssa import BasicBlock, Function, SSAValue
+
+    book, token = begin_identity_book()
+    try:
+        _post_fact(book, "audited", 5, **fact_fields)
+        value = SSAValue(5, "bool", (), accounting=accounting)
+        function = Function("audited", [value], {"entry": BasicBlock("entry", [])})
+        module = IRModule({"audited": function}, metadata={"identity_book": book})
+        return CorrelationTable._ssa_publication_findings(module)
+    finally:
+        end_identity_book(token)
+
+
+def test_audit_reports_physical_unposted_not_disagreement():
+    found = _audited({"physical_dtype": "float64"})
+    assert [f.kind for f in found] == ["ssa-physical-unposted"]
+
+
+def test_audit_reports_physical_disagreement_when_both_set():
+    found = _audited({"physical_dtype": "float64"}, physical_dtype="int32")
+    assert [f.kind for f in found] == ["ssa-publication-type-disagreement"]
+    assert not _audited({"physical_dtype": "float64"}, physical_dtype="float64")

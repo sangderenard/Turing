@@ -39,17 +39,83 @@ def _frame_cells(*items: Any) -> tuple[Any, ...]:
     return tuple(found)
 
 
-def _frame_value_cell(function: Any, value_id: Any) -> Any:
-    """The ``ssa_value`` cell of ``value_id`` in ``function``, or None."""
+def _frame_owner_book(function: Any) -> tuple[Any, Any]:
+    """``(book, artifact_sha256)`` that owns ``function``'s rows: its accepted
+    component's retained book and verified digest, else the ambient book and
+    None (the same owner rule as ``_accepted_component_identity_book``)."""
+
+    from .identity_concordance import current_identity_book
+
+    accepted = dict(
+        (getattr(function, "metadata", None) or {}).get(
+            "accepted_ssa_component"
+        ) or {}
+    )
+    owner = accepted.get("identity_book")
+    if owner is None:
+        return current_identity_book(), None
+    return owner, accepted.get("artifact_sha256")
+
+
+def _frame_cite(book: Any, cell: Any, artifact_sha256: Any) -> Any:
+    """``cell`` as the ambient book may cite it: itself when ``book`` is the
+    ambient book, else the IMPORTED_CELL receipt (``import_cell``) carrying
+    the owner's verified digest."""
+
+    from .identity_concordance import current_identity_book
+
+    ambient = current_identity_book()
+    if cell is None or book is ambient:
+        return cell
+    return ambient.import_cell(book, cell, artifact_sha256)
+
+
+# Program: a result storage lease for an accepted callee.  Wrong record: the
+# callee's ``ssa_value`` cell was looked up on the AMBIENT book (None,
+# silently dropped from the lease's cause set, or another row of the same
+# key) instead of the book that owns the callee.  Rule: a function's cells are
+# read in its owner's book and cited to the caller's book by IMPORTED_CELL
+# receipt; a cell of the ambient book is cited directly.
+def _frame_value_cell(function: Any, value_id: Any, *, book: Any = None) -> Any:
+    """The ``ssa_value`` cell of ``value_id`` in ``function``, or None.
+
+    Read in ``book`` or ``function``'s owner book and returned as the ambient
+    book may cite it (an IMPORTED_CELL receipt for an accepted callee)."""
 
     from .concordance_declarations import SSA_VALUE
-    from .identity_concordance import current_identity_book
 
     if function is None or value_id is None:
         return None
-    return current_identity_book().latest_ref(
+    owner, digest = _frame_owner_book(function)
+    if book is not None:
+        owner = book
+    cell = owner.latest_ref(
         SSA_VALUE, (_frame_book_scope(function), int(value_id)),
     )
+    return _frame_cite(owner, cell, digest)
+
+
+def _frame_required_value_cell(function: Any, value_id: Any) -> Any:
+    """``_frame_value_cell`` for a cell the caller is about to cite: a missing
+    row of an accepted callee is a lost proof and refuses with the function,
+    id and book consulted; an ambient function's missing row stays None."""
+
+    from .identity_concordance import ConcordanceRefusal
+
+    cell = _frame_value_cell(function, value_id)
+    accepted = function is not None and bool(
+        (getattr(function, "metadata", None) or {}).get(
+            "accepted_ssa_component"
+        )
+    )
+    if cell is None and accepted and value_id is not None:
+        owner, _ = _frame_owner_book(function)
+        raise ConcordanceRefusal(
+            f"lost proof: no ssa_value row for value {int(value_id)} of "
+            f"accepted callee {getattr(function, 'name', function)!r} in its "
+            f"accepted component's identity book {id(owner):#x}"
+        )
+    return cell
 
 
 def _frame_graph_cell(graph: Any, value_id: Any) -> Any:
@@ -77,16 +143,28 @@ def _frame_graph_cell(graph: Any, value_id: Any) -> Any:
     return node_identity_cell(graph, node_id)
 
 
-def _frame_table_cell(table: Any, value_id: Any, page: Any) -> Any:
+# Program: a result storage lease for an accepted callee.  Wrong record: the
+# callee's table member cell looked up on the ambient book.  Rule: ``function``
+# (the table's owning function, when it is an accepted callee) names the book
+# the row is read in; the cell is cited by IMPORTED_CELL receipt.
+def _frame_table_cell(
+    table: Any, value_id: Any, page: Any, *, book: Any = None,
+    function: Any = None,
+) -> Any:
     """The ``record_member`` / ``sequence_member`` / descriptor cell of
-    ``value_id`` on a book-backed SSA table, or None."""
+    ``value_id`` on a book-backed SSA table, or None.
 
-    from .identity_concordance import current_identity_book
+    Read in ``book``, else the owner book of ``function`` (the table's
+    function), else the ambient book."""
 
     owner = getattr(table, "owner", None)
     if table is None or owner is None or value_id is None:
         return None
-    return current_identity_book().latest_ref(page, (owner, int(value_id)))
+    source, digest = _frame_owner_book(function)
+    if book is not None:
+        source = book
+    cell = source.latest_ref(page, (owner, int(value_id)))
+    return _frame_cite(source, cell, digest)
 
 
 def _frame_register_sequence(

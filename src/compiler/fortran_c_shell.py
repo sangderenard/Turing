@@ -109,6 +109,7 @@ from .frame_identity_book import (
     _frame_mint as _frame_mint,
     _frame_post as _frame_post,
     _frame_register_sequence as _frame_register_sequence,
+    _frame_required_value_cell as _frame_required_value_cell,
     _frame_table_cell as _frame_table_cell,
     _frame_value_cell as _frame_value_cell,
     _monotonic_ssa_ids as _monotonic_ssa_ids,
@@ -1531,7 +1532,7 @@ def _recover_late_source_literals(
         )
         from .identity_concordance import Derived, Mode, current_identity_book
         from .ssa_record_return_state import (
-            function_scope_of, ssa_value_identity_cell,
+            function_scope_of, revise_ssa_value, ssa_value_identity_cell,
         )
 
         book = current_identity_book()
@@ -1563,6 +1564,18 @@ def _recover_late_source_literals(
                 stage=CONTROL_SSA_FINISH,
                 provenance=Derived(sources),
                 mode=Mode.CONCORD,
+            )
+            # Program: any late-exposed authored literal formal (None, str,
+            # bool, int, float).  Wrong record: the formal's dtype was set
+            # on the resident above ("none"/"int64"/...) but its
+            # ``ssa_value`` row kept the dtype the graph adopted, so row and
+            # resident disagreed.  Rule: the producer revises the row at the
+            # moment it changes the dtype, derived from the cells it read
+            # (graph identity cell, the value's own cell, block geometry).
+            revise_ssa_value(
+                function, value_id, dtype=instruction.res.dtype,
+                shape=tuple(instruction.res.shape or ()),
+                stage=CONTROL_SSA_FINISH, sources=sources, book=book,
             )
     return tuple(recovered)
 
@@ -28200,7 +28213,26 @@ def _class_surface_ssa_program(
                     # spells the absence literal as `NoneValue` with dtype
                     # "none". A structural `x is None` / `x is not None`
                     # operand recovered here must publish the same.
+                    # Program: any `x is None` operand recovered here.  Wrong
+                    # record: the fresh "none" resident was built with no
+                    # ``ssa_value`` row naming it (or the graph-adopted dtype
+                    # None row).  Rule: the producer posts its value at the
+                    # moment it makes it, derived from the source graph
+                    # node's cell (as ``structural_reference_identity``).
                     result = SSAValue(value_id, dtype="none")
+                    from .concordance_declarations import (
+                        CONTROL_SSA_FINISH, SSA_VALUE, SSAValueFact,
+                        SSAValueOrigin,
+                    )
+                    from .identity_concordance import Mode
+                    _frame_post(
+                        SSA_VALUE, (_frame_book_scope(function), int(value_id)),
+                        SSAValueFact("none", (), SSAValueOrigin.ADOPTED_GRAPH_ID),
+                        stage=CONTROL_SSA_FINISH, mode=Mode.REVISE,
+                        cells=_frame_cells(
+                            _frame_graph_cell(graph, int(value_id)),
+                        ),
+                    )
                     insertions.append(Instr("NoneValue", [], result))
                     values[value_id] = result
                     return result
@@ -39223,12 +39255,17 @@ def _class_surface_ssa_program(
                 # on the caller's book.  Discovery has already posted the
                 # exact decision that no caller record member owns it; that
                 # concordance cell is the cause for leasing caller storage.
+                # Program: a result storage lease for an accepted callee.
+                # Wrong record: the callee's value/member cell read on the
+                # ambient book (None, dropped).  Rule: read it in the callee's
+                # owner book, cite it by IMPORTED_CELL receipt; a missing
+                # callee value row is a lost proof and refuses by name.
                 lease_cells = _frame_cells(
                     source_structure_cell,
-                    _frame_value_cell(callee_function, old_id),
+                    _frame_required_value_cell(callee_function, old_id),
                     _frame_table_cell(
                         all_record_tables.get(callee_symbol), old_id,
-                        RECORD_MEMBER,
+                        RECORD_MEMBER, function=callee_function,
                     ) if field is not None else None,
                     _linked_caller_member_cell(
                         caller_symbol, int(planned_call.callsite_id),
@@ -42918,12 +42955,17 @@ def _class_surface_ssa_program(
                             # NOVEL(RESULT_STORAGE_LEASE, callee value cell)
                             # plus the ``result_storage_binding`` row, as the
                             # binding walk's ``allocate_result_storage``.
+                            # Program: a result storage lease for an
+                            # accepted callee.  Wrong record: ambient-book
+                            # lookup of an owner-book cell.  Rule: owner
+                            # book + IMPORTED_CELL receipt; a missing value
+                            # row refuses by name.
                             lease_cells = _frame_cells(
                                 source_structure_cell,
-                                _frame_value_cell(callee, source_id),
+                                _frame_required_value_cell(callee, source_id),
                                 _frame_table_cell(
                                     callee_record_table, source_id,
-                                    RECORD_MEMBER,
+                                    RECORD_MEMBER, function=callee,
                                 ) if field is not None else None,
                             )
                             caller_value_id = mint_compiler_value_id(
@@ -51487,6 +51529,21 @@ def _class_surface_ssa_program(
                     instruction.op = "NoneValue"
                     instruction.attributes = {}
                     instruction.res.dtype = "none"
+                    # Program: any function whose ``Const(value=None)``
+                    # survived to the final literal sweep.  Wrong record: the
+                    # resident became "none" with no revise of its
+                    # ``ssa_value`` row.  Rule: revise the row at the moment
+                    # of the change, derived from the row's own cell (the
+                    # only cell this sweep reads; no row -> nothing to
+                    # revise, left as is).
+                    from .concordance_declarations import CONTROL_SSA_FINISH
+                    from .ssa_record_return_state import revise_ssa_value
+
+                    revise_ssa_value(
+                        function, int(instruction.res.id), dtype="none",
+                        shape=tuple(instruction.res.shape or ()),
+                        stage=CONTROL_SSA_FINISH,
+                    )
         consumed_ids = {
             int(argument.id)
             for block in function.blocks.values()
