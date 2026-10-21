@@ -95,6 +95,72 @@ def _frame_value_cell(function: Any, value_id: Any, *, book: Any = None) -> Any:
     return _frame_cite(owner, cell, digest)
 
 
+# Program: a linked call whose result storage / output is read from the
+# callee's output (``fresh`` record copy, ``history_projection``,
+# ``loop_call_carry``; audit kind ``ssa-physical-unposted``).  Wrong record:
+# the linker's value rows carried no physical set -- the lease mint passed no
+# ``physical=``, and the output rebuild kept KEEP_PHYSICAL while copying the
+# callee's ``accounting`` dict onto the object.  Rule: a value that is a
+# view of a callee value posts that value's PHYSICAL fields as recorded on
+# the callee's own ``ssa_value`` row, read in the owner's book (the same
+# owner rule as ``_frame_value_cell``); accounting is never the source.  A
+# callee row that records none posts none -- the residue then belongs to the
+# callee's producer, not to this writer.
+def _frame_physical_fields(function: Any, value_id: Any, *, book: Any = None) -> Any:
+    """The physical fields (``physical_dtype``, ``storage``, ``rank``,
+    ``arena``, ``device``) recorded on ``value_id``'s ``ssa_value`` row in
+    ``function``'s owner book (or ``book``), as a mapping a mint or
+    ``publish_ssa_value_type(physical=...)`` accepts; ``KEEP_PHYSICAL`` when
+    the function has no such row or the row records none."""
+
+    from .concordance_declarations import KEEP_PHYSICAL, SSA_VALUE, SSAValueFact
+
+    if function is None or value_id is None:
+        return KEEP_PHYSICAL
+    owner, _ = _frame_owner_book(function)
+    if book is not None:
+        owner = book
+    fact = owner.page(SSA_VALUE).latest(
+        (_frame_book_scope(function), int(value_id))
+    )
+    if not isinstance(fact, SSAValueFact):
+        return KEEP_PHYSICAL
+    # Only the fields the callee row RECORDS are posted; an unrecorded field
+    # is not asserted (and cannot erase one the receiving row already has).
+    posted = {
+        name: getattr(fact, name)
+        for name in ("physical_dtype", "storage", "rank", "arena", "device")
+        if getattr(fact, name) not in (None, False)
+    }
+    return posted or KEEP_PHYSICAL
+
+
+def _frame_accounting_from_posted(accounting: Any, physical: Any) -> dict:
+    """``accounting`` with its five physical labels (``physical_dtype``,
+    ``program_abi_storage``, ``program_abi_rank``, ``sequence_arena``,
+    ``device``) set from the physical fields just POSTED -- the row is the
+    truth, the label follows it.
+
+    Program: ``keep`` / ``fresh`` / ``coerce`` / ``loop_call_carry``.  Wrong
+    record: only storage and rank were mirrored, and only where accounting
+    already carried the key, so a posted dtype, arena or device never reached
+    accounting.  Rule: accounting mirrors the fact -- every field the fact
+    records is written, whether or not the label was present."""
+
+    accounting = dict(accounting or {})
+    if isinstance(physical, dict):
+        for field, label in (
+            ("physical_dtype", "physical_dtype"),
+            ("storage", "program_abi_storage"),
+            ("rank", "program_abi_rank"),
+            ("arena", "sequence_arena"),
+            ("device", "device"),
+        ):
+            if physical.get(field) not in (None, False):
+                accounting[label] = physical[field]
+    return accounting
+
+
 def _frame_required_value_cell(function: Any, value_id: Any) -> Any:
     """``_frame_value_cell`` for a cell the caller is about to cite: a missing
     row of an accepted callee is a lost proof and refuses with the function,
@@ -323,7 +389,7 @@ def _frame_post(
 
 def _frame_mint(
     function: Any, transform: Any, operands: Any = (), *,
-    dtype: Any = None, shape: Any = (), stage: Any,
+    dtype: Any = None, shape: Any = (), stage: Any, physical: Any = None,
 ) -> int:
     """Mint one SSA id for ``function`` through the book: a NOVEL
     ``ssa_value`` row under its scope with ``transform`` and the one cell in
@@ -336,9 +402,16 @@ def _frame_mint(
     book = current_identity_book()
     scope = _frame_book_scope(function)
     cells = _frame_cells(*operands) or (_function_root_cell(book, scope),)
+    # Rule: a mint declares its physical fields (``physical``); the
+    # KEEP_PHYSICAL answer of ``_frame_physical_fields`` (nothing recorded to
+    # derive from) declares none.
+    from .concordance_declarations import KEEP_PHYSICAL
+
+    if physical is KEEP_PHYSICAL:
+        physical = None
     return _mint_ssa_id(
         book, scope, transform, cells,
-        dtype=dtype, shape=tuple(shape or ()), stage=stage,
+        dtype=dtype, shape=tuple(shape or ()), stage=stage, physical=physical,
     )
 
 
@@ -369,11 +442,12 @@ class _RecordAbiMinter:
 
         self.declaration = cell
 
-    def mint(self, *operands: Any, dtype: Any = None, shape: Any = ()) -> int:
+    def mint(self, *operands: Any, dtype: Any = None, shape: Any = (),
+             physical: Any = None) -> int:
         return _frame_mint(
             self.function, self.transform,
             (*operands, self.declaration),
-            dtype=dtype, shape=shape, stage=self.stage,
+            dtype=dtype, shape=shape, stage=self.stage, physical=physical,
         )
 
 

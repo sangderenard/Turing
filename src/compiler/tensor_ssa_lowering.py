@@ -326,6 +326,7 @@ def _records_same_identity_shape_transport(
     source_shape: tuple[int, ...],
     target_shape: tuple[int, ...],
     declared_view: Any,
+    target_id: int | None = None,
 ) -> bool:
     """Whether a canonical-id occurrence states that id's own shape.
 
@@ -338,6 +339,23 @@ def _records_same_identity_shape_transport(
     one identity row (for example ``(4, 41)`` and ``(164,)``).
     """
 
+    # Program: a passthrough call rebinds a formal's storage with a
+    # ``tensor_descriptor`` view occurrence (storage id 1, view (8,1,1))
+    # beside the storage's own occurrences (8,).  Wrong record: the view
+    # occurrence was read as the owner edge ``source -> 1`` whenever its
+    # shape happened to equal the source's, so one row key carried two
+    # target states and REVISE refused it.  Rule: an occurrence that
+    # declares ``ssa_storage_view`` of this very storage is a view
+    # identity keyed (storage_value_id, view_shape); it never publishes
+    # into the owner edge, whatever its shape.  The view's own edge is
+    # published from the descriptor-derived view producer.
+    if (
+        isinstance(declared_view, Mapping)
+        and target_id is not None
+        and declared_view.get("storage_value_id") is not None
+        and int(declared_view["storage_value_id"]) == int(target_id)
+    ):
+        return False
     declared_view_shape = tuple(
         declared_view.get("view_shape") or ()
     ) if isinstance(declared_view, Mapping) else ()
@@ -1603,9 +1621,39 @@ def propagate_repository_ssa_call_metadata(
                 and (value.accounting or {}).get("physical_dtype") is None
             ):
                 _log("physical_dtype", None, str(source_physical_dtype))
+                # Rule: post first; accounting is a view.  The physical dtype
+                # carried across this transport edge is revised onto the
+                # target value's ``ssa_value`` row, DERIVED from the source
+                # value's cell (the edge's own source cell) and the target's
+                # previous cell; the accounting is then set FROM that fact (a
+                # value with no row keeps the source's literal).
+                from .ssa_record_return_state import (
+                    posted_ssa_value_fact as _posted_physical_fact,
+                    revise_ssa_value as _revise_physical,
+                    ssa_value_identity_cell as _physical_identity_cell,
+                )
+                _physical_book = identity_book(module)
+                _revise_physical(
+                    function, int(value.id), dtype=value.dtype,
+                    shape=tuple(value.shape or ()), stage=stage,
+                    sources=(_physical_identity_cell(
+                        function if source_owner is None else source_owner,
+                        int(source.id), book=_physical_book,
+                    ),),
+                    book=_physical_book,
+                    physical={"physical_dtype": str(source_physical_dtype)},
+                )
+                _physical_fact = _posted_physical_fact(
+                    function, int(value.id), book=_physical_book,
+                )
                 value.accounting = {
                     **dict(value.accounting or {}),
-                    "physical_dtype": str(source_physical_dtype),
+                    "physical_dtype": (
+                        _physical_fact.physical_dtype
+                        if _physical_fact is not None
+                        and _physical_fact.physical_dtype is not None
+                        else str(source_physical_dtype)
+                    ),
                 }
                 changed = True
             if (
@@ -1634,6 +1682,65 @@ def propagate_repository_ssa_call_metadata(
                     key: source_contract_value,
                 }
                 changed = True
+            # Program: any call whose actual's span contract is transported
+            # onto a callee formal or load (history_projection: kernel formals
+            # and region Loads carrying ``span`` of rank 3).  Wrong record:
+            # the contract reached ``accounting`` but the value's
+            # ``ssa_value`` row kept storage/rank at their defaults, and the
+            # physical dtype post above carried only ``physical_dtype``.
+            # Rule: the edge posts what it carried -- the source row's posted
+            # storage/rank/arena, and the contract's storage/rank for the keys
+            # this edge delivered (accounting equal to the source's) -- onto
+            # the target row, DERIVED from the source's cell; accounting is
+            # then the view.  A partial post merges over the recorded fact.
+            from .concordance_declarations import (
+                SSA_VALUE_PHYSICAL_STORAGES as _PHYSICAL_STORAGES,
+            )
+            from .ssa_record_return_state import (
+                posted_ssa_value_fact as _posted_edge_fact,
+                revise_ssa_value as _revise_edge_physical,
+                ssa_value_identity_cell as _edge_identity_cell,
+            )
+            _edge_book = identity_book(module)
+            _edge_source_fact = _posted_edge_fact(
+                function if source_owner is None else source_owner,
+                int(source.id), book=_edge_book,
+            )
+            _edge_physical: dict[str, Any] = {}
+            if _edge_source_fact is not None:
+                if _edge_source_fact.storage is not None:
+                    _edge_physical["storage"] = _edge_source_fact.storage
+                if _edge_source_fact.rank is not None:
+                    _edge_physical["rank"] = _edge_source_fact.rank
+                if _edge_source_fact.arena:
+                    _edge_physical["arena"] = True
+            for _contract_key, _physical_field in (
+                ("program_abi_storage", "storage"), ("program_abi_rank", "rank"),
+            ):
+                _delivered = source_tensor_contract.get(_contract_key)
+                if (
+                    _delivered is not None
+                    and _physical_field not in _edge_physical
+                    and (value.accounting or {}).get(_contract_key) == _delivered
+                    and (
+                        _physical_field != "storage"
+                        or _delivered in _PHYSICAL_STORAGES
+                    )
+                ):
+                    _edge_physical[_physical_field] = (
+                        int(_delivered) if _physical_field == "rank"
+                        else _delivered
+                    )
+            if _edge_physical:
+                _revise_edge_physical(
+                    function, int(value.id), dtype=value.dtype,
+                    shape=tuple(value.shape or ()), stage=stage,
+                    sources=(_edge_identity_cell(
+                        function if source_owner is None else source_owner,
+                        int(source.id), book=_edge_book,
+                    ),),
+                    book=_edge_book, physical=_edge_physical,
+                )
             from .identity_concordance import (
                 PROVEN_SHAPE_PAGE,
                 SHAPE_STATE_PAGE,
@@ -1695,6 +1802,7 @@ def propagate_repository_ssa_call_metadata(
             # self-edge on the storage id here.
             if not _records_same_identity_shape_transport(
                 live_source_shape, target_shape, declared_view,
+                int(value.id),
             ):
                 continue
             shape_transformation_records.append((
@@ -2673,6 +2781,42 @@ def lower_tensor_calls_to_repository_ssa(
                         **dict(value.accounting or {}),
                         **transferred,
                     }
+                    # Program: a keyed Tensor child selected in the control
+                    # function and consumed in a planned region (history_
+                    # projection ``tick``: span rank 3 Loads).  Wrong record:
+                    # the shape concordance row's storage/rank reached
+                    # ``accounting`` only; the value's ``ssa_value`` row kept
+                    # the defaults.  Rule: the contract read from that row is
+                    # posted on the occurrence's row, DERIVED from the
+                    # concordance cell it was read from; accounting is then
+                    # the view.
+                    from .concordance_declarations import (
+                        SSA_VALUE_PHYSICAL_STORAGES as _TRANSFER_STORAGES,
+                        TENSOR_SHAPE_CONCORDANCE as _TRANSFER_PAGE,
+                        TENSOR_SSA_LOWERING as _TRANSFER_STAGE,
+                    )
+                    from .ssa_record_return_state import (
+                        revise_ssa_value as _revise_transfer,
+                    )
+                    _transfer_physical = {}
+                    if transferred.get("program_abi_storage") in _TRANSFER_STORAGES:
+                        _transfer_physical["storage"] = transferred[
+                            "program_abi_storage"
+                        ]
+                    if transferred.get("program_abi_rank") is not None:
+                        _transfer_physical["rank"] = int(
+                            transferred["program_abi_rank"]
+                        )
+                    if _transfer_physical:
+                        _revise_transfer(
+                            function, int(value.id), dtype=value.dtype,
+                            shape=tuple(value.shape or ()),
+                            stage=_TRANSFER_STAGE,
+                            sources=(book.latest_ref(
+                                _TRANSFER_PAGE, (owner_name, int(value.id)),
+                            ),),
+                            book=book, physical=_transfer_physical,
+                        )
 
         # The metadata identities are produced beside the selected child span
         # in the control function.  Make them ordinary call operands/formals
@@ -2953,14 +3097,57 @@ def lower_tensor_calls_to_repository_ssa(
         # Boolean occurrence crossing one of these calls. Without it, native C
         # allocates one byte per element and ``broadcast_double``/``where``
         # read or write eight, corrupting the activation heap.
-        for value in (*arguments, result):
+        # Rule: post first; accounting is a view.  Each shaped Boolean's row
+        # is revised with the double-backed physical dtype, DERIVED from the
+        # linked kernel's formal cell at that position (the output argument's
+        # for the result) and the value's own previous cell; the accounting
+        # is then set FROM that fact (a value with no row keeps the literal).
+        from .concordance_declarations import TENSOR_SSA_LOWERING as _KERNEL_STAGE
+        from .ssa_record_return_state import (
+            posted_ssa_value_fact as _posted_kernel_fact,
+            revise_ssa_value as _revise_kernel_value,
+            ssa_value_identity_cell as _kernel_identity_cell,
+        )
+        kernel = module.functions.get(callee)
+        kernel_owner = lowering_at[0]
+        kernel_book = identity_book(module)
+        for position, value in enumerate((*arguments, result)):
             if (
                 tuple(value.shape or ())
                 and str(value.dtype or "").casefold() in {"bool", "i1"}
             ):
+                formal_position = (
+                    position if position < len(arguments) else output_argument
+                )
+                formal = (
+                    kernel.args[formal_position]
+                    if kernel is not None and formal_position is not None
+                    and 0 <= formal_position < len(kernel.args) else None
+                )
+                kernel_fact = None
+                if kernel_owner is not None:
+                    _revise_kernel_value(
+                        kernel_owner, int(value.id), dtype=value.dtype,
+                        shape=tuple(value.shape or ()), stage=_KERNEL_STAGE,
+                        sources=(
+                            None if formal is None else _kernel_identity_cell(
+                                kernel, int(formal.id), book=kernel_book,
+                            ),
+                        ),
+                        book=kernel_book,
+                        physical={"physical_dtype": "float64"},
+                    )
+                    kernel_fact = _posted_kernel_fact(
+                        kernel_owner, int(value.id), book=kernel_book,
+                    )
                 value.accounting = {
                     **dict(value.accounting or {}),
-                    "physical_dtype": "float64",
+                    "physical_dtype": (
+                        kernel_fact.physical_dtype
+                        if kernel_fact is not None
+                        and kernel_fact.physical_dtype is not None
+                        else "float64"
+                    ),
                 }
         linked_roots.add(callee)
         attributes = {
@@ -4906,13 +5093,60 @@ def lower_tensor_calls_to_repository_ssa(
                         # back to the declared width).  Stamping it double
                         # made a float32 value live in, and be returned as,
                         # float64.
+                        # Program: history_identity's planned_region_6 emits
+                        # a ``binary_scalar_double`` result (value 62).  The
+                        # ABI stamp below lived on accounting alone, so the
+                        # value's ``ssa_value`` row stayed unposted and the
+                        # caller's Load of it proposed physical None against
+                        # an initial float64 (TransformationConflict).
+                        # Wrong record: an ABI declared on accounting, never
+                        # posted.  Rule: post first, accounting is a view;
+                        # the result's row is revised with the dispatch
+                        # kernel's double output ABI, DERIVED from its
+                        # previous cell and each operand's row.
+                        from .concordance_declarations import (
+                            TENSOR_SSA_LOWERING as _OPCODE_STAGE,
+                        )
+                        from .ssa_record_return_state import (
+                            posted_ssa_value_fact as _posted_opcode_fact,
+                            revise_ssa_value as _revise_opcode_value,
+                            ssa_value_identity_cell as _opcode_identity_cell,
+                        )
+                        _opcode_owner = lowering_at[0]
+                        _opcode_book = identity_book(module)
+                        _opcode_fact = None
+                        if _opcode_owner is not None:
+                            _revise_opcode_value(
+                                _opcode_owner, int(result.id),
+                                dtype=result.dtype,
+                                shape=tuple(result.shape or ()),
+                                stage=_OPCODE_STAGE,
+                                sources=tuple(
+                                    _opcode_identity_cell(
+                                        _opcode_owner, int(operand.id),
+                                        book=_opcode_book,
+                                    )
+                                    for operand in data_args
+                                ),
+                                book=_opcode_book,
+                                physical={"physical_dtype": "float64"},
+                            )
+                            _opcode_fact = _posted_opcode_fact(
+                                _opcode_owner, int(result.id),
+                                book=_opcode_book,
+                            )
                         result.accounting = {
                             **dict(result.accounting or {}),
                             # Both authored C dispatch kernels take
                             # ``double *`` outputs. Tensor comparison masks
                             # may remain semantically Boolean while retaining
                             # that physical storage ABI.
-                            "physical_dtype": "float64",
+                            "physical_dtype": (
+                                _opcode_fact.physical_dtype
+                                if _opcode_fact is not None
+                                and _opcode_fact.physical_dtype is not None
+                                else "float64"
+                            ),
                         }
                     if opcode_contract[0] == "binary":
                         shaped_operands = [

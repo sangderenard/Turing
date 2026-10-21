@@ -1553,7 +1553,7 @@ def post_parameter_abi_kinds(
 
 def _mint_ssa_id(
     book: Any, scope: Any, transform: Any, operands: Any, *,
-    dtype: Any = None, shape: tuple = (), stage: Any,
+    dtype: Any = None, shape: tuple = (), stage: Any, physical: Any = None,
 ) -> int:
     """Mint one SSA id through the book from outside a builder: a NOVEL
     ``ssa_value`` row on ``(scope, NEW)`` whose operand is the one cell in
@@ -1575,12 +1575,70 @@ def _mint_ssa_id(
         raise ConcordanceRefusal(
             f"mint under {scope!r} names no operand cell for {transform.name}"
         )
+    # Rule: a mint declares its physical fields (``physical``: a mapping of
+    # SSAValueFact physical fields, or None for a mint with none).
     ref = book.post(
         SSA_VALUE, (scope, NEW),
-        SSAValueFact(dtype, tuple(shape), SSAValueOrigin.MINTED),
+        SSAValueFact(
+            dtype, tuple(shape), SSAValueOrigin.MINTED, **dict(physical or {}),
+        ),
         stage=stage, provenance=Novel(transform, (operand,)), mode=Mode.REVISE,
     )
     return int(ref.row[1])
+
+
+def _declared_physical_dtype(dtype: Any) -> dict[str, Any]:
+    """``{"physical_dtype": dtype}`` for a mint whose element dtype is the
+    declared one of the storage it creates; nothing for an unresolved dtype
+    (an absent dtype is never posted as a physical one)."""
+
+    if dtype in (None, "", "unknown", "None"):
+        return {}
+    return {"physical_dtype": str(dtype)}
+
+
+def _contract_physical(
+    book: Any, value: Any, *cells: Any,
+) -> tuple[dict[str, Any], Ref] | None:
+    """The physical fields of ``value`` read from its ProgramABI contract row.
+
+    Program: every probe that lowers a typed parameter (repro_opt_tuple.py,
+    caller.py, whole.py, gen_sort.py).  Wrong record: the ``ssa_value`` row of
+    a root/region formal or a graph-id result carried no ``storage``/``rank``
+    while the contract's ``value_type_abi`` row for that very graph id
+    declared them (audit ``ssa-physical-unposted``).  Rule: the producer posts
+    the fields DERIVED from that contract row -- the ``value_type_abi`` cell
+    at the row of the value's ``canonical_value``/``ingestion_value`` cell --
+    and only when the row's physical arms are one view (a union whose arms
+    share storage, dtype, shape and rank is that view) whose dtype is the
+    value's own (and, for a scalar arm, a shapeless value).  A union of
+    different views, an optional, a row of another type, or no row posts
+    nothing: the fields stay absent rather than guessed.  Returns ``(fields, contract cell)`` so the
+    caller adds the contract cell to its DERIVED sources."""
+
+    for cell in cells:
+        if not isinstance(cell, Ref) or cell.page not in (
+            CANONICAL_VALUE, INGESTION_VALUE,
+        ):
+            continue
+        contract = book.current_ref(VALUE_TYPE_ABI, cell.row)
+        if contract is None:
+            continue
+        fact = book.page(VALUE_TYPE_ABI).cell(contract.row, contract.column)
+        arms = tuple(getattr(fact, "physical_alternatives", ()))
+        views = {
+            (arm.storage, arm.dtype, tuple(arm.shape), arm.rank)
+            for arm in arms
+        }
+        if len(views) != 1 or arms[0].storage == "none":
+            return None
+        arm = arms[0]
+        if str(arm.dtype) != str(value.dtype):
+            return None
+        if arm.storage == "scalar" and tuple(value.shape or ()):
+            return None
+        return {"storage": str(arm.storage), "rank": int(arm.rank)}, contract
+    return None
 
 
 def _post_planned_region_identities(
@@ -1619,14 +1677,23 @@ def _post_planned_region_identities(
             row = (scope, int(value.id))
             if book.latest_ref(SSA_VALUE, row) is not None:
                 continue
+            # Program: repro_opt_tuple.py / caller.py planned-region formals.
+            # Wrong record: the formal's row was born with no storage/rank
+            # although its feed's contract row declares them.  Rule: DERIVED
+            # from that ``value_type_abi`` row (``_contract_physical``).
+            _declared = _contract_physical(
+                book, value, graph_cell(int(value.id)),
+            )
             sources = tuple(dict.fromkeys(cell for cell in (
                 signature_cell, graph_cell(int(value.id)),
                 book.latest_ref(CONTROL_VALUE_BINDING, row),
+                *((_declared[1],) if _declared else ()),
             ) if cell is not None))
             book.post(
                 SSA_VALUE, row,
                 SSAValueFact(value.dtype, tuple(value.shape or ()),
-                             SSAValueOrigin.ADOPTED_GRAPH_ID),
+                             SSAValueOrigin.ADOPTED_GRAPH_ID,
+                             **(_declared[0] if _declared else {})),
                 stage=CONTROL_SSA_REGION, provenance=Derived(sources),
                 mode=Mode.CONCORD,
             )
@@ -1652,15 +1719,30 @@ def _post_planned_region_identities(
                     signature_cell if isinstance(signature_cell, Ref)
                     else _function_root_cell(book, scope)
                 )
+            # Program: history_projection / loop_call_carry region results.
+            # Wrong record: a Call/Load/formal result of a region block was
+            # posted with no storage/rank although the graph id's contract
+            # row declares them.  Rule: DERIVED from that ``value_type_abi``
+            # row (``_contract_physical``); a result with no such row (a
+            # minted id, an address Load) posts nothing.
+            _declared = (
+                None if minted
+                else _contract_physical(
+                    book, value, graph_cell(int(value.id)),
+                )
+            )
             book.post(
                 SSA_VALUE, row,
                 SSAValueFact(
                     value.dtype, tuple(value.shape or ()),
                     SSAValueOrigin.MINTED if minted
                     else SSAValueOrigin.ADOPTED_GRAPH_ID,
+                    **(_declared[0] if _declared else {}),
                 ),
                 stage=CONTROL_SSA_REGION,
-                provenance=Derived((source,)),
+                provenance=Derived((
+                    source, *((_declared[1],) if _declared else ()),
+                )),
                 mode=Mode.REVISE,
             )
     if not isinstance(signature_cell, Ref):
@@ -2386,16 +2468,44 @@ class _ControlSSABuilder(TiledObject):
                     str(arm.storage) not in {"sequence", "record"}
                     for arm in material_arms
                 )
+                # The ``value_type_abi`` row the arms were read from: it is
+                # a source of every physical fact posted below.
+                type_abi_cell = (
+                    None if self.lexical_read_scope is None
+                    else self._book().latest_ref(
+                        VALUE_TYPE_ABI,
+                        (self.lexical_read_scope, value_id),
+                    )
+                )
                 if shared_payload:
                     shared_arm = material_arms[0]
                     value.dtype = str(shared_arm.dtype or "unknown")
                     value.shape = tuple(shared_arm.shape or ())
+                    # Program: a native union parameter whose material arms
+                    # share one physical view (tests/
+                    # test_precompile_contract_rows.py, ``test_union_
+                    # parameter_arms_post_their_physical_view``).  Wrong
+                    # record: the parameter's ``ssa_value`` row carried no
+                    # storage/rank while accounting named the arm's storage.
+                    # Rule: DERIVED from the ``value_type_abi`` row and the
+                    # arm's source cells; accounting is then set FROM the
+                    # posted fact.
+                    self._revise_value(
+                        value, type_abi_cell, binding_cell,
+                        *shared_arm.source_cells,
+                        physical={
+                            "storage": str(shared_arm.storage),
+                            "rank": int(shared_arm.rank),
+                        },
+                    )
                     value.accounting.update({
                         "native_value_union_shared_parameter": str(name),
                         "native_value_union_source_id": value_id,
                         "native_value_union_alternatives": alternatives,
                         "program_abi_parameter": str(name),
-                        "program_abi_storage": str(shared_arm.storage),
+                        **self._posted_physical_accounting(
+                            value, ("program_abi_storage",),
+                        ),
                     })
                     self.arguments.append(value)
                 for arm in physical_alternatives:
@@ -2420,17 +2530,33 @@ class _ControlSSABuilder(TiledObject):
                             "descriptor-backed side-by-side frame: "
                             f"{name!r} arm {arm.identity!r}"
                         )
+                    # Program: a native union parameter with distinct
+                    # physical arms (same test family).  Wrong record: the
+                    # per-arm payload formal was minted with no physical
+                    # fields although its arm declares storage and rank.
+                    # Rule: the arm is read from the ``value_type_abi`` row,
+                    # so the mint declares ``physical=`` from it, citing that
+                    # row; accounting follows the posted fact.
                     payload = self.fresh_value(
                         dtype=str(arm.dtype or "unknown"),
                         shape=tuple(arm.shape or ()),
                         transform=REGION_FORMAL_SPLIT,
-                        operands=(value, binding_cell, *arm.source_cells),
+                        operands=(
+                            value, binding_cell, type_abi_cell,
+                            *arm.source_cells,
+                        ),
+                        physical={
+                            "storage": str(arm.storage),
+                            "rank": int(arm.rank),
+                        },
                     )
                     payload.accounting.update({
                         "native_value_union_parameter": str(name),
                         "native_value_union_source_id": value_id,
                         "native_value_union_alternative": str(arm.identity),
-                        "program_abi_storage": str(arm.storage),
+                        **self._posted_physical_accounting(
+                            payload, ("program_abi_storage",),
+                        ),
                     })
                     self.arguments.append(payload)
                     arm_payloads[str(arm.identity)] = (payload,)
@@ -2460,13 +2586,6 @@ class _ControlSSABuilder(TiledObject):
                     "native_type_tag_value_id": int(tag.id),
                     "native_type_alternatives": alternatives,
                 })
-                type_abi_cell = (
-                    None if self.lexical_read_scope is None
-                    else self._book().latest_ref(
-                        VALUE_TYPE_ABI,
-                        (self.lexical_read_scope, value_id),
-                    )
-                )
                 tag_cell = self._book().latest_ref(
                     SSA_VALUE, (self._scope(), int(tag.id)),
                 )
@@ -2549,6 +2668,24 @@ class _ControlSSABuilder(TiledObject):
                 "iterable_element_dtype": str(target.dtype),
                 "iterable_target_value_id": int(target_id),
             }
+            # Program: ``def f(rows: list[list[float]]) -> float`` summing
+            # ``for r in rows: for x in r``.  Wrong record: ``external_value``
+            # posted the iterable's ``ssa_value`` row with dtype None (the
+            # region meta had none), then this binding set float64 on the
+            # object only; the settlement later read the row (None) against
+            # the resident float64 and ``publish_ssa_value_type`` refused.
+            # Rule: the dtype learned here is revised onto the value's row
+            # DERIVED from the target's canonical cell it was read from, and
+            # the binding follows the revision (as the REFINED branch of
+            # ``external_value`` does).
+            previous_binding = self._binding_cell(int(iterable_id))
+            revised = self._revise_value(
+                iterable, self._canonical_cell(int(target_id)),
+            )
+            self._bind(
+                int(iterable_id), iterable, BindingKind.REFINED,
+                previous_binding, revised,
+            )
         self.current = self.new_block("entry")
         deletion_sequence_ids = {
             int(sequence_id)
@@ -3434,15 +3571,23 @@ class _ControlSSABuilder(TiledObject):
                 # owns the integer key representation.  Convert that native
                 # word explicitly; no Python object or runtime inspection is
                 # involved.
+                # Program: a table lookup/store keyed by an ``opaque_ref``
+                # (tests/test_ir_sequence_tables::test_static_program_
+                # reference_is_typed_ssa_and_native_handle_storage).  Wrong
+                # record: the cast result carried scalar/rank 0 only in
+                # accounting.  Rule: the cast's result IS a fixed-width
+                # native word, scalar by construction, so that literal is the
+                # DECLARATION of the construct and is posted Novel at the
+                # mint (``physical=``); accounting is set from the fact.
                 handle = self.fresh_value(
                     dtype=expected,
                     transform=CONTROL_EXPRESSION,
                     operands=(value,),
+                    physical={"storage": "scalar", "rank": 0},
                 )
                 handle.accounting.update({
                     "native_reference_handle_for_value_id": int(value.id),
-                    "program_abi_storage": "scalar",
-                    "program_abi_rank": 0,
+                    **self._posted_physical_accounting(handle),
                 })
                 self.emit(
                     Handler.Cast, [value], handle,
@@ -3701,30 +3846,26 @@ class _ControlSSABuilder(TiledObject):
                 element_count,
                 attributes={"binding": "keyed_tensor_row_length"},
             )
-            row_base.accounting = {
-                **dict(row_base.accounting or {}),
-                "program_abi_storage": "span",
-                "program_abi_rank": max(
-                    1, int(self.region_value_ranks.get(int(result_id), 1))
-                ),
-                "tensor_metadata_state": "dynamic",
-                "tensor_shape_value_id": int(shape_address.id),
-                "tensor_rank_value_id": int(rank.id),
-                "tensor_element_count_value_id": int(element_count.id),
-                "keyed_tensor_handle_value_id": int(result.id),
-            }
-            # This lookup is the stage that owns the physical child-span
-            # identities.  Commit the complete contract under the authored
-            # result identity so the planned numerical occurrence can recover
-            # it without rediscovering shape from flat storage.
-            # DERIVED(the lookup's ``ssa_value`` cell and the cells it names).
-            self._post_tensor_shape_contract(
+            # Program: a keyed Tensor lookup (test_precompile_contract_rows.py,
+            # ``test_keyed_tensor_lookup_posts_span_rank``).  Wrong record:
+            # the selected child span's rank (the region's rank claim, read
+            # from the ``tensor_shape_concordance`` row the planner posted
+            # under this identity) reached the row base only in accounting,
+            # with just the shape-concordance row posted.  Rule: this lookup
+            # owns the physical child-span identities, so it commits the
+            # complete contract under the authored result identity FIRST
+            # (DERIVED from the incumbent row, the lookup's ``ssa_value``
+            # cell and the cells it names), then posts the row base's
+            # storage/rank DERIVED from that contract cell, then sets the
+            # accounting FROM the posted fact.
+            _keyed_rank = max(
+                1, int(self.region_value_ranks.get(int(result_id), 1))
+            )
+            _contract_cell = self._post_tensor_shape_contract(
                 int(result_id),
                 {
                     "program_abi_storage": "span",
-                    "program_abi_rank": int(
-                        row_base.accounting["program_abi_rank"]
-                    ),
+                    "program_abi_rank": _keyed_rank,
                     "tensor_metadata_state": "dynamic",
                     "tensor_shape_value_id": int(shape_address.id),
                     "tensor_rank_value_id": int(rank.id),
@@ -3733,6 +3874,19 @@ class _ControlSSABuilder(TiledObject):
                 },
                 result, shape_address, rank, element_count,
             )
+            self._revise_value(
+                row_base, _contract_cell,
+                physical={"storage": "span", "rank": _keyed_rank},
+            )
+            row_base.accounting = {
+                **dict(row_base.accounting or {}),
+                **self._posted_physical_accounting(row_base),
+                "tensor_metadata_state": "dynamic",
+                "tensor_shape_value_id": int(shape_address.id),
+                "tensor_rank_value_id": int(rank.id),
+                "tensor_element_count_value_id": int(element_count.id),
+                "keyed_tensor_handle_value_id": int(result.id),
+            }
             self._bind(
                 int(result_id), row_base, BindingKind.SEQUENCE_RESULT,
                 result, offset,
@@ -4751,11 +4905,28 @@ class _ControlSSABuilder(TiledObject):
             for argument in function.args:
                 old_id = int(argument.id)
                 if has_flag(old_id, MINTED) and old_id not in minted_with_edges:
+                    # Program: keyed Tensor lookup (tests/test_sequence_helper
+                    # _physical_rows.py).  Wrong record: the lookup helper's
+                    # own formals (its query/default; the builder declares
+                    # their dtype from the descriptor's key/value column) were
+                    # minted with dtype only, ``physical_dtype`` reaching the
+                    # row in accounting alone.  Rule: this registration is the
+                    # first producer to know the formal and its declared
+                    # dtype, so the mint posts it (plus ``arena`` when the
+                    # builder declared a ``sequence_arena``); accounting
+                    # follows the fact.
+                    _arena = bool(
+                        (argument.accounting or {}).get("sequence_arena")
+                    )
                     replacements[old_id] = _mint_ssa_id(
                         book, scope, CONTROL_EXPRESSION, (owner,),
                         dtype=argument.dtype,
                         shape=tuple(argument.shape or ()),
                         stage=self._stage(),
+                        physical={
+                            **({"arena": True} if _arena else {}),
+                            **_declared_physical_dtype(argument.dtype),
+                        } or None,
                     )
             if replacements:
                 for value in (
@@ -4785,6 +4956,31 @@ class _ControlSSABuilder(TiledObject):
             for argument in function.args:
                 row = (scope, int(argument.id))
                 if book.latest_ref(SSA_VALUE, row) is None:
+                    # Program: keyed Tensor lookup.  Wrong record: a helper
+                    # formal that keeps the caller's descriptor id was
+                    # adopted with dtype only while the caller's own row
+                    # (this builder's descriptor mint) posts its physical
+                    # fields.  Rule: the formal is the same storage, so its
+                    # row is DERIVED from the caller's row and carries the
+                    # fields that row records; none recorded posts none.
+                    _caller_ref = book.latest_ref(
+                        SSA_VALUE, (self._scope(), int(argument.id)),
+                    )
+                    _caller_fact = (
+                        None if _caller_ref is None else
+                        book.page(SSA_VALUE).cell(
+                            _caller_ref.row, _caller_ref.column,
+                        )
+                    )
+                    _carried = {
+                        name: getattr(_caller_fact, name)
+                        for name in (
+                            "physical_dtype", "storage", "rank", "arena",
+                            "device",
+                        )
+                        if isinstance(_caller_fact, SSAValueFact)
+                        and getattr(_caller_fact, name) not in (None, False)
+                    }
                     book.post(
                         SSA_VALUE,
                         row,
@@ -4792,9 +4988,13 @@ class _ControlSSABuilder(TiledObject):
                             argument.dtype,
                             tuple(argument.shape or ()),
                             SSAValueOrigin.ADOPTED_GRAPH_ID,
+                            **_carried,
                         ),
                         stage=self._stage(),
-                        provenance=Derived((owner,)),
+                        provenance=Derived(tuple(
+                            (owner,) if not _carried
+                            else (owner, _caller_ref)
+                        )),
                         mode=Mode.REVISE,
                     )
             generated = tuple(
@@ -5399,9 +5599,18 @@ class _ControlSSABuilder(TiledObject):
         key = (int(iterable_id), int(column_projection))
         source = self.variant_type_tag_columns.get(key)
         if source is None:
+            # Program: a heterogeneous resident sequence read through its
+            # union tag column (test_precompile_contract_rows.py).  Wrong
+            # record: every column projection below carried span/rank 1 only
+            # in accounting.  Rule: a table column IS a one-axis span by
+            # construction -- that literal is the DECLARATION of the
+            # construct, posted Novel at the mint (``physical=``), and the
+            # accounting is set from the posted fact.
+            _column_physical = {"storage": "span", "rank": 1}
             source = self.fresh_value(
                 dtype="int64", transform=ROW_COLUMN_PROJECTION,
                 operands=(int(iterable_id), int(target_id)),
+                physical=_column_physical,
             )
             parameter_name = next((
                 str(name) for name, history in self.value_name_histories.items()
@@ -5416,8 +5625,7 @@ class _ControlSSABuilder(TiledObject):
                     "native_type_tag_sequence_parameter": parameter_name,
                     "program_abi_parameter": parameter_name,
                 } if parameter_name is not None else {}),
-                "program_abi_storage": "span",
-                "program_abi_rank": 1,
+                **self._posted_physical_accounting(source),
             })
             self.arguments.append(source)
             self.variant_type_tag_columns[key] = source
@@ -5451,6 +5659,7 @@ class _ControlSSABuilder(TiledObject):
                         dtype="int64",
                         transform=ROW_COLUMN_PROJECTION,
                         operands=(int(iterable_id), int(target_id), identity),
+                        physical=_column_physical,
                     )
                     payload.accounting.update({
                         "native_value_union_sequence_for_value_id": int(
@@ -5469,8 +5678,7 @@ class _ControlSSABuilder(TiledObject):
                         "compiler_frame_member": (
                             "value_union", int(column_projection), identity,
                         ),
-                        "program_abi_storage": "span",
-                        "program_abi_rank": 1,
+                        **self._posted_physical_accounting(payload),
                     })
                     self.arguments.append(payload)
                     self.variant_type_payload_columns[
@@ -5491,6 +5699,7 @@ class _ControlSSABuilder(TiledObject):
                     shape=tuple(arm.shape or ()),
                     transform=ROW_COLUMN_PROJECTION,
                     operands=(int(iterable_id), int(target_id), identity),
+                    physical=_column_physical,
                 )
                 payload.accounting.update({
                     "native_value_union_sequence_for_value_id": int(
@@ -5506,8 +5715,7 @@ class _ControlSSABuilder(TiledObject):
                     "compiler_frame_member": (
                         "value_union", int(column_projection), identity,
                     ),
-                    "program_abi_storage": "span",
-                    "program_abi_rank": 1,
+                    **self._posted_physical_accounting(payload),
                     "sequence_row_shape": tuple(arm.shape or ()),
                 })
                 self.arguments.append(payload)
@@ -6852,6 +7060,15 @@ class _ControlSSABuilder(TiledObject):
             sources = self._cells(
                 self._declaring_region_cell(int(value.id)),
             ) or (self._function_root(),)
+        # Program: gen_sort.py / caller.py root formals, singleton_snapshot
+        # call results.  Wrong record: an adopted graph id's row carried no
+        # storage/rank although its contract row (``value_type_abi`` at the
+        # id's canonical cell) declares them.  Rule: DERIVED from that row
+        # (``_contract_physical``); an id with no contract row posts none.
+        _declared = _contract_physical(book, value, *sources)
+        if _declared:
+            fact = replace(fact, **_declared[0])
+            sources = (*sources, _declared[1])
         ref = book.post(
             SSA_VALUE, row, fact,
             stage=self._stage(stage),
@@ -6861,6 +7078,72 @@ class _ControlSSABuilder(TiledObject):
         self.ssa_value_objects[int(value.id)] = value
         return ref
 
+    def _phi_physical(self, *operands: SSAValue) -> dict[str, Any] | None:
+        """The ``storage``/``rank`` of a Phi, read from its operands' rows.
+
+        Program: loop_call_carry (``lower_loop`` carried Phis).  Wrong
+        record: the header Phi row posted no storage/rank beside its seed's.
+        Rule: a Phi is one storage with its operands; every operand row that
+        carries the fields must carry the SAME fields, which the Phi posts;
+        operand rows that carry none are no evidence.  Operands that disagree
+        are refused by name -- a Phi of two storages is not one value."""
+
+        book = self._book()
+        seen: dict[tuple, SSAValue] = {}
+        for operand in operands:
+            cell = book.latest_ref(
+                SSA_VALUE, (self._scope(), int(operand.id)),
+            )
+            fact = (
+                None if cell is None
+                else book.page(SSA_VALUE).cell(cell.row, cell.column)
+            )
+            if not isinstance(fact, SSAValueFact) or fact.storage is None:
+                continue
+            seen.setdefault((fact.storage, fact.rank), operand)
+        if not seen:
+            return None
+        if len(seen) > 1:
+            raise ConcordanceRefusal(
+                "Phi operands name different physical storage: "
+                + ", ".join(
+                    f"value {int(v.id)} is storage={k[0]!r} rank={k[1]!r}"
+                    for k, v in seen.items()
+                )
+            )
+        (storage, rank), = seen
+        return {"storage": storage, "rank": rank}
+
+    def _posted_carried_type(
+        self, initial: SSAValue, *operands: SSAValue,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """The dtype and physical fields a carried Phi is minted with, read
+        from the POSTED ``ssa_value`` row of its initial value.
+
+        Program: ``for i in range(8): j = 0; while j < 4: ...; j = j + 1``.
+        Wrong record: the header Phi was minted with the initial's authored
+        spelling (``int``, the object's dtype) while the literal's posted row
+        is the declared ``int64`` (constant materialization revises it), so
+        one shape edge keyed on the Phi id received ``int64 -> int`` beside
+        ``int64 -> int64`` from the region-call occurrences.  Rule: the book
+        is the authority and the object a view; a carried Phi is DERIVED from
+        its initial's cell (the operand of the mint) and declares that row's
+        dtype and physical fields.  A value with no posted row keeps its
+        object's dtype."""
+
+        book = self._book()
+        cell = book.latest_ref(SSA_VALUE, (self._scope(), int(initial.id)))
+        fact = (
+            None if cell is None
+            else book.page(SSA_VALUE).cell(cell.row, cell.column)
+        )
+        physical = dict(self._phi_physical(initial, *operands) or {})
+        if not isinstance(fact, SSAValueFact):
+            return initial.dtype, (physical or None)
+        if fact.physical_dtype is not None:
+            physical.setdefault("physical_dtype", fact.physical_dtype)
+        return fact.dtype, (physical or None)
+
     def fresh_value(
         self,
         *,
@@ -6869,6 +7152,7 @@ class _ControlSSABuilder(TiledObject):
         transform: Any,
         operands: tuple = (),
         stage: Any = None,
+        physical: Any = None,
     ) -> SSAValue:
         """Mint one SSA value through the book: NOVEL(``transform``,
         operand) on ``ssa_value`` row ``(scope, NEW)``.
@@ -6886,9 +7170,15 @@ class _ControlSSABuilder(TiledObject):
             operand = self._cell_set(cells, stage)
         else:
             operand = self._function_root()
+        # Rule: a mint declares its physical fields (``physical``: a mapping
+        # of SSAValueFact physical fields, or None for a mint with none),
+        # as ``_mint_ssa_id`` does.
         ref = self._book().post(
             SSA_VALUE, (self._scope(), NEW),
-            SSAValueFact(dtype, tuple(shape), SSAValueOrigin.MINTED),
+            SSAValueFact(
+                dtype, tuple(shape), SSAValueOrigin.MINTED,
+                **dict(physical or {}),
+            ),
             stage=stage,
             provenance=Novel(transform, (operand,)),
             mode=Mode.REVISE,
@@ -6896,6 +7186,31 @@ class _ControlSSABuilder(TiledObject):
         value = SSAValue(int(ref.row[1]), dtype=dtype, shape=shape)
         self.ssa_value_objects[int(value.id)] = value
         return value
+
+    def _posted_physical_accounting(
+        self, value: SSAValue,
+        keys: tuple[str, ...] = ("program_abi_storage", "program_abi_rank"),
+    ) -> dict[str, Any]:
+        """The ProgramABI accounting labels (``program_abi_storage``,
+        ``program_abi_rank``) of ``value`` read FROM its posted ``ssa_value``
+        row, for the fields the row records.  Rule: the book is the
+        authority and accounting a derived view -- a producer posts the
+        physical fact first (``physical=`` on the mint or the revise) and
+        sets its accounting from this, never the other way round."""
+
+        book = self._book()
+        cell = book.latest_ref(SSA_VALUE, (self._scope(), int(value.id)))
+        fact = (
+            None if cell is None
+            else book.page(SSA_VALUE).cell(cell.row, cell.column)
+        )
+        view: dict[str, Any] = {}
+        if isinstance(fact, SSAValueFact):
+            if fact.storage is not None and "program_abi_storage" in keys:
+                view["program_abi_storage"] = fact.storage
+            if fact.rank is not None and "program_abi_rank" in keys:
+                view["program_abi_rank"] = fact.rank
+        return view
 
     def _revise_value(
         self, value: SSAValue, *cells: Any, stage: Any = None,
@@ -7998,6 +8313,27 @@ class _ControlSSABuilder(TiledObject):
                 feeds, storage_arguments,
             ))
         ]
+        # Rule: an argument occurrence states its id's POSTED dtype -- the
+        # row is the authority, the occurrence its view.  The feed's dtype
+        # is the region formal's spelling (``region_feed_meta``, built from
+        # the planned region's ``arguments``) and may be the authored
+        # ``int`` where the storage's row declares ``int64``; spelling the
+        # occurrence from the feed posted two target states to one shape
+        # edge.  A storage with no posted row keeps the feed's dtype.
+        for _position, _argument in enumerate(arguments):
+            _cell = self._book().latest_ref(
+                SSA_VALUE, (self._scope(), int(_argument.id)),
+            )
+            _recorded = (
+                None if _cell is None
+                else self._book().page(SSA_VALUE).cell(_cell.row, _cell.column)
+            )
+            if (
+                isinstance(_recorded, SSAValueFact)
+                and _recorded.dtype not in {None, "unknown"}
+                and _argument.dtype != _recorded.dtype
+            ):
+                _argument.dtype = _recorded.dtype
         # REGION_CALL_RESULT: the region's signature cell (posted where the
         # signature was built) and the storage arguments it is fed.
         signature_cell = self._declared_cell(
@@ -8361,6 +8697,7 @@ class _ControlSSABuilder(TiledObject):
             dtype=str(candidate.dtype or incumbent.dtype or "unknown"),
             shape=tuple(candidate.shape or incumbent.shape),
             transform=PHI_LOOP_HEADER, operands=tuple(incoming_values),
+            physical=self._phi_physical(*incoming_values),
         )
         self.emit(
             Handler.Phi,
@@ -8476,6 +8813,7 @@ class _ControlSSABuilder(TiledObject):
                     dtype=str(candidate.dtype or incumbent.dtype or "unknown"),
                     shape=tuple(candidate.shape or incumbent.shape),
                     transform=PHI_LOOP_HEADER, operands=tuple(incoming_values),
+                    physical=self._phi_physical(*incoming_values),
                 )
                 self.emit(
                     Handler.Phi,
@@ -9030,6 +9368,27 @@ class _ControlSSABuilder(TiledObject):
             value = self.external_value(
                 int(expression.value_id), dtype="bool"
             )
+            # Rule: post first; accounting is a view.  The presence value's
+            # physical record (bool, scalar, rank 0) is revised onto its
+            # ``ssa_value`` row DERIVED from the presence expression's
+            # canonical cell and the payload's canonical cell, then the
+            # accounting below is set FROM that posted fact.
+            _presence_sources = (
+                int(expression.value_id),
+                *((int(expression.optional_payload_value_id),)
+                  if expression.optional_payload_value_id is not None else ()),
+            )
+            self._value_cell(value, *_presence_sources)
+            _presence_cell = self._revise_value(
+                value, *_presence_sources,
+                physical={
+                    "physical_dtype": "bool", "storage": "scalar", "rank": 0,
+                    "arena": False, "device": value.device,
+                },
+            )
+            _presence_fact = self._book().page(SSA_VALUE).cell(
+                _presence_cell.row, _presence_cell.column,
+            )
             value.accounting = {
                 **dict(value.accounting or {}),
                 **({
@@ -9041,10 +9400,10 @@ class _ControlSSABuilder(TiledObject):
                 **({
                     "program_abi_field": expression.program_abi_field,
                 } if expression.program_abi_field is not None else {}),
-                "program_abi_storage": "scalar",
+                "program_abi_storage": _presence_fact.storage,
                 "program_abi_optional_presence": True,
                 "program_abi_optional_present_when": True,
-                "physical_dtype": "bool",
+                "physical_dtype": _presence_fact.physical_dtype,
                 "physical_dtype_provenance": (
                     "control_ir_optional_presence"
                 ),
@@ -9988,6 +10347,17 @@ class _ControlSSABuilder(TiledObject):
             return
         raise TypeError(f"unknown control block {type(block).__name__}")
 
+    def _mint_arena_column(
+        self, dtype: str | None, operands: tuple,
+    ) -> SSAValue:
+        """A descriptor column beyond column 0: an arena whose element dtype
+        the descriptor declares at the mint."""
+
+        return self.fresh_value(
+            dtype=dtype, transform=DESCRIPTOR_CELL, operands=operands,
+            physical={"arena": True, **_declared_physical_dtype(dtype)},
+        )
+
     def _sequence_descriptor(
         self,
         value_id: int,
@@ -10213,16 +10583,19 @@ class _ControlSSABuilder(TiledObject):
         # ``external_value(dtype=first_dtype)`` (whose ``_value_cell`` keeps
         # the existing row), plus the write just above.  Wrong record: the
         # resident arena carries the concorded dtype while its ``ssa_value``
-        # row kept 'unknown'.  Rule: the producer posts the change at the
+        # row kept 'unknown'; and ``sequence_arena`` was set above with no
+        # ``arena`` posted.  Rule: the producer posts the change at the
         # moment it makes it, derived from the cells the dtype was concorded
-        # from (the same cells ``concord_sequence_row_dtypes`` read); an
-        # unchanged fact posts nothing.
+        # from (the same cells ``concord_sequence_row_dtypes`` read); the
+        # data column is column 0 of the sequence's descriptor, hence an
+        # arena; an unchanged fact posts nothing.
         self._revise_value(
             data,
             self._sequence_contract_cell(value_id),
             self.ssa_value_objects.get(value_id),
             self._canonical_cell(value_id),
             stage=self._stage(),
+            physical={"arena": True},
         )
         # Every storage cell of the descriptor descends from the data arena
         # (the authored sequence's value) and its contract cell.
@@ -10232,15 +10605,30 @@ class _ControlSSABuilder(TiledObject):
             if declared_child_layout is not None else
             1
         )
+        # Program: gen_sort.py -- the sort order/scratch descriptors' extra
+        # columns.  Wrong record: each was minted with no ``arena`` while the
+        # accounting set below says ``sequence_arena``.  Rule: a column
+        # beyond column 0 of the descriptor schema is an arena; the mint
+        # declares it (``physical``), derived from the descriptor operands.
+        # Program: a keyed Tensor lookup (tests/test_sequence_helper_physical_
+        # rows.py).  Wrong record: the descriptor's arenas and typed storage
+        # cells were minted with their element dtype only in ``dtype``; the
+        # helper formals built from them later carried ``physical_dtype`` in
+        # accounting alone (audit ``ssa-physical-unposted``).  Rule: the
+        # descriptor is the first producer to know the element type of its
+        # arena / typed one-element cell, so the mint declares it
+        # (``_declared_physical_dtype``); accounting is set from the fact.
         extra_columns = tuple(
-            self.fresh_value(dtype=_canonicalize_column(
-                (
-                    "int64"
-                    if nested_table and index + 1 == handle_column
-                    else concorded_column_dtypes[index + 1]
-                ),
-                index + 1,
-            ), transform=DESCRIPTOR_CELL, operands=descriptor_operands)
+            self._mint_arena_column(
+                _canonicalize_column(
+                    (
+                        "int64"
+                        if nested_table and index + 1 == handle_column
+                        else concorded_column_dtypes[index + 1]
+                    ),
+                    index + 1,
+                ), descriptor_operands,
+            )
             for index in range(max(0, int(column_count) - 1))
         )
         for index, column in enumerate(extra_columns, start=1):
@@ -10268,6 +10656,7 @@ class _ControlSSABuilder(TiledObject):
             return self.fresh_value(
                 dtype=dtype, shape=shape, transform=DESCRIPTOR_CELL,
                 operands=descriptor_operands,
+                physical=_declared_physical_dtype(dtype),
             )
 
         length_address = storage_cell("int64", (1,))
@@ -10440,13 +10829,42 @@ class _ControlSSABuilder(TiledObject):
             )
             arena_ids = {*descriptor.column_value_ids,
                          *((descriptor.live_flags_value_id,) if descriptor.live_flags_value_id is not None else ())}
+            # Program: gen_sort.py (``xs: list[int]`` parameter).  Wrong record:
+            # the descriptor members (data arena, length address, capacity,
+            # status address, live flags) were given ProgramABI storage/rank
+            # in accounting only, their rows carrying none.  Rule: post
+            # first, accounting is a view.  A member is a span when the
+            # descriptor schema names it a column/live-flag arena or its
+            # shape is non-empty, else a scalar; the row is revised DERIVED
+            # from the sequence contract cell, the owner's
+            # ``parameter_abi_kind`` cell and the member's own row, and the
+            # accounting is set FROM the posted fact.
+            _owner_kind = (
+                None if self.lexical_read_scope is None
+                else self._book().latest_ref(
+                    PARAMETER_ABI_KIND,
+                    (tuple(self.lexical_read_scope), str(parameter_owner)),
+                )
+            )
             for member in members:
                 span = int(member.id) in arena_ids or bool(member.shape)
+                _member_cell = self._revise_value(
+                    member,
+                    self._sequence_contract_cell(value_id), _owner_kind,
+                    stage=self._stage(),
+                    physical={
+                        "storage": "span" if span else "scalar",
+                        "rank": 1 if span else 0,
+                    },
+                )
+                _member_fact = self._book().page(SSA_VALUE).cell(
+                    _member_cell.row, _member_cell.column,
+                )
                 member.accounting = {
                     **dict(member.accounting or {}),
                     "program_abi_parameter": str(parameter_owner),
-                    "program_abi_storage": "span" if span else "scalar",
-                    "program_abi_rank": 1 if span else 0,
+                    "program_abi_storage": _member_fact.storage,
+                    "program_abi_rank": _member_fact.rank,
                 }
         return descriptor
 
@@ -14627,8 +15045,16 @@ class _ControlSSABuilder(TiledObject):
                         # concorded dtype was read from; the resident is a
                         # view of its row.
                         value.dtype = str(dtype)
+                        # ... and a descriptor column is an arena: the same
+                        # revise posts ``arena`` when the schema names this
+                        # value one of the descriptor's columns.
                         self._revise_value(
                             value, *_dtype_cells, stage=self._stage(),
+                            physical=(
+                                {"arena": True}
+                                if int(value.id) in descriptor.column_value_ids
+                                else KEEP_PHYSICAL
+                            ),
                         )
             destination_tags = self.sequence_native_type_tag_columns(
                 int(destination.sequence_id)
@@ -16140,9 +16566,12 @@ class _ControlSSABuilder(TiledObject):
             )
             updated_value = self.external_values.get(updated_id)
             if updated_value is None:
+                # The reserved backedge slot declares the initial's POSTED
+                # dtype (see ``_posted_carried_type``), not its authored
+                # spelling.
                 updated_value = SSAValue(
                     updated_id,
-                    dtype=initial_value.dtype,
+                    dtype=self._posted_carried_type(initial_value)[0],
                     shape=initial_value.shape,
                 )
                 # LOOP_SEED: the reserved backedge slot, from the pre-loop
@@ -16164,11 +16593,15 @@ class _ControlSSABuilder(TiledObject):
                     "loop_carried_preexisting_update"
                 ] = True
             self.reserve_loop_native_union_update(updated_id, updated_value)
+            carried_dtype, carried_physical = self._posted_carried_type(
+                initial_value, updated_value,
+            )
             current_value = self.fresh_value(
-                dtype=initial_value.dtype,
+                dtype=carried_dtype,
                 shape=initial_value.shape,
                 transform=PHI_LOOP_HEADER,
                 operands=(initial_value, updated_value),
+                physical=carried_physical,
             )
             current_value.accounting.update({
                 "source_value_id": initial_id,
@@ -16965,16 +17398,20 @@ class _ControlSSABuilder(TiledObject):
                         "shape": storage_shape,
                         "source": "concorded-loop-resident-meta",
                     }
+                    # Program: a nested retained loop whose carried value
+                    # is a resident span (tests/test_precompile_contract_rows.py,
+                    # ``test_loop_resident_shape_contract_is_posted_derived``).
+                    # Wrong record: this wrote the ``tensor_shape_concordance``
+                    # row straight into the page (``shape_page.set``), past the
+                    # closed latch.  Rule: nothing writes a page except through
+                    # ``book.post``; the contract is DERIVED from the canonical
+                    # cells of every spelling of the resident whose
+                    # ``region_value_meta`` supplied the shape.
                     for value_id in dict.fromkeys((
                         int(resident_id), int(updated_id),
                     )):
-                        shape_page.set(
-                            (
-                                self.tensor_shape_concordance_scope,
-                                value_id,
-                            ),
-                            max(shape_page.columns, default=-1) + 1,
-                            shape_contract,
+                        self._post_tensor_shape_contract(
+                            value_id, shape_contract, *identity_occurrences,
                         )
                 storage_rank = int(
                     (shape_contract or {}).get("program_abi_rank", 0) or 0
@@ -17226,9 +17663,12 @@ class _ControlSSABuilder(TiledObject):
             )
             updated_value = self.external_values.get(updated_id)
             if updated_value is None:
+                # The reserved backedge slot declares the initial's POSTED
+                # dtype (see ``_posted_carried_type``), not its authored
+                # spelling.
                 updated_value = SSAValue(
                     updated_id,
-                    dtype=initial_value.dtype,
+                    dtype=self._posted_carried_type(initial_value)[0],
                     shape=initial_value.shape,
                 )
                 # LOOP_SEED: the reserved backedge slot, from the pre-loop
@@ -17247,11 +17687,15 @@ class _ControlSSABuilder(TiledObject):
                     "loop_carried_preexisting_update"
                 ] = True
             self.reserve_loop_native_union_update(updated_id, updated_value)
+            carried_dtype, carried_physical = self._posted_carried_type(
+                initial_value, updated_value,
+            )
             current_value = self.fresh_value(
-                dtype=initial_value.dtype,
+                dtype=carried_dtype,
                 shape=initial_value.shape,
                 transform=PHI_LOOP_HEADER,
                 operands=(initial_value, updated_value),
+                physical=carried_physical,
             )
             carried.append((
                 updated_id, initial_id, initial_value,
@@ -20499,6 +20943,7 @@ def _inject_field_slot_access(
     field_dtypes: Mapping[int, str] | None = None,
     separate_field_storage: bool = False,
     field_accounting: Mapping[int, Mapping[str, Any]] | None = None,
+    field_physical: Mapping[int, tuple[Mapping[str, Any], tuple]] | None = None,
     receiver_accounting: Mapping[str, Any] | None = None,
     field_write_state_cells: tuple[Any, ...] = (),
     lexical_read_scope: Any = None,
@@ -20576,7 +21021,9 @@ def _inject_field_slot_access(
             dtype=dtype, stage=CONTROL_SSA_FINISH,
         )
 
-    def publish_row(value: SSAValue, *causes: Any) -> None:
+    def publish_row(
+        value: SSAValue, *causes: Any, physical: Any = KEEP_PHYSICAL,
+    ) -> None:
         # Program: a method reading/writing ``self.<field>`` of an
         # opaque_ref field (test_ir_sequence_tables::
         # test_static_program_reference_is_typed_ssa_and_native_handle_
@@ -20599,8 +21046,9 @@ def _inject_field_slot_access(
             )
             book.post(
                 SSA_VALUE, row,
-                SSAValueFact(
-                    value.dtype, shape, SSAValueOrigin.ADOPTED_GRAPH_ID,
+                rebuilt_ssa_value_fact(
+                    None, value.dtype, shape,
+                    SSAValueOrigin.ADOPTED_GRAPH_ID, physical,
                 ),
                 stage=CONTROL_SSA_FINISH,
                 provenance=Derived(tuple(dict.fromkeys(
@@ -20613,6 +21061,7 @@ def _inject_field_slot_access(
         revise_ssa_value(
             control_function, int(value.id), dtype=value.dtype, shape=shape,
             stage=CONTROL_SSA_FINISH, sources=causes, book=book,
+            physical=physical,
         )
 
     # A receiver is physically a set of typed columns.  The traditional one
@@ -20655,7 +21104,28 @@ def _inject_field_slot_access(
                 if key[1] is not None else dict(receiver_accounting or {})
             ),
         )
-        publish_row(column_arrays[key])
+        _declared = (
+            (field_physical or {}).get(int(key[1]))
+            if key[1] is not None else None
+        )
+        if _declared is None:
+            publish_row(column_arrays[key])
+        else:
+            publish_row(
+                column_arrays[key], *_declared[1], physical=_declared[0],
+            )
+            # Accounting is the view of the fact just posted.
+            _posted = _slot_book().latest_ref(
+                SSA_VALUE, (_slot_scope, int(column_arrays[key].id)),
+            )
+            _posted_fact = _slot_book().page(SSA_VALUE).cell(
+                _posted.row, _posted.column,
+            )
+            column_arrays[key].accounting = {
+                **dict(column_arrays[key].accounting or {}),
+                "program_abi_storage": _posted_fact.storage,
+                "program_abi_rank": _posted_fact.rank,
+            }
     field_locations = {
         slot: (
             int(column_arrays[(slot_dtype, slot if separate_field_storage else None)].id),
@@ -25833,10 +26303,6 @@ def lower_control_sections_to_ssa(
             "program_abi_record": str(record_identity),
             "program_abi_parameter": "self",
             "program_abi_field": str(field_names[old_slot]),
-            "program_abi_storage": (
-                "reference" if old_slot in reference_slots else "scalar"
-            ),
-            "program_abi_rank": 0,
             "program_abi_mutable": bool(
                 (record_field_mutability or {}).get(field_names[old_slot], False)
             ),
@@ -25845,6 +26311,33 @@ def lower_control_sections_to_ssa(
                 for kind, _value_id, slot in field_ops
             ),
         }
+        for old_slot in scalar_slots
+    }
+    # Program: a method whose receiver holds scalar/reference field slots
+    # (test_precompile_contract_rows.py, ``test_field_slot_columns_post_
+    # their_physical_view``).  Wrong record: each slot's column carried
+    # storage and rank 0 only in accounting.  Rule: a field slot's column
+    # IS scalar (or, for a reference-handle slot, reference) at rank 0 by
+    # construction -- the DECLARATION of the construct.  The injector posts
+    # it with the class field declaration cell as a source and sets the
+    # accounting FROM the posted fact.
+    from .frame_identity_book import _record_field_declaration_cell as _decl
+    _field_receiver = dict(
+        dict(parameter_record_abi or {}).get("self") or {}
+    )
+    scalar_field_physical = {
+        compact_slot[old_slot]: (
+            {
+                "storage": (
+                    "reference" if old_slot in reference_slots else "scalar"
+                ),
+                "rank": 0,
+            },
+            (_decl(
+                _field_receiver, str(field_names[old_slot]),
+                identity=record_identity,
+            ),),
+        )
         for old_slot in scalar_slots
     }
     # ``self`` is a compile-time record correlation, not an opaque runtime
@@ -25897,6 +26390,7 @@ def lower_control_sections_to_ssa(
             field_dtypes=scalar_slot_dtypes,
             separate_field_storage=bool(declared_contracts),
             field_accounting=scalar_field_accounting,
+            field_physical=scalar_field_physical,
             receiver_accounting=(
                 {
                     "program_abi_record": str(record_identity),
@@ -26149,6 +26643,13 @@ def lower_control_sections_to_ssa(
     report("propagating sequence ABI members")
     control_sequences = sequence_tables.get(control_function.name)
     if control_sequences is not None:
+        from .concordance_declarations import (
+            SEQUENCE_CONTRACT_CONCORDANCE as _SEQUENCE_CONTRACT_PAGE,
+        )
+        from .identity_concordance import current_identity_book
+        from .ssa_record_return_state import revise_ssa_value
+
+        _control_book = current_identity_book()
         for region_function in functions.values():
             receipt = (
                 region_function.metadata or {}
@@ -26208,12 +26709,57 @@ def lower_control_sections_to_ssa(
                     row_shape = tuple(
                         (descriptor.column_shapes or ((),))[0]
                     )
+                    # Program: a planned region capturing a resident N-by-W
+                    # sequence arena (test_precompile_contract_rows.py,
+                    # ``test_region_sequence_arena_formal_posts_span_rank``).
+                    # Wrong record: the formal's ``ssa_value`` row carried no
+                    # storage/rank while accounting said span, 1 + len(row).
+                    # Rule: the rank is read from the sequence descriptor, so
+                    # the formal's row is REVISED DERIVED from the
+                    # descriptor's ``sequence_contract_concordance`` cell and
+                    # the accounting is set FROM the posted fact.
+                    _descriptor_cells = tuple(
+                        cell for cell in (
+                            _control_book.latest_ref(
+                                _SEQUENCE_CONTRACT_PAGE,
+                                (_scope, int(descriptor.sequence_id)),
+                            )
+                            for _scope in (
+                                control_function.name,
+                                str(control_function.metadata.get(
+                                    "tensor_shape_concordance_scope"
+                                ) or control_function.name),
+                            )
+                        ) if cell is not None
+                    )
+                    _formal_cell = revise_ssa_value(
+                        region_function, int(argument.id),
+                        dtype=argument.dtype,
+                        shape=tuple(argument.shape or ()),
+                        stage=CONTROL_SSA_REGION,
+                        sources=_descriptor_cells, book=_control_book,
+                        physical={
+                            "storage": "span", "rank": 1 + len(row_shape),
+                        },
+                    )
+                    _formal_fact = (
+                        None if _formal_cell is None
+                        else _control_book.page(SSA_VALUE).cell(
+                            _formal_cell.row, _formal_cell.column,
+                        )
+                    )
                     argument.accounting = {
                         **accounting,
                         "sequence_id": int(descriptor.sequence_id),
                         "sequence_row_shape": row_shape,
-                        "program_abi_storage": "span",
-                        "program_abi_rank": 1 + len(row_shape),
+                        **(
+                            {
+                                "program_abi_storage": _formal_fact.storage,
+                                "program_abi_rank": _formal_fact.rank,
+                            }
+                            if isinstance(_formal_fact, SSAValueFact)
+                            and _formal_fact.storage is not None else {}
+                        ),
                         "tensor_metadata_state": "dynamic",
                     }
                 length_id = int(descriptor.length_address_id)

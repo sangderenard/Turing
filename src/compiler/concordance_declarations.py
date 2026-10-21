@@ -1534,7 +1534,9 @@ LOOP_RESULT_USE_REBINDING = declare_page("loop_result_use_rebinding", (
 #: folds a projected output (``Load(GEP(aggregate, k))``) into the call's own
 #: actual and rebinds every use of the projection's value.  One row per
 #: rebound value ``(function scope, original id)`` -> ``(replacement id,
-#: callee, output id)``.  REVISE (the legalization runs at several stages),
+#: callee, output id[, view shape])``; the view shape is the callee
+#: descriptor's declared view of the storage (absent when the output is the
+#: storage).  REVISE (the legalization runs at several stages),
 #: DERIVED(the original's and the replacement's ``ssa_value`` cells).  Every
 #: id-carrying reference to the original (an operand, a Phi's
 #: ``initial_value_id``) follows THIS row; the original has no definition

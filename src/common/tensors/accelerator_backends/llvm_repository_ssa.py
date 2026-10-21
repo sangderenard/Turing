@@ -612,6 +612,7 @@ def post_repository_kernel_identity(function: Any, book: Any = None) -> bool:
     if returned is not None:
         values.setdefault(int(returned.id), returned)
     scope = function_scope_of(function)
+    formal_ids = {int(value.id) for value in function.args}
     for value_id, (position, kind, text) in sorted(
         origins.items(), key=lambda item: item[1][0],
     ):
@@ -626,11 +627,30 @@ def post_repository_kernel_identity(function: Any, book: Any = None) -> bool:
             stage=INGESTION, provenance=Derived((root,)), mode=Mode.CONCORD,
         )
         if book.latest_ref(SSA_VALUE, (scope, int(value_id))) is None:
+            # Program: any imported repository kernel (binary_double, where_
+            # double, ...).  Wrong record: its formals' rows were posted with
+            # storage/rank at their defaults although ingestion is where the
+            # kernel's declared ABI enters.  Rule: a formal posts the ABI the
+            # LLVM signature itself declares, read from the imported value
+            # the row derives from: a non-pointer formal is a ``scalar`` of
+            # rank 0.  A pointer formal declares NO storage kind or rank --
+            # those are the caller's contract, delivered on the call edge
+            # (``span`` of the actual's rank) and posted where it is
+            # delivered.  Posting ``reference`` here was measured: it made
+            # every kernel pointer formal disagree with the span contract the
+            # shell later delivers (4 type-disagreements per probe), so the
+            # pointer's row stays unposted until the edge posts it.
+            physical: dict[str, Any] = {}
+            if (
+                int(value_id) in formal_ids
+                and value.dtype not in (None, "", "unknown", "ptr")
+            ):
+                physical = {"storage": "scalar", "rank": 0}
             book.post(
                 SSA_VALUE, (scope, int(value_id)),
                 SSAValueFact(
                     value.dtype, tuple(value.shape or ()),
-                    SSAValueOrigin.MINTED,
+                    SSAValueOrigin.MINTED, **physical,
                 ),
                 stage=INGESTION, provenance=Derived((cell,)),
                 mode=Mode.REVISE,

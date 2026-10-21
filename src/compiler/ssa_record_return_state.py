@@ -60,6 +60,22 @@ def ssa_value_identity_cell(function, value_id, *, book=None):
     )
 
 
+def posted_ssa_value_fact(function, value_id, *, book=None):
+    """The ``SSAValueFact`` the latest ``ssa_value`` row of ``value_id`` in
+    ``function`` records, or None when no pass posted the row (or the row
+    holds another fact).  The reader a producer uses to set resident
+    accounting FROM the fact it just posted: the accounting is a view."""
+    from .concordance_declarations import SSA_VALUE, SSAValueFact
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book() if book is None else book
+    cell = ssa_value_identity_cell(function, value_id, book=book)
+    if cell is None:
+        return None
+    fact = book.page(SSA_VALUE).cell(cell.row, cell.column)
+    return fact if isinstance(fact, SSAValueFact) else None
+
+
 def ssa_block_identity_cell(function, label, *, book=None):
     """The latest ``ssa_block`` cell of block ``label`` of ``function``
     (row ``(function_scope_of(function), function.name, label)``), or None
@@ -199,7 +215,8 @@ def return_site_cell_for(graph, expression):
     return None
 
 
-def mint_ssa_value(function, transform, operands, *, dtype=None, shape=(), stage):
+def mint_ssa_value(function, transform, operands, *, dtype=None, shape=(), stage,
+                   physical=None):
     """Mint one SSA id for ``function`` through the book: a NOVEL
     ``ssa_value`` row on ``(function scope, NEW)`` with ``transform`` and the
     cells in ``operands`` (several become one ``cell_set`` row; none becomes
@@ -214,7 +231,7 @@ def mint_ssa_value(function, transform, operands, *, dtype=None, shape=(), stage
         cells = (_function_root_cell(book, scope),)
     return _mint_ssa_id(
         book, scope, transform, cells, dtype=dtype, shape=tuple(shape or ()),
-        stage=stage,
+        stage=stage, physical=physical,
     )
 
 
@@ -1045,6 +1062,29 @@ def reconcile_conditional_phi_continuations(module):
     return len(receipts)
 
 
+def _posted_physical_fields(function, value):
+    """The non-default physical fields recorded on ``value``'s ``ssa_value``
+    row in ``function`` (None when the row records none)."""
+    from .concordance_declarations import (
+        SSA_VALUE, SSA_VALUE_PHYSICAL_FIELDS, SSAValueFact,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    cell = book.latest_ref(SSA_VALUE, (function_scope_of(function), int(value.id)))
+    fact = (
+        None if cell is None
+        else book.page(SSA_VALUE).cell(cell.row, cell.column)
+    )
+    if not isinstance(fact, SSAValueFact):
+        return None
+    fields = {
+        name: getattr(fact, name) for name in SSA_VALUE_PHYSICAL_FIELDS
+        if getattr(fact, name) not in (None, False)
+    }
+    return fields or None
+
+
 def freshen_redefined_ssa_objects(module):
     """Give every repeated definition of one SSAValue object a fresh value.
 
@@ -1110,12 +1150,22 @@ def freshen_redefined_ssa_objects(module):
             })
             # The clone is NOVEL(freshen) from the redefined value's own
             # identity cell (the function root when it has none).
+            # Program: tests/test_sequence_contract_concordance.py::
+            # test_authored_tuple_loop_row_remains_integer_table_key_handle
+            # (a descriptor cell whose row posts ``physical_dtype``).  Wrong
+            # record: the clone copies the original's accounting (physical
+            # labels included) but its mint posted no physical fields, so
+            # the settlement saw two equal-priority contracts that differ
+            # only in ``physical_dtype``.  Rule: the clone is the same
+            # storage redefined; its mint declares the physical fields the
+            # original's own row records (none recorded posts none).
             fresh = replace(
                 original,
                 id=mint_ssa_value(
                     function, FRESHEN, (original,),
                     dtype=original.dtype, shape=original.shape or (),
                     stage=RECORD_RETURN_REPAIR,
+                    physical=_posted_physical_fields(function, original),
                 ),
                 accounting=accounting,
             )

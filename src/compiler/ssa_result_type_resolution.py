@@ -3,27 +3,76 @@ from .transformation_priority import TransformationLedger, TransformationRule
 
 
 def _type(value):
-    return (value.dtype, tuple(value.shape), value.device)
+    # The proof tuple: (dtype, shape, device, physical_dtype).  The resident
+    # physical_dtype is its accounting view.
+    return (value.dtype, tuple(value.shape), value.device,
+            (value.accounting or {}).get('physical_dtype'))
 
 
 def _recorded_type(function, value):
     from .structural_concordance import function_value_structure
 
     structure, _cell = function_value_structure(function, int(value.id))
-    return (structure.dtype, structure.shape, value.device)
+    # The fourth member is the POSTED physical dtype (None when no producer
+    # posted one): the proof reads the row, not the accounting.
+    return (structure.dtype, structure.shape, value.device,
+            structure.physical_dtype)
 
 
-def _publish_type(function, value, winner, decision):
-    """Commit the retained decision before changing its resident SSA view."""
-    from .concordance_declarations import FRAME_LINK
+def _posted_physical(function, value):
+    """The storage/rank/arena POSTED on ``value``'s ``ssa_value`` row (the
+    fields a producer declared; absent ones are omitted).
+
+    Program: call-result settlement.  Wrong record: ``_publish_type`` posted
+    only the winner's ``physical_dtype``, so a call result or formal whose
+    winning proof was a callee's posted ``span`` of rank 3 was revised with
+    no storage or rank.  Rule: the winning proof's source row is read for its
+    whole posted physical set; nothing is read from accounting."""
+    from .structural_concordance import function_value_structure
+
+    structure, _cell = function_value_structure(function, int(value.id))
+    fields = {}
+    if structure.declared_storage is not None:
+        fields['storage'] = structure.declared_storage
+    if structure.rank is not None:
+        fields['rank'] = structure.rank
+    if structure.arena:
+        fields['arena'] = True
+    return fields
+
+
+def _publish_type(function, value, winner, decision, carried=None):
+    """Commit the retained decision before changing its resident SSA view.
+
+    Rule: post first; accounting is a view.  The whole winner -- dtype, shape
+    and, when the winning proof carries one, the physical dtype -- is revised
+    onto the value's row; the resident ``physical_dtype`` accounting is then
+    set FROM that posted winner.  A winner with no posted physical dtype
+    leaves the resident accounting untouched.
+
+    ``carried`` is the posted storage/rank/arena of the source row of the
+    ACCEPTED proposal (``_posted_physical``): a partial ``physical`` post
+    merges over the recorded fact, so a field the winner's source did not
+    post leaves the value's own posted field untouched."""
+    from .concordance_declarations import FRAME_LINK, KEEP_PHYSICAL
     from .ssa_record_return_state import publish_ssa_value_type
 
-    changed = _type(value) != winner
+    resident = _type(value)
+    changed = (
+        resident[:3] != winner[:3]
+        or (winner[3] is not None and resident[3] != winner[3])
+    )
+    physical = {**({} if winner[3] is None
+                   else {"physical_dtype": winner[3]}), **(carried or {})}
     publish_ssa_value_type(
         function, value, dtype=winner[0], shape=winner[1],
         stage=FRAME_LINK, sources=(decision,),
+        physical=physical or KEEP_PHYSICAL,
     )
     value.device = winner[2]
+    if winner[3] is not None and resident[3] != winner[3]:
+        value.accounting = {**dict(value.accounting or {}),
+                            'physical_dtype': winner[3]}
     return changed
 
 
@@ -95,6 +144,11 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                           ledger.decision_cell((function.name, int(value.id))))
 
     capture_planning_cells = {}
+    # The posted storage/rank/arena of each identity's accepted callee-output
+    # proof, read from the source row it was accepted from.  Kept OUT of the
+    # proof tuple: equal-priority proposals that differ only in a posted
+    # field would otherwise raise TransformationConflict.
+    carried_physical = {}
 
     def bindings():
         for caller in functions.values():
@@ -273,7 +327,8 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 if base_type[0] in {None, '', 'unknown', 'ptr', 'ssa.aggregate'}:
                     continue
                 target = item.res
-                proposal = (base_type[0], _recorded_type(owner, target)[1], base_type[2])
+                proposal = (base_type[0], _recorded_type(owner, target)[1],
+                            base_type[2], base_type[3])
                 identity = (owner.name, int(target.id))
                 source_cells = _value_cells((owner, base), (owner, target))
                 ledger.propose(
@@ -285,7 +340,9 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 winner = ledger.incumbent_target(identity)
                 if _publish_type(owner, target, winner, ledger.decision_cell(identity)):
                     changed = True
-                physical = (base.accounting or {}).get('physical_dtype')
+                # Rule: accounting is a view of the posted winner; the base's
+                # accounting stands only where no physical dtype was posted.
+                physical = winner[3] or (base.accounting or {}).get('physical_dtype')
                 if physical:
                     target.accounting = {**dict(target.accounting or {}),
                         'physical_dtype': physical,
@@ -310,14 +367,19 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                     ) if cell is not None
                 ), revision_source=source_cells[0])
             winner = ledger.incumbent_target(identity)
-            if _publish_type(caller, target, winner, ledger.decision_cell(identity)):
+            if accepted:
+                carried_physical[identity] = _posted_physical(callee, source)
+            if _publish_type(caller, target, winner, ledger.decision_cell(identity),
+                             carried_physical.get(identity)):
                 changed = True
             if ledger.incumbent_priority(identity) != previous_priority:
                 changed = True
             if accepted:
                 target.accounting = {**dict(target.accounting or {}),
                     'ssa_call_result_from': (callee.name, int(source.id))}
-                physical_dtype = (source.accounting or {}).get('physical_dtype')
+                # Rule: accounting is a view of the posted winner; the source's
+                # accounting stands only where no physical dtype was posted.
+                physical_dtype = winner[3] or (source.accounting or {}).get('physical_dtype')
                 if physical_dtype and previous_priority != 3:
                     target.accounting['physical_dtype'] = physical_dtype
                     target.accounting['physical_dtype_provenance'] = (
@@ -332,9 +394,9 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 exact_values.add(id(target))
 
     conflicts = tuple(dict(caller=caller.name, value_id=int(target.id),
-        retained=_type(target), retained_storage=_storage_type(target),
+        retained=_type(target)[:3], retained_storage=_storage_type(target),
         callee=callee.name, callee_value_id=int(source.id),
-        proposed=_type(source), proposed_storage=_storage_type(source))
+        proposed=_type(source)[:3], proposed_storage=_storage_type(source))
         for caller, target, callee, source in bindings()
         if source.dtype not in {None, '', 'unknown'} and not equivalent_physical_layout(_storage_type(source), _storage_type(target)))
     return exact_values, ledger.events, conflicts, rounds

@@ -11,7 +11,10 @@ from .concordance_declarations import (
     CALL_INPUT_STORAGE,
     KERNEL_INPUT_CONVERSION,
 )
-from .ssa_record_return_state import mint_ssa_value, ssa_value_identity_cell, identity_cells
+from .ssa_record_return_state import (
+    mint_ssa_value, ssa_value_identity_cell, identity_cells,
+    posted_ssa_value_fact, revise_ssa_value,
+)
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -70,7 +73,7 @@ def _concord_exact_region_feed_dtypes(
     changed = 0
     from .ssa_record_return_state import accepted_ssa_component
 
-    def revise_value_row(owner, value_id, dtype, shape, *causes):
+    def revise_value_row(owner, value_id, dtype, shape, *causes, physical=None):
         """The exact feed dtype installed on ``value_id`` of ``owner`` is a
         REVISE of its ``ssa_value`` row, DERIVED from the row's previous
         cell and ``causes`` (the feed concordance cell, the other side's
@@ -80,6 +83,7 @@ def _concord_exact_region_feed_dtypes(
         return revise_ssa_value(
             owner, int(value_id), dtype=dtype, shape=shape,
             stage=PHYSICAL_CALL_INPUT_ADAPTATION, sources=causes, book=book,
+            **({} if physical is None else {'physical': physical}),
         )
 
     for caller in functions.values():
@@ -401,8 +405,59 @@ def _concord_exact_region_feed_dtypes(
                         changed += 1
                     if (str(actual.dtype) == str(formal.dtype)
                             and tuple(actual.shape or ()) == tuple(formal.shape or ())):
+                        # Program: a loop body feeds planned region 3's
+                        # formal (shape and dtype already equal) with a
+                        # minted value whose ``ssa_value`` row posts
+                        # ``physical_dtype``; the formal's row never did, so
+                        # the same-representation transport below refused
+                        # (producer float64, consumer None).  Wrong record:
+                        # a formal left unposted where its feeding actual is
+                        # posted.  Rule: the formal's unposted physical
+                        # fields are DERIVED from the actual's row at the
+                        # binding, through the same revise writer the
+                        # dtype/shape adapter uses; a posted formal field
+                        # is never overwritten.
+                        _actual_fact = posted_ssa_value_fact(
+                            caller, int(actual.id), book=book)
+                        _formal_fact = posted_ssa_value_fact(
+                            callee, int(formal.id), book=book)
+                        if _actual_fact is not None and _formal_fact is not None:
+                            _inherit = {
+                                name: getattr(_actual_fact, name)
+                                for name in (
+                                    'physical_dtype', 'storage', 'rank',
+                                    'arena', 'device',
+                                )
+                                if getattr(_actual_fact, name)
+                                not in (None, False)
+                                and getattr(_formal_fact, name)
+                                in (None, False)
+                            }
+                            if _inherit:
+                                revise_value_row(
+                                    callee, int(formal.id), formal.dtype,
+                                    formal.shape,
+                                    ssa_value_identity_cell(
+                                        caller, int(actual.id), book=book,
+                                    ),
+                                    physical=_inherit,
+                                )
+                        # An actual that declares ``ssa_storage_view`` of its
+                        # own id is the declared view, not the storage: its
+                        # producer endpoint is the view's structural row
+                        # (see ``ssa_view_structure``).
+                        _declared_view = actual_accounting.get('ssa_storage_view')
+                        _view_shape = (
+                            tuple(_declared_view.get('view_shape') or ())
+                            if isinstance(_declared_view, dict)
+                            and _declared_view.get('storage_value_id') is not None
+                            and int(_declared_view['storage_value_id'])
+                            == int(actual.id)
+                            else ()
+                        )
                         source_structure, source_cell = function_value_structure(
                             caller, int(actual.id), book=book,
+                            view_shape=_view_shape or None,
                         )
                         target_structure, target_cell = function_value_structure(
                             callee, int(formal.id), book=book,
@@ -564,6 +619,7 @@ def _infer_pointer_storage(functions, native_storage=None):
             if formal.dtype != 'ptr' or (formal.accounting or {}).get('physical_dtype'):
                 continue
             aliases = {int(formal.id)}
+            alias_values = []
             changed = True
             while changed:
                 changed = False
@@ -573,19 +629,58 @@ def _infer_pointer_storage(functions, native_storage=None):
                             and int(instruction.args[0].id) in aliases
                             and int(instruction.res.id) not in aliases):
                         aliases.add(int(instruction.res.id))
+                        alias_values.append(instruction.res)
                         changed = True
             types = set()
+            witnesses = []
             for instruction in instructions:
                 dtype = None
                 if instruction.op == 'Load' and instruction.args and int(instruction.args[0].id) in aliases and instruction.res is not None:
                     dtype = instruction.res.dtype
+                    witnesses.append(instruction.res)
                 elif instruction.op == 'Store' and len(instruction.args) >= 2 and int(instruction.args[1].id) in aliases:
                     dtype = instruction.args[0].dtype
+                    witnesses.append(instruction.args[0])
                 if dtype is not None:
                     types.add(canonical.get(dtype, dtype))
             if len(types) == 1 and 'ptr' not in types:
+                inferred = next(iter(types))
+                # Rule: post first; accounting is a view.  The element type
+                # read from the Load results / Store values over the formal's
+                # alias set is revised onto the formal's row, DERIVED from the
+                # formal's own cell, the alias-chain values' cells and the
+                # witnessing Load/Store values' cells; the accounting is set
+                # FROM that posted fact.  (The native-storage branch above
+                # takes its element type from the accelerator, which names no
+                # instruction cell: it cannot be posted here.)
+                from .concordance_declarations import PHYSICAL_CALL_INPUT_ADAPTATION
+                revise_ssa_value(
+                    function, int(formal.id), dtype=formal.dtype,
+                    shape=formal.shape,
+                    stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                    sources=tuple(
+                        ssa_value_identity_cell(function, value.id)
+                        for value in (*alias_values, *witnesses)
+                    ),
+                    # Program: typed repository kernels (history_projection's
+                    # binary_double / where_double / index_select_double
+                    # pointer formals).  Wrong record: this revise carries
+                    # only the inferred element type.  Rule: it posts the one
+                    # field the Load/Store witnesses prove; the partial post
+                    # MERGES over the recorded fact (rebuilt_ssa_value_fact),
+                    # so storage/rank/arena the formal's row already records
+                    # are carried.  The witnesses do not prove them: a
+                    # pointer's storage kind and rank are the caller's span
+                    # contract, delivered on the call edge by the shell's
+                    # ProgramABI settlement, not by typed memory operations.
+                    physical={'physical_dtype': inferred},
+                )
+                posted = posted_ssa_value_fact(function, formal.id)
                 formal.accounting = {**dict(formal.accounting or {}),
-                    'physical_dtype': next(iter(types)), 'physical_dtype_provenance': 'typed_memory_operations'}
+                    'physical_dtype': (
+                        posted.physical_dtype if posted is not None
+                        and posted.physical_dtype is not None else inferred),
+                    'physical_dtype_provenance': 'typed_memory_operations'}
 
 
 def physical_call_input_conflicts(functions):
@@ -895,12 +990,18 @@ def _adapt_physical_call_inputs_round(
                         # a value conversion after whole-program type
                         # settlement; passing its pointer directly is byte
                         # reinterpretation (integer 1 becomes 5e-324).
+                        # Rule: post first; accounting is a view.  Minted with
+                        # its physical record, DERIVED from the source's cell.
+                        converted_id = mint_ssa_value(caller, CONTROL_CAST, (source,),
+                            dtype='float64', stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                            physical={'physical_dtype': 'float64',
+                                'device': source.device})
                         converted = SSAValue(
-                            mint_ssa_value(caller, CONTROL_CAST, (source,),
-                                dtype='float64', stage=PHYSICAL_CALL_INPUT_ADAPTATION),
+                            converted_id,
                             dtype='float64', shape=(), device=source.device,
                             accounting={
-                                'physical_dtype': 'float64',
+                                'physical_dtype': posted_ssa_value_fact(
+                                    caller, converted_id).physical_dtype,
                                 'kernel_input_conversion': (
                                     caller.name, int(source.id),
                                     'broadcast_double', 0,
@@ -1070,11 +1171,20 @@ def _adapt_physical_call_inputs_round(
                         # These six energy-helper conversions used to mint
                         # outside the book. The source value and the exact
                         # callee formal are the causes of this ABI conversion.
-                        converted = SSAValue(mint_ssa_value(caller, CONTROL_CAST,
+                        # Rule: post first; accounting is a view.  The converted
+                        # value is minted WITH its physical record (the target
+                        # dtype, the actual's device) DERIVED from the actual's
+                        # cell and the callee formal's cell; its accounting is
+                        # set FROM that posted fact.
+                        converted_id = mint_ssa_value(caller, CONTROL_CAST,
                             (actual, ssa_value_identity_cell(callee, formal.id)),
                             dtype=target_dtype, shape=actual.shape,
-                            stage=PHYSICAL_CALL_INPUT_ADAPTATION), dtype=target_dtype, shape=actual.shape, device=actual.device,
-                            accounting={'physical_dtype': target_dtype,
+                            stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                            physical={'physical_dtype': target_dtype,
+                                'device': actual.device})
+                        converted_fact = posted_ssa_value_fact(caller, converted_id)
+                        converted = SSAValue(converted_id, dtype=target_dtype, shape=actual.shape, device=actual.device,
+                            accounting={'physical_dtype': converted_fact.physical_dtype,
                                 'call_input_conversion': (caller.name, int(actual.id), callee.name, int(formal.id)),
                                 'call_input_conversion_kind': (
                                     'read_only_scalar_numeric'
@@ -1094,9 +1204,30 @@ def _adapt_physical_call_inputs_round(
                             attributes=conversion_attributes,
                         ))
                         instruction.args[index] = converted
+                        # Rule: post first; accounting is a view.  The callee
+                        # formal's row is revised with the physical dtype the
+                        # conversion settled, DERIVED from the actual's cell
+                        # and the converted value's cell; a formal with no row
+                        # in the ambient book (an accepted callee's own book)
+                        # keeps its accounting write alone.
+                        revise_ssa_value(
+                            callee, int(formal.id), dtype=formal.dtype,
+                            shape=formal.shape,
+                            stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                            sources=(
+                                ssa_value_identity_cell(caller, actual.id),
+                                ssa_value_identity_cell(caller, converted.id),
+                            ),
+                            physical={'physical_dtype': target_dtype},
+                        )
+                        formal_fact = posted_ssa_value_fact(callee, formal.id)
                         formal.accounting = {**dict(formal.accounting or {}),
                             'source_physical_dtype': source_dtype,
-                            'physical_dtype': target_dtype}
+                            'physical_dtype': (
+                                formal_fact.physical_dtype
+                                if formal_fact is not None
+                                and formal_fact.physical_dtype is not None
+                                else target_dtype)}
                         conversion = {
                             'caller': str(caller.name),
                             'actual_id': int(actual.id),
@@ -1143,11 +1274,18 @@ def _adapt_physical_call_inputs_round(
                             and int(instruction.res.id) == int(original.id)
                             and not (not original.shape and (original.accounting or {}).get('program_abi_storage') == 'span')
                             and int(original.id) not in {int(value.id) for value in caller.args}):
-                        temporary = SSAValue(mint_ssa_value(caller, CONTROL_CAST,
+                        # Rule: post first; accounting is a view.  Minted with
+                        # its physical record, DERIVED from the original's cell
+                        # and the callee formal's cell.
+                        temporary_id = mint_ssa_value(caller, CONTROL_CAST,
                             (original, ssa_value_identity_cell(callee, formal.id)),
                             dtype=backend_dtype, shape=original.shape,
-                            stage=PHYSICAL_CALL_INPUT_ADAPTATION), dtype=backend_dtype, shape=original.shape, device=original.device,
-                            accounting={'physical_dtype': backend_dtype,
+                            stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                            physical={'physical_dtype': backend_dtype,
+                                'device': original.device})
+                        temporary = SSAValue(temporary_id, dtype=backend_dtype, shape=original.shape, device=original.device,
+                            accounting={'physical_dtype': posted_ssa_value_fact(
+                                    caller, temporary_id).physical_dtype,
                                 'call_output_conversion': (callee.name, int(formal.id), caller.name, int(original.id))})
                         instruction.args[position] = temporary
                         instruction.res = temporary

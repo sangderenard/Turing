@@ -54,7 +54,9 @@ def test_equal_priority_producer_disagreement_refuses_as_conflict():
         settle_call_result_types(fs, outputs, values)
     message = str(refusal.value)
     assert "('root', 0)" in message
-    assert "('float64', (), None)" in message and "('int64', (), None)" in message
+    # The proof tuple is (dtype, shape, device, physical_dtype); neither
+    # producer posted a physical dtype, so the fourth member is None.
+    assert "('float64', (), None, None)" in message and "('int64', (), None, None)" in message
     assert "'first'" in message and "'second'" in message
 
 

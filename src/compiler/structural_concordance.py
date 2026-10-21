@@ -171,7 +171,48 @@ def ssa_structure(scope, value_id, *, shape_scope=None, storage_scope=None, book
     return book.page(STRUCTURAL_VALUE).cell(cell.row, cell.column), cell
 
 
-def function_value_structure(function, value_id, *, book=None):
+def _ssa_view_structure(read, scope, value_id, view_shape, shape_scope=None,
+                        storage_scope=None):
+    from dataclasses import replace
+
+    storage = _ssa_structure(read, scope, value_id, shape_scope, storage_scope)
+    view_shape = tuple(map(int, view_shape))
+    return replace(
+        storage, shape=view_shape,
+        kind="span" if view_shape and storage.kind != "unresolved"
+        else storage.kind,
+        storage="span" if view_shape and storage.kind != "unresolved"
+        else storage.storage,
+        declared_storage=None,
+    )
+
+
+def ssa_view_structure(scope, value_id, view_shape, *, shape_scope=None,
+                       storage_scope=None, book=None):
+    """The structure of a declared view of a storage: its own identity.
+
+    Program: a passthrough call feeds a region formal of (8, 1, 1) with the
+    ``ssa_storage_view`` rebinding of storage id 1, whose own row is (8,).
+    Wrong record: the feed's producer endpoint was the storage's structural
+    row, so the same-shape transport it claimed refused on (8,) vs (8, 1, 1).
+    Rule: a declared view is keyed (storage_value_id, view_shape); this row
+    is DERIVED from the storage's ``ssa_value`` row (and graph shape state)
+    with the declared ``view_shape``; its source cell stays the storage's
+    ``ssa_value`` row, which is what the call edge binds."""
+    book = current_identity_book() if book is None else book
+    view_shape = tuple(map(int, view_shape))
+    authority = (SSA_VALUE.name, scope, shape_scope, storage_scope,
+                 "ssa_storage_view", view_shape)
+    row = (authority, int(value_id))
+    cell = book.derive_current(
+        STRUCTURAL_VALUE, row, _ssa_view_structure,
+        (scope, int(value_id), view_shape, shape_scope, storage_scope),
+        stage=STRUCTURAL_CONCORDANCE,
+    )
+    return book.page(STRUCTURAL_VALUE).cell(cell.row, cell.column), cell
+
+
+def function_value_structure(function, value_id, *, book=None, view_shape=None):
     """Read a physical value in its owning SSA and graph-copy scopes.
 
     SSA type publication and graph shape publication are independent facts.
@@ -186,10 +227,17 @@ def function_value_structure(function, value_id, *, book=None):
     component = (function.metadata["accepted_ssa_component"]
                  if accepted_ssa_component(function) else None)
     owner = destination if component is None else component["identity_book"]
-    structure, cell = ssa_structure(
-        function_scope_of(function), int(value_id),
-        shape_scope=shape_scope_of(function), storage_scope=str(function.name), book=owner,
-    )
+    if view_shape is not None:
+        structure, cell = ssa_view_structure(
+            function_scope_of(function), int(value_id), view_shape,
+            shape_scope=shape_scope_of(function),
+            storage_scope=str(function.name), book=owner,
+        )
+    else:
+        structure, cell = ssa_structure(
+            function_scope_of(function), int(value_id),
+            shape_scope=shape_scope_of(function), storage_scope=str(function.name), book=owner,
+        )
     if owner is not destination:
         cell = destination.import_cell(owner, cell, component["artifact_sha256"])
     return structure, cell

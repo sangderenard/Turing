@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from ..transmogrifier.ssa import Function, Instr, IRModule, SSAValue
 
@@ -352,6 +352,8 @@ def _post_passthrough_rebinding(
 
     DERIVED(the original's and the replacement's ``ssa_value`` cells; a fold
     that can name neither is written raw, which the book tags ``Unsourced``).
+    The row's fourth field is the declared view shape the replacement carries
+    (absent when the output is the storage itself).
     """
 
     from .concordance_declarations import (
@@ -363,9 +365,13 @@ def _post_passthrough_rebinding(
 
     book = current_identity_book()
     row = (function_scope_of(function), int(source.id))
+    declared_view = (replacement.accounting or {}).get("ssa_storage_view")
     _post_derived_or_raw(
         book, AGGREGATE_PASSTHROUGH_REBINDING, row,
-        (int(replacement.id), str(via[0]), int(via[1])),
+        (int(replacement.id), str(via[0]), int(via[1]), *(
+            (tuple(int(extent) for extent in declared_view["view_shape"]),)
+            if declared_view else ()
+        )),
         identity_cells(function, source, replacement),
         stage=AGGREGATE_ABI_LEGALIZATION, mode=Mode.REVISE,
     )
@@ -773,8 +779,10 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     # than leaving the two in disagreement.
                     authored = caller_ids
                 canonical: list[int] = []
+                output_descriptors: list[Any] = []
                 for output_id in authored:
                     current = int(output_id)
+                    output_descriptors.append(table.by_id(current))
                     seen: set[int] = set()
                     while current not in seen:
                         seen.add(current)
@@ -845,6 +853,41 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                         # independent call result from the ABI.
                         retained.append(index)
                         continue
+                    # Program: ``valid.reshape((-1, 1, 1))`` planned as a call
+                    # whose output is a view of the formal ``valid`` and
+                    # consumed by a later region.  Wrong record: the fold
+                    # rebound the output to the actual's bare id, dropping the
+                    # callee descriptor's declared view, so call-metadata
+                    # propagation restamped the occurrence to the storage's
+                    # own extents and recorded ``proven_shape conflicting``
+                    # against the consumer's ``(8, 1, 1)`` formal.  Rule: a
+                    # declared view of a storage is part of the value's
+                    # identity and travels with every rebinding of it; the
+                    # declaration is derived from the descriptor this pass
+                    # read (as tensor_ssa_lowering declares a descriptor
+                    # view) and the rebinding row states the view shape.
+                    view_accounting: dict[str, Any] = {}
+                    output_descriptor = output_descriptors[index]
+                    storage_descriptor = table.by_id(int(callee_id))
+                    if (
+                        output_descriptor is not None
+                        and storage_descriptor is not None
+                        and (
+                            output_descriptor.storage == "view"
+                            or output_descriptor.alias_of is not None
+                        )
+                        and tuple(output_descriptor.shape or ())
+                        and tuple(output_descriptor.shape)
+                        != tuple(storage_descriptor.shape or ())
+                    ):
+                        view_accounting["ssa_storage_view"] = {
+                            "storage_value_id": int(actual.id),
+                            "view_shape": tuple(
+                                int(extent)
+                                for extent in output_descriptor.shape
+                            ),
+                            "operation": "tensor_descriptor",
+                        }
                     replacement = SSAValue(
                         int(actual.id),
                         dtype=projection.value.dtype or actual.dtype,
@@ -859,6 +902,7 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                             "ssa_aggregate_passthrough": (
                                 callee_name, int(caller_id),
                             ),
+                            **view_accounting,
                         },
                     )
                     _replace_exact_uses(
