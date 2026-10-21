@@ -423,6 +423,21 @@ def test_typed_call_result_projection_is_routing_but_its_tensor_index_is_numeric
     assert graph.G.has_edge(1, 3) and graph.G.has_edge(3, 4)
 
 
+def test_resident_sequence_query_member_is_control_routing(graph_cut_book):
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Call")
+    _add(graph, 1, "Indexed", (0,))
+    graph.G.nodes[1]["parents"] = [(0, "base")]
+    graph.G.nodes[1]["attributes"].update({
+        "producer_kind": "sequence_query_member",
+        "aggregate_parent_value_id": 0,
+        "aggregate_index": 0,
+    })
+    _scope_dispatch_fixture(graph, graph_cut_book)
+
+    assert _is_dispatch_metadata_node(graph, 1)
+
+
 def test_old_serialized_dispatch_classification_is_recomputed(graph_cut_book):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "Indexed")

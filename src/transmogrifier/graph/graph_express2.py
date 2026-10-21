@@ -1037,11 +1037,19 @@ def _source_owner_declaration_shell(value):
         return None
     shell = ast.ClassDef(
         name=definition.name,
-        bases=[], keywords=[], body=declarations,
+        bases=copy.deepcopy(definition.bases),
+        keywords=copy.deepcopy(definition.keywords),
+        body=declarations,
         decorator_list=[],
         type_params=list(getattr(definition, "type_params", ())),
     )
     shell = ast.copy_location(shell, definition)
+    # This node is a source-declaration view of ``owner``, not a second
+    # authored class.  Source pursuit can later retain an executable method
+    # (or the class itself) from the same declaration.  The map-IR publisher
+    # uses this receipt to join the two exact views and still refuses two
+    # unmarked full definitions of one identity.
+    shell._turing_declaration_fragment = True
     shell._python_source_identity = (
         str(getattr(owner, "__module__", "")),
         str(getattr(owner, "__qualname__", owner.__name__)),
@@ -1173,6 +1181,7 @@ def _source_owner_annotation_declaration_shells(value):
             type_params=list(getattr(definition, "type_params", ())),
         )
         shell = ast.copy_location(shell, definition)
+        shell._turing_declaration_fragment = True
         shell._python_source_identity = (
             str(getattr(referenced, "__module__", "")),
             str(getattr(
@@ -1520,6 +1529,9 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
     schema = {
         "class_name": definition.name,
         "class_identity": class_identity,
+        "declaration_fragment": bool(getattr(
+            definition, "_turing_declaration_fragment", False,
+        )),
         # Direct source bases are retained as authored identities.  The
         # exact declaration-to-declaration topology is published after all
         # classes in this source have posted their CLASS_DECLARATION cells;
@@ -1847,10 +1859,77 @@ def _map_ir_from_ast(tree):
                     )
         return entry
 
-    objects = tuple(
+    object_fragments = tuple(
         _class_schema_from_ast(definition)
         for definition in ast.walk(tree)
         if isinstance(definition, ast.ClassDef)
+    )
+    # Recursive pursuit may first retain a declaration-only shell for a
+    # method owner's fields and later retain executable methods from that same
+    # source ClassDef.  Both views carry the exact class identity and span row;
+    # they are one declaration, not two classes.  Join only an explicitly
+    # marked declaration fragment.  Two full definitions with one identity
+    # remain a hard duplicate-material error.
+    objects_by_identity = {}
+    object_order = []
+    for fragment in object_fragments:
+        identity = str(fragment["class_identity"])
+        incumbent = objects_by_identity.get(identity)
+        if incumbent is None:
+            objects_by_identity[identity] = dict(fragment)
+            object_order.append(identity)
+            continue
+        if not (
+            bool(incumbent.get("declaration_fragment"))
+            or bool(fragment.get("declaration_fragment"))
+        ):
+            raise ValueError(
+                "map IR contains two full class definitions for identity "
+                f"{identity!r}"
+            )
+        for field in (
+            "class_name", "class_identity", "bases", "class_node_id",
+            "permissions",
+        ):
+            if incumbent.get(field) != fragment.get(field):
+                raise ValueError(
+                    "class declaration fragments disagree for identity "
+                    f"{identity!r} on {field!r}: "
+                    f"{incumbent.get(field)!r} != {fragment.get(field)!r}"
+                )
+
+        def join_members(field, key):
+            joined = list(incumbent.get(field, ()))
+            positions = {key(item): index for index, item in enumerate(joined)}
+            for item in fragment.get(field, ()):
+                member_key = key(item)
+                index = positions.get(member_key)
+                if index is None:
+                    positions[member_key] = len(joined)
+                    joined.append(item)
+                elif joined[index] != item:
+                    raise ValueError(
+                        "class declaration fragments disagree for identity "
+                        f"{identity!r} on {field} member {member_key!r}"
+                    )
+            incumbent[field] = tuple(joined)
+
+        join_members(
+            "attributes",
+            lambda item: (str(item["name"]), str(item["storage"])),
+        )
+        join_members("methods", lambda item: str(item["name"]))
+        incumbent["declaration_fragment"] = bool(
+            incumbent.get("declaration_fragment")
+            and fragment.get("declaration_fragment")
+        )
+    objects = tuple(
+        {
+            key: value
+            for key, value in objects_by_identity[identity].items()
+            if key != "declaration_fragment"
+        }
+        for identity in object_order
     )
     # Publish inheritance only between exact class declaration cells.  A
     # source spelling which does not identify one unique declaration in this

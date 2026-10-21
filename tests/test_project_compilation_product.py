@@ -24,6 +24,7 @@ from src.compiler.precompile_to_ssa import (
 
 from src.compiler.project_compilation_product import (
     _accepted_physical_output_paths,
+    _authored_module_record_contracts,
     adaptive_worker_memory_ceiling,
     compilation_creep_frontier,
     compile_project_call,
@@ -55,6 +56,36 @@ from src.compiler.project_compilation_product import (
     verify_structural_resident_table_integral,
     verify_project_scalar_units_automatically,
 )
+
+
+def test_authored_module_record_contracts_carry_aggregate_field_producers(
+    tmp_path, monkeypatch,
+):
+    package = tmp_path / "producer_contracts"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    source = package / "model.py"
+    source.write_text(
+        """
+class Model:
+    def __init__(self):
+        self.current = None
+
+    def publish(self):
+        snapshot = {"count": 1, "payload": object()}
+        self.current = snapshot
+
+    def read(self):
+        return tuple(self.current.items())
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    module_name, contracts = _authored_module_record_contracts(source)
+
+    assert module_name == "producer_contracts.model"
+    assert contracts == {("Model", "current"): "dict"}
 
 
 def test_record_return_layout_expands_the_conceptual_output_path():
@@ -2265,6 +2296,95 @@ def test_source_region_accounting_rejects_an_unranked_address_base():
         "kind": "unresolved-address-base-contracts",
         "value_ids": [1],
     }]
+
+
+def test_source_region_accounting_accepts_an_exact_in_place_effect():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    base = SSAValue(1, dtype="float64", shape=(4,))
+    index = SSAValue(2, dtype="int")
+    value = SSAValue(3, dtype="float64")
+    effect = SSAValue(4, dtype="float64", shape=(4,))
+    function = Function(
+        "builder__planned_region_2",
+        [base, index, value],
+        {"entry": BasicBlock("entry", [
+            Instr("IndexedStore", [base, index, value], effect),
+        ])},
+        metadata={
+            "source_region_integral": {
+                "schema": "turing.source-region-integral.v1",
+                "owner": "builder",
+                "plan_name": "region_2",
+                "region_index": 2,
+                "closure_id": 5,
+                "identity_token_chain": (
+                    "source-region", "builder", "closure:5", "region_2",
+                ),
+                "capture_value_ids": (1, 2, 3),
+                "output_value_ids": (),
+                "effect_value_ids": (4,),
+            },
+        },
+    )
+
+    record = source_region_integral_accounting(
+        IRModule({function.name: function}), {function.name: ()},
+    )[0]
+
+    assert record["complete"] is True
+    assert record["effect_value_ids"] == [4]
+    assert record["shortfalls"] == []
+
+
+def test_source_region_accounting_follows_effect_through_address_lowering():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    base = SSAValue(1, dtype="float64", shape=(4,))
+    index = SSAValue(2, dtype="int")
+    value = SSAValue(3, dtype="float64")
+    address = SSAValue(5, dtype="pointer")
+    effect_attributes = {
+        "lowered_from": "IndexedStore",
+        "source_effect_value_id": 4,
+    }
+    function = Function(
+        "builder__planned_region_2",
+        [base, index, value],
+        {"entry": BasicBlock("entry", [
+            Instr(
+                "GetElementPtr", [base, index], address,
+                attributes=effect_attributes,
+            ),
+            Instr(
+                "Store", [value, address], None,
+                attributes=effect_attributes,
+            ),
+        ])},
+        metadata={
+            "source_region_integral": {
+                "schema": "turing.source-region-integral.v1",
+                "owner": "builder",
+                "plan_name": "region_2",
+                "region_index": 2,
+                "closure_id": 5,
+                "identity_token_chain": (
+                    "source-region", "builder", "closure:5", "region_2",
+                ),
+                "capture_value_ids": (1, 2, 3),
+                "output_value_ids": (),
+                "effect_value_ids": (4,),
+            },
+        },
+    )
+
+    record = source_region_integral_accounting(
+        IRModule({function.name: function}), {function.name: ()},
+    )[0]
+
+    assert record["complete"] is True
+    assert record["effect_value_ids"] == [4]
+    assert record["shortfalls"] == []
 
 
 def test_source_region_accounting_rejects_scalarized_set_algebra():

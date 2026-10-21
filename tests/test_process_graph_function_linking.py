@@ -1273,6 +1273,47 @@ def test_sympy_process_graph_is_registered_before_python_dependency_pursuit():
     )
 
 
+def test_linked_sympy_function_address_derives_from_every_authored_equation():
+    x = sympy.Symbol("x")
+    symbolic = compile_sympy_equations((
+        sympy.Eq(sympy.Symbol("incremented"), x + 1, evaluate=False),
+        sympy.Eq(sympy.Symbol("doubled"), x * 2, evaluate=False),
+    ), name="linked_pair_sources")
+
+    from src.compiler.concordance_declarations import (
+        FUNCTION_ADDRESS,
+        SYMBOLIC_EQUATION,
+    )
+    from src.compiler.identity_concordance import (
+        begin_identity_book,
+        current_identity_book,
+        end_identity_book,
+    )
+
+    _book, token = begin_identity_book()
+    try:
+        root = ProcessGraph(materialize_memory=False)
+        link_process_graph_functions(
+            root, {"linked_pair_sources": symbolic.process_graph},
+        )
+        entry = root.function_table.entry("linked_pair_sources")
+        address = current_identity_book().latest_ref(
+            FUNCTION_ADDRESS,
+            (entry.metadata["function_address_identity"],),
+        )
+        sources = tuple(
+            source
+            for source, _stage in current_identity_book().edges_into(address)
+        )
+        assert tuple(source.page for source in sources) == (
+            SYMBOLIC_EQUATION,
+            SYMBOLIC_EQUATION,
+        )
+        assert tuple(source.row[1] for source in sources) == (0, 1)
+    finally:
+        end_identity_book(token)
+
+
 def test_direct_source_to_ssa_preserves_linked_sympy_function_without_fusion():
     x = sympy.Symbol("x")
     symbolic = compile_sympy_equations((
@@ -2290,8 +2331,21 @@ def test_authored_scalar_payload_survives_forwarded_optional_calls(tmp_path):
 
 
 def test_missing_aggregate_leaf_repair_is_exact_and_idempotent():
+    from src.common.tensors.topological_reducer import node_identity_cell
+    from src.compiler.concordance_declarations import (
+        INGESTION_VALUE,
+        INGEST_SOURCE,
+        NodeFact,
+        READ_SCOPE_FORK,
+    )
     from src.compiler.glsl_deployment_strategy import (
         _repair_missing_aggregate_leaf_projections,
+    )
+    from src.compiler.identity_concordance import (
+        Mode,
+        Novel,
+        begin_identity_book,
+        end_identity_book,
     )
 
     graph = ProcessGraph(materialize_memory=False)
@@ -2313,24 +2367,38 @@ def test_missing_aggregate_leaf_repair_is_exact_and_idempotent():
         },
     )
 
-    assert _repair_missing_aggregate_leaf_projections(graph) == 2
-    leaves = tuple(
-        graph.G.nodes[0]["attributes"]["aggregate_leaf_value_ids"]
-    )
-    assert len(leaves) == 2
-    assert all(leaf in graph.G for leaf in leaves)
-    assert [graph.G.nodes[leaf]["tensor"]["dtype"] for leaf in leaves] == [
-        "float64", "bool",
-    ]
-    receipt = graph.G.nodes[0]["attributes"][
-        "aggregate_leaf_republication"
-    ]
-    assert receipt["replacements"] == ((4, leaves[0]), (6, leaves[1]))
-    assert receipt["tie_policy"] == "incumbent"
-    assert _repair_missing_aggregate_leaf_projections(graph) == 0
-    assert tuple(
-        graph.G.nodes[0]["attributes"]["aggregate_leaf_value_ids"]
-    ) == leaves
+    book, token = begin_identity_book()
+    try:
+        scope = book.mint_scope("ingestion:aggregate-leaf-repair")
+        graph.G.graph["ingestion_value_scope"] = scope
+        book.post(
+            INGESTION_VALUE, (scope, 0), NodeFact("Call", "call", ""),
+            stage=READ_SCOPE_FORK,
+            provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+
+        assert _repair_missing_aggregate_leaf_projections(graph) == 2
+        leaves = tuple(
+            graph.G.nodes[0]["attributes"]["aggregate_leaf_value_ids"]
+        )
+        assert len(leaves) == 2
+        assert all(leaf in graph.G for leaf in leaves)
+        assert all(node_identity_cell(graph, leaf) is not None for leaf in leaves)
+        assert [graph.G.nodes[leaf]["tensor"]["dtype"] for leaf in leaves] == [
+            "float64", "bool",
+        ]
+        receipt = graph.G.nodes[0]["attributes"][
+            "aggregate_leaf_republication"
+        ]
+        assert receipt["replacements"] == ((4, leaves[0]), (6, leaves[1]))
+        assert receipt["tie_policy"] == "incumbent"
+        assert _repair_missing_aggregate_leaf_projections(graph) == 0
+        assert tuple(
+            graph.G.nodes[0]["attributes"]["aggregate_leaf_value_ids"]
+        ) == leaves
+    finally:
+        end_identity_book(token)
 
 
 def test_mutable_optional_record_write_marks_presence_before_later_test(tmp_path):
@@ -2712,6 +2780,88 @@ def test_direct_source_lowers_declared_record_literal_and_bool_return():
         for block in root.blocks.values()
         for instruction in block.instrs
     )
+
+
+def test_control_used_predicate_survives_beside_record_return():
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def child(value):\n"
+        "    finite = value > 0.0 and value < 2.0\n"
+        "    if finite:\n"
+        "        observed = value + 1.0\n"
+        "    else:\n"
+        "        observed = value - 1.0\n"
+        "    metrics = Metrics(max_vel=observed, max_flux=observed, "
+        "div_inf=0.0, mass_err=0.0, dt_limit=value)\n"
+        "    return finite, metrics\n\n"
+        "def root(value):\n"
+        "    finite, metrics = child(value)\n"
+        "    return finite, metrics\n",
+        "root",
+        name="predicate_record_return",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=CONTRACT,
+    )
+
+    child = module.functions["predicate_record_return__child"]
+    returned = next(
+        tuple(instruction.args)
+        for block in child.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    )
+    semantic = tuple(map(int, child.metadata["semantic_output_ids"]))
+    layouts = dict(child.metadata["record_return_layouts"])
+    aliases = dict(child.metadata.get("output_identity_aliases", ()))
+    predicate_id = int(aliases.get(semantic[0], semantic[0]))
+
+    assert int(returned[0].id) == predicate_id
+    assert tuple(map(int, layouts[semantic[1]])) == tuple(
+        int(value.id) for value in returned[1:]
+    )
+    assert outputs[child.name] == returned
+
+
+def test_concorded_predicate_survives_late_record_call_result():
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def make_metrics(value):\n"
+        "    return Metrics(max_vel=value, max_flux=value, div_inf=0.0, "
+        "mass_err=0.0, dt_limit=value)\n\n"
+        "def child(value):\n"
+        "    finite = value > 0.0 and value < 2.0\n"
+        "    if finite:\n"
+        "        observed = value + 1.0\n"
+        "    else:\n"
+        "        observed = value - 1.0\n"
+        "    metrics = make_metrics(observed)\n"
+        "    return finite, metrics\n\n"
+        "def root(value):\n"
+        "    finite, metrics = child(value)\n"
+        "    return finite, metrics\n",
+        "root",
+        name="late_record_predicate_return",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=CONTRACT,
+    )
+
+    children = tuple(
+        function for name, function in module.functions.items()
+        if "__child" in name and "__planned_region_" not in name
+    )
+    assert children
+    for child in children:
+        returned = next(
+            tuple(instruction.args)
+            for block in child.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Ret"
+        )
+        semantic = tuple(map(int, child.metadata["semantic_output_ids"]))
+        aliases = dict(child.metadata.get("output_identity_aliases", ()))
+        predicate_id = int(aliases.get(semantic[0], semantic[0]))
+
+        assert len(returned) == len(semantic) == 2
+        assert int(returned[0].id) == predicate_id
+        assert outputs[child.name] == returned
 
 
 def test_linked_record_result_expands_as_typed_sequence_row():

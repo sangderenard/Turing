@@ -65,10 +65,12 @@ from src.compiler.loop_ir import (
 )
 from src.compiler.control_source import (
     ConditionalBlock,
+    ControlExpression,
     ControlProgram,
     ControlTarget,
     LoopBlock,
     LoopControlBlock,
+    SequenceQueryBlock,
     SequenceBlock,
     StatementBlock,
     StreamPublishBlock,
@@ -1360,6 +1362,46 @@ def test_reversed_resident_iterable_keeps_source_binding_and_reverse_bounds():
     assert reduction.control_program.root.step == "-1"
 
 
+def test_mapping_items_projects_the_producer_owned_keyed_columns():
+    graph = _function_graph(
+        "def kernel(mapping):\n"
+        "    total = 0\n"
+        "    for key, value in mapping.items():\n"
+        "        total = total + value\n"
+        "    return total\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,)
+    )
+    items_node = graph.G.nodes[int(plan.loop.iterable_node)]
+    mapping_id, = (
+        int(parent)
+        for parent, role in items_node["parents"]
+        if str(role) in {"operand", "value", "object", "base"}
+    )
+
+    assert reduction.control_program is not None
+    assert reduction.control_program.projected_iterable_bindings == (
+        (
+            mapping_id,
+            int(plan.loop.target_bindings[0][1]),
+            f"iteration_{int(plan.loop.node_id)}",
+            0,
+        ),
+        (
+            mapping_id,
+            int(plan.loop.target_bindings[1][1]),
+            f"iteration_{int(plan.loop.node_id)}",
+            1,
+        ),
+    )
+    assert reduction.control_program.root.stop == (
+        f"__iterable_extent_{mapping_id}__"
+    )
+
+
 def test_enumerate_resident_iterable_exports_projected_bindings():
     graph = _function_graph(
         "def kernel(field):\n"
@@ -1789,6 +1831,211 @@ def test_indexed_table_store_keeps_tuple_value_as_one_mapping_item():
     assert (graph.G.nodes[value_id].get("attributes") or {}).get(
         "aggregate_kind"
     ) == "tuple"
+
+
+def test_conditional_tuple_set_row_uses_authoritative_aggregate_layout():
+    graph = _function_graph(
+        "def kernel(flag, first, second, third):\n"
+        "    rows = set()\n"
+        "    row = (first, second)\n"
+        "    if flag:\n"
+        "        row = (first, third)\n"
+        "    rows.add(row)\n"
+        "    return rows\n",
+        "kernel",
+    )
+
+    mutation, = (
+        item for item in _sequence_append_call_mutations(graph.G)
+        if item.operator == "add"
+    )
+
+    assert mutation.argument_kind == "row"
+    assert len(mutation.argument_value_ids) == 2
+    first_id = int(graph.G.graph["identity_table"]["first"][0])
+    assert mutation.argument_value_ids[0] == first_id
+
+
+def test_comprehension_tuple_row_uses_authoritative_aggregate_layout():
+    graph = _function_graph(
+        "def kernel(values):\n"
+        "    return {(value.dtype, tuple(value.shape or ())) if value "
+        "else (None, ()) for value in values}\n",
+        "kernel",
+    )
+    plans = _glsl_composer().compose(graph)
+    plans = materialize_retained_loop_ports(graph, plans)
+    reductions = analyze_shader_loop_reductions(
+        graph,
+        plans,
+        tuple(plan.loop.body_nodes for plan in plans),
+    )
+    comprehension = next(
+        reduction.control_program
+        for plan, reduction in zip(plans, reductions)
+        if plan.loop.source_type == "comprehension"
+    )
+
+    assert comprehension is not None
+    mutation, = comprehension.root.sequence_mutations
+    assert mutation.operator == "add"
+    assert len(mutation.argument_value_ids) == 2
+    from src.compiler.fortran_c_shell import (
+        _attach_graph_control_expressions,
+    )
+    ifexp_id, ifexp = next(
+        (int(data.get("value_id", node_id)), data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.IfExp)
+    )
+    parents = {
+        str(role): int(graph.G.nodes[parent].get("value_id", parent))
+        for parent, role in ifexp.get("parents", ())
+    }
+    attached = _attach_graph_control_expressions(
+        ControlProgram(root=ConditionalBlock(
+            parents["test"], SequenceBlock(()), SequenceBlock(()),
+            source_node_id=ifexp_id,
+            result_aliases=((
+                parents["body"], parents["orelse"], ifexp_id,
+            ),),
+        )),
+        graph.G,
+    )
+    conditional = attached.root
+    assert tuple(alias[2] for alias in conditional.result_aliases) == (
+        mutation.argument_value_ids
+    )
+
+
+def test_validation_structured_predicate_schedules_resident_query_producer():
+    """A normalized raise guard retains the dependencies of its predicate."""
+
+    from src.compiler.control_source import SequenceQueryBlock
+    from src.compiler.fortran_c_shell import (
+        _attach_graph_control_expressions,
+        _schedule_sequence_query_dependencies,
+    )
+
+    graph = _function_graph(
+        "def kernel(values: list[float]):\n"
+        "    if not values or any(value > 0.0 for value in values):\n"
+        "        raise ValueError('invalid')\n"
+        "    return 0\n",
+        "kernel",
+    )
+    predicate_id = next(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.BoolOp)
+    )
+    query_id = next(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Name)
+        and data["expr_obj"].func.id == "any"
+    )
+    producer = LoopBlock(
+        "value", "0", "n", "1", StatementBlock(("produce",)),
+        source_loop_node_id=700,
+    )
+    query = SequenceQueryBlock(
+        result_value_id=query_id,
+        sequence_value_id=701,
+        operation="any",
+        producer_loop_node_id=700,
+    )
+    validation = ValidationBlock(
+        predicate_value_id=predicate_id,
+        error_code=1,
+        expect_true=False,
+    )
+
+    attached = _attach_graph_control_expressions(
+        ControlProgram(SequenceBlock((validation, producer, query))),
+        graph.G,
+    )
+    scheduled = _schedule_sequence_query_dependencies(attached.root)
+
+    assert attached.root.blocks[0].predicate_expression is not None
+    assert scheduled.blocks == (producer, query, attached.root.blocks[0])
+
+
+def test_graph_expression_attachment_keeps_terminal_raise_constant():
+    from src.compiler.fortran_c_shell import _attach_graph_control_expressions
+
+    graph = _function_graph(
+        "def refuse(value):\n"
+        "    raise RuntimeError(f'value={value!r}')\n",
+        "refuse",
+    )
+    raise_id = next(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Raise)
+    )
+    predicate = ControlExpression(
+        "const", value_id=raise_id, literal=False,
+    )
+    validation = ValidationBlock(
+        predicate_value_id=raise_id,
+        error_code=raise_id,
+        predicate_expression=predicate,
+    )
+
+    attached = _attach_graph_control_expressions(
+        ControlProgram(validation), graph.G,
+    )
+
+    assert attached.root.predicate_expression is predicate
+
+
+def test_loop_target_query_is_inserted_inside_spanless_comprehension():
+    from src.compiler.fortran_c_shell import _insert_lexically
+
+    graph = _function_graph(
+        "def kernel(rows):\n"
+        "    return any(len(row) > 1 for row in rows)\n",
+        "kernel",
+    )
+    loop_id = next(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.comprehension)
+    )
+    call_id = next(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Name)
+        and data["expr_obj"].func.id == "len"
+    )
+    target_id, = tuple(
+        int(value_id)
+        for value_id in (
+            graph.G.nodes[loop_id].get("attributes") or {}
+        )["loop_target_bindings"].values()
+    )
+    query = SequenceQueryBlock(
+        result_value_id=call_id,
+        sequence_value_id=target_id,
+        operation="length",
+        source_call_node_id=call_id,
+        extraction_identity="builtins.len",
+    )
+    root = LoopBlock(
+        "row", "0", "1", "1", StatementBlock(("body",)),
+        source_loop_node_id=loop_id,
+    )
+
+    inserted, found = _insert_lexically(
+        root, graph, (), query, call_id,
+    )
+
+    assert found
+    assert isinstance(inserted, LoopBlock)
+    assert query in inserted.body.blocks
 
 
 def test_source_sort_retains_lambda_projection_and_mapping_getitem_keys():

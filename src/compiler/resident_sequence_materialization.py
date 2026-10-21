@@ -464,8 +464,27 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
     grouped = {}
     for recipe_cell, component in recipes:
         mode = "repr" if int(component.conversion) == ord("r") else "raw"
-        grouped.setdefault(mode, []).append((recipe_cell, component))
-    for mode, mode_recipes in grouped.items():
+        transform = component.projection_transform
+        if transform not in {None, "strip"}:
+            raise ValueError(
+                "unknown string-token glyph transform: "
+                f"value={int(component.operand_value_id)} "
+                f"transform={transform!r}"
+            )
+        token_value_id = int(
+            component.projection_source_value_id
+            if component.projection_source_value_id is not None
+            else component.operand_value_id
+        )
+        if transform == "strip" and component.projection_source_value_id is None:
+            raise ValueError(
+                "str.strip glyph projection has no exact source token: "
+                f"value={int(component.operand_value_id)}"
+            )
+        grouped.setdefault((mode, transform), []).append((
+            recipe_cell, component, int(token_value_id),
+        ))
+    for (mode, transform), mode_recipes in grouped.items():
         vocabulary_rows = []
         entry_cells = []
         for row in sorted(entry_page.rows(), key=lambda item: int(item[0])):
@@ -481,10 +500,13 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
                     f"StringTable concordance entry is not text: {row!r}"
                 )
             entry_cells.append(entry_cell)
+            projected_word = word.strip() if transform == "strip" else word
             glyphs = (
-                tuple(quoted_string_glyph_tokens(word))
+                tuple(quoted_string_glyph_tokens(projected_word))
                 if mode == "repr"
-                else tuple(string_token(character) for character in word)
+                else tuple(
+                    string_token(character) for character in projected_word
+                )
             )
             vocabulary_rows.append((int(token), -1, len(glyphs)))
             vocabulary_rows.extend(
@@ -497,7 +519,11 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
         # still names the recipes the (empty) vocabulary serves.
         vocabulary_id, vocabulary_cell = mint_vocabulary(vocabulary_rows, (
             *entry_cells,
-            *(recipe_cell for recipe_cell, _component in mode_recipes),
+            *(
+                recipe_cell
+                for recipe_cell, _component, _token_value_id
+                in mode_recipes
+            ),
         ))
         declarations.append((vocabulary_id, "unique", 3, False))
         initializations.append((
@@ -508,14 +534,18 @@ def _string_token_glyph_materializations(graph_obj: Any, string_table: Any):
             ControlSequenceMutation(
                 int(component.component_value_id),
                 "glyph_token_lookup_copy",
-                (int(component.operand_value_id), vocabulary_id),
+                (int(token_value_id), vocabulary_id),
                 int(component.component_value_id),
                 policy="duplicates",
-                argument_kind="string_table_glyph_projection",
+                argument_kind=(
+                    "string_table_strip_glyph_projection"
+                    if transform == "strip"
+                    else "string_table_glyph_projection"
+                ),
                 source_contract_cell=recipe_cell,
                 vocabulary_contract_cell=vocabulary_cell,
             )
-            for recipe_cell, component in mode_recipes
+            for recipe_cell, component, token_value_id in mode_recipes
         )
     enum_page = book.page(SOURCE_ENUM_GLYPH_TABLE)
     enum_grouped = {}
@@ -1701,6 +1731,32 @@ def _sequence_append_call_mutations(graph_obj: Any):
         int(data.get("value_id", node_id)): data
         for node_id, data in graph_obj.nodes(data=True)
     }
+    from .concordance_declarations import (
+        SOURCE_AGGREGATE_LAYOUT,
+        SourceAggregateLayout,
+    )
+    aggregate_scope = graph_obj.graph.get("source_aggregate_layout_scope")
+    aggregate_page = current_identity_book().page(SOURCE_AGGREGATE_LAYOUT)
+
+    def aggregate_members(value_id: int) -> tuple[int, ...]:
+        """Return the reducer-owned immediate row layout for one tuple.
+
+        Graph attributes are a projection/debug view and can disappear at a
+        copy boundary.  SOURCE_AGGREGATE_LAYOUT is the immutable authority for
+        member order, including a tuple selected by conditional control.  Keep
+        nested resident sequences as one member: their descriptor handle is a
+        row column, not a request to flatten runtime-length storage.
+        """
+
+        if aggregate_scope is None:
+            return ()
+        layout = aggregate_page.latest((aggregate_scope, int(value_id)))
+        if not isinstance(layout, SourceAggregateLayout):
+            return ()
+        if str(layout.aggregate_kind) != "tuple":
+            return ()
+        return tuple(int(member.value_id) for member in layout.members)
+
     expanded_mutations = []
     for mutation in mutations:
         arguments: list[int] = []
@@ -1711,6 +1767,8 @@ def _sequence_append_call_mutations(graph_obj: Any):
             leaves = tuple(map(
                 int, attributes.get("aggregate_leaf_value_ids", ())
             ))
+            if not leaves:
+                leaves = aggregate_members(int(value_id))
             abi = (graph_obj.graph.get('linked_value_abi') or {}).get(int(value_id), {})
             if (attributes.get("aggregate_kind") == "tuple" and leaves
                     and not mutation.argument_kind.startswith((
@@ -1845,9 +1903,16 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
     materializers; callers pass only ordinary declared sequence identities.
     """
     from .control_source import ControlExpression, ControlSequenceMutation
+    from .concordance_declarations import (
+        SOURCE_AGGREGATE_LAYOUT,
+        SourceAggregateLayout,
+    )
+    from .identity_concordance import current_identity_book
     from .string_table import string_token
 
     accepted = set(map(int, sequence_ids))
+    aggregate_scope = graph_obj.graph.get("source_aggregate_layout_scope")
+    aggregate_page = current_identity_book().page(SOURCE_AGGREGATE_LAYOUT)
     mutations = []
     for node_id, data in graph_obj.nodes(data=True):
         sequence_id = int(data.get("value_id", node_id))
@@ -1861,10 +1926,35 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         parents = tuple((int(parent), graph_obj.nodes[parent])
                         for parent, role in data.get("parents", ())
                         if str(role).startswith("elts") and parent in graph_obj)
+        layout = (
+            aggregate_page.latest((aggregate_scope, sequence_id))
+            if aggregate_scope is not None else None
+        )
+        layout_members = (
+            tuple(int(member.value_id) for member in layout.members)
+            if isinstance(layout, SourceAggregateLayout)
+            and str(layout.aggregate_kind) == "list"
+            else ()
+        )
+        if layout_members and len(layout_members) != len(expression.elts):
+            raise ValueError(
+                f"List {sequence_id} aggregate layout has "
+                f"{len(layout_members)} member(s), source has "
+                f"{len(expression.elts)}"
+            )
         rows = []
-        for element in expression.elts:
-            exact = tuple((parent, row) for parent, row in parents
-                          if row.get("expr_obj") is element)
+        for ordinal, element in enumerate(expression.elts):
+            member_id = (
+                layout_members[ordinal] if layout_members else None
+            )
+            exact = tuple(
+                (parent, row) for parent, row in parents
+                if (
+                    int(row.get("value_id", parent)) == int(member_id)
+                    if member_id is not None
+                    else row.get("expr_obj") is element
+                )
+            )
             if len(exact) != 1 or isinstance(element, ast.Starred):
                 raise ValueError(f"List {sequence_id} lacks one exact element producer")
             parent, row = exact[0]

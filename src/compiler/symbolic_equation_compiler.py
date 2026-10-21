@@ -28,7 +28,11 @@ from .external_functions import declared_external_functions
 from .sympy_dual_ir_cache import SympyDualIRCache
 from ..common.tensors.accelerator_backends.aot_checkpoint import callable_digest
 from ..common.tensors.accelerator_backends.artifact_cache import implementation_digest
-from ..transmogrifier.graph.graph_express2 import ProcessGraph
+from ..transmogrifier.graph.graph_express2 import (
+    ProcessGraph,
+    SourceDefinition,
+    resolve_source_definition,
+)
 from ..transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
 
 
@@ -745,7 +749,80 @@ def compile_sympy_equations(
             cache_hit=cached.hit,
         )
     _post_symbolic_outputs(value, name)
+    value.process_graph.G.graph["symbolic_compilation_recipe"] = {
+        "equations": authored,
+        "name": str(name),
+        "schedule": str(schedule),
+        "publications": publication_rows,
+        "dtype": str(dtype),
+        "external_derivatives": dict(external_derivatives or {}),
+        "node_count": len(value.process_graph.G),
+        "edge_count": value.process_graph.G.number_of_edges(),
+    }
     return value
+
+
+def rebuild_symbolic_process_graph_in_current_book(graph: ProcessGraph) -> ProcessGraph:
+    """Re-ingest an unmodified symbolic function into the active book.
+
+    A linked graph may have been obtained from the persistent dual-IR cache or
+    compiled before the enclosing source compiler opened its identity book.
+    Its graph nodes therefore cannot reuse the old book's minted ingestion
+    scope.  Replaying the retained authored equations through the same
+    compiler is the exact source-to-graph operation and mints this book's own
+    node identities.  A graph whose topology was subsequently edited is
+    refused here: replaying only its original equations would discard those
+    edits.
+    """
+
+    recipe = graph.G.graph.get("symbolic_compilation_recipe")
+    if not isinstance(recipe, Mapping):
+        return graph
+    from .concordance_declarations import INGESTION_VALUE
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("ingestion_value_scope")
+    if scope is not None and all(
+        current_identity_book().latest_ref(
+            INGESTION_VALUE, (tuple(scope), int(node_id)),
+        ) is not None
+        for node_id in graph.G
+    ):
+        return graph
+    if (
+        len(graph.G) != int(recipe["node_count"])
+        or graph.G.number_of_edges() != int(recipe["edge_count"])
+    ):
+        raise ValueError(
+            "linked symbolic ProcessGraph topology changed after compilation; "
+            "its authored graph edits need their own portable source recipe"
+        )
+    rebuilt = _compile_sympy_equations_uncached(
+        tuple(recipe["equations"]),
+        name=str(recipe["name"]),
+        schedule=str(recipe["schedule"]),
+        publications=tuple(recipe["publications"]),
+        dtype=str(recipe["dtype"]),
+        external_derivatives=dict(recipe["external_derivatives"]),
+    )
+    _post_symbolic_outputs(rebuilt, str(recipe["name"]))
+    rebuilt.process_graph.G.graph["symbolic_compilation_recipe"] = dict(recipe)
+
+    # Some callers narrow only the public boundary of the compiled law (for
+    # example removing parameter-echo outputs).  Node identities are stable
+    # under the exact replay, so retain those declared surface selections.
+    for key in (
+        "function_parameters",
+        "positional_parameters",
+        "keyword_only_parameters",
+        "function_outputs",
+        "deployment_outputs",
+        "identity_table",
+    ):
+        if key in graph.G.graph:
+            rebuilt.process_graph.G.graph[key] = copy.deepcopy(graph.G.graph[key])
+    rebuilt.process_graph.roots = list(graph.roots)
+    return rebuilt.process_graph
 
 
 def symbolic_program_scope(
@@ -832,30 +909,22 @@ def _post_symbolic_program(
     writes no new cell, so the pre-ingestion post and the per-call post of
     ``_post_symbolic_outputs`` agree."""
 
-    import hashlib
-
     from .concordance_declarations import (
-        INGEST_SOURCE, INGESTION, SYMBOLIC_EQUATION, SYMBOLIC_EQUATION_OUTPUT,
-        SymbolicEquationFact, SymbolicOutputFact, SymbolicOutputForm,
+        INGESTION, SYMBOLIC_EQUATION_OUTPUT,
+        SymbolicOutputFact, SymbolicOutputForm,
     )
     from .identity_concordance import (
-        Derived, Mode, Novel, current_identity_book,
+        Derived, Mode, current_identity_book,
     )
 
     program = _symbolic_program_key(name, reprs)
     book = current_identity_book()
-    cells = {}
-    for index, (text, equation) in enumerate(zip(reprs, equations)):
-        lhs = equation.lhs
-        cells[index] = book.post(
-            SYMBOLIC_EQUATION, (program, index),
-            SymbolicEquationFact(
-                hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                tuple(int(extent) for extent in lhs.shape) if _is_matrix(lhs) else (),
-            ),
-            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
-            mode=Mode.CONCORD,
+    cells = {
+        index: resolve_source_definition(definition)
+        for index, definition in enumerate(
+            _symbolic_equation_source_definitions(name, reprs, equations)
         )
+    }
     output_cells = {}
     for output, equation_index, component, form in outputs:
         output_cells[str(output)] = book.post(
@@ -878,6 +947,42 @@ def _post_symbolic_program(
     return output_cells
 
 
+def _symbolic_equation_source_definitions(
+    name: str,
+    reprs: Sequence[str],
+    equations: Sequence[sympy.Equality],
+) -> tuple[SourceDefinition, ...]:
+    """Book-independent authored roots for one symbolic function.
+
+    Linked ProcessGraphs outlive the identity book in which their equations
+    were first lowered.  Carry the declared roots, not stale ``Ref`` objects,
+    so a later whole-program book can post the exact same equation identities
+    and derive the function address from the complete authored set.
+    """
+
+    import hashlib
+
+    from .concordance_declarations import (
+        SYMBOLIC_EQUATION,
+        SymbolicEquationFact,
+    )
+
+    program = _symbolic_program_key(name, reprs)
+    return tuple(
+        SourceDefinition(
+            SYMBOLIC_EQUATION,
+            (program, index),
+            SymbolicEquationFact(
+                hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                tuple(int(extent) for extent in equation.lhs.shape)
+                if _is_matrix(equation.lhs)
+                else (),
+            ),
+        )
+        for index, (text, equation) in enumerate(zip(reprs, equations))
+    )
+
+
 def _post_symbolic_outputs(
     compilation: SymbolicEquationCompilation, name: str,
 ) -> None:
@@ -895,6 +1000,11 @@ def _post_symbolic_outputs(
     outputs = tuple(metadata.get("symbolic_outputs") or ())
     if not reprs or not outputs:
         return
+    compilation.process_graph.G.graph["function_source_definitions"] = (
+        _symbolic_equation_source_definitions(
+            name, reprs, compilation.equations,
+        )
+    )
     derivatives = {
         sympy.Function(function): sympy.Function(derivative)
         for function, derivative in metadata.get("external_derivatives") or ()}

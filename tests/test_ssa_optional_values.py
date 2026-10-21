@@ -4,7 +4,7 @@ from pathlib import Path
 from src.common.tensors import AbstractTensor
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import c_backend_repository_ssa_reference
 from src.common.dt_system import dt_controller
-from src.common.dt_system.dt_scaler import _scalar
+from src.common.dt_system.dt_scaler import Metrics, _scalar
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.ssa_c_backend import emit_ssa_to_c
@@ -241,7 +241,11 @@ def test_energy_limit_exact_helper_has_closed_optional_and_structural_abi():
         name="test_energy_limit_optional",
         extraction_contract=contract,
         resolved_process_graph_sink=resolved.append,
-        python_bindings={"AbstractTensor": AbstractTensor},
+        python_bindings={
+            "AbstractTensor": AbstractTensor,
+            "Metrics": Metrics,
+            "Targets": dt_controller.Targets,
+        },
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
     )
 

@@ -30,6 +30,7 @@ from src.compiler.shell_reference_tables import (
     build_shell_reference_tables,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+from src.transmogrifier.graph.graph_express2 import _map_ir_from_ast
 
 
 def _reduced_function_graph():
@@ -49,6 +50,49 @@ def record(writer, frame):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
     return graph, graph.function_table.entry("record").graph
+
+
+def test_map_ir_joins_one_exact_class_declaration_fragment():
+    complete = ast.parse(
+        "class Payload:\n"
+        "    value: float = 0.0\n"
+        "    def read(self):\n"
+        "        return self.value\n"
+    ).body[0]
+    fragment = ast.parse(
+        "class Payload:\n"
+        "    value: float = 0.0\n"
+    ).body[0]
+    for definition in (complete, fragment):
+        definition._python_source_identity = ("package.records", "Payload")
+    fragment._turing_declaration_fragment = True
+    module = ast.Module(body=[complete, fragment], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    mapped = _map_ir_from_ast(module)
+
+    assert len(mapped["objects"]) == 1
+    payload = mapped["objects"][0]
+    assert payload["class_identity"] == "package.records.Payload"
+    assert tuple(item["name"] for item in payload["attributes"]) == ("value",)
+    assert tuple(item["name"] for item in payload["methods"]) == ("read",)
+
+
+def test_map_ir_refuses_two_full_definitions_of_one_class_identity():
+    definitions = [
+        ast.parse("class Payload:\n    value: float = 0.0\n").body[0]
+        for _ in range(2)
+    ]
+    for definition in definitions:
+        definition._python_source_identity = ("package.records", "Payload")
+    module = ast.Module(body=definitions, type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    with pytest.raises(
+        ValueError,
+        match="two full class definitions.*package.records.Payload",
+    ):
+        _map_ir_from_ast(module)
 
 
 def test_shell_reference_tables_use_dense_monotonic_local_ids():

@@ -1,9 +1,30 @@
-"""Monotone aggregate result-type propagation with incumbent tie breaking."""
+"""Producer-backed result contracts with explicit revision and conflict rules."""
 from .transformation_priority import TransformationLedger, TransformationRule
 
 
 def _type(value):
     return (value.dtype, tuple(value.shape), value.device)
+
+
+def _recorded_type(function, value):
+    from .structural_concordance import function_value_structure
+
+    structure, _cell = function_value_structure(function, int(value.id))
+    return (structure.dtype, structure.shape, value.device)
+
+
+def _publish_type(function, value, winner, decision):
+    """Commit the retained decision before changing its resident SSA view."""
+    from .concordance_declarations import FRAME_LINK
+    from .ssa_record_return_state import publish_ssa_value_type
+
+    changed = _type(value) != winner
+    publish_ssa_value_type(
+        function, value, dtype=winner[0], shape=winner[1],
+        stage=FRAME_LINK, sources=(decision,),
+    )
+    value.device = winner[2]
+    return changed
 
 
 def _storage_type(value):
@@ -31,12 +52,12 @@ def equivalent_physical_layout(left, right):
 def _value_cells(*pairs):
     """The ``ssa_value`` cells of ``(function, value)`` pairs that the book
     holds (the proof of a proposal was read from these values)."""
-    from .ssa_record_return_state import ssa_value_identity_cell
+    from .structural_concordance import function_value_structure
 
     cells = []
     for function, value in pairs:
-        cell = ssa_value_identity_cell(function, int(value.id))
-        if cell is not None and cell not in cells:
+        _structure, cell = function_value_structure(function, int(value.id))
+        if cell not in cells:
             cells.append(cell)
     return tuple(cells)
 
@@ -50,7 +71,7 @@ def settle_call_result_types(functions, emit_outputs, function_values):
         TransformationRule('physical_storage', 3),
         TransformationRule('addressed_element', 3),
     ), {'provisional': ('callee_output', 'physical_storage', 'addressed_element'),
-        'callee_output': ('physical_storage', 'addressed_element')})
+        'callee_output': ('physical_storage', 'addressed_element')}, concordant_ties=True)
     for function in functions.values():
         # Accepted dependency bodies retain the book that proved their
         # internal values.  They are immutable sources for this unit's call
@@ -62,11 +83,14 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             continue
         for value in function_values(function).values():
             accounting = value.accounting or {}
-            physical = (accounting.get('physical_dtype') or accounting.get('program_abi_storage')) and value.dtype not in {None, '', 'unknown'}
+            recorded = _recorded_type(function, value)
+            physical = (accounting.get('physical_dtype') or accounting.get('program_abi_storage')) and recorded[0] not in {None, '', 'unknown'}
             ledger.propose((function.name, int(value.id)),
                 'physical_storage' if physical else 'provisional',
-                ('initial', _type(value)), after=_type(value),
+                ('initial', recorded), after=recorded,
                 sources=_value_cells((function, value)))
+            _publish_type(function, value, recorded,
+                          ledger.decision_cell((function.name, int(value.id))))
 
     def bindings():
         for caller in functions.values():
@@ -216,20 +240,23 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                         or item.attributes.get('lowered_from') not in {'Indexed', 'gather'}):
                     continue
                 base = addresses.get(int(item.args[0].id))
-                if base is None or base.dtype in {None, '', 'unknown', 'ptr', 'ssa.aggregate'}:
+                if base is None:
+                    continue
+                base_type = _recorded_type(owner, base)
+                if base_type[0] in {None, '', 'unknown', 'ptr', 'ssa.aggregate'}:
                     continue
                 target = item.res
-                proposal = (base.dtype, tuple(target.shape), base.device)
+                proposal = (base_type[0], _recorded_type(owner, target)[1], base_type[2])
                 identity = (owner.name, int(target.id))
+                source_cells = _value_cells((owner, base), (owner, target))
                 ledger.propose(
                     identity, 'addressed_element',
                     (owner.name, int(base.id), int(item.args[0].id), proposal),
                     before=_type(target), after=proposal,
-                    sources=_value_cells((owner, base), (owner, target)),
+                    sources=source_cells, revision_source=source_cells[0],
                 )
                 winner = ledger.incumbent_target(identity)
-                if winner != _type(target):
-                    target.dtype, target.shape, target.device = winner
+                if _publish_type(owner, target, winner, ledger.decision_cell(identity)):
                     changed = True
                 physical = (base.accounting or {}).get('physical_dtype')
                 if physical:
@@ -237,30 +264,26 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                         'physical_dtype': physical,
                         'physical_dtype_provenance': ('addressed_element', owner.name, int(base.id))}
         for caller, target, callee, source in bindings():
-            if source.dtype in {None, '', 'unknown'} and not source.shape and source.device is None:
-                continue
-            # An accepted dependency's value fact belongs to its retained
-            # identity book.  This ambient ledger has no sanctioned
-            # cross-book receipt from which to revise the caller.  Preserve
-            # the caller's already-concorded type; the conflict report below
-            # exposes any disagreement instead of re-deriving the foreign
-            # fact from a Python object or from the call's mere existence.
-            if accepted_ssa_component(callee):
+            # Imported bodies remain immutable. Their exact producer proof
+            # crosses through the book's digest-qualified import edge; it is
+            # now usable evidence for this caller, not a foreign local Ref.
+            source_type = _recorded_type(callee, source)
+            if source_type[0] in {None, '', 'unknown'} and not source_type[1] and source_type[2] is None:
                 continue
             identity = (caller.name, int(target.id))
             source_priority = ledger.incumbent_priority((callee.name, int(source.id))) or 1
             rule = 'physical_storage' if source_priority == 3 else 'callee_output'
             previous_priority = ledger.incumbent_priority(identity)
+            source_cells = _value_cells((callee, source), (caller, target))
             accepted = ledger.propose(identity, rule,
-                (callee.name, int(source.id), _type(source)), before=_type(target), after=_type(source),
-                sources=_value_cells((callee, source), (caller, target)) + tuple(
+                (callee.name, int(source.id), source_type), before=_recorded_type(caller, target), after=source_type,
+                sources=source_cells + tuple(
                     cell for cell in (
                         ledger.decision_cell((callee.name, int(source.id))),
                     ) if cell is not None
-                ))
+                ), revision_source=source_cells[0])
             winner = ledger.incumbent_target(identity)
-            if winner != _type(target):
-                target.dtype, target.shape, target.device = winner
+            if _publish_type(caller, target, winner, ledger.decision_cell(identity)):
                 changed = True
             if ledger.incumbent_priority(identity) != previous_priority:
                 changed = True
@@ -272,13 +295,13 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                     target.accounting['physical_dtype'] = physical_dtype
                     target.accounting['physical_dtype_provenance'] = (
                         'callee_output', callee.name, int(source.id))
-            elif winner == _type(source):
+            elif winner == source_type:
                 target.accounting = dict(target.accounting or {})
                 target.accounting.setdefault('ssa_call_result_from', (callee.name, int(source.id)))
             # A rejected physical incumbent need not have a callee origin.
             # Only accepted/equivalent result bindings authorize downstream
             # consumers to propagate that origin.
-            if (accepted or winner == _type(source)) and (target.accounting or {}).get('ssa_call_result_from'):
+            if (accepted or winner == source_type) and (target.accounting or {}).get('ssa_call_result_from'):
                 exact_values.add(id(target))
 
     conflicts = tuple(dict(caller=caller.name, value_id=int(target.id),

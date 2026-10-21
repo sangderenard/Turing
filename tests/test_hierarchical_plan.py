@@ -122,6 +122,40 @@ def test_shell_hierarchy_plan_lists_mixed_operator_without_capture():
     )
 
 
+def test_refreshed_region_drops_parent_records_for_retired_values():
+    process = nx.DiGraph()
+    process.add_node(
+        0, type="Input", op="input",
+        attributes={"binding_name": "live"},
+        tensor={"shape": (), "dtype": "float64", "rank": 0},
+    )
+    process.add_node(
+        1, type="Add", op="Add",
+        parents=((0, "lhs"), (299, "rhs")), attributes={},
+        tensor={"shape": (), "dtype": "float64", "rank": 0},
+    )
+    process.add_edge(0, 1)
+    region = nx.DiGraph()
+    region.graph.update({
+        "deployment_nodes": (1,),
+        "deployment_inputs": (0, 299),
+    })
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process),
+        dispatch_subgraphs=(SimpleNamespace(G=region),),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    planned_region = _build_shell_hierarchy_plan(shell).items[0]
+    line = planned_region.items[0]
+
+    assert planned_region.captures == (0,)
+    assert line.inputs == (0,)
+    assert line.input_roles == ("lhs",)
+
+
 def test_control_loop_backedges_are_exact_hierarchy_dependencies():
     process = nx.DiGraph()
     process.add_node(
@@ -164,6 +198,39 @@ def test_control_loop_backedges_are_exact_hierarchy_dependencies():
     plan = _build_shell_hierarchy_plan(shell)
 
     assert plan.captures == (1, 2)
+
+
+def test_retired_control_endpoint_is_not_a_graph_capture():
+    """Control-only aliases survive specialization without fake node roots."""
+
+    process = nx.DiGraph()
+    process.add_node(
+        1,
+        type="Input",
+        attributes={"binding_name": "initial"},
+    )
+    control = ControlProgram(
+        LoopBlock(
+            "iteration_0",
+            "0",
+            "1",
+            "1",
+            StatementBlock(()),
+            carried_aliases=((299, 1),),
+        ),
+        region_indices=(),
+    )
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process),
+        dispatch_subgraphs=(),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=control,
+    )
+
+    plan = _build_shell_hierarchy_plan(shell)
+
+    assert plan.captures == (1,)
 
 
 def test_direct_aggregate_return_binds_call_from_source_span_and_backing_storage():

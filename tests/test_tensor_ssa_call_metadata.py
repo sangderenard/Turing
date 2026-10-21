@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from src.compiler.tensor_ssa_lowering import (
+    _records_same_identity_shape_transport,
+    _settle_unary_result_metadata,
     legalize_aggregate_adapters,
     legalize_aggregate_output_views,
     propagate_repository_ssa_call_metadata,
@@ -45,6 +47,31 @@ def test_explicit_broadcast_shape_owns_allocation_before_call_settlement(operati
     assert descriptor.byte_size == 48
     assert descriptor.strides == (3, 1)
     assert descriptor.owns_allocation
+
+
+def test_shaped_isfinite_keeps_semantic_bool_descriptor():
+    source = SSAValue(128, "float64", (8, 4, 14))
+    finite = SSAValue(130, "bool", (8, 4, 14))
+
+    _settle_unary_result_metadata(source, finite)
+
+    assert finite.dtype == "bool"
+    assert finite.shape == source.shape
+
+
+def test_storage_view_does_not_publish_a_collapsed_identity_self_edge():
+    declared_view = {
+        "storage_value_id": 13,
+        "view_shape": (164,),
+        "operation": "reshape",
+    }
+
+    assert not _records_same_identity_shape_transport(
+        (4, 41), (164,), declared_view,
+    )
+    assert _records_same_identity_shape_transport(
+        (4, 41), (4, 41), declared_view,
+    )
 
 
 def test_call_metadata_shares_owner_regions_but_not_unrelated_local_ids():

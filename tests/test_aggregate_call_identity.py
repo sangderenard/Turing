@@ -264,6 +264,75 @@ def test_nested_conditional_aggregate_layout_is_exact_source_fact():
         end_identity_book(token)
 
 
+def test_ifexp_aggregate_layout_is_exact_source_fact():
+    book, token = begin_identity_book()
+    try:
+        process = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            process.build_from_ast(ast.parse(
+                "def choose(flag, first, second, third):\n"
+                "    return (first, second) if flag else (first, third)\n"
+            ))
+        reduce_abstract_tensor_topology(process)
+        graph = process.function_table.entry("choose").graph.G
+        scope = graph.graph["source_aggregate_layout_scope"]
+        result_id = next(
+            int(data.get("value_id", node_id))
+            for node_id, data in graph.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.IfExp)
+        )
+        layout = book.page(SOURCE_AGGREGATE_LAYOUT).latest(
+            (scope, result_id)
+        )
+
+        assert isinstance(layout, SourceAggregateLayout)
+        assert layout.aggregate_kind == "tuple"
+        assert layout.conditional_cell is not None
+        assert len(layout.arm_layout_cells) == 2
+        assert len(layout.members) == 2
+    finally:
+        end_identity_book(token)
+
+
+def test_next_over_resident_tuple_rows_publishes_exact_result_layout():
+    book, token = begin_identity_book()
+    try:
+        process = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            process.build_from_ast(ast.parse(
+                "def first_row(values):\n"
+                "    rows = {(value, value + 1) for value in values}\n"
+                "    return next(iter(rows))\n"
+            ))
+        reduce_abstract_tensor_topology(process)
+        graph = process.function_table.entry("first_row").graph.G
+        scope = graph.graph["source_aggregate_layout_scope"]
+        result_id = next(
+            int(data.get("value_id", node_id))
+            for node_id, data in graph.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Call)
+            and isinstance(data["expr_obj"].func, ast.Name)
+            and data["expr_obj"].func.id == "next"
+        )
+        layout = book.page(SOURCE_AGGREGATE_LAYOUT).latest(
+            (scope, result_id)
+        )
+
+        assert isinstance(layout, SourceAggregateLayout)
+        assert layout.aggregate_kind == "tuple"
+        assert len(layout.members) == 2
+        assert all(member.value_cell is not None for member in layout.members)
+        assert all(member.source_cells for member in layout.members)
+        assert tuple(
+            graph.nodes[int(member.value_id)]["attributes"][
+                "aggregate_index"
+            ]
+            for member in layout.members
+        ) == (0, 1)
+    finally:
+        end_identity_book(token)
+
+
 def test_projected_graph_carries_aggregate_layout_without_graph_attrs():
     book, token = begin_identity_book()
     try:

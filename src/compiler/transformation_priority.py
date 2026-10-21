@@ -67,7 +67,7 @@ class TransformationLedger:
 
     def __init__(self, rules: tuple[TransformationRule, ...],
                  successors: Mapping[str, tuple[str, ...]], *,
-                 scope: Hashable = None, book=None):
+                 scope: Hashable = None, book=None, concordant_ties: bool = False):
         from .identity_concordance import current_identity_book
 
         self.rules = {rule.name: rule for rule in rules}
@@ -81,6 +81,7 @@ class TransformationLedger:
                     raise TransformationConflict(
                         f"Non-increasing transformation edge: {source} -> {target}")
         self._successors = {name: tuple(targets) for name, targets in successors.items()}
+        self.concordant_ties = concordant_ties
         self.book = current_identity_book() if book is None else book
         self.scope = self.book.mint_scope(scope or "transformation_ledger")
         self._decision_page = self.book.page("transformation_decision")
@@ -128,7 +129,7 @@ class TransformationLedger:
         )
 
     def propose(self, identity: Hashable, rule: str, proof: Hashable,
-                *, before=None, after=None, sources: tuple = ()) -> bool:
+                *, before=None, after=None, sources: tuple = (), revision_source=None) -> bool:
         """Propose ``rule`` for ``identity``.  ``sources`` are the book
         cells the proof was read from (the linked member row, the result
         lease, the exact argument binding, the owner's member row); the
@@ -143,9 +144,29 @@ class TransformationLedger:
             old_rule, old_proof = previous
             rank = self.rules[rule].priority
             old_rank = self.rules[old_rule].priority
-            if previous == (rule, proof) and after == decision[2]:
+            # A producer's new revision is not a competing same-rank guess.
+            # It replaces that producer's previous proof. Only the exact
+            # source row previously consumed by this decision can do so;
+            # a different producer must agree or remain an explicit conflict.
+            refreshed = (
+                rank == old_rank and rule == old_rule
+                and revision_source is not None
+                and revision_source in sources
+                and self.book.current_ref(revision_source.page, revision_source.row) == revision_source
+                and any(
+                    old.page == revision_source.page and old.row == revision_source.row
+                    and old.column < revision_source.column
+                    for old, _stage in self.book.edges_into(incumbent_cell)
+                )
+            )
+            if previous == (rule, proof) and after == decision[2] and not refreshed:
                 return True
-            if rank <= old_rank:
+            if rank <= old_rank and not refreshed:
+                if self.concordant_ties and rank == old_rank and after != decision[2]:
+                    raise TransformationConflict(
+                        f"incompatible equal-priority contracts for {identity!r}: "
+                        f"{decision[2]!r} from {old_proof!r}; {after!r} from {proof!r}"
+                    )
                 # Whether this exact rejection is already recorded is a keyed
                 # fact, not a scan of every event: the scan made each
                 # rejected proposal O(events^2) and stalled the woodshop
@@ -168,7 +189,7 @@ class TransformationLedger:
                         reason="incumbent_tie" if rank == old_rank else "stronger_incumbent",
                         before=before, after=after), incumbent_cell)
                 return False
-            if rule not in self._successors.get(old_rule, ()):
+            if not refreshed and rule not in self._successors.get(old_rule, ()):
                 raise TransformationConflict(
                     f"Undeclared transformation for {identity!r}: {old_rule} -> {rule}")
         # A decision stands on the competing claims it chose between: the

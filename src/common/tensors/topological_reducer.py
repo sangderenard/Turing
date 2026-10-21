@@ -96,6 +96,7 @@ from ...compiler.concordance_declarations import (
     # Step 9 (plan 100, 1.2): the causes this module's operand rewrites
     # record on ``identity_transition``.
     APPEND_OPERAND as _APPEND_OPERAND,
+    AGGREGATE_MEMBER as _AGGREGATE_MEMBER,
     CANONICAL_RELABEL_OPERANDS as _CANONICAL_RELABEL_OPERANDS,
     CLASS_TABLE_MEMBER as _CLASS_TABLE_MEMBER,
     DISSOLVE_EXPR as _DISSOLVE_EXPR,
@@ -4478,9 +4479,7 @@ def _link_integer_glyph_formatter_calls(
 
 
 def _relink_settled_glyph_formatters(graph: Any, function_table: Any) -> None:
-    """Link the integer formatter into every canonical glyph recipe of a
-    settled function graph whose formatted scalar operand acquired its
-    ``int`` class after the recipe was authored.
+    """Relink canonical glyph recipes after call-edge classes settle.
 
     The program ``def f(x): return f"{x!r}"`` called once as ``f(a)`` with
     ``a: int`` lowered its recipe with the formatted component unresolved
@@ -4492,6 +4491,13 @@ def _relink_settled_glyph_formatters(graph: Any, function_table: Any) -> None:
     value-class row, repeated once the call-edge facts have settled; the
     recipe is REVISED from its cell and the new call's cell, and the call
     carries its ``call_binding`` row as a recipe-time formatter call does.
+
+    The same timing applies to ``line.strip()`` when ``line`` is an
+    unannotated formal or loop binding whose ``str`` class arrives from a
+    call edge.  Its authored Call and receiver edge are still present here;
+    revise the scalar component to the same resident StringTable projection
+    that recipe-time recognition publishes, then retire the Call only when
+    that formatted component is its sole consumer.
     """
 
     from ...compiler.planner_concordance_posts import _post_call_binding
@@ -4515,6 +4521,109 @@ def _relink_settled_glyph_formatters(graph: Any, function_table: Any) -> None:
         )
         if not isinstance(fact, _SourceGlyphSequence):
             continue
+        settled_components = list(fact.components)
+        settled_sources = [glyph_cell]
+        settled_strip_operations = []
+        for ordinal, component in enumerate(fact.components):
+            if (
+                component.kind != "formatted"
+                or component.projection_kind != "scalar"
+                or component.operand_value_id is None
+                or component.formatted_sequence_value_id is not None
+            ):
+                continue
+            operation_id = int(component.operand_value_id)
+            if operation_id not in graph.G:
+                continue
+            operation_data = graph.G.nodes[operation_id]
+            expression = operation_data.get("expr_obj")
+            if not (
+                isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Attribute)
+                and expression.func.attr == "strip"
+                and not expression.args
+                and not expression.keywords
+            ):
+                continue
+            receiver_id = next((
+                int(parent)
+                for parent, role in operation_data.get("parents", ())
+                if str(role) == "operand"
+            ), None)
+            receiver_class, _receiver_width = (
+                _resolved_source_value_class(graph, receiver_id)
+            )
+            if (
+                receiver_id is None
+                or _canonical_source_class_identity(receiver_class)
+                != "builtins.str"
+            ):
+                continue
+            operation_cell = node_identity_cell(graph, operation_id)
+            receiver_cell = node_identity_cell(graph, receiver_id)
+            receiver_class_cell = book.latest_ref(
+                _SOURCE_VALUE_CLASS,
+                (value_class_scope, int(receiver_id)),
+            )
+            sources = tuple(dict.fromkeys(filter(None, (
+                operation_cell, receiver_cell, receiver_class_cell,
+            ))))
+            operation_data.setdefault("attributes", {}).update({
+                "result_class_ref": "str",
+                "string_token_transform": "strip",
+            })
+            _concord_source_value_class(
+                value_class_scope,
+                operation_id,
+                "str",
+                source="builtins.str.strip result",
+                provenance=_Derived(sources),
+            )
+            settled_components[ordinal] = _dataclass_replace(
+                component,
+                operand_value_id=receiver_id,
+                projection_kind="string_token",
+                projection_source_value_id=receiver_id,
+                projection_transform="strip",
+                projection_operation_cell=operation_cell,
+            )
+            settled_sources.extend(sources)
+            settled_strip_operations.append((
+                operation_id, receiver_id, int(component.component_value_id),
+            ))
+        if tuple(settled_components) != tuple(fact.components):
+            glyph_cell = book.post(
+                _SOURCE_GLYPH_SEQUENCE,
+                tuple(row),
+                _SourceGlyphSequence(tuple(settled_components)),
+                stage=_REDUCTION,
+                provenance=_Derived(tuple(dict.fromkeys(settled_sources))),
+                mode=_Mode.REVISE,
+            )
+            fact = book.page(_SOURCE_GLYPH_SEQUENCE).cell(
+                glyph_cell.row, glyph_cell.column,
+            )
+            for operation_id, receiver_id, component_id in (
+                settled_strip_operations
+            ):
+                graph.G.nodes[component_id].setdefault(
+                    "attributes", {}
+                ).update({
+                    "producer_kind": "formatted_glyph_sequence",
+                    "aggregate_kind": "list",
+                    "sequence_key_columns": (),
+                    "sequence_column_count": 1,
+                    "sequence_writable": True,
+                    "sequence_element_dtypes": ("int64",),
+                })
+                consumers = {
+                    int(child)
+                    for child, _role in (
+                        graph.G.nodes[operation_id].get("children") or ()
+                    )
+                }
+                if consumers == {component_id}:
+                    _redirect_value(graph, operation_id, receiver_id)
         if not any(
             component.kind == "formatted"
             and component.projection_kind == "scalar"
@@ -4659,6 +4768,9 @@ def _normalize_lexical_values(
     ] | None = None,
     class_field_sequence_dtypes: Mapping[
         tuple[str, str], tuple[str, ...]
+    ] | None = None,
+    class_field_sequence_element_classes: Mapping[
+        tuple[str, str], str
     ] | None = None,
     class_field_sequence_records: Mapping[
         tuple[str, str], str
@@ -5039,7 +5151,10 @@ def _normalize_lexical_values(
         matches = tuple(
             row for row in page.rows()
             if len(row) == 3
-            and str(row[1]) == str(class_identity)
+            and (
+                str(row[1]) == str(class_identity)
+                or str(row[1]).endswith("." + str(class_identity))
+            )
             and str(row[2]) == str(attr)
             and page.latest(row) is not None
         )
@@ -5124,9 +5239,24 @@ def _normalize_lexical_values(
     parameter_numeric_descriptors: dict[str, NumericFeatureDescriptor] = {}
     parameter_aggregate_kinds: dict[str, str] = {}
     parameter_sequence_record_widths: dict[str, int] = {}
+    parameter_sequence_element_classes: dict[str, str] = {}
     known_class_identities = {
         record.identity for record in navigation_table.classes
     }
+    # Imported authored classes are resolved into the function's static
+    # bindings before lexical normalization.  Their local binding name is
+    # the same identity used by the imported field-schema indexes below
+    # (``from ...dt_scaler import Metrics`` -> ``Metrics``); admit that exact
+    # declared parameter class alongside source-local navigation records.
+    known_class_identities.update(
+        str(name)
+        for name, value in dict(static_bindings or {}).items()
+        if (
+            isinstance(value, type)
+            and value is not Any
+            and value is not object
+        )
+    )
     primitive_class_identities = {
         "bool": "builtins.bool",
         "builtins.bool": "builtins.bool",
@@ -5139,6 +5269,7 @@ def _normalize_lexical_values(
     }
 
     local_class_declarations: dict[str, tuple[str, Any]] = {}
+    local_sequence_element_declarations: dict[str, tuple[str, Any]] = {}
     source_identity = getattr(statement, "_python_source_identity", None)
     function_identity = (
         str(source_identity[1])
@@ -5161,6 +5292,53 @@ def _normalize_lexical_values(
                 ).body
             except SyntaxError:
                 continue
+            name = str(declaration["name"])
+            span_row = tuple(declaration.get("ast_node_id") or ())
+            annotation_cell = (
+                current_identity_book().latest_ref(
+                    annotation_page,
+                    (span_row[0], str(span_row[1]), name),
+                )
+                if len(span_row) >= 2 else None
+            )
+            if isinstance(annotation_expression, ast.Subscript):
+                aggregate = annotation_expression.value
+                aggregate_name = (
+                    aggregate.id if isinstance(aggregate, ast.Name)
+                    else aggregate.attr if isinstance(aggregate, ast.Attribute)
+                    else ""
+                )
+                element = annotation_expression.slice
+                if (
+                    isinstance(element, ast.Tuple)
+                    and len(element.elts) == 2
+                    and isinstance(element.elts[1], ast.Constant)
+                    and element.elts[1].value is Ellipsis
+                ):
+                    element = element.elts[0]
+                element_name = (
+                    element.id if isinstance(element, ast.Name)
+                    else element.attr if isinstance(element, ast.Attribute)
+                    else None
+                )
+                element_class = primitive_class_identities.get(
+                    str(element_name)
+                ) or (
+                    str(element_name)
+                    if element_name in known_class_identities else None
+                )
+                if (
+                    aggregate_name in {
+                        "Sequence", "Iterable", "Collection", "List", "list",
+                        "Tuple", "tuple", "Set", "set", "FrozenSet",
+                        "frozenset",
+                    }
+                    and element_class is not None
+                    and annotation_cell is not None
+                ):
+                    local_sequence_element_declarations[name] = (
+                        str(element_class), annotation_cell,
+                    )
             annotation_members = [annotation_expression]
             class_identities = []
             valid_class_annotation = True
@@ -5205,15 +5383,6 @@ def _normalize_lexical_values(
             ):
                 continue
             annotation = distinct_class_identities[0]
-            name = str(declaration["name"])
-            span_row = tuple(declaration.get("ast_node_id") or ())
-            annotation_cell = (
-                current_identity_book().latest_ref(
-                    annotation_page,
-                    (span_row[0], str(span_row[1]), name),
-                )
-                if len(span_row) >= 2 else None
-            )
             local_class_declarations[name] = (
                 annotation,
                 annotation_cell,
@@ -5266,6 +5435,21 @@ def _normalize_lexical_values(
         aggregate_kind = annotation_aggregate_kind(annotation)
         if aggregate_kind is not None:
             parameter_aggregate_kinds[argument.arg] = aggregate_kind
+        if isinstance(annotation, ast.Subscript) and aggregate_kind in {
+            "list", "set", "frozenset", "tuple",
+        }:
+            element = annotation.slice
+            element_identity = (
+                element.id if isinstance(element, ast.Name) else None
+            )
+            if element_identity in primitive_class_identities:
+                parameter_sequence_element_classes[argument.arg] = (
+                    primitive_class_identities[element_identity]
+                )
+            elif element_identity in known_class_identities:
+                parameter_sequence_element_classes[argument.arg] = str(
+                    element_identity
+                )
     for parameter_name, record in dict(
         graph.G.graph.get("parameter_sequence_record_abi") or {}
     ).items():
@@ -5717,6 +5901,21 @@ def _normalize_lexical_values(
             and len(body_layout.members) == len(else_layout.members)
         ):
             return None
+        incumbent, incumbent_cell = source_aggregate_layout(merged_id)
+        if incumbent is not None:
+            if not (
+                isinstance(incumbent, _SourceAggregateLayout)
+                and incumbent.aggregate_kind == body_layout.aggregate_kind
+                and len(incumbent.members) == len(body_layout.members)
+                and incumbent.conditional_cell == conditional_cell
+                and tuple(incumbent.arm_layout_cells)
+                == (body_layout_cell, else_layout_cell)
+            ):
+                raise ValueError(
+                    "conditional aggregate layout changed across reduction: "
+                    f"value={int(merged_id)} recorded={incumbent!r}"
+                )
+            return incumbent_cell
         members = []
         for index, (body_member, else_member) in enumerate(zip(
             body_layout.members, else_layout.members,
@@ -5823,11 +6022,24 @@ def _normalize_lexical_values(
         """The exact binding version held by ``environment[name]`` now."""
 
         versions = identity_bindings.get(str(name), ())
-        if not versions or int(versions[-1]) != int(value):
+        # ``identity_bindings`` is an append-only history across all visited
+        # control arms, while ``environment`` is restored to an arm's entry
+        # snapshot before reducing its sibling.  Consequently the binding
+        # currently held by the environment is not necessarily the last
+        # history row: a terminal fast path can read the loop seed after a
+        # later fallthrough path has already published its carried update.
+        # Select the latest history row for the exact value the environment
+        # holds.  This is still an identity lookup, never a spelling-only
+        # guess; if the value has no authored binding row, publish no read.
+        version = next((
+            index for index in range(len(versions) - 1, -1, -1)
+            if int(versions[index]) == int(value)
+        ), None)
+        if version is None:
             return None
         return current_identity_book().latest_ref(
             _NAME_BINDING,
-            (ingestion_read_scope, str(name), len(versions) - 1),
+            (ingestion_read_scope, str(name), int(version)),
         )
 
     def input_value(
@@ -5908,6 +6120,16 @@ def _normalize_lexical_values(
                 },
                 **dict((local_mapping_contracts or {}).get(name) or {}),
             })
+            element_class = parameter_sequence_element_classes.get(name)
+            if element_class is not None:
+                # The parameter annotation is the exact authority for the
+                # class of each iterated value.  Keep that authority attached
+                # to sequence-preserving projections so a loop binding can
+                # publish its own SOURCE_VALUE_CLASS row from the same cell.
+                attributes.update({
+                    "sequence_element_class_ref": str(element_class),
+                    "sequence_element_annotation_cell": annotation_cell,
+                })
         scalar_parameters = tuple(
             graph.G.graph.get("scalar_parameters") or ()
         )
@@ -6512,6 +6734,51 @@ def _normalize_lexical_values(
         if isinstance(target, (ast.Tuple, ast.List)):
             for element in target.elts:
                 bind_loop_target(element)
+
+    def concord_iterated_target_class(
+        iterator_value: int | None, target: ast.AST,
+    ) -> None:
+        """Project one declared sequence element class to its loop binding."""
+
+        if (
+            not isinstance(iterator_value, int)
+            or iterator_value not in graph.G
+            or not isinstance(target, ast.Name)
+        ):
+            return
+        iterator_attributes = (
+            graph.G.nodes[int(iterator_value)].get("attributes") or {}
+        )
+        class_identity = iterator_attributes.get(
+            "sequence_element_class_ref"
+        )
+        annotation_cell = iterator_attributes.get(
+            "sequence_element_annotation_cell"
+        )
+        target_value = loop_target_bindings_by_ast.get(id(target))
+        if (
+            class_identity is None
+            or annotation_cell is None
+            or target_value is None
+            or int(target_value) not in graph.G
+        ):
+            return
+        target_attributes = graph.G.nodes[int(target_value)].setdefault(
+            "attributes", {}
+        )
+        target_attributes["result_class_ref"] = str(class_identity)
+        sources = tuple(dict.fromkeys(filter(None, (
+            annotation_cell,
+            node_identity_cell(graph, int(iterator_value)),
+            node_identity_cell(graph, int(target_value)),
+        ))))
+        _concord_source_value_class(
+            value_class_scope,
+            int(target_value),
+            str(class_identity),
+            source="declared sequence element projection",
+            provenance=_Derived(sources),
+        )
 
     def loop_target_names(target: ast.AST) -> tuple[str, ...]:
         if isinstance(target, ast.Name):
@@ -7179,7 +7446,14 @@ def _normalize_lexical_values(
                         graph.G.nodes[node_id].setdefault(
                             "attributes", {}
                         )["sequence_column_count"] = len(row_leaves)
-                for generator in expression.generators:
+                # Python emits one comprehension element only after every
+                # generator and filter has selected the innermost iteration.
+                # Publishing the same materialization on each generator made
+                # an outer loop append the inner target after the inner loop
+                # had exited (observed on ``_result_layout``'s ``i.args``).
+                # The nested loop structure still comes from every generator;
+                # only the element-write effect belongs to the last one.
+                for generator in expression.generators[-1:]:
                     generator_id = id(generator)
                     if (
                         generator_id in graph.G
@@ -7389,10 +7663,26 @@ def _normalize_lexical_values(
                         "sequence_column_count": column_count,
                         "sequence_writable": writable,
                     })
+                    # Expression-form conditional selection has the same
+                    # aggregate semantics as the statement/name Phi handled
+                    # above.  Publish its exact member joins on the incumbent
+                    # SOURCE_AGGREGATE_LAYOUT page; aggregate metadata alone
+                    # leaves a tuple as one unexplained scalar when a
+                    # comprehension inserts the selected row.
+                    if all(isinstance(value, int) for value in (
+                        test_value, body_value, else_value,
+                    )):
+                        post_conditional_aggregate_layout(
+                            int(node_id), int(test_value), int(body_value),
+                            int(else_value), _post_source_span(expression),
+                        )
             return node_id if node_id in graph.G else None
         if isinstance(expression, ast.comprehension):
             iterator_value = resolve_expression(expression.iter)
             bind_loop_target(expression.target)
+            concord_iterated_target_class(
+                iterator_value, expression.target,
+            )
             node_id = id(expression)
             if node_id in graph.G:
                 graph.G.nodes[node_id].setdefault("attributes", {})[
@@ -8289,6 +8579,11 @@ def _normalize_lexical_values(
                             str(receiver_class), str(expression.attr)
                         ))
                     )
+                    sequence_element_class = (
+                        (class_field_sequence_element_classes or {}).get((
+                            str(receiver_class), str(expression.attr)
+                        ))
+                    )
                     graph.G.nodes[attribute_id].setdefault(
                         "attributes", {}
                     ).update({
@@ -8319,6 +8614,15 @@ def _normalize_lexical_values(
                         **({
                             "sequence_value_record": str(sequence_record),
                         } if sequence_record is not None else {}),
+                        **({
+                            "sequence_element_class_ref": str(
+                                sequence_element_class
+                            ),
+                            "sequence_element_annotation_cell": (
+                                refined_field_cell
+                            ),
+                        } if sequence_element_class is not None
+                           and refined_field_cell is not None else {}),
                         **mapping_contract,
                     })
                 page_key_cell = page_key_field_schemas.get((
@@ -8965,6 +9269,161 @@ def _normalize_lexical_values(
                     graph, node_id, tuple(resolved_inputs),
                     fork_from=receiver_fork or None,
                 )
+                if (
+                    isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr == "strip"
+                    and not expression.args
+                    and not expression.keywords
+                ):
+                    receiver_id = next((
+                        int(parent)
+                        for parent, role in resolved_inputs
+                        if str(role) == "operand"
+                    ), None)
+                    receiver_class, _receiver_width = (
+                        _resolved_source_value_class(graph, receiver_id)
+                    )
+                    if _canonical_source_class_identity(
+                        receiver_class
+                    ) == "builtins.str":
+                        # ``str.strip`` returns a string.  Publish that result
+                        # from the exact receiver-class edge while the call's
+                        # authored receiver is still present; the glyph
+                        # producer is settled separately from this semantic
+                        # class fact.
+                        call_attributes.update({
+                            "result_class_ref": "str",
+                            "string_token_transform": "strip",
+                        })
+                        receiver_class_cell = (
+                            current_identity_book().latest_ref(
+                                _SOURCE_VALUE_CLASS,
+                                (value_class_scope, int(receiver_id)),
+                            )
+                            if receiver_id is not None else None
+                        )
+                        class_sources = tuple(dict.fromkeys(filter(None, (
+                            node_identity_cell(graph, int(node_id)),
+                            node_identity_cell(graph, int(receiver_id)),
+                            receiver_class_cell,
+                        ))))
+                        _concord_source_value_class(
+                            value_class_scope,
+                            int(node_id),
+                            "str",
+                            source="builtins.str.strip result",
+                            provenance=_Derived(class_sources),
+                        )
+                if (
+                    "builtins.next" in {
+                        call_attributes.get("extraction_identity"),
+                        call_attributes.get("static_python_reference"),
+                    }
+                    or call_attributes.get("static_python_reference")
+                    == "next"
+                ) and len(expression.args) >= 1:
+                    # ``next(iter(rows))`` returns one row of the resident
+                    # sequence.  A tuple-valued comprehension already owns
+                    # the exact row layout on SOURCE_AGGREGATE_LAYOUT; project
+                    # that contract onto the query result here, while both
+                    # the source row and the authored call still have exact
+                    # identity cells.  The aggregate root remains semantic;
+                    # control SSA later publishes the physical columns under
+                    # these member identities.
+                    iterator_id = next((
+                        int(parent)
+                        for parent, role in resolved_inputs
+                        if str(role) == "arg:0" and int(parent) in graph.G
+                    ), None)
+                    sequence_id = iterator_id
+                    if iterator_id is not None:
+                        iterator_data = graph.G.nodes[int(iterator_id)]
+                        iterator_expression = iterator_data.get("expr_obj")
+                        if (
+                            isinstance(iterator_expression, ast.Call)
+                            and isinstance(iterator_expression.func, ast.Name)
+                            and iterator_expression.func.id == "iter"
+                        ):
+                            sequence_id = next((
+                                int(parent)
+                                for parent, role in (
+                                    iterator_data.get("parents") or ()
+                                )
+                                if str(role) == "arg:0"
+                                and int(parent) in graph.G
+                            ), None)
+                    sequence_data = (
+                        graph.G.nodes[int(sequence_id)]
+                        if sequence_id is not None
+                        and int(sequence_id) in graph.G else {}
+                    )
+                    row_id = (
+                        (sequence_data.get("attributes") or {}).get(
+                            "sequence_row_value_id"
+                        )
+                        or next((
+                            int(parent)
+                            for parent, role in (
+                                sequence_data.get("parents") or ()
+                            )
+                            if str(role) == "elt" and int(parent) in graph.G
+                        ), None)
+                    )
+                    row_layout, row_layout_cell = (
+                        source_aggregate_layout(int(row_id))
+                        if isinstance(row_id, int) else (None, None)
+                    )
+                    result_layout, _result_layout_cell = (
+                        source_aggregate_layout(int(node_id))
+                    )
+                    if (
+                        result_layout is None
+                        and isinstance(row_layout, _SourceAggregateLayout)
+                        and str(row_layout.aggregate_kind) == "tuple"
+                        and row_layout.members
+                    ):
+                        call_cell = node_identity_cell(graph, int(node_id))
+                        result_members = []
+                        for index, row_member in enumerate(
+                            row_layout.members
+                        ):
+                            member_sources = tuple(dict.fromkeys(filter(None, (
+                                call_cell,
+                                row_layout_cell,
+                                row_member.value_cell,
+                                *tuple(row_member.source_cells),
+                            ))))
+                            member_id = new_node(
+                                "Indexed",
+                                f"next aggregate member {index}",
+                                attributes={
+                                    "aggregate_parent_value_id": int(node_id),
+                                    "aggregate_index": int(index),
+                                    "producer_kind": "sequence_query_member",
+                                },
+                                parents=((int(node_id), "base"),),
+                                source_cell=member_sources,
+                                cause=_AGGREGATE_MEMBER,
+                            )
+                            result_members.append(_SourceAggregateMember(
+                                int(member_id),
+                                node_identity_cell(graph, int(member_id)),
+                                tuple(dict.fromkeys(filter(None, (
+                                    row_layout_cell,
+                                    row_member.value_cell,
+                                    *tuple(row_member.source_cells),
+                                )))),
+                            ))
+                        call_attributes.update({
+                            "producer_kind": "sequence_query_aggregate",
+                            "aggregate_kind": "tuple",
+                            "aggregate_leaf_value_ids": tuple(
+                                member.value_id for member in result_members
+                            ),
+                        })
+                        post_source_aggregate_layout(
+                            int(node_id), "tuple", tuple(result_members),
+                        )
                 if call_attributes.get("extraction_identity") == "builtins.len":
                     # The extraction contract identifies this operation as
                     # Python's resident leading-dimension intrinsic.  Its
@@ -9293,6 +9752,74 @@ def _normalize_lexical_values(
                 continue
             resolve_expression(child)
         node_id = id(expression)
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and expression.func.attr == "get"
+            and node_id in graph.G
+        ):
+            call_parents = {
+                str(role): int(parent)
+                for parent, role in (
+                    graph.G.nodes[node_id].get("parents") or ()
+                )
+            }
+            mapping_base_id = call_parents.get(
+                "operand", call_parents.get("value")
+            )
+            mapping_base_attributes = (
+                graph.G.nodes[mapping_base_id].get("attributes") or {}
+                if mapping_base_id in graph.G else {}
+            )
+            mapping_value_columns = tuple(
+                mapping_base_attributes.get("mapping_value_columns") or ()
+            )
+            if (
+                len(mapping_value_columns) > 1
+                and source_aggregate_layout(int(node_id))[0] is None
+            ):
+                lookup_cell = node_identity_cell(graph, int(node_id))
+                base_cell = node_identity_cell(
+                    graph, int(mapping_base_id)
+                )
+                result_members = []
+                for index, column in enumerate(mapping_value_columns):
+                    member_sources = tuple(dict.fromkeys(filter(None, (
+                        lookup_cell, base_cell,
+                    ))))
+                    member_id = new_node(
+                        "Indexed", f"mapping get member {index}",
+                        attributes={
+                            "aggregate_parent_value_id": int(node_id),
+                            "aggregate_index": int(index),
+                            "producer_kind": "mapping_lookup_member",
+                        },
+                        parents=((int(node_id), "base"),),
+                        source_cell=member_sources,
+                        cause=_AGGREGATE_MEMBER,
+                    )
+                    dtype = column.get("dtype") if isinstance(
+                        column, Mapping
+                    ) else None
+                    if dtype is not None:
+                        graph.G.nodes[int(member_id)]["tensor"] = {
+                            "shape": (), "dtype": str(dtype),
+                        }
+                    result_members.append(_SourceAggregateMember(
+                        int(member_id),
+                        node_identity_cell(graph, int(member_id)),
+                        member_sources,
+                    ))
+                graph.G.nodes[node_id].setdefault("attributes", {}).update({
+                    "producer_kind": "mapping_lookup_aggregate",
+                    "aggregate_kind": "tuple",
+                    "aggregate_leaf_value_ids": tuple(
+                        member.value_id for member in result_members
+                    ),
+                })
+                post_source_aggregate_layout(
+                    int(node_id), "tuple", tuple(result_members),
+                )
         if isinstance(expression, ast.Subscript) and node_id in graph.G:
             base_id = resolve_expression(expression.value)
             base_attributes = (
@@ -9312,6 +9839,41 @@ def _normalize_lexical_values(
                     base_class_cell.row, base_class_cell.column,
                 )
             )
+            if (
+                isinstance(expression.slice, ast.Slice)
+                and base_attributes.get("aggregate_kind") in {
+                    "list", "set", "frozenset", "tuple",
+                }
+            ):
+                # A sequence slice preserves the declared row contract.  In
+                # ``for line in items[1:]`` the iterator is this slice, not
+                # the parameter Input, so dropping the element-class edge
+                # here made the loop target an untyped int64 token.
+                projected = graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                )
+                projected.update({
+                    "producer_kind": "sequence_slice",
+                    "aggregate_kind": base_attributes["aggregate_kind"],
+                    "sequence_key_columns": tuple(base_attributes.get(
+                        "sequence_key_columns", ()
+                    )),
+                    "sequence_column_count": int(base_attributes.get(
+                        "sequence_column_count", 1
+                    )),
+                    "sequence_writable": bool(base_attributes.get(
+                        "sequence_writable", True
+                    )),
+                })
+                for field in (
+                    "sequence_element_dtypes",
+                    "sequence_column_dtypes",
+                    "sequence_element_class_ref",
+                    "sequence_element_annotation_cell",
+                    "sequence_element_record",
+                ):
+                    if field in base_attributes:
+                        projected[field] = base_attributes[field]
             if (
                 isinstance(expression.slice, ast.Slice)
                 and isinstance(base_class_fact, tuple)
@@ -9466,6 +10028,97 @@ def _normalize_lexical_values(
                         source="keyed value-record edge",
                         provenance=_Derived(value_sources),
                     )
+            mapping_value_columns = tuple(
+                base_attributes.get("mapping_value_columns") or ()
+            )
+            if (
+                not isinstance(expression.slice, ast.Slice)
+                and len(mapping_value_columns) > 1
+                and source_aggregate_layout(int(node_id))[0] is None
+            ):
+                # A fixed-arity tuple in a mapping value position is stored as
+                # one physical column per authored member.  Publish the lookup
+                # result as the corresponding tuple aggregate now, while the
+                # exact Indexed node and mapping declaration still own their
+                # identity cells.  Control lowering consumes these minted
+                # member ids as the multi-result lookup's physical outputs.
+                lookup_cell = node_identity_cell(graph, int(node_id))
+                base_cell = (
+                    node_identity_cell(graph, int(base_id))
+                    if isinstance(base_id, int) else None
+                )
+                result_members = []
+                for index, column in enumerate(mapping_value_columns):
+                    member_sources = tuple(dict.fromkeys(filter(None, (
+                        lookup_cell, base_cell,
+                    ))))
+                    member_id = new_node(
+                        "Indexed",
+                        f"mapping value member {index}",
+                        attributes={
+                            "aggregate_parent_value_id": int(node_id),
+                            "aggregate_index": int(index),
+                            "producer_kind": "mapping_lookup_member",
+                        },
+                        parents=((int(node_id), "base"),),
+                        source_cell=member_sources,
+                        cause=_AGGREGATE_MEMBER,
+                    )
+                    dtype = column.get("dtype") if isinstance(
+                        column, Mapping
+                    ) else None
+                    if dtype is not None:
+                        graph.G.nodes[int(member_id)]["tensor"] = {
+                            "shape": (), "dtype": str(dtype),
+                        }
+                    result_members.append(_SourceAggregateMember(
+                        int(member_id),
+                        node_identity_cell(graph, int(member_id)),
+                        member_sources,
+                    ))
+                projected = graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                )
+                projected.update({
+                    "producer_kind": "mapping_lookup_aggregate",
+                    "aggregate_kind": "tuple",
+                    "aggregate_leaf_value_ids": tuple(
+                        member.value_id for member in result_members
+                    ),
+                })
+                post_source_aggregate_layout(
+                    int(node_id), "tuple", tuple(result_members),
+                )
+            sequence_element_class = base_attributes.get(
+                "sequence_element_class_ref"
+            )
+            sequence_element_cell = base_attributes.get(
+                "sequence_element_annotation_cell"
+            )
+            if (
+                not isinstance(expression.slice, ast.Slice)
+                and sequence_element_class is not None
+                and isinstance(sequence_element_cell, _Ref)
+            ):
+                # A scalar index projects the declared element class from the
+                # annotated sequence.  This is the non-loop counterpart of
+                # ``concord_iterated_target_class``: ``first = rows[0]`` must
+                # retain the same record identity as ``for first in rows``.
+                graph.G.nodes[node_id].setdefault("attributes", {})[
+                    "result_class_ref"
+                ] = str(sequence_element_class)
+                element_sources = tuple(dict.fromkeys(filter(None, (
+                    sequence_element_cell,
+                    node_identity_cell(graph, int(base_id)),
+                    node_identity_cell(graph, int(node_id)),
+                ))))
+                _concord_source_value_class(
+                    value_class_scope,
+                    int(node_id),
+                    str(sequence_element_class),
+                    source="declared sequence indexed element projection",
+                    provenance=_Derived(element_sources),
+                )
         if (
             isinstance(expression, (ast.Tuple, ast.List, ast.Set, ast.Dict))
             and node_id in graph.G
@@ -11007,12 +11660,30 @@ def _normalize_lexical_values(
                             projected_literal_component(")", operand_cell)
                         )
                     projection_components = tuple(projected_components)
+                projection_transform = operand_attributes.get(
+                    "string_token_transform"
+                )
+                projection_source_value_id = (
+                    next((
+                        int(parent)
+                        for parent, role in operand_data.get("parents", ())
+                        if str(role) == "operand"
+                    ), None)
+                    if projection_transform == "strip" else None
+                )
+                projection_operation_cell = (
+                    node_identity_cell(graph, int(operand_value_id))
+                    if projection_source_value_id is not None
+                    and operand_value_id is not None else None
+                )
                 formatted_component = _SourceGlyphComponent(
                     kind="formatted",
                     component_value_id=component_value_id,
                     operand_value_id=(
                         int(enum_name_value_id)
                         if enum_name_value_id is not None
+                        else int(projection_source_value_id)
+                        if projection_source_value_id is not None
                         else operand_value_id
                     ),
                     glyph_tokens=(),
@@ -11031,6 +11702,9 @@ def _normalize_lexical_values(
                     projection_value_ids=projection_value_ids,
                     projection_components=projection_components,
                     enum_table_cell=enum_name_cell,
+                    projection_source_value_id=projection_source_value_id,
+                    projection_transform=projection_transform,
+                    projection_operation_cell=projection_operation_cell,
                 )
                 optional_dispatch = (
                     optional_or_absence_owner(
@@ -11291,6 +11965,38 @@ def _normalize_lexical_values(
                         "sequence_element_dtypes": ("int64",),
                         "source_glyph_component": (row, int(ordinal)),
                     })
+                for component in components:
+                    if (
+                        component.projection_transform is None
+                        or component.projection_source_value_id is None
+                        or component.projection_operation_cell is None
+                    ):
+                        continue
+                    operation_id = _cell_node_id(
+                        component.projection_operation_cell
+                    )
+                    source_id = int(component.projection_source_value_id)
+                    if operation_id is None or operation_id not in graph.G:
+                        continue
+                    consumers = {
+                        int(child)
+                        for child, _role in (
+                            graph.G.nodes[operation_id].get("children") or ()
+                        )
+                    }
+                    if consumers != {int(component.component_value_id)}:
+                        # The recipe owns this transformed value only when
+                        # the FormattedValue is its sole consumer.  Any other
+                        # use still needs a general string-operation lowering
+                        # and must remain visible to the compiler.
+                        continue
+                    # The SOURCE_GLYPH_SEQUENCE fact now owns the strip
+                    # operation and names its exact source token.  Retire the
+                    # otherwise producerless Call from the execution graph;
+                    # the ordinary graph edge into FormattedValue becomes the
+                    # source token edge, while the immutable recipe retains
+                    # the authored operation identity and transform.
+                    _redirect_value(graph, operation_id, source_id)
         if lone_string_projection and node_id in graph.G:
             # ``str(x)`` evaluates to a ``str`` whether or not its argument
             # has a glyph recipe: the class is the builtin's own result
@@ -11399,7 +12105,7 @@ def _normalize_lexical_values(
             for generator in generator_expression.generators:
                 bind_loop_target(generator.target)
             value_id = resolve_expression(generator_expression.elt)
-            for generator in generator_expression.generators:
+            for generator in generator_expression.generators[-1:]:
                 generator_id = id(generator)
                 if (
                     generator_id not in graph.G
@@ -11489,7 +12195,7 @@ def _normalize_lexical_values(
                 for generator in generator_expression.generators:
                     bind_loop_target(generator.target)
                 value_id = resolve_expression(generator_expression.elt)
-                for generator in generator_expression.generators:
+                for generator in generator_expression.generators[-1:]:
                     generator_id = id(generator)
                     if (
                         generator_id not in graph.G
@@ -11553,7 +12259,10 @@ def _normalize_lexical_values(
             # second resident sequence for the same parameter identity.
             aggregate_kind = (local_aggregate_kinds or {}).get(target.id)
             if aggregate_kind is not None and int(value) in graph.G:
-                graph.G.nodes[int(value)].setdefault("attributes", {}).update({
+                aggregate_attributes = graph.G.nodes[int(value)].setdefault(
+                    "attributes", {}
+                )
+                aggregate_attributes.update({
                     "producer_kind": "annotated_aggregate_binding",
                     "aggregate_kind": aggregate_kind,
                     "sequence_key_columns": (
@@ -11567,6 +12276,19 @@ def _normalize_lexical_values(
                         (local_mapping_contracts or {}).get(target.id) or {}
                     ),
                 })
+                element_declaration = local_sequence_element_declarations.get(
+                    target.id
+                )
+                if element_declaration is not None:
+                    element_class, element_annotation_cell = (
+                        element_declaration
+                    )
+                    aggregate_attributes.update({
+                        "sequence_element_class_ref": str(element_class),
+                        "sequence_element_annotation_cell": (
+                            element_annotation_cell
+                        ),
+                    })
             local_class_declaration = local_class_declarations.get(target.id)
             if local_class_declaration is not None and int(value) in graph.G:
                 class_identity, annotation_cell = local_class_declaration
@@ -12384,13 +13106,12 @@ def _normalize_lexical_values(
                 )
                 if body_statement is statement.body[-1]:
                     return_tail_sites.add(return_site_cell)
-                if return_arms_kind is not None or return_arms_unclassified:
-                    return_arm_posts.append((
-                        return_site_cell, container_cell,
-                        tuple(slot_cells[index] for index in sorted(slot_cells)),
-                        isinstance(returned, ast.Constant)
-                        and returned.value is None,
-                    ))
+                return_arm_posts.append((
+                    return_site_cell, container_cell,
+                    tuple(slot_cells[index] for index in sorted(slot_cells)),
+                    isinstance(returned, ast.Constant)
+                    and returned.value is None,
+                ))
                 # Record correlation alone does not describe the field state
                 # at this return.  For every field row whose receiver is a
                 # returned slot, the site names the cursor cell current here,
@@ -12809,6 +13530,14 @@ def _normalize_lexical_values(
                                 str(receiver_class), str(attribute_name)
                             )) or ()
                         )
+                        sequence_element_class = (
+                            (class_field_sequence_element_classes or {}).get((
+                                str(receiver_class), str(attribute_name)
+                            ))
+                        )
+                        sequence_annotation_cell = declared_field_schema_cell(
+                            receiver_class, attribute_name,
+                        )
                         initial_attributes.update({
                             "producer_kind": "record_field",
                             "aggregate_kind": field_kind,
@@ -12831,6 +13560,15 @@ def _normalize_lexical_values(
                             **({
                                 "sequence_column_dtypes": sequence_dtypes,
                             } if sequence_dtypes else {}),
+                            **({
+                                "sequence_element_class_ref": str(
+                                    sequence_element_class
+                                ),
+                                "sequence_element_annotation_cell": (
+                                    sequence_annotation_cell
+                                ),
+                            } if sequence_element_class is not None
+                               and sequence_annotation_cell is not None else {}),
                             **mapping_contract,
                         })
                     initial = new_node(
@@ -13204,6 +13942,9 @@ def _normalize_lexical_values(
                 # when the body writes it.
                 before_loop = dict(environment)
                 bind_loop_target(body_statement.target)
+                concord_iterated_target_class(
+                    iterator_value, body_statement.target,
+                )
                 iterator_attributes = (
                     graph.G.nodes[int(iterator_value)].get("attributes") or {}
                     if isinstance(iterator_value, int)
@@ -14061,6 +14802,9 @@ def _normalize_lexical_values(
         (stage 5 is deferred): downstream behaviour for it is unchanged.
         """
 
+        nonlocal return_arms_kind
+        from ...compiler.structural_concordance import source_structure
+
         if not return_arm_posts:
             return
         book = current_identity_book()
@@ -14072,12 +14816,41 @@ def _normalize_lexical_values(
             for cell in slots
         )
         slot_values_by_arm = []
+        slot_cells_by_arm = []
+        structural_cells = []
+        has_structural_arm = False
         for _site, _container, slots, absent in return_arm_posts:
             values = []
+            member_cells = []
             for cell in slots:
                 value = _cell_node_id(_cell_fact(book, cell))
-                values.append(value)
+                layout, _layout_cell = (
+                    (None, None) if value is None else source_aggregate_layout(value)
+                )
+                if layout is not None and layout.aggregate_kind == "tuple":
+                    structure, structure_cell = source_structure(value_class_scope, value, book=book)
+                    leaves = structure.leaves()
+                    values.extend(leaf.value_id for _path, leaf in leaves)
+                    member_cells.extend(leaf.source for _path, leaf in leaves)
+                    structural_cells.append(structure_cell)
+                    has_structural_arm = True
+                else:
+                    values.append(value)
+                    member_cells.append(cell)
             slot_values_by_arm.append(tuple(values))
+            slot_cells_by_arm.append(tuple(member_cells))
+        if return_arms_kind is None and has_structural_arm:
+            present_lengths = {
+                len(values) for values, post in zip(slot_values_by_arm, return_arm_posts)
+                if not post[3]
+            }
+            if (any(post[3] for post in return_arm_posts)
+                    and len(present_lengths) == 1 and min(present_lengths) >= 1):
+                return_arms_kind = _ReturnArmsKind.OPTIONAL_AGGREGATE
+                graph.G.graph["function_outputs"] = ("result_0",)
+                graph.G.graph["positional_output_names"] = ("result_0",)
+        if return_arms_kind is None and not return_arms_unclassified:
+            return
         if return_arms_kind is None or any(
             value is None for values in slot_values_by_arm for value in values
         ):
@@ -14102,7 +14875,7 @@ def _normalize_lexical_values(
                 site in return_tail_sites,
             ))
         width = max(arm.length for arm in arms)
-        derived = tuple(dict.fromkeys((*container_cells, *all_slot_cells)))
+        derived = tuple(dict.fromkeys((*container_cells, *all_slot_cells, *structural_cells)))
         output_id = new_node(
             "Phi", "return output", source_cell=derived,
             attributes={"producer_kind": "aggregate_phi",
@@ -14111,7 +14884,7 @@ def _normalize_lexical_values(
         members = []
         for position in range(width):
             arm_slots = tuple(
-                (arm_index, return_arm_posts[arm_index][2][position],
+                (arm_index, slot_cells_by_arm[arm_index][position],
                  slot_values_by_arm[arm_index][position])
                 for arm_index, arm in enumerate(arms)
                 if arm.length > position
@@ -14773,6 +15546,7 @@ def _normalize_lexical_values(
             yield int(component.component_value_id)
             for value_id in (
                 component.operand_value_id,
+                component.projection_source_value_id,
                 component.format_spec_value_id,
                 *component.projection_value_ids,
                 component.formatted_sequence_value_id,
@@ -14845,6 +15619,15 @@ def _normalize_lexical_values(
                     )
                     for arm in component.union_alternatives
                 ),
+                projection_source_value_id=(
+                    None
+                    if component.projection_source_value_id is None
+                    else int(mapping[int(
+                        component.projection_source_value_id
+                    )])
+                ),
+                projection_transform=component.projection_transform,
+                projection_operation_cell=component.projection_operation_cell,
             )
         canonical_components = tuple(
             canonical_glyph_component(component)
@@ -14870,11 +15653,18 @@ def _normalize_lexical_values(
             for value_id in (
                 int(component.component_value_id),
                 component.operand_value_id,
+                component.projection_source_value_id,
                 component.format_spec_value_id,
                 *component.projection_value_ids,
                 component.formatted_sequence_value_id,
             )
             if value_id is not None and int(value_id) in canonical_cells
+        )
+        provenance.extend(
+            component.projection_operation_cell
+            for component in source_fact.components
+            for component in glyph_component_tree(component)
+            if component.projection_operation_cell is not None
         )
         book.post(
             _SOURCE_GLYPH_SEQUENCE,
@@ -16181,6 +16971,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             and receipt.get("dtype") is not None
         )
     }
+    class_field_sequence_element_classes: dict[
+        tuple[str, str], str
+    ] = {}
 
     def _annotation_storage(annotation: ast.AST) -> dict[str, Any]:
         """Return the exact scalar/record handle stated by one annotation."""
@@ -16228,7 +17021,34 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "mapping": "dict",
                     "mutablemapping": "dict",
                 }.get(aggregate, aggregate)
-                return {"dtype": "int64", "aggregate_kind": normalized}
+                receipt: dict[str, Any] = {
+                    "dtype": "int64", "aggregate_kind": normalized,
+                }
+                if normalized == "tuple":
+                    elements = (
+                        tuple(annotation.slice.elts)
+                        if isinstance(annotation.slice, ast.Tuple)
+                        else (annotation.slice,)
+                    )
+                    element_receipts = tuple(
+                        _annotation_storage(element) for element in elements
+                    )
+                    if (
+                        elements
+                        and not any(
+                            isinstance(element, ast.Constant)
+                            and element.value is Ellipsis
+                            for element in elements
+                        )
+                        and all(
+                            element_receipt.get("dtype") is not None
+                            and element_receipt.get("aggregate_kind") is None
+                            and not element_receipt.get("tensor")
+                            for element_receipt in element_receipts
+                        )
+                    ):
+                        receipt["columns"] = element_receipts
+                return receipt
         name = (
             annotation.id if isinstance(annotation, ast.Name)
             else annotation.attr if isinstance(annotation, ast.Attribute)
@@ -16323,6 +17143,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             **({
                 "mapping_value_record": str(value["record"]),
             } if value.get("record") is not None else {}),
+            **({
+                "mapping_value_column_count": len(value["columns"]),
+                "mapping_value_columns": tuple(value["columns"]),
+            } if value.get("columns") else {}),
             "mapping_value_optional": bool(value.get("optional", False)),
         }
 
@@ -16502,6 +17326,66 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         dtype = storage.get("dtype")
         return (str(dtype),) if dtype is not None else ()
 
+    def _sequence_annotation_element_class(
+        annotation: ast.AST | str | Any,
+    ) -> str | None:
+        """Return the semantic class declared for each sequence element."""
+
+        if not isinstance(annotation, ast.AST):
+            try:
+                annotation = ast.parse(str(annotation), mode="eval").body
+            except SyntaxError:
+                return None
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        container = (
+            annotation.value.id
+            if isinstance(annotation.value, ast.Name)
+            else annotation.value.attr
+            if isinstance(annotation.value, ast.Attribute)
+            else ""
+        )
+        if container not in {
+            "Sequence", "Iterable", "Collection", "List", "list",
+            "Tuple", "tuple", "Set", "set", "FrozenSet", "frozenset",
+        }:
+            return None
+        element = annotation.slice
+        if (
+            isinstance(element, ast.Tuple)
+            and len(element.elts) == 2
+            and isinstance(element.elts[1], ast.Constant)
+            and element.elts[1].value is Ellipsis
+        ):
+            element = element.elts[0]
+        identity = (
+            element.id if isinstance(element, ast.Name)
+            else element.attr if isinstance(element, ast.Attribute)
+            else None
+        )
+        return {
+            "str": "builtins.str",
+            "bool": "builtins.bool",
+            "int": "builtins.int",
+            "float": "builtins.float",
+        }.get(str(identity)) or (
+            str(identity)
+            if identity in class_definitions
+            or identity in dict((graph.G.graph.get("program_abi") or {}).get(
+                "records"
+            ) or {})
+            else None
+        )
+
+    def note_sequence_element_class(
+        owner: str, field: str, annotation: ast.AST | str | Any,
+    ) -> None:
+        element_class = _sequence_annotation_element_class(annotation)
+        if element_class is not None:
+            class_field_sequence_element_classes[
+                (str(owner), str(field))
+            ] = str(element_class)
+
     def _sequence_annotation_record(
         annotation: ast.AST | str | Any,
     ) -> str | None:
@@ -16577,6 +17461,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 class_field_sequence_dtypes[(
                     class_name, str(field_record.get("name") or ""),
                 )] = dtypes
+            note_sequence_element_class(
+                class_name,
+                str(field_record.get("name") or ""),
+                annotation_node,
+            )
             row_record = _sequence_annotation_record(annotation_node)
             if row_record is not None:
                 class_field_sequence_records[(
@@ -16629,6 +17518,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     class_field_sequence_dtypes[
                         (str(class_name), str(field_name))
                     ] = dtypes
+                note_sequence_element_class(
+                    str(class_name), str(field_name), declaration.annotation,
+                )
                 row_record = _sequence_annotation_record(
                     declaration.annotation
                 )
@@ -16673,6 +17565,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 class_field_sequence_dtypes[
                     (str(class_name), str(declaration.target.attr))
                 ] = dtypes
+            note_sequence_element_class(
+                str(class_name), str(declaration.target.attr),
+                declaration.annotation,
+            )
             row_record = _sequence_annotation_record(declaration.annotation)
             if row_record is not None:
                 class_field_sequence_records[
@@ -16722,6 +17618,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 class_field_sequence_dtypes.setdefault(
                     (str(binding_name), str(declared_field.name)), dtypes,
                 )
+            note_sequence_element_class(
+                str(binding_name), str(declared_field.name),
+                declared_field.type,
+            )
             row_record = _sequence_annotation_record(declared_field.type)
             if row_record is not None:
                 class_field_sequence_records.setdefault(
@@ -16899,6 +17799,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                                 (str(owner_name), str(declared_field)),
                                 sequence_dtypes,
                             )
+                        note_sequence_element_class(
+                            str(owner_name), str(declared_field),
+                            source_member.annotation,
+                        )
                 else:
                     continue
                 outer_kind = aggregate_expression_kind(value)
@@ -17604,6 +18508,67 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         return import_bindings, static_bindings
 
     _resolve_python_bindings()
+    # Import resolution above is the first point at which an authored
+    # external dataclass is guaranteed to be present in ``python_bindings``.
+    # The earlier schema survey also accepts pre-bound classes, but an
+    # ordinary ``from ... import Metrics`` reaches the compiler here.  Index
+    # its declared sequence element class now, before function graphs read
+    # record fields; the field declaration remains the provenance cell used
+    # by ``_normalize_lexical_values``.
+    for binding_name, bound_value in dict(
+        getattr(graph, "python_bindings", {}) or {}
+    ).items():
+        if not isinstance(bound_value, type) or not is_dataclass(bound_value):
+            continue
+        for declared_field in fields(bound_value):
+            factory = declared_field.default_factory
+            aggregate_kind = next((
+                kind.__name__
+                for kind in (
+                    list, set, frozenset, dict, tuple, bytes, bytearray,
+                )
+                if factory is kind
+            ), None)
+            if aggregate_kind is None:
+                aggregate_kind = next((
+                    kind.__name__
+                    for kind in (
+                        list, set, frozenset, dict, tuple, bytes, bytearray,
+                    )
+                    if type(declared_field.default) is kind
+                ), None)
+            annotation_kind = _aggregate_annotation_kind(
+                declared_field.type
+            )
+            if annotation_kind is not None:
+                aggregate_kind = annotation_kind
+            key = (str(binding_name), str(declared_field.name))
+            if aggregate_kind is not None:
+                class_field_aggregate_kinds.setdefault(key, aggregate_kind)
+            dtypes = _sequence_annotation_dtypes(declared_field.type)
+            if dtypes:
+                class_field_sequence_dtypes.setdefault(key, dtypes)
+            row_record = _sequence_annotation_record(declared_field.type)
+            if row_record is not None:
+                class_field_sequence_records.setdefault(key, row_record)
+            try:
+                annotation_node = (
+                    declared_field.type
+                    if isinstance(declared_field.type, ast.AST)
+                    else ast.parse(
+                        str(declared_field.type), mode="eval"
+                    ).body
+                )
+            except SyntaxError:
+                annotation_node = None
+            if annotation_node is not None:
+                storage = _annotation_storage(annotation_node)
+                if storage.get("dtype") is not None:
+                    class_field_storage_contracts.setdefault(key, storage)
+            note_sequence_element_class(
+                str(binding_name), str(declared_field.name),
+                declared_field.type,
+            )
     # A named concordance page declares the class of every fact it can hold.
     # Retain that source relation before function subgraphs split away from
     # the module-level ``declare_page`` call.  A later ``book.borrowed(name)``
@@ -20894,9 +21859,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             ]
             return_values.extend(terminal_merges)
         statement = graph.G.nodes[node_id].get("expr_obj")
-        definition_static_bindings = dict(
-            getattr(statement, "_python_bindings", static_bindings)
-        )
+        # Every function inherits the module imports resolved above.  Source
+        # pursuit may attach additional definition-local bindings, but an
+        # existing empty/partial ``_python_bindings`` mapping is not a
+        # replacement for that module environment (it previously erased an
+        # ordinary ``from ... import Metrics`` at this boundary).
+        definition_static_bindings = dict(static_bindings)
+        definition_static_bindings.update(dict(
+            getattr(statement, "_python_bindings", {}) or {}
+        ))
         for builtin_name, builtin_value in vars(builtins).items():
             definition_static_bindings.setdefault(
                 builtin_name,
@@ -21365,6 +22336,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             class_field_aggregate_kinds=class_field_aggregate_kinds,
             class_field_mapping_contracts=local_mapping_contracts,
             class_field_sequence_dtypes=class_field_sequence_dtypes,
+            class_field_sequence_element_classes=(
+                class_field_sequence_element_classes
+            ),
             class_field_sequence_records=class_field_sequence_records,
             class_field_storage_contracts=class_field_storage_contracts,
             class_field_classes=class_field_classes,
@@ -21749,6 +22723,44 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         ))
         for (callee_scope, formal_id), evidence in formal_evidence.items():
             facts = tuple(evidence["facts"])
+            class_page = current_identity_book().page(
+                "source_value_class_concordance"
+            )
+            declared = class_page.latest((callee_scope, int(formal_id)))
+            if (
+                isinstance(declared, tuple)
+                and len(declared) >= 3
+                and str(declared[2]).startswith("parameter annotation")
+            ):
+                # A non-numeric annotation is the callee's authored record
+                # interface, not a promise that every Python actual has the
+                # same nominal class.  The dt controller deliberately passes
+                # its wider Metrics publication record to helpers annotated
+                # with the narrower StepSpans interface.  Keep the declared
+                # formal class; only a nominally identical actual adds another
+                # concordance edge.  Record-field lowering remains responsible
+                # for proving every field the callee actually reads.
+                matching = tuple(
+                    fact for fact in facts
+                    if (
+                        _canonical_source_class_identity(fact[0]),
+                        int(fact[1]),
+                    ) == (
+                        str(declared[0]), int(declared[1]),
+                    )
+                )
+                if matching:
+                    publish_formal_class(
+                        callee_scope, formal_id, evidence["graph"],
+                        str(declared[0]), int(declared[1]),
+                        matching[0][2],
+                        tuple(dict.fromkeys(
+                            cell
+                            for _identity, _limbs, _source, cells in matching
+                            for cell in cells
+                        )),
+                    )
+                continue
             distinct = {
                 (class_identity, limbs)
                 for class_identity, limbs, _source, _cells in facts

@@ -254,6 +254,70 @@ def revise_ssa_value(function, value_id, *, dtype, shape, stage, sources=(), boo
     )
 
 
+def publish_declared_scalar_abi(function, value, source, *, stage, book=None):
+    """Resolve a provisional scalar spelling from its exact source ABI.
+
+    Planned-region captures of resident's integer index were adopted as
+    ``int`` although their source VALUE_TYPE_ABI already declared int64.
+    A later reader must not choose between that old fact and a mutable view.
+    Fixed physical types and tensor views are not inferred from a Python name.
+    """
+    from .concordance_declarations import CANONICAL_VALUE, VALUE_TYPE_ABI
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book() if book is None else book
+    if (source is None or source.page != CANONICAL_VALUE or value.shape
+            or value.dtype not in (None, "", "unknown", "int")):
+        return
+    cell = book.current_ref(VALUE_TYPE_ABI, source.row)
+    if cell is None:
+        return
+    abi = book.page(VALUE_TYPE_ABI).cell(cell.row, cell.column)
+    alternatives = tuple(getattr(abi, "physical_alternatives", ()))
+    if len(alternatives) != 1:
+        return
+    physical = alternatives[0]
+    if (physical.storage != "scalar" or physical.shape != ()
+            or not physical.dtype):
+        return
+    publish_ssa_value_type(
+        function, value, dtype=physical.dtype, shape=(), sources=(cell,),
+        stage=stage, book=book,
+    )
+
+
+def publish_ssa_value_type(function, value, *, dtype, shape, sources, stage, book=None):
+    """Publish an evidenced type change, then materialize that exact fact.
+
+    An existing SSA identity is required. This cannot adopt an unrecorded
+    value, or turn a failed publication into a mutable-object-only change.
+    """
+    from .concordance_declarations import SSA_VALUE, SSAValueFact
+    from .identity_concordance import ConcordanceRefusal, current_identity_book
+
+    book = current_identity_book() if book is None else book
+    sources = tuple(cell for cell in sources if cell is not None)
+    if not sources:
+        raise ConcordanceRefusal("SSA type change lacks its decision/source cells")
+    if (dtype in (None, "", "unknown")
+            and value.dtype not in (None, "", "unknown")):
+        raise ConcordanceRefusal(
+            f"incomplete producer publication for {function.name!r}/{value.id}: "
+            f"unresolved evidence cannot erase resident type {value.dtype!r}"
+        )
+    cell = revise_ssa_value(
+        function, int(value.id), dtype=dtype, shape=shape,
+        stage=stage, sources=sources, book=book,
+    )
+    fact = None if cell is None else book.page(SSA_VALUE).cell(cell.row, cell.column)
+    if not isinstance(fact, SSAValueFact) or (fact.dtype, fact.shape) != (dtype, tuple(shape)):
+        raise ConcordanceRefusal(
+            f"SSA type change was not published: {function.name!r}/{value.id}"
+        )
+    value.dtype, value.shape = fact.dtype, fact.shape
+    return cell
+
+
 def record_descriptor_cell(table, record_id):
     """The latest ``record_descriptor`` cell of ``record_id`` in ``table``."""
     from .concordance_declarations import RECORD_DESCRIPTOR
@@ -278,14 +342,31 @@ def record_member_cell(table, value_id):
     )
 
 
+def record_return_layouts(function, *, book=None):
+    """Read record expansions from their owner, not the metadata snapshot."""
+    from .concordance_declarations import RECORD_RETURN_LAYOUT
+    from .identity_concordance import current_identity_book
+
+    if book is None and accepted_ssa_component(function):
+        book = function.metadata["accepted_ssa_component"]["identity_book"]
+    book = current_identity_book() if book is None else book
+    page = book.page(RECORD_RETURN_LAYOUT)
+    result = {}
+    for row in page.scope_rows(function_scope_of(function)):
+        cell = book.current_ref(RECORD_RETURN_LAYOUT, row)
+        if cell is not None:
+            result[int(row[1])] = tuple(page.cell(row, cell.column))
+    return result
+
+
 def post_record_return_layout(function, table, record_id, layout, *, stage):
     """Post ``record_return_layout`` row ``(function scope, record)`` =
     the layout tuple, REVISE, DERIVED(the record's descriptor cell, each
     layout id's identity cell).  A changed layout none of whose members has
     a cell yet cannot name its cause and is recorded
     ``Unsourced(LAYOUT_MEMBER_NOT_YET_DEFINED)``; an unchanged layout posts
-    nothing.  ``metadata["record_return_layouts"]`` stays the readers'
-    view and is written by the caller as before."""
+    nothing. Metadata is a serialized compatibility view; compiler readers
+    use ``record_return_layouts`` to read this page."""
     from .concordance_declarations import (
         LAYOUT_MEMBER_NOT_YET_DEFINED, RECORD_RETURN_LAYOUT,
     )
@@ -333,20 +414,23 @@ def normalize_declared_scalar_record_shapes(module):
     provenance.  Repeated or equal evidence keeps the incumbent scalar form.
     """
 
+    from .concordance_declarations import (
+        RECORD_DESCRIPTOR, RECORD_SCALAR_SHAPE, RECORD_RETURN_REPAIR, SSA_VALUE,
+    )
+    from .identity_concordance import Derived, Mode
+
     receipts = []
     for symbol, function in module.functions.items():
         table = module.record_tables.get(str(symbol))
         if table is None:
             continue
-        values = {
-            int(value.id): value for value in function.args
-        }
-        values.update({
-            int(instruction.res.id): instruction.res
-            for block in function.blocks.values()
-            for instruction in block.instrs
-            if instruction.res is not None
-        })
+        occurrences = {}
+        for value in (
+            *function.args,
+            *(value for block in function.blocks.values() for instruction in block.instrs
+              for value in (*instruction.args, instruction.res) if value is not None),
+        ):
+            occurrences.setdefault(int(value.id), {})[id(value)] = value
         fields_by_value = {}
         for record_id, descriptor in table.records.items():
             for field in descriptor.fields:
@@ -358,11 +442,27 @@ def normalize_declared_scalar_record_shapes(module):
                         str(field.storage_identity),
                     ))
         for value_id, owners in fields_by_value.items():
-            value = values.get(value_id)
+            values = tuple(occurrences.get(value_id, {}).values())
+            value = next((value for value in values if value.shape), None)
             prior_shape = () if value is None else tuple(value.shape or ())
             if value is None or not prior_shape:
                 continue
-            value.shape = ()
+            book = table.book
+            cells = tuple(dict.fromkeys(
+                book.current_ref(RECORD_DESCRIPTOR, (table.owner, record_id))
+                for record_id, _field_name, _identity in owners
+            ))
+            scalar_cell = book.post(
+                RECORD_SCALAR_SHAPE, (str(symbol), value_id), (prior_shape, ()),
+                stage=RECORD_RETURN_REPAIR, provenance=Derived(cells), mode=Mode.REVISE,
+            )
+            value_cell = book.current_ref(SSA_VALUE, (function_scope_of(function), value_id))
+            dtype = book.page(SSA_VALUE).cell(value_cell.row, value_cell.column).dtype
+            for occurrence in values:
+                publish_ssa_value_type(
+                    function, occurrence, dtype=dtype, shape=(),
+                    sources=(scalar_cell,), stage=RECORD_RETURN_REPAIR, book=book,
+                )
             value.accounting = {
                 **dict(value.accounting or {}),
                 "record_scalar_shape_normalization": True,
@@ -513,9 +613,7 @@ def publish_inout_scalar_return_snapshots(module):
             returned_values_by_symbol[str(symbol)] = next(iter(new_returns))
         layouts = []
         table = module.record_tables.get(symbol)
-        for record_id, layout in function.metadata.get(
-            "record_return_layouts", ()
-        ):
+        for record_id, layout in record_return_layouts(function).items():
             updated = tuple(map(int, layout))
             for old_return, new_return in old_and_new_returns:
                 starts = [

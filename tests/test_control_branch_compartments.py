@@ -30,7 +30,7 @@ from src.compiler.fortran_c_shell import (
 
 def _optional_field_graph(*, duplicate_presence=False):
     graph = nx.DiGraph()
-    graph.graph['identity_table'] = {'limit': (2,)}
+    graph.graph['identity_table'] = {'self': (1,), 'limit': (2,)}
     graph.add_node(1, type='Input', value_id=1, parents=[], attributes={
         'binding_name': 'self', 'binding_kind': 'parameter',
     })
@@ -61,6 +61,7 @@ def test_erased_optional_none_test_uses_exact_presence_slot():
     absent = _optional_presence_control_expression(graph, is_absent)
 
     assert (present.op, present.value_id) == ('optional_presence', 3)
+    assert present.optional_payload_value_id == 2
     assert absent.op == 'not'
     assert absent.operands[0].op == 'optional_presence'
     assert absent.operands[0].value_id == 3
@@ -93,6 +94,20 @@ def test_ambiguous_optional_presence_keeps_unresolved_incumbent():
 
     assert _optional_presence_control_expression(graph, expression) is None
     assert 'optional_presence_control_receipts' not in graph.graph
+
+
+def test_erased_optional_none_test_recovers_receiver_from_identity_history():
+    graph = _optional_field_graph()
+    graph.nodes[1]['attributes'].pop('binding_name')
+    expression = ast.parse('limit is not None', mode='eval').body
+
+    predicate = _optional_presence_control_expression(graph, expression)
+
+    assert (predicate.op, predicate.value_id) == ('optional_presence', 3)
+    assert predicate.optional_payload_value_id == 2
+    assert graph.graph['optional_presence_control_receipts'][0][
+        'parameter'
+    ] == 'self'
 
 
 def test_missing_phi_initial_uses_unique_nearest_identity_ancestor():

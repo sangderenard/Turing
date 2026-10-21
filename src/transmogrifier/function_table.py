@@ -190,11 +190,10 @@ class FunctionTable(TiledObject):
         A new declaration is recorded on the identity book as one
         ``function_address`` row ``(qualified,) -> address`` (plan 60,
         section 3.8): DERIVED from ``source`` -- the cell of the definition's
-        ``source_span`` -- when the caller names one; otherwise Unsourced
-        under the latch, ``EXTERNAL_DECLARATION`` for an external handoff
-        and ``HELPER_CALLER_UNROUTED`` for a caller that has not yet routed
-        its provenance.  Addresses stay the dense counter: they are dict
-        keys and ``function_ref`` ints throughout, not minted ids.
+        ``source_span``, or every authored root of a graph-native definition.
+        A caller that has not routed those cells is refused.  Addresses stay
+        the dense counter: they are dict keys and ``function_ref`` ints
+        throughout, not minted ids.
         """
 
         local_name = str(name)
@@ -249,19 +248,32 @@ class FunctionTable(TiledObject):
             Derived, Mode, Ref, current_identity_book,
         )
 
-        if isinstance(source, Ref):
-            provenance = Derived((source,))
+        sources = (
+            (source,)
+            if isinstance(source, Ref)
+            else tuple(source)
+            if isinstance(source, (tuple, list))
+            else ()
+        )
+        if sources and all(isinstance(item, Ref) for item in sources):
+            scopes = {item.row[0] for item in sources}
+            if len(scopes) != 1:
+                raise ValueError(
+                    f"{FUNCTION_ADDRESS.name}: source cells for "
+                    f"{str(qualified)!r} disagree on definition scope"
+                )
+            provenance = Derived(tuple(dict.fromkeys(sources)))
             # Function addresses are local to one FunctionTable, while the
             # concordance is shared by every source admitted to the book.
             # Qualify an authored address by the exact module identity on its
             # source cell; anonymous programs use their AST-SHA module scope.
             # A bare spelling such as ``run`` is therefore never asked to
             # concord two unrelated tables' dense local addresses.
-            address_identity = repr((source.row[0], str(qualified)))
+            address_identity = repr((sources[0].row[0], str(qualified)))
         else:
             raise ValueError(
-                f"{FUNCTION_ADDRESS.name}: no source cell for {str(qualified)!r}"
-                " -- the caller named no source span"
+                f"{FUNCTION_ADDRESS.name}: no source cells for {str(qualified)!r}"
+                " -- the caller named no source definition"
                 + (" (external declaration)" if external else "")
             )
         current_identity_book().post(

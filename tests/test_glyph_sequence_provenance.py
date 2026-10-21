@@ -2660,3 +2660,154 @@ def test_string_slice_class_is_read_through_the_canonical_identity():
     assert classes[int(component.operand_value_id)][2] == (
         "authored string slice"
     )
+
+
+def test_declared_string_sequence_projects_class_to_loop_target():
+    formatted, classes = _reduced_joined_components(
+        "def render(items: list[str]):\n"
+        "    for line in items[1:]:\n"
+        "        print(f'{line}')\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert classes[int(component.operand_value_id)][:2] == (
+        "builtins.str", 1,
+    )
+
+
+def test_string_strip_result_keeps_string_class_for_fstring():
+    formatted, classes = _reduced_joined_components(
+        "def render(items: list[str]):\n"
+        "    for line in items[1:]:\n"
+        "        print(f'  {line.strip()}')\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert classes[int(component.operand_value_id)][:2] == (
+        "builtins.str", 1,
+    )
+
+
+def test_string_strip_projection_relinks_after_call_formal_class_settles():
+    formatted, classes = _reduced_joined_components(
+        "def render(line):\n"
+        "    return f'{line.strip()}'\n"
+        "def root(line: str):\n"
+        "    return render(line)\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert component.projection_transform == "strip"
+    assert component.projection_source_value_id is not None
+    assert classes[int(component.operand_value_id)][:2] == (
+        "builtins.str", 1,
+    )
+
+
+def test_declared_record_string_sequence_field_projects_loop_element_class():
+    formatted, classes = _reduced_joined_components(
+        "class Metrics:\n"
+        "    unresolved_report: list[str]\n"
+        "def render(first: Metrics):\n"
+        "    for line in first.unresolved_report[1:]:\n"
+        "        print(f'  {line.strip()}')\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert component.projection_transform == "strip"
+    assert component.projection_source_value_id is not None
+    assert classes[int(component.operand_value_id)][:2] == (
+        "builtins.str", 1,
+    )
+
+
+def test_local_record_sequence_index_preserves_nested_string_field_class():
+    formatted, classes = _reduced_joined_components(
+        "class Metrics:\n"
+        "    unresolved_report: list[str]\n"
+        "def render(metrics: Metrics):\n"
+        "    unresolved: list[Metrics] = []\n"
+        "    unresolved.append(metrics)\n"
+        "    first = unresolved[0]\n"
+        "    for line in first.unresolved_report[1:]:\n"
+        "        print(f'  {line.strip()}')\n",
+        "render",
+    )
+    component, = formatted
+    assert component.projection_kind == "string_token"
+    assert component.projection_transform == "strip"
+    assert component.projection_source_value_id is not None
+    assert classes[int(component.operand_value_id)][:2] == (
+        "builtins.str", 1,
+    )
+
+
+def test_imported_class_parameter_keeps_module_binding_during_reduction():
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        source = (
+            "from src.common.dt_system.dt_scaler import Metrics\n"
+            "def render(first: Metrics):\n"
+            "    return first.max_vel\n"
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(source))
+        reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("render").graph
+        parameter = next(
+            data for _node_id, data in function.G.nodes(data=True)
+            if data.get("type") == "Input"
+            and (data.get("attributes") or {}).get("binding_name") == "first"
+        )
+        assert parameter["attributes"]["result_class_ref"] == "Metrics"
+    finally:
+        end_identity_book(token)
+
+
+def test_string_strip_loop_fstring_has_resident_native_producer():
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    )
+    source = (
+        "def render(items: list[str]):\n"
+        "    for line in items[1:]:\n"
+        "        print(f'  {line.strip()}')\n"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, _outputs, exports = lower_ast_source_to_ssa(
+            source,
+            "render",
+            name="string_strip_loop_glyph",
+            extraction_contract=policy,
+            progress=lambda _message: None,
+        )
+    assert exports == ("string_strip_loop_glyph__render",)
+    operations = tuple(
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+    assert not any(
+        (instruction.attributes or {}).get("external_reference")
+        for instruction in operations
+    )
+    root = module.functions[exports[0]]
+    assert not any(
+        (
+            (argument.accounting or {}).get("source_execution_receipt")
+            or {}
+        ).get("source") == "line.strip()"
+        for argument in root.args
+    )
+    assert any(
+        (instruction.attributes or {}).get("ssa_sequence_operation")
+        == "glyph_token_lookup_copy"
+        for instruction in operations
+    )

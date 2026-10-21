@@ -4319,6 +4319,16 @@ def analyze_shader_loop_reductions(
     def expanded_row_arguments(value_ids: Iterable[int]) -> tuple[int, ...]:
         """Expose fixed aggregate leaves as sequence row columns."""
 
+        from .concordance_declarations import (
+            SOURCE_AGGREGATE_LAYOUT,
+            SourceAggregateLayout,
+        )
+        from .identity_concordance import current_identity_book
+
+        aggregate_scope = graph.G.graph.get("source_aggregate_layout_scope")
+        aggregate_page = current_identity_book().page(
+            SOURCE_AGGREGATE_LAYOUT
+        )
         expanded: list[int] = []
         for value_id in map(int, value_ids):
             data = nodes_by_value.get(value_id, {})
@@ -4326,7 +4336,20 @@ def analyze_shader_loop_reductions(
             leaf_ids = tuple(map(
                 int, attributes.get("aggregate_leaf_value_ids", ())
             ))
-            if attributes.get("aggregate_kind") == "tuple" and leaf_ids:
+            layout = (
+                None if aggregate_scope is None else
+                aggregate_page.latest((aggregate_scope, int(value_id)))
+            )
+            if not leaf_ids and isinstance(layout, SourceAggregateLayout):
+                if str(layout.aggregate_kind) == "tuple":
+                    leaf_ids = tuple(
+                        int(member.value_id) for member in layout.members
+                    )
+            if (
+                attributes.get("aggregate_kind") == "tuple"
+                or isinstance(layout, SourceAggregateLayout)
+                and str(layout.aggregate_kind) == "tuple"
+            ) and leaf_ids:
                 expanded.extend(leaf_ids)
             else:
                 expanded.append(value_id)
@@ -4744,6 +4767,7 @@ def analyze_shader_loop_reductions(
         # Python iterator object to expose as another public input.
         iterable_source_id = loop.iterable_node
         reverse_iterable = False
+        mapping_projection_columns: tuple[int, ...] | None = None
         if (
             loop.stop is None
             and loop.stop_node is None
@@ -4769,6 +4793,22 @@ def analyze_shader_loop_reductions(
                 if len(reversed_sources) == 1:
                     iterable_source_id = reversed_sources[0]
                     reverse_iterable = True
+            mapping_columns = {
+                "items": (0, 1),
+                "keys": (0,),
+                "values": (1,),
+            }.get(str(
+                iterable_data.get("type") or iterable_data.get("op") or ""
+            ).casefold())
+            if mapping_columns is not None:
+                mapping_sources = tuple(
+                    int(parent)
+                    for parent, role in iterable_data.get("parents", ())
+                    if str(role) in {"operand", "value", "object", "base"}
+                )
+                if len(mapping_sources) == 1:
+                    iterable_source_id = mapping_sources[0]
+                    mapping_projection_columns = mapping_columns
         # A range loop's lexical target is the induction value itself.  Record
         # that identity through the existing projected-iterable binding table
         # so region calls consuming the source target ID receive the loop
@@ -4797,6 +4837,26 @@ def analyze_shader_loop_reductions(
                 induction_name,
                 None,
             ),)
+        if (
+            mapping_projection_columns is not None
+            and len(loop.target_bindings) == len(mapping_projection_columns)
+        ):
+            # Mapping iterator views own no arena.  Their exact operand owns
+            # the keyed columns and extent, while the method determines which
+            # authored column each lexical target reads.  Publish that source
+            # relation before SSA sequence construction so union tags and
+            # payloads are attached to the same resident descriptor.
+            projected_iterable_bindings = tuple(
+                (
+                    int(iterable_source_id), int(target_id), induction_name,
+                    int(column),
+                )
+                for column, (_name, target_id) in zip(
+                    mapping_projection_columns,
+                    loop.target_bindings,
+                    strict=True,
+                )
+            )
         enumerated_source_id = None
         iterable_extent_ids: tuple[int, ...] = ()
         if (
@@ -4805,6 +4865,7 @@ def analyze_shader_loop_reductions(
             and loop.iterable_node is not None
             and len(loop.target_bindings) > 1
             and loop.iterable_constant is None
+            and mapping_projection_columns is None
         ):
             iterable_id = int(loop.iterable_node)
             iterable_data = graph.G.nodes[iterable_id]

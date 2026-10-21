@@ -11,6 +11,48 @@ from src.transmogrifier.ssa import (
 )
 
 
+def test_program_abi_record_aliases_are_one_native_type_identity():
+    from src.compiler.fortran_c_shell import (
+        _canonical_program_abi_type_identity,
+        _program_abi_record_for_type_identity,
+    )
+
+    program_abi = {"records": {
+        "Metrics": {
+            "identity": "src.common.dt_system.dt_scaler.Metrics",
+            "fields": {},
+        },
+        "CompilerSSAExtent": {
+            "identity": "builtins.int",
+            "fields": {
+                "value": {"storage": "scalar", "dtype": "int64"},
+            },
+        },
+    }}
+
+    assert _canonical_program_abi_type_identity(
+        "Metrics", program_abi,
+    ) == "Metrics"
+    assert _canonical_program_abi_type_identity(
+        "src.common.dt_system.dt_scaler.Metrics", program_abi,
+    ) == "Metrics"
+    assert _canonical_program_abi_type_identity(
+        "int", program_abi,
+    ) == "builtins.int"
+    assert _canonical_program_abi_type_identity(
+        "CompilerSSAExtent", program_abi,
+    ) == "CompilerSSAExtent"
+    assert _program_abi_record_for_type_identity(
+        "builtins.int", program_abi,
+    ) is None
+    assert _program_abi_record_for_type_identity(
+        "CompilerSSAExtent", program_abi,
+    ) == "CompilerSSAExtent"
+    assert _program_abi_record_for_type_identity(
+        "src.common.dt_system.dt_scaler.Metrics", program_abi,
+    ) == "Metrics"
+
+
 def test_optional_fixed_tuple_annotation_retains_exact_member_contracts():
     from src.compiler.fortran_c_shell import (
         _authored_annotation_field_receipt,
@@ -39,6 +81,28 @@ def test_optional_fixed_tuple_annotation_retains_exact_member_contracts():
         "dtype": "int64",
         "rank": 0,
         "mutable": False,
+    }
+
+
+def test_optional_sequence_of_bare_collections_uses_reference_elements():
+    from src.compiler.fortran_c_shell import (
+        _authored_annotation_field_receipt,
+        _authored_annotation_python_types,
+    )
+
+    annotation = ast.parse("list[dict] | None", mode="eval").body
+
+    assert _authored_annotation_python_types(annotation) == (
+        "builtins.NoneType",
+        "builtins.list",
+    )
+    assert _authored_annotation_field_receipt(annotation) == {
+        "storage": "span",
+        "dtype": "opaque_ref",
+        "rank": 1,
+        "mutable": True,
+        "aggregate_kind": "list",
+        "optional": True,
     }
 
 
@@ -92,7 +156,11 @@ def test_value_union_none_arm_has_no_payload():
         )
 
 
-def test_linked_union_result_claims_provisional_call_tag():
+@pytest.mark.parametrize("descriptor_id", (200, 201))
+@pytest.mark.parametrize("through_wrapper", (False, True))
+def test_linked_union_result_claims_provisional_call_tag(
+    descriptor_id, through_wrapper,
+):
     from src.compiler.fortran_c_shell import (
         _propagate_native_type_tag_results,
     )
@@ -112,7 +180,7 @@ def test_linked_union_result_claims_provisional_call_tag():
         SCOPE_REGISTRY, tuple(callee_unions.owner),
     )
     callee_unions.register(SSAValueUnionDescriptor(
-        union_id=200,
+        union_id=descriptor_id,
         identity="builtins.NoneType | builtins.tuple",
         tag_value_id=202,
         alternatives=(
@@ -153,6 +221,47 @@ def test_linked_union_result_claims_provisional_call_tag():
         },
     )
 
+    union_fact = {
+        "alternatives": ("builtins.NoneType", "builtins.tuple"),
+        "tags": (("builtins.NoneType", 0), ("builtins.tuple", 1)),
+    }
+    functions = {"callee": callee}
+    called_symbol = "callee"
+    called_outputs = (201, 202)
+    call_link_rank = {"callee": 0, "caller": 1}
+    if through_wrapper:
+        wrapper_payload = SSAValue(301, dtype="opaque_ref")
+        wrapper_tag = SSAValue(302, dtype="int64")
+        wrapper_aggregate = SSAValue(350, dtype="ssa.aggregate")
+        wrapper = Function(
+            "wrapper", [],
+            {"entry": BasicBlock("entry", [
+                Instr("Call", [], wrapper_aggregate, attributes={
+                    "callee": "callee",
+                    "callee_output_ids": (201, 202),
+                    "physical_result_bindings": ((201, 301), (202, 302)),
+                }),
+                Instr("Load", [wrapper_aggregate], wrapper_payload),
+                Instr("Load", [wrapper_aggregate], wrapper_tag),
+                Instr("Ret", [wrapper_payload, wrapper_tag], None),
+            ])},
+            metadata={
+                "native_value_union_return_layouts": ((
+                    300,
+                    (
+                        (("alternative", "builtins.tuple", 0), 0),
+                        (("tag",), 1),
+                    ),
+                ),),
+                "native_value_type_abi": {300: union_fact},
+                "value_union_table": SSAValueUnionTable(owner="wrapper"),
+            },
+        )
+        functions["wrapper"] = wrapper
+        called_symbol = "wrapper"
+        called_outputs = (301, 302)
+        call_link_rank = {"callee": 0, "wrapper": 1, "caller": 2}
+
     provisional = SSAValue(101, dtype="int64", accounting={
         "native_type_tag_pending_for_value_id": 31,
         "native_type_tag_pending_call_result": True,
@@ -164,9 +273,11 @@ def test_linked_union_result_claims_provisional_call_tag():
     aggregate = SSAValue(150, dtype="ssa.aggregate")
     merged_tag = SSAValue(160, dtype="int64")
     linked_call = Instr("Call", [], aggregate, attributes={
-        "callee": "callee",
-        "callee_output_ids": (201, 202),
-        "physical_result_bindings": ((201, 31), (202, 102)),
+        "callee": called_symbol,
+        "callee_output_ids": called_outputs,
+        "physical_result_bindings": (
+            (called_outputs[0], 31), (called_outputs[1], 102),
+        ),
     })
     consumer = Instr("Phi", [provisional, physical_tag], merged_tag)
     caller = Function(
@@ -184,9 +295,13 @@ def test_linked_union_result_claims_provisional_call_tag():
         },
     )
 
+    functions["caller"] = caller
     _propagate_native_type_tag_results(
-        {"caller": caller, "callee": callee},
+        # Deliberately present callers before callees: the sanctioned link
+        # rank, not dictionary insertion order, governs propagation.
+        dict(reversed(tuple(functions.items()))),
         lambda *_args, **_kwargs: 999,
+        call_link_rank,
     )
 
     assert consumer.args[0] is physical_tag

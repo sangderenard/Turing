@@ -58,10 +58,12 @@ def _concord_exact_region_feed_dtypes(
     page so another call cannot silently reinterpret the identity.
     """
     from .concordance_declarations import (
-        EXACT_REGION_FEED_DTYPE, PHYSICAL_CALL_INPUT_ADAPTATION,
+        EXACT_REGION_FEED_DTYPE, PHYSICAL_CALL_INPUT_ADAPTATION, CALL_EDGE,
     )
     from .identity_concordance import ConcordanceRefusal, Derived, Mode
     from .ssa_record_return_state import ssa_value_identity_cell
+    from .ssa_record_return_state import function_scope_of
+    from .structural_concordance import function_value_structure, boundary_transport
 
     book = current_identity_book()
     page = book.page('exact_region_feed_dtype')
@@ -125,15 +127,48 @@ def _concord_exact_region_feed_dtypes(
                 # reconstruction from a consumer or from the Phi downstream.
                 revised_feed_dtypes = list(feed_dtypes)
                 authoritative_residents = []
+                settled_physical_results = []
                 for position, (actual, feed_id) in enumerate(zip(
                     instruction.args, feed_ids,
                 )):
-                    resident = residents.get(int(feed_id))
+                    feed_resident = residents.get(int(feed_id))
+                    actual_resident = residents.get(int(actual.id))
+                    # A returned aggregate member can replace the provisional
+                    # value captured when the region was cut while retaining
+                    # that cut-time value in ``feed_ids``.  The actual
+                    # occurrence's ``ssa_call_result_from`` edge is the exact
+                    # producer publication; consulting the stale feed-id row
+                    # first discarded that publication (Metrics.hard_failure
+                    # remained float64 although coerce_metrics returned bool).
+                    # Prefer the producer-backed actual, then the authored
+                    # capture.  This is the same structural rule used below
+                    # for declared reference residents: consumers read the
+                    # published producer view before a provisional cut view.
+                    resident = (
+                        actual_resident
+                        if actual_resident is not None
+                        and (actual_resident.accounting or {}).get(
+                            'ssa_call_result_from'
+                        )
+                        else feed_resident
+                    )
                     if resident is None:
-                        resident = residents.get(int(actual.id))
+                        resident = actual_resident
                     authoritative_residents.append(resident)
+                    resident_accounting = {} if resident is None else (resident.accounting or {})
+                    formal_accounting = callee.args[position].accounting or {}
+                    result_origin = resident_accounting.get('ssa_call_result_from')
+                    settled_physical_result = bool(
+                        resident is not None
+                        and isinstance(result_origin, tuple) and len(result_origin) == 2
+                        and result_origin == formal_accounting.get('ssa_call_result_from')
+                        and resident_accounting.get('physical_dtype') == str(resident.dtype)
+                        and formal_accounting.get('physical_dtype') == str(resident.dtype)
+                        and str(resident.dtype) in _NUMERIC_DTYPES
+                    )
+                    settled_physical_results.append(settled_physical_result)
                     if (
-                        not defer_unsettled_region_call_results
+                        (not defer_unsettled_region_call_results or settled_physical_result)
                         and
                         resident is not None
                         and (resident.accounting or {}).get(
@@ -141,7 +176,13 @@ def _concord_exact_region_feed_dtypes(
                         )
                         and str(resident.dtype or '') in _NUMERIC_DTYPES
                     ):
-                        revised_feed_dtypes[position] = str(resident.dtype)
+                        structure, _cell = function_value_structure(
+                            caller, int(resident.id), book=book,
+                        )
+                        payload = dict(structure.children).get("payload", structure)
+                        if payload.dtype is None:
+                            raise ConcordanceRefusal("returned region feed has no physical type")
+                        revised_feed_dtypes[position] = str(payload.dtype)
                     elif (
                         resident is not None
                         and (resident.accounting or {}).get(
@@ -174,12 +215,13 @@ def _concord_exact_region_feed_dtypes(
                     if (
                         defer_unsettled_region_call_results
                         and not declared_reference
+                        and not settled_physical_results[position]
                     ):
                         # The early frame pass has not settled numerical
                         # result storage yet.  It must neither revise nor
                         # publish those provisional cut-time views.  Declared
-                        # references are already authoritative and are the
-                        # only exact region feeds admitted in this phase.
+                        # references and producer-backed results whose physical
+                        # storage both endpoints already declare are settled.
                         continue
                     if exact_dtype not in _NUMERIC_DTYPES and not declared_reference:
                         continue
@@ -357,6 +399,35 @@ def _concord_exact_region_feed_dtypes(
                             ),
                         )
                         changed += 1
+                    if (str(actual.dtype) == str(formal.dtype)
+                            and tuple(actual.shape or ()) == tuple(formal.shape or ())):
+                        source_structure, source_cell = function_value_structure(
+                            caller, int(actual.id), book=book,
+                        )
+                        target_structure, target_cell = function_value_structure(
+                            callee, int(formal.id), book=book,
+                        )
+                        # Optional payload formals transport the payload only;
+                        # their companion presence is a separately declared feed.
+                        source_paths = tuple(path for path, _ in source_structure.leaves())
+                        target_paths = tuple(path for path, _ in target_structure.leaves())
+                        if source_paths == target_paths:
+                            binding = book.post(
+                                CALL_EDGE,
+                                (function_scope_of(callee), int(formal.id),
+                                 function_scope_of(caller), int(actual.id)),
+                                "argument", stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                                provenance=Derived((source_structure.source, target_structure.source)),
+                                mode=Mode.CONCORD,
+                            )
+                            boundary_transport(
+                                function_scope_of(caller),
+                                (str(block.name), str(callee.name), int(position),
+                                 int(actual.id), int(formal.id)),
+                                source_cell, target_cell,
+                                tuple((path, path) for path in source_paths),
+                                bindings=(binding,), book=book,
+                            )
     return changed
 
 

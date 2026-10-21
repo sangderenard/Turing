@@ -365,6 +365,81 @@ def test_concorded_primitive_class_has_one_canonical_identity():
     })
 
 
+def test_any_local_does_not_override_declared_sequence_element_class():
+    """An open local annotation cannot compete with an exact row schema."""
+
+    from src.compiler.concordance_declarations import SOURCE_VALUE_CLASS
+
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        "from typing import Any\n"
+        "class RowField:\n"
+        "    name: str\n"
+        "class Page:\n"
+        "    row_fields: tuple[RowField, ...]\n"
+        "def validate(page: Page):\n"
+        "    row_fields: tuple[RowField, ...] = page.row_fields\n"
+        "    item: Any\n"
+        "    for item in row_fields:\n"
+        "        return item.name\n"
+        "    return ''\n"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("validate").graph
+    loop_input = next(
+        int(node_id)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "item"
+    )
+    scope = function_graph.G.graph["authored_function_identity"]
+    assert current_identity_book().page(SOURCE_VALUE_CLASS).latest(
+        (scope, loop_input)
+    )[:2] == ("RowField", 1)
+
+
+def test_list_literal_uses_concorded_member_order_after_ast_copy():
+    from src.compiler.resident_sequence_materialization import (
+        _list_literal_mutations,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        "def build(value):\n"
+        "    rows = [value, 0.0]\n"
+        "    return rows\n"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("build").graph
+    list_id, list_data = next(
+        (int(node_id), data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.List)
+    )
+    original = list_data["expr_obj"]
+    list_data["expr_obj"] = ast.parse(
+        ast.unparse(original), mode="eval",
+    ).body
+
+    mutations = _list_literal_mutations(function_graph.G, (list_id,))
+
+    assert [mutation.operator for mutation in mutations] == [
+        "clear", "append", "append",
+    ]
+    assert tuple(
+        mutation.argument_value_ids for mutation in mutations[1:]
+    ) == tuple(
+        (int(value_id),)
+        for value_id in list_data["attributes"]["aggregate_leaf_value_ids"]
+    )
+
+
 def test_staticmethod_receiver_is_not_bound_to_first_formal_class():
     from src.compiler.concordance_declarations import SOURCE_VALUE_CLASS
     from src.common.tensors.topological_reducer import _source_numeric_scope
@@ -399,6 +474,43 @@ def run(table: Table, name: str, value):
     assert current_identity_book().page(SOURCE_VALUE_CLASS).latest((
         _source_numeric_scope(helper), name_id,
     ))[:2] == ("builtins.str", 1)
+
+
+def test_annotated_record_formal_keeps_its_declared_interface_for_wider_actual():
+    from src.compiler.concordance_declarations import SOURCE_VALUE_CLASS
+    from src.common.tensors.topological_reducer import _source_numeric_scope
+
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Narrow:
+    value: int
+
+class Wide:
+    value: int
+    extra: int
+
+def read_value(record: Narrow):
+    return record.value
+
+def run(record: Wide):
+    return read_value(record)
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    callee = graph.function_table.entry("read_value").graph.G
+    formal_id = next(
+        int(node_id)
+        for node_id, data in callee.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "record"
+    )
+    assert current_identity_book().page(SOURCE_VALUE_CLASS).latest((
+        _source_numeric_scope(callee), formal_id,
+    ))[:2] == ("Narrow", 1)
 
 
 def test_python_named_integer_becomes_plain_constant_with_origin_metadata():
@@ -3458,6 +3570,31 @@ def repro(xs, ys):
     _node_id, loop_data = for_loops[0]
     attributes = loop_data.get("attributes") or {}
     assert "address" not in attributes.get("loop_target_initials", {})
+
+
+def test_nested_comprehension_materializes_only_on_innermost_generator():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        "def repro(rows):\n"
+        "    return [value for row in rows for value in row]\n"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("repro").graph
+    generators = [
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.comprehension)
+    ]
+
+    assert len(generators) == 2
+    assert not (generators[0].get("attributes") or {}).get(
+        "loop_iteration_outputs"
+    )
+    assert len((generators[1].get("attributes") or {}).get(
+        "loop_iteration_outputs", ()
+    )) == 1
 
 
 @pytest.mark.parametrize('xs,ys,flag', [((), (), True), ((1, 2), (), True),

@@ -314,6 +314,40 @@ _SHAPED_SSA_OPERATIONS = {
 }
 
 
+def _settle_unary_result_metadata(source: SSAValue, result: SSAValue) -> None:
+    """Apply the unary kernel's shape law without erasing result semantics."""
+
+    result.shape = tuple(source.shape or ())
+    if result.dtype in {None, "unknown"} and source.dtype is not None:
+        result.dtype = source.dtype
+
+
+def _records_same_identity_shape_transport(
+    source_shape: tuple[int, ...],
+    target_shape: tuple[int, ...],
+    declared_view: Any,
+) -> bool:
+    """Whether a canonical-id occurrence states that id's own shape.
+
+    Repository lowering represents a storage view with an ``SSAValue`` whose
+    integer id is the allocation owner's id while ``ssa_storage_view`` keeps
+    the view extents.  The authored reshape still has its own semantic SSA id
+    and its real ``owner -> result`` shape edge is published from the graph
+    tensor descriptor.  Publishing the collapsed storage occurrence as an
+    additional ``owner -> owner`` edge would make two legitimate views revise
+    one identity row (for example ``(4, 41)`` and ``(164,)``).
+    """
+
+    declared_view_shape = tuple(
+        declared_view.get("view_shape") or ()
+    ) if isinstance(declared_view, Mapping) else ()
+    return not (
+        declared_view_shape
+        and tuple(target_shape) == declared_view_shape
+        and tuple(target_shape) != tuple(source_shape)
+    )
+
+
 def _shape_polymorphic_function(function_name: str) -> bool:
     """Whether call-edge settlement proved multiple shapes for this helper.
 
@@ -339,7 +373,9 @@ def _shape_polymorphic_function(function_name: str) -> bool:
     )
 
 
-def _settle_operand_shapes(function: Any, values: Any) -> None:
+def _settle_operand_shapes(
+    function: Any, values: Any, descriptor_of: Any = None,
+) -> None:
     """Read each operand's shape from the concordance before dispatching.
 
     An SSAValue's shape is a field somebody filled in at construction, and
@@ -383,6 +419,22 @@ def _settle_operand_shapes(function: Any, values: Any) -> None:
             if shape_polymorphic and tuple(value.shape or ()):
                 continue
             value.shape = settled
+        if tuple(value.shape or ()) or descriptor_of is None:
+            continue
+        # Region extraction can create the consumer SSAValue occurrence
+        # before call-edge settlement publishes the exact tensor descriptor
+        # for that same source-integral identity.  ``proven_shape`` may then
+        # have no row in the consumer region even though the repository tensor
+        # table has one unanimous, allocation-owning contract.  Re-read that
+        # descriptor before classifying a call operand as scalar.  This is the
+        # same identity lookup used by region output/call settlement; shaped
+        # storage views above remain authoritative for themselves.
+        descriptor = descriptor_of(value)
+        descriptor_shape = tuple(
+            getattr(descriptor, "shape", ()) or ()
+        ) if descriptor is not None else ()
+        if descriptor_shape:
+            value.shape = descriptor_shape
 
 
 def _post_scalar_kernel_operand(
@@ -1294,7 +1346,7 @@ def propagate_repository_ssa_call_metadata(
         function: Any, function_name: Any, value_id: int, field: str,
         old: Any, new: Any, authoritative: bool, source_id: int,
         fixed_point_round: int,
-    ) -> None:
+    ) -> Any:
         """One enrichment write, posted DERIVED from the value's and the
         source value's ``ssa_value`` cells in ``function``'s scope."""
 
@@ -1319,7 +1371,7 @@ def propagate_repository_ssa_call_metadata(
         ):
             # The same transition from the same cause, repeated by a
             # fixed-point round that changed nothing: no new fact.
-            return
+            return incumbent_cell
         # Each write derives from the value's and the source's cells and
         # from the row's previous write, which is what a later write
         # revises (a round-trip is a revision of the write it undoes).
@@ -1335,7 +1387,7 @@ def propagate_repository_ssa_call_metadata(
             )
             if cell is not None
         ))
-        enrichment_book.post(
+        return enrichment_book.post(
             TENSOR_SHAPE_ENRICHMENT, row,
             (int(fixed_point_round), next(mutation_step), *transition),
             stage=TENSOR_SSA_LOWERING, provenance=Derived(cells),
@@ -1421,15 +1473,64 @@ def propagate_repository_ssa_call_metadata(
             "tensor_shape_value_id",
             "tensor_rank_value_id",
             "tensor_element_count_value_id",
+            "sequence_row_shape",
         )
         source_tensor_contract = {
             key: source_accounting[key]
             for key in tensor_contract_keys
             if source_accounting.get(key) is not None
         }
+        # All occurrences in one owner scope with this canonical value id
+        # are one SSA identity.  A dynamic descriptor on any occurrence is
+        # therefore the contract of the others too, even when the immediate
+        # transport source is a plain repository result with no tensor
+        # accounting of its own.  Leaving an unannotated sibling to the
+        # shape state's ``static`` default made successive occurrences post
+        # dynamic and static target states to the same transformation row.
+        # Carry only concordant sibling fields; disagreement remains visible
+        # to the ordinary settlement instead of being guessed away here.
+        sibling_accounting = tuple(
+            dict(occurrence.accounting or {})
+            for occurrence in occurrences_of(int(value_id), function)
+            if (occurrence.accounting or {}).get(
+                "tensor_metadata_state"
+            ) == "dynamic"
+        )
+        if (
+            sibling_accounting
+            and "tensor_metadata_state" not in source_tensor_contract
+        ):
+            source_tensor_contract["tensor_metadata_state"] = "dynamic"
+            for key in tensor_contract_keys:
+                if key in source_tensor_contract:
+                    continue
+                candidates = {
+                    accounting[key]
+                    for accounting in sibling_accounting
+                    if accounting.get(key) is not None
+                }
+                if len(candidates) == 1:
+                    source_tensor_contract[key] = candidates.pop()
+        # Distinct SSAValue objects may carry one canonical integer id.  A
+        # repository transport sometimes selects an unresolved occurrence as
+        # ``source`` even though another occurrence already owns the exact
+        # dtype.  That resolved sibling is not a competing inference: it is
+        # the same SSA identity.  Use its concordant dtype for this whole
+        # enrichment pass so a later occurrence cannot revise a proven
+        # float64 edge back to ``unknown``.
+        if source_dtype in {None, "unknown"}:
+            sibling_dtypes = {
+                str(occurrence.dtype)
+                for occurrence in occurrences_of(int(value_id), function)
+                if occurrence.dtype not in {None, "unknown"}
+            }
+            if len(sibling_dtypes) == 1:
+                source_dtype = sibling_dtypes.pop()
         fixed_constant = int(value_id) in constant_result_ids(function)
+        shape_transformation_records = []
         for value in occurrences_of(int(value_id), function):
             before = (tuple(value.shape or ()), value.dtype)
+            enrichment_cells = []
             # An occurrence that declares itself an exact view of this same
             # storage owns its shape.  Restamping it with the allocation
             # owner's shape silently rewrote ``b.reshape((-1, 1, 2))`` back
@@ -1454,11 +1555,13 @@ def propagate_repository_ssa_call_metadata(
                 ("canonical_identity_exact_writer",),
             }
             def _log(field: str, old: Any, new: Any) -> None:
-                _log_enrichment(
+                cell = _log_enrichment(
                     function, function_names_by_id.get(id(function), "?"),
                     int(value.id), field, old, new, authoritative,
                     int(source.id), fixed_point_round,
                 )
+                if cell is not None:
+                    enrichment_cells.append(cell)
 
             if retained_view and tuple(value.shape or ()) != declared_view_shape:
                 _log("shape", tuple(value.shape or ()), declared_view_shape)
@@ -1532,6 +1635,7 @@ def propagate_repository_ssa_call_metadata(
                 }
                 changed = True
             from .identity_concordance import (
+                PROVEN_SHAPE_PAGE,
                 SHAPE_STATE_PAGE,
                 record_shape_transformation,
                 shape_scope_of,
@@ -1560,40 +1664,68 @@ def propagate_repository_ssa_call_metadata(
                     sources=(source_value_cell,), book=book,
                 ) or target_value_cell
 
-            source_rank = int(source_accounting.get(
-                "program_abi_rank", len(source_shape),
-            ) or len(source_shape))
+            # ``source`` can itself be one of this canonical id's
+            # occurrences and may have been enriched above.  Publish from
+            # its live contract, not the snapshot taken on entry.
+            live_source_accounting = {
+                **dict(source.accounting or {}),
+                # When the transport source is a helper-function occurrence
+                # of this same canonical id, the owner scope's concordant
+                # dynamic contract still governs the shared identity.
+                **source_tensor_contract,
+            }
+            live_source_shape = tuple(source.shape or ())
+            live_source_dtype = (
+                source_dtype
+                if source_dtype not in {None, "unknown"}
+                else source.dtype
+            )
+            source_rank = int(live_source_accounting.get(
+                "program_abi_rank", len(live_source_shape),
+            ) or len(live_source_shape))
             target_shape = tuple(value.shape or ())
             target_accounting = dict(value.accounting or {})
             target_rank = int(target_accounting.get(
                 "program_abi_rank", len(target_shape),
             ) or len(target_shape))
-            record_shape_transformation(
-                shape_scope_of(
-                    function if source_function is None else source_function
+            # A lowered storage alias can deliberately retain a different
+            # view shape while carrying the allocation owner's integer id.
+            # Its semantic reshape edge was already published under the
+            # reshape result id; do not collapse that view into a conflicting
+            # self-edge on the storage id here.
+            if not _records_same_identity_shape_transport(
+                live_source_shape, target_shape, declared_view,
+            ):
+                continue
+            shape_transformation_records.append((
+                (
+                    shape_scope_of(
+                        function if source_function is None else source_function
+                    ),
+                    int(source.id),
+                    shape_scope_of(function),
+                    int(value.id),
                 ),
-                int(source.id),
-                shape_scope_of(function),
-                int(value.id),
-                stage=stage,
-                operation="ssa_metadata_transport",
-                source_state={
-                    "shape": source_shape,
-                    "dtype": str(source_dtype or "unknown"),
+                {
+                    "stage": stage,
+                    "operation": "ssa_metadata_transport",
+                    "source_state": {
+                    "shape": live_source_shape,
+                    "dtype": str(live_source_dtype or "unknown"),
                     "rank": source_rank,
-                    "metadata_state": str(source_accounting.get(
+                    "metadata_state": str(live_source_accounting.get(
                         "tensor_metadata_state", "static",
                     )),
                     **(
-                        {"sequence_row_shape": tuple(source_accounting[
+                        {"sequence_row_shape": tuple(live_source_accounting[
                             "sequence_row_shape"
                         ])}
-                        if source_accounting.get(
+                        if live_source_accounting.get(
                             "sequence_row_shape"
                         ) is not None else {}
                     ),
-                },
-                target_state={
+                    },
+                    "target_state": {
                     "shape": target_shape,
                     "dtype": str(value.dtype or "unknown"),
                     "rank": target_rank,
@@ -1608,11 +1740,11 @@ def propagate_repository_ssa_call_metadata(
                             "sequence_row_shape"
                         ) is not None else {}
                     ),
-                },
-                role="ssa_value",
+                    },
+                    "role": "ssa_value",
                 # The shape was read off the source value: the edge derives
                 # from that value's ``ssa_value`` cell in its own function.
-                source_cells=tuple(
+                    "source_cells": tuple(
                     cell for cell in (
                         source_value_cell,
                         # The target state was read off the target value:
@@ -1630,10 +1762,33 @@ def propagate_repository_ssa_call_metadata(
                                 int(source.id),
                             ),
                         ),
+                        # A later shape proof can refine an occurrence whose
+                        # ``ssa_value`` identity has not itself been revised
+                        # yet.  That proof is the exact cause of transporting
+                        # the newly visible extent.
+                        identity_book(module).latest_ref(
+                            PROVEN_SHAPE_PAGE, (
+                                shape_scope_of(function), int(value.id),
+                            ),
+                        ),
+                        # Accounting-only enrichment (notably a dynamic to
+                        # static tensor metadata transition) changes the
+                        # shape state without changing the SSA value's
+                        # display shape or dtype, so ``revise_ssa_value`` has
+                        # no row to revise.  The exact enrichment write is
+                        # the cause of this edge revision.
+                        *enrichment_cells,
                     )
                     if cell is not None
                 ),
-            )
+                },
+            ))
+        # One canonical id can have several SSAValue occurrences.  Settle
+        # all of them before publishing their common shape edge: otherwise
+        # an already-settled occurrence can revise the row before the later
+        # occurrence that actually changes has produced the causal receipt.
+        for arguments, keywords in shape_transformation_records:
+            record_shape_transformation(*arguments, **keywords)
         return changed
 
     def settle_specialized_formal_descriptor(
@@ -3003,7 +3158,9 @@ def lower_tensor_calls_to_repository_ssa(
             if len(extents) != 1:
                 return None
             return next(iter(extents))
-        _settle_operand_shapes(function, function.args)
+        _settle_operand_shapes(
+            function, function.args, owner_tensor_descriptor,
+        )
         function_argument_ids = {int(value.id) for value in function.args}
         unresolved_argument_ids = {
             int(value.id)
@@ -3367,9 +3524,13 @@ def lower_tensor_calls_to_repository_ssa(
                 # the opcode falls through to the scalar emitter, which writes
                 # element zero and leaves the rest of the buffer untouched.
                 # Take the settled fact for the identity before deciding.
-                _settle_operand_shapes(function, instruction.args)
+                _settle_operand_shapes(
+                    function, instruction.args, owner_tensor_descriptor,
+                )
                 if instruction.res is not None:
-                    _settle_operand_shapes(function, (instruction.res,))
+                    _settle_operand_shapes(
+                        function, (instruction.res,), owner_tensor_descriptor,
+                    )
                 candidate_only = bool(
                     instruction.attributes.get("tensor_candidate") is not None
                     and instruction.attributes.get("tensor_operation") is None
@@ -4392,9 +4553,13 @@ def lower_tensor_calls_to_repository_ssa(
                 # structure (shape, axis, dtype, keepdim, ...).  Dropping a
                 # constant first operand made calls such as
                 # ``broadcast_to(1.0, (m, n))`` appear to have no source.
-                _settle_operand_shapes(function, args)
+                _settle_operand_shapes(
+                    function, args, owner_tensor_descriptor,
+                )
                 if instruction.res is not None:
-                    _settle_operand_shapes(function, (instruction.res,))
+                    _settle_operand_shapes(
+                        function, (instruction.res,), owner_tensor_descriptor,
+                    )
                 data_positions = (
                     frozenset({0, 1, 2})
                     if operation == "where" else frozenset({0})
@@ -4782,14 +4947,15 @@ def lower_tensor_calls_to_repository_ssa(
                     and opcode_contract is not None
                     and opcode_contract[0] == "unary"
                 ):
-                    # ``unary_double`` is an elementwise authored kernel: its
-                    # output descriptor is identical to its data source.  A
-                    # stale cross-call hint must not turn that identity into
-                    # a fabricated broadcast (or size an internal frame for
-                    # a different model layer).
-                    result.shape = tuple(source.shape or ())
-                    if source.dtype is not None:
-                        result.dtype = source.dtype
+                    # ``unary_double`` is elementwise, so its output shape is
+                    # identical to its data source.  Its semantic dtype is
+                    # not necessarily identical: ``isfinite``/``isnan``/
+                    # ``isinf`` and ``logical_not`` produce Boolean values
+                    # in the repository's double-backed Boolean ABI.  Region
+                    # 19 of ``balloon_tire_managed_advance`` exposed the old
+                    # unconditional copy by changing its exact ``isfinite``
+                    # result from bool to float64 before call-edge settlement.
+                    _settle_unary_result_metadata(source, result)
                 if operation == "where" and len(data_args) == 3:
                     # Settle the broadcast contract before registering the
                     # result descriptor.  Registration owns allocation size;

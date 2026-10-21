@@ -1,5 +1,6 @@
 """Callsite shape facts follow authored identities into specialized graphs."""
 
+import ast
 from types import SimpleNamespace
 
 import networkx as nx
@@ -13,7 +14,14 @@ from src.compiler.glsl_deployment_strategy import (
     _tensor_descriptor,
 )
 from src.compiler.tensor_ssa_lowering import _settle_operand_shapes
+from src.compiler.concordance_declarations import (
+    CANONICAL_VALUE,
+    INGEST_SOURCE,
+    INGESTION,
+)
 from src.compiler.identity_concordance import (
+    Mode,
+    Novel,
     begin_identity_book,
     current_identity_book,
     end_identity_book,
@@ -41,6 +49,89 @@ def test_constant_array_descriptor_enters_the_value_concordance():
             "shape": (96,), "dtype": "float64", "rank": 1,
         }
         assert proven_shape_of(shape_scope_of(graph), 3) == (96,)
+    finally:
+        end_identity_book(token)
+
+
+def test_builtin_scalar_cast_declares_rank_zero_result_descriptor():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["function_name"] = "scalar_cast_result"
+    graph.G.add_node(
+        1, type="Input", op="input", value_id=1,
+        attributes={"binding_name": "value", "binding_kind": "parameter"},
+        parents=[], children=[],
+    )
+    graph.G.add_node(
+        2, type="float", op="float", value_id=2,
+        attributes={"extraction_identity": "builtins.float"},
+        parents=[(1, "arg:0")], children=[],
+    )
+    graph.G.add_node(
+        3, type="Constant", op="const", value_id=3, constant=1.0,
+        attributes={"value": 1.0}, parents=[], children=[],
+    )
+    graph.G.add_node(
+        4, type="min", op="min", value_id=4,
+        expr_obj=ast.parse("min(float(value), 1.0)", mode="eval").body,
+        attributes={"extraction_identity": "builtins.min"},
+        parents=[(2, "arg:0"), (3, "arg:1")], children=[],
+    )
+    graph.G.add_edge(1, 2)
+    graph.G.add_edges_from(((2, 4), (3, 4)))
+
+    _book, token = begin_identity_book()
+    try:
+        assert _tensor_descriptor(graph, 2) == {
+            "shape": (), "dtype": "float64", "rank": 0,
+        }
+        assert _tensor_descriptor(graph, 4) == {
+            "shape": (), "dtype": "float64", "rank": 0,
+        }
+    finally:
+        end_identity_book(token)
+
+
+def test_declared_scalar_record_field_is_a_rank_zero_descriptor():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["function_name"] = "scalar_record_field"
+    record = {
+        "identity": "example.Targets",
+        "fields": {
+            "limit": {
+                "storage": "scalar", "dtype": "float64", "rank": 0,
+            },
+        },
+    }
+    graph.G.graph["program_abi"] = {"records": {"Targets": record}}
+    graph.G.graph["parameter_record_abi"] = {"targets": record}
+    graph.G.add_node(
+        1, type="Input", op="input", value_id=1,
+        attributes={"binding_name": "targets", "binding_kind": "parameter"},
+        parents=[], children=[],
+    )
+    graph.G.add_node(
+        2, type="GetAttr", op="GetAttr", value_id=2,
+        expr_obj=ast.parse("targets.limit", mode="eval").body,
+        attributes={"attribute": "limit"},
+        parents=[(1, "value")], children=[],
+    )
+    graph.G.add_node(
+        3, type="Constant", op="const", value_id=3, constant=2.0,
+        attributes={"value": 2.0},
+        parents=[], children=[],
+    )
+    graph.G.add_node(
+        4, type="Div", op="Div", value_id=4,
+        expr_obj=ast.parse("measure / targets.limit", mode="eval").body,
+        attributes={}, parents=[(3, "lhs"), (2, "rhs")], children=[],
+    )
+    graph.G.add_edges_from(((1, 2), (3, 4), (2, 4)))
+
+    _book, token = begin_identity_book()
+    try:
+        expected = {"shape": (), "dtype": "float64", "rank": 0}
+        assert _tensor_descriptor(graph, 2) == expected
+        assert _tensor_descriptor(graph, 4) == expected
     finally:
         end_identity_book(token)
 
@@ -127,6 +218,66 @@ def test_specialized_graph_reads_authored_formal_shape_row():
         end_identity_book(token)
 
 
+def test_parametric_formal_shape_repeated_caller_is_not_a_new_mutation():
+    """A settled conflict changes only when a genuinely new callsite is read."""
+
+    _book, token = begin_identity_book()
+    try:
+        book = current_identity_book()
+        for value_id, name in enumerate(("first", "second", "third"), 1):
+            book.post(
+                CANONICAL_VALUE, (("callers", 0), value_id),
+                ("Input", "input", name),
+                stage=INGESTION,
+                provenance=Novel(INGEST_SOURCE, ()),
+                mode=Mode.CONCORD,
+            )
+        page = book.page("formal_shape")
+        first = book.latest_ref(
+            CANONICAL_VALUE, (("callers", 0), 1),
+        )
+        second = book.latest_ref(
+            CANONICAL_VALUE, (("callers", 0), 2),
+        )
+        third = book.latest_ref(
+            CANONICAL_VALUE, (("callers", 0), 3),
+        )
+
+        assert _publish_formal_shape(
+            "callee", "value",
+            {"shape": (2,), "dtype": "float64"}, "first",
+            (first,),
+        )
+        assert _publish_formal_shape(
+            "callee", "value",
+            {"shape": (3,), "dtype": "float64"}, "second",
+            (second,),
+        )
+        conflict_history_length = len(page.history(("callee", "value")))
+
+        assert not _publish_formal_shape(
+            "callee", "value",
+            {"shape": (3,), "dtype": "float64"}, "second",
+            (second,),
+        )
+        assert len(page.history(("callee", "value"))) == conflict_history_length
+
+        assert _publish_formal_shape(
+            "callee", "value",
+            {"shape": (4,), "dtype": "float64"}, "third",
+            (third,),
+        )
+        third_history_length = len(page.history(("callee", "value")))
+        assert not _publish_formal_shape(
+            "callee", "value",
+            {"shape": (2,), "dtype": "float64"}, "first",
+            (first,),
+        )
+        assert len(page.history(("callee", "value"))) == third_history_length
+    finally:
+        end_identity_book(token)
+
+
 def test_exact_polymorphic_shape_conflicts_at_current_concordance_depth():
     """A later exact specialization must not inherit a peer's deeper shape."""
 
@@ -165,6 +316,28 @@ def test_polymorphic_helper_keeps_exact_specialization_operand_shape():
         _settle_operand_shapes(column, (local,))
 
         assert local.shape == (2, 1)
+    finally:
+        end_identity_book(token)
+
+
+def test_region_operand_reads_later_unanimous_tensor_descriptor_shape():
+    """A captured tensor projection cannot remain scalar at its consumer."""
+
+    _book, token = begin_identity_book()
+    try:
+        operand = SSAValue(710, dtype="float64", shape=())
+        region = SimpleNamespace(
+            name="artifact__planned_region_267", blocks={}, metadata={},
+        )
+        descriptor = SimpleNamespace(shape=(144, 288))
+
+        _settle_operand_shapes(
+            region, (operand,), lambda value: (
+                descriptor if int(value.id) == 710 else None
+            ),
+        )
+
+        assert operand.shape == (144, 288)
     finally:
         end_identity_book(token)
 

@@ -31,25 +31,26 @@ def _record_covered_return_receipts(function: Any) -> tuple[dict[str, Any], ...]
     """The per-position receipts of a function whose ONE output is an
     aggregate of varying arity (RETURN_OUTPUT_ARMS), in position order.
 
-    ``optional_return_contracts`` is written per output and per position by
-    this pass; a function without it, or with positions that are not
-    ``0..N-1`` of one output, is not record-covered.
+    Read the aggregate expansion and each payload/presence relationship from
+    the owning book. The metadata receipts are diagnostics, not an alternate
+    source of arity, positions or payload types.
     """
 
-    receipts = tuple(
-        receipt for receipt in function.metadata.get(
-            "optional_return_contracts", ()
-        )
-        if receipt.get("return_output_id") is not None
-    )
-    if not receipts or len({r["return_output_id"] for r in receipts}) != 1:
+    from .structural_concordance import aggregate_return_layouts, optional_return_members
+
+    layouts = aggregate_return_layouts(function)
+    if len(layouts) != 1:
         return ()
-    ordered = tuple(sorted(receipts, key=lambda r: int(r["return_position"])))
-    if tuple(int(r["return_position"]) for r in ordered) != tuple(
-        range(len(ordered))
-    ):
+    output_id = next(iter(layouts))
+    members = optional_return_members(function, output_id)
+    if not members or (len(members) == 1 and members[0][0] == output_id):
         return ()
-    return ordered
+    return tuple({
+        "function": str(function.name), "return_output_id": output_id,
+        "return_position": position, "payload_value_id": payload_id,
+        "presence_value_id": presence_id, "dtype": payload.dtype,
+        "shape": payload.shape,
+    } for position, (payload_id, presence_id, payload) in enumerate(members))
 
 
 def _lower_record_covered_call(
@@ -247,8 +248,16 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
     from .concordance_declarations import (
         ADDRESS, CONTROL_CONST, OPTIONAL_AGGREGATE,
         OPTIONAL_INACTIVE_PAYLOAD, OPTIONAL_PRESENCE, RECORD_RETURN_REPAIR,
+        OPTIONAL_VALUE_STRUCTURE, STRUCTURAL_CONCORDANCE,
     )
-    from .ssa_record_return_state import mint_ssa_value
+    from .identity_concordance import current_identity_book, Derived, Mode
+    from .ssa_record_return_state import (
+        mint_ssa_value, function_scope_of, identity_cells, revise_ssa_value,
+    )
+    from .structural_concordance import (
+        aggregate_return_layouts, publish_aggregate_return_layout,
+        optional_structure,
+    )
 
     # Call-frame and returned-record reconciliation can replace an early
     # ProgramABI argument object with another occurrence of the same settled
@@ -523,10 +532,6 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                                 "ssa_optional_payload_id": int(instruction.res.id),
                             },
                         )
-                        instruction.args = payload_args
-                        instruction.res.dtype = dtype
-                        instruction.res.shape = shape
-                        instruction.res.device = device
                         instruction.res.accounting = {
                             **dict(instruction.res.accounting or {}),
                             "ssa_optional_payload": True,
@@ -546,6 +551,26 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         live_index = block.instrs.index(instruction)
                         block.instrs.insert(live_index + 1, presence_phi)
                         presence_by_payload[int(instruction.res.id)] = presence
+                        structure_book = current_identity_book()
+                        structure_scope = function_scope_of(function)
+                        revise_ssa_value(
+                            function, int(instruction.res.id), dtype=dtype, shape=shape,
+                            stage=STRUCTURAL_CONCORDANCE,
+                            sources=identity_cells(function, *payload_args, presence),
+                            book=structure_book,
+                        )
+                        structure_book.post(
+                            OPTIONAL_VALUE_STRUCTURE,
+                            (structure_scope, int(instruction.res.id)),
+                            (int(instruction.res.id), int(presence.id)),
+                            stage=STRUCTURAL_CONCORDANCE,
+                            provenance=Derived(identity_cells(function, instruction.res, presence)),
+                            mode=Mode.CONCORD,
+                        )
+                        instruction.args = payload_args
+                        instruction.res.dtype = dtype
+                        instruction.res.shape = shape
+                        instruction.res.device = device
                         receipt = {
                             "function": str(function_name),
                             "payload_value_id": int(instruction.res.id),
@@ -560,26 +585,7 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         }
                         receipts.append(receipt)
                         if is_return:
-                            for candidate_block in function.blocks.values():
-                                for terminator in candidate_block.instrs:
-                                    if terminator.op not in _RETURN_OPS:
-                                        continue
-                                    expanded = []
-                                    for value in terminator.args:
-                                        if (
-                                            value is instruction.res
-                                            or int(value.id)
-                                            == int(instruction.res.id)
-                                        ):
-                                            expanded.extend((
-                                                instruction.res, presence,
-                                            ))
-                                        else:
-                                            expanded.append(value)
-                                    terminator.args = expanded
-                            layouts = dict(function.metadata.get(
-                                "aggregate_return_layouts", (),
-                            ))
+                            layouts = aggregate_return_layouts(function)
                             if "return_arm_absent" in instruction.attributes:
                                 # A ``return_output_arms`` member Phi: the
                                 # semantic output's own layout entry names
@@ -625,9 +631,30 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                                     int(instruction.res.id), int(presence.id),
                                 )
                                 contracts[str(function_name)] = receipt
-                            function.metadata[
-                                "aggregate_return_layouts"
-                            ] = tuple(layouts.items())
+                            optional_cell = structure_book.current_ref(
+                                OPTIONAL_VALUE_STRUCTURE,
+                                (structure_scope, int(instruction.res.id)),
+                            )
+                            for output_id, layout in layouts.items():
+                                if int(instruction.res.id) in layout:
+                                    publish_aggregate_return_layout(
+                                        function, output_id, layout,
+                                        sources=(optional_cell,), stage=STRUCTURAL_CONCORDANCE,
+                                        book=structure_book,
+                                    )
+                            for candidate_block in function.blocks.values():
+                                for terminator in candidate_block.instrs:
+                                    if terminator.op not in _RETURN_OPS:
+                                        continue
+                                    terminator.args = [
+                                        item
+                                        for value in terminator.args
+                                        for item in (
+                                            (instruction.res, presence)
+                                            if int(value.id) == int(instruction.res.id)
+                                            else (value,)
+                                        )
+                                    ]
                         lowered_one = True
                         break
                 if lowered_one:
@@ -705,9 +732,20 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
             ))
             if callee_contract is None:
                 continue
+            callee = functions[str(producer.attributes.get("callee") or "")]
+            from .structural_concordance import function_optional_structure
+            from .ssa_record_return_state import publish_ssa_value_type
+
+            callee_structure, callee_cell = function_optional_structure(
+                callee, int(callee_contract["payload_value_id"]),
+            )
+            payload_structure = dict(callee_structure.children)["payload"]
             payload = returns[0].args[0]
-            payload.dtype = str(callee_contract["dtype"])
-            payload.shape = tuple(callee_contract["shape"])
+            publish_ssa_value_type(
+                function, payload, dtype=payload_structure.dtype,
+                shape=payload_structure.shape, stage=STRUCTURAL_CONCORDANCE,
+                sources=(callee_cell,),
+            )
             payload.accounting = {
                 **dict(payload.accounting or {}),
                 "ssa_optional_payload": True,
@@ -724,21 +762,26 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                     "ssa_optional_forwarded_return": True,
                 },
             )
+            structure_book = current_identity_book()
+            optional_cell = structure_book.post(
+                OPTIONAL_VALUE_STRUCTURE, (function_scope_of(function), payload_id),
+                (payload_id, int(presence.id)), stage=STRUCTURAL_CONCORDANCE,
+                provenance=Derived((callee_cell, *identity_cells(function, payload, presence))),
+                mode=Mode.CONCORD,
+            )
+            publish_aggregate_return_layout(
+                function, payload_id, (payload_id, int(presence.id)),
+                sources=(optional_cell,), stage=STRUCTURAL_CONCORDANCE,
+                book=structure_book,
+            )
             for ret in returns:
                 ret.args = [ret.args[0], presence]
-            layouts = dict(function.metadata.get(
-                "aggregate_return_layouts", (),
-            ))
-            layouts[payload_id] = (payload_id, int(presence.id))
-            function.metadata["aggregate_return_layouts"] = tuple(
-                layouts.items()
-            )
             receipt = {
                 "function": str(function_name),
                 "payload_value_id": payload_id,
                 "presence_value_id": int(presence.id),
-                "dtype": str(callee_contract["dtype"]),
-                "shape": tuple(callee_contract["shape"]),
+                "dtype": payload_structure.dtype,
+                "shape": payload_structure.shape,
                 "priority": "exact_forwarded_optional_return",
                 "tie_policy": "incumbent",
                 "forwarded_callee": str(

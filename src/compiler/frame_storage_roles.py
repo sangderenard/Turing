@@ -246,30 +246,56 @@ def _prune_dead_entry_field_aliases(
             for argument in function.args
             if (argument.accounting or {}).get("program_abi_field")
         }
-        from .identity_concordance import current_identity_book
+        from .concordance_declarations import (
+            ENTRY_RECORD_HANDLE, FRAME_BINDING,
+        )
+        from .frame_identity_book import (
+            _frame_cells, _frame_post, _frame_value_cell,
+        )
 
-        handle_page = current_identity_book().page(
-            "entry_record_handle_concordance"
-        )
-        removable.update(
-            int(value_id)
-            for name, value_id in function.metadata.get("parameter_names", ())
-            if str(name) in parameters_with_fields
-            and int(value_id) not in referenced | receipt_sources
-            and not any(
-                (argument.accounting or {}).get(key) not in {None, ""}
-                for argument in function.args
-                if int(argument.id) == int(value_id)
-                for key in (
-                    "program_abi_field", "program_abi_storage",
-                    "linked_call_frame_storage", "returned_record_storage",
-                    "compiler_frame_storage",
+        for name, value_id in function.metadata.get("parameter_names", ()):
+            if not (
+                str(name) in parameters_with_fields
+                and int(value_id) not in referenced | receipt_sources
+                and not any(
+                    (argument.accounting or {}).get(key) not in {None, ""}
+                    for argument in function.args
+                    if int(argument.id) == int(value_id)
+                    for key in (
+                        "program_abi_field", "program_abi_storage",
+                        "linked_call_frame_storage", "returned_record_storage",
+                        "compiler_frame_storage",
+                    )
                 )
+            ):
+                continue
+            # The aggregate handle is redundant only because the exact
+            # authored parameter and its declared field formals are resident
+            # together.  Publish that conclusion from those SSA identity
+            # cells.  Calling ``IdentityPage.concord`` here used the raw page
+            # writer and correctly began failing once the concordance latch
+            # was closed during final pruning.
+            decision_cells = _frame_cells(
+                _frame_value_cell(function, int(value_id)),
+                *(
+                    _frame_value_cell(function, int(argument.id))
+                    for argument in function.args
+                    if str((argument.accounting or {}).get(
+                        "program_abi_parameter"
+                    )) == str(name)
+                    and (argument.accounting or {}).get(
+                        "program_abi_field"
+                    ) is not None
+                ),
             )
-            and handle_page.concord(
-                (str(function_name), str(name)), "fields_only",
-            ) == "fields_only"
-        )
+            _frame_post(
+                ENTRY_RECORD_HANDLE,
+                (str(function_name), str(name)),
+                "fields_only",
+                stage=FRAME_BINDING,
+                cells=decision_cells,
+            )
+            removable.add(int(value_id))
         # A top-level function has no incoming call transaction to prune an
         # identity-call placeholder from its signature. Once that generated
         # formal is unreferenced, unauthored, and owns no declared storage, it

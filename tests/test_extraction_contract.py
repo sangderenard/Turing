@@ -56,6 +56,58 @@ def test_program_abi_table_row_retains_dynamic_span_rank():
     )
 
 
+def test_program_abi_table_row_keeps_nested_table_as_child_handle():
+    contract = ExtractionContract(CONTRACT).with_program_abi({
+        "records": {
+            "Instruction": {
+                "identity": "src.transmogrifier.ssa.Instr",
+                "fields": {
+                    "op": {"storage": "scalar", "dtype": "int64"},
+                    "args": {
+                        "storage": "table", "rank": 1,
+                        "row_record": "Value",
+                    },
+                },
+            },
+            "Value": {
+                "identity": "src.transmogrifier.ssa.SSAValue",
+                "fields": {
+                    "dtype": {"storage": "scalar", "dtype": "int64"},
+                },
+            },
+            "Block": {
+                "identity": "src.transmogrifier.ssa.BasicBlock",
+                "fields": {
+                    "instrs": {
+                        "storage": "table", "rank": 1,
+                        "row_record": "Instruction",
+                    },
+                },
+            },
+        },
+        "bindings": [],
+        "values": [],
+    })
+
+    instrs = contract.program_abi.records["Block"].fields["instrs"]
+    assert instrs.table_columns == (
+        {"name": "op", "dtype": "int64", "rank": 0},
+        {"name": "args", "dtype": "int64", "rank": 0},
+    )
+    assert instrs.row_record == "Instruction"
+    args = contract.program_abi.records["Instruction"].fields["args"]
+    assert args.row_record == "Value"
+    assert args.table_columns == (
+        {"name": "dtype", "dtype": "int64", "rank": 0},
+    )
+
+    round_trip = contract.with_program_abi(contract.program_abi.receipt())
+    assert (
+        round_trip.program_abi.records["Block"].fields["instrs"].table_columns
+        == instrs.table_columns
+    )
+
+
 def test_source_availability_is_probed_once_per_exact_definition(monkeypatch):
     import inspect
     contract = ExtractionContract(CONTRACT)

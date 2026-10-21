@@ -1,3 +1,87 @@
+2026-10-21 DETERMINISTIC OWNERSHIP/PUBLICATION REPAIR (UNVERIFIED):
+The 12:27 bootstrap receipts were diagnosed without compiling. Source repairs
+now transport accepted dependency proofs through digest-qualified IdentityBook
+edges, publish dictionary-truth and declared scalar ABI refinements at their
+producers, seed scalar settlement from concordance, and prohibit unresolved
+publications from erasing known types. Result typing no longer silently resolves
+incompatible equal-priority contracts by arrival order. Recursive records retain
+typed links; physical consumers still require materialized layouts. Optional
+and ordinary values share shape/storage-scoped reads. Both bootstrap and full
+validator/tire paths use these changes. No compiles or tests were run; this is
+NOT a pass or progress receipt. See the opening repair section in
+docs/compiler_convergence/32_structural_provenance_core_2026_10_21.md.
+
+2026-10-21 SOURCE-ONLY CONCORDANCE INTEGRATION (UNVERIFIED):
+The user prohibited further compilation/test runs and further process killing.
+Continue source work; do not use the older commands below as permission to run.
+Canonical compiler edits now publish aggregate return expansions on the book,
+read record/aggregate layouts through concordance, retain return-arm aggregate
+roots, publish forwarded optional pairs, and make emit_outputs a non-mutating
+reader of explicit returns. Result leases read copy-scoped shape facts; call
+result typing, linked projections, marker retention, final shape materialization,
+and declared-scalar normalization publish SSA_VALUE changes before applying them.
+These edits have NOT been executed. Earlier test counts do not validate them.
+Both full compilation outcomes remain unproved; the goal is NOT complete.
+The source-only continuation and remaining integration risks are recorded in
+docs/compiler_convergence/32_structural_provenance_core_2026_10_21.md.
+
+2026-10-21 STRUCTURAL PROVENANCE CORE (EARLIER RECEIPT, NOT GREEN):
+See docs/compiler_convergence/32_structural_provenance_core_2026_10_21.md.
+The user explicitly authorized three provenance-core additions before further
+paired compilation progress. The focused suite passes 157 tests; broader
+identity spill/compression/log tests have 46 passes and 9 failures. The second
+full bootstrap reports 12/337 admitted (11 compiled-unverified, 1 failed), but
+unit027 is falsely accepted: its optional two-member tuple exports only one
+member, dropping the second member and presence. Unit028 fails at a missing
+nested record descriptor in the new structural publication. The paired full
+managed tire fails earlier in the new transport check: Metrics.error_present
+is a declared span with producer shape (15,), but its leased SSA_VALUE still
+records (). This does NOT demonstrate that the earlier hard_failure conflict
+is repaired. The new core views remain incompletely integrated with producer
+authority; no additional compiler edits were made during the ordering study.
+Neither process has demonstrated correct progress. The goal is NOT complete.
+
+2026-10-21 BOOTSTRAP/TIRE ABI AND PREDICATE CONVERGENCE (EARLIER RECEIPT):
+See docs/compiler_convergence/31_bootstrap_tire_abi_predicate_frontiers_2026_10_21.md.
+Fresh dual-oracle runs now put the bootstrap at 23/330 admitted (22
+compiled-unverified, one partial, zero failed); unit 035
+`IdentityPage._virtual_fact` newly compiles. The managed tire lowers its
+396-region `balloon_tire_vector_step` repository with zero shortfalls. Repairs
+cover primitive-vs-record ABI identity, terminal-raise predicates, unary
+predicate dtype, collapsed storage views, late tensor-descriptor rereading,
+returned-record provenance, and serialized Windows progress publication. The
+bootstrap now stops on unit 034's real starred `Ref.row`/tuple-mapping gap. The
+returned-record descriptor writer, dead entry-record pruning, and call-table
+revision now carry exact source cells. A clean full tire rerun passes all
+three, lowers all 41 functions, and links the 396-region/369-function tire
+repository with zero shortfalls. It now stops later because
+`balloon_tire_managed_advance`'s authored `Metrics` aggregate is absent from
+its physical `Ret` while still present on its semantic output surface. Neither
+target compiles completely.
+
+2026-10-20 BOOTSTRAP/TIRE DUAL-ORACLE REPAIR (SUPERSEDED):
+See docs/compiler_convergence/30_bootstrap_tire_dual_oracle_2026_10_20.md.
+The bootstrap topology regression from an exact `Any` local is repaired, and
+fresh full receipts advance from 19 to 20 admitted units after two additional
+public-identity/aggregate-provenance repairs. The tire advances past duplicate
+`dt_min` parameter identity and list 243's copied-AST producer refusal. It now
+stops on a bool-to-float64 shape-transformation revision with no changed source;
+bootstrap unit 034 stops on a `CompilerSSAExtent` conditional arm changing its
+physical ABI. Neither target compiles completely. Continue by tracing the two
+physical-ABI writers; do not weaken the concordance refusals.
+
+2026-10-20 SSA RECORD ABI AND AGGREGATE QUERY FRONTIER:
+See docs/compiler_convergence/29_ssa_record_abi_and_aggregate_query_frontier_2026_10_20.md.
+The isolated real `_result_layout` bootstrap unit now has complete source
+regions, complete root parameter accounting, resident `any`, and canonical
+conditional aggregate member Phis. Program-ABI nested table fields are
+admitted as child handles. The remaining exact mechanisms are the missing
+`Instr.args -> SSAValue` child-pool correlation and full-row publication for
+`next(iter(layouts))`. The compiler now refuses the latter as
+`first-aggregate-row` instead of silently returning only column zero. The
+complete precompile-to-SSA file passes 134 tests. This is not a clean full
+bootstrap receipt; continue with the isolated unit before another census.
+
 2026-10-19 PROVENANCE CHECKPOINT AND CONTINUATION (CURRENT):
 See docs/compiler_convergence/20_provenance_bootstrap_continuation_2026_10_19.md.
 The user's fingerprint

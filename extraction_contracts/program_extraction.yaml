@@ -195,6 +195,33 @@ program_abi:
       fields:
         feeds: {storage: span, dtype: int64, rank: 1, mutable: false}
         steps: {storage: table, row_record: CompilerOpStep, rank: 1, mutable: false}
+    # Repository SSA inspected by compiler helpers.  Nested lists stay in the
+    # ordinary table/row-record ABI: the parent row carries an int64 child-row
+    # handle and the child table owns its columns and extent.
+    CompilerSSAFunction:
+      identity: src.transmogrifier.ssa.Function
+      fields:
+        blocks: {storage: keyed, dtype: int64, rank: 1, key_encoding: string_token, value_record: CompilerSSABasicBlock, mutable: false}
+    CompilerSSABasicBlock:
+      identity: src.transmogrifier.ssa.BasicBlock
+      fields:
+        instrs: {storage: table, row_record: CompilerSSAInstr, rank: 1, mutable: false}
+    CompilerSSAInstr:
+      identity: src.transmogrifier.ssa.Instr
+      fields:
+        # Opcode and dtype spellings remain admitted repository references;
+        # the contract does not invent a second opcode/type vocabulary.
+        op: {storage: reference, mutable: false}
+        args: {storage: table, row_record: CompilerSSAValue, rank: 1, mutable: false}
+    CompilerSSAValue:
+      identity: src.transmogrifier.ssa.SSAValue
+      fields:
+        dtype: {storage: reference, mutable: false}
+        shape: {storage: table, row_record: CompilerSSAExtent, rank: 1, mutable: false}
+    CompilerSSAExtent:
+      identity: builtins.int
+      fields:
+        value: {storage: scalar, dtype: int64, mutable: false}
   bindings:
     - {function: "*", parameter: state, record: SymbolicFluidGridState}
     - {function: "*", parameter: targets, record: Targets}
@@ -210,6 +237,7 @@ program_abi:
     - {function: _is_ast_metadata_node, parameter: graph, record: CompilerProcessGraph}
     - {function: _semantic_children, parameter: graph, record: CompilerProcessGraph}
     - {function: close_region_feed_set, parameter: program, record: CompilerFusedProgram}
+    - {function: _result_layout, parameter: function, record: CompilerSSAFunction}
   # Native scalar entry values have an explicit source-language type.  This
   # makes authored type-preserving guards deterministic during preprocessing;
   # the compiler does not guess whether a float64 slot is still a Python or

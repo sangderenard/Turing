@@ -121,6 +121,7 @@ from .concordance_declarations import (
     VALUE_TYPE_TAG,
     WHILE_CARRIED_TEST,
     WHILE_TEST_NO_READ_EXPRESSION,
+    EXECUTABLE_NODE,
     AliasFact,
     AliasKind,
     BindingKind,
@@ -1045,6 +1046,7 @@ class ResolvedSequenceSchema:
     nested_table: bool
     nested_tensor: bool = False
     nested_value_dtype: str | None = None
+    value_column_count: int = 1
 
 
 def resolve_sequence_schemas(
@@ -1063,6 +1065,7 @@ def resolve_sequence_schemas(
     Missing keys default to ``()``, so callers may pass only what they have.
     """
     column_counts: dict[int, int] = {}
+    value_column_counts: dict[int, int] = {}
     policies: dict[int, str] = {}
     origins: dict[int, str] = {}
     writable_union: dict[int, bool] = {}
@@ -1078,10 +1081,13 @@ def resolve_sequence_schemas(
         policy: object,
         writable: object,
         origin: object,
+        value_column_count: int = 1,
     ) -> None:
         sid = int(sequence_id)
         if sid in column_counts and (
-            column_counts[sid] != int(column_count) or policies[sid] != str(policy)
+            column_counts[sid] != int(column_count)
+            or policies[sid] != str(policy)
+            or value_column_counts[sid] != int(value_column_count)
         ):
             if sid not in conflicted:
                 shortfalls.append(SSALoweringShortfall(
@@ -1091,11 +1097,12 @@ def resolve_sequence_schemas(
                     f"in {origins[sid]} and "
                     f"{int(column_count)} column(s)/policy {str(policy)!r} "
                     f"in {str(origin)} -- every function touching a shared "
-                    "sequence must agree on its shape",
+                    "sequence must agree on its shape and value-column width",
                 ))
                 conflicted.add(sid)
             return
         column_counts[sid] = int(column_count)
+        value_column_counts[sid] = int(value_column_count)
         policies[sid] = str(policy)
         origins[sid] = str(origin)
         writable_union[sid] = writable_union.get(sid, False) or bool(writable)
@@ -1120,7 +1127,12 @@ def resolve_sequence_schemas(
         ):
             names = tuple(sequence_names.get(int(sequence_id), ()))
             origin = f"{function_name}{names!r}"
-            _observe(sequence_id, column_count, policy, writable, origin)
+            _observe(
+                sequence_id, column_count, policy, writable, origin,
+                int(dict(shell.get("sequence_value_column_counts") or {}).get(
+                    int(sequence_id), 1
+                )),
+            )
             sid = int(sequence_id)
             retains_union[sid] = retains_union.get(sid, False) or sid in deletion_ids
             nested_union[sid] = nested_union.get(sid, False) or sid in nested_ids
@@ -1161,6 +1173,7 @@ def resolve_sequence_schemas(
             retains_deleted_rows=retains_union.get(sid, False),
             nested_table=nested_union.get(sid, False),
             nested_tensor=nested_tensor_union.get(sid, False),
+            value_column_count=value_column_counts[sid],
         )
         for sid in column_counts
         if sid not in conflicted
@@ -1591,6 +1604,15 @@ def _post_planned_region_identities(
             )
     if not isinstance(signature_cell, Ref):
         return
+    # Source ABI publication precedes consumers of these captures. This is
+    # shared by bootstrap regions and the managed validator/tire regions.
+    from .ssa_record_return_state import publish_declared_scalar_abi
+
+    for value in function.args:
+        publish_declared_scalar_abi(
+            function, value, graph_cell(int(value.id)),
+            stage=CONTROL_SSA_REGION, book=book,
+        )
     for label in function.blocks:
         book.post(
             SSA_BLOCK, (scope, str(function.name), str(label)),
@@ -1660,6 +1682,8 @@ class _ControlSSABuilder(TiledObject):
         region_value_ranks: Mapping[int, int] | None = None,
         tensor_shape_concordance_scope: str | None = None,
         lexical_read_scope: Any = None,
+        planning_scope: Any = None,
+        source_value_descriptions: Mapping[int, Mapping[str, Any]] | None = None,
         shape_scope: Any = None,
         plan_callsite_bindings: Mapping[
             int, tuple[tuple[int, ...], tuple[int, ...]]
@@ -1667,6 +1691,7 @@ class _ControlSSABuilder(TiledObject):
         value_aliases: Mapping[int, int] | None = None,
         inout_value_ids: tuple[int, ...] = (),
         constant_value_ids: tuple[int, ...] = (),
+        none_value_ids: tuple[int, ...] = (),
         output_value_ids: tuple[int, ...] = (),
         named_output_histories: Mapping[str, tuple[int, ...]] | None = None,
         value_name_histories: Mapping[str, tuple[int, ...]] | None = None,
@@ -1675,6 +1700,9 @@ class _ControlSSABuilder(TiledObject):
         sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
         sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
         sequence_record_identities: Mapping[int, str] | None = None,
+        sequence_child_table_layouts: Mapping[
+            int, tuple[int, tuple[str, ...], tuple[int, ...], bool]
+        ] | None = None,
         sequence_row_record_slots: Mapping[
             int, tuple[tuple[int, str, int], ...]
         ] | None = None,
@@ -1757,6 +1785,12 @@ class _ControlSSABuilder(TiledObject):
         self.lexical_read_scope = (
             None if lexical_read_scope is None else tuple(lexical_read_scope)
         )
+        self.planning_scope = planning_scope
+        self.source_value_descriptions = {
+            int(value_id): dict(description)
+            for value_id, description in (source_value_descriptions or {}).items()
+        }
+        self.source_execution_receipts: dict[int, dict[str, Any]] = {}
         #: The shape scope of the graph COPY this function is lowered from
         #: (``identity_concordance.shape_scope_of``): the key every proven
         #: shape this lowering reads is held under.
@@ -1798,6 +1832,11 @@ class _ControlSSABuilder(TiledObject):
         # ``_materialize_control_constants`` from the provisional argument
         # ``external_value`` mints, never invented as an ABI input.
         self.constant_value_ids = set(map(int, constant_value_ids))
+        # Exact authored ``None`` literals, retained separately from the
+        # other control-owned constants.  Return-frame normalization must
+        # distinguish an absent aggregate/sequence arm from an arbitrary
+        # one-slot value without guessing from an SSA dtype.
+        self.none_value_ids = set(map(int, none_value_ids))
         self.output_value_ids = tuple(map(int, output_value_ids))
         self.resource_scopes: list[tuple[ResourceScopeBlock, int]] = []
         # (block, per-slot values) for every source ``return`` lowered below
@@ -1951,6 +1990,15 @@ class _ControlSSABuilder(TiledObject):
                 sequence_record_identities or {}
             ).items()
         }
+        self.sequence_child_table_layouts = {
+            int(sequence_id): (
+                int(layout[0]), tuple(map(str, layout[1])),
+                tuple(map(int, layout[2])), bool(layout[3]),
+            )
+            for sequence_id, layout in (
+                sequence_child_table_layouts or {}
+            ).items()
+        }
         # Record-typed columns of fixed-width rows: (authored column,
         # identity, physical width) per resident sequence.
         self.sequence_row_record_slots = {
@@ -1973,6 +2021,11 @@ class _ControlSSABuilder(TiledObject):
         # payload storage remains in the incumbent sequence descriptor.
         # Entries are installed only from SOURCE_OPTIONAL_GLYPH_CARRY cells.
         self.optional_glyph_presence_by_value: dict[int, SSAValue] = {}
+        # ProgramABI optional scalar fields are a typed payload plus one
+        # Boolean presence cell.  Control IR carries their exact relation so
+        # a later union join can construct its semantic tag without treating
+        # the inactive numeric filler as a Python object.
+        self.optional_scalar_presence_by_payload: dict[int, SSAValue] = {}
         self.native_object_context = native_object_context
         self.native_object_module = native_object_module
         self.native_object_constructor_receipts = []
@@ -2070,6 +2123,9 @@ class _ControlSSABuilder(TiledObject):
         self.nested_child_rows: dict[
             tuple[str, int, int],
             tuple[SSAValue, SSAValue, SSAValue, SSAValue],
+        ] = {}
+        self.nested_row_selections: dict[
+            int, tuple[SSAValue, SSAValue]
         ] = {}
         self.nested_iterable_targets = {
             int(iterable_id): int(target_id)
@@ -3379,12 +3435,32 @@ class _ControlSSABuilder(TiledObject):
         )
         contract_cell = self._sequence_contract_cell(int(sequence_id))
         query_values = self._table_query_values(query_id, descriptor)
+        value_columns = tuple(
+            column
+            for column in range(len(descriptor.column_value_ids))
+            if column not in descriptor.key_columns
+        )
+        aggregate_member_ids = self._structural_return_members(int(result_id)) or ()
+        if len(value_columns) > 1 and (
+            len(aggregate_member_ids) != len(value_columns)
+        ):
+            raise ValueError(
+                "multi-column mapping lookup has no exact aggregate member "
+                f"layout: result={int(result_id)}, "
+                f"value_columns={value_columns!r}, "
+                f"members={aggregate_member_ids!r}"
+            )
         result = (
             self.fresh_value(
                 dtype="int", transform=TABLE_LOOKUP,
                 operands=(contract_cell, *query_values),
             )
             if tensor_child
+            else self.fresh_value(
+                dtype="ssa.aggregate", transform=TABLE_LOOKUP,
+                operands=(contract_cell, *query_values),
+            )
+            if len(value_columns) > 1
             else SSAValue(
                 int(result_id),
                 dtype=("int" if pool is not None
@@ -3399,7 +3475,7 @@ class _ControlSSABuilder(TiledObject):
                        ]),
             )
         )
-        if not tensor_child:
+        if not tensor_child and len(value_columns) == 1:
             self._bind(
                 int(result_id), result, BindingKind.SEQUENCE_RESULT,
                 contract_cell, *query_values,
@@ -3424,6 +3500,19 @@ class _ControlSSABuilder(TiledObject):
                 attributes={"value": default_literal},
             )
             default_operands = (default_value,)
+        call_attributes = {
+            "callee": helper_name,
+            "source_linked": True,
+            "ssa_sequence_operation": "lookup",
+            "sequence_id": int(sequence_id),
+            "ssa_lookup_ownership": str(ownership),
+            "ssa_lookup_owner_ids": tuple(map(int, owner_ids)),
+        }
+        if len(value_columns) > 1:
+            call_attributes.update({
+                "output_ids": aggregate_member_ids,
+                "result_convention": "ssa.aggregate",
+            })
         self.emit(
             Handler.Call,
             [
@@ -3433,15 +3522,25 @@ class _ControlSSABuilder(TiledObject):
                 *default_operands,
             ],
             result,
-            attributes={
-                "callee": helper_name,
-                "source_linked": True,
-                "ssa_sequence_operation": "lookup",
-                "sequence_id": int(sequence_id),
-                "ssa_lookup_ownership": str(ownership),
-                "ssa_lookup_owner_ids": tuple(map(int, owner_ids)),
-            },
+            attributes=call_attributes,
         )
+        if len(value_columns) > 1:
+            self._bind(
+                int(result_id), result, BindingKind.SEQUENCE_RESULT,
+                contract_cell, *query_values,
+            )
+            for output_index, member_id in enumerate(aggregate_member_ids):
+                self.indexed_load(
+                    result,
+                    self.constant_value(output_index, result),
+                    int(member_id),
+                    attributes={
+                        "aggregate_index": int(output_index),
+                        "source_output_id": int(member_id),
+                        "mapping_lookup_projection": True,
+                    },
+                    claim_provisional_definition=True,
+                )
         if pool is not None:
             self.child_table_selections[int(result_id)] = (
                 pool, result
@@ -3623,6 +3722,23 @@ class _ControlSSABuilder(TiledObject):
             for column in range(len(descriptor.column_value_ids))
             if column not in descriptor.key_columns
         )
+        stored_values = (stored_value,)
+        if len(value_columns) > 1:
+            member_ids = tuple(map(
+                int,
+                self.source_value_descriptions.get(
+                    int(value_id), {}
+                ).get("aggregate_leaf_value_ids", ()),
+            ))
+            if len(member_ids) != len(value_columns):
+                raise ValueError(
+                    "multi-column mapping store has no exact aggregate member "
+                    f"layout: value={int(value_id)}, "
+                    f"value_columns={value_columns!r}, members={member_ids!r}"
+                )
+            stored_values = tuple(
+                self.external_value(member_id) for member_id in member_ids
+            )
         if tag_columns:
             if len(value_columns) != 1 or set(tag_columns) != {
                 int(value_columns[0])
@@ -3729,7 +3845,7 @@ class _ControlSSABuilder(TiledObject):
             return
         actual_dtypes = tuple(
             str(_canonical_sequence_dtype(value.dtype) or "unknown")
-            for value in (*query_values, stored_value)
+            for value in (*query_values, *stored_values)
         )
         if len(actual_dtypes) == len(descriptor.column_dtypes):
             concorded_dtypes = concord_sequence_row_dtypes(
@@ -3739,7 +3855,7 @@ class _ControlSSABuilder(TiledObject):
                 sources=self._cells(
                     self._sequence_contract_cell(int(sequence_id)),
                     *query_values,
-                    stored_value,
+                    *stored_values,
                     *self.sequence_storage_values.get(
                         int(sequence_id), ()
                     ),
@@ -3774,7 +3890,7 @@ class _ControlSSABuilder(TiledObject):
                 *self.sequence_storage_values[int(sequence_id)],
                 self.sequence_status_values[int(sequence_id)],
                 *query_values,
-                stored_value,
+                *stored_values,
             ],
             None,
             attributes={
@@ -4747,6 +4863,27 @@ class _ControlSSABuilder(TiledObject):
         value = self.external_values.get(value_id)
         if value is None:
             value = self._value_from_meta(value_id, dtype=dtype)
+            description = self.source_value_descriptions.get(value_id)
+            if description is not None:
+                receipt = dict(description)
+                node_id = int(receipt.get("node_id", value_id))
+                fact = None
+                if self.planning_scope is not None:
+                    page = self._book().pages.get(EXECUTABLE_NODE.name)
+                    if page is not None:
+                        fact = page.cell(
+                            (self.planning_scope, node_id), 0, None,
+                        )
+                receipt["planner_verdict"] = (
+                    "absent" if fact is None else str(fact.kind.value)
+                )
+                if fact is not None:
+                    receipt["planner_rule"] = str(fact.rule.value)
+                self.source_execution_receipts[value_id] = dict(receipt)
+                value.accounting = {
+                    **dict(value.accounting or {}),
+                    "source_execution_receipt": receipt,
+                }
             # PROVISIONAL_ARGUMENT: a value minted from absence -- no region
             # has published the id yet -- is recorded as unresolved; the
             # producer's later claim is the revision that resolves it.
@@ -5167,6 +5304,37 @@ class _ControlSSABuilder(TiledObject):
             if isinstance(fact, Mapping)
             else getattr(fact, "tags", ())
         )
+        material_arms = tuple(
+            arm for arm in physical if str(arm.storage) != "none"
+        )
+        shared_payload = bool(material_arms) and len({
+            (
+                str(arm.storage), str(arm.dtype),
+                tuple(arm.shape or ()), int(arm.rank),
+                tuple(arm.storage_identity or ()),
+            )
+            for arm in material_arms
+        }) == 1 and all(
+            str(arm.storage) not in {"sequence", "record"}
+            for arm in material_arms
+        )
+        storage = self.sequence_storage_values.get(int(iterable_id))
+        if shared_payload and (
+            storage is None
+            or not 0 <= int(column_projection) < len(storage)
+        ):
+            # The union record describes the semantic alternatives, but it
+            # does not create the iterable's physical payload arena.  A
+            # mapping/iterator consumer must read that producer-owned arena;
+            # manufacturing a column here would sever its storage identity.
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", "missing-union-payload-column",
+                self.function_name,
+                f"projected union value {int(target_id)} reads column "
+                f"{int(column_projection)} of iterable {int(iterable_id)}, "
+                "which has no published resident sequence payload",
+            ))
+            return None
         key = (int(iterable_id), int(column_projection))
         source = self.variant_type_tag_columns.get(key)
         if source is None:
@@ -5193,25 +5361,9 @@ class _ControlSSABuilder(TiledObject):
             self.arguments.append(source)
             self.variant_type_tag_columns[key] = source
             payload_columns = {}
-            material_arms = tuple(
-                arm for arm in physical if str(arm.storage) != "none"
-            )
-            shared_payload = bool(material_arms) and len({
-                (
-                    str(arm.storage), str(arm.dtype),
-                    tuple(arm.shape or ()), int(arm.rank),
-                    tuple(arm.storage_identity or ()),
-                )
-                for arm in material_arms
-            }) == 1 and all(
-                str(arm.storage) not in {"sequence", "record"}
-                for arm in material_arms
-            )
             shared_column = None
             if shared_payload:
-                shared_column = self.sequence_storage_values[
-                    int(iterable_id)
-                ][int(column_projection)]
+                shared_column = storage[int(column_projection)]
             for arm in physical:
                 identity = str(arm.identity)
                 storage = str(arm.storage)
@@ -5748,6 +5900,32 @@ class _ControlSSABuilder(TiledObject):
         )
         if shared_payload:
             arm = material_arms[0]
+            material_identities = {
+                str(candidate.identity) for candidate in material_arms
+            }
+            if source_alternatives and not (
+                material_identities & set(map(str, source_alternatives))
+            ):
+                # A shared union frame still owns one fixed-width payload
+                # slot when the selected semantic arm is storage-free (most
+                # commonly ``None``).  The companion tag makes that slot
+                # inactive, but the slot itself must retain the declared ABI
+                # so callers and callees agree on one physical frame.
+                inactive = self.fresh_value(
+                    dtype=str(arm.dtype or "unknown"),
+                    shape=tuple(arm.shape or ()),
+                    transform=CONTROL_CONST,
+                    operands=(self._canonical_cell(int(value_id)),),
+                )
+                self.emit(
+                    Handler.Const, [], inactive,
+                    attributes={
+                        "value": 0,
+                        "native_value_union_inactive_shared_payload": True,
+                        "native_value_union_source_id": int(value_id),
+                    },
+                )
+                return (inactive,)
             if (
                 str(value.dtype or "unknown")
                 != str(arm.dtype or "unknown")
@@ -5917,7 +6095,10 @@ class _ControlSSABuilder(TiledObject):
                 attributes=handle_attributes,
             )
         child = self._nested_child_storage(child_key, target_id)
-        child_data, _child_lengths, sequence_stride, row_stride = child
+        child_data, child_lengths, sequence_stride, row_stride = child
+        self.nested_row_selections[int(target_id)] = (
+            child_lengths, handle,
+        )
         row_index = induction
         if selected_sequence:
             sequence_offset = self.fresh_value(
@@ -5952,7 +6133,15 @@ class _ControlSSABuilder(TiledObject):
             dtype=str(child_data.dtype or "unknown"),
             transform=ROW_COLUMN_PROJECTION, operands=(child_data, offset),
         )
-        row_base.accounting["source_value_id"] = int(target_id)
+        row_base.accounting.update({
+            "source_value_id": int(target_id),
+            # The selected child row is an addressable one-dimensional span,
+            # even when its extent is dynamic and therefore absent from
+            # ``shape``.  Region-call construction reads this exact physical
+            # rank; without it the callee formal was published as a scalar
+            # while its first operation was GetElementPtr.
+            "ssa_call_rank": 1,
+        })
         self.emit(
             Handler.Mul,
             [row_index if selected_sequence else handle, row_stride],
@@ -6505,6 +6694,22 @@ class _ControlSSABuilder(TiledObject):
         return self._book().latest_ref(CANONICAL_VALUE, row) or (
             self._book().latest_ref(INGESTION_VALUE, row)
         )
+
+    def _structural_return_members(self, value_id: int) -> tuple[int, ...] | None:
+        """Read recursive tuple positions from their live concordance view."""
+        from .concordance_declarations import SOURCE_AGGREGATE_LAYOUT
+        from .structural_concordance import source_structure
+
+        if self.lexical_read_scope is None:
+            return None
+        book = self._book()
+        row = (self.lexical_read_scope, int(value_id))
+        if book.latest_ref(SOURCE_AGGREGATE_LAYOUT, row) is None:
+            return None
+        structure, _cell = source_structure(*row, book=book)
+        if structure.kind != "product" or structure.storage != "tuple":
+            return None
+        return tuple(leaf.value_id for _path, leaf in structure.leaves())
 
     def _declared_cell(self, page_name: str, row: tuple) -> Ref | None:
         """Read-side lookup of a cell on a page another lane declares
@@ -7317,11 +7522,8 @@ class _ControlSSABuilder(TiledObject):
 
         book = self._book()
         return tuple(
-            cell for cell in (
-                book.latest_ref(SSA_VALUE, (self._scope(), int(value_id)))
-                for value_id in value_ids
-            )
-            if cell is not None
+            book.latest_ref(SSA_VALUE, (self._scope(), int(value_id)))
+            for value_id in value_ids
         )
 
     def _loop_scope_rebinds(self, loop: Any, carried: Any) -> tuple:
@@ -8472,24 +8674,6 @@ class _ControlSSABuilder(TiledObject):
             ):
                 seen_aliases.add(resident_id)
                 resident_id = int(self.value_aliases[resident_id])
-            resident = self.sequence_descriptors.get(resident_id)
-            if resident is not None:
-                length_cell = self.sequence_storage_values[resident_id][
-                    len(resident.column_value_ids)
-                ]
-                extent = self.fresh_value(
-                    dtype="int64", transform=LOAD,
-                    operands=(length_cell, iterable_id),
-                )
-                self.emit(
-                    Handler.Load, [length_cell], extent,
-                    attributes={
-                        "binding": "resident_iterable_length",
-                        "sequence_id": int(resident_id),
-                        "source_value_id": iterable_id,
-                    },
-                )
-                return extent
             child_selection = self.child_table_selections.get(iterable_id)
             if child_selection is not None:
                 pool, handle = child_selection
@@ -8510,6 +8694,24 @@ class _ControlSSABuilder(TiledObject):
                 self.emit(
                     Handler.Load, [length_address], extent,
                     attributes={"binding": "child_table_length"},
+                )
+                return extent
+            resident = self.sequence_descriptors.get(resident_id)
+            if resident is not None:
+                length_cell = self.sequence_storage_values[resident_id][
+                    len(resident.column_value_ids)
+                ]
+                extent = self.fresh_value(
+                    dtype="int64", transform=LOAD,
+                    operands=(length_cell, iterable_id),
+                )
+                self.emit(
+                    Handler.Load, [length_cell], extent,
+                    attributes={
+                        "binding": "resident_iterable_length",
+                        "sequence_id": int(resident_id),
+                        "source_value_id": iterable_id,
+                    },
                 )
                 return extent
             nested_target_id = self.nested_iterable_targets.get(iterable_id)
@@ -8783,6 +8985,10 @@ class _ControlSSABuilder(TiledObject):
                 ),
                 "physical_dtype_tie_policy": "incumbent",
             }
+            if expression.optional_payload_value_id is not None:
+                self.optional_scalar_presence_by_payload[
+                    int(expression.optional_payload_value_id)
+                ] = value
             return value
         if expression.op == "native_type_identity":
             if expression.value_id is None:
@@ -9220,10 +9426,32 @@ class _ControlSSABuilder(TiledObject):
                         f"external_values[chain_end]={None if self.external_values.get(current) is None else int(self.external_values[current].id)}",
                         file=sys.stderr,
                     )
-            edge_values = tuple(
-                None if slot is None else self.external_value(int(slot))
-                for slot in block.return_value_ids
-            )
+            # Fixed tuples are already authored as ordered scalar identities
+            # by SOURCE_AGGREGATE_LAYOUT.  Carry those identities across the
+            # return edge instead of collapsing them back into the tuple's
+            # conceptual handle.  This is especially important for an
+            # optional tuple: the existing return merge can then pair each
+            # authored member with its presence bit, rather than publishing
+            # ``(aggregate_handle, presence)`` as though the handle were a
+            # physical scalar result.
+            edge_values_list: list[SSAValue | None] = []
+            edge_source_value_ids: list[int | None] = []
+            for slot in block.return_value_ids:
+                members = None if slot is None else self._structural_return_members(int(slot))
+                if members is not None:
+                    edge_values_list.extend(
+                        self.external_value(member) for member in members
+                    )
+                    edge_source_value_ids.extend(members)
+                else:
+                    edge_values_list.append(
+                        None if slot is None
+                        else self.external_value(int(slot))
+                    )
+                    edge_source_value_ids.append(
+                        None if slot is None else int(slot)
+                    )
+            edge_values = tuple(edge_values_list)
             exit_block = self.function_exit_block()
             if block.predicate_value_id is None and (
                 block.predicate_expression is None
@@ -9232,7 +9460,7 @@ class _ControlSSABuilder(TiledObject):
                 self.function_return_edges.append((self.current, edge_values))
                 self.branch(exit_block)
                 self.current.instrs[-1].attributes["source_control"] = "return"
-                self.current.instrs[-1].attributes["return_source_value_ids"] = tuple(block.return_value_ids)
+                self.current.instrs[-1].attributes["return_source_value_ids"] = tuple(edge_source_value_ids)
                 if block.return_site_cell is not None:
                     # The edge names its own return SITE (the construct's
                     # cell), not only the values it carries.
@@ -9260,7 +9488,7 @@ class _ControlSSABuilder(TiledObject):
                 self._emit_resource_cleanup("return", path)
                 self.function_return_edges.append((self.current, edge_values))
                 self.branch(exit_block)
-                self.current.instrs[-1].attributes["return_source_value_ids"] = tuple(block.return_value_ids)
+                self.current.instrs[-1].attributes["return_source_value_ids"] = tuple(edge_source_value_ids)
                 if block.return_site_cell is not None:
                     self.current.instrs[-1].attributes["return_site_cell"] = block.return_site_cell
                 self.current = fallthrough
@@ -9719,6 +9947,9 @@ class _ControlSSABuilder(TiledObject):
         column_dtypes = tuple(column_dtypes or ())
         column_shapes = tuple(column_shapes or ())
         resolved = self.resolved_sequence_schemas.get(value_id)
+        declared_child_layout = self.sequence_child_table_layouts.get(value_id)
+        if declared_child_layout is not None:
+            nested_table = True
         existing = self.sequence_descriptors.get(value_id)
         if column_count is None:
             column_count = (
@@ -9752,8 +9983,11 @@ class _ControlSSABuilder(TiledObject):
             nested_table = bool(nested_table or resolved.nested_table)
             nested_tensor = bool(nested_tensor or resolved.nested_tensor)
             nested_value_dtype = nested_value_dtype or resolved.nested_value_dtype
+        value_column_count = (
+            int(resolved.value_column_count) if resolved is not None else 1
+        )
         key_columns = (
-            tuple(range(max(1, int(column_count) - 1)))
+            tuple(range(max(1, int(column_count) - value_column_count)))
             if policy == "unique" else ()
         )
         def _canonicalize_column(raw_dtype: str | None, column: int) -> str | None:
@@ -9902,11 +10136,16 @@ class _ControlSSABuilder(TiledObject):
         # Every storage cell of the descriptor descends from the data arena
         # (the authored sequence's value) and its contract cell.
         descriptor_operands = (data, self._sequence_contract_cell(int(value_id)))
+        handle_column = (
+            int(declared_child_layout[0])
+            if declared_child_layout is not None else
+            1
+        )
         extra_columns = tuple(
             self.fresh_value(dtype=_canonicalize_column(
                 (
                     "int64"
-                    if nested_table and index == int(column_count) - 2
+                    if nested_table and index + 1 == handle_column
                     else concorded_column_dtypes[index + 1]
                 ),
                 index + 1,
@@ -9958,15 +10197,25 @@ class _ControlSSABuilder(TiledObject):
         child_table_pool = None
         child_pool_values: tuple[SSAValue, ...] = ()
         if nested_table:
-            child_keys = (
-                None
-                if nested_tensor
-                else storage_cell("unknown")
+            if declared_child_layout is None:
+                child_column_dtypes = (
+                    (nested_value_dtype or "unknown",)
+                    if nested_tensor else
+                    ("unknown", nested_value_dtype or "unknown")
+                )
+                child_key_columns = (() if nested_tensor else (0,))
+                child_writable = bool(writable)
+            else:
+                (
+                    handle_column, child_column_dtypes,
+                    child_key_columns, child_writable,
+                ) = declared_child_layout
+            child_columns = tuple(
+                storage_cell(dtype) for dtype in child_column_dtypes
             )
-            child_values = storage_cell(nested_value_dtype or "unknown")
-            child_lengths = storage_cell("int")
-            child_capacity = storage_cell("int")
-            child_stride = storage_cell("int")
+            child_lengths = storage_cell("int64")
+            child_capacity = storage_cell("int64")
+            child_stride = storage_cell("int64")
             child_shapes = (
                 storage_cell("int32") if nested_tensor else None
             )
@@ -9976,18 +10225,18 @@ class _ControlSSABuilder(TiledObject):
             child_shape_stride = (
                 storage_cell("int64") if nested_tensor else None
             )
-            child_status = storage_cell("int")
-            child_live = storage_cell("bool")
-            child_columns = (
-                (child_values,) if child_keys is None
-                else (child_keys, child_values)
+            child_status = (
+                storage_cell("int") if child_writable else None
+            )
+            child_live = (
+                storage_cell("bool") if child_writable else None
             )
             child_pool_values = (
                 *child_columns, child_lengths, child_capacity,
                 child_stride,
                 *((child_shapes, child_ranks, child_shape_stride)
                   if nested_tensor else ()),
-                child_status, child_live,
+                *((child_status, child_live) if child_writable else ()),
             )
             for member, pool_value in enumerate(child_pool_values):
                 pool_value.accounting = {
@@ -10007,7 +10256,7 @@ class _ControlSSABuilder(TiledObject):
                     BindingKind.SEQUENCE_RESULT, *descriptor_operands,
                 )
             child_table_pool = SSAChildTablePoolDescriptor(
-                handle_column=1,
+                handle_column=int(handle_column),
                 column_value_ids=tuple(
                     int(column.id) for column in child_columns
                 ),
@@ -10025,15 +10274,15 @@ class _ControlSSABuilder(TiledObject):
                     if child_shape_stride is None
                     else int(child_shape_stride.id)
                 ),
-                status_value_id=int(child_status.id),
-                live_flags_value_id=int(child_live.id),
-                column_dtypes=(
-                    (nested_value_dtype or "unknown",)
-                    if nested_tensor
-                    else ("unknown", nested_value_dtype or "unknown")
+                status_value_id=(
+                    None if child_status is None else int(child_status.id)
                 ),
-                key_columns=(() if nested_tensor else (0,)),
-                writable=bool(writable),
+                live_flags_value_id=(
+                    None if child_live is None else int(child_live.id)
+                ),
+                column_dtypes=tuple(child_column_dtypes),
+                key_columns=tuple(child_key_columns),
+                writable=bool(child_writable),
             )
         descriptor = SSASequenceDescriptor(
             sequence_id=value_id,
@@ -10188,6 +10437,53 @@ class _ControlSSABuilder(TiledObject):
                 )
             return
         sequence_id = int(query.sequence_value_id)
+        nested_selection = self.nested_row_selections.get(sequence_id)
+        if (
+            nested_selection is not None
+            and query.operation in {"length", "truth"}
+        ):
+            child_lengths, handle = nested_selection
+            attributes = {
+                "binding": f"ssa_sequence_{query.operation}",
+                "sequence_value_id": sequence_id,
+                "source_call_node_id": query.source_call_node_id,
+                "extraction_identity": query.extraction_identity,
+            }
+            length_address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS,
+                operands=(child_lengths, handle),
+            )
+            length = self.fresh_value(
+                dtype="int64", transform=LOAD,
+                operands=(length_address,),
+            )
+            self.emit(
+                Handler.GetElementPtr,
+                [child_lengths, handle],
+                length_address,
+                attributes={**attributes, "binding": "nested_row_length"},
+            )
+            self.emit(
+                Handler.Load, [length_address], length,
+                attributes={**attributes, "binding": "nested_row_length"},
+            )
+            result = self.produced_value(
+                int(query.result_value_id),
+                dtype="bool" if query.operation == "truth" else "int64",
+                claim_provisional_definition=True,
+                cause=(length,),
+            )
+            self.emit(
+                Handler.Gt if query.operation == "truth" else Handler.Cast,
+                (
+                    [length, self.constant_value(0, length)]
+                    if query.operation == "truth" else [length]
+                ),
+                result,
+                attributes={**attributes, "target_dtype": result.dtype},
+            )
+            self._bind_sequence_query_result(query, result, length)
+            return
         from .identity_concordance import committed_sequence_contract
 
         contract = committed_sequence_contract(
@@ -10226,6 +10522,101 @@ class _ControlSSABuilder(TiledObject):
             dtype="int64", transform=LOAD, operands=(length_address,),
         )
         self.emit(Handler.Load, [length_address], length, attributes=attributes)
+        if query.operation == "any":
+            preheader = self.current
+            header = self.new_block("sequence_any_header")
+            body = self.new_block("sequence_any_body")
+            latch = self.new_block("sequence_any_latch")
+            exit_block = self.new_block("sequence_any_exit")
+            zero = self.constant_value(0, length)
+            one = self.constant_value(1, length)
+            false = self.constant_value(False, length)
+            next_index = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(length,),
+            )
+            next_accumulator = self.fresh_value(
+                dtype="bool", transform=CONTROL_EXPRESSION,
+                operands=(storage[0],),
+            )
+            self.branch(header)
+
+            self.current = header
+            index = self.fresh_value(
+                dtype="int64", transform=PHI_LOOP_HEADER,
+                operands=(zero, next_index),
+            )
+            self.emit(
+                Handler.Phi, [zero, next_index], index,
+                attributes={
+                    **attributes,
+                    "incoming_blocks": (preheader.name, latch.name),
+                    "binding": "ssa_sequence_any_index",
+                },
+            )
+            accumulator = self.fresh_value(
+                dtype="bool", transform=PHI_LOOP_HEADER,
+                operands=(false, next_accumulator),
+            )
+            self.emit(
+                Handler.Phi, [false, next_accumulator], accumulator,
+                attributes={
+                    **attributes,
+                    "incoming_blocks": (preheader.name, latch.name),
+                    "binding": "ssa_sequence_any_accumulator",
+                },
+            )
+            has_item = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(index, length),
+            )
+            self.emit(
+                Handler.Lt, [index, length], has_item,
+                attributes=attributes,
+            )
+            self.conditional_branch(has_item, body, exit_block)
+
+            self.current = body
+            address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS,
+                operands=(storage[0], index),
+            )
+            self.emit(
+                Handler.GetElementPtr, [storage[0], index], address,
+                attributes=attributes,
+            )
+            candidate = self.fresh_value(
+                dtype="bool", transform=LOAD, operands=(address,),
+            )
+            self.emit(
+                Handler.Load, [address], candidate,
+                attributes=attributes,
+            )
+            self.emit(
+                Handler.Or, [accumulator, candidate], next_accumulator,
+                attributes={**attributes, "binding": "ssa_sequence_any"},
+            )
+            self.branch(latch)
+
+            self.current = latch
+            self.emit(
+                Handler.Add, [index, one], next_index,
+                attributes=attributes,
+            )
+            self.branch(header)
+
+            self.current = exit_block
+            result = self.produced_value(
+                int(query.result_value_id), dtype="bool",
+                claim_provisional_definition=True,
+                cause=(accumulator,),
+            )
+            self.emit(
+                Handler.Cast, [accumulator], result,
+                attributes={**attributes, "target_dtype": "bool"},
+            )
+            self._bind_sequence_query_result(query, result, accumulator)
+            return
         if query.operation == "maximum":
             value_dtype = str(storage[0].dtype or "unknown")
 
@@ -10423,6 +10814,94 @@ class _ControlSSABuilder(TiledObject):
             return
 
         zero = self.constant_value(0, length)
+        if query.operation == "first":
+            row_storage = storage[:len(descriptor.column_value_ids)]
+            if len(row_storage) > 1 and len(query.result_member_ids) != len(row_storage):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", "first-aggregate-row",
+                    self.function_name,
+                    "resident sequence first requires an exact aggregate "
+                    "member identity for every row column",
+                ))
+                return
+            if len(row_storage) > 1:
+                contract_cell = self._sequence_contract_cell(
+                    int(query.sequence_value_id)
+                )
+                for column, (column_storage, member_id) in enumerate(zip(
+                    row_storage, query.result_member_ids,
+                )):
+                    address = self.fresh_value(
+                        dtype="ptr", transform=ADDRESS,
+                        operands=(column_storage, zero),
+                    )
+                    member_attributes = {
+                        **attributes,
+                        "aggregate_index": int(column),
+                        "binding": "sequence_first_aggregate_member",
+                    }
+                    self.emit(
+                        Handler.GetElementPtr,
+                        [column_storage, zero],
+                        address,
+                        attributes=member_attributes,
+                    )
+                    selected_value = self.fresh_value(
+                        dtype=column_storage.dtype,
+                        transform=LOAD,
+                        operands=(address,),
+                    )
+                    self.emit(
+                        Handler.Load, [address], selected_value,
+                        attributes=member_attributes,
+                    )
+                    result = self.produced_value(
+                        int(member_id),
+                        dtype=str(selected_value.dtype or "unknown"),
+                        claim_provisional_definition=True,
+                        cause=(selected_value,),
+                    )
+                    self.emit(
+                        Handler.Cast, [selected_value], result,
+                        attributes={
+                            **member_attributes,
+                            "target_dtype": result.dtype,
+                        },
+                    )
+                    self._bind(
+                        int(member_id), result,
+                        BindingKind.SEQUENCE_RESULT,
+                        contract_cell, selected_value,
+                    )
+                return
+            address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS,
+                operands=(storage[0], zero),
+            )
+            self.emit(
+                Handler.GetElementPtr, [storage[0], zero], address,
+                attributes=attributes,
+            )
+            selected_value = self.fresh_value(
+                dtype=storage[0].dtype, transform=LOAD,
+                operands=(address,),
+            )
+            self.emit(
+                Handler.Load, [address], selected_value,
+                attributes=attributes,
+            )
+            result = self.produced_value(
+                int(query.result_value_id),
+                dtype=str(selected_value.dtype or "unknown"),
+                claim_provisional_definition=True,
+                cause=(selected_value,),
+            )
+            self.emit(
+                Handler.Cast, [selected_value], result,
+                attributes={**attributes, "target_dtype": result.dtype},
+            )
+            self._bind_sequence_query_result(query, result, selected_value)
+            return
         nonempty = self.fresh_value(
             dtype="bool", transform=CONTROL_PREDICATE, operands=(length, zero),
         )
@@ -10946,6 +11425,38 @@ class _ControlSSABuilder(TiledObject):
                     "native_type_tag_value_id"
                 ]))
             )
+        if source_tag is None:
+            presence = self.optional_scalar_presence_by_payload.get(
+                int(value_id)
+            )
+            material_source = tuple(
+                identity for identity in source_alternatives
+                if identity != "builtins.NoneType"
+            )
+            if (
+                presence is not None
+                and "builtins.NoneType" in source_alternatives
+                and len(material_source) == 1
+            ):
+                present_token = self.constant_value(
+                    int(target_tags[material_source[0]]), presence,
+                )
+                absent_token = self.constant_value(
+                    int(target_tags["builtins.NoneType"]), presence,
+                )
+                source_tag = self.fresh_value(
+                    dtype="int64", transform=CONTROL_EXPRESSION,
+                    operands=(presence, present_token, absent_token),
+                )
+                self.emit(
+                    Handler.Select,
+                    [presence, present_token, absent_token], source_tag,
+                    attributes={
+                        "binding": "program_abi_optional_scalar_type_tag",
+                        "payload_value_id": int(value_id),
+                    },
+                )
+                self.native_value_type_tags[int(value_id)] = source_tag
         if source_tag is None:
             return None
         source_tags = dict(
@@ -12083,7 +12594,11 @@ class _ControlSSABuilder(TiledObject):
                 token_components = {
                     (
                         int(component.component_value_id),
-                        int(component.operand_value_id),
+                        int(
+                            component.projection_source_value_id
+                            if component.projection_source_value_id is not None
+                            else component.operand_value_id
+                        ),
                     )
                     for component in all_components
                     if str(component.kind) == "formatted"
@@ -16045,6 +16560,33 @@ class _ControlSSABuilder(TiledObject):
                 },
                 claim_provisional_definition=True,
             )
+            resident_sequence_id = int(iterable_id)
+            seen_aliases = set()
+            while (
+                resident_sequence_id in self.value_aliases
+                and resident_sequence_id not in seen_aliases
+            ):
+                seen_aliases.add(resident_sequence_id)
+                resident_sequence_id = int(
+                    self.value_aliases[resident_sequence_id]
+                )
+            resident_descriptor = self.sequence_descriptors.get(
+                resident_sequence_id
+            )
+            if (
+                resident_descriptor is not None
+                and resident_descriptor.child_table_pool is not None
+                and column_projection is not None
+                and int(column_projection)
+                == int(resident_descriptor.child_table_pool.handle_column)
+            ):
+                # The projected handle is the selected child sequence.  Keep
+                # the exact pool/handle pair so extent and nested iteration use
+                # the caller-owned child arenas instead of a parallel
+                # provisional descriptor for the same source value.
+                self.child_table_selections[int(target_id)] = (
+                    resident_descriptor.child_table_pool, projected_value,
+                )
             # ``enumerate(source)`` over a single-column source authors its
             # element binding with projection ``None`` (loop_composer): the
             # element IS the source's only physical column, column zero, the
@@ -17810,10 +18352,27 @@ class _ControlSSABuilder(TiledObject):
                 retained_payloads = self.native_value_union_payloads.get(
                     int(source_id), {}
                 )
+                material_arms = tuple(
+                    arm for arm in physical
+                    if str(arm.storage) != "none"
+                )
+                shared_payload = bool(material_arms) and len({
+                    (
+                        str(arm.storage), str(arm.dtype),
+                        tuple(arm.shape or ()), int(arm.rank),
+                        tuple(arm.storage_identity or ()),
+                    )
+                    for arm in material_arms
+                }) == 1 and all(
+                    str(arm.storage) not in {"sequence", "record"}
+                    for arm in material_arms
+                )
                 for arm in physical:
                     identity = str(arm.identity)
                     storage = str(arm.storage)
                     if storage == "none":
+                        continue
+                    if shared_payload and arm is not material_arms[0]:
                         continue
                     if storage == "sequence":
                         sequence_id = sequence_arms.get(identity)
@@ -17845,7 +18404,11 @@ class _ControlSSABuilder(TiledObject):
                         arm_values = (next(payload_iter),)
                     for position, arm_value in enumerate(arm_values):
                         values.append(arm_value)
-                        roles.append(("alternative", identity, position))
+                        roles.append(
+                            ("shared", "value", position)
+                            if shared_payload else
+                            ("alternative", identity, position)
+                        )
                 tag = self.native_type_tag_for(int(source_id), type_fact)
                 if tag is None:
                     raise ValueError(
@@ -17932,6 +18495,8 @@ class _ControlSSABuilder(TiledObject):
             or self.current.instrs[-1].op
             not in {Handler.Br.value, Handler.CondBr.value, Handler.Ret.value}
         )
+        return_arm_layouts = {}
+        aggregate_layout_sources = {}
         if self.function_return_edges:
             # Control-aware result merging: every source ``return`` below the
             # top level branched to `function_exit` carrying its own slot
@@ -17978,9 +18543,32 @@ class _ControlSSABuilder(TiledObject):
                     else:
                         arms_record = None
             record_kind = None if arms_record is None else arms_record[1].kind
-            authored_edge_width = max(
-                (len(values) for _block, values in edges), default=0,
-            )
+            fallthrough_returned = list(returned)
+            tail_arm = edge_arms.get(id(self.current)) if fallthrough_open else None
+            if tail_arm is not None and not tail_arm.absent:
+                from .concordance_declarations import RETURN_SITE_SLOT
+                from .structural_concordance import return_slot_structure
+
+                # The output history names the merge destination, not the
+                # values arriving on this edge. Read this exact authored site.
+                scope = tail_arm.container.row[0]
+                slots = sorted(
+                    int(row[2]) for row in self._book().page(RETURN_SITE_SLOT).scope_rows(scope)
+                    if row[1] == tail_arm.site
+                )
+                fallthrough_returned = []
+                for slot in slots:
+                    structure, _cell = return_slot_structure(
+                        scope, tail_arm.site, slot, book=self._book(),
+                    )
+                    fallthrough_returned.extend(
+                        self.external_value(leaf.value_id)
+                        for _path, leaf in structure.leaves()
+                    )
+            authored_edge_width = max((
+                *(len(values) for _block, values in edges),
+                *((len(fallthrough_returned),) if fallthrough_open else ()),
+            ), default=0)
             if authored_edge_width > 1:
                 normalized_edges = []
                 for block, values in edges:
@@ -17994,7 +18582,9 @@ class _ControlSSABuilder(TiledObject):
                             if isinstance(type_fact, Mapping)
                             else getattr(type_fact, "alternatives", ())
                         )
-                        if alternatives == ("builtins.NoneType",) or (
+                        if int(absence.id) in self.none_value_ids or (
+                            alternatives == ("builtins.NoneType",)
+                        ) or (
                             record_kind is ReturnArmsKind.OPTIONAL_AGGREGATE
                             and edge_arms[id(block)].absent
                         ):
@@ -18016,7 +18606,7 @@ class _ControlSSABuilder(TiledObject):
                     )
             slot_count = max(
                 (
-                    len(returned),
+                    len(fallthrough_returned),
                     *(len(values) for _block, values in edges),
                 )
                 if fallthrough_open
@@ -18024,7 +18614,8 @@ class _ControlSSABuilder(TiledObject):
             )
             if fallthrough_open:
                 fallthrough_values = tuple(
-                    returned[index] if index < len(returned) else None
+                    fallthrough_returned[index]
+                    if index < len(fallthrough_returned) else None
                     for index in range(slot_count)
                 )
                 edges.append((self.current, fallthrough_values))
@@ -18163,6 +18754,16 @@ class _ControlSSABuilder(TiledObject):
                     )
                 merged_values.append(merged)
             returned = merged_values
+            if record_kind is ReturnArmsKind.OPTIONAL_AGGREGATE:
+                from .concordance_declarations import RETURN_OUTPUT_ARMS
+
+                output_id = int(arms_record[0])
+                return_arm_layouts[output_id] = tuple(int(value.id) for value in returned)
+                aggregate_layout_sources[output_id] = (
+                    self._book().current_ref(
+                        RETURN_OUTPUT_ARMS, (tuple(self.lexical_read_scope), output_id),
+                    ),
+                )
             named_returns = [
                 (
                     name,
@@ -18180,6 +18781,113 @@ class _ControlSSABuilder(TiledObject):
             self.emit(Handler.Ret, returned)
         elif fallthrough_open:
             self.emit(Handler.Ret, returned)
+
+        # A returned union can be widened into a physical frame before the
+        # function-exit join is built.  When that join has multiple incoming
+        # edges, its payload and tag are new Phi values.  They are the values
+        # exported by the function, so the semantic union descriptor must name
+        # those physical members, not remain absent because only one incoming
+        # call arm carried the semantic identity.  ``_shadow_dt_limit`` is the concrete
+        # failure: semantic value 26 fed return Phi 2305843010213708123; the
+        # next caller followed this return layout and correctly found no
+        # descriptor for the Phi.  The layout below is the exact authored-to-
+        # physical receipt, and the declared VALUE_TYPE_ABI cell remains its
+        # source of truth.
+        for declared_id, role_slots in native_value_union_return_layouts:
+            type_fact = self.native_value_type_abi.get(int(declared_id))
+            physical = tuple(
+                type_fact.get("physical_alternatives", ())
+                if isinstance(type_fact, Mapping)
+                else getattr(type_fact, "physical_alternatives", ())
+            )
+            # Aggregate arms require their descriptor tables to be remapped
+            # with the return frame.  This path publishes only the fixed-width
+            # value unions whose complete frame is already named here.
+            if not physical or any(
+                str(arm.storage) in {"sequence", "record", "reference"}
+                for arm in physical
+                if str(arm.storage) != "none"
+            ):
+                continue
+            frame = {
+                tuple(role): returned[int(slot)]
+                for role, slot in role_slots
+                if int(slot) < len(returned)
+            }
+            tag = frame.get(("tag",))
+            if tag is None:
+                raise ValueError(
+                    "native union return layout has no exact merged tag: "
+                    f"{self.function_name} value {int(declared_id)}"
+                )
+            material_arms = tuple(
+                arm for arm in physical if str(arm.storage) != "none"
+            )
+            shared_payload = bool(material_arms) and len({
+                (
+                    str(arm.storage), str(arm.dtype),
+                    tuple(arm.shape or ()), int(arm.rank),
+                    tuple(arm.storage_identity or ()),
+                )
+                for arm in material_arms
+            }) == 1
+            payloads = {
+                str(arm.identity): tuple(
+                    value for role, value in sorted(
+                        frame.items(),
+                        key=lambda item: int(item[0][-1])
+                        if item[0] and isinstance(item[0][-1], int)
+                        else -1,
+                    )
+                    if len(role) == 3 and (
+                        role[:2] == (
+                            "alternative", str(arm.identity),
+                        )
+                        or (
+                            shared_payload
+                            and str(arm.storage) != "none"
+                            and role[:2] == ("shared", "value")
+                        )
+                    )
+                )
+                for arm in physical
+            }
+            if shared_payload:
+                shared_candidates = tuple(
+                    payloads[str(arm.identity)]
+                    for arm in material_arms
+                    if payloads[str(arm.identity)]
+                )
+                shared_values = (
+                    shared_candidates[0] if shared_candidates else ()
+                )
+                if any(
+                    tuple(int(value.id) for value in candidate)
+                    != tuple(int(value.id) for value in shared_values)
+                    for candidate in shared_candidates[1:]
+                ):
+                    raise ValueError(
+                        "shared native union return arms disagree about "
+                        f"their physical payload: {self.function_name} "
+                        f"value {int(declared_id)}"
+                    )
+                payloads.update({
+                    str(arm.identity): shared_values
+                    for arm in material_arms
+                })
+            # The descriptor key is the authored union identity.  Its member
+            # ids are the physical return Phis.  Keeping those two roles
+            # distinct lets the next call edge ask for the declared result
+            # directly while still receiving the exact exported frame.
+            union_id = int(declared_id)
+            if self.value_union_table.by_id(union_id) is not None:
+                continue
+            self.native_value_union_payloads[union_id] = payloads
+            self.native_value_type_tags[union_id] = tag
+            self.post_native_type_tag(
+                union_id, tag, type_fact, *frame.values(),
+            )
+            self.publish_native_value_union(union_id, tag, type_fact)
         optional_glyph_return_layouts = [
             (
                 int(semantic_payload_id),
@@ -18191,7 +18899,13 @@ class _ControlSSABuilder(TiledObject):
             for semantic_payload_id, payload_slot, presence_slot
             in optional_glyph_return_slots
         ]
-        aggregate_return_layouts = dict(optional_glyph_return_layouts)
+        aggregate_return_layouts = {
+            **return_arm_layouts, **dict(optional_glyph_return_layouts),
+        }
+        for semantic_payload_id, payload_slot, presence_slot in optional_glyph_return_slots:
+            aggregate_layout_sources[int(semantic_payload_id)] = self._cells(
+                returned[payload_slot], returned[presence_slot],
+            )
         for semantic_payload_id, payload_slot, tag_slot in (
             native_type_return_slots
         ):
@@ -18203,6 +18917,21 @@ class _ControlSSABuilder(TiledObject):
                 int(returned[tag_slot].id),
             )))
             aggregate_return_layouts[int(semantic_payload_id)] = physical
+            aggregate_layout_sources[int(semantic_payload_id)] = (
+                *aggregate_layout_sources.get(int(semantic_payload_id), ()),
+                self._book().current_ref(
+                    VALUE_TYPE_ABI, (self.lexical_read_scope, int(semantic_payload_id)),
+                ),
+            )
+        for output_id, role_slots in native_value_union_return_layouts:
+            aggregate_return_layouts[int(output_id)] = tuple(
+                int(returned[int(slot)].id) for _role, slot in role_slots
+            )
+            aggregate_layout_sources[int(output_id)] = (
+                self._book().current_ref(
+                    VALUE_TYPE_ABI, (self.lexical_read_scope, int(output_id)),
+                ),
+            )
         page_metadata = self._finish_pages(
             tuple(named_returns), tuple(parameter_value_names), tuple(returned),
         )
@@ -18281,6 +19010,12 @@ class _ControlSSABuilder(TiledObject):
                         self.table_lookup_ownership_receipts
                     )),
                     "control_ir": True,
+                    "source_execution_receipts": tuple(
+                        (int(value_id), dict(receipt))
+                        for value_id, receipt in sorted(
+                            self.source_execution_receipts.items()
+                        )
+                    ),
                     "deployment_regions": tuple(deployment_regions),
                     "sequence_table": sequence_table,
                     "value_union_table": self.value_union_table,
@@ -18377,6 +19112,25 @@ class _ControlSSABuilder(TiledObject):
                     ),
                 },
         )
+        from .structural_concordance import publish_aggregate_return_layout
+        from .concordance_declarations import OPTIONAL_VALUE_STRUCTURE
+
+        for _semantic_id, payload_slot, presence_slot in optional_glyph_return_slots:
+            payload, presence = returned[payload_slot], returned[presence_slot]
+            optional_cell = self._book().post(
+                OPTIONAL_VALUE_STRUCTURE, (self._scope(), int(payload.id)),
+                (int(payload.id), int(presence.id)), stage=CONTROL_SSA_FINISH,
+                provenance=Derived(self._cells(payload, presence)), mode=Mode.CONCORD,
+            )
+            aggregate_layout_sources[int(_semantic_id)] = (
+                *aggregate_layout_sources[int(_semantic_id)], optional_cell,
+            )
+        for output_id, members in aggregate_return_layouts.items():
+            publish_aggregate_return_layout(
+                function, output_id, members,
+                sources=aggregate_layout_sources[output_id],
+                stage=CONTROL_SSA_FINISH, book=self._book(),
+            )
         loop_result_rebindings = (
             _canonicalize_non_dominating_loop_result_uses(
                 function,
@@ -18827,6 +19581,8 @@ def lower_control_program_to_ssa(
     region_value_ranks: Mapping[int, int] | None = None,
     tensor_shape_concordance_scope: str | None = None,
     lexical_read_scope: Any = None,
+    planning_scope: Any = None,
+    source_value_descriptions: Mapping[int, Mapping[str, Any]] | None = None,
     shape_scope: Any = None,
     plan_callsite_bindings: Mapping[
         int, tuple[tuple[int, ...], tuple[int, ...]]
@@ -18834,6 +19590,7 @@ def lower_control_program_to_ssa(
     value_aliases: Mapping[int, int] | None = None,
     inout_value_ids: tuple[int, ...] = (),
     constant_value_ids: tuple[int, ...] = (),
+    none_value_ids: tuple[int, ...] = (),
     output_value_ids: tuple[int, ...] = (),
     named_output_histories: Mapping[str, tuple[int, ...]] | None = None,
     value_name_histories: Mapping[str, tuple[int, ...]] | None = None,
@@ -18842,6 +19599,9 @@ def lower_control_program_to_ssa(
     sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
     sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
     sequence_record_identities: Mapping[int, str] | None = None,
+    sequence_child_table_layouts: Mapping[
+        int, tuple[int, tuple[str, ...], tuple[int, ...], bool]
+    ] | None = None,
     sequence_row_record_slots: Mapping[
         int, tuple[tuple[int, str, int], ...]
     ] | None = None,
@@ -18892,11 +19652,14 @@ def lower_control_program_to_ssa(
         region_value_ranks=region_value_ranks,
         tensor_shape_concordance_scope=tensor_shape_concordance_scope,
         lexical_read_scope=lexical_read_scope,
+        planning_scope=planning_scope,
+        source_value_descriptions=source_value_descriptions,
         shape_scope=shape_scope,
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=value_aliases,
         inout_value_ids=inout_value_ids,
         constant_value_ids=constant_value_ids,
+        none_value_ids=none_value_ids,
         output_value_ids=output_value_ids,
         named_output_histories=named_output_histories,
         value_name_histories=value_name_histories,
@@ -18905,6 +19668,7 @@ def lower_control_program_to_ssa(
         sequence_declarations=sequence_declarations,
         sequence_column_dtypes=sequence_column_dtypes,
         sequence_record_identities=sequence_record_identities,
+        sequence_child_table_layouts=sequence_child_table_layouts,
         sequence_row_record_slots=sequence_row_record_slots,
         source_sequence_ids=source_sequence_ids,
         sequence_memberships=sequence_memberships,
@@ -19491,6 +20255,7 @@ def _inject_field_slot_access(
     *,
     self_value_id: int,
     non_self_param_ids: tuple[int, ...],
+    non_self_parameters: tuple[tuple[str, int], ...] = (),
     field_ops: tuple[tuple[str, int, int], ...],
     field_count: int,
     field_const_sources: Mapping[int, Any] | None = None,
@@ -20067,12 +20832,78 @@ def _inject_field_slot_access(
             arguments.append(SSAValue(int(param_id), dtype=dtype))
             seen_argument_ids.add(int(param_id))
 
+    # Control lowering names parameters from uses present before receiver-slot
+    # injection.  A constructor parameter used only by ``self.field = value``
+    # has no such use until the Store above is installed, even though the
+    # ProcessGraph identity table already names its exact version-zero input.
+    # Publish that existing identity now, at the same seam that rebuilds the
+    # public argument list.  This is not a positional reconstruction: callers
+    # provide the exact authored name/value pairs from the identity table.
+    parameter_names = list(control_function.metadata.get(
+        "parameter_names", (),
+    ))
+    named_parameters = {
+        str(name): int(value_id) for name, value_id in parameter_names
+    }
+    arguments_by_id = {int(argument.id): argument for argument in arguments}
+    for name, value_id in non_self_parameters:
+        name = str(name)
+        value_id = int(value_id)
+        argument = arguments_by_id.get(value_id)
+        if argument is None:
+            continue
+        incumbent = named_parameters.get(name)
+        if incumbent is not None and incumbent != value_id:
+            # Control lowering ran before receiver-slot injection and could
+            # therefore name a later lexical version when the version-zero
+            # parameter was used only by ``self.field = parameter``.  The
+            # identity table supplies that exact authored input here.  Keep
+            # the later value as an ordinary frame argument, but move the one
+            # public parameter name to the authored identity.
+            incumbent_argument = arguments_by_id.get(int(incumbent))
+            if (
+                incumbent_argument is not None
+                and (incumbent_argument.accounting or {}).get(
+                    "program_abi_parameter"
+                ) == name
+            ):
+                incumbent_argument.accounting = {
+                    key: item
+                    for key, item in dict(
+                        incumbent_argument.accounting or {}
+                    ).items()
+                    if key != "program_abi_parameter"
+                }
+            parameter_names = [
+                (existing_name, existing_id)
+                for existing_name, existing_id in parameter_names
+                if str(existing_name) != name
+            ]
+            named_parameters.pop(name, None)
+            incumbent = None
+        claimed_name = (argument.accounting or {}).get(
+            "program_abi_parameter"
+        )
+        if claimed_name not in {None, "", name}:
+            raise ValueError(
+                "field-slot injection parameter identity disagrees with "
+                f"formal {value_id}: {claimed_name!r} != {name!r}"
+            )
+        argument.accounting = {
+            **dict(argument.accounting or {}),
+            "program_abi_parameter": name,
+        }
+        if incumbent is None:
+            parameter_names.append((name, value_id))
+            named_parameters[name] = value_id
+
     return Function(
         control_function.name,
         arguments,
         new_blocks,
         metadata={
             **dict(control_function.metadata),
+            "parameter_names": tuple(parameter_names),
             "receiver_field_locations": tuple(sorted(
                 (int(slot), *location)
                 for slot, location in field_locations.items()
@@ -20581,6 +21412,7 @@ def _schedule_loop_callsites(
                 tuple(dict.fromkeys((
                     int(block.result_value_id),
                     *map(int, block.result_alias_ids),
+                    *map(int, block.result_member_ids),
                 ))),
             )
         if isinstance(block, ConditionalBlock):
@@ -21663,6 +22495,8 @@ def lower_control_sections_to_ssa(
     function_outputs: tuple[str, ...] = (),
     function_parameters: tuple[str, ...] = (),
     lexical_read_scope: Any = None,
+    planning_scope: Any = None,
+    source_value_descriptions: Mapping[int, Mapping[str, Any]] | None = None,
     shape_scope: Any = None,
     value_dtypes: Mapping[int, str] | None = None,
     value_shapes: Mapping[int, tuple[int, ...]] | None = None,
@@ -21687,6 +22521,9 @@ def lower_control_sections_to_ssa(
     sequence_capacity_sources: tuple[tuple[int, int], ...] = (),
     sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
     sequence_record_identities: Mapping[int, str] | None = None,
+    sequence_child_table_layouts: Mapping[
+        int, tuple[int, tuple[str, ...], tuple[int, ...], bool]
+    ] | None = None,
     sequence_row_record_slots: Mapping[
         int, tuple[tuple[int, str, int], ...]
     ] | None = None,
@@ -22067,6 +22904,36 @@ def lower_control_sections_to_ssa(
     ):
         if projection == "induction":
             region_value_meta[int(target_id)] = Meta((), "int")
+
+    def queried_row_sequences(block: ControlBlock) -> set[int]:
+        """Loop-local rows whose authored query requires sequence storage."""
+
+        if isinstance(block, SequenceQueryBlock):
+            return (
+                {int(block.sequence_value_id)}
+                if block.operation in {"length", "truth"} else set()
+            )
+        if isinstance(block, SequenceBlock):
+            return set().union(*(
+                queried_row_sequences(child) for child in block.blocks
+            )) if block.blocks else set()
+        if isinstance(block, ConditionalBlock):
+            result = queried_row_sequences(block.body)
+            if block.orelse is not None:
+                result.update(queried_row_sequences(block.orelse))
+            return result
+        if isinstance(block, LoopBlock):
+            return queried_row_sequences(block.body)
+        if isinstance(block, WhileBlock):
+            return (
+                queried_row_sequences(block.condition)
+                | queried_row_sequences(block.body)
+            )
+        if isinstance(block, CallBlock):
+            return queried_row_sequences(block.callee)
+        return set()
+
+    queried_sequence_ids = queried_row_sequences(control.root)
     # Settle strict scalar roles across the complete method before constructing
     # any one region signature.  The same SSA identity can cross several
     # regions; whichever region proves it is an address index or predicate must
@@ -22107,6 +22974,14 @@ def lower_control_sections_to_ssa(
             in control.projected_iterable_bindings
             if projection != "induction"
         })
+        # ``len(row)`` and ``bool(row)`` are direct structural evidence that
+        # a loop target is a selected child row even when its body never
+        # indexes the row.  The nested-table ABI already owns the child length
+        # arena; admitting the target here lets control lowering bind that
+        # exact row handle before emitting the query.
+        nested_row_target_ids.update(
+            iterable_target_ids.intersection(queried_sequence_ids)
+        )
         nested_row_target_ids.update(
             int(instruction.args[0].id)
             for instruction in semantic_instructions
@@ -23350,6 +24225,37 @@ def lower_control_sections_to_ssa(
                             if not (instruction.op == "IndexedStore"
                                     and instruction.res is not None
                                     and int(instruction.res.id) in lexical_mapping_write_ids)]
+            # The table helper publishes every member of its source tuple.
+            # A planned Indexed of that exact member is the same projection,
+            # not a second numerical operation on a scalar aggregate handle.
+            # Keep all other indexing, including mixed-region computations.
+            if lexical_read_scope is not None:
+                from .structural_concordance import source_structure
+
+                retained_instructions = []
+                for instruction in instructions:
+                    supplied_by_lookup = False
+                    if (str(instruction.op).casefold() == "indexed"
+                            and instruction.res is not None and instruction.args
+                            and int(instruction.args[0].id) in table_lookup_result_ids
+                            and instruction.attributes.get("aggregate_index") is not None):
+                        structure, _cell = source_structure(
+                            tuple(lexical_read_scope), int(instruction.args[0].id), book=_book(),
+                        )
+                        member = dict(structure.leaves()).get((int(instruction.attributes["aggregate_index"]),))
+                        supplied_by_lookup = bool(
+                            structure.kind == "product" and structure.storage == "tuple"
+                            and member is not None and member.value_id == int(instruction.res.id)
+                        )
+                    if not supplied_by_lookup:
+                        retained_instructions.append(instruction)
+                if len(retained_instructions) != len(instructions):
+                    instructions = retained_instructions
+                    planned_region_instructions[region_index] = tuple(instructions)
+                    if not instructions:
+                        table_region_operations.setdefault(region_index, []).append((
+                            "structural_consumed", (),
+                        ))
             if lexical_mapping_write_ids:
                 planned_region_instructions[region_index] = tuple(instructions)
             if not instructions:
@@ -23763,9 +24669,25 @@ def lower_control_sections_to_ssa(
                 # several reshapes share the storage id, keep the canonical
                 # formal neutral; the individual op occurrences above retain
                 # their own views.
-                if len(contracts) == 1:
-                    return occurrences[0]
-                return canonical
+                selected = occurrences[0] if len(contracts) == 1 else canonical
+                if value_id in region_array_feed_ids.get(region_index, set()):
+                    # ``region_array_feed_ids`` is derived from an exact
+                    # indexed use of a projected iterable target.  The
+                    # control caller supplies ``variant_row_values[target]``,
+                    # a nested-row base address, so publish that same rank on
+                    # the independently compiled region formal instead of
+                    # leaving a scalar ABI beside GetElementPtr.
+                    return SSAValue(
+                        int(selected.id), dtype=selected.dtype,
+                        shape=tuple(selected.shape or ()),
+                        device=selected.device,
+                        accounting={
+                            **dict(selected.accounting or {}),
+                            "ssa_call_rank": 1,
+                            "nested_row_region_feed": int(region_index),
+                        },
+                    )
+                return selected
 
             # Python integer arithmetic stays integer: a scalar result whose
             # operands are all integers and whose dtype is only the planner's
@@ -23879,6 +24801,25 @@ def lower_control_sections_to_ssa(
                 ),
                 "capture_value_ids": tuple(map(int, effective_captures)),
                 "output_value_ids": tuple(map(int, outputs)),
+                # An in-place store publishes its result through the captured
+                # arena, not through a copied return slot.  Keep the store's
+                # own SSA identity in the integral receipt so the product
+                # audit can distinguish an effect-only region from a dead
+                # output-less arithmetic region without guessing from names
+                # or from the caller's eventual backend spelling.
+                **({"effect_value_ids": tuple(
+                    int(instruction.res.id)
+                    for instruction in instructions
+                    if (
+                        instruction.res is not None
+                        and str(instruction.op).casefold()
+                        == "indexedstore"
+                    )
+                )} if any(
+                    instruction.res is not None
+                    and str(instruction.op).casefold() == "indexedstore"
+                    for instruction in instructions
+                ) else {}),
             }
             region_function.metadata[
                 "tensor_shape_concordance_scope"
@@ -24319,11 +25260,18 @@ def lower_control_sections_to_ssa(
         region_value_ranks=region_value_ranks,
         tensor_shape_concordance_scope=tensor_shape_concordance_scope,
         lexical_read_scope=lexical_read_scope,
+        planning_scope=planning_scope,
+        source_value_descriptions=source_value_descriptions,
         shape_scope=shape_scope,
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=final_value_aliases,
         inout_value_ids=tuple(map(int, record_field_write_value_ids)),
         constant_value_ids=tuple(map(int, constant_values or {})),
+        none_value_ids=tuple(
+            int(value_id)
+            for value_id, literal in (constant_values or {}).items()
+            if literal is None
+        ),
         output_value_ids=tuple(map(int, required_output_value_ids)),
         named_output_histories={
             str(name): tuple(map(int, (identity_table or {}).get(name, ())))
@@ -24335,6 +25283,7 @@ def lower_control_sections_to_ssa(
         sequence_declarations=sequence_declarations,
         sequence_column_dtypes=sequence_column_dtypes,
         sequence_record_identities=sequence_record_identities,
+        sequence_child_table_layouts=sequence_child_table_layouts,
         sequence_row_record_slots=sequence_row_record_slots,
         source_sequence_ids=source_sequence_ids,
         sequence_memberships=sequence_memberships,
@@ -24602,10 +25551,13 @@ def lower_control_sections_to_ssa(
             if int(argument.id) != int(self_value_id)
         ]
     if self_value_id is not None and scalar_slots:
-        non_self_param_ids = tuple(
-            int((identity_table or {}).get(name, (None,))[-1])
+        non_self_parameters = tuple(
+            (str(name), int((identity_table or {})[name][0]))
             for name in function_parameters
             if name != "self" and (identity_table or {}).get(name)
+        )
+        non_self_param_ids = tuple(
+            value_id for _name, value_id in non_self_parameters
         )
         output_value_ids = tuple(
             int((identity_table or {}).get(name, (None,))[-1])
@@ -24616,6 +25568,7 @@ def lower_control_sections_to_ssa(
             control_function,
             self_value_id=int(self_value_id),
             non_self_param_ids=non_self_param_ids,
+            non_self_parameters=non_self_parameters,
             field_ops=scalar_field_ops,
             field_write_state_cells=scalar_write_state_cells,
             lexical_read_scope=lexical_read_scope,

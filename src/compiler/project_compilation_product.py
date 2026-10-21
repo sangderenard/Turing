@@ -112,6 +112,7 @@ def compiler_toolchain_fingerprint() -> dict[str, Any]:
         "src/compiler/id_space.py",
         "src/compiler/monotonic_ids.py",
         "src/compiler/concordance_declarations.py",
+        "src/compiler/structural_concordance.py",
         "src/compiler/__init__.py",
         "src/compiler/compiler_bootstrap_runtime.py",
         "src/compiler/compiler_source_tree.py",
@@ -3558,9 +3559,11 @@ def _require_native_root_semantics(module: Any, entrypoint: str) -> Any:
         )
     unexplained_arguments = _unexplained_root_argument_ids(root_function)
     if unexplained_arguments:
+        details = _unexplained_root_argument_details(root_function)
         raise RuntimeError(
             "native emission refused: root SSA exposes compiler-intermediate "
-            f"values as public inputs {unexplained_arguments}"
+            f"values as public inputs {unexplained_arguments}; "
+            f"source execution receipts={details!r}"
         )
     return root_function
 
@@ -3647,6 +3650,12 @@ def _unexplained_root_argument_details(
     uses: dict[int, list[dict[str, Any]]] = {
         value_id: [] for value_id in unexplained
     }
+    source_receipts = {
+        int(value_id): dict(receipt)
+        for value_id, receipt in function.metadata.get(
+            "source_execution_receipts", ()
+        )
+    }
     structural_attributes = (
         "binding", "callee", "region_index", "source_value_id",
         "plan_callsite_id", "semantic_result_id", "tensor_operation",
@@ -3696,8 +3705,22 @@ def _unexplained_root_argument_details(
                         for item in value)
             )
         },
+        **({"source_execution_receipt": source_receipts[value_id]}
+           if value_id in source_receipts else {}),
         "uses": uses[value_id],
     } for value_id in sorted(unexplained))
+
+
+def _source_execution_refusals(function: Any) -> tuple[dict[str, Any], ...]:
+    """Unexplained formals whose exact planner row forbids their execution."""
+
+    return tuple(
+        detail
+        for detail in _unexplained_root_argument_details(function)
+        for receipt in (detail.get("source_execution_receipt"),)
+        if receipt is not None
+        and receipt.get("planner_verdict") != "executable"
+    )
 
 
 def source_region_integral_accounting(
@@ -3740,7 +3763,8 @@ def source_region_integral_accounting(
                     if value_id not in available:
                         undefined_uses.append((str(instruction.op), value_id))
                 if (
-                    str(instruction.op).casefold() == "getelementptr"
+                    str(instruction.op).casefold()
+                    in {"getelementptr", "indexed", "indexedstore"}
                     and instruction.args
                 ):
                     address_base_ids.add(int(instruction.args[0].id))
@@ -3792,6 +3816,23 @@ def source_region_integral_accounting(
                     available.add(result_id)
 
         published_outputs = tuple(outputs.get(function_name, ()))
+        declared_effects = tuple(map(
+            int, provenance.get("effect_value_ids") or (),
+        ))
+        materialized_effects = {
+            int(instruction.attributes["source_effect_value_id"])
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if (
+                str(instruction.op).casefold() == "store"
+                and instruction.attributes.get("source_effect_value_id")
+                is not None
+            )
+        }
+        missing_effects = tuple(
+            value_id for value_id in declared_effects
+            if value_id not in produced and value_id not in materialized_effects
+        )
         missing_outputs = tuple(
             int(value.id) for value in published_outputs
             if int(value.id) not in available
@@ -3809,7 +3850,12 @@ def source_region_integral_accounting(
                 "kind": "missing-output-values",
                 "value_ids": list(missing_outputs),
             })
-        if not published_outputs:
+        if missing_effects:
+            shortfalls.append({
+                "kind": "missing-effect-values",
+                "value_ids": list(missing_effects),
+            })
+        if not published_outputs and not declared_effects:
             shortfalls.append({"kind": "no-published-outputs"})
 
         boundary_values = tuple(function.args) + published_outputs
@@ -3908,6 +3954,7 @@ def source_region_integral_accounting(
                 }
                 for value in published_outputs
             ],
+            "effect_value_ids": list(declared_effects),
             "shortfalls": shortfalls,
             "complete": not shortfalls,
         })
@@ -4584,12 +4631,12 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     # Windows refuses replacement while an observer has the destination open.
     # Progress readers are deliberately lock-free, so tolerate that short
     # sharing window without turning telemetry into a compiler failure.
-    for attempt in range(20):
+    for attempt in range(500):
         try:
             os.replace(temporary, path)
             return
         except PermissionError:
-            if attempt == 19:
+            if attempt == 499:
                 raise
             time.sleep(0.01)
 
@@ -4599,12 +4646,12 @@ def _atomic_text(path: Path, value: str) -> None:
         f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
     temporary.write_text(value, encoding="utf-8", newline="")
-    for attempt in range(20):
+    for attempt in range(500):
         try:
             os.replace(temporary, path)
             return
         except PermissionError:
-            if attempt == 19:
+            if attempt == 499:
                 raise
             time.sleep(0.01)
 
@@ -5981,14 +6028,14 @@ def _authored_module_record_contracts(
         ):
             continue
         candidates.append((len(root.parts), ".".join(parts)))
-    if not candidates:
-        return None, {}
-    module_name = max(candidates)[1]
-    module = sys.modules.get(module_name)
-    if module is None:
+    module_name = max(candidates)[1] if candidates else None
+    module = None if module_name is None else sys.modules.get(module_name)
+    if module is None and module_name is not None:
         module = importlib.import_module(module_name)
     contracts: dict[tuple[str, str], str] = {}
-    for binding_name, bound_value in vars(module).items():
+    for binding_name, bound_value in (
+        () if module is None else vars(module).items()
+    ):
         if not isinstance(bound_value, type) or not dataclasses.is_dataclass(
             bound_value
         ):
@@ -6002,6 +6049,106 @@ def _authored_module_record_contracts(
             ), None)
             if kind is not None:
                 contracts[(str(binding_name), str(declared_field.name))] = kind
+    # Source partitioning intentionally removes unrelated methods from the
+    # worker's compile slice.  Aggregate fields can nevertheless be declared
+    # by an exact producer in one of those methods (``snapshot = {...}``, then
+    # ``self.current = snapshot``) and consumed by the selected method.  Carry
+    # that authored storage fact across the partition boundary just as the
+    # dataclass factory facts above are carried.  ``None`` initializers and
+    # other opaque assignments contribute no contract; disagreeing aggregate
+    # producers erase the fact rather than selecting a representation.
+    tree = ast.parse(source_file.read_text(encoding="utf-8"))
+
+    def aggregate_kind(value: ast.AST | None) -> str | None:
+        if isinstance(value, (ast.List, ast.ListComp)):
+            return "list"
+        if isinstance(value, (ast.Set, ast.SetComp)):
+            return "set"
+        if isinstance(value, (ast.Dict, ast.DictComp)):
+            return "dict"
+        if isinstance(value, ast.Tuple):
+            return "tuple"
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in {
+                "list", "set", "frozenset", "dict", "tuple",
+                "bytes", "bytearray",
+            }
+        ):
+            return value.func.id
+        return None
+
+    def scope_assignments(
+        definition: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[ast.Assign | ast.AnnAssign, ...]:
+        found: list[ast.Assign | ast.AnnAssign] = []
+        pending: list[ast.AST] = list(reversed(definition.body))
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                found.append(node)
+            pending.extend(reversed(tuple(ast.iter_child_nodes(node))))
+        return tuple(found)
+
+    source_contracts: dict[tuple[str, str], str] = {}
+    conflicts: set[tuple[str, str]] = set()
+    for definition in (
+        node for node in tree.body if isinstance(node, ast.ClassDef)
+    ):
+        for method in (
+            node for node in definition.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            assignments = scope_assignments(method)
+            local_kinds: dict[str, str] = {}
+            for assignment in assignments:
+                value = assignment.value
+                kind = aggregate_kind(value)
+                if kind is None and isinstance(value, ast.Name):
+                    kind = local_kinds.get(value.id)
+                targets = (
+                    tuple(assignment.targets)
+                    if isinstance(assignment, ast.Assign)
+                    else (assignment.target,)
+                )
+                if kind is not None:
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            local_kinds[target.id] = kind
+            for assignment in assignments:
+                value = assignment.value
+                kind = aggregate_kind(value)
+                if kind is None and isinstance(value, ast.Name):
+                    kind = local_kinds.get(value.id)
+                if kind is None:
+                    continue
+                targets = (
+                    tuple(assignment.targets)
+                    if isinstance(assignment, ast.Assign)
+                    else (assignment.target,)
+                )
+                for target in targets:
+                    if not (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in {"self", "cls"}
+                    ):
+                        continue
+                    key = (str(definition.name), str(target.attr))
+                    if key in conflicts:
+                        continue
+                    previous = source_contracts.setdefault(key, kind)
+                    if previous != kind:
+                        source_contracts.pop(key, None)
+                        conflicts.add(key)
+    for key, kind in source_contracts.items():
+        previous = contracts.setdefault(key, kind)
+        if previous != kind:
+            contracts.pop(key, None)
     return module_name, contracts
 
 
@@ -6275,6 +6422,10 @@ def compile_project_call(
         () if root_function is None
         else _unexplained_root_argument_ids(root_function)
     )
+    source_execution_refusals = (
+        () if root_function is None
+        else _source_execution_refusals(root_function)
+    )
     root_semantic_complete = bool(
         root_function is not None
         and not unresolved_required_source_values
@@ -6534,6 +6685,9 @@ def compile_project_call(
                     _unexplained_root_argument_details(root_function)
                 )
             ),
+            "concordance_consumer_refusals": list(
+                source_execution_refusals
+            ),
             "complete": root_semantic_complete,
         },
         "unresolved_program_abi_references": [
@@ -6576,15 +6730,18 @@ def _accepted_physical_output_paths(
     published_ids: set[int],
     function: Any,
     kind: str | None,
+    *, book=None,
 ) -> tuple[dict[tuple[int, ...], int], str | None]:
     """Expand one authored output through its accepted physical receipt."""
 
+    from .structural_concordance import aggregate_return_layouts, optional_return_members
+    from .ssa_record_return_state import record_return_layouts
+
+    recorded_aggregates = aggregate_return_layouts(function, book=book)
     resolved = dict(paths)
     if len(resolved) == 1:
         _path, authored_id = next(iter(resolved.items()))
-        record_layout = dict(
-            function.metadata.get("record_return_layouts", ())
-        ).get(int(authored_id))
+        record_layout = record_return_layouts(function, book=book).get(int(authored_id))
         if record_layout is not None:
             layout = tuple(map(int, record_layout))
             if layout and len(layout) == len(published_ids) and (
@@ -6600,10 +6757,9 @@ def _accepted_physical_output_paths(
                 )
     optional_layouts = {
         int(payload_id): tuple(map(int, layout))
-        for payload_id, layout in tuple(
-            function.metadata.get("aggregate_return_layouts", ())
-        )
+        for payload_id, layout in recorded_aggregates.items()
         if len(tuple(layout)) == 2
+        and optional_return_members(function, payload_id, book=book)
     }
     if (
         len(resolved) == 1
@@ -6632,12 +6788,7 @@ def _accepted_physical_output_paths(
         for value_id in function.metadata.get("semantic_output_ids") or ()
     )
     if resolved and len(semantic_output_ids) == 1:
-        output_layout = dict(
-            (int(output_id), tuple(map(int, layout)))
-            for output_id, layout in tuple(
-                function.metadata.get("aggregate_return_layouts", ())
-            )
-        ).get(semantic_output_ids[0])
+        output_layout = recorded_aggregates.get(semantic_output_ids[0])
         if (
             output_layout is not None
             and len(output_layout) == 2 * len(resolved)
@@ -7000,6 +7151,8 @@ def _compile_resolved_process_graph_unit_impl(
         published_outputs = tuple(outputs.get(str(export_name), ()))
         sequence_table = module.sequence_tables.get(str(export_name))
         record_table = module.record_tables.get(str(export_name))
+        from .ssa_record_return_state import record_return_layouts
+
         conceptual_aggregate_ids = {
             *(
                 map(int, getattr(sequence_table, "sequences", {}).keys())
@@ -7011,8 +7164,10 @@ def _compile_resolved_process_graph_unit_impl(
             ),
             *(
                 int(record_id)
-                for record_id, _layout in function.metadata.get(
-                    "record_return_layouts", ()
+                for record_id in record_return_layouts(
+                    function, book=(function.metadata.get("accepted_ssa_component") or {}).get(
+                        "identity_book", module.metadata.get("identity_book"),
+                    ),
                 )
             ),
         }
@@ -7059,11 +7214,18 @@ def _compile_resolved_process_graph_unit_impl(
                 "values": [list(row) for row in structural_shortfalls],
             })
         if unexplained_arguments:
+            unexplained_details = _unexplained_root_argument_details(function)
             shortfalls.append({
                 "kind": "unexplained-public-arguments",
                 "value_ids": list(unexplained_arguments),
-                "details": list(_unexplained_root_argument_details(function)),
+                "details": list(unexplained_details),
             })
+            refusals = _source_execution_refusals(function)
+            if refusals:
+                shortfalls.append({
+                    "kind": "concordance-consumer-refusal",
+                    "details": list(refusals),
+                })
         if unresolved_calls:
             shortfalls.append({
                 "kind": "unresolved-authored-calls",
@@ -7159,14 +7321,18 @@ def _compile_resolved_process_graph_unit_impl(
                 kind = next(iter(kinds)) if len(kinds) == 1 else None
                 paths, kind = _accepted_physical_output_paths(
                     paths, published_ids, function, kind,
+                    book=(function.metadata.get("accepted_ssa_component") or {}).get(
+                        "identity_book", module.metadata.get("identity_book"),
+                    ),
                 )
-                if len(published_ids) == 1 and kind not in {"tuple", "list"}:
+                if len(paths) == 1 and len(published_ids) == 1 and kind not in {"tuple", "list"}:
                     # A scalar Return/Phi is the one published value, even
                     # when several authored return sites feed that Phi.
                     paths = {(0,): int(outputs[str(export_name)][0].id)}
             else:
                 raise ValueError("native result layout has no authoritative source reference")
-            if set(paths.values()) != published_ids:
+            if (set(paths.values()) != published_ids
+                    or len(paths) != len(outputs.get(str(export_name), ()))):
                 mismatch = {
                     "kind": "native-result-layout-mismatch",
                     "authored_paths": [

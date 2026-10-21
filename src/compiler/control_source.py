@@ -97,6 +97,7 @@ class ControlExpression(TiledObject):
     program_abi_parameter: str | None = None
     program_abi_field: str | None = None
     program_abi_record: str | None = None
+    optional_payload_value_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -630,6 +631,10 @@ class SequenceQueryBlock(TiledObject):
     source_call_node_id: int | None = None
     extraction_identity: str | None = None
     result_alias_ids: tuple[int, ...] = ()
+    # Exact reducer-owned member identities when the query returns one
+    # aggregate row. The aggregate root has no independent physical SSA
+    # value; resident columns publish under these members instead.
+    result_member_ids: tuple[int, ...] = ()
     producer_loop_node_id: int | None = None
     # Exact authored key identities for a resident keyed-table read.  These
     # are defined at this lexical position (often by a loop projection), so a
@@ -653,7 +658,7 @@ class SequenceQueryBlock(TiledObject):
     def __post_init__(self) -> None:
         if self.operation not in {
             "length", "truth", "first_or_default", "lookup", "membership",
-            "maximum",
+            "maximum", "any", "first",
         }:
             raise ValueError("unknown resident sequence query")
         if self.operation == "first_or_default" and self.default_value_id is None:
@@ -833,6 +838,7 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
         elif isinstance(block, SequenceQueryBlock):
             values.add(int(block.result_value_id))
             values.update(int(value_id) for value_id in block.result_alias_ids)
+            values.update(int(value_id) for value_id in block.result_member_ids)
             values.add(int(block.sequence_value_id))
             values.update(int(value_id) for value_id in block.key_value_ids)
             values.update(

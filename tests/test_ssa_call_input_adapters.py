@@ -312,6 +312,47 @@ def test_deferred_region_settlement_does_not_publish_numeric_feed():
     assert formal.dtype == 'int64'
 
 
+@pytest.mark.parametrize('deferred', (False, True))
+def test_returned_record_field_revises_stale_cut_time_feed_resident(deferred):
+    provisional = SSAValue(295, 'float64')
+    returned_field = SSAValue(2305843010216712754, 'bool', accounting={
+        'ssa_call_result_from': ('coerce_metrics', 17),
+        'program_abi_record': 'Metrics',
+        'program_abi_field': 'hard_failure',
+        'physical_dtype': 'bool',
+    })
+    formal = SSAValue(295, 'float64', accounting={
+        'ssa_call_result_from': ('coerce_metrics', 17),
+        'physical_dtype': 'bool',
+    })
+    region = Function('step_with_dt_control_used__planned_region_24', [formal], {
+        'entry': BasicBlock('entry', [Instr('Ret', [formal], None)]),
+    }, metadata={'source_region_integral': {'owner': 'step_with_dt_control_used'}})
+    call = Instr('Call', [returned_field], None, attributes={
+        'callee': region.name,
+        'feed_ids': (provisional.id,),
+        'feed_dtypes': ('float64',),
+    })
+    caller = Function('step_with_dt_control_used', [provisional], {
+        'entry': BasicBlock('entry', [
+            Instr('Identity', [], returned_field),
+            call,
+            Instr('Ret', [], None),
+        ]),
+    })
+    functions = {caller.name: caller, region.name: region}
+    publish_authored_ssa(functions)
+
+    assert _concord_exact_region_feed_dtypes(
+        functions, defer_unsettled_region_call_results=deferred,
+    ) == 1
+    assert call.attributes['feed_dtypes'] == ('bool',)
+    assert call.args[0].id == returned_field.id
+    assert call.args[0].dtype == 'bool'
+    assert formal.dtype == 'bool'
+    assert physical_call_input_conflicts(functions) == ()
+
+
 def test_cycle_signature_quotients_fresh_conversion_temporary_ids():
     source = SSAValue(1, 'bool', accounting={'physical_dtype': 'bool'})
     first = SSAValue(2, 'float64', accounting={'physical_dtype': 'float64'})

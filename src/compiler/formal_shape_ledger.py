@@ -97,9 +97,25 @@ def _publish_formal_shape(
         # Already parametric.  A third caller is a revision only when it is
         # a new source (its cells are not the ones already read); the same
         # caller on a later fixed-point round is not.
-        if not cells or {cell.key for cell in read} == {
-            source.key for source, _stage in book.edges_into(previous)
-        }:
+        # Revisions retain the preceding row cell plus the newly observed
+        # caller cells.  Walk that row-local revision chain so evidence read
+        # before the latest revision remains known; looking only at the
+        # latest cell's direct edges forgets the first callers and makes a
+        # settled polymorphic row report a mutation forever.
+        previously_read = set()
+        pending = [previous]
+        visited = set()
+        while pending:
+            revision = pending.pop()
+            if revision.key in visited:
+                continue
+            visited.add(revision.key)
+            for source, _stage in book.edges_into(revision):
+                if source.page == FORMAL_SHAPE and source.row == row:
+                    pending.append(source)
+                else:
+                    previously_read.add(source.key)
+        if not cells or all(cell.key in previously_read for cell in cells):
             return False
         book.post(
             FORMAL_SHAPE, row, Unresolved(FORMAL_SHAPE_CONFLICT, read=read),

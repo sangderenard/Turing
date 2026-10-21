@@ -1,5 +1,11 @@
 import pytest
+from src.compiler.extraction_contract import ExtractionContract
+from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.fortran_c_shell import _full_native_link_failures, _undefined_repository_ssa_operands
+from src.compiler.project_compilation_product import (
+    _source_execution_refusals,
+    _unexplained_root_argument_details,
+)
 from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock, IRModule
 
@@ -74,3 +80,69 @@ def test_full_native_gate_rejects_missing_returns_without_undefined_operands(key
     assert _undefined_repository_ssa_operands(module) == ()
     failures = _full_native_link_failures((), (), (), module=module)
     assert failures['structural_outputs']
+
+
+def test_variadic_tuple_formal_consumer_preserves_planner_verdict():
+    source = '''
+def f(x: tuple[int, ...]) -> tuple[int, ...]:
+    return (0, *x[1:])
+'''
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source,
+        'f',
+        extraction_contract=ExtractionContract(
+            'extraction_contracts/program_extraction.yaml'
+        ),
+        progress=lambda _message: None,
+        progress_bars=False,
+    )
+    function = module.functions[exports[0]]
+    receipts = dict(function.metadata['source_execution_receipts'])
+
+    constant = next(
+        receipt for receipt in receipts.values()
+        if receipt['construct'] == 'Constant' and receipt['source'] == '0'
+    )
+    assert constant['span'] == (3, 12, 3, 13)
+    assert constant['planner_verdict'] == 'dispatch_metadata'
+    assert constant['planner_rule'] == 'coordinator_node_type'
+
+
+def test_unexplained_formal_audit_joins_source_execution_receipt():
+    escaped = SSAValue(19, 'unknown')
+    function = Function('root', [escaped], {
+        'entry': BasicBlock('entry', [Instr('Ret', [escaped], None)]),
+    }, metadata={
+        'parameter_names': (),
+        'source_execution_receipts': ((19, {
+            'node_id': 19,
+            'construct': 'Tuple',
+            'source': '(origin, *ref.row[1:])',
+            'span': (5966, 21, 5966, 43),
+            'planner_verdict': 'dispatch_metadata',
+            'planner_rule': 'python_syntax',
+        }),),
+    })
+
+    expected = ({
+        'value_id': 19,
+        'dtype': 'unknown',
+        'shape': [],
+        'accounting': {},
+        'source_execution_receipt': {
+            'node_id': 19,
+            'construct': 'Tuple',
+            'source': '(origin, *ref.row[1:])',
+            'span': (5966, 21, 5966, 43),
+            'planner_verdict': 'dispatch_metadata',
+            'planner_rule': 'python_syntax',
+        },
+        'uses': [{
+            'block': 'entry',
+            'instruction_index': 0,
+            'operation': 'Ret',
+            'role': 'arg:0',
+        }],
+    },)
+    assert _unexplained_root_argument_details(function) == expected
+    assert _source_execution_refusals(function) == expected

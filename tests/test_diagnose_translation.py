@@ -1,6 +1,8 @@
 import json
 import os
 import hashlib
+import threading
+import time
 
 import tools.compile_project_catalogue as compile_project_catalogue
 from tools.diagnose_translation import (
@@ -160,7 +162,9 @@ def test_resolved_worker_retries_transient_windows_progress_replace(
 
     def briefly_denied(source, destination):
         attempts.append((source, destination))
-        if len(attempts) < 4:
+        # A real Windows observer/antivirus sharing interval exceeded the old
+        # 20-attempt window during the compiler bootstrap.
+        if len(attempts) < 26:
             raise PermissionError("observer retains sharing handle")
         real_replace(source, destination)
 
@@ -171,10 +175,53 @@ def test_resolved_worker_retries_transient_windows_progress_replace(
 
     report("ssa-source: lowering full planned source to repository SSA")
 
-    assert len(attempts) == 4
+    assert len(attempts) == 26
     assert json.loads((tmp_path / "compile-progress.json").read_text())[
         "current"
     ]["phase"] == "repository-ssa-lowering"
+
+
+def test_resolved_worker_serializes_threaded_progress_publishers(
+    tmp_path, monkeypatch,
+):
+    real_replace = os.replace
+    active = 0
+    overlap = []
+    guard = threading.Lock()
+
+    def reject_overlapping_replace(source, destination):
+        nonlocal active
+        with guard:
+            active += 1
+            if active > 1:
+                overlap.append(True)
+        try:
+            time.sleep(0.01)
+            real_replace(source, destination)
+        finally:
+            with guard:
+                active -= 1
+
+    monkeypatch.setattr(
+        compile_project_catalogue.os, "replace", reject_overlapping_replace,
+    )
+    report = _planned_unit_progress_writer(
+        tmp_path, 2, {"qualified_names": ["Compiler.lower"]},
+    )
+    workers = [
+        threading.Thread(target=report, args=(f"worker {index}",))
+        for index in range(8)
+    ]
+
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    assert not overlap
+    assert json.loads((tmp_path / "compile-progress.json").read_text())[
+        "unit_index"
+    ] == 2
 
 
 def test_compilation_unit_routes_published_repository_into_ssa_tree(tmp_path):

@@ -865,6 +865,18 @@ class ProgramABIContract:
                         active=(*active, record_name),
                     ))
                     continue
+                if row_field.storage == "table":
+                    # A child table in a record row is represented by the
+                    # row's exact int64 handle.  Its columns, lengths and
+                    # stride remain in the incumbent child-table pool named
+                    # by the field's row_record; they are not flattened into
+                    # the parent row or replaced by an opaque object.
+                    columns.append({
+                        "name": name,
+                        "dtype": "int64",
+                        "rank": 0,
+                    })
+                    continue
                 raise ExtractionContractError(
                     "program_abi table row record "
                     f"{record_name}.{field_name} uses unsupported "

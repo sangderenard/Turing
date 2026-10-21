@@ -1,14 +1,21 @@
 import pytest
 
 from src.compiler.identity_concordance import (
-    begin_identity_book, current_identity_book, end_identity_book,
+    Mode, Novel, begin_identity_book, current_identity_book,
+    end_identity_book,
+)
+from src.compiler.concordance_declarations import (
+    CALL_RECORD, CONTROL_SSA, FRAME_BINDING, INGEST_SOURCE, SSA_VALUE,
+    SSAValueFact, SSAValueOrigin,
 )
 from src.compiler.fortran_c_shell import (
     _complete_propagated_frame_tails, _propagate_record_field_demand,
     _harmonize_call_argument_shapes, _prune_unused_callee_formals,
     _intern_writable_region_outputs,
 )
-from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock
+from src.transmogrifier.ssa import (
+    SSAValue, Instr, Function, BasicBlock, SSACallRecord, SSACallTable,
+)
 from src.transmogrifier.ssa import SSATensorDescriptor, SSATensorTable
 
 
@@ -153,6 +160,55 @@ def test_pruning_updates_exact_call_input_receipt_with_operands():
     assert _prune_unused_callee_formals({'caller': caller, 'callee': callee}) == 1
     assert call.args == [args[1]]
     assert call.attributes['callee_input_ids'] == (2,)
+
+
+def test_pruning_revises_book_call_record_from_exact_record_and_formal_cells():
+    book = current_identity_book()
+    dead, live = SSAValue(1, 'float64'), SSAValue(2, 'float64')
+    for value in (dead, live):
+        book.post(
+            SSA_VALUE, ('callee', value.id),
+            SSAValueFact(value.dtype, (), SSAValueOrigin.ADOPTED_GRAPH_ID),
+            stage=CONTROL_SSA,
+            provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+        )
+    callee = Function(
+        'callee', [dead, live],
+        {'entry': BasicBlock('entry', [Instr('Ret', [live], None)])},
+    )
+    actual_dead, actual_live = SSAValue(10), SSAValue(11)
+    caller = Function(
+        'caller', [actual_dead, actual_live],
+        {'entry': BasicBlock('entry', [Instr(
+            'Call', [actual_dead, actual_live], None,
+            attributes={'callee': 'callee', 'callee_input_ids': (1, 2)},
+        )])},
+    )
+    table = SSACallTable(owner='prune-test', mutable=True)
+    source_cell = book.latest_ref(SSA_VALUE, ('callee', dead.id))
+    table.assign(
+        'caller', (SSACallRecord(
+            caller='caller', callsite_id=20, callee_reference=None,
+            callee_name='callee', callee_symbol='callee',
+            argument_bindings=((10, 1), (11, 2)),
+            frame_bindings=((1, 'caller_value', 10),
+                            (2, 'caller_value', 11)),
+            unresolved_frame_value_ids=(1, 2),
+        ),), sources=(source_cell,), stage=FRAME_BINDING,
+    )
+    incumbent = book.latest_ref(CALL_RECORD, (table.owner, 'caller'))
+
+    assert _prune_unused_callee_formals(
+        {'caller': caller, 'callee': callee}, table,
+    ) == 1
+
+    record = table['caller'][0]
+    assert record.argument_bindings == ((11, 2),)
+    assert record.frame_bindings == ((2, 'caller_value', 11),)
+    assert record.unresolved_frame_value_ids == (2,)
+    revised = book.latest_ref(CALL_RECORD, (table.owner, 'caller'))
+    assert revised is not None and revised != incumbent
+    assert incumbent in tuple(source for source, _stage in book.edges_into(revised))
 
 
 def test_tensor_output_ownership_survives_loss_of_record_field_name():

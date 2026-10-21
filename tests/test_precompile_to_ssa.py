@@ -214,6 +214,72 @@ def test_shared_receiver_column_is_the_declared_self_formal():
     ]
 
 
+def test_field_only_parameter_use_keeps_its_exact_authored_identity():
+    """``self.value = value`` acquires its use during slot injection."""
+
+    control = Function(
+        "Receiver__init",
+        [SSAValue(7, dtype="float64")],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], None)])},
+        metadata={
+            "authored_parameters": ("self", "value"),
+            "parameter_names": (),
+        },
+    )
+    lowered, _locations = _inject_field_slot_access(
+        control,
+        self_value_id=10,
+        non_self_param_ids=(7,),
+        non_self_parameters=(("value", 7),),
+        field_ops=(("write", 7, 0),),
+        field_count=1,
+        field_dtypes={0: "float64"},
+        receiver_accounting={
+            "program_abi_record": "Receiver",
+            "program_abi_parameter": "self",
+        },
+    )
+
+    assert lowered.metadata["parameter_names"] == (("value", 7),)
+    value = next(argument for argument in lowered.args if argument.id == 7)
+    assert value.accounting["program_abi_parameter"] == "value"
+
+
+def test_field_only_parameter_replaces_later_public_lexical_version():
+    later = SSAValue(
+        13, dtype="float64",
+        accounting={"program_abi_parameter": "dt_min"},
+    )
+    control = Function(
+        "Controller__init",
+        [later],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], None)])},
+        metadata={
+            "authored_parameters": ("self", "dt_min"),
+            "parameter_names": (("dt_min", 13),),
+        },
+    )
+
+    lowered, _locations = _inject_field_slot_access(
+        control,
+        self_value_id=10,
+        non_self_param_ids=(1,),
+        non_self_parameters=(("dt_min", 1),),
+        field_ops=(("write", 1, 0),),
+        field_count=1,
+        field_dtypes={0: "float64"},
+        receiver_accounting={
+            "program_abi_record": "Controller",
+            "program_abi_parameter": "self",
+        },
+    )
+
+    assert lowered.metadata["parameter_names"] == (("dt_min", 1),)
+    arguments = {argument.id: argument for argument in lowered.args}
+    assert arguments[1].accounting["program_abi_parameter"] == "dt_min"
+    assert "program_abi_parameter" not in arguments[13].accounting
+
+
 def test_field_receiver_rewrite_preserves_cfg_successors():
     predicate = SSAValue(7, dtype="bool")
     control = Function(
@@ -860,6 +926,14 @@ def test_structural_region_ops_are_ssa_values_and_indexes_are_legalized():
     assert operations.count("GetElementPtr") == 2
     assert "Load" in operations
     assert "Store" in operations
+    store = next(
+        instruction
+        for block in result.module.functions["numerical_region_0"].blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Store"
+    )
+    assert store.attributes["lowered_from"] == "IndexedStore"
+    assert store.attributes["source_effect_value_id"] == 15
 
 
 def test_index_dtype_propagation_is_scoped_per_function_identity():
@@ -1716,6 +1790,9 @@ def test_in_place_store_chain_on_a_parameter_publishes_nothing():
     assert shortfalls == ()
     region_0 = module.functions["planned_control__planned_region_0"]
     assert [value.id for value in outputs[region_0.name]] == []
+    assert region_0.metadata["source_region_integral"][
+        "effect_value_ids"
+    ] == (12, 13)
     control_function = module.functions["planned_control"]
     ret = next(
         instruction
@@ -2507,6 +2584,43 @@ def test_optional_physical_slot_keeps_following_named_output_alignment():
     )
 
 
+def test_exact_none_edge_expands_to_open_tail_physical_return_width():
+    """An early absent arm covers every lane of a physical tail result."""
+
+    program = ControlProgram(SequenceBlock(()))
+    builder = _ControlSSABuilder(
+        program,
+        function_name="optional_physical_tail",
+        first_value_id=100,
+        region_callees=None,
+        region_signatures=None,
+        constant_value_ids=(10,),
+        none_value_ids=(10,),
+        output_value_ids=(20, 21),
+    )
+    absence = builder.external_value(10, dtype="None")
+    first = builder.external_value(20, dtype="int64")
+    second = builder.external_value(21, dtype="float64")
+    entry = builder.current
+    early = builder.new_block("if_true")
+    builder.current = early
+    builder.branch(builder.function_exit_block())
+    builder.function_return_edges.append((early, (absence,)))
+    builder.current = entry
+
+    function, shortfalls = builder.finish()
+
+    assert shortfalls == ()
+    return_phis = [
+        instruction
+        for instruction in function.blocks["function_exit"].instrs
+        if instruction.attributes.get("binding") == "return_merge"
+    ]
+    assert len(return_phis) == 2
+    assert tuple(value.id for value in return_phis[0].args) == (10, first.id)
+    assert tuple(value.id for value in return_phis[1].args) == (10, second.id)
+
+
 def test_sequence_row_load_resolves_an_earlier_provisional_argument():
     program = ControlProgram(SequenceBlock(()))
     builder = _ControlSSABuilder(
@@ -2610,6 +2724,43 @@ def test_scheduled_row_type_tag_is_defined_at_its_earlier_predicate():
     assert all(
         int(argument.id) != target_id for argument in builder.arguments
     )
+
+
+def test_projected_union_requires_its_producer_sequence_payload_column():
+    scope = ("missing_projected_union_payload",)
+    target_id = 14
+    value_cell = _seed_value(scope, target_id, dtype="opaque_ref")
+    physical = tuple(
+        ValueTypeABIAlternative(
+            identity, "reference", "opaque_ref", (), 0, (), (value_cell,),
+        )
+        for identity in ("builtins.bool", "builtins.int")
+    )
+    fact = ValueTypeABIFact(
+        tuple(arm.identity for arm in physical),
+        (("builtins.bool", 0), ("builtins.int", 1)), physical,
+    )
+    current_identity_book().post(
+        VALUE_TYPE_ABI, (scope, target_id), fact,
+        stage=INGESTION, provenance=Derived((value_cell,)),
+        mode=Mode.CONCORD,
+    )
+    builder = _ControlSSABuilder(
+        ControlProgram(SequenceBlock(())),
+        function_name="missing_projected_union_payload",
+        first_value_id=100,
+        region_callees=None,
+        region_signatures=None,
+        lexical_read_scope=scope,
+        native_value_type_abi={target_id: fact},
+    )
+
+    assert builder._native_type_tag_sequence_column(20, 1, target_id) is None
+    assert len(builder.shortfalls) == 1
+    assert builder.shortfalls[0].domain == "ssa-sequence"
+    assert builder.shortfalls[0].name == "missing-union-payload-column"
+    assert "iterable 20" in builder.shortfalls[0].reason
+    assert (20, 1) not in builder.variant_type_tag_columns
 
 
 def test_stream_publication_uses_retained_aggregate_members_not_tuple_formal():
@@ -2948,7 +3099,70 @@ def test_nested_iterable_row_is_handle_stride_and_child_address():
     )
     # Call operands are derived typed/accounted views of the same identity.
     assert [(v.id, v.dtype, v.shape) for v in call.args] == [(row_address.id, row_address.dtype, row_address.shape)]
+    assert row_address.accounting["ssa_call_rank"] == 1
+    assert call.args[0].accounting["ssa_call_rank"] == 1
     assert call.args[0].accounting['ssa_storage_alias'] == row_address.id
+
+
+def test_nested_iterable_row_length_uses_selected_child_length():
+    control = ControlProgram(
+        LoopBlock(
+            "iteration_9",
+            "0",
+            "__iterable_extent_40__",
+            "1",
+            SequenceQueryBlock(
+                result_value_id=43,
+                sequence_value_id=42,
+                operation="length",
+                source_call_node_id=43,
+                extraction_identity="builtins.len",
+            ),
+        ),
+        iterable_bindings=((40, 42, "iteration_9"),),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_callees={},
+        region_signatures={},
+        region_value_meta={
+            40: Meta((4,), "int", "cpu"),
+            42: Meta((3,), "int", "cpu"),
+            43: Meta((), "int64", "cpu"),
+        },
+        nested_row_target_ids=(42,),
+    )
+
+    assert shortfalls == ()
+    body = function.blocks["loop_body"].instrs
+    length_address = next(
+        instruction
+        for instruction in body
+        if instruction.op == "GetElementPtr"
+        and instruction.attributes.get("binding") == "nested_row_length"
+    )
+    length_load = next(
+        instruction
+        for instruction in body
+        if instruction.op == "Load"
+        and instruction.attributes.get("binding") == "nested_row_length"
+    )
+    row_handle = next(
+        instruction.res
+        for instruction in body
+        if instruction.op == "Load"
+        and instruction.attributes.get("binding") == "nested_row_handle"
+    )
+    assert length_address.args[1].id == row_handle.id
+    assert length_load.args[0].id == length_address.res.id
+    assert any(
+        instruction.op == "Cast"
+        and instruction.res is not None
+        and instruction.res.id == 43
+        for instruction in body
+    )
 
 
 def test_explicit_iterable_binding_precedes_duplicate_closure_fallback():
@@ -4973,6 +5187,51 @@ def test_sequence_first_or_default_query_is_resident_and_receipted():
     assert 51 not in {value.id for value in function.args}
 
 
+def test_sequence_any_and_first_queries_are_resident_and_receipted():
+    control = ControlProgram(SequenceBlock((
+        SequenceQueryBlock(
+            result_value_id=50,
+            sequence_value_id=30,
+            operation="any",
+            source_call_node_id=41,
+            extraction_identity="builtins.any",
+        ),
+        SequenceQueryBlock(
+            result_value_id=51,
+            sequence_value_id=30,
+            operation="first",
+            source_call_node_id=42,
+            extraction_identity="builtins.next",
+        ),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        sequence_declarations=((30, "duplicates", 1, False),),
+        sequence_column_dtypes={30: ("bool",)},
+    )
+
+    assert shortfalls == ()
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    reduced = next(
+        instruction for instruction in instructions
+        if instruction.op == "Or"
+        and instruction.attributes.get("binding") == "ssa_sequence_any"
+    )
+    assert reduced.op == "Or"
+    first = next(
+        instruction for instruction in instructions
+        if instruction.res is not None and instruction.res.id == 51
+    )
+    assert first.op == "Cast"
+    assert first.attributes["extraction_identity"] == "builtins.next"
+    assert {50, 51}.isdisjoint(value.id for value in function.args)
+
+
 def test_sequence_query_consumes_unique_resident_contract():
     control = ControlProgram(SequenceBlock((
         SequenceMutationBlock(ControlSequenceMutation(
@@ -5310,6 +5569,68 @@ def test_zip_loop_uses_minimum_of_resident_source_lengths():
         instruction.op == "Select"
         and instruction.attributes.get("binding") == "control_minimum"
         for instruction in entry
+    )
+
+
+def test_sequence_first_refuses_to_drop_aggregate_row_columns():
+    control = ControlProgram(SequenceBlock((
+        SequenceQueryBlock(
+            result_value_id=50,
+            sequence_value_id=30,
+            operation="first",
+            source_call_node_id=41,
+            extraction_identity="builtins.next",
+        ),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        sequence_declarations=((30, "unique", 2, False),),
+        sequence_column_dtypes={30: ("int64", "int64")},
+    )
+
+    assert any(item.name == "first-aggregate-row" for item in shortfalls)
+    assert not any(
+        instruction.res is not None and instruction.res.id == 50
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+
+
+def test_sequence_first_publishes_every_exact_aggregate_row_member():
+    control = ControlProgram(SequenceBlock((
+        SequenceQueryBlock(
+            result_value_id=50,
+            sequence_value_id=30,
+            operation="first",
+            source_call_node_id=41,
+            extraction_identity="builtins.next",
+            result_member_ids=(51, 52),
+        ),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        sequence_declarations=((30, "unique", 2, False),),
+        sequence_column_dtypes={30: ("int64", "float64")},
+    )
+
+    assert shortfalls == ()
+    member_casts = {
+        instruction.res.id: instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Cast"
+        and instruction.attributes.get("binding")
+        == "sequence_first_aggregate_member"
+    }
+    assert tuple(member_casts) == (51, 52)
+    assert member_casts[51].res.dtype == "int64"
+    assert member_casts[52].res.dtype == "float64"
+    assert not any(
+        instruction.res is not None and instruction.res.id == 50
+        for block in function.blocks.values()
+        for instruction in block.instrs
     )
 
 

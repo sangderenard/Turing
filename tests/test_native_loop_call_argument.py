@@ -50,3 +50,32 @@ for dt in (0.5, 1.0, 2.0):
     assert execution.buffers[output].item() == dt * 1.75, execution.buffers[output]
 ''', str(saved)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_terminal_arm_call_keeps_seed_binding_before_later_carried_update():
+    policy = ExtractionContract('extraction_contracts/program_extraction.yaml').with_execution_file(
+        'extraction_contracts/vehicle_full_native_execution.yaml')
+    source = '''
+def next_cap(value):
+    return value * 2.0
+
+def root(dt, fast):
+    cap = AbstractTensor.tensor(dt * 0.25)
+    while True:
+        if fast:
+            return next_cap(cap)
+        cap = next_cap(cap)
+'''
+    module, _, exports = lower_ast_source_to_ssa(
+        source, 'root', name='terminal_arm_carried_call',
+        extraction_contract=policy,
+        python_bindings={'AbstractTensor': AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference())
+    assert exports[0] in module.functions
+    assert any(
+        instruction.op == 'Call'
+        and 'next_cap__specialized' in instruction.attributes.get('callee', '')
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )

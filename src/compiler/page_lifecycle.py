@@ -106,6 +106,15 @@ REPAIRS = "pre-native-repairs"
 EMISSION = "emission"
 
 PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
+    # Live structural recipes are consulted through finalization and by
+    # accepted-component readers. Their proof imports retain their owner;
+    # they are book edges, not scratch lowering pages.
+    "concordance_imported_cell": PageLifecycle(EMISSION, EMISSION, None),
+    "live_derivation": PageLifecycle(EMISSION, EMISSION, None),
+    "structural_value": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "boundary_transport": PageLifecycle("compiler-finalization", EMISSION, EMISSION),
+    "optional_value_structure": PageLifecycle(REPAIRS, EMISSION, EMISSION),
+    "aggregate_return_layout": PageLifecycle(REPAIRS, EMISSION, EMISSION),
     "glyph_sequence_step": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "graph_math_output": PageLifecycle(LOWERING, EMISSION, EMISSION),
     "abstract_tensor_program_value": PageLifecycle(LOWERING, None, LOWERING),

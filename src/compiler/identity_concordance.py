@@ -1386,6 +1386,8 @@ class CorrelationTable:
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
+        found.extend(self._live_structure_findings(module))
+        found.extend(self._ssa_publication_findings(module))
         found.extend(self._value_type_abi_findings(module))
         found.extend(self._source_callsite_activation_findings(module))
         found.extend(self._source_precision_boundary_findings(module))
@@ -3239,6 +3241,94 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _live_structure_findings(module: Any) -> list[Finding]:
+        """Audit current views separately from immutable historical evidence."""
+        books = []
+        main = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if main is not None:
+            books.append(main)
+        for function in module.functions.values():
+            component = (function.metadata or {}).get("accepted_ssa_component")
+            owner = None if component is None else component.get("identity_book")
+            if owner is not None and all(owner is not book for book in books):
+                books.append(owner)
+        found = []
+        for book in books:
+            imported_page = book.pages.get(IMPORTED_CELL.name)
+            if imported_page is not None:
+                for row in imported_page.rows():
+                    for column, _fact in imported_page.history(row):
+                        try:
+                            book._source_stamp(Ref(IMPORTED_CELL, row, column))
+                        except (ValueError, KeyError) as error:
+                            found.append(Finding(
+                                "invalid-imported-proof", str(row), None, str(error),
+                            ))
+            for page_name, row in book.stale_derivations():
+                found.append(Finding(
+                    "stale-live-derivation", str(row), None,
+                    f"{page_name} still names superseded dependency revisions",
+                ))
+        return found
+
+    @staticmethod
+    def _ssa_publication_findings(module: Any) -> list[Finding]:
+        """Compare every resident SSA occurrence with its published value fact.
+
+        The full bootstrap retained output facts after rewriting its Ret; the
+        managed tire retained a scalar SSA fact for a returned span. Checking
+        only whether an identity has a mint, or whether a derived view reads
+        current revisions, misses both: an unrecorded object write changes no
+        revision. This is a read-only comparison, never a late publication of
+        whatever the object currently happens to contain.
+        """
+        from .concordance_declarations import SSA_VALUE, SSAValueFact
+        from .ssa_record_return_state import function_scope_of
+
+        main = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        found = []
+        for name, function in module.functions.items():
+            component = (function.metadata or {}).get("accepted_ssa_component")
+            book = main if component is None else component.get("identity_book")
+            if book is None:
+                continue
+            scope = function_scope_of(function)
+            occurrences = {}
+
+            def observe(value, position):
+                key = (int(value.id), value.dtype, tuple(value.shape or ()))
+                occurrences.setdefault(key, []).append(position)
+
+            for index, value in enumerate(function.args):
+                observe(value, ("formal", index))
+            for label, block in function.blocks.items():
+                for index, instruction in enumerate(block.instrs):
+                    if instruction.res is not None:
+                        observe(instruction.res, (str(label), index, "result"))
+                    for ordinal, value in enumerate(instruction.args):
+                        observe(value, (str(label), index, "operand", ordinal))
+            for (value_id, dtype, shape), positions in occurrences.items():
+                cell = book.latest_ref(SSA_VALUE, (scope, value_id))
+                # Missing identity is already checked by the unsourced-value
+                # audit. It is not permission to synthesize a publication.
+                if cell is None:
+                    continue
+                fact = book.page(SSA_VALUE).cell(cell.row, cell.column)
+                if not isinstance(fact, SSAValueFact):
+                    found.append(Finding(
+                        "ssa-publication-unresolved", str(name), value_id,
+                        f"resident occurrence uses {cell!r} with fact {fact!r}",
+                    ))
+                elif (dtype, shape) != (fact.dtype, tuple(fact.shape or ())):
+                    found.append(Finding(
+                        "ssa-publication-type-disagreement", str(name), value_id,
+                        f"{cell!r} records {(fact.dtype, tuple(fact.shape or ()))!r}; "
+                        f"resident occurrence carries {(dtype, shape)!r} at "
+                        f"{tuple(positions)!r}",
+                    ))
+        return found
+
+    @staticmethod
     def _source_aggregate_layout_findings(module: Any) -> list[Finding]:
         """Validate immutable reducer-owned aggregate layout facts."""
 
@@ -4448,6 +4538,20 @@ class Derived:
 
 
 @dataclass(frozen=True)
+class ImportedCell:
+    """An exact source edge into a digest-pinned, independently owned book.
+
+    The owner is retained, not copied into the importing book's namespace.
+    In particular equal local row/column coordinates in two units do not
+    identify the same cell. The recorded fact is checked on every use.
+    """
+
+    source: Ref
+    fact: Any
+    owner: Any = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
 class Novel:
     transform: Transform
     operands: tuple[Ref, ...]
@@ -4464,6 +4568,23 @@ class Unresolved:
 
     reason: Reason
     read: tuple[Ref, ...] = ()
+
+
+@dataclass(frozen=True)
+class DerivationSnapshot:
+    """A live view's recipe and the exact revisions it last consumed.
+
+    Ordinary Derived edges remain historical evidence. Only a view explicitly
+    registered here follows the current revisions of its input rows. Recipes
+    are import-owned functions, so the same declaration survives book copying,
+    spilling and worker checkpoints without retaining compiler object closures.
+    """
+
+    recipe: Any
+    arguments: tuple
+    stage: Stage
+    target: Ref
+    reads: tuple  # (Page, row, Ref | None), including observed absence
 
 
 class Registry:
@@ -4573,6 +4694,16 @@ DEPENDENTS_PAGE = declare_page(
     "concordance_dependents",
     (RowField("source", _SCOPE), RowField("edge_row", _LABEL)),
     bool, private=True, rows_level=IdentityLogLevel.FULL,
+)
+LIVE_DERIVATION = declare_page(
+    "live_derivation",
+    (RowField("target_page", _NAME), RowField("target_row", _LABEL)),
+    DerivationSnapshot,
+)
+IMPORTED_CELL = declare_page(
+    "concordance_imported_cell",
+    (RowField("artifact_sha256", _SCOPE), RowField("source_key", _LABEL)),
+    ImportedCell, private=True,
 )
 #: One row per ``Novel`` post: ``(target_key, minted_id)`` with fact
 #: ``(transform, operands)``.  ``minted_id`` is None for a root row that
@@ -5653,6 +5784,135 @@ class IdentityBook:
         return page
 
     # ------------------------------------------------------------- the api
+    def derive_current(
+        self, page: Page, row: tuple, recipe: Any, arguments: tuple = (),
+        *, stage: Stage,
+    ) -> Ref:
+        """Refresh an explicitly live derived view before handing it out.
+
+        ``recipe(read, *arguments)`` reads authoritative rows through ``read``.
+        Those reads are both the dependency snapshot and the Derived sources;
+        there is no independently maintained invalidation graph. A source
+        revision invalidates this snapshot even when its value compares equal.
+        Historical provenance reads through ``cell`` remain historical.
+        """
+        if (not callable(recipe)
+                or "<" in getattr(recipe, "__qualname__", "")
+                or not getattr(recipe, "__module__", None)):
+            raise ConcordanceRefusal("live derivation requires an import-owned recipe")
+        key = (page.name, row)
+        snapshots = self.page(LIVE_DERIVATION)
+        previous = snapshots.latest(key)
+        if previous is not None and (
+            previous.recipe != recipe or previous.arguments != arguments
+            or previous.stage != stage
+        ):
+            raise ConcordanceRefusal(f"live derivation recipe disagreement: {key!r}")
+        active = self.__dict__.setdefault("_active_derivations", set())
+        if key in active:
+            raise ConcordanceRefusal(f"cyclic live derivation: {key!r}")
+        active.add(key)
+        try:
+            if previous is not None:
+                current_reads = tuple(
+                    (source_page, source_row, self.current_ref(source_page, source_row))
+                    for source_page, source_row, _cell in previous.reads
+                )
+                if (current_reads == previous.reads
+                        and self.latest_ref(page, row) == previous.target):
+                    return previous.target
+            reads = {}
+
+            def read(source_page, source_row, default=None):
+                cell = self.current_ref(source_page, source_row)
+                reads[(source_page, source_row)] = cell
+                return (default if cell is None else
+                        self.page(source_page).cell(cell.row, cell.column))
+
+            def read_ref(source_page, source_row):
+                read(source_page, source_row)
+                return reads[(source_page, source_row)]
+
+            read.ref = read_ref
+
+            fact = recipe(read, *arguments)
+            cells = tuple(dict.fromkeys(cell for cell in reads.values() if cell is not None))
+            if not cells:
+                raise ConcordanceRefusal(f"live derivation has no authoritative inputs: {key!r}")
+            incumbent = self.latest_ref(page, row)
+            # Even an equal answer must name its new generation when inputs
+            # changed. Downstream views then observe the revision causally.
+            target = self.post(
+                page, row, fact, stage=stage, provenance=Derived(cells),
+                mode=Mode.CONCORD if incumbent is None else Mode.REVISE,
+            )
+            snapshot = DerivationSnapshot(
+                recipe, tuple(arguments), stage, target,
+                tuple((source_page, source_row, cell)
+                      for (source_page, source_row), cell in reads.items()),
+            )
+            self.post(
+                LIVE_DERIVATION, key, snapshot, stage=stage,
+                provenance=Derived((target, *cells)),
+                mode=Mode.CONCORD if previous is None else Mode.REVISE,
+            )
+            return target
+        finally:
+            active.remove(key)
+
+    def current_ref(self, page: Page, row: tuple) -> Ref | None:
+        """Read a live view after refreshing its transitive dependencies."""
+        snapshots = dict.get(self.pages, LIVE_DERIVATION.name)
+        snapshot = None if snapshots is None else snapshots.latest((page.name, row))
+        if snapshot is None:
+            return self.latest_ref(page, row)
+        return self.derive_current(
+            page, row, snapshot.recipe, snapshot.arguments, stage=snapshot.stage,
+        )
+
+    def stale_derivations(self) -> tuple:
+        """Report stale current views without rewriting historical evidence."""
+        snapshots = dict.get(self.pages, LIVE_DERIVATION.name)
+        if snapshots is None:
+            return ()
+        stale = set()
+        records = tuple((row, snapshots.latest(row)) for row in snapshots.rows())
+        # A transitive dependent is stale even before its direct source has
+        # been recomputed. Traverse to closure; every round adds a row.
+        changed = True
+        while changed:
+            changed = False
+            for row, snapshot in records:
+                if row not in stale and (self.latest_ref(
+                    snapshot.target.page, snapshot.target.row,
+                ) != snapshot.target or any(
+                    (page.name, source_row) in stale
+                    or self.latest_ref(page, source_row) != cell
+                    for page, source_row, cell in snapshot.reads
+                )):
+                    stale.add(row)
+                    changed = True
+        return tuple(row for row, _snapshot in records if row in stale)
+
+    def settle_derivations(self) -> None:
+        """Settle registered live views with the compiler's bounded guard."""
+        from .bounded_fixed_point import BoundedFixedPoint
+
+        snapshots = dict.get(self.pages, LIVE_DERIVATION.name)
+        if snapshots is None:
+            return
+        guard = BoundedFixedPoint(
+            "live-concordance-derivations", len(tuple(snapshots.rows())) + 1,
+            book=self,
+        )
+        while True:
+            stale = self.stale_derivations()
+            for page_name, row in stale:
+                self.current_ref(self.registry.page(page_name), row)
+            if not guard.round(bool(stale), changed_ids=stale,
+                               state=self.stale_derivations()):
+                return
+
     def post(
         self,
         page: Page,
@@ -5902,7 +6162,42 @@ class IdentityBook:
             self._materialise_row(page, ref.row)
         if page is None or (ref.row, ref.column) not in page.cells:
             raise ConcordanceRefusal(f"source cell does not exist: {ref!r}")
+        if ref.page == IMPORTED_CELL:
+            imported = page.cells[(ref.row, ref.column)]
+            imported.owner._source_stamp(imported.source)
+            source_page = imported.owner.page(imported.source.page)
+            if source_page.cell(imported.source.row, imported.source.column) != imported.fact:
+                raise ConcordanceRefusal(f"imported source changed: {ref!r}")
         return page.stamps[(ref.row, ref.column)]
+
+    def import_cell(self, owner, source: Ref, artifact_sha256: str) -> Ref:
+        """Transport a proof, not a foreign row disguised as a local Ref.
+
+        This is a book-owned cross-book edge, like the ordinary edge page.
+        It neither mints a root nor asserts a new physical value. Accepted
+        dependency loading supplies the digest it verified and retains the
+        source book. Downstream Derived posts name this local edge receipt.
+        """
+        if owner is self:
+            self._source_stamp(source)
+            return source
+        if (not isinstance(artifact_sha256, str) or len(artifact_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in artifact_sha256)):
+            raise ConcordanceRefusal("imported proof requires its verified artifact digest")
+        owner._source_stamp(source)
+        fact = owner.page(source.page).cell(source.row, source.column)
+        row = (artifact_sha256, source.key)
+        page = self.page(IMPORTED_CELL)
+        previous = self.latest_ref(IMPORTED_CELL, row)
+        receipt = ImportedCell(source, fact, owner)
+        if previous is not None:
+            self._source_stamp(previous)
+            if page.cell(row, previous.column) != receipt:
+                raise ConcordanceRefusal(f"artifact proof disagreement: {row!r}")
+            return previous
+        page._stamp(row, 0, receipt)
+        self.clock[0] += 1
+        return Ref(IMPORTED_CELL, row, 0)
 
     def _admit_raw_write(self, page: IdentityPage, row: Any) -> None:
         """Refuse a write made through a raw primitive rather than
@@ -6288,6 +6583,14 @@ class IdentityBook:
             visited.add(ref.key)
             self._source_stamp(ref)  # materialise a virtual referenced cell
             copy_cell(ref.page.name, ref.row, ref.column)
+            # A current derived view transports its recomputation contract,
+            # not only the historical cells from which it was last computed.
+            # An explicitly historical target remains historical.
+            snapshot_cell = self.latest_ref(LIVE_DERIVATION, (ref.page.name, ref.row))
+            if snapshot_cell is not None:
+                snapshot = self.page(LIVE_DERIVATION).cell(snapshot_cell.row, snapshot_cell.column)
+                if snapshot.target == ref:
+                    pending.append(snapshot_cell)
             for source, stage in self.edges_into(ref):
                 edge_row = (ref.key, source.key, stage.name)
                 copy_cell(EDGE_PAGE.name, edge_row, 0)
@@ -6409,6 +6712,7 @@ def _concurrent_book_operation(operation):
 
 
 for _operation in ("post", "latest_ref", "mint_scope", "_source_stamp",
+                   "derive_current", "current_ref", "stale_derivations", "settle_derivations", "import_cell",
                    "_materialise_row", "_preserve_fork_snapshots", "register_read_through",
                    "register_scope_projection", "edges_into", "edges_out_of", "mint_of"):
     setattr(_ConcurrentIdentityBook, _operation,
@@ -7642,30 +7946,53 @@ def declare_loop_scope(
         # the earlier row.  Unique rows retain the historical key shape.
         row_key = (
             int(outer_id)
-            if outer_counts[int(outer_id)] == 1
+            if outer_counts[int(outer_id)] == 1 and not source_bindings
             else (
                 int(outer_id),
                 source_bindings or ("entry", int(ordinal)),
             )
         )
         row = (*scope, row_key)
-        cells = (
+        generation_cells = (
             () if rebind_cells is None
             else tuple(rebind_cells(
                 int(outer_id), int(carried_id), int(inner_id),
             ))
         )
-        _post_loop_scope_cell(book, row, OUTER, int(outer_id), cells)
-        _post_loop_scope_cell(book, row, CARRIED, int(carried_id), cells)
-        _post_loop_scope_cell(book, row, INNER, int(inner_id), cells)
-        _post_loop_scope_cell(
-            book, row, INNER + 1,
-            ("graph", int(graph_outer), int(graph_inner)), cells,
+        # Each column is a different generation.  Deriving all three from
+        # the same aggregate cell set makes the second revision correctly
+        # fail the monotonic-book rule (no source changed).  Preserve the
+        # callback's positional identity and source each generation from its
+        # own exact SSA cell.
+        generation_sources = tuple(
+            (() if index >= len(generation_cells) else (
+                generation_cells[index],
+            ))
+            for index in (OUTER, CARRIED, INNER)
         )
-        if source_bindings:
+        _post_loop_scope_cell(
+            book, row, OUTER, int(outer_id), generation_sources[OUTER],
+        )
+        _post_loop_scope_cell(
+            book, row, CARRIED, int(carried_id), generation_sources[CARRIED],
+        )
+        _post_loop_scope_cell(
+            book, row, INNER, int(inner_id), generation_sources[INNER],
+        )
+        # Historical unsourced declarations stored graph/binding annotations
+        # as later columns.  A sourced row is strictly the three generations:
+        # those annotations are not later generations and therefore cannot
+        # truthfully revise the row from the same already-consumed cells.
+        # The binding identity is retained in the row key itself.
+        if not any(cell is not None for cell in generation_cells):
             _post_loop_scope_cell(
-                book, row, INNER + 2, ("bindings", source_bindings), cells,
+                book, row, INNER + 1,
+                ("graph", int(graph_outer), int(graph_inner)), (),
             )
+            if source_bindings:
+                _post_loop_scope_cell(
+                    book, row, INNER + 2, ("bindings", source_bindings), (),
+                )
 
 
 def rebind_loop_scope_inner(
@@ -7760,19 +8087,33 @@ def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
                 and binding_identity[0] == "bindings"
             ):
                 rebind["source_bindings"] = tuple(binding_identity[1])
+            elif (
+                isinstance(key, tuple)
+                and len(key) == 2
+                and isinstance(key[1], tuple)
+                and not (
+                    len(key[1]) == 2 and key[1][0] == "entry"
+                    and isinstance(key[1][1], int)
+                )
+            ):
+                rebind["source_bindings"] = tuple(key[1])
             record["rebinds"].append(rebind)
     return [record for record in scopes.values() if record["boundary"]]
 
 
 def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
-    """Publish the final resident identity on every transformed backedge.
+    """Concord the completed module with every declared loop generation.
 
     Aggregate legalization and linked-call projection happen after control
     lowering declared the authored inner generation.  At the completed-module
     seam the loop Phi is the exact authority on what now crosses the latch.
     Reconcile that resident into the concordance so the declaration tracks the
     transformation instead of leaving a locally recorded but globally unknown
-    rename.
+    rename.  The same declaration says that an instruction inside the loop
+    cannot read the preheader (outer) generation: its header Phi is the exact
+    carried generation for that lexical binding.  Late-installed instructions
+    are rebound here from that declaration, not from a name, dtype, or inferred
+    value equivalence.
     """
 
     book = identity_book(module)
@@ -7781,6 +8122,11 @@ def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
         for declaration in loop_scope_declarations(book, function_name):
             header, latch, _exit = declaration["boundary"]
             loop_node_id = int(declaration["loop_node_id"])
+            rebinds_by_outer: dict[int, list[dict]] = {}
+            for declared_rebind in declaration["rebinds"]:
+                rebinds_by_outer.setdefault(
+                    int(declared_rebind["outer"]), []
+                ).append(declared_rebind)
             for rebind in declaration["rebinds"]:
                 carried = int(rebind["carried"])
                 declared_inner = int(rebind.get(
@@ -7834,6 +8180,129 @@ def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
                             "completed_module_latch_projection",
                         ),
                     }
+
+            # One outer value can seed several authored bindings in a
+            # simultaneous update.  In that case there is no unique carried
+            # generation and the concordance detector must retain the
+            # collapse finding.  A unique row, however, names the exact Phi
+            # that owns every in-scope read of the outer generation.
+            inside = _blocks_between(function, str(header), str(latch))
+            for outer, matching_rebinds in rebinds_by_outer.items():
+                if len(matching_rebinds) != 1:
+                    continue
+                rebind = matching_rebinds[0]
+                carried = int(rebind["carried"])
+                if outer == carried:
+                    continue
+                phi = _carried_phi(function, str(header), carried)
+                if phi is None or phi.res is None:
+                    continue
+
+                # Recover the declaration cell whose three generations name
+                # this exact outer/carried/inner relation.  Its row key may
+                # carry the authored binding identity, so match facts rather
+                # than weakening that identity back to the outer value id.
+                loop_page_decl = book.registry.page("loop_scope")
+                loop_page = book.page(loop_page_decl)
+                declaration_scope = (
+                    authored_function_name(function_name), loop_node_id,
+                )
+                generation_cells = []
+                for row in loop_page.scope_rows(declaration_scope[0]):
+                    if not (
+                        isinstance(row, tuple) and len(row) == 3
+                        and row[:2] == declaration_scope
+                        and row[2] != "boundary"
+                    ):
+                        continue
+                    generations = dict(loop_page.history(row))
+                    if (
+                        int(generations.get(OUTER, -1)) == outer
+                        and int(generations.get(CARRIED, -1)) == carried
+                        and int(generations.get(INNER, -1))
+                        == int(rebind.get("declared_inner", rebind["inner"]))
+                    ):
+                        cell = book.latest_ref(loop_page_decl, row)
+                        if cell is not None:
+                            generation_cells.append(cell)
+                if len(generation_cells) != 1:
+                    continue
+
+                from .concordance_declarations import (
+                    CONTROL_SSA_FINISH, LOOP_RESULT_USE_REBINDING,
+                )
+                from .ssa_record_return_state import (
+                    function_scope_of, ssa_block_identity_cell,
+                    ssa_value_identity_cell,
+                )
+
+                boundary_cell = book.latest_ref(
+                    loop_page_decl, (*declaration_scope, "boundary"),
+                )
+                value_cells = tuple(
+                    ssa_value_identity_cell(function, value_id, book=book)
+                    for value_id in (outer, carried)
+                )
+                for block_name, block in function.blocks.items():
+                    if str(block_name) not in inside:
+                        continue
+                    for instruction_index, instruction in enumerate(block.instrs):
+                        if str(instruction.op).casefold() == "phi":
+                            continue
+                        resolved_args = list(instruction.args)
+                        for argument_index, argument in enumerate(instruction.args):
+                            if int(argument.id) != outer:
+                                continue
+                            row = (
+                                function_scope_of(function), str(block_name),
+                                int(instruction_index), int(argument_index),
+                            )
+                            sources = tuple(dict.fromkeys(cell for cell in (
+                                boundary_cell,
+                                generation_cells[0],
+                                *value_cells,
+                                ssa_block_identity_cell(
+                                    function, str(block_name), book=book,
+                                ),
+                                ssa_block_identity_cell(
+                                    function, str(header), book=book,
+                                ),
+                            ) if cell is not None))
+                            if not sources:
+                                continue
+                            fact = (
+                                outer, carried,
+                                ("declared_loop_scope", loop_node_id,
+                                 str(header), str(latch)),
+                            )
+                            existing = book.latest_ref(
+                                LOOP_RESULT_USE_REBINDING, row,
+                            )
+                            if not (
+                                existing is not None
+                                and book.page(
+                                    LOOP_RESULT_USE_REBINDING
+                                ).latest(row) == fact
+                                and book.edges_into(existing)
+                            ):
+                                book.post(
+                                    LOOP_RESULT_USE_REBINDING, row, fact,
+                                    stage=CONTROL_SSA_FINISH,
+                                    provenance=Derived(sources),
+                                    mode=Mode.REVISE,
+                                )
+                            resolved_args[argument_index] = phi.res
+                            receipts.append({
+                                "function": str(function_name),
+                                "loop_node_id": loop_node_id,
+                                "block": str(block_name),
+                                "instruction_index": int(instruction_index),
+                                "argument_index": int(argument_index),
+                                "outer": outer,
+                                "carried": carried,
+                                "reason": "declared_loop_scope_outer_read",
+                            })
+                        instruction.args = resolved_args
     if receipts:
         metadata = getattr(module, "metadata", None)
         if metadata is not None:
@@ -8366,6 +8835,16 @@ def record_proven_shape(
         if isinstance(deepest[1], tuple) and len(deepest[1]) > 3
         else int(deepest[0])
     )
+    if (
+        tuple(deepest[1][1]) == extents
+        and target_level < deepest_level
+    ):
+        # Causal depth is monotone for one proven extent.  A later caller
+        # using the default level must not downgrade an answer already
+        # confirmed more deeply; retain that depth and let the duplicate
+        # source check below decide whether any new evidence was added.
+        target_level = deepest_level
+        fact = ("proven", extents, str(dtype or "float64"), target_level)
     if (
         tuple(deepest[1][1]) == extents
         or target_level > deepest_level

@@ -114,10 +114,30 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                         function, ADDRESS, (base, *indices, instruction.res),
                         stage=CONTROL_SSA_FINISH,
                     ))
+                    # The store has no result in address SSA, but the source
+                    # IndexedStore result is the exact identity of this
+                    # resident-memory effect.  Carry that identity across the
+                    # lowering transaction so integral accounting can prove
+                    # the effect was materialized instead of requiring the
+                    # deliberately eliminated alias value to remain defined.
+                    lowered_attributes = {
+                        **dict(instruction.attributes or {}),
+                        "lowered_from": str(canonical_op),
+                        **({"source_effect_value_id": int(instruction.res.id)}
+                           if instruction.res is not None else {}),
+                    }
                     rewritten.append(
-                        Instr("GetElementPtr", [base, *indices], address)
+                        Instr(
+                            "GetElementPtr", [base, *indices], address,
+                            attributes=lowered_attributes,
+                        )
                     )
-                    rewritten.append(Instr("Store", [value, address], None))
+                    rewritten.append(
+                        Instr(
+                            "Store", [value, address], None,
+                            attributes=lowered_attributes,
+                        )
+                    )
                     if instruction.res is not None:
                         aliases[int(instruction.res.id)] = base
                 else:
@@ -247,13 +267,18 @@ def _propagate_scalar_dtypes(functions) -> None:
                 ):
                     values.setdefault(int(value.id), []).append(value)
 
+        # Shared control identities may occur in several planned regions.
+        # Seeding from each region's local objects let a stale formal undo
+        # another region's published int64 feed (resident value 7), and let
+        # stale tire projections override a completed producer contract.
+        # Inference starts from the book, never from occurrence order.
+        from .structural_concordance import function_value_structure
+
         dtype_of: dict[int, str] = {}
-        for value_id, occurrences in values.items():
-            declared = [str(value.dtype) for value in occurrences if value.dtype]
-            if "int64" in declared or "i64" in declared:
-                dtype_of[value_id] = "int64"
-            elif declared:
-                dtype_of[value_id] = declared[0]
+        for value_id in values:
+            structure, _cell = function_value_structure(function, value_id, book=book)
+            if structure.dtype is not None:
+                dtype_of[value_id] = structure.dtype
 
         address_base: dict[int, int] = {}
         for instruction in instructions:
@@ -293,7 +318,7 @@ def _propagate_scalar_dtypes(functions) -> None:
             # identity book; its existing projection settlement still applies.
             and (not instruction.args or address_base.get(int(instruction.args[0].id))
                  not in aggregate_result_ids)
-            and str(instruction.res.dtype or "") in _DECLARED_LITERAL_DTYPES
+            and dtype_of.get(int(instruction.res.id), "") in _DECLARED_LITERAL_DTYPES
         }
 
         def declared_float(instruction) -> str | None:
@@ -325,7 +350,7 @@ def _propagate_scalar_dtypes(functions) -> None:
                 inferred = None
                 if instruction.op == "Const":
                     literal = instruction.attributes.get("value")
-                    declared = str(instruction.res.dtype or "")
+                    declared = dtype_of.get(result_id, "")
                     inferred = (
                         # A typed pointer literal (including null) is an
                         # address value, not an integer inferred from its
@@ -360,7 +385,7 @@ def _propagate_scalar_dtypes(functions) -> None:
                     if len(incoming_types) == 1 and None not in incoming_types:
                         inferred = next(iter(incoming_types))
                 elif instruction.op == "Load" and instruction.args:
-                    declared = str(instruction.res.dtype or "")
+                    declared = dtype_of.get(result_id, "")
                     base_id = address_base.get(int(instruction.args[0].id))
                     candidate = None if base_id is None else dtype_of.get(base_id)
                     if (
@@ -429,7 +454,7 @@ def _propagate_scalar_dtypes(functions) -> None:
                 # own ``ssa_value`` cell.  The book and the instruction
                 # disagreeing about a declared width is a missing edge: raise.
                 if inferred in narrow_integers and instruction.op not in {"Phi", "phi"}:
-                    declared = str(instruction.res.dtype or "")
+                    declared = dtype_of.get(result_id, "")
                     if (
                         (instruction.op == "Const" or result_id in declared_load_ids)
                         and declared in _DECLARED_LITERAL_DTYPES
@@ -486,46 +511,33 @@ def _propagate_scalar_dtypes(functions) -> None:
                 mode=Mode.CONCORD,
             )
 
-        for value_id, dtype in dtype_of.items():
-            for value in values.get(value_id, ()):
-                value.dtype = dtype
-        # The Phi's SSA record is the same identity, revised from its exact
-        # incoming records. Keep this settlement visible to the concordance.
-        for instruction in instructions:
-            if instruction.op not in {"Phi", "phi"} or instruction.res is None:
-                continue
-            previous, fact = value_cell(int(instruction.res.id))
-            if previous is None or fact.dtype == instruction.res.dtype:
-                continue
-            incoming = instruction.attributes.get("incoming")
-            incoming_values = tuple(v for _, v in incoming) if incoming else instruction.args
-            sources = tuple(cell for value in incoming_values
-                            for cell in (value_cell(int(value.id))[0],) if cell is not None)
-            book.post(SSA_VALUE, (scope, int(instruction.res.id)),
-                      SSAValueFact(instruction.res.dtype, fact.shape, fact.origin),
-                      stage=SCALAR_DTYPE_SETTLEMENT,
-                      provenance=Derived((previous, *sources)), mode=Mode.REVISE)
-        # Every other result this settlement retyped is the same identity
-        # too, revised from its operands' records (the dtype was inferred
-        # from them) and its integer-width decision when one was posted.
+        # Commit inferred contracts before materializing any occurrence.
+        # Phi causes are its incoming identities, not argument-list order.
         producers = {
             int(instruction.res.id): instruction
             for instruction in instructions if instruction.res is not None
         }
         for value_id, dtype in dtype_of.items():
             previous, fact = value_cell(int(value_id))
-            if previous is None or fact is None or fact.dtype == dtype:
-                continue
             producer = producers.get(int(value_id))
+            incoming = (None if producer is None or producer.op not in {"Phi", "phi"}
+                        else producer.attributes.get("incoming"))
+            operands = (tuple(value for _, value in incoming) if incoming
+                        else () if producer is None else producer.args)
             operand_cells = tuple(
-                cell for operand in (producer.args if producer is not None else ())
+                cell for operand in operands
                 for cell in (value_cell(int(operand.id))[0],) if cell is not None
             )
             width_cell = book.latest_ref(SCALAR_INTEGER_WIDTH, (scope, int(value_id)))
-            book.post(SSA_VALUE, (scope, int(value_id)),
-                      SSAValueFact(dtype, fact.shape, fact.origin),
-                      stage=SCALAR_DTYPE_SETTLEMENT,
-                      provenance=Derived(tuple(dict.fromkeys(
-                          cell for cell in (previous, *operand_cells, width_cell)
-                          if cell is not None))),
-                      mode=Mode.REVISE)
+            if previous is None or fact is None:
+                raise ValueError(f"scalar settlement lacks SSA identity: {(scope, value_id)!r}")
+            if fact.dtype != dtype:
+                book.post(SSA_VALUE, (scope, int(value_id)),
+                          SSAValueFact(dtype, fact.shape, fact.origin),
+                          stage=SCALAR_DTYPE_SETTLEMENT,
+                          provenance=Derived(tuple(dict.fromkeys(
+                              cell for cell in (previous, *operand_cells, width_cell)
+                              if cell is not None))),
+                          mode=Mode.REVISE)
+            for value in values.get(value_id, ()):
+                value.dtype = dtype

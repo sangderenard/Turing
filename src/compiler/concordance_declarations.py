@@ -147,6 +147,13 @@ class SourceGlyphComponent:
     #: Exact per-arm recipes for a semantic value union.  The component's
     #: ``operand_value_id`` names the union whose native tag selects one.
     union_alternatives: tuple[SourceGlyphUnionAlternative, ...] = ()
+    #: A source string operation may project glyphs from an earlier token
+    #: while preserving the operation as part of the exact recipe.  For
+    #: example ``token.strip()`` is rendered by a vocabulary keyed by
+    #: ``projection_source_value_id`` whose rows contain stripped glyphs.
+    projection_source_value_id: int | None = None
+    projection_transform: str | None = None
+    projection_operation_cell: Ref | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +187,75 @@ class SourceAggregateLayout:
     members: tuple
     conditional_cell: Ref | None = None
     arm_layout_cells: tuple = ()
+
+
+@dataclass(frozen=True)
+class StructuralValue:
+    """A recursive view of an existing value/descriptor, never a new identity.
+
+    Children retain semantic positions, including repeated physical identities.
+    Unknown physical types stay unknown until an authoritative row supplies
+    them. The source cell names the existing record that owns this structure.
+    """
+
+    kind: str
+    value_id: int
+    source: Ref
+    children: tuple = ()  # (semantic position/name, StructuralValue)
+    dtype: str | None = None
+    shape: tuple = ()
+    storage: str | None = None
+    mutable: bool | None = None
+
+    def __post_init__(self):
+        if self.kind not in {"scalar", "product", "record", "sequence",
+                             "optional", "reference", "unresolved", "span", "record_link"}:
+            raise ValueError(f"unknown structural kind {self.kind!r}")
+        positions = tuple(position for position, _child in self.children)
+        if len(set(positions)) != len(positions):
+            raise ValueError("structural positions must be unique")
+
+    def leaves(self, path: tuple = ()) -> tuple:
+        if self.kind == "record_link" and not self.children:
+            # A declared recursive/deferred link is not an empty record or
+            # an opaque scalar. A physical consumer needs its actual layout.
+            raise ValueError(f"record link has no materialized physical layout: {self.source!r}/{path!r}")
+        if self.children:
+            return tuple(leaf for position, child in self.children
+                         for leaf in child.leaves((*path, position)))
+        if self.kind in {"product", "record"}:
+            return ()
+        return ((path, self),)
+
+
+@dataclass(frozen=True)
+class BoundaryTransport:
+    """Total correspondence of two declared structural surfaces.
+
+    Every pair is an explicit producer path / consumer path relation. The
+    endpoints are current structural descriptor cells; their physical leaf
+    cells and storage contracts are recorded in ``members``.
+    """
+
+    producer: Ref
+    consumer: Ref
+    members: tuple
+    bindings: tuple
+
+
+STRUCTURAL_CONCORDANCE = declare_stage("structural_concordance")
+STRUCTURAL_VALUE = declare_page("structural_value", (
+    RowField("authority", K.SCOPE), RowField("value", K.VALUE_ID),
+), StructuralValue)
+BOUNDARY_TRANSPORT = declare_page("boundary_transport", (
+    RowField("owner", K.SCOPE), RowField("boundary", K.LABEL),
+), BoundaryTransport)
+OPTIONAL_VALUE_STRUCTURE = declare_page("optional_value_structure", (
+    RowField("function_scope", K.SCOPE), RowField("payload", K.VALUE_ID),
+), tuple)  # exact payload/presence SSA identities from optional lowering
+AGGREGATE_RETURN_LAYOUT = declare_page("aggregate_return_layout", (
+    RowField("function_scope", K.SCOPE), RowField("output", K.VALUE_ID),
+), tuple)  # ordered physical SSA identities, including repeated positions
 
 
 @dataclass(frozen=True)
@@ -2623,6 +2699,10 @@ class SSABlockKind(Enum):
     SEQUENCE_MAXIMUM_LOOP_RETAINED = "sequence_maximum_loop_retained"
     SEQUENCE_MAXIMUM_LATCH = "sequence_maximum_latch"
     SEQUENCE_MAXIMUM_EXIT = "sequence_maximum_exit"
+    SEQUENCE_ANY_HEADER = "sequence_any_header"
+    SEQUENCE_ANY_BODY = "sequence_any_body"
+    SEQUENCE_ANY_LATCH = "sequence_any_latch"
+    SEQUENCE_ANY_EXIT = "sequence_any_exit"
     SEQUENCE_QUERY_SELECTED = "sequence_query_selected"
     SEQUENCE_QUERY_DEFAULTED = "sequence_query_defaulted"
     SEQUENCE_QUERY_MERGE = "sequence_query_merge"
@@ -3952,6 +4032,16 @@ TENSOR_SHAPE_ENRICHMENT = declare_page("tensor_shape_enrichment", (
 CALL_RESULT_PROJECTION = declare_page("call_result_projection_concordance", (
     RowField("call", K.VALUE_ID), RowField("projection", K.VALUE_ID),
 ), tuple)
+#: A call-result aggregate projection that was replaced after specialization
+#: or structural folding, ``(callsite copy, slot, stale projection)`` -> the
+#: resident projection id; CONCORD, DERIVED(the stale and resident projection
+#: identity cells), stage PLANNER_TENSOR_SPECIALIZATION.
+CALLSITE_PROJECTION_IDENTITY = declare_page(
+    "callsite_projection_identity_concordance", (
+        RowField("callsite", K.SCOPE), RowField("slot", K.INDEX),
+        RowField("stale_projection", K.VALUE_ID),
+    ), int,
+)
 #: ``_class_surface_ssa_program``: an assignment target's projection of a call
 #: result (``a, b = f(n)``), ``(caller symbol, call node, projection node)`` ->
 #: ``(aggregate temporary, target name, projection node, target identity

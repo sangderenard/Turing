@@ -314,6 +314,11 @@ def link_process_graph_functions(
     references: dict[str, int] = {}
     for name, callee in sorted(functions.items()):
         function_name = str(name)
+        from .symbolic_equation_compiler import (
+            rebuild_symbolic_process_graph_in_current_book,
+        )
+
+        callee = rebuild_symbolic_process_graph_in_current_book(callee)
         parameters = tuple(callee.G.graph.get("function_parameters") or ())
         if not parameters:
             raise ValueError(
@@ -324,6 +329,22 @@ def link_process_graph_functions(
             raise ValueError(
                 f"linked ProcessGraph {function_name!r} has no outputs"
             )
+        from ..transmogrifier.graph.graph_express2 import (
+            resolve_source_definition,
+        )
+
+        source_definitions = tuple(
+            callee.G.graph.get("function_source_definitions") or ()
+        )
+        if not source_definitions:
+            raise ValueError(
+                f"linked ProcessGraph {function_name!r} has no authored "
+                "function source definitions"
+            )
+        source_cells = tuple(
+            resolve_source_definition(definition)
+            for definition in source_definitions
+        )
         reference = table.declare(
             function_name,
             qualified_name=function_name,
@@ -331,6 +352,7 @@ def link_process_graph_functions(
                 "source_language": callee.G.graph.get("symbolic_source"),
                 "linked_process_graph": True,
             },
+            source=source_cells,
         )
         callee.function_table = table
         callee.external_function_table = root.external_function_table

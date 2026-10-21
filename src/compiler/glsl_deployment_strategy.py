@@ -1652,14 +1652,14 @@ def _projection_result_bindings(graph, node_id, payload_ids):
 
 
 def _accepted_semantic_result_bindings(
-    declaration, output_paths, node_id, graph=None,
+    declaration, output_paths, node_id, graph=None, *, book=None,
 ):
     """Recover a logical result from an accepted physical return layout.
 
     Optional SSA publishes ``(payload, presence)`` at the native boundary,
-    but the source call still produces one value.  The reciprocal accounting
-    on those two accepted SSA values is the authority for that expansion; a
-    merely two-element tuple return has no such accounting and continues
+    but the source call still produces one value. The accepted component's
+    OPTIONAL_VALUE_STRUCTURE row is the authority for that expansion; a
+    merely two-element tuple return has no such declaration and continues
     through ordinary projection binding.
     """
 
@@ -1669,9 +1669,9 @@ def _accepted_semantic_result_bindings(
     if len(semantic_outputs) != 1:
         return None
     semantic_output = semantic_outputs[0]
-    layout = dict(
-        declaration.metadata.get("aggregate_return_layouts", ())
-    ).get(semantic_output)
+    from .structural_concordance import aggregate_return_layouts, optional_return_members
+
+    layout = aggregate_return_layouts(declaration, book=book).get(semantic_output)
     if layout is None:
         return None
     physical_outputs = tuple(map(int, layout))
@@ -1684,13 +1684,6 @@ def _accepted_semantic_result_bindings(
     ):
         return None
 
-    values = {int(value.id): value for value in declaration.args}
-    for block in declaration.blocks.values():
-        for instruction in block.instrs:
-            if instruction.res is not None:
-                values[int(instruction.res.id)] = instruction.res
-            for argument in instruction.args:
-                values.setdefault(int(argument.id), argument)
     pairs = tuple(zip(
         physical_outputs[0::2], physical_outputs[1::2], strict=True,
     ))
@@ -1700,32 +1693,11 @@ def _accepted_semantic_result_bindings(
     # per-position receipts ``optional_return_contracts`` carries for this
     # output say which.
     payload_ids = tuple(int(payload) for payload, _presence in pairs)
-    recorded_members = tuple(
-        int(contract["payload_value_id"])
-        for contract in sorted(
-            (
-                contract
-                for contract in declaration.metadata.get(
-                    "optional_return_contracts", ()
-                )
-                if contract.get("return_output_id") == semantic_output
-            ),
-            key=lambda contract: int(contract["return_position"]),
-        )
-    )
+    recorded_pairs = optional_return_members(declaration, semantic_output, book=book)
+    recorded_members = tuple(payload for payload, _presence, _fact in recorded_pairs)
     if int(pairs[0][0]) != semantic_output and recorded_members != payload_ids:
         return None
-    if not all(
-        values.get(int(payload_id)) is not None
-        and values.get(int(presence_id)) is not None
-        and (values[int(payload_id)].accounting or {}).get(
-            "ssa_optional_presence_id"
-        ) == int(presence_id)
-        and (values[int(presence_id)].accounting or {}).get(
-            "ssa_optional_payload_id"
-        ) == int(payload_id)
-        for payload_id, presence_id in pairs
-    ):
+    if tuple((payload, presence) for payload, presence, _fact in recorded_pairs) != pairs:
         return None
     if recorded_members != payload_ids or graph is None:
         return ((semantic_output, int(node_id)),)
@@ -2066,6 +2038,9 @@ def _build_shell_hierarchy_plan(
             _concord_call_argument_operands(graph, int(node_id), dict(enumerate(edges)))
             result_bindings = _accepted_semantic_result_bindings(
                 declaration, output_paths, node_id, graph,
+                book=(declaration.metadata.get("accepted_ssa_component") or {}).get(
+                    "identity_book", host.metadata.get("identity_book"),
+                ),
             )
             if result_bindings is None:
                 result_bindings = _call_result_bindings(
@@ -2474,6 +2449,16 @@ def _build_shell_hierarchy_plan(
             expanded: list[tuple[int, str]] = []
             for parent, role in node_data.get("parents") or ():
                 parent = int(parent)
+                if parent not in graph.G:
+                    # Structural specialization can retire a Phi after the
+                    # dispatch view was carved.  Its consumer's historical
+                    # parent record is not a live value and cannot become a
+                    # region capture: hierarchy publication quite correctly
+                    # refuses such a capture because there is no identity
+                    # cell left to derive it from.  The resident graph is the
+                    # authority for operands during this refresh, just as it
+                    # is for ``region_nodes`` above.
+                    continue
                 parent_data = graph.G.nodes.get(parent, {})
                 attributes = parent_data.get("attributes") or {}
                 leaves = tuple(map(
@@ -3267,9 +3252,20 @@ def _build_shell_hierarchy_plan(
             value_ranks=value_ranks,
             value_views=tuple(value_views),
         ))
-    control_values = set(_control_dependency_value_ids(
-        getattr(shell, "shell_control_program", None)
-    ))
+    # A final ControlProgram can retain control-only endpoints after
+    # structural specialization has retired their numerical graph nodes
+    # (for example, the updated side of a loop-carried Phi alias).  Those
+    # endpoints are allocated by ``compose_hierarchical_control``; they are
+    # not graph-backed captures and therefore have no node identity cell to
+    # publish here.  Capture only dependencies which still belong to this
+    # specialized graph.
+    control_values = {
+        int(value_id)
+        for value_id in _control_dependency_value_ids(
+            getattr(shell, "shell_control_program", None)
+        )
+        if int(value_id) in graph.G
+    }
 
     planned = PlanClosure(
         name=str(
@@ -3541,7 +3537,14 @@ def _refresh_hierarchy_control_captures(
         WhileBlock,
     )
 
-    values = set(_control_dependency_value_ids(shell.shell_control_program))
+    graph_nodes = shell.process_graph.G
+    values = {
+        int(value_id)
+        for value_id in _control_dependency_value_ids(
+            shell.shell_control_program
+        )
+        if int(value_id) in graph_nodes
+    }
 
     refreshed_items = []
     for item in closure.items:
@@ -6521,7 +6524,7 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
 
 # Serialized ProcessGraphs retain this derived cache. Bump its schema when
 # classification semantics change, so a compiler replay recomputes old facts.
-_DISPATCH_METADATA_CACHE_SCHEMA = 3
+_DISPATCH_METADATA_CACHE_SCHEMA = 4
 
 
 def _dispatch_metadata_node_classifier(graph: Any):
@@ -6666,11 +6669,19 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
         "-selector"
     ):
         return Rule.PRECISION_SELECTOR
-    if (data.get("attributes") or {}).get("authored_call_result_projection"):
+    if (
+        (data.get("attributes") or {}).get(
+            "authored_call_result_projection"
+        )
+        or (data.get("attributes") or {}).get("producer_kind")
+        == "sequence_query_member"
+    ):
         # Specialization publishes typed leaves of a callee's tuple return.
-        # Their tensor descriptors describe the payload, not a tensor gather
-        # to dispatch. Keep the projection at its owning call/branch; a free
-        # numerical region here escapes the loop that produces the return.
+        # A resident sequence query does the same for one aggregate row.
+        # Their tensor descriptors describe payloads, not tensor gathers to
+        # dispatch. Keep each projection at its owning call/query; a free
+        # numerical region here escapes the control operation that produces
+        # the result and asks an aggregate root for tensor address storage.
         return Rule.CALL_RESULT_PROJECTION
     if (data.get("attributes") or {}).get("bound_method_ref") is not None:
         return Rule.BOUND_METHOD
@@ -7758,6 +7769,29 @@ def _optional_presence_control_expression(
             "binding_name"
         )
         if candidate_parameter is None:
+            # Topology reduction can retain the formal's exact lexical
+            # identity while dropping the convenience ``binding_name``
+            # attribute from its Input occurrence.  The identity table is
+            # authoritative for that relation.  Require one name whose
+            # history owns this receiver and whose ProgramABI presence slot
+            # names the same optional field; never choose from a label.
+            candidates = {
+                str(name)
+                for name, history in histories.items()
+                if int(receiver_id) in tuple(map(int, history))
+                and any(
+                    attributes.get("program_abi_optional_presence")
+                    and str(attributes.get("program_abi_parameter"))
+                    == str(name)
+                    and str(attributes.get("program_abi_field"))
+                    == str(candidate_field)
+                    for _node_id, data in graph_obj.nodes(data=True)
+                    for attributes in (data.get("attributes") or {},)
+                )
+            }
+            if len(candidates) == 1:
+                candidate_parameter = candidates.pop()
+        if candidate_parameter is None:
             continue
         presence = tuple(
             (int(node_id), attributes)
@@ -7798,6 +7832,7 @@ def _optional_presence_control_expression(
     predicate = ControlExpression(
         "optional_presence",
         value_id=presence_id,
+        optional_payload_value_id=int(payload_id),
         program_abi_parameter=str(parameter),
         program_abi_field=str(field),
         program_abi_record=(
@@ -16431,6 +16466,12 @@ def _source_fallthrough_predicate_facts(graph: Any, controls, predicate_fact):
 
 def _publish_conditional_tuple_members(graph: Any) -> bool:
     """Publish position-matched tuple members as control-owned merge values."""
+    from ..common.tensors.topological_reducer import (
+        node_identity_cell,
+        post_derived_node_identity,
+    )
+    from .concordance_declarations import PLANNER_TENSOR_SPECIALIZATION
+
     changed = False
     memberships = _branch_compartments(graph)
     controls = _source_control_records(graph.G)
@@ -16493,13 +16534,25 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
                                     (graph.G.graph.get("return_slot_values") or {}).values()):
                 raise ValueError(f"optional tuple {node_id} escapes without a presence ABI")
             inactive = []
-            for descriptor in descriptors:
+            absent_role = ("body", "orelse")[1 - present_arm]
+            for descriptor, present_leaf in zip(
+                descriptors, leaves[present_arm],
+            ):
                 value_id = next_process_value_id(graph)
                 graph.G.add_node(value_id, type="Constant", op="const", value_id=value_id,
                                  constant=0, parents=[], children=[],
                                  tensor={"shape": (), "dtype": "ptr" if descriptor["shape"] else descriptor["dtype"]},
                                  attributes={"value": 0, "conditional_result_of": int(node_id),
                                              "optional_inactive_payload": True})
+                post_derived_node_identity(
+                    graph, value_id,
+                    (
+                        node_identity_cell(graph, int(node_id)),
+                        node_identity_cell(graph, int(parents[absent_role])),
+                        node_identity_cell(graph, int(present_leaf)),
+                    ),
+                    stage=PLANNER_TENSOR_SPECIALIZATION,
+                )
                 inactive.append(value_id)
             leaves[1 - present_arm] = tuple(inactive)
             optional = {"predicate_id": required[0], "present_when": required[1],
@@ -16520,6 +16573,14 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
             graph.G.add_node(member, type="Phi", op="Phi", value_id=member,
                              parents=[], children=[], tensor=copy.deepcopy(descriptor),
                              attributes={"conditional_result_of": int(node_id)})
+            post_derived_node_identity(
+                graph, member,
+                tuple(
+                    node_identity_cell(graph, int(source))
+                    for source, _role in edges
+                ),
+                stage=PLANNER_TENSOR_SPECIALIZATION,
+            )
             _set_operands(graph, member, edges, cause=_AGGREGATE_MEMBER)
             _append_operand(graph, int(node_id), member, "elts")
             bindings.append((int(left), int(right), member))
@@ -16609,8 +16670,11 @@ def _publish_callsite_return_members(
         int, attributes.get("aggregate_leaf_value_ids") or (),
     ))
 
-    from .concordance_declarations import PLANNER_TENSOR_SPECIALIZATION
-    from .identity_concordance import current_identity_book
+    from .concordance_declarations import (
+        CALLSITE_PROJECTION_IDENTITY,
+        PLANNER_TENSOR_SPECIALIZATION,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
 
     caller_name = str(caller.G.graph.get("function_name") or "")
     return_cells = tuple(return_cells)
@@ -16775,8 +16839,12 @@ def _publish_callsite_return_members(
         # the replacement ledger.  Otherwise ``append(result_record)`` can
         # retain the dead pre-specialization projection while the call itself
         # publishes the new one.
-        projection_identity = current_identity_book().page(
-            "callsite_projection_identity_concordance"
+        projection_book = current_identity_book()
+        projection_identity = projection_book.page(
+            CALLSITE_PROJECTION_IDENTITY
+        )
+        from ..common.tensors.topological_reducer import (
+            _posted_node_identity_cell,
         )
         projection_scope = (
             caller_name,
@@ -16798,7 +16866,19 @@ def _publish_callsite_return_members(
                     f"replacement={fact!r}"
                 )
             if incumbent is None:
-                projection_identity.set(row, 0, fact)
+                projection_sources = tuple(dict.fromkeys(
+                    cell for cell in (
+                        _posted_node_identity_cell(caller, int(stale_id)),
+                        _posted_node_identity_cell(caller, int(replacement_id)),
+                    )
+                    if cell is not None
+                ))
+                projection_book.post(
+                    CALLSITE_PROJECTION_IDENTITY, row, fact,
+                    stage=PLANNER_TENSOR_SPECIALIZATION,
+                    provenance=Derived(projection_sources),
+                    mode=Mode.CONCORD,
+                )
             _retarget_all_cached_value_ids(
                 caller, int(stale_id),
                 int(projection_identity.latest(row)),
@@ -16869,9 +16949,9 @@ def _linked_optional_aggregate_record(entry: Any) -> tuple | None:
     if owner_book is None or len(semantic) != 1:
         return None
     output = int(semantic[0])
-    source = dict(
-        declaration.metadata.get("aggregate_return_layout_sources", ())
-    ).get(output)
+    from .structural_concordance import aggregate_return_source
+
+    source = aggregate_return_source(declaration, output, book=owner_book)
     if source is None:
         return None
     from .concordance_declarations import (
@@ -16891,20 +16971,20 @@ def _linked_optional_aggregate_record(entry: Any) -> tuple | None:
         and arms.kind is ReturnArmsKind.OPTIONAL_AGGREGATE
     ):
         return None
-    receipts = {
-        int(receipt["payload_value_id"]): receipt
-        for receipt in declaration.metadata.get("optional_return_contracts", ())
-        if receipt.get("return_output_id") is not None
-        and int(receipt["return_output_id"]) == output
+    from .structural_concordance import optional_return_members
+
+    payloads = {
+        payload_id: payload for payload_id, _presence_id, payload
+        in optional_return_members(declaration, output, book=owner_book)
     }
     descriptors = []
     for member in layout.members:
-        receipt = receipts.get(int(member.value_id))
+        payload = payloads.get(int(member.value_id))
         descriptors.append(
-            None if receipt is None else {
-                "shape": tuple(receipt.get("shape") or ()),
-                "dtype": str(receipt["dtype"]),
-                "rank": len(tuple(receipt.get("shape") or ())),
+            None if payload is None else {
+                "shape": payload.shape,
+                "dtype": payload.dtype,
+                "rank": len(payload.shape),
             }
         )
     return tuple(descriptors), str(layout.aggregate_kind)
@@ -18197,6 +18277,13 @@ def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
             continue
         replacements = []
         replaced = []
+        from ..common.tensors.topological_reducer import (
+            node_identity_cell,
+            post_derived_node_identity,
+        )
+        from .concordance_declarations import PLANNER_TENSOR_SPECIALIZATION
+
+        aggregate_source_cell = node_identity_cell(graph, int(node_id))
         for index, (leaf_id, descriptor) in enumerate(zip(
             leaves, descriptors,
         )):
@@ -18224,6 +18311,11 @@ def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
                     else copy.deepcopy(dict(descriptor))
                 ),
             )
+            for synthesized_id in (index_id, member_id):
+                post_derived_node_identity(
+                    graph, synthesized_id, (aggregate_source_cell,),
+                    stage=PLANNER_TENSOR_SPECIALIZATION,
+                )
             _set_operands(
                 graph, member_id, [(int(node_id), "base"), (index_id, "index")],
                 cause=_AGGREGATE_MEMBER,
@@ -18232,10 +18324,19 @@ def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
             replaced.append((int(leaf_id), int(member_id)))
             repaired += 1
         if replaced:
-            from .identity_concordance import current_identity_book
+            from .concordance_declarations import (
+                CALLSITE_PROJECTION_IDENTITY,
+            )
+            from .identity_concordance import (
+                Derived, Mode, current_identity_book,
+            )
 
-            projection_identity = current_identity_book().page(
-                "callsite_projection_identity_concordance"
+            projection_book = current_identity_book()
+            projection_identity = projection_book.page(
+                CALLSITE_PROJECTION_IDENTITY
+            )
+            from ..common.tensors.topological_reducer import (
+                _posted_node_identity_cell,
             )
             projection_scope = (
                 str(graph.G.graph.get("function_name") or ""),
@@ -18260,8 +18361,24 @@ def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
                         f"replacement={replacement_id!r}"
                     )
                 if incumbent is None:
-                    projection_identity.set(
-                        row, 0, int(replacement_id)
+                    projection_sources = tuple(dict.fromkeys(
+                        cell for cell in (
+                            _posted_node_identity_cell(
+                                graph, int(stale_id),
+                            ),
+                            _posted_node_identity_cell(
+                                graph, int(replacement_id),
+                            ),
+                            aggregate_source_cell,
+                        )
+                        if cell is not None
+                    ))
+                    projection_book.post(
+                        CALLSITE_PROJECTION_IDENTITY,
+                        row, int(replacement_id),
+                        stage=PLANNER_TENSOR_SPECIALIZATION,
+                        provenance=Derived(projection_sources),
+                        mode=Mode.CONCORD,
                     )
                 _retarget_all_cached_value_ids(
                     graph, int(stale_id),
@@ -19374,6 +19491,25 @@ def _tensor_descriptor_rule(
     tensor = dict(data.get("tensor") or {})
     attributes = data.get("attributes") or {}
     reference = attributes.get("callee_ref", attributes.get("method_ref"))
+    scalar_cast_identity = str(
+        attributes.get("extraction_identity")
+        or attributes.get("static_python_reference")
+        or ""
+    )
+    scalar_cast_dtype = {
+        "builtins.bool": "bool", "bool": "bool",
+        "builtins.float": "float64", "float": "float64",
+        "builtins.int": "int64", "int": "int64",
+    }.get(scalar_cast_identity)
+    if scalar_cast_dtype is not None:
+        # These canonical Python-language intrinsics declare their physical
+        # result independently of the operand: conversion may consume a
+        # tensor scalar, a native scalar, or another admitted numeric value,
+        # but its result is one rank-zero value of the named builtin class.
+        # Publishing that exact descriptor here lets ordinary downstream laws
+        # (notably the two-argument min in _propose_dt_pen) retain the scalar
+        # result across a call edge instead of manufacturing a formal later.
+        return {"shape": (), "dtype": scalar_cast_dtype, "rank": 0}
     if (str(data.get("op") or data.get("type") or "").casefold() == "call"
             and attributes.get("static_python_reference") == "id"):
         # Identity is an integer handle even when its reference operand has
@@ -19656,12 +19792,14 @@ def _tensor_descriptor_rule(
     if "shape" not in tensor and str(
         data.get("op") or data.get("type") or ""
     ).casefold() == "getattr":
-        # A declared record span is already a tensor boundary even when the
-        # receiver is an opaque Python-shaped record. Resolve that exact
-        # contract here, in the compiler-owned descriptor query used by both
-        # callsite specialization and region shape planning. Waiting until
-        # record-slot SSA materialization is too late: callees have already
-        # partitioned gather/matmul regions by then.
+        # A declared record field is already a numerical boundary even when
+        # the receiver is an opaque Python-shaped record.  Spans state their
+        # extents explicitly; scalar fields state ``storage=scalar, rank=0``
+        # and deliberately omit ``shape``.  Both declarations are complete.
+        # Resolve that exact contract here, in the compiler-owned descriptor
+        # query used by callsite specialization and region shape planning.
+        # Waiting until record-slot SSA materialization is too late: callees
+        # have already partitioned their numerical regions by then.
         field_name = str(
             (data.get("attributes") or {}).get("attribute") or ""
         )
@@ -19701,10 +19839,19 @@ def _tensor_descriptor_rule(
             (record.get("fields") or {}).get(field_name)
             if isinstance(record, Mapping) else None
         )
-        if isinstance(field, Mapping) and field.get("shape") is not None:
+        declared_scalar = bool(
+            isinstance(field, Mapping)
+            and str(field.get("storage") or "").casefold() == "scalar"
+            and int(field.get("rank", 0)) == 0
+        )
+        if isinstance(field, Mapping) and (
+            field.get("shape") is not None or declared_scalar
+        ):
+            field_shape = tuple(map(int, field.get("shape") or ()))
             tensor = {
-                "shape": tuple(map(int, field["shape"])),
+                "shape": field_shape,
                 "dtype": str(field.get("dtype") or "float64"),
+                "rank": len(field_shape),
             }
         elif field_name in {"real", "imag"} and receiver is not None:
             inherited = _tensor_descriptor(graph, receiver, seen)
@@ -20093,16 +20240,29 @@ def _tensor_descriptor_rule(
                             "dtype": dtype,
                             "rank": len(settled),
                         }
-        if operation in _ELEMENTWISE_BINARY_OPERATIONS:
+        expression = data.get("expr_obj")
+        variadic_builtin_selector = bool(
+            operation in {"min", "max"}
+            and isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+            and str(attributes.get("extraction_identity") or "")
+            in {f"builtins.{operation}", operation}
+        )
+        if operation in _ELEMENTWISE_BINARY_OPERATIONS or variadic_builtin_selector:
             operands = tuple(
                 int(parent)
                 for parent, role in data.get("parents") or ()
-                if str(role).casefold() in {
-                    "lhs", "rhs", "left", "right", "operand", "value", "other",
-                }
+                if (
+                    str(role).casefold() in {
+                        "lhs", "rhs", "left", "right", "operand", "value",
+                        "other",
+                    }
+                    or variadic_builtin_selector
+                    and str(role).casefold().startswith("arg:")
+                )
                 and int(parent) in graph.G
             )
-            if len(operands) == 2:
+            if len(operands) >= 2:
                 sides = []
                 for operand in operands:
                     side = _tensor_descriptor(graph, operand, seen)
@@ -20187,14 +20347,18 @@ def _tensor_descriptor_rule(
                 if all(side is not None for side in sides) and all(
                     descriptor_states_a_shape(side) for side in sides
                 ):
-                    left_shape = tuple(sides[0].get("shape") or ())
-                    right_shape = tuple(sides[1].get("shape") or ())
                     # Only the existing admitted integer law crosses the
                     # accelerator boundary. Unknown/scalar/callsite guards
                     # above, precision promotion below and book publication
                     # in _tensor_descriptor remain owned by this pass.
                     from .native_compiler_accelerators import broadcast_shape
-                    broadcast = broadcast_shape(left_shape, right_shape)
+                    broadcast = tuple(sides[0].get("shape") or ())
+                    for side in sides[1:]:
+                        broadcast = broadcast_shape(
+                            broadcast, tuple(side.get("shape") or ()),
+                        )
+                        if broadcast is None:
+                            break
                     if broadcast is not None:
                         dtype = (
                             "bool"
@@ -24197,6 +24361,15 @@ def _apply_callsite_aggregate_descriptors(
         ) -> None:
             """Materialize one level, retaining nested member ledgers."""
 
+            from ..common.tensors.topological_reducer import (
+                node_identity_cell,
+                post_derived_node_identity,
+            )
+            from .concordance_declarations import (
+                PLANNER_TENSOR_SPECIALIZATION,
+            )
+
+            aggregate_source_cell = node_identity_cell(graph, int(input_id))
             projections: dict[int, list[int]] = {}
             for node_id, data in tuple(graph.G.nodes(data=True)):
                 if str(
@@ -24252,6 +24425,14 @@ def _apply_callsite_aggregate_descriptors(
                         copy.deepcopy(dict(descriptor))
                         if isinstance(descriptor, Mapping) else {}
                     ),
+                )
+                # Each synthesized formal member is the exact projection of
+                # this aggregate input.  Register that identity before an
+                # alias or operand edge names the member; otherwise
+                # ``_set_operands`` correctly refuses the unbooked node.
+                post_derived_node_identity(
+                    graph, leaf_id, (aggregate_source_cell,),
+                    stage=PLANNER_TENSOR_SPECIALIZATION,
                 )
                 leaves.append(leaf_id)
                 for projection in projections.get(index, ()):

@@ -30,9 +30,10 @@ from src.compiler.project_compilation_product import (
 
 
 COMPILER_USAGE_TRACE_ROOT_ENV = "TURING_COMPILER_USAGE_TRACE_ROOT"
+_ATOMIC_JSON_WRITER_LOCK = threading.Lock()
 
 
-def _atomic_json(path: Path, value) -> None:
+def _atomic_json_unlocked(path: Path, value) -> None:
     """Publish worker telemetry without making observation a failure mode.
 
     Progress files are read concurrently by the parent process.  On Windows,
@@ -48,14 +49,28 @@ def _atomic_json(path: Path, value) -> None:
         json.dumps(value, indent=2, sort_keys=True),
         encoding="utf-8", newline="\n",
     )
-    for attempt in range(50):
+    for attempt in range(500):
         try:
             os.replace(temporary, path)
             return
         except PermissionError:
-            if attempt == 49:
+            if attempt == 499:
                 raise
             time.sleep(0.01)
+
+
+def _atomic_json(path: Path, value) -> None:
+    """Serialize telemetry publishers within one worker process.
+
+    SSA regions report from several threads.  Their temporary names are
+    distinct, but Windows can deny two simultaneous replacements of the same
+    destination long enough to exhaust the sharing-violation retry window.
+    The progress receipt is one ordered stream, so its publishers must cross
+    this existing atomic boundary one at a time.
+    """
+
+    with _ATOMIC_JSON_WRITER_LOCK:
+        _atomic_json_unlocked(path, value)
 
 
 class _CompilerUsageProfiler:

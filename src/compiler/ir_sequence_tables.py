@@ -2707,7 +2707,7 @@ def lower_table_lookup(
     required: bool = False,
     first_value_id: int | None = None,
 ) -> SSASequenceLowering:
-    """Build key lookup for a two-column table and publish found status.
+    """Build key lookup and return every physical value column.
 
     ``default_parameter`` appends one trailing argument of the value column's
     dtype and returns it from the absent branch -- the ``d.get(key, default)``
@@ -2718,8 +2718,12 @@ def lower_table_lookup(
         column for column in range(len(descriptor.column_value_ids))
         if column not in descriptor.key_columns
     )
-    if not descriptor.key_columns or len(value_columns) != 1:
-        raise ValueError("table lookup requires key columns and one value column")
+    if not descriptor.key_columns or not value_columns:
+        raise ValueError("table lookup requires key and value columns")
+    if default_parameter and len(value_columns) != 1:
+        raise ValueError(
+            "table lookup defaults require exactly one value column"
+        )
     if descriptor.status_address_id is None:
         raise ValueError("table lookup requires a caller-visible status cell")
     storage = _storage_values(descriptor)
@@ -2730,8 +2734,9 @@ def lower_table_lookup(
     key_dtypes = tuple(
         descriptor.column_dtypes[column] for column in descriptor.key_columns
     )
-    value_column = value_columns[0]
-    value_dtype = descriptor.column_dtypes[value_column]
+    value_dtypes = tuple(
+        descriptor.column_dtypes[column] for column in value_columns
+    )
     queries = tuple(builder.fresh(dtype) for dtype in key_dtypes)
     entry = builder.block("entry")
     header = builder.block("lookup_header")
@@ -2791,23 +2796,31 @@ def lower_table_lookup(
     builder.cond(body, matches, found, latch)
     builder.emit(latch, "Add", [index, one], next_index)
     builder.branch(latch, header)
-    value_address = builder.fresh("ptr")
-    found_value = builder.fresh(value_dtype)
-    builder.emit(found, "GetElementPtr", [
-        SSAValue(descriptor.column_value_ids[value_column], dtype=value_dtype), index
-    ], value_address)
-    builder.emit(found, "Load", [value_address], found_value)
+    found_values = []
+    for value_column, value_dtype in zip(value_columns, value_dtypes):
+        value_address = builder.fresh("ptr")
+        found_value = builder.fresh(value_dtype)
+        builder.emit(found, "GetElementPtr", [
+            SSAValue(
+                descriptor.column_value_ids[value_column], dtype=value_dtype,
+            ), index,
+        ], value_address)
+        builder.emit(found, "Load", [value_address], found_value)
+        found_values.append(found_value)
     builder.emit(found, "Store", [one, status_slot])
     builder.branch(found, result_block)
     if default_parameter:
-        missing_value = builder.fresh(value_dtype)
-        default_argument = missing_value
+        missing_values = (builder.fresh(value_dtypes[0]),)
+        default_argument = missing_values[0]
     else:
-        missing_value = builder.fresh(value_dtype)
-        default_argument = None
-        builder.emit(
-            absent, "Const", [], missing_value, attributes={"value": 0},
+        missing_values = tuple(
+            builder.fresh(value_dtype) for value_dtype in value_dtypes
         )
+        default_argument = None
+        for missing_value in missing_values:
+            builder.emit(
+                absent, "Const", [], missing_value, attributes={"value": 0},
+            )
     builder.emit(absent, "Store", [zero, status_slot])
     if required:
         builder.emit(absent, "Call", [], attributes={
@@ -2818,11 +2831,17 @@ def lower_table_lookup(
             "failure": "required_key_absent",
         })
     builder.branch(absent, result_block)
-    result = builder.fresh(value_dtype)
-    builder.emit(result_block, "Phi", [found_value, missing_value], result, attributes={
-        "incoming_blocks": (found.name, absent.name)
-    })
-    builder.emit(result_block, "Ret", [result])
+    results = []
+    for found_value, missing_value, value_dtype in zip(
+        found_values, missing_values, value_dtypes,
+    ):
+        result = builder.fresh(value_dtype)
+        builder.emit(
+            result_block, "Phi", [found_value, missing_value], result,
+            attributes={"incoming_blocks": (found.name, absent.name)},
+        )
+        results.append(result)
+    builder.emit(result_block, "Ret", list(results))
     name = function_name or f"ssa_sequence_{descriptor.sequence_id}_lookup"
     function = Function(
         name,
@@ -2841,7 +2860,13 @@ def lower_table_lookup(
                 int(descriptor.status_address_id),
                 *((int(descriptor.live_flags_value_id),) if descriptor.live_flags_value_id is not None else ()),
             )),
-            "named_outputs": (("value", int(result.id)),),
+            "named_outputs": tuple(
+                (
+                    "value" if len(results) == 1 else f"value_{index}",
+                    int(result.id),
+                )
+                for index, result in enumerate(results)
+            ),
             "required": bool(required),
         },
     )
