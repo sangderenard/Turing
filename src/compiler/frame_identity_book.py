@@ -106,6 +106,19 @@ def _frame_value_cell(function: Any, value_id: Any, *, book: Any = None) -> Any:
 # owner rule as ``_frame_value_cell``); accounting is never the source.  A
 # callee row that records none posts none -- the residue then belongs to the
 # callee's producer, not to this writer.
+def _frame_field_recorded(name: str, value: Any) -> bool:
+    """Whether a physical field is RECORDED on a row.  Program: ``fresh`` /
+    ``keep`` (a scalar result, rank 0).  Wrong record: the test was
+    ``value not in (None, False)`` and ``0 == False``, so a recorded rank of
+    0 read as "records none" and the lease posted no rank.  Rule: ``arena``
+    is a flag (recorded when True); every other field is recorded when it is
+    not None, so rank 0 is a recorded rank."""
+
+    if name == "arena":
+        return value is True
+    return value is not None
+
+
 def _frame_physical_fields(function: Any, value_id: Any, *, book: Any = None) -> Any:
     """The physical fields (``physical_dtype``, ``storage``, ``rank``,
     ``arena``, ``device``) recorded on ``value_id``'s ``ssa_value`` row in
@@ -130,7 +143,7 @@ def _frame_physical_fields(function: Any, value_id: Any, *, book: Any = None) ->
     posted = {
         name: getattr(fact, name)
         for name in ("physical_dtype", "storage", "rank", "arena", "device")
-        if getattr(fact, name) not in (None, False)
+        if _frame_field_recorded(name, getattr(fact, name))
     }
     return posted or KEEP_PHYSICAL
 

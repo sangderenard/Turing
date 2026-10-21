@@ -96,3 +96,50 @@ def test_while_header_phi_row_dtype_is_the_posted_dtype_of_its_literal():
                     function, instruction.res
                 )
     assert checked
+
+
+def test_planned_region_formals_state_the_posted_dtype_of_what_they_are_bound_to():
+    # Program: the ``for`` containing a ``while`` above.  Record under test:
+    # the planned-region formals are minted from the region signature with the
+    # authored spelling (``int``) for the loop counters, while the posted
+    # ``ssa_value`` row of the value each formal is bound to says ``int64``
+    # (the control builder's declared induction / carried dtype, which does
+    # not exist yet when the region is built).  Rule at the end state: for
+    # every region Call, the argument's row, the callee formal's row, the
+    # callee formal object and the call's ``feed_dtypes`` are one dtype.
+    from src.compiler.concordance_declarations import SSA_VALUE
+    from src.compiler.identity_concordance import identity_book
+    from src.compiler.ssa_record_return_state import function_scope_of
+
+    module, _outputs, _exports = _lower(FOR_WHILE, "formal_dtypes", FEEDS)
+    book = identity_book(module)
+
+    def row_dtype(function, value):
+        row = (function_scope_of(function), int(value.id))
+        ref = book.latest_ref(SSA_VALUE, row)
+        assert ref is not None, (function.name, value.id)
+        return book.pages[SSA_VALUE.name].cells.get((row, ref.column)).dtype
+
+    checked = 0
+    for function in module.functions.values():
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                attributes = instruction.attributes or {}
+                if (
+                    str(instruction.op) != "Call"
+                    or "region_index" not in attributes
+                    or "feed_dtypes" not in attributes
+                ):
+                    continue
+                callee = module.functions[attributes["callee"]]
+                assert len(instruction.args) == len(callee.args)
+                for position, (argument, formal) in enumerate(
+                    zip(instruction.args, callee.args)
+                ):
+                    checked += 1
+                    bound = row_dtype(function, argument)
+                    where = (callee.name, position, bound)
+                    assert row_dtype(callee, formal) == bound, where
+                    assert formal.dtype == bound, where
+                    assert attributes["feed_dtypes"][position] == bound, where
+    assert checked

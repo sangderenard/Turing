@@ -1057,6 +1057,17 @@ _INOUT_REDEFINED = ("program_abi_mutable", "program_abi_field_written")
 #: in its gating first line.
 # ssa-physical-unposted is the stage-3 migration worklist (accounting set, fact
 # unset); retire it from this set when the last producer posts its physical fields.
+_PHYSICAL_ACCOUNTING_KEYS = ("physical_dtype", "program_abi_storage",
+                             "program_abi_rank", "sequence_arena", "device")
+
+
+def _physical_unset(key: str, item: Any) -> bool:
+    """Only ``None`` means unset, so rank 0 is a value.  ``sequence_arena`` is
+    the one bool key: its writers store ``value_id in column_value_ids`` (False
+    = not an arena member) and ``SSAValueFact.arena`` defaults False."""
+    return item is None or (key == "sequence_arena" and item is False)
+
+
 _UNSOURCED_KINDS = frozenset({"unsourced-fact", "unsourced-identity",
                               "ssa-physical-unposted"})
 
@@ -3309,7 +3320,8 @@ class CorrelationTable:
                 view = tuple(account.get(k) for k in (
                     "physical_dtype", "program_abi_storage", "program_abi_rank",
                     "sequence_arena", "device"))
-                if any(item not in (None, False) for item in view):
+                if any(not _physical_unset(k, item) for k, item in zip(
+                        _PHYSICAL_ACCOUNTING_KEYS, view)):
                     accounted.setdefault((int(value.id), view), []).append(position)
 
             for index, value in enumerate(function.args):
@@ -3359,9 +3371,9 @@ class CorrelationTable:
                     continue
                 for (key, field), resident in zip(fields, view):
                     posted = getattr(fact, field, None)
-                    if resident in (None, False):
+                    if _physical_unset(key, resident):
                         continue
-                    if posted in (None, False):
+                    if _physical_unset(key, posted):
                         found.append(Finding(
                             "ssa-physical-unposted", str(name), value_id,
                             f"{cell!r} has no {field}; resident accounting "
