@@ -4332,6 +4332,12 @@ def _emit_repository_call_module(
                 # stored (`or i1 <double>` fails LLVM verification).
                 if operation in {"LAnd", "LOr", "LNot"}:
                     operand_type = "i1"
+                if operation == "Div" and result_type in {"double", "float"}:
+                    # Python ``/`` is true division: ``Div(i64, i64) ->
+                    # float64`` divides the converted operands (``sdiv``
+                    # truncated 7 / 2 to 3), as the module lane's
+                    # declared-result rule already does.
+                    operand_type = "double"
                 operands = [
                     load_as(argument, operand_type, f"{tag}.{position}")
                     for position, argument in enumerate(instruction.args)

@@ -212,6 +212,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "layout_state": PageLifecycle(None, REPAIRS, REPAIRS),
     "layout_supersession": PageLifecycle(None, LOWERING, LOWERING),
     "lexical_read_binding": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "operand_position_orphan": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "linked_caller_member": PageLifecycle(None, LOWERING, LOWERING),
     "loop_carried_binding": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),
     "loop_carried_entry": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),

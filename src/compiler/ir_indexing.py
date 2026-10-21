@@ -224,6 +224,39 @@ def _propagate_scalar_dtypes(functions) -> None:
         post_repository_kernel_identity,
     )
 
+    # Every resident occurrence of one ``ssa_value`` row, across every
+    # function whose rows share a scope (a planned region's formals and
+    # the owner's values are one identity).  Program: the list probe's
+    # ``total + len(xs)`` region: the region was settled before its owner,
+    # so its formal 21 kept the planning spelling float64 after the owner
+    # revised the shared row to int64; the call adapter then read the stale
+    # formal, cast the int64 actual to float64 and revised the row back.
+    # Rule: the writer that revises a row updates every view of that row.
+    scope_occurrences: dict[tuple, list[SSAValue]] = {}
+    for _occurrence_function in functions.values():
+        if accepted_ssa_component(_occurrence_function):
+            continue
+        _occurrence_scope = function_scope_of(_occurrence_function)
+        for _occurrence in (
+            *_occurrence_function.args,
+            *(
+                item
+                for block in _occurrence_function.blocks.values()
+                for instruction in block.instrs
+                for item in (
+                    *instruction.args,
+                    *(value for _, value in (
+                        instruction.attributes.get("incoming") or ()
+                    ) if instruction.op in {"Phi", "phi"}),
+                    *((instruction.res,) if instruction.res is not None
+                      else ()),
+                )
+            ),
+        ):
+            scope_occurrences.setdefault(
+                (_occurrence_scope, int(_occurrence.id)), [],
+            ).append(_occurrence)
+
     for function in functions.values():
         # A composed dependency carries the identity book that already
         # accepted every value in its body.  Re-running this unit's scalar
@@ -540,5 +573,7 @@ def _propagate_scalar_dtypes(functions) -> None:
                               cell for cell in (previous, *operand_cells, width_cell)
                               if cell is not None))),
                           mode=Mode.REVISE)
-            for value in values.get(value_id, ()):
+            for value in scope_occurrences.get(
+                (scope, int(value_id)), values.get(value_id, ()),
+            ):
                 value.dtype = dtype

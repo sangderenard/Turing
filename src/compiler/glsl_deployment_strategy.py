@@ -1311,9 +1311,18 @@ def _concord_consumer_operands(
                 positions.setdefault(int(parent), []).append((role, ordinal))
         for position in read_rows.get(int(node_id), ()):
             if position not in present:
-                orphan_page.concord(
-                    (tuple(scope), int(node_id), *position),
-                    read_page.latest((tuple(scope), int(node_id), *position)),
+                # The orphan record is DERIVED from the read row it names
+                # (a raw ``concord`` here was refused by the closed latch,
+                # so an orphan raised instead of being reported).
+                orphan_row = (tuple(scope), int(node_id), *position)
+                book.post(
+                    book.registry.page("operand_position_orphan"),
+                    orphan_row, read_page.latest(orphan_row),
+                    stage=_OPERAND_POSITION,
+                    provenance=_Derived((
+                        book.latest_ref(_LEXICAL_READ_BINDING, orphan_row),
+                    )),
+                    mode=_Mode.CONCORD,
                 )
         for parent, operand_positions in positions.items():
             # DERIVED from the cells of the operand positions it names (the

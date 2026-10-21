@@ -16827,8 +16827,29 @@ def _propagate_record_field_demand(
                             # a new one.
                             instruction.args.append(existing)
                         else:
+                            from .concordance_declarations import (
+                                FRAME_LINK as _DEMAND_STAGE,
+                                FRAME_SCAFFOLD as _DEMAND_FORMAL,
+                            )
+
+                            # The caller's copy of a demanded record-field
+                            # formal is NOVEL from the callee formal's cell
+                            # and carries the physical fields that row
+                            # records; it was a bare counter id.
                             propagated = SSAValue(
-                                GLOBAL_MONOTONIC_IDS.mint(),
+                                _frame_mint(
+                                    caller, _DEMAND_FORMAL, (
+                                        _frame_value_cell(
+                                            callee, int(formal.id),
+                                        ),
+                                    ),
+                                    dtype=formal.dtype,
+                                    shape=tuple(formal.shape or ()),
+                                    stage=_DEMAND_STAGE,
+                                    physical=_frame_physical_fields(
+                                        callee, int(formal.id),
+                                    ),
+                                ),
                                 dtype=formal.dtype,
                                 shape=tuple(formal.shape or ()),
                                 device=formal.device,
@@ -19380,12 +19401,13 @@ def _class_surface_ssa_program(
         resolve_sequence_schemas,
     )
     from .identity_concordance import (
-        Derived, Mode, Unresolved, current_identity_book,
+        ConcordanceRefusal, Derived, Mode, Unresolved, current_identity_book,
     )
     from .concordance_declarations import (
         AGGREGATE_POSITION_MISSING, ARGUMENT_BINDING, ArgumentBindingFact,
         CALL_BINDING_INPUT, CALL_LINK_ORDER, CALL_RECORD, CALL_RECORD_PAIR,
-        CONSTRUCTOR_REMAP,
+        CONSTRUCTOR_REMAP, CONTROL_EXPRESSION as _CHILD_CAPACITY_PRODUCT,
+        LINKED_VALUE_ABI_SETTLEMENT, SSA_VALUE_PHYSICAL_STORAGES,
         CallBindingSource, DECLARED_ROW_COLUMN, FRAME_BINDING, FRAME_LINK,
         FRAME_SCAFFOLD, FRAME_STORAGE_CLONE, FRESHEN,
             GRAPH_ID_WITHOUT_CANONICAL_CELL,
@@ -22013,6 +22035,23 @@ def _class_surface_ssa_program(
                 )
             existing = destination.get(int(callee_id))
             marker = (id(callee_graph), int(callee_id))
+            # The edge is the contract's derivation: the caller actual's
+            # identity cell (and the cells its own contract was settled
+            # from) are the source cells of the callee formal's contract,
+            # read when a producer posts that contract's physical view.
+            _edge_cells = tuple(dict.fromkeys(cell for cell in (
+                *linked_value_type_source_cells_by_graph.get(
+                    id(callee_graph), {},
+                ).get(int(callee_id), ()),
+                _identity_cell(caller_graph, int(caller_id)),
+                *linked_value_type_source_cells_by_graph.get(
+                    id(caller_graph), {},
+                ).get(int(caller_id), ()),
+            ) if cell is not None))
+            if _edge_cells:
+                linked_value_type_source_cells_by_graph.setdefault(
+                    id(callee_graph), {},
+                )[int(callee_id)] = _edge_cells
             if existing is None:
                 destination[int(callee_id)] = dict(source)
                 note_shape(callee_graph, int(callee_id), (
@@ -25983,13 +26022,76 @@ def _class_surface_ssa_program(
                         "program_abi_rank", _formal_row[0]["rank"],
                     )
                 else:
+                    # Program: the oscillator's ``cos_series(peak)``; the
+                    # formal ``x`` has no Python type, so no
+                    # ``value_type_abi`` row, and its physical view is the
+                    # call-edge contract settled from ``peak``.  Wrong
+                    # record: storage/rank went to accounting only (audit
+                    # ``ssa-physical-unposted``).  Rule: the contract's
+                    # storage and rank are posted on the formal's row,
+                    # DERIVED from the exact source cells the contract was
+                    # settled from (``linked_value_type_source_cells``) and
+                    # the formal's graph cell; accounting follows the row.
+                    # A row that already records them, a dtype the row does
+                    # not hold, or a scalar contract on a shaped row posts
+                    # nothing.
+                    _edge_physical = {
+                        key: (int(contract[key]) if key == "rank"
+                              else str(contract[key]))
+                        for key in ("storage", "rank")
+                        if contract.get(key) is not None
+                    }
+                    _edge_fact = _posted_ssa_value_fact(
+                        lowered_control, int(formal.id),
+                    )
+                    _edge_sources = linked_value_type_source_cells_by_graph.get(
+                        id(graph_obj), {},
+                    ).get(int(formal.id), ())
+                    if (
+                        _edge_fact is not None
+                        and _edge_fact.storage is None
+                        and _edge_fact.rank is None
+                        and set(_edge_physical) == {"storage", "rank"}
+                        and _edge_physical["storage"]
+                        in SSA_VALUE_PHYSICAL_STORAGES
+                        and str(contract.get("dtype") or "")
+                        == str(_edge_fact.dtype or "")
+                        and not (
+                            _edge_physical["storage"] == "scalar"
+                            and tuple(_edge_fact.shape or ())
+                        )
+                        and _frame_cells(*_edge_sources)
+                    ):
+                        _revise_ssa_value(
+                            lowered_control, int(formal.id),
+                            dtype=_edge_fact.dtype, shape=_edge_fact.shape,
+                            stage=LINKED_VALUE_ABI_SETTLEMENT,
+                            sources=_frame_cells(
+                                *_edge_sources,
+                                _frame_graph_cell(graph_obj, int(formal.id)),
+                            ),
+                            physical=_edge_physical,
+                        )
+                        _edge_fact = _posted_ssa_value_fact(
+                            lowered_control, int(formal.id),
+                        )
                     if contract.get("storage") is not None:
                         accounting.setdefault(
-                            "program_abi_storage", str(contract["storage"]),
+                            "program_abi_storage", str(
+                                _edge_fact.storage
+                                if _edge_fact is not None
+                                and _edge_fact.storage is not None
+                                else contract["storage"]
+                            ),
                         )
                     if contract.get("rank") is not None:
                         accounting.setdefault(
-                            "program_abi_rank", int(contract["rank"]),
+                            "program_abi_rank", int(
+                                _edge_fact.rank
+                                if _edge_fact is not None
+                                and _edge_fact.rank is not None
+                                else contract["rank"]
+                            ),
                         )
                 if (
                     str(contract.get("storage") or "") == "span"
@@ -27100,6 +27202,38 @@ def _class_surface_ssa_program(
         # only exists for the authored expression itself. These stay inside the
         # function's own SSA numbering -- graph node keys are Python object
         # identities and are not part of that space.
+        def recovery_value(
+            dtype: str, transform: Any, source_value_id: Any, *operands: Any,
+        ) -> SSAValue:
+            """Mint one structural-recovery intermediate through the book.
+
+            Program: ``_energy_time_limit``'s ``float(limit.item())`` lowered
+            here as ``Const 0``/``GetElementPtr``/``Load``.  Wrong record: the
+            index and address ids were drawn from the bare id counter, so the
+            audit listed them ``unsourced-identity`` (minted outside a Novel
+            post).  Rule: every intermediate is a NOVEL ``ssa_value`` row
+            under the function's scope, DERIVED from the authored graph
+            value it lowers and the resident operands it is computed from.
+            """
+            from .concordance_declarations import STRUCTURAL_RECOVERY
+
+            cells = [
+                None if source_value_id is None
+                else _frame_graph_cell(graph, int(source_value_id))
+            ]
+            cells.extend(
+                _frame_value_cell(function, int(operand.id))
+                for operand in operands
+                if operand is not None
+            )
+            return SSAValue(
+                _frame_mint(
+                    function, transform, tuple(cells),
+                    dtype=dtype, stage=STRUCTURAL_RECOVERY,
+                ),
+                dtype=dtype,
+            )
+
         def structural_boolop_value(value_id: int, data, canonical: str):
             """Lower ``and``/``or`` as the operand selection Python defines.
 
@@ -27184,12 +27318,15 @@ def _class_surface_ssa_program(
             current = operands[0]
             for position, operand in enumerate(operands[1:], start=1):
                 last = position == len(operands) - 1
-                if last:
-                    result_id = value_id
-                else:
-                    result_id = GLOBAL_MONOTONIC_IDS.mint()
                 dtype = current.dtype or operand.dtype
-                result = SSAValue(int(result_id), dtype=dtype)
+                if last:
+                    result = SSAValue(int(value_id), dtype=dtype)
+                else:
+                    from .concordance_declarations import CONTROL_EXPRESSION
+
+                    result = recovery_value(
+                        dtype, CONTROL_EXPRESSION, value_id, current, operand,
+                    )
                 # Select(mask, when_true, when_false). `or` keeps the left
                 # operand when it is truthy; `and` keeps the right one.
                 arguments = (
@@ -27205,7 +27342,7 @@ def _class_surface_ssa_program(
                         "short_circuit_selection": True,
                     },
                 ))
-                values[int(result_id)] = result
+                values[int(result.id)] = result
                 current = result
             return current
 
@@ -27310,8 +27447,16 @@ def _class_surface_ssa_program(
                 ):
                     comparisons = []
                     for member in layout.members:
+                        from .concordance_declarations import (
+                            CONTROL_PREDICATE,
+                        )
+
                         comparison = structural_resident_string_equality(
-                            GLOBAL_MONOTONIC_IDS.mint(),
+                            int(recovery_value(
+                                "bool", CONTROL_PREDICATE, value_id,
+                                values.get(int(query_id)),
+                                values.get(int(member.value_id)),
+                            ).id),
                             (int(query_id), int(member.value_id)),
                             negate=False,
                         )
@@ -27322,8 +27467,9 @@ def _class_surface_ssa_program(
                     if comparisons:
                         current = comparisons[0]
                         for comparison in comparisons[1:]:
-                            combined = SSAValue(
-                                GLOBAL_MONOTONIC_IDS.mint(), dtype="bool",
+                            combined = recovery_value(
+                                "bool", CONTROL_PREDICATE, value_id,
+                                current, comparison,
                             )
                             insertions.append(Instr(
                                 "LOr", [current, comparison], combined,
@@ -27664,10 +27810,42 @@ def _class_surface_ssa_program(
                 descriptor, function_name=helper_name,
                 first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
             )
-            for helper_function in lowering.functions:
-                all_functions[helper_function.name] = helper_function
-            call_result_id = GLOBAL_MONOTONIC_IDS.mint() if negate else value_id
-            call_result = SSAValue(int(call_result_id), dtype="bool")
+            from .concordance_declarations import STRUCTURAL_RECOVERY
+            from .identity_concordance import (
+                current_identity_book as _helper_book,
+            )
+            from .precompile_to_ssa import (
+                _function_root_cell as _helper_root_cell,
+                register_sequence_lowering,
+            )
+            from .ssa_record_return_state import function_scope_of
+
+            # The helper's labels become compiler SSA through the one
+            # registration boundary the control builder uses (it installed
+            # them raw: every helper value lacked an ``ssa_value`` row).
+            registered_helpers, _unposted_helper_results = (
+                register_sequence_lowering(
+                    lowering, book=_helper_book(),
+                    owner=_frame_graph_cell(graph, int(value_id))
+                    or _frame_value_cell(function, int(value_id))
+                    or _helper_root_cell(
+                        _helper_book(), function_scope_of(function),
+                    ),
+                    caller_scope=function_scope_of(function),
+                    stage=STRUCTURAL_RECOVERY,
+                )
+            )
+            all_functions.update(registered_helpers)
+            if negate:
+                from .concordance_declarations import CONTROL_PREDICATE
+
+                call_result = recovery_value(
+                    "bool", CONTROL_PREDICATE, value_id,
+                    *storage_args, *query_values,
+                )
+            else:
+                call_result = SSAValue(int(value_id), dtype="bool")
+            call_result_id = int(call_result.id)
             insertions.append(Instr(
                 "Call", [*storage_args, *query_values], call_result,
                 attributes={
@@ -27965,12 +28143,41 @@ def _class_surface_ssa_program(
                 function_name=helper_name,
                 first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
             )
-            for helper_function in lowering.functions:
-                all_functions[helper_function.name] = helper_function
-            call_result_id = (
-                GLOBAL_MONOTONIC_IDS.mint() if negate else int(value_id)
+            from .concordance_declarations import STRUCTURAL_RECOVERY
+            from .identity_concordance import (
+                current_identity_book as _helper_book,
             )
-            call_result = SSAValue(int(call_result_id), dtype="bool")
+            from .precompile_to_ssa import (
+                _function_root_cell as _helper_root_cell,
+                register_sequence_lowering,
+            )
+            from .ssa_record_return_state import function_scope_of
+
+            # The helper's labels become compiler SSA through the one
+            # registration boundary the control builder uses (it installed
+            # them raw: every helper value lacked an ``ssa_value`` row).
+            registered_helpers, _unposted_helper_results = (
+                register_sequence_lowering(
+                    lowering, book=_helper_book(),
+                    owner=_frame_graph_cell(graph, int(value_id))
+                    or _frame_value_cell(function, int(value_id))
+                    or _helper_root_cell(
+                        _helper_book(), function_scope_of(function),
+                    ),
+                    caller_scope=function_scope_of(function),
+                    stage=STRUCTURAL_RECOVERY,
+                )
+            )
+            all_functions.update(registered_helpers)
+            if negate:
+                from .concordance_declarations import CONTROL_PREDICATE
+
+                call_result = recovery_value(
+                    "bool", CONTROL_PREDICATE, value_id, *storage_args,
+                )
+            else:
+                call_result = SSAValue(int(value_id), dtype="bool")
+            call_result_id = int(call_result.id)
             insertions.append(Instr(
                 "Call", storage_args, call_result,
                 attributes={
@@ -28603,8 +28810,12 @@ def _class_surface_ssa_program(
                             *prior_receipts, receipt,
                         )
                     return operand
-                index = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="int")
-                address = SSAValue(GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr")
+                from .concordance_declarations import ADDRESS, CONTROL_CONST
+
+                index = recovery_value("int", CONTROL_CONST, value_id, operand)
+                address = recovery_value(
+                    "ptr", ADDRESS, value_id, operand, index,
+                )
                 result = SSAValue(value_id, dtype=operand.dtype)
                 insertions.extend((
                     Instr("Const", [], index, attributes={"value": 0}),
@@ -28734,11 +28945,13 @@ def _class_surface_ssa_program(
                     ) is not None
                 ):
                     function.args.append(length_storage)
-                zero = SSAValue(
-                    GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                from .concordance_declarations import ADDRESS, CONTROL_CONST
+
+                zero = recovery_value(
+                    "int64", CONTROL_CONST, value_id, length_storage,
                 )
-                address = SSAValue(
-                    GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr",
+                address = recovery_value(
+                    "ptr", ADDRESS, value_id, length_storage, zero,
                 )
                 result = SSAValue(int(value_id), dtype="int64")
                 insertions.extend((
@@ -28861,14 +29074,18 @@ def _class_surface_ssa_program(
                         ) is not None
                     ):
                         function.args.append(length_storage)
-                    zero = SSAValue(
-                        GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                    from .concordance_declarations import (
+                        ADDRESS, CONTROL_CONST, LOAD,
                     )
-                    address = SSAValue(
-                        GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr",
+
+                    zero = recovery_value(
+                        "int64", CONTROL_CONST, value_id, length_storage,
                     )
-                    length = SSAValue(
-                        GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                    address = recovery_value(
+                        "ptr", ADDRESS, value_id, length_storage, zero,
+                    )
+                    length = recovery_value(
+                        "int64", LOAD, value_id, address,
                     )
                     result = SSAValue(int(value_id), dtype="bool")
                     insertions.extend((
@@ -29254,23 +29471,49 @@ def _class_surface_ssa_program(
         from .concordance_declarations import STRUCTURAL_CONCORDANCE
 
         recorded_aggregate_layouts = aggregate_return_layouts(function)
+        # Program: ``total = 0; for x in xs: total += x; if 4 in xs:
+        # total += 1; return total``.  Wrong record: the output was chosen
+        # as the LAST member of the name's identity-table history,
+        # (12, 13, 13, 18, 20, 22), whose order is insertion order, not
+        # lexical order -- the for-loop's LoopResult (22) was appended after
+        # the if-merge Phi (20).  Recovery appended 22 to ``Ret [20]``, then
+        # dropped 20 as a "stale" member: the function returned the total
+        # before the ``if``.  Rule: the reducer's ``semantic_output`` row,
+        # which the control builder revises when finish fixes the returned
+        # value, is the output's identity.  A named-output hint is kept only
+        # when it is that value or its concordant resident.
+        from .concordance_declarations import SEMANTIC_OUTPUT as _DECLARED_OUTPUT
+        from .identity_concordance import (
+            current_identity_book as _declared_output_book,
+        )
+
+        reducer_output_scope = graph.graph.get("lexical_read_scope")
+        declared_output_ids = {}
+        if reducer_output_scope is not None:
+            _declared_page = _declared_output_book().page(_DECLARED_OUTPUT)
+            for _declared_row in _declared_page.scope_rows(
+                reducer_output_scope
+            ):
+                _declared_fact = _declared_page.latest(_declared_row)
+                if _declared_fact is not None:
+                    declared_output_ids.setdefault(
+                        str(_declared_fact[0]), int(_declared_fact[1]),
+                    )
         named_output_ids = {}
         for name, value_id in function.metadata.get("named_outputs") or ():
             name = str(name)
             value_id = int(value_id)
-            history = tuple(map(int, identities.get(name, ())))
-            # A named-output hint sometimes still points at the authored
-            # parameter Input. The identity ledger is the source of truth:
-            # when the hint is one member of that deterministic SSA chain,
-            # its final member is the current spelling. A carried/region phi
-            # can legitimately sit outside the lexical history, so preserve
-            # such a resolved value unchanged.
-            named_output_ids[name] = (
-                history[-1]
-                if history and (
-                    value_id in history or history[-1] in recorded_aggregate_layouts
-                ) else value_id
-            )
+            declared_id = declared_output_ids.get(name)
+            if declared_id is not None and value_id not in (
+                declared_id,
+                _concordant_function_resident(function, declared_id),
+            ) and _concordant_function_resident(
+                function, value_id,
+            ) != declared_id:
+                value_id = declared_id
+            named_output_ids[name] = value_id
+        for name, declared_id in declared_output_ids.items():
+            named_output_ids.setdefault(name, declared_id)
         output_names = tuple(dict.fromkeys((
             *tuple(graph.graph.get("function_outputs") or ()),
             *tuple(named_output_ids),
@@ -30067,7 +30310,38 @@ def _class_surface_ssa_program(
                 if recovered.res is None or getattr(recovered.res, "id", None) is None:
                     continue
                 value_id = int(recovered.res.id)
-                if _frame_value_cell(function, value_id) is not None:
+                _recovered_cell = _frame_value_cell(function, value_id)
+                if _recovered_cell is not None:
+                    # Program: ``if 4 in xs`` recovered as a contains-helper
+                    # Call whose result (graph id 16) was adopted earlier
+                    # with an unresolved dtype; this pass built it ``bool``
+                    # and published nothing, so result settlement refused
+                    # "unresolved evidence cannot erase resident type".
+                    # Rule: the producer that resolves the type posts it, a
+                    # REVISE DERIVED from the row's cell, the graph cell and
+                    # the operands'; a resolved recorded type is kept.
+                    _recorded = _posted_ssa_value_fact(function, value_id)
+                    if (
+                        _recorded is not None
+                        and _recorded.dtype in (None, "", "unknown")
+                        and recovered.res.dtype not in (None, "", "unknown")
+                    ):
+                        _revise_ssa_value(
+                            function, value_id, dtype=recovered.res.dtype,
+                            shape=tuple(recovered.res.shape or ()),
+                            stage=STRUCTURAL_RECOVERY,
+                            sources=_frame_cells(
+                                _frame_graph_cell(graph, value_id),
+                                *(
+                                    _frame_value_cell(
+                                        function, int(argument.id),
+                                    )
+                                    for argument in recovered.args
+                                    if getattr(argument, "id", None)
+                                    is not None
+                                ),
+                            ),
+                        )
                     continue
                 graph_cell = _frame_graph_cell(graph, value_id)
                 operand_cells = _frame_cells(*(
@@ -34838,19 +35112,56 @@ def _class_surface_ssa_program(
                             prior_presence_accounting.get("physical_dtype")
                         )
                         # Rule: post first; accounting is a view.  The presence
-                        # slot's row (when a pass has posted one) is revised
-                        # with its physical record -- bool, scalar, rank 0 --
-                        # DERIVED from the graph value's canonical cell and the
-                        # id declaration; the accounting below is set FROM the
-                        # posted fact.  UNKNOWN: a presence value with no row
-                        # here is adopted by a later pass; it is not adopted
-                        # in this stage.
+                        # slot's row is revised with its physical record --
+                        # bool, scalar, rank 0 -- DERIVED from the graph
+                        # value's canonical cell and the id declaration; the
+                        # accounting below is set FROM the posted fact.
+                        # Program: ``root(metrics, targets)`` forwarding to
+                        # ``_energy_time_limit``; the optional field
+                        # ``targets.energy_exchange_fraction`` has its presence
+                        # Input (graph value 5) in ``root``'s graph, which no
+                        # control builder read.  Wrong record: the presence
+                        # formal was appended to ``root`` with no
+                        # ``ssa_value`` row ("adopted by a later pass" -- no
+                        # pass did), and call-result settlement refused
+                        # "physical structure lacks SSA identity".  Rule: as
+                        # the nested-optional path above, a graph-authored
+                        # presence with no row is adopted here,
+                        # ADOPTED_GRAPH_ID DERIVED from its canonical cell and
+                        # the declaration, with its physical record.
                         _presence_physical = {
                             "physical_dtype": "bool", "storage": "scalar",
                             "rank": 0, "arena": False,
                             "device": presence.device,
                         }
-                        if _frame_value_cell(function, int(presence.id)) is not None:
+                        if _frame_value_cell(function, int(presence.id)) is None:
+                            from .concordance_declarations import (
+                                SSA_VALUE, SSAValueFact, SSAValueOrigin,
+                            )
+                            _presence_graph_cell = _frame_graph_cell(
+                                graph, int(presence.id),
+                            )
+                            if _presence_graph_cell is None:
+                                raise ConcordanceRefusal(
+                                    "optional presence is neither a minted "
+                                    "SSA value nor an authored graph value: "
+                                    f"{int(presence.id)}"
+                                )
+                            _frame_post(
+                                SSA_VALUE,
+                                (_frame_book_scope(function), int(presence.id)),
+                                SSAValueFact(
+                                    "bool", (),
+                                    SSAValueOrigin.ADOPTED_GRAPH_ID,
+                                    **_presence_physical,
+                                ),
+                                stage=RECORD_ABI_MATERIALIZATION,
+                                cells=(
+                                    _presence_graph_cell,
+                                    GLOBAL_MONOTONIC_IDS.declaration,
+                                ),
+                            )
+                        else:
                             _revise_ssa_value(
                                 function, int(presence.id), dtype="bool",
                                 shape=(), stage=RECORD_ABI_MATERIALIZATION,
@@ -38688,6 +38999,48 @@ def _class_surface_ssa_program(
                     or not constructor_table.records
                 ):
                     continue
+
+                def remap_mint(old_id: Any = None, dtype: Any = None) -> int:
+                    """Mint the caller's copy of one constructor frame slot.
+
+                    Program: a constructor inlined into its caller's frame
+                    (record fields, pool columns, strides, scratch).  Wrong
+                    record: each caller slot drew a bare id from the
+                    counter, so its ``ssa_value`` row did not exist and the
+                    audit listed it ``unsourced-identity``.  Rule: the slot is
+                    a NOVEL ``constructor_remap`` row of the caller, DERIVED
+                    from the constructor value it copies (when it copies
+                    one) and the constructor call node, carrying the physical
+                    fields that value's own row records.
+                    """
+                    source = (
+                        None if old_id is None
+                        else constructor_values.get(int(old_id))
+                    )
+                    return _frame_mint(
+                        caller, CONSTRUCTOR_REMAP,
+                        (
+                            None if old_id is None
+                            else _frame_value_cell(constructor, int(old_id)),
+                            _frame_graph_cell(caller_graph, int(node_id)),
+                        ),
+                        dtype=(
+                            dtype if source is None
+                            else getattr(source, "dtype", None)
+                        ),
+                        shape=(
+                            () if source is None
+                            else tuple(getattr(source, "shape", ()) or ())
+                        ),
+                        stage=FRAME_LINK,
+                        physical=(
+                            None if old_id is None
+                            else _frame_physical_fields(
+                                constructor, int(old_id),
+                            )
+                        ),
+                    )
+
                 class_storage_identities = {
                     str(class_identity),
                     str(class_definition.identity),
@@ -38842,7 +39195,7 @@ def _class_surface_ssa_program(
                 for old_id in referenced_ids:
                     if old_id in remap:
                         continue
-                    remap[old_id] = GLOBAL_MONOTONIC_IDS.mint()
+                    remap[old_id] = remap_mint(old_id)
                 # A constructor's repository-SSA signature is its complete
                 # physical frame, not merely its authored parameters and
                 # record fields. Region scratch and descriptor slots are also
@@ -38852,7 +39205,7 @@ def _class_surface_ssa_program(
                     old_id = int(value.id)
                     if old_id in remap:
                         continue
-                    remap[old_id] = GLOBAL_MONOTONIC_IDS.mint()
+                    remap[old_id] = remap_mint(old_id)
 
                 # Constructor field writes and subsequent reads can carry
                 # separate local sequence descriptors for one record slot.
@@ -38970,7 +39323,7 @@ def _class_surface_ssa_program(
                                 )
                             for old_id in map(int, pool_ids):
                                 if old_id not in remap:
-                                    new_id = GLOBAL_MONOTONIC_IDS.mint()
+                                    new_id = remap_mint(old_id)
                                     remap[old_id] = new_id
                                     source = constructor_values.get(
                                         old_id, SSAValue(old_id)
@@ -39145,7 +39498,7 @@ def _class_surface_ssa_program(
                             if field_sequence is None or callee_sequence is None:
                                 pool_specs = []
                                 break
-                            row_stride_id = GLOBAL_MONOTONIC_IDS.mint()
+                            row_stride_id = remap_mint(dtype="int")
                             row_stride = SSAValue(
                                 row_stride_id,
                                 dtype="int",
@@ -39210,7 +39563,7 @@ def _class_surface_ssa_program(
                             pool_specs = []
                         elif scalar_fields:
                             scalar_source_id = scalar_source_ids[0]
-                            scalar_stride_id = GLOBAL_MONOTONIC_IDS.mint()
+                            scalar_stride_id = remap_mint(dtype="int")
                             scalar_stride = SSAValue(
                                 scalar_stride_id,
                                 dtype="int",
@@ -41779,14 +42132,15 @@ def _class_surface_ssa_program(
         function: Any = None, transform: Any = None, operands: Any = (), *,
         dtype: Any = None, shape: Any = (),
     ) -> int:
-        """Mint one compiler value id.  With ``function`` the id is a NOVEL
-        ``ssa_value`` row under that function's scope (``transform``,
-        default FRAME_SCAFFOLD, from ``operands``); a caller that names no
-        function still draws a bare id, which the audit lists under
-        ``unsourced-identity`` until that site is routed."""
+        """Mint one compiler value id: a NOVEL ``ssa_value`` row under
+        ``function``'s scope (``transform``, default FRAME_SCAFFOLD, from
+        ``operands``).  Every site names its function; a bare counter id has
+        no row and no reader can derive from it."""
 
         if function is None:
-            return GLOBAL_MONOTONIC_IDS.mint()
+            raise ConcordanceRefusal(
+                "compiler value id minted without its owning function"
+            )
         return _frame_mint(
             function, FRAME_SCAFFOLD if transform is None else transform,
             operands, dtype=dtype, shape=shape, stage=FRAME_LINK,
@@ -42355,11 +42709,21 @@ def _class_surface_ssa_program(
                     )
                     if opcode is None or len(operands) < 2:
                         return None
+                    from .concordance_declarations import CONTROL_EXPRESSION
+
                     current = operands[0]
                     for index, operand in enumerate(operands[1:], start=1):
                         is_last = index == len(operands) - 1
+                        # An inner link of the chain is NOVEL from the
+                        # authored boolop's graph cell and its two operands.
                         result_id = (
-                            source_id if is_last else mint_compiler_value_id()
+                            source_id if is_last else mint_compiler_value_id(
+                                caller, CONTROL_EXPRESSION, (
+                                    _frame_graph_cell(caller_graph, source_id),
+                                    _frame_value_cell(caller, int(current.id)),
+                                    _frame_value_cell(caller, int(operand.id)),
+                                ), dtype="bool",
+                            )
                         )
                         result = SSAValue(
                             result_id,
@@ -43972,13 +44336,55 @@ def _class_surface_ssa_program(
                                 for callee_value_id in map(
                                     int, callee_field.value_ids
                                 ):
-                                    caller_value_id = mint_compiler_value_id()
                                     source = callee_values.get(
                                         callee_value_id,
                                         SSAValue(
                                             callee_value_id,
                                             dtype=callee_field.dtype,
                                         ),
+                                    )
+                                    # The caller slot of a callee result
+                                    # field IS a result storage lease: NOVEL
+                                    # RESULT_STORAGE_LEASE from the callee
+                                    # value's cells plus its
+                                    # ``result_storage_binding`` row, as
+                                    # ``allocate_late_result_storage`` posts.
+                                    # It was a bare counter id with no row.
+                                    from .structural_concordance import (
+                                        function_value_structure,
+                                    )
+
+                                    _field_structure, _field_cell = (
+                                        function_value_structure(
+                                            callee, callee_value_id,
+                                        )
+                                    )
+                                    _field_lease_cells = _frame_cells(
+                                        _field_cell,
+                                        _frame_required_value_cell(
+                                            callee, callee_value_id,
+                                        ),
+                                        _frame_table_cell(
+                                            callee_record_table,
+                                            callee_value_id, RECORD_MEMBER,
+                                            function=callee,
+                                        ),
+                                    )
+                                    caller_value_id = _frame_mint(
+                                        caller, RESULT_STORAGE_LEASE,
+                                        _field_lease_cells,
+                                        dtype=callee_field.dtype,
+                                        shape=_field_structure.shape,
+                                        stage=FRAME_LINK,
+                                        physical=_frame_physical_fields(
+                                            callee, callee_value_id,
+                                        ),
+                                    )
+                                    _post_result_storage_lease(
+                                        caller, record.caller,
+                                        int(record.callsite_id),
+                                        callee_value_id, caller_value_id,
+                                        _field_lease_cells, stage=FRAME_LINK,
                                     )
                                     value = clone_value(
                                         source,
@@ -45049,7 +45455,23 @@ def _class_surface_ssa_program(
                             for index in range(len(callee_aggregate_outputs)):
                                 node_id = projected_by_index.get(index)
                                 if node_id is None:
-                                    node_id = mint_compiler_value_id()
+                                    # An unprojected member is NOVEL from the
+                                    # callee output member it receives.
+                                    from .concordance_declarations import (
+                                        REGION_CALL_RESULT,
+                                    )
+
+                                    node_id = mint_compiler_value_id(
+                                        caller, REGION_CALL_RESULT, (
+                                            _frame_value_cell(
+                                                callee, int(
+                                                    callee_aggregate_outputs[
+                                                        index
+                                                    ]
+                                                ),
+                                            ),
+                                        ),
+                                    )
                                 completed.append(int(node_id))
                             bound_aggregate_outputs = tuple(completed)
                             break
@@ -45270,7 +45692,32 @@ def _class_surface_ssa_program(
                     ))
                     pooled_argument_ids = {}
                     pooled_setup = []
+
+                    def pool_value(
+                        dtype: Any, transform: Any, *operands: Any,
+                        accounting: Any = None,
+                    ) -> SSAValue:
+                        """One instance-pool frame computation of ``caller``:
+                        NOVEL ``transform`` from its operands' cells.  These
+                        row offsets, indices and pointers were bare counter
+                        ids with no ``ssa_value`` row."""
+                        return SSAValue(
+                            mint_compiler_value_id(
+                                caller, transform, tuple(
+                                    _frame_value_cell(caller, int(operand.id))
+                                    for operand in operands
+                                ), dtype=dtype,
+                            ),
+                            dtype=dtype, accounting=dict(accounting or {}),
+                        )
+
                     if instance_pool is not None:
+                        from .concordance_declarations import (
+                            ADDRESS as _POOL_ADDRESS,
+                            CONTROL_CONST as _POOL_CONST,
+                            CONTROL_EXPRESSION as _POOL_EXPRESSION,
+                        )
+
                         target_loop_id = int(record.enclosing_loop_ids[-1])
                         induction = next((
                             instruction.res
@@ -45309,8 +45756,9 @@ def _class_surface_ssa_program(
                             for field_spec in instance_pool["fields"]:
                                 pool = field_spec["pool"]
                                 callee_sequence = field_spec["callee_sequence"]
-                                row_offset = SSAValue(
-                                    mint_compiler_value_id(), dtype="int"
+                                row_offset = pool_value(
+                                    "int", _POOL_EXPRESSION, induction,
+                                    values[int(pool.row_stride_value_id)],
                                 )
                                 pooled_setup.append(Instr(
                                     "Mul",
@@ -45369,9 +45817,10 @@ def _class_surface_ssa_program(
                                 for callee_id, (source_id, offset) in (
                                     pointer_sources.items()
                                 ):
-                                    pointer = SSAValue(
-                                        mint_compiler_value_id(),
-                                        dtype=values[int(source_id)].dtype,
+                                    pointer = pool_value(
+                                        values[int(source_id)].dtype,
+                                        _POOL_ADDRESS,
+                                        values[int(source_id)], offset,
                                         accounting={
                                             "record_instance_pool_pointer": True
                                         },
@@ -45388,8 +45837,9 @@ def _class_surface_ssa_program(
                             for scalar_spec in instance_pool.get(
                                 "scalar_fields", ()
                             ):
-                                scalar_base = SSAValue(
-                                    mint_compiler_value_id(), dtype="int"
+                                scalar_base = pool_value(
+                                    "int", _POOL_EXPRESSION, induction,
+                                    values[int(scalar_spec["stride_value_id"])],
                                 )
                                 pooled_setup.append(Instr(
                                     "Mul",
@@ -45408,8 +45858,8 @@ def _class_surface_ssa_program(
                                 ))
                                 scalar_index = scalar_base
                                 if int(scalar_spec["offset"]):
-                                    offset_value = SSAValue(
-                                        mint_compiler_value_id(), dtype="int"
+                                    offset_value = pool_value(
+                                        "int", _POOL_CONST, scalar_base,
                                     )
                                     pooled_setup.append(Instr(
                                         "Const", [], offset_value,
@@ -45419,8 +45869,9 @@ def _class_surface_ssa_program(
                                             )
                                         },
                                     ))
-                                    scalar_index = SSAValue(
-                                        mint_compiler_value_id(), dtype="int"
+                                    scalar_index = pool_value(
+                                        "int", _POOL_EXPRESSION,
+                                        scalar_base, offset_value,
                                     )
                                     pooled_setup.append(Instr(
                                         "Add",
@@ -45432,11 +45883,13 @@ def _class_surface_ssa_program(
                                             )
                                         },
                                     ))
-                                pointer = SSAValue(
-                                    mint_compiler_value_id(),
-                                    dtype=values[int(
+                                pointer = pool_value(
+                                    values[int(
                                         scalar_spec["arena_value_id"]
                                     )].dtype,
+                                    _POOL_ADDRESS,
+                                    values[int(scalar_spec["arena_value_id"])],
+                                    scalar_index,
                                     accounting={
                                         "record_instance_pool_pointer": True
                                     },
@@ -45521,8 +45974,26 @@ def _class_surface_ssa_program(
                                 length_position is not None
                                 and length_position < len(call_arguments)
                             ):
+                                from .concordance_declarations import (
+                                    LOAD as _DERIVED_LENGTH_LOAD,
+                                )
+
+                                # NOVEL load of the length slot, from that
+                                # slot's cell and the formal it feeds.
                                 derived_length = SSAValue(
-                                    mint_compiler_value_id(),
+                                    mint_compiler_value_id(
+                                        caller, _DERIVED_LENGTH_LOAD, (
+                                            _frame_value_cell(
+                                                caller, int(call_arguments[
+                                                    int(length_position)
+                                                ].id),
+                                            ),
+                                            _frame_value_cell(
+                                                callee, int(argument.id),
+                                            ),
+                                        ),
+                                        dtype=str(argument.dtype or "int64"),
+                                    ),
                                     dtype=str(argument.dtype or "int64"),
                                     accounting={
                                         "linked_scalar_source_transform": (
@@ -47664,11 +48135,36 @@ def _class_surface_ssa_program(
                                 if len(existing) == 1:
                                     projected_id = int(existing[0])
                                 else:
+                                    from .concordance_declarations import (
+                                        ADDRESS as _ROW_ADDRESS,
+                                        ROW_COLUMN_PROJECTION as _ROW_LOAD,
+                                    )
+
+                                    # NOVEL address and load of one row
+                                    # column, from the column arena's and
+                                    # the row index's cells.
                                     address = SSAValue(
-                                        GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr"
+                                        mint_compiler_value_id(
+                                            function, _ROW_ADDRESS, (
+                                                _frame_value_cell(function, int(
+                                                    source_arenas[
+                                                        column_index
+                                                    ].id
+                                                )),
+                                                _frame_value_cell(
+                                                    function, int(row_index.id),
+                                                ),
+                                            ), dtype="ptr",
+                                        ), dtype="ptr",
                                     )
                                     projected = SSAValue(
-                                        GLOBAL_MONOTONIC_IDS.mint(),
+                                        mint_compiler_value_id(
+                                            function, _ROW_LOAD, (
+                                                _frame_value_cell(
+                                                    function, int(address.id),
+                                                ),
+                                            ), dtype=str(column_dtype),
+                                        ),
                                         dtype=str(column_dtype),
                                         accounting={
                                             "record_row_projection": (
@@ -47882,19 +48378,47 @@ def _class_surface_ssa_program(
                                 base = current_values[physical_ids[0]]
                                 projected_ids = []
                                 for element_index in range(required):
+                                    from .concordance_declarations import (
+                                        ADDRESS as _SPAN_ADDRESS,
+                                        CONTROL_CONST as _SPAN_INDEX,
+                                        LOAD as _SPAN_LOAD,
+                                    )
+
+                                    # NOVEL index, address and load of one
+                                    # span element, from the span's cell.
+                                    _span_cell = _frame_value_cell(
+                                        function, int(base.id),
+                                    )
                                     index_value = SSAValue(
-                                        GLOBAL_MONOTONIC_IDS.mint(), dtype="int"
+                                        mint_compiler_value_id(
+                                            function, _SPAN_INDEX,
+                                            (_span_cell,), dtype="int",
+                                        ), dtype="int",
                                     )
                                     address = SSAValue(
-                                        GLOBAL_MONOTONIC_IDS.mint(), dtype="ptr"
+                                        mint_compiler_value_id(
+                                            function, _SPAN_ADDRESS, (
+                                                _span_cell,
+                                                _frame_value_cell(
+                                                    function,
+                                                    int(index_value.id),
+                                                ),
+                                            ), dtype="ptr",
+                                        ), dtype="ptr",
+                                    )
+                                    _span_element_dtype = str(
+                                        column_dtype or field.dtype
+                                        or "unknown"
                                     )
                                     projected = SSAValue(
-                                        GLOBAL_MONOTONIC_IDS.mint(),
-                                        dtype=str(
-                                            column_dtype
-                                            or field.dtype
-                                            or "unknown"
+                                        mint_compiler_value_id(
+                                            function, _SPAN_LOAD, (
+                                                _frame_value_cell(
+                                                    function, int(address.id),
+                                                ),
+                                            ), dtype=_span_element_dtype,
                                         ),
+                                        dtype=_span_element_dtype,
                                         accounting={
                                             "record_span_projection": (
                                                 str(expected_identity),
@@ -48178,8 +48702,24 @@ def _class_surface_ssa_program(
                         source_sequence.column_dtypes
                         or ("unknown",) * len(source_sequence.column_value_ids)
                     ):
+                        # NOVEL frame storage of ``function``: the child
+                        # column is a copy of the source sequence's column.
                         value = SSAValue(
-                            mint_compiler_value_id(),
+                            mint_compiler_value_id(
+                                function, FRAME_STORAGE_CLONE, (
+                                    _frame_value_cell(function, int(
+                                        source_sequence.column_value_ids[
+                                            column_index
+                                        ]
+                                    )) if column_index < len(
+                                        source_sequence.column_value_ids
+                                    ) else None,
+                                    _frame_value_cell(function, int(
+                                        destination_sequence.capacity_value_id
+                                    )),
+                                ),
+                                dtype=str(dtype or "unknown"),
+                            ),
                             dtype=str(dtype or "unknown"),
                             accounting={
                                 "compiler_frame_storage": str(function_name),
@@ -48196,7 +48736,16 @@ def _class_surface_ssa_program(
                         current_values[int(value.id)] = value
                         child_columns.append(int(value.id))
                     child_lengths = SSAValue(
-                        mint_compiler_value_id(), dtype="int64",
+                        mint_compiler_value_id(
+                            function, FRAME_STORAGE_CLONE, (
+                                _frame_value_cell(function, int(
+                                    source_sequence.length_address_id
+                                )),
+                                _frame_value_cell(function, int(
+                                    destination_sequence.capacity_value_id
+                                )),
+                            ), dtype="int64",
+                        ), dtype="int64",
                         accounting={
                             "compiler_frame_storage": str(function_name),
                             "record_child_pool_sequence_id": int(
@@ -48211,7 +48760,16 @@ def _class_surface_ssa_program(
                     function.args.append(child_lengths)
                     current_values[int(child_lengths.id)] = child_lengths
                     child_capacity = SSAValue(
-                        mint_compiler_value_id(), dtype="int64",
+                        mint_compiler_value_id(
+                            function, _CHILD_CAPACITY_PRODUCT, (
+                                _frame_value_cell(function, int(
+                                    destination_sequence.capacity_value_id
+                                )),
+                                _frame_value_cell(function, int(
+                                    source_sequence.capacity_value_id
+                                )),
+                            ), dtype="int64",
+                        ), dtype="int64",
                     )
                     capacity_product = Instr(
                         "Mul",
@@ -48707,8 +49265,24 @@ def _class_surface_ssa_program(
                     for column_index, dtype in enumerate(
                         source_sequence.column_dtypes
                     ):
+                        # NOVEL frame storage of ``function``: the child
+                        # column is a copy of the source sequence's column.
                         value = SSAValue(
-                            mint_compiler_value_id(),
+                            mint_compiler_value_id(
+                                function, FRAME_STORAGE_CLONE, (
+                                    _frame_value_cell(function, int(
+                                        source_sequence.column_value_ids[
+                                            column_index
+                                        ]
+                                    )) if column_index < len(
+                                        source_sequence.column_value_ids
+                                    ) else None,
+                                    _frame_value_cell(function, int(
+                                        destination_sequence.capacity_value_id
+                                    )),
+                                ),
+                                dtype=str(dtype or "unknown"),
+                            ),
                             dtype=str(dtype or "unknown"),
                             accounting={
                                 "compiler_frame_storage": str(function_name),
@@ -48725,7 +49299,16 @@ def _class_surface_ssa_program(
                         current_values[int(value.id)] = value
                         child_columns.append(int(value.id))
                     child_lengths = SSAValue(
-                        mint_compiler_value_id(), dtype="int64",
+                        mint_compiler_value_id(
+                            function, FRAME_STORAGE_CLONE, (
+                                _frame_value_cell(function, int(
+                                    source_sequence.length_address_id
+                                )),
+                                _frame_value_cell(function, int(
+                                    destination_sequence.capacity_value_id
+                                )),
+                            ), dtype="int64",
+                        ), dtype="int64",
                         accounting={
                             "compiler_frame_storage": str(function_name),
                             "record_child_pool_sequence_id": int(
@@ -48740,7 +49323,16 @@ def _class_surface_ssa_program(
                     function.args.append(child_lengths)
                     current_values[int(child_lengths.id)] = child_lengths
                     child_capacity = SSAValue(
-                        mint_compiler_value_id(), dtype="int64",
+                        mint_compiler_value_id(
+                            function, _CHILD_CAPACITY_PRODUCT, (
+                                _frame_value_cell(function, int(
+                                    destination_sequence.capacity_value_id
+                                )),
+                                _frame_value_cell(function, int(
+                                    source_sequence.capacity_value_id
+                                )),
+                            ), dtype="int64",
+                        ), dtype="int64",
                     )
                     capacity_product = Instr(
                         "Mul",
@@ -48948,6 +49540,10 @@ def _class_surface_ssa_program(
                     str(instruction.attributes.get("callee") or "")
                 )
                 if callee is None or len(callee.args) != len(instruction.args):
+                    continue
+                if (callee.metadata or {}).get("llvm_repository_kernel"):
+                    # An imported repository kernel is shared by every
+                    # caller; no caller's ownership is its formal's.
                     continue
                 for fed, formal in zip(instruction.args, callee.args):
                     accounting = dict(fed.accounting or {})
@@ -49200,6 +49796,7 @@ def _class_surface_ssa_program(
     # lowering sat 3.5 h in this loop on 2026-09-03).
     from .ssa_call_input_adapters import (
         adapt_physical_call_inputs, physical_call_input_conflicts,
+        scalar_region_formal,
         call_input_rank_updates,
     )
 
@@ -49425,7 +50022,7 @@ def _class_surface_ssa_program(
                         )
                         actual_storage_dtype = (actual.accounting or {}).get("physical_dtype") or actual_dtype
                         formal_storage_dtype = formal_accounting.get("physical_dtype") or formal_dtype
-                        if callee.metadata.get("source_region_integral") and not formal.shape:
+                        if scalar_region_formal(callee, formal):
                             formal_storage_dtype = formal_dtype
                         if (actual_is_physical and formal_is_physical
                                 and actual_storage_dtype not in {"", "unknown"}
@@ -51888,6 +52485,10 @@ def _class_surface_ssa_program(
                 )
                 if callee is None or len(callee.args) != len(instruction.args):
                     continue
+                if (callee.metadata or {}).get("llvm_repository_kernel"):
+                    # An imported repository kernel is shared by every
+                    # caller; no caller's field identity is its formal's.
+                    continue
                 for fed, formal in zip(instruction.args, callee.args):
                     accounting = dict(fed.accounting or {})
                     if not accounting.get("program_abi_storage"):
@@ -53310,7 +53911,42 @@ def _class_surface_ssa_program(
                             tuple(int(instruction.res.id) for instruction in moving),
                             placement_name, placement_reason,
                         )
-                        phi_edge_page.concord(receipt[:5], receipt[5:])
+                        # Program: ``STController.pi_update``'s merge reads
+                        # a record-field projection relocated to its
+                        # predecessor edge.  Wrong record: the relocation
+                        # was written through the raw ``concord`` primitive,
+                        # which the closed latch refuses.  Rule: the
+                        # placement is DERIVED from the Phi's and every moved
+                        # value's ``ssa_value`` cells and the two blocks'
+                        # ``ssa_block`` cells.
+                        from .concordance_declarations import (
+                            FRAME_LINK as _PHI_EDGE_STAGE,
+                            PHI_EDGE_PROJECTION_PLACEMENT as _PHI_EDGE_PAGE,
+                        )
+                        from .ssa_record_return_state import (
+                            identity_cells as _phi_edge_cells,
+                            ssa_block_identity_cell as _phi_edge_block,
+                        )
+
+                        _phi_edge_sources = _frame_cells(
+                            *_phi_edge_cells(
+                                function, phi.res,
+                                *(instruction.res for instruction in moving),
+                            ),
+                            _phi_edge_block(function, merge_name),
+                            _phi_edge_block(function, placement_name),
+                        )
+                        if not _phi_edge_sources:
+                            raise ConcordanceRefusal(
+                                "phi edge projection placement names no "
+                                f"cell: {receipt[:5]!r}"
+                            )
+                        current_identity_book().post(
+                            _PHI_EDGE_PAGE, receipt[:5], receipt[5:],
+                            stage=_PHI_EDGE_STAGE,
+                            provenance=Derived(_phi_edge_sources),
+                            mode=Mode.CONCORD,
+                        )
                         phi_edge_projection_repairs.append(receipt)
                         changed = True
                         break

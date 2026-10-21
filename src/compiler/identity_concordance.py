@@ -1125,6 +1125,36 @@ def _identity_bases_of(book: Any, ref: Any, value_id: int) -> set:
     return found
 
 
+def _source_class_subject_bases(book: Any, ref: Any, value_id: int) -> set:
+    """The identity bases of the value a ``source_value_class`` row is ABOUT.
+
+    Program: ``root`` calls ``hyp(a, b)`` at graph node 2; ``hyp``'s
+    parameter ``b`` is also value 2 in ``hyp``.  The class row of ``hyp``'s
+    ``b`` derives from the call node (a cause) as well as from ``b``'s own
+    cell.  Wrong join: ``_identity_bases_of`` admitted every identity cell
+    with the same integer id, so the class of ``hyp``'s ``b`` was taken as
+    the class of ``root``'s call result and the call result's type ABI was
+    reported as not deriving from it.  Rule: a class row keyed by scope
+    ``s`` (or a specialization ``(s, 'specialization', h)``) is about the
+    value in the read scope the reducer minted from that exact scope,
+    ``lexical_reads:{s}``; only identity bases in that scope are its
+    subject.
+    """
+    row_scope = ref.row[0] if isinstance(ref.row, tuple) else None
+    if (
+        isinstance(row_scope, tuple) and len(row_scope) == 3
+        and row_scope[1] == "specialization"
+    ):
+        row_scope = row_scope[0]
+    label = f"lexical_reads:{row_scope}"
+    return {
+        base for base in _identity_bases_of(book, ref, value_id)
+        if isinstance(base.row, tuple) and base.row
+        and isinstance(base.row[0], tuple) and base.row[0]
+        and base.row[0][0] == label
+    }
+
+
 class CorrelationTable:
     """Every identity claim the module makes, keyed by (function, value id)."""
 
@@ -1597,7 +1627,7 @@ class CorrelationTable:
                         if identity in alternatives
                         and (
                             (
-                                class_bases := _identity_bases_of(
+                                class_bases := _source_class_subject_bases(
                                     book, source_ref, int(value_id),
                                 )
                             ) & abi_bases
@@ -3879,6 +3909,19 @@ class CorrelationTable:
                         ),
                     ))
                     helper = module.functions.get(str(attributes.get("callee") or ""))
+                    # A storage formal the helper never reads (a contains
+                    # scan's capacity) is pruned from helper and call alike;
+                    # the pruning pass records each one on
+                    # ``pruned_callee_formal_concordance``.
+                    pruned_page = identity_book(module).pages.get(
+                        "pruned_callee_formal_concordance"
+                    )
+                    storage = tuple(
+                        value_id for value_id in storage
+                        if pruned_page is None or pruned_page.latest(
+                            (str(attributes.get("callee") or ""), int(value_id))
+                        ) is None
+                    )
                     if (descriptor is None or instruction.op != "Call"
                             or attributes.get("ssa_sequence_operation") != "contains"
                             or int(membership["source_target_id"]) != int(descriptor.sequence_id)
@@ -7793,6 +7836,24 @@ def authored_function_name(name: Any) -> str:
     return text.split("__", 1)[-1] if "__" in text else text
 
 
+def loop_scope_owner(name: Any) -> str:
+    """The lowering that owns a ``loop_scope`` row: the lowered symbol with
+    only its planned-region suffix removed (a region shares its owner's
+    loops).
+
+    Program: ``find(n, k)`` called twice gives two callsite
+    specializations of one authored loop; each lowering mints its own
+    carried value.  Wrong record: rows keyed by the AUTHORED name
+    (``authored_function_name``: module prefix and specialization hash
+    stripped) put both specializations' generations on one row, and the
+    second declaration refused ("already holds carried ...").  Rule: a
+    specialization is its own lowering, so its loop generations are its
+    own rows; the key keeps the lowered symbol.
+    """
+
+    return str(name).split("__planned_region", 1)[0]
+
+
 def _shape_owner_metadata(owner: Any) -> dict:
     """The metadata dict that names the shape scope of ``owner``: a
     ProcessGraph (``G.graph``), a networkx graph (``graph``), an IR function
@@ -8007,7 +8068,7 @@ def declare_loop_scope(
 
     book = current_identity_book()
     page = book.page("loop_scope")
-    scope = (authored_function_name(function), int(loop_node_id))
+    scope = (loop_scope_owner(function), int(loop_node_id))
     _post_loop_scope_cell(
         book, (*scope, "boundary"), 0,
         (str(header), str(latch), str(exit_block)), boundary_cells,
@@ -8087,7 +8148,7 @@ def rebind_loop_scope_inner(
 
     book = current_identity_book()
     row = (
-        authored_function_name(function), int(loop_node_id),
+        loop_scope_owner(function), int(loop_node_id),
         int(declared_inner),
     )
     fact = (int(resident_inner), str(reason))
@@ -8113,7 +8174,7 @@ def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
     """Every loop scope declared for one authored function."""
 
     page = book.page("loop_scope")
-    wanted = authored_function_name(function)
+    wanted = loop_scope_owner(function)
     scopes: dict[int, dict] = {}
     for row in page.rows():
         if not (isinstance(row, tuple) and len(row) == 3):
@@ -8273,7 +8334,7 @@ def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
                 loop_page_decl = book.registry.page("loop_scope")
                 loop_page = book.page(loop_page_decl)
                 declaration_scope = (
-                    authored_function_name(function_name), loop_node_id,
+                    loop_scope_owner(function_name), loop_node_id,
                 )
                 generation_cells = []
                 for row in loop_page.scope_rows(declaration_scope[0]):

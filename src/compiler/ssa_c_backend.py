@@ -5268,6 +5268,20 @@ def emit_ssa_module_to_c(
                     if integral:
                         integer_ids.add(result_id)
                     expression = f"({args[0]} {_BINARY[op]} {args[1]})"
+                    if (
+                        op == "Div"
+                        and any(map(is_integer, instruction.args))
+                        and kind in {"double", "float"}
+                    ):
+                        # Program: ``t = a / b`` with int64 ``a``, ``b``
+                        # (Div -> float64).  Wrong spelling: C ``/`` on two
+                        # int64_t operands truncates (7 / 2 == 3.0).  Rule:
+                        # a Div whose result is floating is true division;
+                        # integer operands are converted before dividing.
+                        integer_ids.discard(result_id)
+                        expression = (
+                            f"((double)({args[0]}) / (double)({args[1]}))"
+                        )
                     if integral and op in {"Add", "Sub", "Mul"}:
                         unsigned = _unsigned_c_type(instruction.res.dtype)
                         expression = (
@@ -5735,6 +5749,30 @@ def emit_ssa_module_to_c(
             capacity = owned_storage_names.get(int(sequence.capacity_value_id))
             columns = [owned_storage_names.get(int(value_id))
                        for value_id in sequence.column_value_ids]
+            if capacity is not None and columns and all(
+                column in allocation_counts for column in columns
+            ) and any(
+                storage_requirements.get(int(value_id)) is None
+                or storage_requirements[int(value_id)].element_count is None
+                for value_id in sequence.column_value_ids
+            ):
+                # Program: ``xs = []; while i < n: xs.append(i * 2)``;
+                # ``return len(xs)`` returned 1 for n=5.  Wrong record: a
+                # private arena whose element count nothing proves was
+                # allocated with one element and its capacity cell set to
+                # 1, so every later append reported "full" into a private
+                # status cell nobody reads.  Rule: a resident sequence's
+                # capacity is a proven static extent or a caller-provided
+                # arena; dynamic growth is the explicit unsupported
+                # boundary (``DYNAMIC_GROWTH_UNAVAILABLE``), never 1.
+                shortfalls.append(CEmissionShortfall(
+                    "sequence",
+                    "dynamic-growth-unavailable: private sequence "
+                    f"{int(sequence.sequence_id)} of {function_name} has no "
+                    "proven capacity; a caller-provided arena or a static "
+                    "producer extent is required",
+                ))
+                continue
             if capacity is not None and columns and all(
                 column in allocation_counts for column in columns
             ):

@@ -661,17 +661,26 @@ def plan_region_to_ssa_instrs(
                 CANONICAL_VALUE, (tuple(lexical_read_scope), int(result.id)),
             )
         )
-        if source is None:
-            value_id = GLOBAL_MONOTONIC_IDS.mint()
-        else:
-            from .concordance_declarations import FRESH_LIKE, PLANNER_HIERARCHY
-            from .precompile_to_ssa import _mint_ssa_id
+        from .concordance_declarations import (
+            FRESH_LIKE, PLANNER_HIERARCHY, SSA_VALUE,
+        )
+        from .precompile_to_ssa import _function_root_cell, _mint_ssa_id
 
-            value_id = _mint_ssa_id(
-                current_identity_book(), function_scope, FRESH_LIKE, (source,),
-                dtype=result.dtype, shape=tuple(result.shape),
-                stage=PLANNER_HIERARCHY,
+        book = current_identity_book()
+        if source is None:
+            # A value with no canonical cell (a planner synthesis) is fresh
+            # LIKE the value it copies when that value has a row, else from
+            # the function root, as the control builder's ``fresh_value``
+            # mints with no more specific cell.  It was a bare counter id.
+            source = (
+                book.latest_ref(SSA_VALUE, (function_scope, int(result.id)))
+                or _function_root_cell(book, function_scope)
             )
+        value_id = _mint_ssa_id(
+            book, function_scope, FRESH_LIKE, (source,),
+            dtype=result.dtype, shape=tuple(result.shape),
+            stage=PLANNER_HIERARCHY,
+        )
         made = SSAValue(
             value_id,
             dtype=result.dtype,

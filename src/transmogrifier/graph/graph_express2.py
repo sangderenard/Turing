@@ -2417,6 +2417,42 @@ def _resolved_ast_literal(node, bindings):
             return constructor(argument)
         except (TypeError, ValueError):
             return _UNRESOLVED_LITERAL
+    if isinstance(node, ast.BinOp):
+        # ``SERIAL_BITS = (1 << 57) - 1`` (``id_space``) is a literal
+        # constant too.  Unresolved, the name became a public Input of every
+        # function reading it, with no class, so ``serial_of(...)`` had no
+        # result class and ``describe``'s f-string had no formatter.  Only
+        # arithmetic over already-resolved int/float/bool literals is
+        # evaluated; a shift or power that could not stay small is left
+        # unresolved rather than computed.
+        left = _resolved_ast_literal(node.left, bindings)
+        right = _resolved_ast_literal(node.right, bindings)
+        if (
+            left is _UNRESOLVED_LITERAL or right is _UNRESOLVED_LITERAL
+            or not all(
+                type(item) in {int, float, bool} for item in (left, right)
+            )
+        ):
+            return _UNRESOLVED_LITERAL
+        operators = {
+            ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+            ast.Mult: lambda a, b: a * b, ast.Div: lambda a, b: a / b,
+            ast.FloorDiv: lambda a, b: a // b, ast.Mod: lambda a, b: a % b,
+            ast.BitAnd: lambda a, b: a & b, ast.BitOr: lambda a, b: a | b,
+            ast.BitXor: lambda a, b: a ^ b,
+            ast.LShift: lambda a, b: a << b, ast.RShift: lambda a, b: a >> b,
+            ast.Pow: lambda a, b: a ** b,
+        }
+        operator = operators.get(type(node.op))
+        if operator is None or (
+            isinstance(node.op, (ast.LShift, ast.Pow))
+            and (not isinstance(right, int) or abs(right) > 256)
+        ):
+            return _UNRESOLVED_LITERAL
+        try:
+            return operator(left, right)
+        except (ArithmeticError, TypeError, ValueError):
+            return _UNRESOLVED_LITERAL
     if isinstance(node, ast.UnaryOp):
         operand = _resolved_ast_literal(node.operand, bindings)
         if operand is _UNRESOLVED_LITERAL:

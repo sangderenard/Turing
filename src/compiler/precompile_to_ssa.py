@@ -1782,6 +1782,217 @@ def _control_expression_mapping(
     }
 
 
+def register_sequence_lowering(
+    lowering: Any, *, book: Any, owner: Ref, caller_scope: Any, stage: Any,
+) -> tuple[dict[str, Function], dict[int, SSAValue]]:
+    """Install sequence helpers and give every generated value a book-minted ID.
+
+    The sequence algorithm builder's IDs are construction-local labels.
+    A helper becomes compiler SSA only here, at its source-linked
+    registration boundary; its durable identities are therefore minted
+    from the exact operation/control cell that caused the helper (``owner``)
+    and from already-published operand cells.  Descriptor storage formals
+    keep the caller's (``caller_scope``) physical ids and derive their rows
+    from the caller's rows.  Every producer of a sequence helper registers it
+    here: the control builder and the shell's structural recovery.
+
+    Returns the registered helpers by name and the generated results that
+    still have no row (the control builder adopts those as read views).
+    """
+    registered: dict[str, Function] = {}
+    unposted: dict[int, SSAValue] = {}
+
+
+    def remap_metadata(value: Any, replacements: Mapping[int, int]) -> Any:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return replacements.get(int(value), value)
+        if isinstance(value, tuple):
+            return tuple(remap_metadata(item, replacements) for item in value)
+        if isinstance(value, list):
+            return [remap_metadata(item, replacements) for item in value]
+        if isinstance(value, dict):
+            return {
+                remap_metadata(key, replacements): remap_metadata(
+                    item, replacements,
+                )
+                for key, item in value.items()
+            }
+        return value
+
+    for function in lowering.functions:
+        scope = str(function.name)
+        mint_page = book.pages.get("concordance_mint")
+        minted_with_edges = {
+            int(row[1])
+            for row in (() if mint_page is None else mint_page.rows())
+            if row[1] is not None
+        }
+        replacements: dict[int, int] = {}
+        # Extra helper formals (for example a keyed lookup's query) are
+        # construction-local identities. Descriptor storage formals keep
+        # the caller's already-minted physical IDs; only an unaccounted
+        # minted label receives a durable helper-local identity here.
+        for argument in function.args:
+            old_id = int(argument.id)
+            if has_flag(old_id, MINTED) and old_id not in minted_with_edges:
+                # Program: keyed Tensor lookup (tests/test_sequence_helper
+                # _physical_rows.py).  Wrong record: the lookup helper's
+                # own formals (its query/default; the builder declares
+                # their dtype from the descriptor's key/value column) were
+                # minted with dtype only, ``physical_dtype`` reaching the
+                # row in accounting alone.  Rule: this registration is the
+                # first producer to know the formal and its declared
+                # dtype, so the mint posts it (plus ``arena`` when the
+                # builder declared a ``sequence_arena``); accounting
+                # follows the fact.
+                _arena = bool(
+                    (argument.accounting or {}).get("sequence_arena")
+                )
+                replacements[old_id] = _mint_ssa_id(
+                    book, scope, CONTROL_EXPRESSION, (owner,),
+                    dtype=argument.dtype,
+                    shape=tuple(argument.shape or ()),
+                    stage=stage,
+                    physical={
+                        **({"arena": True} if _arena else {}),
+                        **_declared_physical_dtype(argument.dtype),
+                    } or None,
+                )
+        if replacements:
+            for value in (
+                *function.args,
+                *(
+                    item
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    for item in instruction.args
+                ),
+            ):
+                value.id = replacements.get(int(value.id), int(value.id))
+            function.metadata = remap_metadata(
+                dict(function.metadata or {}), replacements,
+            )
+        for label in function.blocks:
+            row = (scope, str(function.name), str(label))
+            if book.latest_ref(SSA_BLOCK, row) is None:
+                book.post(
+                    SSA_BLOCK,
+                    row,
+                    SSABlockKind.SEQUENCE_HELPER,
+                    stage=stage,
+                    provenance=Derived((owner,)),
+                    mode=Mode.CONCORD,
+                )
+        for argument in function.args:
+            row = (scope, int(argument.id))
+            if book.latest_ref(SSA_VALUE, row) is None:
+                # Program: keyed Tensor lookup.  Wrong record: a helper
+                # formal that keeps the caller's descriptor id was
+                # adopted with dtype only while the caller's own row
+                # (this builder's descriptor mint) posts its physical
+                # fields.  Rule: the formal is the same storage, so its
+                # row is DERIVED from the caller's row and carries the
+                # fields that row records; none recorded posts none.
+                _caller_ref = book.latest_ref(
+                    SSA_VALUE, (caller_scope, int(argument.id)),
+                )
+                _caller_fact = (
+                    None if _caller_ref is None else
+                    book.page(SSA_VALUE).cell(
+                        _caller_ref.row, _caller_ref.column,
+                    )
+                )
+                _carried = {
+                    name: getattr(_caller_fact, name)
+                    for name in (
+                        "physical_dtype", "storage", "rank", "arena",
+                        "device",
+                    )
+                    if isinstance(_caller_fact, SSAValueFact)
+                    and getattr(_caller_fact, name) not in (None, False)
+                }
+                book.post(
+                    SSA_VALUE,
+                    row,
+                    SSAValueFact(
+                        argument.dtype,
+                        tuple(argument.shape or ()),
+                        SSAValueOrigin.ADOPTED_GRAPH_ID,
+                        **_carried,
+                    ),
+                    stage=stage,
+                    provenance=Derived(tuple(
+                        (owner,) if not _carried
+                        else (owner, _caller_ref)
+                    )),
+                    mode=Mode.REVISE,
+                )
+        generated = tuple(
+            (instruction, instruction.res)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        )
+        for instruction, result in generated:
+            old_id = int(result.id)
+            operand_cells = tuple(dict.fromkeys(
+                cell for value in instruction.args
+                if (cell := book.latest_ref(
+                    SSA_VALUE,
+                    (
+                        scope,
+                        replacements.get(int(value.id), int(value.id)),
+                    ),
+                )) is not None
+            ))
+            replacements[old_id] = _mint_ssa_id(
+                book,
+                scope,
+                (
+                    CONTROL_CONST
+                    if str(instruction.op).casefold() == "const"
+                    else CONTROL_EXPRESSION
+                ),
+                operand_cells or (owner,),
+                dtype=result.dtype,
+                shape=tuple(result.shape or ()),
+                stage=stage,
+            )
+        seen_values: set[int] = set()
+        for value in (
+            *function.args,
+            *(
+                item
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for item in (
+                    *instruction.args,
+                    *((instruction.res,) if instruction.res is not None else ()),
+                )
+            ),
+        ):
+            if id(value) in seen_values:
+                continue
+            seen_values.add(id(value))
+            value.id = replacements.get(int(value.id), int(value.id))
+        function.metadata = remap_metadata(
+            dict(function.metadata or {}), replacements,
+        )
+        registered[function.name] = function
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                result = instruction.res
+                if result is None:
+                    continue
+                row = (scope, int(result.id))
+                if book.latest_ref(SSA_VALUE, row) is not None:
+                    continue
+                unposted[int(result.id)] = result
+    return registered, unposted
+
+
 class _ControlSSABuilder(TiledObject):
     __live_storage_root__ = True
 
@@ -4857,207 +5068,21 @@ class _ControlSSABuilder(TiledObject):
         return replaces_region
 
     def _register_sequence_lowering(self, lowering) -> None:
-        """Install helpers and give every generated value a book-minted ID.
+        """Install helpers through ``register_sequence_lowering``, caused by
+        the innermost control cell (else this lowering's root)."""
 
-        The sequence algorithm builder's IDs are construction-local labels.
-        A helper becomes compiler SSA only here, at its source-linked
-        registration boundary; its durable identities are therefore minted
-        from the exact operation/control cell that caused the helper and from
-        already-published operand cells.
-        """
-
-        def remap_metadata(value: Any, replacements: Mapping[int, int]) -> Any:
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, int):
-                return replacements.get(int(value), value)
-            if isinstance(value, tuple):
-                return tuple(remap_metadata(item, replacements) for item in value)
-            if isinstance(value, list):
-                return [remap_metadata(item, replacements) for item in value]
-            if isinstance(value, dict):
-                return {
-                    remap_metadata(key, replacements): remap_metadata(
-                        item, replacements,
-                    )
-                    for key, item in value.items()
-                }
-            return value
-
-        for function in lowering.functions:
-            book = self._book()
-            scope = str(function.name)
-            owner = next((
+        registered, unposted = register_sequence_lowering(
+            lowering,
+            book=self._book(),
+            owner=next((
                 cell for cell in reversed(self._control_cells)
                 if cell is not None
-            ), None) or self._function_root()
-            mint_page = book.pages.get("concordance_mint")
-            minted_with_edges = {
-                int(row[1])
-                for row in (() if mint_page is None else mint_page.rows())
-                if row[1] is not None
-            }
-            replacements: dict[int, int] = {}
-            # Extra helper formals (for example a keyed lookup's query) are
-            # construction-local identities. Descriptor storage formals keep
-            # the caller's already-minted physical IDs; only an unaccounted
-            # minted label receives a durable helper-local identity here.
-            for argument in function.args:
-                old_id = int(argument.id)
-                if has_flag(old_id, MINTED) and old_id not in minted_with_edges:
-                    # Program: keyed Tensor lookup (tests/test_sequence_helper
-                    # _physical_rows.py).  Wrong record: the lookup helper's
-                    # own formals (its query/default; the builder declares
-                    # their dtype from the descriptor's key/value column) were
-                    # minted with dtype only, ``physical_dtype`` reaching the
-                    # row in accounting alone.  Rule: this registration is the
-                    # first producer to know the formal and its declared
-                    # dtype, so the mint posts it (plus ``arena`` when the
-                    # builder declared a ``sequence_arena``); accounting
-                    # follows the fact.
-                    _arena = bool(
-                        (argument.accounting or {}).get("sequence_arena")
-                    )
-                    replacements[old_id] = _mint_ssa_id(
-                        book, scope, CONTROL_EXPRESSION, (owner,),
-                        dtype=argument.dtype,
-                        shape=tuple(argument.shape or ()),
-                        stage=self._stage(),
-                        physical={
-                            **({"arena": True} if _arena else {}),
-                            **_declared_physical_dtype(argument.dtype),
-                        } or None,
-                    )
-            if replacements:
-                for value in (
-                    *function.args,
-                    *(
-                        item
-                        for block in function.blocks.values()
-                        for instruction in block.instrs
-                        for item in instruction.args
-                    ),
-                ):
-                    value.id = replacements.get(int(value.id), int(value.id))
-                function.metadata = remap_metadata(
-                    dict(function.metadata or {}), replacements,
-                )
-            for label in function.blocks:
-                row = (scope, str(function.name), str(label))
-                if book.latest_ref(SSA_BLOCK, row) is None:
-                    book.post(
-                        SSA_BLOCK,
-                        row,
-                        SSABlockKind.SEQUENCE_HELPER,
-                        stage=self._stage(),
-                        provenance=Derived((owner,)),
-                        mode=Mode.CONCORD,
-                    )
-            for argument in function.args:
-                row = (scope, int(argument.id))
-                if book.latest_ref(SSA_VALUE, row) is None:
-                    # Program: keyed Tensor lookup.  Wrong record: a helper
-                    # formal that keeps the caller's descriptor id was
-                    # adopted with dtype only while the caller's own row
-                    # (this builder's descriptor mint) posts its physical
-                    # fields.  Rule: the formal is the same storage, so its
-                    # row is DERIVED from the caller's row and carries the
-                    # fields that row records; none recorded posts none.
-                    _caller_ref = book.latest_ref(
-                        SSA_VALUE, (self._scope(), int(argument.id)),
-                    )
-                    _caller_fact = (
-                        None if _caller_ref is None else
-                        book.page(SSA_VALUE).cell(
-                            _caller_ref.row, _caller_ref.column,
-                        )
-                    )
-                    _carried = {
-                        name: getattr(_caller_fact, name)
-                        for name in (
-                            "physical_dtype", "storage", "rank", "arena",
-                            "device",
-                        )
-                        if isinstance(_caller_fact, SSAValueFact)
-                        and getattr(_caller_fact, name) not in (None, False)
-                    }
-                    book.post(
-                        SSA_VALUE,
-                        row,
-                        SSAValueFact(
-                            argument.dtype,
-                            tuple(argument.shape or ()),
-                            SSAValueOrigin.ADOPTED_GRAPH_ID,
-                            **_carried,
-                        ),
-                        stage=self._stage(),
-                        provenance=Derived(tuple(
-                            (owner,) if not _carried
-                            else (owner, _caller_ref)
-                        )),
-                        mode=Mode.REVISE,
-                    )
-            generated = tuple(
-                (instruction, instruction.res)
-                for block in function.blocks.values()
-                for instruction in block.instrs
-                if instruction.res is not None
-            )
-            for instruction, result in generated:
-                old_id = int(result.id)
-                operand_cells = tuple(dict.fromkeys(
-                    cell for value in instruction.args
-                    if (cell := book.latest_ref(
-                        SSA_VALUE,
-                        (
-                            scope,
-                            replacements.get(int(value.id), int(value.id)),
-                        ),
-                    )) is not None
-                ))
-                replacements[old_id] = _mint_ssa_id(
-                    book,
-                    scope,
-                    (
-                        CONTROL_CONST
-                        if str(instruction.op).casefold() == "const"
-                        else CONTROL_EXPRESSION
-                    ),
-                    operand_cells or (owner,),
-                    dtype=result.dtype,
-                    shape=tuple(result.shape or ()),
-                    stage=self._stage(),
-                )
-            seen_values: set[int] = set()
-            for value in (
-                *function.args,
-                *(
-                    item
-                    for block in function.blocks.values()
-                    for instruction in block.instrs
-                    for item in (
-                        *instruction.args,
-                        *((instruction.res,) if instruction.res is not None else ()),
-                    )
-                ),
-            ):
-                if id(value) in seen_values:
-                    continue
-                seen_values.add(id(value))
-                value.id = replacements.get(int(value.id), int(value.id))
-            function.metadata = remap_metadata(
-                dict(function.metadata or {}), replacements,
-            )
-            self.sequence_helper_functions[function.name] = function
-            for block in function.blocks.values():
-                for instruction in block.instrs:
-                    result = instruction.res
-                    if result is None:
-                        continue
-                    row = (scope, int(result.id))
-                    if book.latest_ref(SSA_VALUE, row) is not None:
-                        continue
-                    self.ssa_value_objects[int(result.id)] = result
+            ), None) or self._function_root(),
+            caller_scope=self._scope(),
+            stage=self._stage(),
+        )
+        self.sequence_helper_functions.update(registered)
+        self.ssa_value_objects.update(unposted)
 
     def external_value(
         self,
@@ -10373,7 +10398,11 @@ class _ControlSSABuilder(TiledObject):
         element_dtype: str | None = None,
         column_dtypes: tuple[str | None, ...] | None = (),
         column_shapes: tuple[tuple[int, ...], ...] | None = (),
+        dtype_sources: tuple = (),
     ) -> SSASequenceDescriptor | None:
+        """``dtype_sources``: the values whose dtypes ``column_dtypes``
+        proposes (a row a writer stores); their cells derive the row
+        dtype the proposal refines."""
         value_id = int(value_id)
         # Literal-table survey uses ``None`` to mean that an empty table has
         # no authored rows from which a column dtype/shape can be inferred.
@@ -10488,6 +10517,7 @@ class _ControlSSABuilder(TiledObject):
                 sources=self._cells(
                     self._sequence_contract_cell(value_id),
                     *self.sequence_storage_values.get(value_id, ()),
+                    *dtype_sources,
                 ) or (self._function_root(),),
                 stage=self._stage(),
             )
@@ -14801,6 +14831,45 @@ class _ControlSSABuilder(TiledObject):
                         projected.dtype = str(column_dtype)
                     indexed_values.append(projected)
                 mutation_values = tuple(indexed_values)
+            if (
+                deferred_record_row is None and not deferred_record_slots
+                and indexed_record_row_source is None
+                and len(mutation_values) == len(destination.column_value_ids)
+                and any(
+                    str(column_dtype) in {"", "unknown", "None"}
+                    and str(value.dtype or "unknown")
+                    not in {"", "unknown", "None"}
+                    for column_dtype, value in zip(
+                        destination.column_dtypes, mutation_values,
+                    )
+                )
+            ):
+                # Program: ``xs = []`` then ``xs.append(i * 2 + n)``.  Wrong
+                # record: the row dtype was concorded only at the empty
+                # literal ('unknown') and the appended int64 never proposed
+                # its dtype, so the arena became a double buffer read back as
+                # float64 into an int64 accumulator (physical transport
+                # disagreement).  Rule: the writer of a row proposes the
+                # dtypes of the values it stores; ``unknown`` is absence and
+                # a known dtype refines it through the row-dtype concordance,
+                # DERIVED from the stored values' cells.  A disagreement with
+                # a known column still raises there.
+                refined = self._sequence_descriptor(
+                    mutation.sequence_value_id,
+                    policy=mutation.policy,
+                    writable=True,
+                    location=location,
+                    column_count=len(destination.column_value_ids),
+                    column_dtypes=tuple(
+                        None if str(value.dtype or "unknown")
+                        in {"", "unknown", "None"} else str(value.dtype)
+                        for value in mutation_values
+                    ),
+                    dtype_sources=tuple(mutation_values),
+                )
+                if refined is None:
+                    return
+                destination = refined
             if deferred_record_row is None and not deferred_record_slots:
                 for mutation_value, element_dtype in zip(
                     mutation_values, destination.column_dtypes

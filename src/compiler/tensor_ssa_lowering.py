@@ -314,6 +314,40 @@ _SHAPED_SSA_OPERATIONS = {
 }
 
 
+def _elementwise_result_physical(
+    owner: Any, operands: Any, *, book: Any,
+) -> dict[str, Any]:
+    """The storage and rank of an elementwise kernel result, read from its
+    operands' posted ``ssa_value`` rows.
+
+    Program: ``_energy_time_limit``'s ``power > 0.0`` (value 53) compares
+    the rank-1 span ``power`` (value 28, posted ``storage='span', rank=1``)
+    with a rank-0 literal through ``binary_scalar_double``, whose output is a
+    ``double *`` buffer.  Wrong record: the result's row carried only
+    ``physical_dtype='float64'``; its rank and storage were never posted, so
+    the region ``where(mask, power, ones)`` received the mask as a
+    shapeless scalar ``bool`` formal while the caller held a double buffer
+    ("incompatible physical call inputs").  Rule: an elementwise result
+    broadcasts its operands, so its rank is the largest operand rank and its
+    storage is a span exactly when that rank is positive.  Derived only when
+    every operand's row records its rank; otherwise nothing is posted and the
+    fields stay absent rather than guessed.
+    """
+
+    from .ssa_record_return_state import posted_ssa_value_fact
+
+    ranks = []
+    for operand in operands:
+        fact = posted_ssa_value_fact(owner, int(operand.id), book=book)
+        if fact is None or fact.rank is None:
+            return {}
+        ranks.append(int(fact.rank))
+    if not ranks:
+        return {}
+    rank = max(ranks)
+    return {"storage": "span" if rank > 0 else "scalar", "rank": rank}
+
+
 def _settle_unary_result_metadata(source: SSAValue, result: SSAValue) -> None:
     """Apply the unary kernel's shape law without erasing result semantics."""
 
@@ -1731,6 +1765,30 @@ def propagate_repository_ssa_call_metadata(
                         int(_delivered) if _physical_field == "rank"
                         else _delivered
                     )
+            if not authoritative and _edge_physical:
+                # Program: the view probe's two stores into ``m`` call the
+                # one shared ``index_assign_double`` kernel; its ``values``
+                # formal (582) is fed a scalar by one store and a span by
+                # the other.  Wrong record: every caller's edge REVISED the
+                # shared formal's row, which alternated span/scalar each
+                # round while accounting kept the first fill
+                # (``ssa-publication-type-disagreement``).  Rule: a
+                # non-authoritative edge is fill-only on the row exactly as
+                # on accounting (``old_contract_value is not None and not
+                # authoritative``): it posts only the fields the target row
+                # does not record.
+                _edge_target_fact = _posted_edge_fact(
+                    function, int(value.id), book=_edge_book,
+                )
+                if _edge_target_fact is not None:
+                    _edge_physical = {
+                        field: item for field, item in _edge_physical.items()
+                        if (
+                            getattr(_edge_target_fact, field) is None
+                            if field != "arena"
+                            else not _edge_target_fact.arena
+                        )
+                    }
             if _edge_physical:
                 _revise_edge_physical(
                     function, int(value.id), dtype=value.dtype,
@@ -2270,13 +2328,23 @@ def propagate_repository_ssa_call_metadata(
                         # distinction between a scalar ``()`` and a tensor.
                         # Reverse propagation remains fill-only so a stale
                         # placeholder cannot reshape the actual argument.
-                        changed |= enrich(
-                            callee, int(formal.id), semantic_actual,
-                            authoritative=(
-                                specialized_call and settle_exact_formals
-                            ),
-                            source_owner=function,
-                        )
+                        # A repository kernel is the imported, complete
+                        # LLVM body shared by every caller; its formals are
+                        # its own ABI, not any one caller's actual.  Every
+                        # caller writing its storage onto the one formal row
+                        # made ``index_assign_double``'s ``values`` formal
+                        # alternate span/scalar.  The body stays its input;
+                        # the call edge is settled on the caller's side.
+                        if not (callee.metadata or {}).get(
+                            "llvm_repository_kernel"
+                        ):
+                            changed |= enrich(
+                                callee, int(formal.id), semantic_actual,
+                                authoritative=(
+                                    specialized_call and settle_exact_formals
+                                ),
+                                source_owner=function,
+                            )
                         if specialized_call:
                             changed |= settle_specialized_formal_descriptor(
                                 callee_name, formal, semantic_actual,
@@ -5129,7 +5197,13 @@ def lower_tensor_calls_to_repository_ssa(
                                     for operand in data_args
                                 ),
                                 book=_opcode_book,
-                                physical={"physical_dtype": "float64"},
+                                physical={
+                                    "physical_dtype": "float64",
+                                    **_elementwise_result_physical(
+                                        _opcode_owner, data_args,
+                                        book=_opcode_book,
+                                    ),
+                                },
                             )
                             _opcode_fact = _posted_opcode_fact(
                                 _opcode_owner, int(result.id),
@@ -5148,6 +5222,17 @@ def lower_tensor_calls_to_repository_ssa(
                                 else "float64"
                             ),
                         }
+                        if _opcode_fact is not None:
+                            # Accounting is the view of the posted storage
+                            # and rank, as it is of the physical dtype.
+                            if _opcode_fact.storage is not None:
+                                result.accounting["program_abi_storage"] = (
+                                    _opcode_fact.storage
+                                )
+                            if _opcode_fact.rank is not None:
+                                result.accounting["program_abi_rank"] = int(
+                                    _opcode_fact.rank
+                                )
                     if opcode_contract[0] == "binary":
                         shaped_operands = [
                             tuple(operand.shape or ())

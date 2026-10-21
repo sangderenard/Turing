@@ -148,6 +148,9 @@ def _lower_toplevel(*, process_graph_sink=None):
         setattr(stub, name, np.zeros((1,), dtype=np.float64))
     base = balloon_tire_managed_extraction_contract(stub).program_abi.receipt()
     source = "\n\n".join((
+        # The real module's channel indices; unimported, ``ENERGY_J`` was a
+        # free name and the slices were not the real program's.
+        "from src.common.dt_system.error_channels import ENERGY_J, POWER_W",
         inspect.getsource(_scalar),
         inspect.getsource(_energy_time_limit),
         inspect.getsource(_propose_dt_pen),
@@ -207,6 +210,7 @@ def _lower_energy(*, process_graph_sink=None):
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     source = "\n\n".join((
+        "from src.common.dt_system.error_channels import ENERGY_J, POWER_W",
         inspect.getsource(_energy_time_limit),
         "def root(metrics, targets):\n"
         "    return _energy_time_limit(metrics, targets)\n",

@@ -171,12 +171,25 @@ def _concord_exact_region_feed_dtypes(
                         and str(resident.dtype) in _NUMERIC_DTYPES
                     )
                     settled_physical_results.append(settled_physical_result)
+                    # Program: the list probe's ``total + len(xs)`` region,
+                    # cut while ``total`` (the if-merge Phi, 21) was still the
+                    # planner's provisional float64; scalar settlement later
+                    # revised the shared row to int64.  Wrong record: the
+                    # instruction's cut-time ``feed_dtypes`` copy was kept as
+                    # the exact feed, so the int64 actual was cast to float64
+                    # and the formal row revised back to float64.  Rule: once
+                    # result settlement has run (the non-deferred pass), the
+                    # resident's posted row is the feed's type for every
+                    # numeric resident, not only a producer-backed result.
                     if (
                         (not defer_unsettled_region_call_results or settled_physical_result)
                         and
                         resident is not None
-                        and (resident.accounting or {}).get(
-                            'ssa_call_result_from'
+                        and (
+                            (resident.accounting or {}).get(
+                                'ssa_call_result_from'
+                            )
+                            or not defer_unsettled_region_call_results
                         )
                         and str(resident.dtype or '') in _NUMERIC_DTYPES
                     ):
@@ -683,6 +696,30 @@ def _infer_pointer_storage(functions, native_storage=None):
                     'physical_dtype_provenance': 'typed_memory_operations'}
 
 
+def scalar_region_formal(callee, formal):
+    """Whether ``formal`` is a scalar value formal of a source-region integral,
+    whose storage type is its own resident dtype.
+
+    Program: ``_energy_time_limit``'s ``where(power > 0.0, power, ones)``
+    region (planned_region_7) takes the comparison mask, value 53, whose
+    ``ssa_value`` row records a rank-1 double span (shared by caller and
+    region, one identity).  Wrong record: the scalar rule read the formal's
+    resident ``shape`` -- ``()`` for a span whose extent is dynamic -- so the
+    span was compared as a scalar ``bool`` against its own double buffer.
+    Rule: the formal's posted rank decides; rank 0 is a scalar, a positive
+    rank is storage.  Only a row that records no rank leaves the resident
+    shape to decide (the unposted worklist ``ssa-physical-unposted``).
+    """
+    from .ssa_record_return_state import posted_ssa_value_fact
+
+    if not callee.metadata.get('source_region_integral') or formal.dtype == 'ptr':
+        return False
+    fact = posted_ssa_value_fact(callee, int(formal.id))
+    if fact is not None and fact.rank is not None:
+        return int(fact.rank) == 0
+    return not formal.shape
+
+
 def physical_call_input_conflicts(functions):
     """Collect the whole frontier before inference mutates any value types."""
     conflicts = []
@@ -706,7 +743,7 @@ def physical_call_input_conflicts(functions):
                     # "ptr" itself is not a competing numerical dtype.
                     actual_type = (actual.accounting or {}).get('physical_dtype') or actual.dtype
                     formal_type = (formal.accounting or {}).get('physical_dtype') or formal.dtype
-                    if callee.metadata.get('source_region_integral') and not formal.shape and formal.dtype != 'ptr':
+                    if scalar_region_formal(callee, formal):
                         formal_type = formal.dtype
                     if (actual_type in {None, '', 'unknown', 'ptr'} or formal_type in {None, '', 'unknown', 'ptr'}
                             or actual_type == formal_type):
@@ -1068,7 +1105,7 @@ def _adapt_physical_call_inputs_round(
                             continue
                         accounting = {**dict(actual.accounting or {}),
                             **dict((caller_formals.get(int(actual.id), actual).accounting or {}))}
-                        scalar_region = bool(callee.metadata.get('source_region_integral') and not formal.shape and formal.dtype != 'ptr')
+                        scalar_region = scalar_region_formal(callee, formal)
                         source_dtype = accounting.get('physical_dtype') or actual.dtype
                         target_dtype = formal.dtype if scalar_region else (formal.accounting or {}).get('physical_dtype')
                         numeric = {'bool', 'int32', 'int64', 'float32', 'float64'}

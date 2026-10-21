@@ -4497,6 +4497,130 @@ def _link_integer_glyph_formatter_calls(
     return rewritten_components
 
 
+_BUILTIN_SCALAR_INTEGER_OPERATORS = (
+    ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod,
+    ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr, ast.BitXor,
+)
+_BUILTIN_SCALAR_FLOAT_OPERATORS = (
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod,
+)
+
+
+def _builtin_scalar_operator_class(expression: Any, operand_classes: tuple) -> str | None:
+    """Python's own result class of a builtin scalar operator, or None.
+
+    Defined only where the operand classes decide it: ``int`` arithmetic is
+    ``int`` (``/`` is ``float``), any ``float`` operand makes ``float``,
+    ``bool`` bitwise operators stay ``bool`` and ``bool`` arithmetic is
+    ``int``.  ``**`` is excluded (``2 ** -1`` is a ``float``, ``(-8.0) **
+    (1/3)`` a ``complex``): its class is not a function of the operand
+    classes.
+    """
+    classes = tuple(operand_classes)
+    if any(item not in {"builtins.int", "builtins.bool", "builtins.float"}
+           for item in classes):
+        return None
+    if isinstance(expression, ast.BinOp) and len(classes) == 2:
+        if "builtins.float" in classes:
+            return (
+                "builtins.float"
+                if isinstance(expression.op, _BUILTIN_SCALAR_FLOAT_OPERATORS)
+                else None
+            )
+        if isinstance(expression.op, ast.Div):
+            return "builtins.float"
+        if (
+            classes == ("builtins.bool", "builtins.bool")
+            and isinstance(expression.op, (ast.BitAnd, ast.BitOr, ast.BitXor))
+        ):
+            return "builtins.bool"
+        if isinstance(expression.op, _BUILTIN_SCALAR_INTEGER_OPERATORS):
+            return "builtins.int"
+        return None
+    if isinstance(expression, ast.UnaryOp) and len(classes) == 1:
+        if isinstance(expression.op, ast.Not):
+            return "builtins.bool"
+        if classes[0] == "builtins.float":
+            return (
+                "builtins.float"
+                if isinstance(expression.op, (ast.UAdd, ast.USub)) else None
+            )
+        if isinstance(expression.op, (ast.UAdd, ast.USub, ast.Invert)):
+            return "builtins.int"
+    return None
+
+
+def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
+    """Publish the class of every builtin scalar operator result.
+
+    Program: ``k = value_id + 1; return f"legacy#{k}"`` with ``value_id:
+    int`` (and ``id_space.describe``'s ``serial_of(...)``, seven bootstrap
+    units in all).  Wrong record: an operator result had no
+    ``source_value_class`` row, so the integer glyph formatter was never
+    linked and materialization refused "formatted glyph component has no
+    resident producer".  Rule: an operator over operands whose class rows
+    are builtin ``int``/``bool``/``float`` has the class Python defines for
+    it, DERIVED from the operator node's cell and the operand class cells;
+    a result whose class the operands do not decide gets no row.  Returns
+    whether a row was added (the numeric fixed point repeats on change).
+    """
+
+    from ...compiler.concordance_declarations import SOURCE_VALUE_CLASS
+
+    book = current_identity_book()
+    target = getattr(graph, "G", graph)
+    scope = _source_numeric_scope(graph)
+    page = book.page(SOURCE_VALUE_CLASS)
+    changed = False
+    for node_id, data in tuple(target.nodes(data=True)):
+        expression = data.get("expr_obj")
+        if isinstance(expression, ast.BinOp):
+            roles = ("lhs", "rhs")
+        elif isinstance(expression, ast.UnaryOp):
+            roles = ("operand",)
+        else:
+            continue
+        value_id = int(data.get("value_id", node_id))
+        if page.latest((scope, value_id)) is not None:
+            continue
+        parents = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        if any(role not in parents for role in roles) or len(parents) != len(roles):
+            continue
+        operand_ids = tuple(
+            int(target.nodes[parents[role]].get("value_id", parents[role]))
+            if parents[role] in target else parents[role]
+            for role in roles
+        )
+        operand_cells = tuple(
+            book.latest_ref(SOURCE_VALUE_CLASS, (scope, operand_id))
+            for operand_id in operand_ids
+        )
+        if any(cell is None for cell in operand_cells):
+            continue
+        operand_classes = tuple(
+            _canonical_source_class_identity(
+                book.page(SOURCE_VALUE_CLASS).cell(cell.row, cell.column)[0]
+            )
+            for cell in operand_cells
+        )
+        result_class = _builtin_scalar_operator_class(
+            expression, operand_classes,
+        )
+        if result_class is None:
+            continue
+        node_cell = node_identity_cell(graph, int(node_id))
+        _concord_source_value_class(
+            scope, value_id, result_class,
+            source="builtin scalar operator result",
+            provenance=_Derived(tuple(dict.fromkeys(
+                cell for cell in (node_cell, *operand_cells)
+                if cell is not None
+            ))),
+        )
+        changed = True
+    return changed
+
+
 def _relink_settled_glyph_formatters(graph: Any, function_table: Any) -> None:
     """Relink canonical glyph recipes after call-edge classes settle.
 
@@ -22873,6 +22997,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # two facts together rather than relying on traversal order.
     compile_substage("topology: settle numeric operator call contracts")
     for _round in range(max(len(tuple(function_table)), 1) + 1):
+        operator_classes_changed = False
         for entry in compile_iter(function_table, "numeric-call-contracts",
                 label="Numeric operator call contracts settled"):
             entry_wrapper = getattr(entry, "graph", None)
@@ -22883,7 +23008,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 specialize_concorded_same_type_numeric_operator(entry_wrapper)
                 resolve_concorded_receiver_constructor(entry_wrapper)
                 lower_class_operator_calls(entry_wrapper)
-        if not propagate_call_formal_numeric_types():
+                if _propagate_builtin_scalar_operator_classes(entry_wrapper):
+                    operator_classes_changed = True
+        if not propagate_call_formal_numeric_types() and not operator_classes_changed:
             break
     # An unannotated formal's class arrives on the call edge above, after
     # its function's glyph recipes were authored and linked; link the

@@ -1584,8 +1584,25 @@ def repair_non_dominating_return_phi_inputs(function):
                     if failed or producer.res is None:
                         failed = True
                         return value
+                    from .concordance_declarations import (
+                        FRESHEN, RECORD_RETURN_REPAIR,
+                    )
+
+                    # The edge-local recomputation is NOVEL from the
+                    # producer it clones and its cloned operands, carrying
+                    # the producer row's physical fields (it was a bare
+                    # counter id with no row).
                     cloned_result = SSAValue(
-                        GLOBAL_MONOTONIC_IDS.mint(),
+                        mint_ssa_value(
+                            function, FRESHEN,
+                            (producer.res, *cloned_arguments),
+                            dtype=producer.res.dtype,
+                            shape=producer.res.shape,
+                            stage=RECORD_RETURN_REPAIR,
+                            physical=_posted_physical_fields(
+                                function, producer.res,
+                            ),
+                        ),
                         dtype=producer.res.dtype,
                         shape=producer.res.shape,
                         device=producer.res.device,

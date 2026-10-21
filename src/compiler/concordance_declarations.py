@@ -1437,6 +1437,13 @@ LEXICAL_READ_BINDING = declare_page("lexical_read_binding", (
     RowField("read_scope", K.SCOPE), RowField("consumer", K.LABEL),
     RowField("role", K.LABEL), RowField("ordinal", K.INDEX),
 ), str)                                # mode CONCORD
+#: A live ``lexical_read_binding`` row at a position its consumer no longer
+#: has (an operand rewrite that bypassed ``_set_operands``); DERIVED from that
+#: read row.  ``CorrelationTable`` reports it.
+OPERAND_POSITION_ORPHAN = declare_page("operand_position_orphan", (
+    RowField("read_scope", K.SCOPE), RowField("consumer", K.LABEL),
+    RowField("role", K.LABEL), RowField("ordinal", K.INDEX),
+), str)                                # mode CONCORD
 CONSUMER_OPERAND = declare_page("consumer_operand", (
     RowField("read_scope", K.SCOPE), RowField("consumer", K.VALUE_ID),
     RowField("value", K.VALUE_ID),
