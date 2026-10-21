@@ -7383,6 +7383,14 @@ def commit_sequence_row_layout(
         resolved_dtypes = tuple(merged)
     resolved = SequenceRowLayout(shapes, resolved_dtypes)
     row = (scope, sid)
+    if incumbent is not None and incumbent == resolved:
+        # Program: ``CorrelationTable._operator_result_type_findings``
+        # (bootstrap unit 101): a second producer committed the recorded
+        # layout from the same cells under another ``source`` label.  Wrong
+        # record: the label is part of the fact, so the repeat was a REVISE
+        # with no changed source and the book refused it.  Rule: the same
+        # layout is not a revision; the incumbent cell stands.
+        return resolved
     fact = (
         resolved.column_shapes,
         resolved.column_dtypes,

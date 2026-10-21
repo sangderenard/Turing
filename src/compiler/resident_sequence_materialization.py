@@ -1302,7 +1302,19 @@ def _static_mapping_capacity_bounds(
                     unknown.add(destination)
         elif (operation in {"call", "plancall", "update", "setdefault"}
               and int(_node_id) not in nonmutating_calls
-              and int(_node_id) not in copies):
+              and int(_node_id) not in copies
+              # ``k in d`` reaches the graph as a Call over the local dict
+              # literal; the builtin dict containment query never inserts a
+              # key, so it does not unbound the constant-key universe (it
+              # did: ``{1: 10, 2: 20, 3: 30}`` lost its bound and its arena
+              # was allocated with one row).
+              and not (
+                  isinstance(data.get("expr_obj"), ast.Compare)
+                  and all(
+                      isinstance(op, (ast.In, ast.NotIn))
+                      for op in data["expr_obj"].ops
+                  )
+              )):
             for parent in roles.values():
                 destination = int(aliases.get(parent, parent))
                 if destination in keys:

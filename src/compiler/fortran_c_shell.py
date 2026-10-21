@@ -14169,6 +14169,29 @@ def _schedule_sequence_query_dependencies(root: Any) -> Any:
     return root
 
 
+def _reducer_declared_output_ids(graph: Any) -> dict[str, int]:
+    """Read the reducer's ``semantic_output`` rows as ``{name: value id}``.
+
+    Structural recovery takes each output's identity from these rows; the
+    finish writer later compares what recovery published against the same
+    rows and refuses a disagreement.
+    """
+
+    from .concordance_declarations import SEMANTIC_OUTPUT
+    from .identity_concordance import current_identity_book
+
+    scope = graph.graph.get("lexical_read_scope")
+    declared: dict[str, int] = {}
+    if scope is None:
+        return declared
+    page = current_identity_book().page(SEMANTIC_OUTPUT)
+    for row in page.scope_rows(scope):
+        fact = page.latest(row)
+        if fact is not None:
+            declared.setdefault(str(fact[0]), int(fact[1]))
+    return declared
+
+
 def _install_lexical_sequence_queries(
     control: Any,
     graph: Any,
@@ -25380,6 +25403,17 @@ def _class_surface_ssa_program(
         # `_insert_lexically` uses the retained branch/loop ownership already
         # established above and never guesses from numeric ids.
         membership_inserted = False
+        # Program: ``d = {1: 10, 2: 20, 3: 30}; if k in d: return d[k]``.
+        # Wrong value: the membership query ran at entry, before the literal's
+        # clear and three stores, so it searched an empty table and ``root(2)``
+        # returned -1.  Rule: a query reads the sequence's state at its
+        # authored node.  Entry placement is exact only for a sequence this
+        # control tree never mutates; any sequence with a retained mutation
+        # places its membership at the authored node.
+        mutated_sequence_ids = {
+            int(mutation.sequence_value_id)
+            for mutation in _control_sequence_mutations(control.root)
+        }
         for result_id, query_ids, sequence_id, negate in sequence_memberships:
             exact_query_ids = tuple(map(
                 int,
@@ -25410,7 +25444,7 @@ def _class_surface_ssa_program(
             # lexical path is required when every component is owned by one
             # exact retained loop—the case that cannot legally be emitted at
             # entry and the only placement proved by this map.
-            if (
+            if int(sequence_id) not in mutated_sequence_ids and (
                 len(owners) != 1
                 or any(
                     query_id not in table_lookup_loop_owners
@@ -26015,11 +26049,50 @@ def _class_surface_ssa_program(
                     "keyed", "table",
                 } else None
                 if _formal_row is not None:
+                    # Program: ``raise ValueError(f"serial {serial} ...")``
+                    # (id_space.compose; IdentityBook._admit_raw_write; seven
+                    # bootstrap dependencies).  Wrong record: the contract
+                    # row's storage/rank reached accounting while the
+                    # formal's row kept none (``ssa-physical-unposted`` in a
+                    # dependency product).  Rule: the fields read from the
+                    # ``value_type_abi`` row are posted on the formal's row,
+                    # DERIVED from that contract cell; accounting follows.
+                    _abi_fact = _posted_ssa_value_fact(
+                        lowered_control, int(formal.id),
+                    )
+                    if (
+                        _abi_fact is not None
+                        and _abi_fact.storage is None
+                        and _abi_fact.rank is None
+                    ):
+                        _revise_ssa_value(
+                            lowered_control, int(formal.id),
+                            dtype=_abi_fact.dtype, shape=_abi_fact.shape,
+                            stage=LINKED_VALUE_ABI_SETTLEMENT,
+                            sources=_frame_cells(
+                                _formal_row[1],
+                                _frame_graph_cell(graph_obj, int(formal.id)),
+                            ),
+                            physical=dict(_formal_row[0]),
+                        )
+                        _abi_fact = _posted_ssa_value_fact(
+                            lowered_control, int(formal.id),
+                        )
                     accounting.setdefault(
-                        "program_abi_storage", _formal_row[0]["storage"],
+                        "program_abi_storage", (
+                            _abi_fact.storage
+                            if _abi_fact is not None
+                            and _abi_fact.storage is not None
+                            else _formal_row[0]["storage"]
+                        ),
                     )
                     accounting.setdefault(
-                        "program_abi_rank", _formal_row[0]["rank"],
+                        "program_abi_rank", (
+                            _abi_fact.rank
+                            if _abi_fact is not None
+                            and _abi_fact.rank is not None
+                            else _formal_row[0]["rank"]
+                        ),
                     )
                 else:
                     # Program: the oscillator's ``cos_series(peak)``; the
@@ -29482,23 +29555,7 @@ def _class_surface_ssa_program(
         # which the control builder revises when finish fixes the returned
         # value, is the output's identity.  A named-output hint is kept only
         # when it is that value or its concordant resident.
-        from .concordance_declarations import SEMANTIC_OUTPUT as _DECLARED_OUTPUT
-        from .identity_concordance import (
-            current_identity_book as _declared_output_book,
-        )
-
-        reducer_output_scope = graph.graph.get("lexical_read_scope")
-        declared_output_ids = {}
-        if reducer_output_scope is not None:
-            _declared_page = _declared_output_book().page(_DECLARED_OUTPUT)
-            for _declared_row in _declared_page.scope_rows(
-                reducer_output_scope
-            ):
-                _declared_fact = _declared_page.latest(_declared_row)
-                if _declared_fact is not None:
-                    declared_output_ids.setdefault(
-                        str(_declared_fact[0]), int(_declared_fact[1]),
-                    )
+        declared_output_ids = _reducer_declared_output_ids(graph)
         named_output_ids = {}
         for name, value_id in function.metadata.get("named_outputs") or ():
             name = str(name)
