@@ -54,6 +54,10 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
         current_identity_book,
     )
 
+    from .ssa_record_return_state import (
+        function_scope_of, publish_ssa_value_type,
+    )
+
     book = current_identity_book()
 
     def record_normalization(
@@ -119,7 +123,20 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
                             instruction, op="NoneValue", attributes=attributes,
                         )
                         if instruction.res is not None:
-                            instruction.res.dtype = "none"
+                            # Program: `x = None` (test_unplanned_callable_capture_
+                            # cannot_publish_a_complete_no_argument_body). Wrong record:
+                            # resident dtype "none" vs the ssa_value row (dtype None).
+                            # Rule: the pass that retypes a resident value REVISEs its
+                            # row, derived from the row it read.
+                            publish_ssa_value_type(
+                                function, instruction.res, dtype="none",
+                                shape=tuple(instruction.res.shape or ()),
+                                sources=(book.latest_ref(SSA_VALUE, (
+                                    function_scope_of(function),
+                                    int(instruction.res.id),
+                                )),),
+                                stage=CONTROL_SSA_FINISH, book=book,
+                            )
                         record_normalization(
                             function, block_name, instruction, normalized, value,
                         )
@@ -145,7 +162,17 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
                         # A word is an integer identity in SSA.  It must never
                         # masquerade as f64 merely because numerical regions
                         # historically used one working dtype.
-                        instruction.res.dtype = "int64"
+                        # Program: a string literal. Wrong record: resident int64
+                        # vs the ssa_value row (its prior dtype). Rule: REVISE.
+                        publish_ssa_value_type(
+                            function, instruction.res, dtype="int64",
+                            shape=tuple(instruction.res.shape or ()),
+                            sources=(book.latest_ref(SSA_VALUE, (
+                                function_scope_of(function),
+                                int(instruction.res.id),
+                            )),),
+                            stage=CONTROL_SSA_FINISH, book=book,
+                        )
                         token_result_ids.add(int(instruction.res.id))
                     record_normalization(
                         function, block_name, instruction, normalized, value,

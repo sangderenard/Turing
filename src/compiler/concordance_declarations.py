@@ -256,6 +256,17 @@ OPTIONAL_VALUE_STRUCTURE = declare_page("optional_value_structure", (
 AGGREGATE_RETURN_LAYOUT = declare_page("aggregate_return_layout", (
     RowField("function_scope", K.SCOPE), RowField("output", K.VALUE_ID),
 ), tuple)  # ordered physical SSA identities, including repeated positions
+# Program shape: a function whose authored outputs are consumed by position
+# (``return a, b``; ``return row, column`` / ``None`` as one aggregate output).
+# Wrong record: the physical-slot page ``function_output`` (Ret ABI slots 17,
+# 18 of the aggregate whose root is 16) or a metadata tuple restated from
+# structural recovery.  Rule: the REDUCER posts one row per authored output
+# position, ``(scope, position) -> (name, output value id)``, DERIVED from the
+# output value's cell (and the arms row when one exists); the physical slots
+# of an aggregate output are named by AGGREGATE_RETURN_LAYOUT[output].
+SEMANTIC_OUTPUT = declare_page("semantic_output", (
+    RowField("function_scope", K.SCOPE), RowField("position", K.INDEX),
+), tuple)                              # (name, output value id); CONCORD
 
 
 @dataclass(frozen=True)
@@ -1149,11 +1160,100 @@ class SSAValueOrigin(Enum):
     ADOPTED_GRAPH_ID = "adopted_graph_id"
 
 
+class _PhysicalSentinel:
+    """A named marker for the ``physical=`` keyword; pickles by module name."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __repr__(self) -> str:
+        return self._name
+
+    def __reduce__(self) -> str:
+        return self._name
+
+
+#: ``physical=`` default: keep the recorded physical fields untouched.
+KEEP_PHYSICAL = _PhysicalSentinel("KEEP_PHYSICAL")
+#: ``physical=`` explicit erasure of every recorded physical field.
+REVOKE_PHYSICAL = _PhysicalSentinel("REVOKE_PHYSICAL")
+
+SSA_VALUE_PHYSICAL_STORAGES = frozenset({
+    "scalar", "span", "reference", "record", "sequence", "table", "keyed",
+})
+SSA_VALUE_PHYSICAL_FIELDS = (
+    "physical_dtype", "storage", "rank", "arena", "device",
+)
+
+
 @dataclass(frozen=True)
 class SSAValueFact:
+    """One SSA value's identity facts.  ``dtype``/``shape``/``origin`` are the
+    semantic record; the defaulted fields after ``origin`` are the value's
+    PHYSICAL representation (absent until a producer posts them).  Old
+    pickles restore ``__dict__`` without the physical keys; the class
+    defaults supply them."""
+
     dtype: Any
     shape: tuple
     origin: SSAValueOrigin
+    physical_dtype: str | None = None
+    storage: str | None = None
+    rank: int | None = None
+    arena: bool = False
+    device: Any = None
+
+    def __post_init__(self) -> None:
+        if (self.storage is not None
+                and self.storage not in SSA_VALUE_PHYSICAL_STORAGES):
+            raise ValueError(
+                "SSA value fact has no native physical storage kind: "
+                f"{self.storage!r}"
+            )
+
+
+def rebuilt_ssa_value_fact(
+    recorded: Any, dtype: Any, shape: Any, origin: Any,
+    physical: Any = KEEP_PHYSICAL,
+) -> SSAValueFact:
+    """The fact a REVISE posts for a value whose row already records
+    ``recorded``.  Rule: a rebuilt fact carries its physical fields forward
+    (``physical`` defaults to KEEP_PHYSICAL); a mint declares them.
+    ``physical`` may be an SSAValueFact (its physical fields), a mapping of
+    physical fields, or REVOKE_PHYSICAL.  Erasing a declared
+    ``physical_dtype`` takes REVOKE_PHYSICAL."""
+    from dataclasses import replace
+    from .identity_concordance import ConcordanceRefusal
+
+    shape = tuple(shape or ())
+    if isinstance(recorded, SSAValueFact):
+        fact = replace(recorded, dtype=dtype, shape=shape, origin=origin)
+    else:
+        fact = SSAValueFact(dtype, shape, origin)
+    if physical is KEEP_PHYSICAL:
+        return fact
+    if physical is REVOKE_PHYSICAL:
+        return replace(
+            fact, physical_dtype=None, storage=None, rank=None,
+            arena=False, device=None,
+        )
+    if isinstance(physical, SSAValueFact):
+        fields = {n: getattr(physical, n) for n in SSA_VALUE_PHYSICAL_FIELDS}
+    else:
+        fields = dict(physical)
+        unknown = set(fields) - set(SSA_VALUE_PHYSICAL_FIELDS)
+        if unknown:
+            raise ConcordanceRefusal(
+                f"SSA physical fields not declared: {sorted(unknown)!r}"
+            )
+        fields = {**{n: getattr(fact, n) for n in SSA_VALUE_PHYSICAL_FIELDS},
+                  **fields}
+    if fact.physical_dtype is not None and fields["physical_dtype"] is None:
+        raise ConcordanceRefusal(
+            f"SSA physical_dtype {fact.physical_dtype!r} cannot be erased "
+            "without REVOKE_PHYSICAL"
+        )
+    return replace(fact, **fields)
 
 
 class BindingKind(Enum):

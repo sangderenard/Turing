@@ -1,6 +1,8 @@
 import inspect
 from pathlib import Path
 
+import pytest
+
 from src.common.tensors import AbstractTensor
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import c_backend_repository_ssa_reference
 from src.common.dt_system import dt_controller
@@ -9,6 +11,8 @@ from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.ssa_c_backend import emit_ssa_to_c
 from src.compiler.ssa_optional_values import lower_optional_scalar_returns
+from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+from tests.compiler_provenance_inputs import publish_authored_ssa
 from src.compiler.ssa_self_check import check_formal_parity, check_optional_merges
 from src.compiler.vehicle_python_compilation import (
     balloon_tire_managed_extraction_contract,
@@ -25,6 +29,15 @@ from src.transmogrifier.ssa import (
     SSAValue,
 )
 
+
+@pytest.fixture(autouse=True)
+def _fresh_compile_book():
+    # One compile book per test, as the real pipeline opens one per compile.
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
 
 def test_scalar_optional_return_and_linked_none_test_split_into_payload_presence():
     absent = SSAValue(1, "none")
@@ -53,6 +66,7 @@ def test_scalar_optional_return_and_linked_none_test_split_into_payload_presence
     ])})
     module = IRModule({"maybe": callee, "root": caller})
 
+    publish_authored_ssa(module.functions)  # stands in for precompile_to_ssa's ssa_value rows
     receipts = lower_optional_scalar_returns(module)
 
     assert receipts
@@ -103,6 +117,7 @@ def test_nested_optional_phi_presence_flows_into_return_presence():
     })
     module = IRModule({function.name: function})
 
+    publish_authored_ssa(module.functions)  # stands in for precompile_to_ssa's ssa_value rows
     lower_optional_scalar_returns(module)
 
     assert check_optional_merges(module) == []
@@ -196,6 +211,7 @@ def test_optional_presence_closes_through_exact_forwarding_return():
     ])})
     module = IRModule({"leaf": leaf, "middle": middle, "root": root})
 
+    publish_authored_ssa(module.functions)  # stands in for precompile_to_ssa's ssa_value rows
     receipts = lower_optional_scalar_returns(module)
 
     forwarding = next(

@@ -63,6 +63,8 @@ def _value_cells(*pairs):
 
 
 def settle_call_result_types(functions, emit_outputs, function_values):
+    from .concordance_declarations import PLANNING_VALUE
+    from .identity_concordance import current_identity_book
     from .ssa_record_return_state import accepted_ssa_component
 
     ledger = TransformationLedger((
@@ -91,6 +93,8 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 sources=_value_cells((function, value)))
             _publish_type(function, value, recorded,
                           ledger.decision_cell((function.name, int(value.id))))
+
+    capture_planning_cells = {}
 
     def bindings():
         for caller in functions.values():
@@ -207,11 +211,34 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             if not capture_ids:
                 continue
             owner_values = function_values(owner)
+            # Program: a returned record's field read (``m.err``) captured
+            # into a region.  ``capture_value_ids`` were cut with the region
+            # (the GetAttr projection id, e.g. 17); the record-projection
+            # repair later rebinds that projection to the returned-record
+            # resident (e.g. ...018) and posts PLANNING_VALUE
+            # (owner scope, projection id) -> resident.  Wrong record: the
+            # metadata capture id is no longer a value of the owner, so
+            # ``owner_values.get(capture_id)`` found nothing and the formal kept
+            # its cut-time dtype while the actual was the settled bool/int.
+            # Rule: the capture id is resolved through the posted planning
+            # value row; no row means the capture id is the resident.
+            book = current_identity_book()
+            planning_page = book.page(PLANNING_VALUE)
             for target in region.args:
                 value_id = int(target.id)
-                source = owner_values.get(value_id)
-                if value_id in capture_ids and source is not None:
-                    yield region, target, owner, source
+                if value_id not in capture_ids:
+                    continue
+                row = (str(owner.name), value_id)
+                resident_id = planning_page.latest(row)
+                source = owner_values.get(
+                    value_id if resident_id is None else int(resident_id)
+                )
+                if source is None:
+                    continue
+                planning_cell = book.latest_ref(PLANNING_VALUE, row)
+                if planning_cell is not None:
+                    capture_planning_cells[id(target)] = (planning_cell,)
+                yield region, target, owner, source
 
     exact_values = set()
     changed = True
@@ -277,7 +304,7 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             source_cells = _value_cells((callee, source), (caller, target))
             accepted = ledger.propose(identity, rule,
                 (callee.name, int(source.id), source_type), before=_recorded_type(caller, target), after=source_type,
-                sources=source_cells + tuple(
+                sources=source_cells + capture_planning_cells.get(id(target), ()) + tuple(
                     cell for cell in (
                         ledger.decision_cell((callee.name, int(source.id))),
                     ) if cell is not None

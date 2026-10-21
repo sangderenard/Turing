@@ -533,7 +533,8 @@ def _propagate_scalar_dtypes(functions) -> None:
                 raise ValueError(f"scalar settlement lacks SSA identity: {(scope, value_id)!r}")
             if fact.dtype != dtype:
                 book.post(SSA_VALUE, (scope, int(value_id)),
-                          SSAValueFact(dtype, fact.shape, fact.origin),
+                          # Rule: a rebuilt fact carries its physical fields.
+                          dataclasses.replace(fact, dtype=dtype),
                           stage=SCALAR_DTYPE_SETTLEMENT,
                           provenance=Derived(tuple(dict.fromkeys(
                               cell for cell in (previous, *operand_cells, width_cell)

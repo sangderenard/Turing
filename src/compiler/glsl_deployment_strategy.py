@@ -1663,9 +1663,12 @@ def _accepted_semantic_result_bindings(
     through ordinary projection binding.
     """
 
-    semantic_outputs = tuple(map(
-        int, declaration.metadata.get("semantic_output_ids", ()),
-    ))
+    # Program shape: an accepted optional/aggregate return read for result
+    # binding.  Wrong record: the declaration's metadata tuple.  Rule: the
+    # function_output rows of the owning book are the semantic outputs.
+    from .ssa_reachability import semantic_output_ids_of
+
+    semantic_outputs = semantic_output_ids_of(declaration, book=book)
     if len(semantic_outputs) != 1:
         return None
     semantic_output = semantic_outputs[0]
@@ -16945,8 +16948,15 @@ def _linked_optional_aggregate_record(entry: Any) -> tuple | None:
         )
         or host.metadata.get("identity_book")
     )
-    semantic = tuple(declaration.metadata.get("semantic_output_ids", ()))
-    if owner_book is None or len(semantic) != 1:
+    # Program shape: an accepted entry whose one semantic output carries the
+    # aggregate layout.  Wrong record: the metadata tuple.  Rule: read the
+    # function_output rows of the owner book; no owner book means no answer.
+    if owner_book is None:
+        return None
+    from .ssa_reachability import semantic_output_ids_of
+
+    semantic = semantic_output_ids_of(declaration, book=owner_book)
+    if len(semantic) != 1:
         return None
     output = int(semantic[0])
     from .structural_concordance import aggregate_return_source
@@ -22166,18 +22176,24 @@ def _fold_callsite_structural_values(
                 return identity_fact
         result_class = (data.get("attributes") or {}).get("result_class_ref")
         if result_class is not None:
-            records = tuple(
-                record
-                for record in dict(
-                    (graph.G.graph.get("program_abi") or {}).get("records") or {}
-                ).values()
-                if str(record.get("identity") or "") == str(result_class)
-                or str(record.get("identity") or "").rsplit(".", 1)[-1]
-                == str(result_class).rsplit(".", 1)[-1]
+            # Program: ``len(tagged)`` in the generator-leak test.  Wrong
+            # record: ``CompilerSSAExtent`` (declared identity builtins.int),
+            # chosen because its identity TAIL equalled ``len``'s result_class
+            # 'int'; node 16 was typed record storage and never folded.  Rule:
+            # a result class names a record only through the declared record
+            # resolution (record key, or exact declared identity for a
+            # non-primitive class) -- no name-tail comparison.
+            from .fortran_c_shell import _program_abi_record_for_type_identity
+            program_abi_records = dict(
+                (graph.G.graph.get("program_abi") or {}).get("records") or {}
             )
-            if len(records) == 1:
+            record_name = _program_abi_record_for_type_identity(
+                result_class, graph.G.graph.get("program_abi"),
+            )
+            if record_name is not None:
                 return _ProgramABIValueFact(
-                    str(records[0]["identity"]), "record", None,
+                    str(program_abi_records[record_name]["identity"]),
+                    "record", None,
                 )
         if (name == "callable" and len(arguments) == 1
                 and (data.get("attributes") or {}).get("extraction_identity") == "builtins.callable"

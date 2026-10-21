@@ -3343,7 +3343,15 @@ def update(box: Box, rows, enabled):
         )
     )
 
-    assert initial["attributes"] == {
+    attributes = dict(initial["attributes"])
+    # The element annotation is a cell on the class_field_declaration page
+    # (scope is per-run); the element class rides beside it.
+    from src.compiler.identity_concordance import Ref
+    annotation_cell = attributes.pop("sequence_element_annotation_cell")
+    assert isinstance(annotation_cell, Ref)
+    assert annotation_cell.page.name == "class_field_declaration"
+    assert annotation_cell.row[1:] == ("Box", "report")
+    assert attributes == {
         "attribute": "report",
         "initial_record_field_state": True,
         "producer_kind": "record_field",
@@ -3353,6 +3361,7 @@ def update(box: Box, rows, enabled):
         "sequence_writable": True,
         "record_field": ("Box", "report"),
         "sequence_column_dtypes": ("int64",),
+        "sequence_element_class_ref": "builtins.str",
     }
 
     from src.compiler.fortran_c_shell import (

@@ -511,13 +511,38 @@ def import_llvm_to_repository_ssa(
         name = str(llvm_function.name)
         if llvm_function.is_declaration:
             if include_declarations:
+                # Program: an imported intrinsic declaration (for example
+                # ``llvm.sqrt.f64``), part of the imported repository like a
+                # defined kernel.  Wrong record: its argument values were
+                # minted with no row, so ``function_value_structure`` met a
+                # value with no SSA identity.  Rule: the pass that creates a
+                # value posts its row; the declaration carries the same
+                # ``llvm_repository_kernel`` source record (digest of its LLVM
+                # text, origin of each argument) so
+                # ``post_repository_kernel_identity`` posts its rows.
+                import hashlib
+
                 arguments = []
+                origins: dict[int, tuple[int, str, str]] = {}
                 for argument in llvm_function.arguments:
+                    origins[next_value_id] = (
+                        len(origins), "argument", str(argument.name),
+                    )
                     arguments.append(
                         SSAValue(next_value_id, dtype=str(argument.type))
                     )
                     next_value_id += 1
-                functions[name] = Function(name, arguments, {})
+                functions[name] = Function(
+                    name, arguments, {},
+                    metadata={
+                        "llvm_repository_kernel": (
+                            hashlib.sha256(
+                                str(llvm_function).encode("utf-8")
+                            ).hexdigest(),
+                            origins,
+                        ),
+                    },
+                )
             continue
         importer = _FunctionImporter(llvm_function, next_value_id)
         function, function_shortfalls, next_value_id = (

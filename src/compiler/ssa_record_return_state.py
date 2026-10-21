@@ -1,6 +1,7 @@
 """Resolve an immutable scalar field version for a physical return edge."""
 
 import networkx as nx
+from .concordance_declarations import KEEP_PHYSICAL
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 
@@ -217,7 +218,8 @@ def mint_ssa_value(function, transform, operands, *, dtype=None, shape=(), stage
     )
 
 
-def revise_ssa_value(function, value_id, *, dtype, shape, stage, sources=(), book=None):
+def revise_ssa_value(function, value_id, *, dtype, shape, stage, sources=(), book=None,
+                     physical=KEEP_PHYSICAL):
     """Record an in-place dtype/shape change of ``value_id`` in ``function``
     as a REVISE of its ``ssa_value`` row, DERIVED from the row's previous
     cell and ``sources`` (the cells the new dtype/shape was read from), as
@@ -225,7 +227,7 @@ def revise_ssa_value(function, value_id, *, dtype, shape, stage, sources=(), boo
     recorded origin is kept.  Returns the row's cell: the new one, the
     previous one when the fact is unchanged, or None when the value has no
     row (a creation that skipped the book; this writer does not supply it)."""
-    from .concordance_declarations import SSA_VALUE, SSAValueFact
+    from .concordance_declarations import SSA_VALUE, rebuilt_ssa_value_fact
     from .identity_concordance import (
         Derived, Mode, Stage, current_identity_book,
     )
@@ -240,7 +242,9 @@ def revise_ssa_value(function, value_id, *, dtype, shape, stage, sources=(), boo
     origin = getattr(recorded, "origin", None)
     if origin is None:
         return previous
-    fact = SSAValueFact(dtype, tuple(shape or ()), origin)
+    # Rule: a rebuilt fact carries its physical fields (KEEP by default);
+    # a mint declares them.
+    fact = rebuilt_ssa_value_fact(recorded, dtype, shape, origin, physical)
     if fact == recorded:
         return previous
     if not isinstance(stage, Stage):
@@ -286,7 +290,8 @@ def publish_declared_scalar_abi(function, value, source, *, stage, book=None):
     )
 
 
-def publish_ssa_value_type(function, value, *, dtype, shape, sources, stage, book=None):
+def publish_ssa_value_type(function, value, *, dtype, shape, sources, stage, book=None,
+                           physical=KEEP_PHYSICAL):
     """Publish an evidenced type change, then materialize that exact fact.
 
     An existing SSA identity is required. This cannot adopt an unrecorded
@@ -307,7 +312,7 @@ def publish_ssa_value_type(function, value, *, dtype, shape, sources, stage, boo
         )
     cell = revise_ssa_value(
         function, int(value.id), dtype=dtype, shape=shape,
-        stage=stage, sources=sources, book=book,
+        stage=stage, sources=sources, book=book, physical=physical,
     )
     fact = None if cell is None else book.page(SSA_VALUE).cell(cell.row, cell.column)
     if not isinstance(fact, SSAValueFact) or (fact.dtype, fact.shape) != (dtype, tuple(shape)):

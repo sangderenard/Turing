@@ -125,6 +125,7 @@ from ...compiler.concordance_declarations import (
     REDUCER_RETURN as _REDUCER_RETURN,
     RETURN_ARMS_UNCLASSIFIED as _RETURN_ARMS_UNCLASSIFIED,
     RETURN_OUTPUT_ARMS as _RETURN_OUTPUT_ARMS,
+    SEMANTIC_OUTPUT as _SEMANTIC_OUTPUT,
     ReturnArm as _ReturnArm,
     ReturnArmsKind as _ReturnArmsKind,
     ReturnOutputArms as _ReturnOutputArms,
@@ -4193,6 +4194,24 @@ def _relabel_field_state_pages(book: Any, read_scope: Any, mapping: Any) -> None
                 ))),
                 mode=_Mode.CONCORD,
             )
+    # ``semantic_output``: one row per authored output position; the output
+    # value's id follows ``mapping`` and its cell is the canonical one.
+    semantic_page = book.pages.get(_SEMANTIC_OUTPUT.name)
+    if semantic_page is not None:
+        for row in semantic_page.scope_rows(ingestion_scope):
+            column, fact = semantic_page.history(row)[-1]
+            if fact[1] not in mapping:
+                continue
+            source = _Ref(_SEMANTIC_OUTPUT, row, column)
+            value = book.latest_ref(
+                _CANONICAL_VALUE, (read_scope, mapping[fact[1]]),
+            )
+            cells = (source,) if value is None else (source, value)
+            book.post(
+                _SEMANTIC_OUTPUT, (read_scope, row[1]),
+                (fact[0], int(mapping[fact[1]])),
+                stage=stage, provenance=_Derived(cells), mode=_Mode.CONCORD,
+            )
     site_page = book.pages.get(_RETURN_SITE_FIELD_STATE.name)
     if site_page is not None:
         for row in site_page.scope_rows(ingestion_scope):
@@ -5257,6 +5276,25 @@ def _normalize_lexical_values(
             and value is not object
         )
     )
+    # Program: ``close_region_feed_set(program: FusedProgram)``, a nested
+    # function whose ``FusedProgram`` is an imported class.  Wrong record:
+    # SOURCE_VALUE_CLASS was posted under the bare spelling ``FusedProgram``
+    # while the ProgramABI contract carries the canonical identity, so one
+    # class had two keys.  Rule: a class admitted through ``static_bindings``
+    # is posted under that record's canonical identity (module.qualname),
+    # never its spelling; source-local records are already canonical.
+    canonical_known_class_identities = {
+        str(name): f"{value.__module__}.{value.__qualname__}"
+        for name, value in dict(static_bindings or {}).items()
+        if (
+            isinstance(value, type)
+            and value is not Any
+            and value is not object
+        )
+    }
+    canonical_known_class_identities.update({
+        record.identity: record.identity for record in navigation_table.classes
+    })
     primitive_class_identities = {
         "bool": "builtins.bool",
         "builtins.bool": "builtins.bool",
@@ -6174,11 +6212,20 @@ def _normalize_lexical_values(
             # (ii) a scalar literal default: DERIVED from the default's
             # span (plan 60, section 3.5).  The Input's own cell always.
             post_scalar_parameter(graph, int(value), name, statement)
+        # Same program/rule as ``canonical_known_class_identities``: a
+        # spelling admitted from ``known_class_identities`` posts as its
+        # canonical identity (every admitted spelling has one by construction).
+        posted_class_identity = (
+            canonical_known_class_identities[class_identity]
+            if class_identity in canonical_known_class_identities
+            and numeric_descriptor is None
+            else class_identity
+        )
         if class_identity is not None:
             _concord_source_value_class(
                 value_class_scope,
                 value,
-                class_identity,
+                posted_class_identity,
                 precision_limbs=(
                     numeric_descriptor.limbs
                     if numeric_descriptor is not None else 1
@@ -14915,7 +14962,7 @@ def _normalize_lexical_values(
             int(output_id), "tuple", tuple(members),
         )
         output_cell = node_identity_cell(graph, int(output_id))
-        book.post(
+        arms_cell = book.post(
             _RETURN_OUTPUT_ARMS, (ingestion_read_scope, int(output_id)),
             _ReturnOutputArms(
                 return_arms_kind, tuple(arms), int(width),
@@ -14923,6 +14970,17 @@ def _normalize_lexical_values(
             ),
             stage=_REDUCER_RETURN,
             provenance=_Derived((*derived, output_cell)),
+            mode=_Mode.CONCORD,
+        )
+        # Program shape: returns of different arity are the arms of ONE
+        # output ``result_0``.  Wrong record: the physical Ret slots (the
+        # member Phis) standing for the output.  Rule: the semantic output is
+        # the aggregate root, derived from its cell and the arms row.
+        book.post(
+            _SEMANTIC_OUTPUT, (ingestion_read_scope, 0),
+            ("result_0", int(output_id)),
+            stage=_REDUCER_RETURN,
+            provenance=_Derived((output_cell, arms_cell)),
             mode=_Mode.CONCORD,
         )
         identity_bindings.setdefault("result_0", []).append(int(output_id))
@@ -14937,6 +14995,27 @@ def _normalize_lexical_values(
         if isinstance(body_statement, ast.Return) and value is not None:
             returned_values.append(value)
     post_return_output_arms()
+    if return_arms_kind is None:
+        # Program shape: one arity across every return; slot ``k`` is named
+        # ``function_outputs[k]`` and its binding history ends at the value
+        # the function returns for it.  Wrong record: leaving the order to
+        # structural recovery's own list.  Rule: the reducer fixes the
+        # output position -> (name, value) here, from the binding it just
+        # completed, DERIVED from that value's node cell.
+        semantic_book = current_identity_book()
+        for position, output_name in enumerate(
+            tuple(graph.G.graph.get("function_outputs") or ())
+        ):
+            bound = identity_bindings.get(str(output_name))
+            if not bound or int(bound[-1]) not in graph.G:
+                continue
+            semantic_book.post(
+                _SEMANTIC_OUTPUT, (ingestion_read_scope, int(position)),
+                (str(output_name), int(bound[-1])),
+                stage=_REDUCER_RETURN,
+                provenance=_Derived((node_identity_cell(graph, int(bound[-1])),)),
+                mode=_Mode.CONCORD,
+            )
     if returned_values:
         graph.roots = list(dict.fromkeys(returned_values))
         # The function's return is a consumer of its roots: row

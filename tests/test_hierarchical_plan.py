@@ -418,6 +418,86 @@ def test_native_bound_method_selector_is_not_a_call_boundary():
     assert set(calls[0].argument_bindings) == {(1, 10), (0, 11)}
 
 
+@pytest.fixture
+def _fresh_compile_book():
+    # One compile book per test, as the real pipeline opens one per compile.
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
+
+
+def _post_declaration_structure(shell):
+    """Post what the real producers post for the host declaration.
+
+    Stands in for precompile_to_ssa (ssa_value rows) and ssa_optional_values
+    (OPTIONAL_VALUE_STRUCTURE per payload/presence pair, AGGREGATE_RETURN_LAYOUT).
+    """
+
+    from src.compiler.concordance_declarations import (
+        OPTIONAL_VALUE_STRUCTURE, STRUCTURAL_CONCORDANCE,
+    )
+    from src.compiler.identity_concordance import Derived, Mode
+    from src.compiler.ssa_record_return_state import (
+        function_scope_of, identity_cells,
+    )
+    from src.compiler.structural_concordance import publish_aggregate_return_layout
+    from tests.compiler_provenance_inputs import publish_authored_ssa
+
+    entry = shell.process_graph.function_table.entry(None)
+    module = entry.metadata["host_ssa_module"]
+    book = publish_authored_ssa(module.functions)
+    for function in module.functions.values():
+        layouts = dict(function.metadata["aggregate_return_layouts"])
+        for output, layout in layouts.items():
+            cells = tuple(
+                book.post(
+                    OPTIONAL_VALUE_STRUCTURE,
+                    (function_scope_of(function), payload),
+                    (payload, presence),
+                    stage=STRUCTURAL_CONCORDANCE,
+                    provenance=Derived(identity_cells(function, payload, presence)),
+                    mode=Mode.CONCORD,
+                )
+                for payload, presence in zip(layout[0::2], layout[1::2])
+            )
+            publish_aggregate_return_layout(
+                function, output, layout, sources=cells,
+                stage=STRUCTURAL_CONCORDANCE, book=book,
+            )
+        # The REDUCER is the real producer of SEMANTIC_OUTPUT (one row per
+        # authored output position, derived from the output value's cell);
+        # this fixture has no reducer, so it posts the one row each declared
+        # output would have, so readers consult rows and not metadata.
+        from src.compiler.concordance_declarations import (
+            AGGREGATE_RETURN_LAYOUT, SEMANTIC_OUTPUT,
+        )
+        from src.compiler.ssa_record_return_state import ssa_value_identity_cell
+
+        for position, output in enumerate(
+            function.metadata.get("semantic_output_ids", ())
+        ):
+            book.post(
+                SEMANTIC_OUTPUT, (function_scope_of(function), position),
+                (f"result_{position}", int(output)),
+                stage=STRUCTURAL_CONCORDANCE,
+                provenance=Derived(tuple(cell for cell in (
+                    ssa_value_identity_cell(function, int(output), book=book),
+                    # An aggregate root has no SSA value of its own: its
+                    # layout row is the cell it stands on.
+                    book.current_ref(
+                        AGGREGATE_RETURN_LAYOUT,
+                        (function_scope_of(function), int(output)),
+                    ),
+                ) if cell is not None)),
+                mode=Mode.CONCORD,
+            )
+
+
+@pytest.mark.usefixtures("_fresh_compile_book")
 def test_native_optional_physical_return_binds_one_semantic_call_result():
     """Accepted payload/presence ABI remains one source call value."""
 
@@ -485,6 +565,7 @@ def test_native_optional_physical_return_binds_one_semantic_call_result():
         shell_control_program=None,
     )
 
+    _post_declaration_structure(shell)
     call, = _build_shell_hierarchy_plan(shell).items
 
     assert isinstance(call, PlanCall)
@@ -492,6 +573,7 @@ def test_native_optional_physical_return_binds_one_semantic_call_result():
     assert call.result_bindings == ((11, 3),)
 
 
+@pytest.mark.usefixtures("_fresh_compile_book")
 def test_native_optional_aggregate_return_binds_one_semantic_call_result():
     """Every payload/presence pair belongs to one logical optional tuple."""
 
@@ -571,6 +653,7 @@ def test_native_optional_aggregate_return_binds_one_semantic_call_result():
         shell_control_program=None,
     )
 
+    _post_declaration_structure(shell)
     call, = _build_shell_hierarchy_plan(shell).items
 
     assert isinstance(call, PlanCall)
@@ -578,6 +661,7 @@ def test_native_optional_aggregate_return_binds_one_semantic_call_result():
     assert call.result_bindings == ((11, 3),)
 
 
+@pytest.mark.usefixtures("_fresh_compile_book")
 def test_native_record_covered_optional_aggregate_binds_member_projections():
     """One output over returns of different arity: ``r[k]`` is payload ``k``.
 
@@ -658,6 +742,7 @@ def test_native_record_covered_optional_aggregate_binds_member_projections():
         shell_control_program=None,
     )
 
+    _post_declaration_structure(shell)
     call, = _build_shell_hierarchy_plan(shell).items
 
     assert isinstance(call, PlanCall)

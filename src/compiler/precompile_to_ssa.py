@@ -129,9 +129,11 @@ from .concordance_declarations import (
     FieldStateKind,
     ParameterDeclaration,
     RegionSignature,
+    KEEP_PHYSICAL,
     SSAValueFact,
     SSAValueOrigin,
     SSABlockKind,
+    rebuilt_ssa_value_fact,
     ValueTypeTagFact,
     ValueTypeABIFact,
     ValueTypeABIAlternative,
@@ -509,6 +511,64 @@ def _ssa_value(value_id: int, meta: Meta | None) -> SSAValue:
     )
 
 
+def _post_built_function_rows(function: Function) -> None:
+    # Program: a precompile-built function (``numerical_precompile``, the
+    # ``numerical_region_N`` and ``planned_region_N`` siblings), whose
+    # arguments, results and operands are SSAValues built directly, outside
+    # any control builder.
+    # Wrong record: those values (an argument, id 0) sat in the function with
+    # no ``ssa_value`` row, so ``function_value_structure`` refused it.
+    # Rule: the pass that creates a value posts its row at creation, derived
+    # from the cells it read.  A precompile-built function carries no lexical
+    # read scope, hence no ``canonical_value`` cell for its graph ids; as
+    # ``_value_cell`` does for such an id, each value is ADOPTED_GRAPH_ID
+    # DERIVED from the function root cell of its scope (a MINTED id: MINTED),
+    # stage CONTROL_SSA_ENTRY.  The reader that refuses a value with no row
+    # stays.
+    from .id_space import MINTED as _FUSED_MINTED, has_flag as _fused_has_flag
+    from .identity_concordance import current_identity_book as _fused_row_book
+    from .ssa_record_return_state import function_scope_of as _fused_scope_of
+
+    _row_book = _fused_row_book()
+    _row_scope = _fused_scope_of(function)
+    _row_root = _function_root_cell(_row_book, _row_scope)
+    _row_seen: set[int] = set()
+    for _row_value in (
+        *function.args,
+        *(
+            value
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for value in (
+                *instruction.args,
+                *((instruction.res,) if instruction.res is not None else ()),
+            )
+        ),
+    ):
+        if getattr(_row_value, "id", None) is None:
+            continue
+        _row_id = int(_row_value.id)
+        if _row_id in _row_seen:
+            continue
+        _row_seen.add(_row_id)
+        _row_fact = SSAValueFact(
+            _row_value.dtype, tuple(_row_value.shape or ()),
+            SSAValueOrigin.MINTED if _fused_has_flag(_row_id, _FUSED_MINTED)
+            else SSAValueOrigin.ADOPTED_GRAPH_ID,
+        )
+        _row_ref = _row_book.latest_ref(SSA_VALUE, (_row_scope, _row_id))
+        if _row_ref is not None and (
+            _row_book.page(SSA_VALUE).cell(_row_ref.row, _row_ref.column)
+            == _row_fact
+        ):
+            continue
+        _row_book.post(
+            SSA_VALUE, (_row_scope, _row_id), _row_fact,
+            stage=CONTROL_SSA_ENTRY, provenance=Derived((_row_root,)),
+            mode=Mode.REVISE,
+        )
+
+
 def lower_fused_program_to_ssa(
     program: FusedProgram,
     *,
@@ -816,6 +876,7 @@ def lower_fused_program_to_ssa(
             ),
         },
     )
+    _post_built_function_rows(function)
     if evolution is not None and ssa_evolution is not None:
         evolution.bind_artifact(function, ssa_evolution)
         evolution.close_graph(ssa_evolution)
@@ -6838,6 +6899,7 @@ class _ControlSSABuilder(TiledObject):
 
     def _revise_value(
         self, value: SSAValue, *cells: Any, stage: Any = None,
+        physical: Any = KEEP_PHYSICAL,
     ) -> Ref | None:
         """Record an in-place dtype/shape change of ``value`` as a REVISE
         of its ``ssa_value`` row DERIVED(previous cell, ``cells``)."""
@@ -6849,7 +6911,10 @@ class _ControlSSABuilder(TiledObject):
             return self._value_cell(value, *cells, stage=stage)
         recorded = book.pages[SSA_VALUE.name].cells.get((row, previous.column))
         origin = getattr(recorded, "origin", SSAValueOrigin.ADOPTED_GRAPH_ID)
-        fact = SSAValueFact(value.dtype, tuple(value.shape or ()), origin)
+        # Rule: a rebuilt fact carries its physical fields (KEEP by default).
+        fact = rebuilt_ssa_value_fact(
+            recorded, value.dtype, value.shape, origin, physical,
+        )
         if fact == recorded:
             return previous
         return book.post(
@@ -10068,7 +10133,17 @@ class _ControlSSABuilder(TiledObject):
                     if str(value.dtype or "unknown") in {
                         "", "None", "unknown",
                     }:
+                        # Program: a mapping whose string keys are Constants
+                        # (test_mapping_value_column_uses_writer_union_abi).
+                        # Wrong record: resident dtype from the concorded
+                        # column vs the ssa_value row ('unknown'). Rule: the
+                        # pass that retypes a resident value REVISEs its row,
+                        # derived from the sequence contract it read.
                         value.dtype = str(dtype)
+                        self._revise_value(
+                            value, self._sequence_contract_cell(value_id),
+                            stage=self._stage(),
+                        )
             incumbent_shapes = tuple(existing.column_shapes) or tuple(
                 () for _column in existing.column_value_ids
             )
@@ -17809,6 +17884,71 @@ class _ControlSSABuilder(TiledObject):
             published, BindingKind.CONDITIONAL_MERGE, merged, tick_cell,
         )
 
+    def _revise_semantic_output(self, name: str, value_id: int) -> None:
+        """Re-mint of a semantic output: revise the reducer's row.
+
+        Program shape: a function whose returned name is resolved at finish
+        to a value other than the one the reducer bound (the single-exit
+        result, a loop-exit Phi, a freshened id).  Wrong record: the
+        reducer's ``semantic_output`` row left naming the pre-control id while
+        ``named_returns`` carries the merged one.  Rule: the pass that fixes
+        the new value revises the row at that moment, DERIVED from the
+        reducer's row cell and the new value's ``ssa_value`` cell.
+        """
+
+        scope = self.lexical_read_scope
+        if scope is None:
+            return
+        from .concordance_declarations import SEMANTIC_OUTPUT
+
+        book = self._book()
+        page = book.page(SEMANTIC_OUTPUT)
+        for row in page.scope_rows(scope):
+            fact = page.latest(row)
+            if fact is None or str(fact[0]) != str(name):
+                continue
+            if int(fact[1]) == int(value_id):
+                return
+            sources = self._cells(
+                book.latest_ref(SEMANTIC_OUTPUT, row),
+                book.latest_ref(SSA_VALUE, (self._scope(), int(value_id))),
+            )
+            book.post(
+                SEMANTIC_OUTPUT, row, (str(name), int(value_id)),
+                stage=self._stage(CONTROL_SSA_FINISH),
+                provenance=Derived(sources), mode=Mode.REVISE,
+            )
+            return
+
+    def _posted_carried_ports(self) -> dict[int, SSAValue]:
+        """port id -> the Phi object the ``carried_port_value`` row's cell
+        names, read from the book under this lowering's scope."""
+
+        book = self._book()
+        scope = self._scope()
+        page = book.pages.get(CARRIED_PORT_VALUE.name)
+        ports: dict[int, SSAValue] = {}
+        for row in (() if page is None else page.scope_rows(scope)):
+            fact = page.latest(row)
+            if not isinstance(fact, Ref):
+                continue
+            port = self.ssa_value_objects.get(int(fact.row[1]))
+            if port is not None:
+                ports[int(row[1])] = port
+        return ports
+
+    def _posted_alias_source(self, value_id: int) -> int | None:
+        """The source the latest ``control_value_alias`` row of ``value_id``
+        names, or ``None`` (no row, or a withdrawn alias)."""
+
+        page = self._book().pages.get(CONTROL_VALUE_ALIAS.name)
+        if page is None:
+            return None
+        fact = page.latest((self._scope(), int(value_id)))
+        if isinstance(fact, AliasFact) and fact.source_id is not None:
+            return int(fact.source_id)
+        return None
+
     def _finish_pages(
         self,
         named_returns: tuple,
@@ -17874,22 +18014,46 @@ class _ControlSSABuilder(TiledObject):
             for fact in (page.latest(row),)
             if fact is not None and fact[0] is not None
         )
+        # Program shape: a function whose named returns the builder holds in
+        # ``named_returns`` while the ``function_output`` rows say otherwise.
+        # Wrong record: the dict replaced the book's answer after it had been
+        # computed and compared (authority inverted).  Rule: the posted rows
+        # are the output; a disagreement is a discordance and is refused with
+        # both values, never overridden in either direction.
         if named_outputs != tuple(named_returns):
-            named_outputs = tuple(named_returns)
+            raise ConcordanceRefusal(
+                f"function_output page, scope {scope!r}: the posted rows name "
+                f"{named_outputs!r} but the builder's named_returns is "
+                f"{tuple(named_returns)!r} in {self.function_name!r}"
+            )
         # -- carried_port_values: port -> the Phi object the page's cell names.
+        # Program shape: a loop whose exit Phi is published as a carried port.
+        # Wrong record: the live ``_carried_port_values`` dict over the
+        # ``carried_port_value`` row.  Rule: the row is read; disagreement is
+        # refused naming the row, the book's Phi and the dict's.
         legacy_ports = dict(getattr(self, "_carried_port_values", {}) or {})
-        page = book.pages.get(CARRIED_PORT_VALUE.name)
-        carried_port_values: dict[int, SSAValue] = {}
-        for row in (() if page is None else page.scope_rows(scope)):
-            fact = page.latest(row)
-            if not isinstance(fact, Ref):
-                continue
-            port = self.ssa_value_objects.get(int(fact.row[1]))
-            if port is not None:
-                carried_port_values[int(row[1])] = port
+        carried_port_values = self._posted_carried_ports()
         if carried_port_values != legacy_ports:
-            carried_port_values = legacy_ports
+            discordant = sorted(
+                port for port in set(carried_port_values) | set(legacy_ports)
+                if carried_port_values.get(port) is not legacy_ports.get(port)
+            )
+            port = discordant[0]
+            book_port = carried_port_values.get(port)
+            dict_port = legacy_ports.get(port)
+            raise ConcordanceRefusal(
+                f"carried_port_value page, row {(scope, port)!r}: the posted "
+                f"row names value "
+                f"{None if book_port is None else int(book_port.id)!r} but "
+                f"_carried_port_values holds "
+                f"{None if dict_port is None else int(dict_port.id)!r} in "
+                f"{self.function_name!r}"
+            )
         # -- value_aliases: alias -> source, the latest alias rows.
+        # Program shape: an in-place store chain / loop exit alias.  Wrong
+        # record: the live ``value_aliases`` dict (which loops rewrite while
+        # their bodies lower) over the ``control_value_alias`` rows.  Rule:
+        # the rows are the view; disagreement is refused with both sources.
         page = book.pages.get(CONTROL_VALUE_ALIAS.name)
         value_aliases: dict[int, int] = {}
         for row in (() if page is None else page.scope_rows(scope)):
@@ -17897,7 +18061,17 @@ class _ControlSSABuilder(TiledObject):
             if isinstance(fact, AliasFact) and fact.source_id is not None:
                 value_aliases[int(row[1])] = int(fact.source_id)
         if value_aliases != dict(self.value_aliases):
-            value_aliases = dict(self.value_aliases)
+            live = dict(self.value_aliases)
+            alias = sorted(
+                key for key in set(value_aliases) | set(live)
+                if value_aliases.get(key) != live.get(key)
+            )[0]
+            raise ConcordanceRefusal(
+                f"control_value_alias page, row {(scope, alias)!r}: the "
+                f"posted row names source {value_aliases.get(alias)!r} but "
+                f"value_aliases holds {live.get(alias)!r} in "
+                f"{self.function_name!r}"
+            )
         return {
             "parameter_names": parameter_names,
             "named_outputs": named_outputs,
@@ -18005,7 +18179,10 @@ class _ControlSSABuilder(TiledObject):
         # pre-loop value, and returning both publishes the scalar twice
         # (scorecard level 17: (0.5, 0.5) for 0.5).
         superseded: set[int] = set()
-        carried_port_values = getattr(self, "_carried_port_values", {})
+        # Program shape: a function returning a loop's carried result.  Wrong
+        # record: the live ``_carried_port_values`` dict read for the output
+        # instead of the ``carried_port_value`` rows.  Rule: read the rows.
+        carried_port_values = self._posted_carried_ports()
 
         def existing_value(value_id: int) -> SSAValue | None:
             """Resolve an authored assignment alias without inventing an ABI input.
@@ -18027,9 +18204,14 @@ class _ControlSSABuilder(TiledObject):
                 found = self.external_values.get(value_id)
                 if found is not None:
                     return found
-                if value_id in self.value_aliases and value_id not in seen:
+                # Program shape: an in-place store chain whose returned id is a
+                # later version.  Wrong record: the live ``value_aliases``
+                # dict, which loops rewrite, walked for the chain.  Rule: each
+                # step reads its posted ``control_value_alias`` row.
+                source = self._posted_alias_source(value_id)
+                if source is not None and value_id not in seen:
                     seen.add(value_id)
-                    value_id = int(self.value_aliases[value_id])
+                    value_id = source
                     continue
                 return None
 
@@ -18092,6 +18274,7 @@ class _ControlSSABuilder(TiledObject):
             # whose cell nothing stores.
             value = carried_port_values.get(int(value.id), value)
             named_returns.append((name, int(value.id)))
+            self._revise_semantic_output(name, int(value.id))
             superseded.update(map(int, history))
             if value.id not in returned_ids:
                 returned.append(value)
@@ -18778,6 +18961,12 @@ class _ControlSSABuilder(TiledObject):
                     < len(merged_values)
                 )
             ]
+            # Program shape: returns from several edges merged at the
+            # function exit; the exit Phi (a minted, structured id) IS the
+            # output now.  Wrong record: ``semantic_output`` still naming the
+            # pre-merge value.  Rule: revise it where the Phi is minted.
+            for name, merged_id in named_returns:
+                self._revise_semantic_output(name, int(merged_id))
             self.emit(Handler.Ret, returned)
         elif fallthrough_open:
             self.emit(Handler.Ret, returned)
@@ -20341,6 +20530,45 @@ def _inject_field_slot_access(
             dtype=dtype, stage=CONTROL_SSA_FINISH,
         )
 
+    def publish_row(value: SSAValue, *causes: Any) -> None:
+        # Program: a method reading/writing ``self.<field>`` of an
+        # opaque_ref field (test_ir_sequence_tables::
+        # test_static_program_reference_is_typed_ssa_and_native_handle_
+        # storage). Wrong record: this injector builds the receiver column
+        # and the field-read Load / write-source values with the (dtype, shape) it is
+        # about to emit, but posted no ``ssa_value`` row (or left the row
+        # ``fresh()`` minted with the default dtype). Rule: the pass that
+        # makes a value posts it at that moment -- ADOPTED_GRAPH_ID derived
+        # from the receiver's cell (else the function root) and ``causes``
+        # when the id has no row, a REVISE of the existing row otherwise.
+        from .ssa_record_return_state import revise_ssa_value
+
+        book = _slot_book()
+        row = (_slot_scope, int(value.id))
+        shape = tuple(value.shape or ())
+        if book.latest_ref(SSA_VALUE, row) is None:
+            operand = (
+                _receiver_cell if _receiver_cell is not None
+                else _function_root_cell(book, _slot_scope)
+            )
+            book.post(
+                SSA_VALUE, row,
+                SSAValueFact(
+                    value.dtype, shape, SSAValueOrigin.ADOPTED_GRAPH_ID,
+                ),
+                stage=CONTROL_SSA_FINISH,
+                provenance=Derived(tuple(dict.fromkeys(
+                    cell for cell in (operand, *causes)
+                    if isinstance(cell, Ref)
+                ))),
+                mode=Mode.REVISE,
+            )
+            return
+        revise_ssa_value(
+            control_function, int(value.id), dtype=value.dtype, shape=shape,
+            stage=CONTROL_SSA_FINISH, sources=causes, book=book,
+        )
+
     # A receiver is physically a set of typed columns.  The traditional one
     # arena form is the degenerate (and fastest) one-column case.  Slots keep a
     # logical index, while this table resolves that index to (arena, offset),
@@ -20381,6 +20609,7 @@ def _inject_field_slot_access(
                 if key[1] is not None else dict(receiver_accounting or {})
             ),
         )
+        publish_row(column_arrays[key])
     field_locations = {
         slot: (
             int(column_arrays[(slot_dtype, slot if separate_field_storage else None)].id),
@@ -20628,6 +20857,7 @@ def _inject_field_slot_access(
             ) and int(source.id) not in materialized_references:
                 materialized_references.add(int(source.id))
                 reference_value = SSAValue(int(source.id), dtype="opaque_ref")
+                publish_row(reference_value)
                 insertions.append((0, schedule_index, entry_name, [Instr(
                     Handler.StaticRef.value, [], reference_value,
                     attributes={
@@ -20650,6 +20880,7 @@ def _inject_field_slot_access(
                 not flat[literal][1].args
             ):
                 source = SSAValue(fresh(*causes), dtype=slot_dtype)
+                publish_row(source)
                 group.append(Instr(
                     "Const", [], source,
                     attributes=dict(flat[literal][1].attributes or {}),
@@ -20673,12 +20904,19 @@ def _inject_field_slot_access(
             value_dtype = (
                 "opaque_ref" if int(slot) in reference_slots else slot_dtype
             )
+            loaded = SSAValue(int(value_id), dtype=value_dtype)
+            publish_row(
+                loaded,
+                _slot_book().latest_ref(
+                    SSA_VALUE, (_slot_scope, int(address.id)),
+                ),
+            )
             group = [
                 *prelude,
                 Instr(
                     "Load",
                     [address],
-                    SSAValue(int(value_id), dtype=value_dtype),
+                    loaded,
                     attributes={
                         "opaque_reference_storage": True,
                         "field_slot": int(slot),
@@ -20705,10 +20943,12 @@ def _inject_field_slot_access(
             # in the control body, so materialise its source here -- the
             # tokenizer then turns a None/str/bytes const into a token.
             if reference is not None and int(value_id) not in producer_position:
+                reference_value = SSAValue(int(value_id), dtype="opaque_ref")
+                publish_row(reference_value)
                 group.append(Instr(
                     Handler.StaticRef.value,
                     [],
-                    SSAValue(int(value_id), dtype="opaque_ref"),
+                    reference_value,
                     attributes={
                         "reference_handle": int(reference["reference_handle"]),
                         "reference_identity": str(
@@ -20725,11 +20965,13 @@ def _inject_field_slot_access(
             elif int(value_id) in const_sources and int(value_id) not in (
                 producer_position
             ):
+                literal_value = SSAValue(int(value_id), dtype=slot_dtype)
+                publish_row(literal_value)
                 group.append(
                     Instr(
                         "Const",
                         [],
-                        SSAValue(int(value_id), dtype=slot_dtype),
+                        literal_value,
                         attributes={"value": const_sources[int(value_id)]},
                     )
                 )
@@ -26277,6 +26519,7 @@ def lower_precompile_and_control_to_ssa(
                 arguments,
                 {"entry": BasicBlock("entry", instructions)},
             )
+            _post_built_function_rows(functions[region_name])
             region_callees[region_index] = region_name
             region_signatures[region_index] = (
                 tuple(int(value_id) for value_id in region.captures),

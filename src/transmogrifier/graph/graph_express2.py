@@ -6377,20 +6377,16 @@ class ProcessGraph(TiledObject):
         )
 
         annotation_rows = []
-        for definition in getattr(tree, "body", ()):
-            functions = (
-                (definition,)
-                if isinstance(
-                    definition, (ast.FunctionDef, ast.AsyncFunctionDef)
-                )
-                else tuple(
-                    member for member in definition.body
-                    if isinstance(
-                        member, (ast.FunctionDef, ast.AsyncFunctionDef)
-                    )
-                )
-                if isinstance(definition, ast.ClassDef)
-                else ()
+        # Program: ``close_region_feed_set(program: FusedProgram)`` defined
+        # NESTED inside another function.  Wrong record: only top-level
+        # functions and class members got a PARAMETER_ANNOTATION row, so the
+        # consumer join for the nested function found no declaration.  Rule:
+        # every authored function, nested or not, posts its annotation rows
+        # at this stage with the same provenance cells.
+        for definition in (tree,):
+            functions = tuple(
+                node for node in ast.walk(definition)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             )
             for function in functions:
                 arguments = function.args

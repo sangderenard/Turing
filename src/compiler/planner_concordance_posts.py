@@ -622,6 +622,31 @@ def _post_identity_table_mutation(
                 RETURN_SITE_SLOT, row, replacement_cell, stage=stage,
                 provenance=Derived(cells), mode=Mode.REVISE,
             )
+        # Program shape: a function whose returned name's value is aliased to
+        # another node (a call-result projection aliased to its member).
+        # Wrong record: ``semantic_output`` left naming the aliased id while
+        # the name binding above (the identity table) now names the
+        # replacement.  Rule: the pass that re-mints the output id revises
+        # the row at the same moment, DERIVED from the row's previous cell
+        # and the replacement node's cell.
+        from .concordance_declarations import SEMANTIC_OUTPUT
+
+        outputs = book.pages.get(SEMANTIC_OUTPUT.name)
+        for row in tuple(outputs.scope_rows(scope)) if outputs is not None else ():
+            fact = outputs.latest(row)
+            if fact is None or int(fact[1]) not in aliases:
+                continue
+            replacement = aliases[int(fact[1])]
+            cells = tuple(dict.fromkeys(
+                cell for cell in (
+                    book.latest_ref(SEMANTIC_OUTPUT, row),
+                    source_cell(replacement), *cause_cells,
+                ) if cell is not None
+            ))
+            book.post(
+                SEMANTIC_OUTPUT, row, (fact[0], int(replacement)),
+                stage=stage, provenance=Derived(cells), mode=Mode.REVISE,
+            )
 
 
 def _post_copy_planner_specializations(

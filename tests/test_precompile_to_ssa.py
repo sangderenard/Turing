@@ -104,6 +104,7 @@ def _seed_value(scope, value_id, dtype="float64"):
     )
 from src.compiler.ssa_fortran_backend import emit_module
 from src.compiler.ssa_self_check import check_definition_dominance
+from tests.compiler_provenance_inputs import publish_authored_ssa
 from src.compiler.shell_reference_tables import (
     ClassNavigationMember,
     ClassNavigationRecord,
@@ -950,6 +951,8 @@ def test_index_dtype_propagation_is_scoped_per_function_identity():
     root = Function("root", [], {"entry": BasicBlock("entry", [])})
     root.args.append(aggregate)
 
+    # Stands in for precompile_to_ssa's _mint_ssa_id/_value_cell ssa_value rows.
+    publish_authored_ssa({"region": region, "root": root})
     lower_indexing_to_ssa_addressing({"region": region, "root": root})
 
     region_result = next(
@@ -980,6 +983,8 @@ def test_index_address_lowering_preserves_slice_semantics():
         ]),
     })
 
+    # Stands in for precompile_to_ssa's _mint_ssa_id/_value_cell ssa_value rows.
+    publish_authored_ssa({function.name: function})
     lower_indexing_to_ssa_addressing({function.name: function})
 
     operations = [

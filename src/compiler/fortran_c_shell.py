@@ -26451,9 +26451,12 @@ def _class_surface_ssa_program(
             for value in returns[-1]:
                 function_value_structure(function, int(value.id))
             return tuple(returns[-1])
-        semantic_ids = tuple(map(
-            int, function.metadata.get("semantic_output_ids", ())
-        ))
+        # Program shape: a function whose Ret is empty and whose outputs are
+        # recovered from the book.  Wrong record: the metadata tuple.  Rule:
+        # the ordered FUNCTION_OUTPUT rows are the semantic outputs.
+        from .ssa_reachability import semantic_output_ids_of
+
+        semantic_ids = semantic_output_ids_of(function)
         if semantic_ids:
             values = {int(value.id): value for value in function.args}
             for output_block in function.blocks.values():
@@ -29946,8 +29949,47 @@ def _class_surface_ssa_program(
                     stage=CONTROL_SSA_FINISH,
                     provenance=Derived(output_sources), mode=Mode.CONCORD,
                 )
-            function.metadata["semantic_output_ids"] = tuple(
-                semantic_output_ids
+            # Program shape: the metadata tuple published beside the rows.
+            # Wrong record: building it from the recovery list (or from the
+            # physical Ret slots).  Rule: the reducer's SEMANTIC_OUTPUT rows
+            # (keyed by the graph's lexical read scope) are the authority;
+            # this writer derives the function-scoped row from each and
+            # refuses, naming both values, when structural recovery
+            # disagrees or no reducer row exists.  The metadata is then read
+            # back from the function-scoped rows in row order.
+            from .concordance_declarations import SEMANTIC_OUTPUT
+            from .ssa_reachability import semantic_output_ids_of
+
+            reducer_scope = graph.graph.get("lexical_read_scope")
+            semantic_page = output_book.page(SEMANTIC_OUTPUT)
+            for slot, (output_name, output_id) in enumerate(
+                semantic_output_bindings
+            ):
+                reducer_row = (reducer_scope, int(slot))
+                reducer_fact = (
+                    None if reducer_scope is None
+                    else semantic_page.latest(reducer_row)
+                )
+                if reducer_fact is None or tuple(reducer_fact) != (
+                    output_name, int(output_id)
+                ):
+                    raise ConcordanceRefusal(
+                        f"semantic_output page, row {reducer_row!r}: the "
+                        f"reducer's row holds {reducer_fact!r} but structural "
+                        f"recovery names {(output_name, int(output_id))!r} in "
+                        f"{function.name!r}"
+                    )
+                output_book.post(
+                    SEMANTIC_OUTPUT, (output_scope, int(slot)),
+                    (output_name, int(output_id)),
+                    stage=CONTROL_SSA_FINISH,
+                    provenance=Derived((
+                        output_book.latest_ref(SEMANTIC_OUTPUT, reducer_row),
+                    )),
+                    mode=Mode.CONCORD,
+                )
+            function.metadata["semantic_output_ids"] = semantic_output_ids_of(
+                function, book=output_book,
             )
         structural_shortfalls, region_view_receipts = (
             _reconcile_region_local_view_shortfalls(
@@ -31933,7 +31975,11 @@ def _class_surface_ssa_program(
                     for part_name, (
                         part_storage, part_dtype, part_rank,
                     ) in parts.items():
-                        part_id = GLOBAL_MONOTONIC_IDS.mint()
+                        # Program: a nested keyed (dict) field. Wrong record:
+                        # the part row carried no dtype/shape while the
+                        # SSAValue below is built with the declared part dtype.
+                        # Rule: one row, one value.
+                        part_id = GLOBAL_MONOTONIC_IDS.mint(dtype=part_dtype)
                         part_ids[part_name] = part_id
                         part_value = SSAValue(
                             part_id,
@@ -32094,7 +32140,7 @@ def _class_surface_ssa_program(
                             schema_identity, parameter_name, nested_path, nested_field)
                         row_handle = values[int(row_handle_id)]
                         row_offset = SSAValue(
-                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                            GLOBAL_MONOTONIC_IDS.mint(dtype="int64"), dtype="int64",
                         )
                         setup = [Instr(
                             "Mul", [row_handle, stride], row_offset,
@@ -32106,7 +32152,7 @@ def _class_surface_ssa_program(
                         pointers = []
                         for column_index, (column, arena) in enumerate(zip(columns, column_arenas)):
                             pointer = SSAValue(
-                                int(sequence_id) if column_index == 0 else GLOBAL_MONOTONIC_IDS.mint(),
+                                int(sequence_id) if column_index == 0 else GLOBAL_MONOTONIC_IDS.mint(dtype=str(column["dtype"])),
                                 dtype=str(column["dtype"]),
                             )
                             setup.append(Instr(
@@ -32126,10 +32172,10 @@ def _class_surface_ssa_program(
                                 continue
                             values[int(source_id)] = pointers[0]
                         length_pointer = SSAValue(
-                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64"
+                            GLOBAL_MONOTONIC_IDS.mint(dtype="int64"), dtype="int64"
                         )
                         length = SSAValue(
-                            GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                            GLOBAL_MONOTONIC_IDS.mint(dtype="int64"), dtype="int64",
                         )
                         setup.extend((
                             Instr(
@@ -32327,7 +32373,8 @@ def _class_surface_ssa_program(
                         column = pooled_scalar_columns.get(column_key)
                         if column is None:
                             column = SSAValue(
-                                GLOBAL_MONOTONIC_IDS.mint(),
+                                GLOBAL_MONOTONIC_IDS.mint(dtype=None if nested_dtype is None
+                                    else str(nested_dtype)),
                                 dtype=(
                                     None if nested_dtype is None
                                     else str(nested_dtype)
@@ -32363,7 +32410,8 @@ def _class_surface_ssa_program(
                         if row_handle is not None:
                             result_id = candidate_ids[0]
                             pointer = SSAValue(
-                                GLOBAL_MONOTONIC_IDS.mint(),
+                                GLOBAL_MONOTONIC_IDS.mint(dtype=None if nested_dtype is None
+                                    else str(nested_dtype)),
                                 dtype=(
                                     None if nested_dtype is None
                                     else str(nested_dtype)
@@ -32431,10 +32479,10 @@ def _class_surface_ssa_program(
                                 for extent in nested_shape:
                                     row_extent *= int(extent)
                                 row_stride = SSAValue(
-                                    GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                                    GLOBAL_MONOTONIC_IDS.mint(dtype="int64"), dtype="int64",
                                 )
                                 row_offset = SSAValue(
-                                    GLOBAL_MONOTONIC_IDS.mint(), dtype="int64",
+                                    GLOBAL_MONOTONIC_IDS.mint(dtype="int64"), dtype="int64",
                                 )
                                 setup = [
                                     Instr(
@@ -32504,11 +32552,11 @@ def _class_surface_ssa_program(
                                             token_vocabulary.index(token) + 1
                                         )
                                         constant = SSAValue(
-                                            GLOBAL_MONOTONIC_IDS.mint(),
+                                            GLOBAL_MONOTONIC_IDS.mint(dtype="int64"),
                                             dtype="int64",
                                         )
                                         compared = SSAValue(
-                                            GLOBAL_MONOTONIC_IDS.mint(),
+                                            GLOBAL_MONOTONIC_IDS.mint(dtype="bool"),
                                             dtype="bool",
                                         )
                                         setup.extend((
@@ -32536,7 +32584,7 @@ def _class_surface_ssa_program(
                                         merged = SSAValue(
                                             predicate_id
                                             if position == len(comparisons) - 1
-                                            else GLOBAL_MONOTONIC_IDS.mint(),
+                                            else GLOBAL_MONOTONIC_IDS.mint(dtype="bool"),
                                             dtype="bool",
                                         )
                                         setup.append(Instr(
@@ -33126,9 +33174,36 @@ def _class_surface_ssa_program(
                     # despite root owning the field (duplicate-storage-across-
                     # call). Do not invent a second input beside its residents.
                     if storage != "keyed":
+                        # Program: a record field written but never read
+                        # (test_ir_sequence_tables). Wrong record: the slot row
+                        # carried no dtype/shape; the scalar path below builds
+                        # the SSAValue with the field's declared dtype and
+                        # shape. Rule: one row, one value. A sequence/table/
+                        # record field builds its own member values from its
+                        # own view, so its slot keeps the bare row.
+                        incoming_shape = (
+                            tuple(map(int, field["shape"]))
+                            if field.get("shape") is not None
+                            else (int(field["fixed_length"]),)
+                            if field.get("fixed_length") is not None
+                            else ()
+                        )
+                        scalar_slot = (
+                            storage not in {"table", "record"}
+                            and "sequence" not in access_receipts
+                        )
                         candidate_ids = (
                             (int(incoming_slot),) if incoming_slot is not None
-                            else (GLOBAL_MONOTONIC_IDS.mint(),)
+                            else (
+                                GLOBAL_MONOTONIC_IDS.mint(
+                                    dtype=(
+                                        None if field.get("dtype") is None
+                                        else str(field["dtype"])
+                                    ),
+                                    shape=incoming_shape,
+                                ) if scalar_slot
+                                else GLOBAL_MONOTONIC_IDS.mint(),
+                            )
                         )
                 if (
                     "sequence" in access_receipts
@@ -33163,6 +33238,22 @@ def _class_surface_ssa_program(
                     ) -> tuple[str, tuple[int, ...]]:
                         return accepted_sequence_members.get(
                             role, (str(dtype), tuple(shape)),
+                        )
+
+                    def mint_member(
+                        role: tuple[Any, ...], dtype: str,
+                    ) -> int:
+                        # Program: a Sequence[Record] field (test_ir_sequence_
+                        # tables). Wrong record: the member is minted with no
+                        # dtype/shape and built below with the accepted ABI.
+                        # Rule: one row, one value -- post the row with the
+                        # (dtype, shape) the SSAValue is built with.
+                        member_dtype, member_shape = accepted_member_abi(
+                            role, dtype,
+                        )
+                        return GLOBAL_MONOTONIC_IDS.mint(
+                            dtype=str(member_dtype),
+                            shape=tuple(member_shape),
                         )
                     if has_child_table:
                         raise ValueError(
@@ -33202,16 +33293,22 @@ def _class_surface_ssa_program(
                         column_ids = (
                             int(sequence.column_value_ids[0]),
                             *(
-                                GLOBAL_MONOTONIC_IDS.mint()
-                                for _ in range(column_count - 1)
+                                mint_member(
+                                    ("column", position), dtypes[position],
+                                )
+                                for position in range(1, column_count)
                             ),
                         )
                         live_flags_id = sequence.live_flags_value_id
                         if requires_live_flags and live_flags_id is None:
-                            live_flags_id = GLOBAL_MONOTONIC_IDS.mint()
+                            live_flags_id = mint_member(
+                                ("live_flags_value_id",), "bool",
+                            )
                         status_id = sequence.status_address_id
                         if requires_status and status_id is None:
-                            status_id = GLOBAL_MONOTONIC_IDS.mint()
+                            status_id = mint_member(
+                                ("status_address_id",), "int",
+                            )
                         sequence = SSASequenceDescriptor(
                             sequence_id=int(sequence.sequence_id),
                             column_value_ids=tuple(map(int, column_ids)),
@@ -33259,13 +33356,13 @@ def _class_surface_ssa_program(
                         sequence = replace(
                             sequence,
                             status_address_id=(
-                                GLOBAL_MONOTONIC_IDS.mint()
+                                mint_member(("status_address_id",), "int")
                                 if requires_status
                                 and sequence.status_address_id is None
                                 else sequence.status_address_id
                             ),
                             live_flags_value_id=(
-                                GLOBAL_MONOTONIC_IDS.mint()
+                                mint_member(("live_flags_value_id",), "bool")
                                 if requires_live_flags
                                 and sequence.live_flags_value_id is None
                                 else sequence.live_flags_value_id
@@ -33279,18 +33376,22 @@ def _class_surface_ssa_program(
                         column_ids = (
                             sequence_id,
                             *(
-                                GLOBAL_MONOTONIC_IDS.mint()
-                                for _ in range(max(0, column_count - 1))
+                                mint_member(
+                                    ("column", position), dtypes[position],
+                                )
+                                for position in range(1, column_count)
                             ),
                         )
-                        length_id = GLOBAL_MONOTONIC_IDS.mint()
-                        capacity_id = GLOBAL_MONOTONIC_IDS.mint()
+                        length_id = mint_member(("length_address_id",), "int64")
+                        capacity_id = mint_member(
+                            ("capacity_value_id",), "int64",
+                        )
                         status_id = (
-                            GLOBAL_MONOTONIC_IDS.mint()
+                            mint_member(("status_address_id",), "int")
                             if requires_status else None
                         )
                         live_flags_id = (
-                            GLOBAL_MONOTONIC_IDS.mint()
+                            mint_member(("live_flags_value_id",), "bool")
                             if requires_live_flags else None
                         )
                         members = (
@@ -33601,18 +33702,25 @@ def _class_surface_ssa_program(
                     for part_name, (
                         part_storage, part_dtype, part_rank
                     ) in parts.items():
-                        part_id = GLOBAL_MONOTONIC_IDS.mint()
+                        # The declared entry count is the exact extent of
+                        # the keys and values vectors.
+                        part_shape = (
+                            tuple(map(int, field["shape"]))
+                            if part_rank == 1 and field.get("shape")
+                            else ()
+                        )
+                        # Program: a keyed (dict) record field. Wrong record:
+                        # the part row carried no dtype/shape while the
+                        # SSAValue below is built with them. Rule: one row,
+                        # one value.
+                        part_id = GLOBAL_MONOTONIC_IDS.mint(
+                            dtype=part_dtype, shape=part_shape,
+                        )
                         part_ids[part_name] = part_id
                         part_value = SSAValue(
                             part_id,
                             dtype=part_dtype,
-                            # The declared entry count is the exact extent of
-                            # the keys and values vectors.
-                            shape=(
-                                tuple(map(int, field["shape"]))
-                                if part_rank == 1 and field.get("shape")
-                                else ()
-                            ),
+                            shape=part_shape,
                             accounting={
                                 "program_abi_record": str(record["identity"]),
                                 "program_abi_parameter": str(parameter_name),
@@ -33772,8 +33880,14 @@ def _class_surface_ssa_program(
                                 "dtype": str(field.get("dtype") or "unknown"),
                             },)
                         column_ids = [sequence_id]
+                        # Program: a table field with no sequence producer.
+                        # Wrong record: each physical member row carried no
+                        # dtype/shape; the member loop below builds the
+                        # SSAValue with the spec's dtype and shape.
                         column_ids.extend(
-                            GLOBAL_MONOTONIC_IDS.mint()
+                            GLOBAL_MONOTONIC_IDS.mint(
+                                dtype=str(_column.get("dtype") or "unknown"),
+                            )
                             for _column in columns[1:]
                         )
                         member_specs = [
@@ -33787,15 +33901,19 @@ def _class_surface_ssa_program(
                                 column_ids, columns, strict=True,
                             ))
                         ]
-                        length_id = GLOBAL_MONOTONIC_IDS.mint()
-                        capacity_id = GLOBAL_MONOTONIC_IDS.mint()
+                        length_id = GLOBAL_MONOTONIC_IDS.mint(
+                            dtype="int64", shape=(1,),
+                        )
+                        capacity_id = GLOBAL_MONOTONIC_IDS.mint(dtype="int64")
                         member_specs.extend((
                             (length_id, "int64", "length", 0),
                             (capacity_id, "int64", "capacity", 0),
                         ))
                         status_id = None
                         if mutable:
-                            status_id = GLOBAL_MONOTONIC_IDS.mint()
+                            status_id = GLOBAL_MONOTONIC_IDS.mint(
+                                dtype="int", shape=(1,),
+                            )
                             member_specs.append((status_id, "int", "status", 0))
                         for member_id, member_dtype, member_name, member_rank in (
                             member_specs
@@ -33876,7 +33994,9 @@ def _class_surface_ssa_program(
                             )
                         ))
                         if not presence_ids:
-                            presence_ids = (GLOBAL_MONOTONIC_IDS.mint(),)
+                            presence_ids = (
+                                GLOBAL_MONOTONIC_IDS.mint(dtype="bool"),
+                            )
                         physical_presence_ids = []
                         for requested_id in presence_ids:
                             presence = values.get(int(requested_id))
@@ -33888,7 +34008,7 @@ def _class_surface_ssa_program(
                                 )
                             ):
                                 presence = SSAValue(
-                                    GLOBAL_MONOTONIC_IDS.mint(), dtype="bool"
+                                    GLOBAL_MONOTONIC_IDS.mint(dtype="bool"), dtype="bool"
                                 )
                             if presence is None:
                                 presence = SSAValue(
@@ -34099,7 +34219,9 @@ def _class_surface_ssa_program(
                         )
                     ))
                     if not presence_ids:
-                        presence_ids = (GLOBAL_MONOTONIC_IDS.mint(),)
+                        presence_ids = (
+                            GLOBAL_MONOTONIC_IDS.mint(dtype="bool"),
+                        )
                     requested_presence_ids = tuple(map(int, presence_ids))
                     presence_values = []
                     for presence_id in requested_presence_ids:
@@ -34121,7 +34243,7 @@ def _class_surface_ssa_program(
                             )
                         ):
                             presence = SSAValue(
-                                GLOBAL_MONOTONIC_IDS.mint(), dtype="bool"
+                                GLOBAL_MONOTONIC_IDS.mint(dtype="bool"), dtype="bool"
                             )
                         if presence is None:
                             presence = SSAValue(int(presence_id), dtype="bool")
@@ -34233,7 +34355,7 @@ def _class_surface_ssa_program(
                                 ):
                                     continue
                                 became_present = SSAValue(
-                                    GLOBAL_MONOTONIC_IDS.mint(), dtype="bool"
+                                    GLOBAL_MONOTONIC_IDS.mint(dtype="bool"), dtype="bool"
                                 )
                                 rewritten.extend((
                                     Instr(
@@ -34317,7 +34439,7 @@ def _class_surface_ssa_program(
                                         ):
                                             continue
                                         became_present = SSAValue(
-                                            GLOBAL_MONOTONIC_IDS.mint(),
+                                            GLOBAL_MONOTONIC_IDS.mint(dtype="bool"),
                                             dtype="bool",
                                         )
                                         block.instrs[index + 1:index + 1] = (
@@ -42152,9 +42274,14 @@ def _class_surface_ssa_program(
                     else all_functions.get(record.callee_symbol)
                 )
                 if callee is not None:
-                    semantic_output_ids = tuple(map(
-                        int, callee.metadata.get("semantic_output_ids", ())
-                    ))
+                    # Program shape: caller bindings paired POSITIONALLY to
+                    # the callee's outputs.  Wrong record: the callee's
+                    # metadata tuple (a differently grouped view).  Rule: the
+                    # ordered FUNCTION_OUTPUT rows of the callee's own book
+                    # are the pairing input; the algorithm is unchanged.
+                    from .ssa_reachability import semantic_output_ids_of
+
+                    semantic_output_ids = semantic_output_ids_of(callee)
                     # Process-graph scheduling is free to enumerate the
                     # projections of an evaluate-once destructuring temporary
                     # in dependency order.  That order is not the Python
@@ -43809,7 +43936,7 @@ def _class_surface_ssa_program(
                     print(
                         "DEBUG-RESULT-BINDINGS "
                         f"record={record.result_bindings!r} "
-                        f"semantic={tuple(callee.metadata.get('semantic_output_ids', ()))!r} "
+                        f"semantic={semantic_output_ids_of(callee)!r} "
                         f"layouts={record_return_layouts!r} "
                         f"physical={physical_result_bindings!r} "
                         f"callee_outputs={callee_output_id_sequence!r}",
@@ -43907,9 +44034,11 @@ def _class_surface_ssa_program(
                 # as non-return silently left the caller's projection with no
                 # producer and the failure surfaced only at the contract
                 # check, far from its cause.  Refuse here, naming both sides.
-                authored_callee_output_ids = set(map(
-                    int, callee.metadata.get("semantic_output_ids", ())
-                ))
+                # (the authored outputs are the callee's FUNCTION_OUTPUT rows,
+                # not its metadata tuple.)
+                authored_callee_output_ids = set(
+                    semantic_output_ids_of(callee)
+                )
                 callee_record_ids = (
                     set() if callee_record_table is None
                     else set(map(int, callee_record_table.records))
@@ -45134,7 +45263,9 @@ def _class_surface_ssa_program(
                         # DERIVED from the callsite's ``canonical_value``
                         # cell, the marker handle's cell it replaces and the
                         # cells of the outputs it publishes.  A value that
-                        # already has a row keeps it.
+                        # already has a row keeps it.  Rule: a mint declares
+                        # its physical fields (none here); a rebuild would
+                        # carry them (rebuilt_ssa_value_fact).
                         if _frame_value_cell(caller, caller_result_id) is None:
                             from .concordance_declarations import (
                                 SSA_VALUE, SSAValueFact, SSAValueOrigin,
@@ -48406,7 +48537,22 @@ def _class_surface_ssa_program(
                                     f"{int(actual.id)}); the authored program "
                                     "hands one parameter two dtypes"
                                 )
-                            formal.dtype = actual.dtype
+                            # Wrong record: the resident formal is retyped with
+                            # no REVISE of its ssa_value row. Rule: post the
+                            # row DERIVED from the actual's cell first; the
+                            # resident takes the posted fact.
+                            from .concordance_declarations import (
+                                PHYSICAL_CALL_INPUT_ADAPTATION as _CALL_TYPE_STAGE,
+                            )
+                            from .ssa_record_return_state import (
+                                publish_ssa_value_type as _publish_call_type,
+                            )
+                            _publish_call_type(
+                                callee, formal, dtype=actual.dtype,
+                                shape=tuple(formal.shape or ()),
+                                sources=(_frame_value_cell(caller, actual.id),),
+                                stage=_CALL_TYPE_STAGE,
+                            )
                             formal.accounting = {
                                 **formal_accounting,
                                 "ssa_call_dtype": actual_dtype,
@@ -48473,7 +48619,24 @@ def _class_surface_ssa_program(
                                     "Formal accounting (this callee): "
                                     f"{ {k: v for k, v in formal_accounting.items()} !r}"
                                 )
-                            actual.dtype = formal.dtype
+                            # Program: one value passed to a contracted formal
+                            # (test_mapping_value_column_uses_writer_union_abi).
+                            # Wrong record: the resident actual is retyped
+                            # with no REVISE of its ssa_value row. Rule: post
+                            # the row DERIVED from the formal's cell first;
+                            # the resident takes the posted fact.
+                            from .concordance_declarations import (
+                                PHYSICAL_CALL_INPUT_ADAPTATION as _CALL_TYPE_STAGE,
+                            )
+                            from .ssa_record_return_state import (
+                                publish_ssa_value_type as _publish_call_type,
+                            )
+                            _publish_call_type(
+                                caller, actual, dtype=formal.dtype,
+                                shape=tuple(actual.shape or ()),
+                                sources=(_frame_value_cell(callee, formal.id),),
+                                stage=_CALL_TYPE_STAGE,
+                            )
                             actual.accounting = {
                                 **actual_accounting,
                                 "ssa_call_dtype": formal_dtype,
@@ -48490,7 +48653,21 @@ def _class_surface_ssa_program(
                             and actual_dtype != formal_dtype
                             and not formal_is_contracted
                         ):
-                            formal.dtype = actual.dtype
+                            # Wrong record: the resident formal is retyped with
+                            # no REVISE of its ssa_value row. Rule: post the
+                            # row DERIVED from the actual's cell first.
+                            from .concordance_declarations import (
+                                PHYSICAL_CALL_INPUT_ADAPTATION as _CALL_TYPE_STAGE,
+                            )
+                            from .ssa_record_return_state import (
+                                publish_ssa_value_type as _publish_call_type,
+                            )
+                            _publish_call_type(
+                                callee, formal, dtype=actual.dtype,
+                                shape=tuple(formal.shape or ()),
+                                sources=(_frame_value_cell(caller, actual.id),),
+                                stage=_CALL_TYPE_STAGE,
+                            )
                             formal.accounting = {
                                 **formal_accounting,
                                 "ssa_call_dtype": actual_dtype,
@@ -48505,7 +48682,21 @@ def _class_surface_ssa_program(
                             and formal_dtype != "unknown"
                             and actual_dtype in {"", "unknown"}
                         ):
-                            actual.dtype = formal.dtype
+                            # Wrong record: the resident actual is retyped with
+                            # no REVISE of its ssa_value row. Rule: post the
+                            # row DERIVED from the formal's cell first.
+                            from .concordance_declarations import (
+                                PHYSICAL_CALL_INPUT_ADAPTATION as _CALL_TYPE_STAGE,
+                            )
+                            from .ssa_record_return_state import (
+                                publish_ssa_value_type as _publish_call_type,
+                            )
+                            _publish_call_type(
+                                caller, actual, dtype=formal.dtype,
+                                shape=tuple(actual.shape or ()),
+                                sources=(_frame_value_cell(callee, formal.id),),
+                                stage=_CALL_TYPE_STAGE,
+                            )
                             changed_call_types = True
                             call_type_pass_changes.append(
                                 f"unknown-actual {caller.name}->{callee.name} actual "

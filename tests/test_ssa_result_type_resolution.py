@@ -3,6 +3,22 @@ from src.compiler.ssa_self_check import check_structural_outputs
 from src.transmogrifier.ssa import SSAValue, Instr, Function, BasicBlock, IRModule
 
 
+import pytest
+
+from src.compiler.transformation_priority import TransformationConflict
+
+from tests.compiler_provenance_inputs import publish_authored_ssa
+from src.compiler.identity_concordance import begin_identity_book as _begin_book, end_identity_book as _end_book
+
+@pytest.fixture(autouse=True)
+def _fresh_compile_book():
+    # One compile book per test, as the real pipeline opens one per compile.
+    _book, token = _begin_book()
+    try:
+        yield
+    finally:
+        _end_book(token)
+
 def values(function):
     result = {value.id: value for value in function.args}
     for block in function.blocks.values():
@@ -26,17 +42,20 @@ def function(name, value, calls=()):
     return Function(name, [], {'entry': BasicBlock('entry', [*instructions, Instr('Ret', [value], None)])})
 
 
-def test_equal_priority_producer_keeps_incumbent_and_records_conflict():
+def test_equal_priority_producer_disagreement_refuses_as_conflict():
     result = SSAValue(0, 'unknown')
     fs = {'root': function('root', result, ('first', 'second')),
           'first': function('first', SSAValue(1, 'float64')),
           'second': function('second', SSAValue(2, 'int64'))}
-    _, events, conflicts, rounds = settle_call_result_types(fs, outputs, values)
-    assert result.dtype == 'float64'
-    assert len(conflicts) == 1 and conflicts[0]['callee'] == 'second'
-    assert any(event.get('reason') == 'incumbent_tie' for event in events)
-    module = IRModule(fs, metadata={'call_result_type_conflicts': conflicts})
-    assert check_structural_outputs(module)[0].check == 'call_result_contract'
+    # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+    publish_authored_ssa(fs)
+    # Rule: an equal-priority disagreement between producers is a discordance; arrival order never picks a winner.
+    with pytest.raises(TransformationConflict) as refusal:
+        settle_call_result_types(fs, outputs, values)
+    message = str(refusal.value)
+    assert "('root', 0)" in message
+    assert "('float64', (), None)" in message and "('int64', (), None)" in message
+    assert "'first'" in message and "'second'" in message
 
 
 def test_stronger_physical_proof_propagates_through_reverse_order_chain():
@@ -44,6 +63,8 @@ def test_stronger_physical_proof_propagates_through_reverse_order_chain():
     fs = {'outer': function('outer', SSAValue(0, 'float64'), ('middle',)),
           'middle': function('middle', SSAValue(1, 'float64'), ('inner',)),
           'inner': function('inner', physical)}
+    # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+    publish_authored_ssa(fs)
     _, _, conflicts, _ = settle_call_result_types(fs, outputs, values)
     assert not conflicts
     assert outputs('outer', fs['outer'])[0].dtype == 'bool'
@@ -53,6 +74,8 @@ def test_contiguous_result_views_keep_incumbent_shape_without_cycle():
     result = SSAValue(0, 'float64', (8, 1), accounting={'physical_dtype': 'float64'})
     fs = {'root': function('root', result, ('producer',)),
           'producer': function('producer', SSAValue(1, 'float64', (8,)))}
+    # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+    publish_authored_ssa(fs)
     _, _, conflicts, _ = settle_call_result_types(fs, outputs, values)
     assert result.shape == (8, 1) and not conflicts
     assert not equivalent_physical_layout(('float64', (8,), None), ('float64', (9,), None))
@@ -61,6 +84,8 @@ def test_contiguous_result_views_keep_incumbent_shape_without_cycle():
 def test_runtime_recursion_does_not_make_type_propagation_oscillate():
     fs = {'a': function('a', SSAValue(0, 'float64'), ('b',)),
           'b': function('b', SSAValue(1, 'int64'), ('a',))}
+    # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+    publish_authored_ssa(fs)
     _, _, conflicts, _ = settle_call_result_types(fs, outputs, values)
     assert not conflicts
     assert outputs('a', fs['a'])[0].dtype == outputs('b', fs['b'])[0].dtype
@@ -70,6 +95,8 @@ def test_storage_label_without_known_dtype_is_not_a_physical_type_proof():
     result = SSAValue(0, 'unknown', accounting={'program_abi_storage': 'scalar'})
     fs = {'root': function('root', result, ('producer',)),
           'producer': function('producer', SSAValue(1, 'bool', accounting={'physical_dtype': 'bool'}))}
+    # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+    publish_authored_ssa(fs)
     _, _, conflicts, _ = settle_call_result_types(fs, outputs, values)
     assert result.dtype == 'bool' and not conflicts
 
@@ -93,6 +120,8 @@ def test_rejected_physical_incumbent_does_not_claim_callee_provenance():
     result = SSAValue(0, 'bool', accounting={'physical_dtype': 'bool'})
     fs = {'root': function('root', result, ('producer',)),
           'producer': function('producer', SSAValue(1, 'float64'))}
+    # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+    publish_authored_ssa(fs)
     exact, _, conflicts, _ = settle_call_result_types(fs, outputs, values)
     assert result.dtype == 'bool' and conflicts
     assert id(result) not in exact
@@ -104,6 +133,8 @@ def test_inferred_projection_inherits_proven_buffer_representation():
     source = SSAValue(1, 'bool', (4,), accounting={'physical_dtype': 'float64'})
     fs = {'root': function('root', result, ('producer',)),
           'producer': function('producer', source)}
+    # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+    publish_authored_ssa(fs)
     _, _, conflicts, _ = settle_call_result_types(fs, outputs, values)
     assert result.dtype == 'bool'
     assert result.accounting['physical_dtype'] == 'float64'
@@ -124,6 +155,8 @@ def test_repeated_region_projection_receives_its_own_physical_contract():
         Instr('Load', [pointer], repeated), Instr('Ret', [repeated], None),
     ])})
     fs = {'root': root, 'producer': function('producer', source)}
+    # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+    publish_authored_ssa(fs)
     _, _, conflicts, _ = settle_call_result_types(fs, outputs, values)
     assert not conflicts
     assert repeated.accounting['physical_dtype'] == 'float64'
@@ -149,6 +182,8 @@ def test_projection_uses_caller_output_identity_after_dead_output_removal():
     producer = Function('producer', [left, right], {'entry': BasicBlock('entry', [
         Instr('Ret', [left, right], None),
     ])})
+    # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+    publish_authored_ssa({'root': root, 'producer': producer})
     _, _, conflicts, _ = settle_call_result_types({'root': root, 'producer': producer}, outputs, values)
     assert not conflicts
     assert repeated.shape == (3,)
@@ -176,16 +211,21 @@ def test_accepted_component_is_a_source_not_an_ambient_settlement_target():
     finally:
         end_identity_book(ambient_token)
 
-def test_accepted_component_output_is_not_rederived_in_current_caller():
+def test_caller_derives_from_accepted_components_imported_proof():
+    import hashlib
+    digest = hashlib.sha256(b'accepted-fixture').hexdigest()
     from src.compiler.identity_concordance import begin_identity_book, end_identity_book
 
     source = SSAValue(1, 'bool', accounting={'physical_dtype': 'bool'})
     accepted = function('accepted', source)
     owner, owner_token = begin_identity_book()
     try:
+        # The accepted body's rows live on its owner book, as when it was compiled.
+        # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+        publish_authored_ssa({'accepted': accepted})
         accepted.metadata['accepted_ssa_component'] = {
             'schema': 'turing.accepted-ssa-component.v1',
-            'artifact_sha256': 'accepted-fixture',
+            'artifact_sha256': digest,
             'identity_book': owner,
         }
     finally:
@@ -195,18 +235,15 @@ def test_accepted_component_output_is_not_rederived_in_current_caller():
 
     ambient, ambient_token = begin_identity_book()
     try:
+        # stands in for precompile_to_ssa's _mint_ssa_id/_value_cell rows
+        publish_authored_ssa({'caller': caller})
         _, _, conflicts, _ = settle_call_result_types(
             {'caller': caller, 'accepted': accepted}, outputs, values,
         )
-        assert result.dtype == 'float64'
-        assert 'physical_dtype' not in result.accounting
-        assert conflicts == ({
-            'caller': 'caller', 'value_id': 0,
-            'retained': ('float64', (), None),
-            'retained_storage': ('float64', (), None),
-            'callee': 'accepted', 'callee_value_id': 1,
-            'proposed': ('bool', (), None),
-            'proposed_storage': ('bool', (), None),
-        },)
+        assert result.dtype == 'bool'
+        assert not conflicts
+        # The accepted body's output reaches the caller through the digest-qualified import edge.
+        receipts = ambient.page('concordance_imported_cell').rows()
+        assert receipts and all(row[0] == digest for row in receipts)
     finally:
         end_identity_book(ambient_token)

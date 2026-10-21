@@ -5027,11 +5027,11 @@ def project_process_graph_acceptance(graph, references, book=None):
     )
     from .concordance_declarations import (
         RETURN_OUTPUT_ARMS, RETURN_SITE_CONTAINER, RETURN_SITE_FIELD_STATE,
-        RETURN_SITE_SLOT,
+        RETURN_SITE_SLOT, SEMANTIC_OUTPUT,
     )
     return_site_pages = (
         RETURN_SITE_SLOT, RETURN_SITE_CONTAINER, RETURN_SITE_FIELD_STATE,
-        RETURN_OUTPUT_ARMS,
+        RETURN_OUTPUT_ARMS, SEMANTIC_OUTPUT,
     )
 
     def return_site_scopes(body):
@@ -6783,10 +6783,12 @@ def _accepted_physical_output_paths(
     # (authored 56, 57; published 56, q, 57, q).  The record's even
     # positions ARE the authored leaves, in order; each leaf's physical
     # return ABI is its (payload, presence) pair.
-    semantic_output_ids = tuple(
-        int(value_id)
-        for value_id in function.metadata.get("semantic_output_ids") or ()
-    )
+    # Program shape: one authored output over an interleaved (payload,
+    # presence) accepted layout.  Wrong record: the metadata tuple.  Rule: the
+    # function_output rows of the accepted book are the semantic outputs.
+    from .ssa_reachability import semantic_output_ids_of
+
+    semantic_output_ids = semantic_output_ids_of(function, book=book)
     if resolved and len(semantic_output_ids) == 1:
         output_layout = recorded_aggregates.get(semantic_output_ids[0])
         if (

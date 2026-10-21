@@ -88,10 +88,46 @@ class Model:
     assert contracts == {("Model", "current"): "dict"}
 
 
+@pytest.fixture
+def _fresh_compile_book():
+    # One compile book per test, as the real pipeline opens one per compile.
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    _book, token = begin_identity_book()
+    try:
+        yield
+    finally:
+        end_identity_book(token)
+
+
+def _returning_function(name, *value_ids, bool_ids=()):
+    """A named Function returning ``value_ids``, with its ssa_value rows posted.
+
+    Stands in for precompile_to_ssa's authored-SSA publication.
+    """
+
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+    from tests.compiler_provenance_inputs import publish_authored_ssa
+
+    values = [SSAValue(value_id, "bool" if value_id in bool_ids else "int64")
+        for value_id in value_ids]
+    function = Function(name, [], {"entry": BasicBlock("entry", [
+        Instr("Ret", values, None),
+    ])})
+    book = publish_authored_ssa({name: function})
+    return function, book
+
+
+@pytest.mark.usefixtures("_fresh_compile_book")
 def test_record_return_layout_expands_the_conceptual_output_path():
-    function = SimpleNamespace(metadata={
-        "record_return_layouts": ((12, (11, 6, 8)),),
-    })
+    from src.compiler.concordance_declarations import RECORD_RETURN_LAYOUT_STAGE
+    from src.compiler.ssa_record_return_state import post_record_return_layout
+
+    function, _book = _returning_function("record_return", 12, 11, 6, 8)
+    # Stands in for fortran_c_shell's record-ABI post of RECORD_RETURN_LAYOUT.
+    post_record_return_layout(
+        function, None, 12, (11, 6, 8), stage=RECORD_RETURN_LAYOUT_STAGE,
+    )
 
     paths, kind = _accepted_physical_output_paths(
         {(0,): 12}, {6, 8, 11}, function, None,
@@ -101,10 +137,16 @@ def test_record_return_layout_expands_the_conceptual_output_path():
     assert kind == "tuple"
 
 
+@pytest.mark.usefixtures("_fresh_compile_book")
 def test_record_return_layout_does_not_mask_a_published_disagreement():
-    function = SimpleNamespace(metadata={
-        "record_return_layouts": ((12, (11, 6, 8)),),
-    })
+    from src.compiler.concordance_declarations import RECORD_RETURN_LAYOUT_STAGE
+    from src.compiler.ssa_record_return_state import post_record_return_layout
+
+    function, _book = _returning_function("record_return", 12, 11, 6, 8, 13)
+    # Stands in for fortran_c_shell's record-ABI post of RECORD_RETURN_LAYOUT.
+    post_record_return_layout(
+        function, None, 12, (11, 6, 8), stage=RECORD_RETURN_LAYOUT_STAGE,
+    )
 
     paths, kind = _accepted_physical_output_paths(
         {(0,): 12}, {6, 8, 13}, function, None,
@@ -114,16 +156,36 @@ def test_record_return_layout_does_not_mask_a_published_disagreement():
     assert kind is None
 
 
+@pytest.mark.usefixtures("_fresh_compile_book")
 def test_optional_tuple_return_layout_expands_all_physical_leaf_receipts():
-    function = SimpleNamespace(metadata={
-        "aggregate_return_layouts": (
-            (21, (21, 22)),
-            (31, (31, 32)),
-        ),
-    })
+    from src.compiler.concordance_declarations import (
+        OPTIONAL_VALUE_STRUCTURE, STRUCTURAL_CONCORDANCE,
+    )
+    from src.compiler.identity_concordance import Derived, Mode
+    from src.compiler.ssa_record_return_state import (
+        function_scope_of, identity_cells,
+    )
+    from src.compiler.structural_concordance import publish_aggregate_return_layout
+
+    function, book = _returning_function(
+        "optional_tuple", 21, 22, 31, 32, bool_ids=(22, 32),
+    )
+    # Stands in for ssa_optional_values' OPTIONAL_VALUE_STRUCTURE and
+    # AGGREGATE_RETURN_LAYOUT posts, one per (payload, presence) pair.
+    for payload, presence in ((21, 22), (31, 32)):
+        cell = book.post(
+            OPTIONAL_VALUE_STRUCTURE, (function_scope_of(function), payload),
+            (payload, presence), stage=STRUCTURAL_CONCORDANCE,
+            provenance=Derived(identity_cells(function, payload, presence)),
+            mode=Mode.CONCORD,
+        )
+        publish_aggregate_return_layout(
+            function, payload, (payload, presence), sources=(cell,),
+            stage=STRUCTURAL_CONCORDANCE, book=book,
+        )
 
     paths, kind = _accepted_physical_output_paths(
-        {}, {21, 22, 31, 32}, function, None,
+        {}, {21, 22, 31, 32}, function, None, book=book,
     )
 
     assert paths == {
@@ -133,7 +195,6 @@ def test_optional_tuple_return_layout_expands_all_physical_leaf_receipts():
         (1, 1): 32,
     }
     assert kind == "tuple"
-
 
 def test_source_acceptance_does_not_import_linked_repository_ssa_cells():
     import networkx as nx

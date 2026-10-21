@@ -1,12 +1,12 @@
 import pytest
 
 from src.compiler.identity_concordance import (
-    Mode, Novel, begin_identity_book, current_identity_book,
+    Derived, Mode, Novel, begin_identity_book, current_identity_book,
     end_identity_book,
 )
 from src.compiler.concordance_declarations import (
-    CALL_RECORD, CONTROL_SSA, FRAME_BINDING, INGEST_SOURCE, SSA_VALUE,
-    SSAValueFact, SSAValueOrigin,
+    ARGUMENT_BINDING, ArgumentBindingFact, CALL_RECORD, CONTROL_SSA,
+    FRAME_BINDING, INGEST_SOURCE, SSA_VALUE, SSAValueFact, SSAValueOrigin,
 )
 from src.compiler.fortran_c_shell import (
     _complete_propagated_frame_tails, _propagate_record_field_demand,
@@ -26,6 +26,39 @@ def _isolated_identity_book():
         yield
     finally:
         end_identity_book(token)
+
+
+def _post_value_roots(scope, *values):
+    """Declared inputs of the fixture program: each value's ``ssa_value`` row
+    is a ``Novel(INGEST_SOURCE, ())`` root, as the real builder posts it."""
+
+    book = current_identity_book()
+    return tuple(
+        book.post(
+            SSA_VALUE, (scope, value.id),
+            SSAValueFact(value.dtype, (), SSAValueOrigin.ADOPTED_GRAPH_ID),
+            stage=CONTROL_SSA, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        for value in values
+    )
+
+
+def _post_caller_storage_binding(callee, formal, callsite, caller, storage):
+    """The binding the walk records for a caller-storage formal: DERIVED from
+    the callee formal's cell and the caller storage's cell, as the producer
+    (``_frame_post(ARGUMENT_BINDING, ...)`` in the frame linker) posts it."""
+
+    book = current_identity_book()
+    cells = (
+        book.latest_ref(SSA_VALUE, (callee, formal.id)),
+        book.latest_ref(SSA_VALUE, (caller, storage.id)),
+    )
+    return book.post(
+        ARGUMENT_BINDING, (callee, formal.id, callsite),
+        ArgumentBindingFact('caller_storage', storage.id),
+        stage=FRAME_BINDING, provenance=Derived(cells), mode=Mode.CONCORD,
+    )
 
 
 def test_exact_binding_prevents_duplicate_field_demand_and_survives_storage_growth():
@@ -99,8 +132,14 @@ def test_exact_binding_reuses_concorded_late_sequence_storage():
         'callee', [value, sequence_column],
         {'entry': BasicBlock('entry', [])},
     )
-    current_identity_book().page('argument_binding').set(
-        ('callee', 7, 'binding'), 9, ('caller_storage', 21),
+    # Program: two-formal callee whose tail formal 7 is bound to caller
+    # storage 21.  The wrong write was a raw page set (refused by the book);
+    # the rule is that the binding posts DERIVED from the formal's and the
+    # storage's own cells, which are posted as Novel roots first.
+    _post_value_roots('callee', value, sequence_column)
+    _post_value_roots('caller', actual, caller_storage)
+    _post_caller_storage_binding(
+        'callee', sequence_column, 9, 'caller', caller_storage,
     )
 
     assert _complete_propagated_frame_tails({
@@ -130,8 +169,15 @@ def test_exact_binding_restores_removed_caller_storage_identity():
         'callee', [value, sequence_length],
         {'entry': BasicBlock('entry', [])},
     )
-    current_identity_book().page('argument_binding').set(
-        ('callee', 7, 'binding'), 9, ('caller_storage', 21),
+    # Program: callee tail formal 7 is bound to caller storage 21, which the
+    # caller no longer carries.  Raw page set was refused; post the binding
+    # DERIVED from the formal's cell and the storage's cell (both Novel
+    # roots; the removed storage keeps its own ssa_value row).
+    removed_storage = SSAValue(21, 'int64', shape=(1,))
+    _post_value_roots('callee', value, sequence_length)
+    _post_value_roots('caller', actual, removed_storage)
+    _post_caller_storage_binding(
+        'callee', sequence_length, 9, 'caller', removed_storage,
     )
 
     assert _complete_propagated_frame_tails({
@@ -157,6 +203,10 @@ def test_pruning_updates_exact_call_input_receipt_with_operands():
     call = Instr('Call', args.copy(), SSAValue(12, 'float64'),
                  attributes={'callee': 'callee', 'callee_input_ids': (1, 2)})
     caller = Function('caller', args.copy(), {'entry': BasicBlock('entry', [call])})
+    # Program: callee with an unread formal 1.  The pass derives the pruned
+    # formal from the formal's ssa_value cell, which this fixture never
+    # posted; post the declared formals as Novel roots (as the sibling test).
+    _post_value_roots('callee', dead, live)
     assert _prune_unused_callee_formals({'caller': caller, 'callee': callee}) == 1
     assert call.args == [args[1]]
     assert call.attributes['callee_input_ids'] == (2,)

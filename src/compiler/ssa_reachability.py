@@ -63,6 +63,53 @@ def _record_pruned_block_geometry(function, prior, changed_labels):
     return updated
 
 
+# Program shape: any function whose outputs are consumed by position (caller
+# result pairing, glsl descriptors, reachability protection).
+# Wrong record: ``function.metadata["semantic_output_ids"]``, a tuple derived
+# from a differently grouped recovery list, read as the authority; or the
+# physical-slot page standing for the semantic output (an aggregate output's
+# root 16 is not its Ret slots 17, 18).  Rule: the semantic output is the
+# ordered ``SEMANTIC_OUTPUT`` rows of the function's own book (the accepted
+# component's retained book for an accepted body); the Ret slots are the
+# ``FUNCTION_OUTPUT`` rows.  Metadata is a derived view, never a fallback.  A
+# function whose metadata names outputs but whose book holds no rows is
+# refused.
+def function_output_rows(function, *, book=None, page_declaration=None):
+    """The ordered facts of ``function``'s ``SEMANTIC_OUTPUT`` rows
+    (``(name, output id)``), or of ``page_declaration`` (``FUNCTION_OUTPUT``
+    for the physical Ret slots), in recorded row order."""
+    from .concordance_declarations import FUNCTION_OUTPUT, SEMANTIC_OUTPUT
+    if page_declaration is None:
+        page_declaration = SEMANTIC_OUTPUT
+    from .identity_concordance import ConcordanceRefusal, current_identity_book
+    from .ssa_record_return_state import accepted_ssa_component, function_scope_of
+
+    if book is None and accepted_ssa_component(function):
+        book = function.metadata["accepted_ssa_component"]["identity_book"]
+    book = current_identity_book() if book is None else book
+    page = book.page(page_declaration)
+    scope = function_scope_of(function)
+    facts = tuple(
+        fact for row in page.scope_rows(scope)
+        for fact in (page.latest(row),) if fact is not None
+    )
+    if not facts and (function.metadata or {}).get("semantic_output_ids"):
+        raise ConcordanceRefusal(
+            f"{page_declaration.name} page, scope {scope!r}: no rows, but the function "
+            "metadata names semantic outputs "
+            f"{tuple(function.metadata['semantic_output_ids'])!r}; the book "
+            "owning the function is not the book consulted"
+        )
+    return tuple((fact[0], int(fact[1])) for fact in facts)
+
+
+def semantic_output_ids_of(function, *, book=None) -> tuple[int, ...]:
+    """The ids of the ``SEMANTIC_OUTPUT`` rows in row order."""
+    return tuple(value_id for _name, value_id in function_output_rows(
+        function, book=book,
+    ))
+
+
 def prune_unused_phis(function, protected_value_ids=()) -> tuple[int, ...]:
     """Remove unused joins without dropping their producers or effects.
 
@@ -72,7 +119,7 @@ def prune_unused_phis(function, protected_value_ids=()) -> tuple[int, ...]:
     protect identities still referenced by descriptor tables.
     """
     protected = set(map(int, protected_value_ids))
-    protected.update(map(int, function.metadata.get("semantic_output_ids", ())))
+    protected.update(semantic_output_ids_of(function))
     removed = []
     while True:
         instructions = [item for block in function.blocks.values() for item in block.instrs]
