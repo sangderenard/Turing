@@ -26563,6 +26563,46 @@ def _class_surface_ssa_program(
             ),
             *map(int, graph_obj.graph.get("linked_dynamic_sequence_ids", ())),
         }
+        # Program: ``xs = [i * i for i in range(n) if i % 2 == 1]`` (scratch
+        # c205).  Wrong record: the comprehension's collection is a sequence
+        # the loop composer mints and grows by a loop-owned append, but the
+        # capacity survey only reads authored list displays, so it stayed
+        # FIXED with no bound (refused by C).  Rule: a private sequence
+        # grown inside a loop with no proven bound is DYNAMIC, whoever
+        # authored its birth.
+        def loop_grown(block, inside_loop=False):
+            if isinstance(block, (_ControlLoopBlock, _ControlWhileBlock)):
+                for item in block.sequence_mutations:
+                    yield item
+                if isinstance(block, _ControlWhileBlock):
+                    yield from loop_grown(block.condition, True)
+                yield from loop_grown(block.body, True)
+            elif isinstance(block, _ControlSequenceMutationBlock):
+                if inside_loop:
+                    yield block.mutation
+            elif isinstance(block, _ControlSequenceBlock):
+                for child in block.blocks:
+                    yield from loop_grown(child, inside_loop)
+            elif isinstance(block, _ControlConditionalBlock):
+                yield from loop_grown(block.body, inside_loop)
+                if block.orelse is not None:
+                    yield from loop_grown(block.orelse, inside_loop)
+            elif isinstance(block, _ControlCallBlock):
+                yield from loop_grown(block.callee, inside_loop)
+
+        for mutation in loop_grown(control.root):
+            sequence_id = int(mutation.sequence_value_id)
+            if (
+                str(mutation.operator) in {"append", "add", "extend", "insert"}
+                and sequence_id not in sequence_capacity_bounds
+                and sequence_id not in output_history_ids
+                and (
+                    sequence_id not in graph_obj
+                    or (graph_obj.nodes[sequence_id].get("attributes") or {})
+                    .get("binding_kind") != "parameter"
+                )
+            ):
+                dynamic_sequence_ids.add(sequence_id)
         # Program: f"a@{n}".  Wrong record: the JoinedStr destination is
         # cleared and extended from the formatter's token list, which is
         # DYNAMIC, while the destination stayed FIXED with no bound (C
@@ -26599,6 +26639,11 @@ def _class_surface_ssa_program(
                     dynamic_sequence_ids.add(destination_id)
                     grown = True
         dynamic_sequence_ids = tuple(sorted(dynamic_sequence_ids))
+        from types import SimpleNamespace as _GraphView
+        from .glsl_deployment_strategy import _planned_scalar_dtypes
+        planned_sequence_elements = _planned_scalar_dtypes(
+            _GraphView(G=graph_obj)
+        )
 
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
@@ -26763,6 +26808,26 @@ def _class_surface_ssa_program(
                         )
                         if int(declaration[2]) == 1
                         and int(declaration[0]) in dynamic_sequence_ids
+                    },
+                    # Program: ``s = set(); for i in range(n): s.add(i % 4)``
+                    # then ``2 in s`` (scratch c219).  Wrong record: the
+                    # membership helper was built while the DYNAMIC set's
+                    # row was still unknown, so it read the heap cell as
+                    # rows (``2 in s`` false).  Rule: a DYNAMIC single-column
+                    # sequence whose element type the source proves
+                    # (``_planned_scalar_dtypes``: the join of its writers)
+                    # is declared with it at birth; an authored contract
+                    # still wins.
+                    **{
+                        int(sequence_id): (planned,)
+                        for sequence_id, _policy, column_count, _writable
+                        in sequence_declarations
+                        if int(column_count) == 1
+                        and int(sequence_id) in dynamic_sequence_ids
+                        for planned in (
+                            planned_sequence_elements.get(int(sequence_id)),
+                        )
+                        if planned in {"int64", "float64", "bool"}
                     },
                     **_sequence_column_dtype_contracts(
                         graph_obj, sequence_declarations
