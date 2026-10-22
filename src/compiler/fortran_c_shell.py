@@ -11984,14 +11984,43 @@ def _attach_graph_control_expressions(
             return replace(
                 block, blocks=tuple(children)
             )
+        # Program: ``any(x > 0 and x * 2 > n for x in range(6))`` (scratch
+        # c89).  Wrong record: the comprehension's append argument re-spelled
+        # the element BoolOp as ``and(gt, gt)`` after its short-circuit
+        # conditional merged it, so an eager LAnd at the merge read the
+        # guarded operand only the arm defines (use-not-dominated).  Rule:
+        # the merge is the operator's one definition for loop mutations too.
+        def merged_mutation(mutation):
+            arguments = tuple(
+                read_merges(expression) for expression in mutation.argument_expressions
+            )
+            predicate = read_merges(mutation.predicate_expression)
+            if (
+                arguments == tuple(mutation.argument_expressions)
+                and predicate is mutation.predicate_expression
+            ):
+                return mutation
+            return replace(
+                mutation, argument_expressions=arguments,
+                predicate_expression=predicate,
+            )
+
         if isinstance(block, LoopBlock):
-            return replace(block, body=attach(block.body))
+            return replace(
+                block, body=attach(block.body),
+                sequence_mutations=tuple(
+                    merged_mutation(mutation) for mutation in block.sequence_mutations
+                ),
+            )
         if isinstance(block, WhileBlock):
             return replace(
                 block,
                 condition=attach(block.condition),
                 body=attach(block.body),
                 predicate_expression=read_merges(block.predicate_expression),
+                sequence_mutations=tuple(
+                    merged_mutation(mutation) for mutation in block.sequence_mutations
+                ),
             )
         if isinstance(block, CallBlock):
             return replace(block, callee=attach(block.callee))
