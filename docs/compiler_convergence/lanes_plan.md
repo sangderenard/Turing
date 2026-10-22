@@ -26,7 +26,6 @@ the full typed corpus check (0 non-PASS), a fuzz seed in the lane's tier
 |---|---|---|---|---|---|
 | A1 | Give tuple displays a birth. Place the predicate region that produces the members before the effects that consume them, then birth tuples as lists are born. | S1 | `resident_sequence_materialization._list_literal_mutations`; the region-ownership rule that assigns the members' region to the later conditional (find it with a trap first) | | open: silent on `main` with a clean audit |
 | A2 | Keep a return surface whole. `emit_outputs` must not fall back to `(output_id,)` when an aggregate layout is absent. The control finish publishes the layout. Accepted-unit accounting must not let one value stand for a tuple/optional. Add the false-acceptance check from doc 34 §1.4 to the bootstrap status tool. | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs` (nested, line ~28034); the control-finish member Phi publisher; accepted-unit result accounting | | open: false acceptance |
-| A3 | Make `dict.update()` a recorded mutation, so `_mutated_sequence_node_ids` sees it. | B4 | `glsl_deployment_strategy._mutated_sequence_node_ids` (read only); the mutation-record writer for dict methods | `claude/project-thread-kbkzp7` (after A0) | claimed 2026-10-22: inferred silent-capable |
 | A4 | Tire: the result-storage lease mints a record span member's `SSA_VALUE` row as a scalar. Revise it from the record storage contract. `_ssa_structure` reads the registered record storage before calling a shape-empty fact a scalar. | T1 | `structural_concordance._ssa_structure`; the result-storage lease writer in `fortran_c_shell` | | blocked on A0 (re-observe first) |
 | A5 | Measure the core-chain cascade. After A0, ask Albert for a full bootstrap. Fill doc 34 §1.2 and re-file units into groups. | B6, B7 | none (measurement) | | blocked on A0 |
 | A6 | Variadic returns: the sequence-lane lowering for `return ()`/`(x,)`/`[]`/`[x]` (units 034, 162, 212). | B2 | reducer VARIADIC consumer in `precompile_to_ssa`; `ir_sequence_tables` | | open |
@@ -80,3 +79,4 @@ committed inventory script and classify every hit.
 ## Done
 
 - A0 (chained comparison with a builtin conversion middle): branch `claude/project-thread-kbkzp7`, receipts in doc 35.
+- A3 (`dict.update()` from a display is a table mutation): branch `claude/project-thread-kbkzp7`, receipts in doc 35.

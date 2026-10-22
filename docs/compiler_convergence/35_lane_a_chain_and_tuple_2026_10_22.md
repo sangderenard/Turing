@@ -44,3 +44,41 @@ cloud container (4 cores, deps from `requirements.txt` plus `ziglang`,
   fails identically when run alone on the parent's worktree (a cached
   symbolic process graph is returned, `cache_hit=True`), so it is
   order-dependent, not this change (**observed**; its cause is unknown).
+
+## A1: handed over
+
+A1 (tuple display birth) is owned by the "Tuple len silent wrong answer"
+thread, whose fix also teaches the audit. Measured here and passed to it:
+on `main`, `len(t)` of a tuple display with storage reads 0; a tuple read
+only through constant projections has no storage; a display that repeats a
+producer (`[m, m, 9]`) or holds another structural tuple's projection
+(`[t[1], n]`) is refused on `main` for lists too ("lacks one exact element
+producer").
+
+## A3: `dict.update()` from a display
+
+- **Program.** `d = {1: 10, 2: 20}; d.update({1: 5}); return d[1] + n`
+  returned 13 for 8 on `main`, with a clean audit (**observed**). Corpus
+  c214.
+- **Records that disagree.** The emitted C stores both displays and looks
+  up `d`, but nothing stores the argument's rows into `d`. `update` on a
+  dict was not a mutation record of any kind: `_retain_source_sequence_
+  mutation_records` keeps only list/set/bytes receivers, and the dict
+  display births (`_dict_literal_mutations`) covered displays only.
+- **Rule.** `d.update(<dict display>)` is one `update`/`mapping_items`
+  mutation at the call, holding the display's key and value producers in
+  order: the same table store `d[k] = v` lowers to
+  (`_dict_update_mutations`). The capacity survey adds the rows' literal
+  keys to the receiver's universe and no longer unbounds either side for
+  that call. An update whose argument is not an unchanged display (it was
+  changed after its birth, by `_mutated_sequence_node_ids`; or it is
+  another mapping, keywords or `**`) is posted as a `mapping_source`
+  update, which the table lowering refuses by name ("mapping update
+  requires deterministic key/value pairs ...").
+- **Still loud (frontier).** `d.update({1: d[2]})`, an update whose row
+  reads its own receiver, gives a control effect-order cycle. A dict
+  passed to a callee after an update has no proven capacity (as on
+  `main`).
+- **Measured at `0718f9a`.** Typed corpus 162/162 PASS, 0 findings. Fuzz
+  `FUZZ_EXT=2` seed 12, 40/40 PASS. Gate: aa 89, ab 7, ac 26, rec 20, no
+  name outside the parent's failures.

@@ -1,3 +1,11 @@
+2026-10-22 LANE A ITEM A3 (MEASURED, cloud container):
+Silent wrong answer fixed: `d.update({k: v})` on a dict was dropped,
+so later lookups read the initializer. It is now a keyed store per
+display row. Updates from a changed mapping or with keywords are refused
+by name. At 0718f9a: corpus 162/162 PASS, 0 findings; fuzz FUZZ_EXT=2
+seed 12, 40/40 PASS; gate aa 89 / ab 7 / ac 26 / rec 20, nothing outside
+the parent's failures. See docs/compiler_convergence/35.
+
 2026-10-22 LANE A ITEM A0 (MEASURED, cloud container):
 A chained comparison whose middle is int/float/len/abs/ord of a pure
 operand now lowers, the middle spelled in place in both comparisons
