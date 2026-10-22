@@ -101,6 +101,8 @@ EXTENDED2 = [
     (["k{v} = n", "s{v} = 0", "while k{v} > 0:", "    s{v} += k{v} % 10", "    k{v} //= 10"], "s{v}"),
     (["xs{v} = [{a}, {b}]", "xs{v} += [n]"], "len(xs{v}) * 10 + xs{v}[-1]"),
     (["b{v} = n > {a} or n < -{b}"], "int(b{v}) + (3 if not b{v} else 0)"),
+    # a callee growing its own list and dict (A6, capacity of hoisted storage)
+    (["c{v} = localgrow(n + {a})"], "c{v}"),
     # a callee returning a list display (A6)
     (["xs{v} = pairlist(n + {a})"], "len(xs{v}) * 10 + xs{v}[1]"),
     (["xs{v} = pairlist(n)", "xs{v}.append({b})"], "len(xs{v}) * 10 + xs{v}[2] + xs{v}[0] * 100"),
@@ -158,6 +160,14 @@ EXT2_HELPERS = """def total(xs: list[int]) -> int:
 
 def pairlist(x: int) -> list[int]:
     return [x, x + 1]
+
+
+def localgrow(x: int) -> int:
+    xs = [7, 5]
+    xs.append(x)
+    d = {1: x, 2: 5}
+    d[3] = x * 2
+    return xs[0] + xs[2] * 10 + d[1] * 100 + d[3]
 
 
 """
