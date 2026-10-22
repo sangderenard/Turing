@@ -44,6 +44,8 @@ silent-capable items first.
 
 | rank | item | where the record is missing (doc 33) | claimed functions | branch | status |
 |---|---|---|---|---|---|
+| W1 | Post the payload class of a merge of an int arm and a `None` arm, so a statement-merged optional helper's call result (`maybe_inc` in the fuzzer) has a linked class and its region is not float64. Silent on `main` (WRONG); TYPE on `claude/project-thread-h4aybe`. Doc 34 §6. | no `source_value_class` row for the merge (writer in `topological_reducer`, find with a trap) | | | open: silent, found by fuzz seed 0 tier 1 |
+| W2 | `d = {1: 5, 2: 4}; d[3] = n; xs = [1, 2] + [n, 8]` then `xs[2]` reads 0. Each half alone passes; clean audit. Doc 34 §6. | unknown: trap the concat arena's writer | | | open: silent on `main` |
 | C1 | Reductions over a structural aggregate: `any((1 > n, 2 > n))`, `sum(x * n for x in xs)` with `xs` literal | the region takes the aggregate as an unproduced input, and no layer assembles it from its unrolled members (loud in the product at `main`, silent under `emit_ssa_to_c` alone) | region input assembly in `glsl_deployment_strategy`; structural recovery | | open |
 | C2 | A display rebound inside a loop: `xs = [i + n, i]` | `descriptor-member-shared`; unaccounted formal (loud in the product at `main`) | descriptor birth in `precompile_to_ssa` | | open |
 | C3 | Dict `del d[k]` / `d.pop(k)` | placed by graph-id order into a neighbouring region (a cycle); `pop` has no lowering. It should be one lexical mapping effect. | `_control_block_position` (read only); mapping effect lowering | | open |
