@@ -1,4 +1,4 @@
-# 35: Lane A, items A0 and A1 (2026-10-22)
+# 35: Lane A, item A0 (2026-10-22)
 
 Branch `claude/project-thread-kbkzp7`, from `main` `2532577`. Measured in a
 cloud container (4 cores, deps from `requirements.txt` plus `ziglang`,
