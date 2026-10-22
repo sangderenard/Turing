@@ -601,6 +601,72 @@ def _normalize_chained_comparisons(
     return tuple(receipts)
 
 
+def _normalize_constant_membership(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """Spell ``x in [1, 2, 3]`` as ``x == 1 or x == 2 or x == 3``.
+
+    Program: ``if n in [6, 3, 4]: r = 1`` (fuzzer p3_25).  Wrong record:
+    the membership against an inline literal reached the graph as a
+    coordinator Call over a folded constant; no region and no resident
+    query produced it, so its predicate had no value (refused at C
+    emission).  Rule: Python defines membership in a literal collection as
+    the disjunction of equalities with its members, in order (``not in``:
+    the conjunction of inequalities).  Only numeric literal members and a
+    pure left operand are spelled this way; any other membership keeps its
+    existing lowering.
+    """
+
+    receipts: list[dict[str, Any]] = []
+
+    def numeric(element: ast.AST) -> bool:
+        return isinstance(element, ast.Constant) and isinstance(
+            element.value, (bool, int, float)
+        )
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Compare(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if (
+                len(node.ops) != 1
+                or not isinstance(node.ops[0], (ast.In, ast.NotIn))
+                or not isinstance(
+                    node.comparators[0], (ast.List, ast.Tuple, ast.Set),
+                )
+                or not node.comparators[0].elts
+                or not all(numeric(e) for e in node.comparators[0].elts)
+                or not _pure_operand(node.left)
+            ):
+                return node
+            negate = isinstance(node.ops[0], ast.NotIn)
+            comparisons = []
+            for index, member in enumerate(node.comparators[0].elts):
+                comparison = ast.Compare(
+                    left=(
+                        node.left if index == 0 else copy.deepcopy(node.left)
+                    ),
+                    ops=[ast.NotEq() if negate else ast.Eq()],
+                    comparators=[member],
+                )
+                ast.copy_location(comparison, node)
+                comparisons.append(comparison)
+            receipts.append({
+                "line": int(getattr(node, "lineno", -1)),
+                "column": int(getattr(node, "col_offset", -1)),
+                "members": len(comparisons),
+            })
+            if len(comparisons) == 1:
+                return comparisons[0]
+            return ast.copy_location(ast.BoolOp(
+                op=ast.And() if negate else ast.Or(), values=comparisons,
+            ), node)
+
+    Rewriter().visit(tree)
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
 def _normalize_binary_short_circuit(
     tree: ast.Module,
 ) -> tuple[dict[str, Any], ...]:

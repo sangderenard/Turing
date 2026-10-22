@@ -85,6 +85,7 @@ from .ast_control_normalization import (
     _normalize_binary_short_circuit as _normalize_binary_short_circuit,
     _normalize_loop_else as _normalize_loop_else,
     _normalize_chained_comparisons as _normalize_chained_comparisons,
+    _normalize_constant_membership as _normalize_constant_membership,
     _normalize_direct_tail_recursion as _normalize_direct_tail_recursion,
     _normalize_none_default_assignments as _normalize_none_default_assignments,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
@@ -57216,6 +57217,9 @@ def _lower_ast_source_to_ssa_impl(
 
     compile_substage("source normalisation: authored control and record schemas")
     chained_comparison_receipts = list(_normalize_chained_comparisons(tree))
+    # Membership in an inline numeric literal becomes a disjunction before
+    # the short-circuit normalization nests it.
+    chained_comparison_receipts.extend(_normalize_constant_membership(tree))
     short_circuit_receipts = list(_normalize_binary_short_circuit(tree))
     loop_else_receipts = list(_normalize_loop_else(tree))
     if chained_comparison_receipts:
@@ -57623,6 +57627,9 @@ def _lower_ast_source_to_ssa_impl(
 
         chained_comparison_receipts.extend(
             _normalize_chained_comparisons(discovered_tree)
+        )
+        chained_comparison_receipts.extend(
+            _normalize_constant_membership(discovered_tree)
         )
         short_circuit_receipts.extend(
             _normalize_binary_short_circuit(discovered_tree)
