@@ -1365,9 +1365,32 @@ def _static_mapping_capacity_bounds(
             unknown.add(destination)
             continue
         keys[destination].add(literal_keys[0])
+    # ``d.update(<dict display>)`` stores the display's rows into ``d`` and
+    # only reads the display (corpus c214): the receiver's universe gains
+    # the rows' literal keys, as ``d[k] = v`` does, and neither is
+    # unbounded by the call scan below.
+    display_updates = set()
+    for mutation in _dict_update_mutations(graph_obj):
+        if mutation.argument_kind != "mapping_items":
+            continue
+        display_updates.add(int(mutation.effect_node_id))
+        destination = int(aliases.get(
+            int(mutation.sequence_value_id), int(mutation.sequence_value_id),
+        ))
+        if destination not in keys:
+            continue
+        for key_id in mutation.argument_value_ids[::2]:
+            try:
+                keys[destination].add(ast.literal_eval(
+                    graph_obj.nodes[int(key_id)].get("expr_obj")
+                ))
+            except (KeyError, ValueError, TypeError):
+                unknown.add(destination)
     for _node_id, data in graph_obj.nodes(data=True):
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
         operation = str(data.get("type") or data.get("op") or "").casefold()
+        if int(_node_id) in display_updates:
+            continue
         if operation == "indexedstore":
             destination = int(aliases.get(roles.get("base"), roles.get("base", -1)))
             if destination in keys:
@@ -2576,6 +2599,101 @@ def _joined_list_literal_mutations(
     return tuple(mutations)
 
 
+def _dict_update_mutations(graph_obj: Any) -> tuple[Any, ...]:
+    """``d.update(...)`` on a dict receiver, as table mutations.
+
+    Program: ``d = {1: 10, 2: 20}; d.update({1: 5}); return d[1] + n``
+    (corpus c214).  Wrong record: ``update`` on a dict was no mutation
+    record of any kind, so its rows were never stored and the later lookup
+    read the initializer's 10 (silent; clean audit).  Rule:
+    ``d.update(<dict display>)`` is one keyed store per display row, in
+    order, at the call (the table store ``d[k] = v`` lowers to).  Its rows
+    are the display's own key and value producers, evaluated before the
+    call as Python evaluates the argument.  Any other ``update`` (another
+    mapping, keywords, ``**``) is posted as a ``mapping_source`` update,
+    which the table lowering refuses by name.
+    """
+
+    from .control_source import ControlSequenceMutation
+
+    calls = [
+        (node_id, data)
+        for node_id, data in sorted(graph_obj.nodes(data=True), key=lambda item: int(item[0]))
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "update"
+    ]
+    if not calls:
+        return ()
+    # A display changed after its birth no longer holds its display rows
+    # (``e = {2: n}; e[2] = 9; d.update(e)``): its update is a mapping
+    # source, by the one definition of "changed".
+    from .glsl_deployment_strategy import _mutated_sequence_node_ids
+
+    changed = _mutated_sequence_node_ids(graph_obj)
+    mutations = []
+    for node_id, data in calls:
+        expression = data.get("expr_obj")
+        roles = [
+            (str(role), int(parent)) for parent, role in data.get("parents") or ()
+            if parent in graph_obj
+        ]
+        receiver = next((parent for role, parent in roles if role == "operand"), None)
+        if receiver is None or (
+            graph_obj.nodes[receiver].get("attributes") or {}
+        ).get("aggregate_kind") != "dict":
+            continue
+        sequence_id = int(graph_obj.nodes[receiver].get("value_id", receiver))
+        sources = [parent for role, parent in roles if role.startswith("arg:")]
+        source = graph_obj.nodes[sources[0]] if len(sources) == 1 else {}
+        display = source.get("expr_obj")
+        if not (
+            len(sources) == 1 and len(expression.args) == 1
+            and not expression.keywords
+            and isinstance(display, ast.Dict)
+            and None not in display.keys
+            and (source.get("attributes") or {}).get("aggregate_kind") == "dict"
+            and int(sources[0]) not in changed
+        ):
+            mutations.append(ControlSequenceMutation(
+                sequence_value_id=sequence_id, operator="update",
+                argument_value_ids=tuple(
+                    int(graph_obj.nodes[parent].get("value_id", parent))
+                    for parent in sources
+                ),
+                effect_node_id=int(node_id), policy="unique",
+                argument_kind="mapping_source",
+            ))
+            continue
+        if not display.keys:
+            continue
+        source_parents = tuple(source.get("parents") or ())
+        keys = tuple(
+            int(graph_obj.nodes[parent].get("value_id", parent))
+            for parent, role in source_parents
+            if str(role).startswith("keys") and parent in graph_obj
+        )
+        values = tuple(
+            int(graph_obj.nodes[parent].get("value_id", parent))
+            for parent, role in source_parents
+            if str(role).startswith("values") and parent in graph_obj
+        )
+        if not len(keys) == len(values) == len(display.keys):
+            raise ValueError(
+                f"Dictionary update {node_id} lacks one exact key and value "
+                "producer per display row"
+            )
+        mutations.append(ControlSequenceMutation(
+            sequence_value_id=sequence_id, operator="update",
+            argument_value_ids=tuple(
+                value_id for pair in zip(keys, values) for value_id in pair
+            ),
+            effect_node_id=int(node_id), policy="unique",
+            argument_kind="mapping_items",
+        ))
+    return tuple(mutations)
+
+
 def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
     """Materialize authored dynamic dict rows at the literal's source site.
 
@@ -2719,4 +2837,5 @@ def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
                 argument_kind="mapping_items",
                 argument_expressions=(key_expression_ir, None),
             ))
+    mutations.extend(_dict_update_mutations(graph_obj))
     return tuple(mutations)
