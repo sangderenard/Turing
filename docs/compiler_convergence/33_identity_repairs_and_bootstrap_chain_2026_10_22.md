@@ -623,6 +623,78 @@ Placement and identity faults found and fixed:
   value's posted ABI contract (`linked_value_abi`), `builtins.int`, and a
   `pop`'s receiver. All four int-as-float corpus results now return ints.
 
+## A list passed to a call is one storage at both ends
+
+The fuzzer's call-edge programs found three silent wrong answers with a
+clean audit, present since before this round (686fe50):
+- `setfirst(xs, 9)` on the caller's `[n, 4]` returned the caller's old
+  `xs[0]`; `add_one(xs)` lost its append; an empty list grown by two
+  appends and then stored into by a callee read length 1.
+
+The chain was observed with traps on the writers:
+1. Callsite specialization split the caller's display into per-element
+   member formals (`_apply_callsite_aggregate_descriptors`), the value view
+   used for tuples.
+2. The plan bound the caller's members to them. The callee's whole `xs`
+   formal, which its store or append still read, had no binding.
+3. Frame linking found no source for it and minted storage from absence
+   (`STORAGE_MINTED_FROM_ABSENCE`). The callee wrote that storage; the
+   caller never read it.
+
+Rule (`_aggregate_binds_by_member`): an aggregate is bound by member only
+when neither side changes it and the callee reads it only through
+constant-index projections. Otherwise it is one storage, bound whole. The
+callee side reads the one mutation definition (`_mutated_sequence_node_ids`)
+and, for a mutable collection, any other use (`for x in xs`, `len(xs)`,
+`xs[i]`). The caller side reads the same definition without call escapes:
+`xs.append(7); size(xs)` had bound the callee to the two display leaves
+of a three-row list. The plan builder reads the decision the
+specialization recorded (a child formal with no members and no leaves);
+it does not recompute it on the specialized copy, whose folded literals
+can disagree (`pick(xs, 2)`).
+
+Binding whole exposed three more faults behind it:
+- An escaped local list had no row bound, so its arena became entry-ABI
+  storage that the exported wrapper sized at one row (`len(xs)` read 1).
+  The settlement (`_settle_linked_dynamic_sequences`) now also publishes
+  `linked_bounded_sequence_ids`: a local list whose every escape is an
+  exact argument binding, into a component no function grows, or a
+  by-member binding, is bounded by its own rows.
+- A call that receives a mutable collection is an effect on it, as an
+  append is. Without that edge the reducer fused `n % 3 + 1` (the call's
+  argument) with the reads after the call into one region placed before
+  the call (`_sequence_effect_read_edges`).
+- `first(xs)` returning `xs[0]` is the caller's `n`, by the planner's
+  identity forwarding. Linking published the callee formal's provisional
+  `int` and its view label onto the caller's int64 formal. A call whose
+  result is a caller formal now reads it without redefining its row. A
+  recovered member formal is typed by the planner's scalar rule, which
+  reads a parameter's settled linked-ABI class when it has no annotation
+  of its own.
+
+The new fuzz tier then found three more on the same boundary:
+- `pick(xs, n % 3) * 10 + width(xs)`: both calls bind the caller list's
+  length cell through the exact argument binding and the descriptor's
+  member roles. The frame-slot owner check read record fields only, so
+  each call leased the cell for itself and the second binding was split
+  to a copy. A callee formal that is member ROLE of a sequence bound
+  exactly to caller sequence S, where the slot is member ROLE of S, is
+  owned by (S, ROLE) at every call.
+- `ys = [0]; grow(ys, 2); width(ys)`: `width`'s callsite copy took the
+  display literal `[0]` as its formal (static specialization) and folded
+  `len(xs)` to 1. The caller's tensor descriptor had the same fault. A
+  callsite specializes on an argument only when its initializer is its
+  contents at that call (`_callsite_argument_is_initializer`): the
+  caller's own effects do not change it and it escapes into no other
+  call.
+- A by-member binding reads only the members the callee projects, so a
+  split counts as a non-growing site when any leaf is bound and the
+  aggregate itself is not.
+
+Corpus c180 to c193 hold the family. A new fuzz tier (`FUZZ_EXT=3`) adds
+helpers that store into, append to, grow, swap, index and measure a
+caller's list.
+
 ## Open frontier (stated, not worked around)
 
 - **Variadic returns.** `return ()` / `return (x,)` and `return []` /
@@ -670,9 +742,18 @@ Placement and identity faults found and fixed:
 - `xs = [0, 0]; for ...: t += xs[0]; xs = [i + n, i]` (a display re-bound
   inside a loop) is wrong at 4c70971 and after, with two audit findings
   (`descriptor-member-shared`, `unaccounted-formal`).
-- Lists across call edges: growing (c55) and returning (c56, c60) now
-  pass. A constant list literal passed to a reader still fails with
-  "aggregate call binding arity 3 != 0" (c127).
+- Lists across call edges: growing (c55), returning (c56, c60), storing,
+  appending, iterating, indexing and measuring (c180 to c193) pass.
+  Still loud:
+  a dict display passed to a callee that adds a key has no capacity
+  contract (dict escapes are not settled); a `list[int]` parameter bound
+  whole and iterated into another list types its loaded rows with the
+  provisional `int` element spelling ("declared integer width
+  disagreement").
+- The exported C wrapper still sizes private root storage with no storage
+  requirement at one row (`ssa_c_backend`, `element_count ... else 1`).
+  No program reaches it now that escaped lists are bounded or refused, but
+  the default is not a proof.
 - `any(generator)` over a loop generator is now the resident query, as
   `sum` was (corpus c61). A reduction over a STRUCTURAL aggregate whose
   members were unrolled at reduction still miscompiles: `any((1 > n,

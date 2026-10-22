@@ -20029,6 +20029,7 @@ def _callee_accounting_in_caller(
 
 def _settle_linked_dynamic_sequences(
     graphs: tuple[Any, ...], edges: tuple[tuple[Any, int, Any, int], ...],
+    argument_sites: frozenset[tuple[int, int, int]] = frozenset(),
 ) -> None:
     """One storage, one capacity contract, across exact call bindings.
 
@@ -20114,10 +20115,39 @@ def _settle_linked_dynamic_sequences(
             ):
                 seeds.add((id(graph_obj), sequence_id))
     dynamic_roots = {find(seed) for seed in seeds if seed in linked}
+    from .resident_sequence_materialization import _call_escaped_argument_edges
+
     for graph_obj in graphs:
         graph_obj.graph["linked_dynamic_sequence_ids"] = tuple(sorted(
             value_id for graph_id, value_id in linked
             if graph_id == id(graph_obj) and find((graph_id, value_id)) in dynamic_roots
+        ))
+        # Program: ``xs = [n, 4]; setfirst(xs, 9); len(xs)`` (scratch c_g2).
+        # Wrong record: an escaped local list had no row bound, so its arena
+        # became entry-ABI storage the wrapper sized at one row; the second
+        # display element was refused by the append and ``len(xs)`` read 1.
+        # Rule: a local list whose every escape is an exact argument binding
+        # (``argument_sites``: graph, callsite, caller value) into a
+        # component no function grows -- or bound by member, as values -- is
+        # bounded by its own rows; the callees add none.  Published per graph as
+        # ``linked_bounded_sequence_ids``; the capacity survey reads it.
+        escapes: dict[int, set[int]] = {}
+        for call_id, argument_id in _call_escaped_argument_edges(graph_obj):
+            escapes.setdefault(int(argument_id), set()).add(int(call_id))
+        graph_obj.graph["linked_bounded_sequence_ids"] = tuple(sorted(
+            value_id
+            for node_id, data in graph_obj.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.List)
+            for value_id in (int(node_id),)
+            if value_id in escapes
+            and (
+                (id(graph_obj), value_id) not in linked
+                or find((id(graph_obj), value_id)) not in dynamic_roots
+            )
+            and all(
+                (id(graph_obj), call_id, value_id) in argument_sites
+                for call_id in escapes[value_id]
+            )
         ))
 
 
@@ -22257,6 +22287,7 @@ def _class_surface_ssa_program(
         LINKED_VALUE_ABI_SETTLEMENT as _LINKED_VALUE_ABI_SETTLEMENT,
     )
     linked_value_edges = []
+    linked_argument_sites: set[tuple[int, int, int]] = set()
     from .hierarchical_plan import PlanCall as _ABIPlanCall
     for planned_shell in planned_shells:
         caller_graph = planned_graphs_by_shell.get(id(planned_shell))
@@ -22292,6 +22323,33 @@ def _class_surface_ssa_program(
                 linked_value_edges.append((
                     caller_graph, int(caller_id), callee_graph, int(callee_id),
                 ))
+                linked_argument_sites.add((
+                    id(caller_graph), int(planned_call.callsite_id),
+                    int(caller_id),
+                ))
+            # An aggregate bound by its members (``_aggregate_binds_by_member``:
+            # neither side mutates it) reaches the callee as values; the call
+            # cannot grow it, so it is an exact, non-growing site as well.
+            from types import SimpleNamespace as _SiteGraph
+            from .call_argument_binding import _authored_aggregate_leaves
+
+            bound_callers = {
+                int(caller_id)
+                for caller_id, _callee_id in planned_call.argument_bindings
+            }
+            for actual_id in planned_call.argument_value_ids:
+                leaves = _authored_aggregate_leaves(
+                    _SiteGraph(G=caller_graph), int(actual_id),
+                )
+                if (
+                    leaves
+                    and int(actual_id) not in bound_callers
+                    and set(map(int, leaves)) & bound_callers
+                ):
+                    linked_argument_sites.add((
+                        id(caller_graph), int(planned_call.callsite_id),
+                        int(actual_id),
+                    ))
                 # One row per EDGE.  A formal legitimately has many callers;
                 # putting them on one row made a normal fan-in look like a
                 # value changing its mind.
@@ -22319,6 +22377,7 @@ def _class_surface_ssa_program(
             )
     _settle_linked_dynamic_sequences(
         tuple(planned_graphs_by_shell.values()), tuple(linked_value_edges),
+        frozenset(linked_argument_sites),
     )
     from .glsl_deployment_strategy import (
         _fold_callsite_structural_values,
@@ -26671,6 +26730,9 @@ def _class_surface_ssa_program(
                 graph_obj,
                 nonmutating_call_ids=nonmutating_record_calls,
                 control=control,
+                linked_bounded_ids=graph_obj.graph.get(
+                    "linked_bounded_sequence_ids", (),
+                ),
             )
         )
         output_history_ids = {
@@ -28339,6 +28401,18 @@ def _class_surface_ssa_program(
         values = function_values(function)
         insertions = []
         formals_before = {id(formal) for formal in function.args}
+        _planned_scalar_cache: list[dict[int, str]] = []
+
+        def planned_scalar_dtypes() -> dict[int, str]:
+            if not _planned_scalar_cache:
+                from types import SimpleNamespace as _GraphView
+                from .glsl_deployment_strategy import _planned_scalar_dtypes
+
+                _planned_scalar_cache.append(_planned_scalar_dtypes(
+                    _GraphView(G=getattr(graph, "G", graph))
+                ))
+            return _planned_scalar_cache[0]
+
         structural_shortfalls = []
         structural_root_ids: set[int] = set()
         # Selection chains need their own intermediate results; a graph node id
@@ -29735,9 +29809,18 @@ def _class_surface_ssa_program(
                     ))
                     return None
                 tensor = data.get("tensor") or {}
+                # A scalar parameter's type is the planner's scalar rule
+                # (``_planned_scalar_dtypes``), as for every planned formal;
+                # the descriptor's ``int`` is the provisional class spelling
+                # (scratch c_g4t: recovered ``xs[0]`` stayed ``int`` against
+                # the caller's int64 ``n``).
+                planned_dtype = (
+                    None if tuple(tensor.get("shape") or ())
+                    else planned_scalar_dtypes().get(int(value_id))
+                )
                 result = SSAValue(
                     value_id,
-                    dtype=tensor.get("dtype"),
+                    dtype=planned_dtype or tensor.get("dtype"),
                     shape=tuple(tensor.get("shape") or ()),
                     accounting={
                         "source_parameter_view_root": str(
@@ -45759,6 +45842,61 @@ def _class_surface_ssa_program(
                                 ("authored_argument", int(exact_caller_id)),
                             )
                             continue
+                        # Program: ``pick(xs, n % 3) * 10 + width(xs)``
+                        # (scratch c_h9).  Wrong record: both calls bind
+                        # the caller list's length cell, through the exact
+                        # argument binding of ``xs`` and the descriptor's
+                        # member roles (``_bind_sequence_storage_members``),
+                        # but the owner below reads record fields only, so
+                        # each call leased the cell for itself and the
+                        # second call's binding was split to a fresh copy
+                        # (then refused: "unresolved evidence cannot erase
+                        # resident type").  Rule: a callee formal that is
+                        # member ROLE of a callee sequence bound exactly to
+                        # caller sequence S, where the slot is member ROLE
+                        # of S on the caller's table, is owned by (S, ROLE)
+                        # at every call.
+                        callee_sequence_table = all_sequence_tables.get(
+                            str(record.callee_symbol)
+                        )
+                        caller_sequence_table = all_sequence_tables.get(
+                            str(caller_symbol)
+                        )
+                        sequence_owner = None
+                        if (
+                            callee_sequence_table is not None
+                            and caller_sequence_table is not None
+                        ):
+                            caller_claims = set(
+                                caller_sequence_table.member_claims(source_id)
+                            )
+                            for callee_sequence_id, role in (
+                                callee_sequence_table.member_claims(
+                                    int(callee_id)
+                                )
+                            ):
+                                caller_sequence_id = exact_argument_bindings.get(
+                                    int(callee_sequence_id)
+                                )
+                                if (
+                                    caller_sequence_id is not None
+                                    and (int(caller_sequence_id), role)
+                                    in caller_claims
+                                ):
+                                    sequence_owner = (
+                                        "authored_argument_member",
+                                        int(caller_sequence_id), role,
+                                    )
+                                    break
+                        if sequence_owner is not None:
+                            first_owner = owner_by_slot.setdefault(
+                                source_id, sequence_owner,
+                            )
+                            if first_owner == sequence_owner:
+                                distinct_bindings.append(
+                                    (callee_id, kind, source)
+                                )
+                                continue
                         # A slot's owner is its link: the caller record
                         # member the callee formal is (shared by every
                         # formal linked to it), else the lease minted for
@@ -47494,50 +47632,65 @@ def _class_surface_ssa_program(
                                     )
                                 )
                             values[int(caller_result_id)] = result
-                        # The caller-side placeholder may predate source-call
-                        # linking and therefore carry no useful type.  A
-                        # resolved call's physical result contract is the
-                        # callee output itself; copy it onto the retained SSA
-                        # value instead of letting backend defaults silently
-                        # turn predicates into floating-point values.
-                        from .structural_concordance import function_value_structure
-                        from .ssa_record_return_state import publish_ssa_value_type
+                        # Program: ``first(xs)`` returning ``xs[0]`` of the
+                        # caller's ``(n, 4)`` (scratch c_g4t).  Wrong record:
+                        # the planner forwards the returned member formal to
+                        # its actual, so the call result IS the caller's
+                        # formal ``n``; publishing the callee output's type
+                        # and accounting onto it rewrote the caller's
+                        # settled int64 parameter to the callee's unsettled
+                        # ``int`` and labelled it a view of ``xs[0]``.  Rule:
+                        # a caller formal is born in the caller; a call whose
+                        # result is that formal reads it and does not
+                        # redefine its row.
+                        result_is_caller_formal = any(
+                            value is result for value in caller.args
+                        )
+                        if not result_is_caller_formal:
+                            # The caller-side placeholder may predate source-call
+                            # linking and therefore carry no useful type.  A
+                            # resolved call's physical result contract is the
+                            # callee output itself; copy it onto the retained SSA
+                            # value instead of letting backend defaults silently
+                            # turn predicates into floating-point values.
+                            from .structural_concordance import function_value_structure
+                            from .ssa_record_return_state import publish_ssa_value_type
 
-                        structure, source_cell = function_value_structure(callee, int(callee_output.id))
-                        # Program: ``id_space.is_legacy`` composing the
-                        # accepted ``flags_of`` (bootstrap units 8/9).  Wrong
-                        # record: the result row posted dtype/shape only while
-                        # the callee output's accounting (scalar, rank 0) was
-                        # copied on, so the row had no storage/rank
-                        # (``ssa-physical-unposted``; unit 9 refused unit 8).
-                        # Rule: as for an aggregate member output -- the result
-                        # posts the physical fields recorded on the callee
-                        # output's own row, and its accounting labels follow
-                        # the posted fact.
-                        result_physical = _frame_physical_fields(
-                            callee, int(callee_output.id),
-                        )
-                        publish_ssa_value_type(
-                            caller, result, dtype=structure.dtype, shape=structure.shape,
-                            sources=_frame_cells(
-                                source_cell,
-                                _frame_value_cell(callee, int(callee_output.id)),
-                            ),
-                            stage=FRAME_LINK, physical=result_physical,
-                        )
-                        result.device = callee_output.device
-                        callee_accounting = _callee_accounting_in_caller(
-                            callee_output.accounting,
-                            result_storage_bindings_by_call.get(
-                                (str(caller_symbol), int(record.callsite_id)), {},
-                            ),
-                            caller_symbol=caller_symbol,
-                            callsite_id=int(record.callsite_id),
-                        )
-                        result.accounting = _frame_accounting_from_posted({
-                            **dict(result.accounting or {}),
-                            **callee_accounting,
-                        }, result_physical)
+                            structure, source_cell = function_value_structure(callee, int(callee_output.id))
+                            # Program: ``id_space.is_legacy`` composing the
+                            # accepted ``flags_of`` (bootstrap units 8/9).  Wrong
+                            # record: the result row posted dtype/shape only while
+                            # the callee output's accounting (scalar, rank 0) was
+                            # copied on, so the row had no storage/rank
+                            # (``ssa-physical-unposted``; unit 9 refused unit 8).
+                            # Rule: as for an aggregate member output -- the result
+                            # posts the physical fields recorded on the callee
+                            # output's own row, and its accounting labels follow
+                            # the posted fact.
+                            result_physical = _frame_physical_fields(
+                                callee, int(callee_output.id),
+                            )
+                            publish_ssa_value_type(
+                                caller, result, dtype=structure.dtype, shape=structure.shape,
+                                sources=_frame_cells(
+                                    source_cell,
+                                    _frame_value_cell(callee, int(callee_output.id)),
+                                ),
+                                stage=FRAME_LINK, physical=result_physical,
+                            )
+                            result.device = callee_output.device
+                            callee_accounting = _callee_accounting_in_caller(
+                                callee_output.accounting,
+                                result_storage_bindings_by_call.get(
+                                    (str(caller_symbol), int(record.callsite_id)), {},
+                                ),
+                                caller_symbol=caller_symbol,
+                                callsite_id=int(record.callsite_id),
+                            )
+                            result.accounting = _frame_accounting_from_posted({
+                                **dict(result.accounting or {}),
+                                **callee_accounting,
+                            }, result_physical)
                     elif returns_bound_aggregate:
                         _callee_result_id, caller_result_id = result_binding
                         result = values.get(

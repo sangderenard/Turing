@@ -1563,7 +1563,16 @@ def _call_escaped_argument_ids(graph_obj: Any) -> frozenset[int]:
     escaped collection's initializer is not its runtime contents).
     """
 
-    escaped: set[int] = set()
+    return frozenset(
+        argument for _call, argument in _call_escaped_argument_edges(graph_obj)
+    )
+
+
+def _call_escaped_argument_edges(graph_obj: Any) -> frozenset[tuple[int, int]]:
+    """``(call node, argument)`` for every escape ``_call_escaped_argument_ids``
+    names: the same definition, keeping which call each value escapes into."""
+
+    escaped: set[tuple[int, int]] = set()
     for _node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
         if not isinstance(expression, ast.Call):
@@ -1594,7 +1603,7 @@ def _call_escaped_argument_ids(graph_obj: Any) -> frozenset[int]:
                 continue
         for parent, role in data.get("parents") or ():
             if str(role).startswith("arg:"):
-                escaped.add(int(parent))
+                escaped.add((int(_node_id), int(parent)))
     return frozenset(escaped)
 
 
@@ -1664,6 +1673,7 @@ def _static_sequence_capacity_survey(
     *,
     nonmutating_call_ids: Iterable[int] = (),
     control: Any = None,
+    linked_bounded_ids: Iterable[int] = (),
 ) -> tuple[dict[int, int], frozenset[int]]:
     """Proven row bounds, and the local lists no bound covers.
 
@@ -1695,8 +1705,13 @@ def _static_sequence_capacity_survey(
             unknown.add(sequence_id)
         else:
             local_lists[sequence_id] += 1
+    # ``linked_bounded_ids``: escaped lists every escape of which is an exact
+    # argument binding into a component no function grows
+    # (``_settle_linked_dynamic_sequences``).  The callees share this storage
+    # and add no rows, so its own rows bound it.
+    linked_bounded = set(map(int, linked_bounded_ids))
     for parent in _call_escaped_argument_ids(graph_obj):
-        if parent in local_lists:
+        if parent in local_lists and parent not in linked_bounded:
             unknown.add(parent)
             escaped.add(parent)
     bounds.update({key: count for key, count in local_lists.items() if key not in unknown})

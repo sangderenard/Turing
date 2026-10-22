@@ -1010,6 +1010,129 @@ def _place_validation_blocks(
     )
 
 
+def _callsite_argument_is_initializer(
+    caller: Any, call_id: int, argument_id: int,
+) -> bool:
+    """Whether a caller argument's authored initializer is its contents at
+    this call, so a callsite may specialize on its descriptor or literal.
+
+    Program: ``ys = [0]; grow(ys, 2); width(ys)`` (scratch c_i2).  Wrong
+    record: ``width``'s copy took ``ys``'s display literal ``[0]`` as its
+    formal, folded ``len(xs)`` to 1 and pruned the formal; ``grow`` had
+    appended two rows first.  Rule: a collection whose initializer is not
+    its contents (``_mutated_sequence_node_ids``: the caller's own effects,
+    or an escape into another call) is not specialized at this call.  Its
+    escape into this call is the callee's own: the callee's graph states
+    its own effects on its formal.
+    """
+
+    argument_id = int(argument_id)
+    if argument_id not in _mutated_sequence_node_ids(caller.G):
+        return True
+    from .resident_sequence_materialization import _call_escaped_argument_edges
+
+    return not (
+        argument_id in _mutated_sequence_node_ids(
+            caller.G, include_call_escapes=False,
+        )
+        or any(
+            int(argument) == argument_id and int(call) != int(call_id)
+            for call, argument in _call_escaped_argument_edges(caller.G)
+        )
+    )
+
+
+def _callsite_argument_descriptor(
+    caller: Any, call_id: int, argument_id: int,
+) -> Any:
+    """The caller argument's tensor descriptor a callsite may specialize on
+    (``_callsite_argument_is_initializer``)."""
+
+    if not _callsite_argument_is_initializer(caller, call_id, argument_id):
+        return None
+    return _tensor_descriptor(caller, int(argument_id))
+
+
+def _formal_storage_is_mutated(callee_graph: Any, parameter: str) -> bool:
+    """Whether the callee needs the caller's storage behind ``parameter``.
+
+    Program: ``def setfirst(xs): xs[0] = v`` called as ``setfirst([n, 4],
+    9)`` (scratch c_g2).  Wrong record: the caller's list display was split
+    into per-element member formals, the value view of an aggregate, so the
+    callee's store had no caller storage behind it; the linker minted fresh
+    frame storage from absence and the caller read its unchanged list (105,
+    not 209).  The same holds for any whole use of a mutable collection:
+    ``for x in xs`` over the split formal (scratch c_f3) iterated that
+    absence-minted, empty storage.  Rule: an aggregate the callee mutates
+    (the one mutation definition, ``_mutated_sequence_node_ids``) -- or a
+    mutable collection it reads other than by constant-index projection --
+    is one storage identity shared with the caller, bound whole, never by
+    member.
+    """
+
+    inputs = {
+        int(node_id)
+        for node_id, data in callee_graph.nodes(data=True)
+        if data.get("type") == "Input"
+        and str((data.get("attributes") or {}).get("binding_name"))
+        == str(parameter)
+    }
+    if inputs & set(_mutated_sequence_node_ids(callee_graph)):
+        return True
+
+    def constant_projection(node_id: int, input_id: int) -> bool:
+        data = callee_graph.nodes.get(int(node_id), {})
+        if str(data.get("op") or data.get("type") or "").casefold() not in {
+            "indexed", "getitem", "subscript",
+        }:
+            return False
+        roles = {
+            str(role): int(parent)
+            for parent, role in data.get("parents") or ()
+        }
+        if roles.get("base", roles.get("value")) != int(input_id):
+            return False
+        index = callee_graph.nodes.get(roles.get("index", -1), {})
+        literal = index.get("constant")
+        if literal is None:
+            literal = (index.get("attributes") or {}).get("value")
+        return isinstance(literal, int) and not isinstance(literal, bool)
+
+    return any(
+        str((callee_graph.nodes[input_id].get("attributes") or {}).get(
+            "aggregate_kind"
+        )) in {"list", "dict", "set", "bytearray"}
+        and any(
+            not constant_projection(int(successor), input_id)
+            for successor in callee_graph.successors(input_id)
+        )
+        for input_id in inputs
+    )
+
+
+def _aggregate_binds_by_member(
+    caller_graph: Any, actual_id: int, callee_graph: Any, parameter: str,
+) -> bool:
+    """Whether one call may bind an authored aggregate by its members.
+
+    The member split is the aggregate's value view: the callee receives the
+    display's leaves.  It is exact only when those leaves ARE the contents
+    at the call and after it.  Program: ``xs = [n, 4]; xs.append(7);
+    size(xs)`` (scratch c_g8).  Wrong record: the split bound the callee to
+    the two display leaves while the list held three rows.  Rule: neither
+    the caller (``_mutated_sequence_node_ids`` without call escapes) nor the
+    callee (``_formal_storage_is_mutated``) changes it; otherwise the
+    aggregate is bound whole, as its storage.
+    """
+
+    return not (
+        int(actual_id) in _mutated_sequence_node_ids(
+            caller_graph, include_call_escapes=False,
+        )
+        or _formal_storage_is_mutated(callee_graph, parameter)
+    )
+
+
 def _authored_aggregate_descriptor_tree(graph: Any, value_id: int) -> Any:
     """Return the exact nested descriptor tree of an authored aggregate.
 
@@ -1892,9 +2015,21 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                 kind = attributes.get("binding_kind")
                 if kind == "parameter":
                     # ``builtins.int`` and ``int`` are one class reference.
+                    # Program: ``first(xs)`` over the caller's ``(n, 4)``
+                    # (scratch c_g4t).  Wrong record: a member formal has no
+                    # annotation of its own, so its class was unread and it
+                    # kept the provisional ``int`` spelling against the
+                    # caller's int64 ``n``.  Rule: absent a declared class,
+                    # the parameter's settled linked ABI class (the caller
+                    # actual's, carried over the exact binding) is its class.
+                    linked_class = (dict(
+                        G.graph.get("linked_value_abi") or {}
+                    ).get(node_id) or {}).get("python_type")
                     settle(scalar, node_id, classes.get(
-                        str(attributes.get("result_class_ref") or "")
-                        .removeprefix("builtins.")
+                        str(
+                            attributes.get("result_class_ref")
+                            or linked_class or ""
+                        ).removeprefix("builtins.")
                     ))
                 continue
             if op == "for":
@@ -2595,6 +2730,15 @@ def _build_shell_hierarchy_plan(
                     child_leaves = _authored_aggregate_leaves(
                         child.process_graph, child_input,
                     )
+                    if caller_leaves and not child_leaves:
+                        # The callsite specialization bound this aggregate
+                        # whole (``_aggregate_binds_by_member``): the child
+                        # formal has neither member formals nor a leaf
+                        # ledger.  That recorded decision is read here, not
+                        # recomputed on the specialized copy, whose folded
+                        # literals can disagree with the graph it was made
+                        # from (scratch c_h6, ``pick(xs, 2)``).
+                        continue
                     if caller_leaves or child_leaves:
                         if len(caller_leaves) != len(child_leaves):
                             raise ValueError(
@@ -10517,7 +10661,31 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
                 int(node_id),
             ))
     edges: set[tuple[int, int]] = set()
-    for effect_id, record in records.items():
+    # Program: ``xs = [n, 4]; grow(xs, n % 3 + 1)`` then ``return len(xs) *
+    # 100 + xs[-1] + xs[0]`` (scratch c_h2).  Wrong record: a call that
+    # receives a mutable collection changes it in place exactly as an
+    # append does, but only method effects were records here, so the
+    # reducer fused ``n % 3 + 1`` with the post-call reads into one region
+    # placed before the call and the callee's rows were never read.  Rule:
+    # every escape of a collection the one mutation definition names
+    # (``_mutated_sequence_node_ids``) is an effect of that call on it.
+    from .resident_sequence_materialization import _call_escaped_argument_edges
+
+    mutated = _mutated_sequence_node_ids(graph.G)
+    effects = [
+        (int(effect_id), record)
+        for effect_id, record in records.items()
+    ] + [
+        (int(call_id), {
+            "expression": graph.G.nodes[int(call_id)].get("expr_obj"),
+            "sequence_value_id": int(
+                graph.G.nodes[int(argument_id)].get("value_id", argument_id)
+            ),
+        })
+        for call_id, argument_id in sorted(_call_escaped_argument_edges(graph.G))
+        if int(argument_id) in mutated and int(argument_id) in graph.G
+    ]
+    for effect_id, record in effects:
         expression = record.get("expression")
         end_line = getattr(expression, "end_lineno", None)
         if int(effect_id) not in graph.G or end_line is None:
@@ -17010,7 +17178,11 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                 parameter = str(parameter)
                 bound_parameters.add(parameter)
                 role_cells: tuple = ()
-                if _source_static_value(caller, int(parent)):
+                if _source_static_value(
+                    caller, int(parent),
+                ) and _callsite_argument_is_initializer(
+                    caller, int(_node_id), int(parent),
+                ):
                     try:
                         value = _source_static_literal(caller, int(parent))
                     except ValueError:
@@ -18520,13 +18692,21 @@ def _propagate_callsite_tensor_specializations(
                 continue
             parameter = str(parameter)
             bound_parameters.add(parameter)
-            descriptor = _tensor_descriptor(caller, int(parent))
+            descriptor = _callsite_argument_descriptor(
+                caller, int(node_id), int(parent),
+            )
             if descriptor is not None:
                 descriptors[parameter] = descriptor
-            static_argument = _source_static_value(caller, int(parent))
+            static_argument = _source_static_value(
+                caller, int(parent),
+            ) and _callsite_argument_is_initializer(
+                caller, int(node_id), int(parent),
+            )
             leaves = _authored_aggregate_leaves(caller, int(parent))
             if leaves and not static_argument and all(
                 int(leaf) in caller.G for leaf in leaves
+            ) and _aggregate_binds_by_member(
+                caller.G, int(parent), callee.G, parameter,
             ):
                 # Same member-identity rule as callsite specialization: the
                 # callee's return descriptors may depend on aggregate members
@@ -19402,7 +19582,9 @@ def _propagate_callsite_tensor_specializations(
                     parameter = _callsite_parameter_name(
                         role, receiver, positional,
                     )
-                    descriptor = _tensor_descriptor(caller, int(parent))
+                    descriptor = _callsite_argument_descriptor(
+                        caller, int(_node_id), int(parent),
+                    )
                     if parameter is not None and descriptor is not None:
                         # This fixed point is the first stage that knows the
                         # exact caller value and the callee formal together.
@@ -22622,13 +22804,18 @@ def _remove_dead_metadata_nodes(
                 heapq.heappush(pending, node_order[parent])
 
 
-def _mutated_sequence_node_ids(graph_obj: Any) -> frozenset[int]:
+def _mutated_sequence_node_ids(
+    graph_obj: Any, *, include_call_escapes: bool = True,
+) -> frozenset[int]:
     """Collections whose contents change after their initializer.
 
     One definition for every reader that would otherwise treat an
     initializer as the collection's contents: the structural fold (a
     projection folded to an initializer leaf) and region planning (a
-    capture folded to a ``Const`` literal).
+    capture folded to a ``Const`` literal).  ``include_call_escapes=False``
+    leaves out escapes into calls: the mutations this graph itself makes,
+    for a reader that decides about one call's binding by itself
+    (``_aggregate_binds_by_member``).
     """
 
     mutated_sequence_ids = {
@@ -22670,7 +22857,7 @@ def _mutated_sequence_node_ids(graph_obj: Any) -> frozenset[int]:
 
     mutated_sequence_ids.update(
         node_id for node_id in _call_escaped_argument_ids(graph_obj)
-        if mutable_collection(node_id)
+        if include_call_escapes and mutable_collection(node_id)
     )
     from .resident_sequence_materialization import (
         _method_mutated_receiver_ids,
@@ -26451,12 +26638,20 @@ def _callsite_specialized_shell_type(
             # Replanning the clean callee lets isinstance(record, Schema)
             # fold from that contract before regions/branches are carved.
             record_descriptors[parameter] = copy.deepcopy(dict(record_abi))
-        descriptor = _tensor_descriptor(caller, int(parent))
+        descriptor = _callsite_argument_descriptor(
+            caller, int(node_id), int(parent),
+        )
         if descriptor is not None:
             tensor_descriptors[parameter] = descriptor
-        static_argument = _source_static_value(caller, int(parent))
+        static_argument = _source_static_value(
+            caller, int(parent),
+        ) and _callsite_argument_is_initializer(
+            caller, int(node_id), int(parent),
+        )
         leaves = _authored_aggregate_leaves(caller, int(parent))
-        if leaves and not static_argument:
+        if leaves and not static_argument and _aggregate_binds_by_member(
+            caller.G, int(parent), original.G, parameter,
+        ):
             # Every authored member is a scoped callee identity whether or
             # not its tensor contract is already known.  A member without a
             # descriptor is materialized undescribed and fails loudly where a
