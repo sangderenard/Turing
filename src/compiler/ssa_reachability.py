@@ -124,6 +124,22 @@ def prune_unused_phis(function, protected_value_ids=()) -> tuple[int, ...]:
     while True:
         instructions = [item for block in function.blocks.values() for item in block.instrs]
         used = {int(value.id) for item in instructions for value in item.args}
+        # Program: concordance_controller ``pi_update`` -- a conditional
+        # merge of a union value (24) whose merged type tag Phi nothing read.
+        # Wrong record: the tag Phi was pruned while value 24 still named it
+        # (``accounting-foreign-value-id``).  Rule: a value named by a
+        # retained value's scope-local accounting is used.
+        from .identity_concordance import scope_local_accounting_ids
+        used.update(
+            named
+            for value in (
+                *function.args,
+                *(occurrence for item in instructions for occurrence in (
+                    *item.args, *((item.res,) if item.res is not None else ()),
+                )),
+            )
+            for named in scope_local_accounting_ids(value)
+        )
         counts = Counter(int(item.res.id) for item in instructions if item.res is not None)
         dead = {
             int(item.res.id) for item in instructions

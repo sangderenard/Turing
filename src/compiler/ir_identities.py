@@ -260,6 +260,8 @@ def _post_dead_structural_retirement(function, instruction) -> None:
 def drop_dead_pure_structural_instructions(functions) -> int:
     """Remove unconsumed frontend structural values with no side effects."""
 
+    from .identity_concordance import scope_local_accounting_ids
+
     removed = 0
     for function in functions.values():
         protected: set[int] = set()
@@ -288,14 +290,9 @@ def drop_dead_pure_structural_instructions(functions) -> int:
                 )
             ),
         ):
-            accounting = dict(value.accounting or {})
-            for key in (
-                "tensor_shape_value_id",
-                "tensor_rank_value_id",
-                "tensor_element_count_value_id",
-            ):
-                if accounting.get(key) is not None:
-                    protected.add(int(accounting[key]))
+            # Every scope-local id the value's accounting names (tensor
+            # shape/rank/count, type tag, heap owner, optional payload).
+            protected.update(scope_local_accounting_ids(value))
         changed = True
         while changed:
             changed = False

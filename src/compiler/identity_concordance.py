@@ -1223,6 +1223,22 @@ def _source_class_subject_bases(book: Any, ref: Any, value_id: int) -> set:
     }
 
 
+def scope_local_accounting_ids(value: Any) -> tuple[int, ...]:
+    """The SSA value ids of the same function that ``value``'s accounting
+    names (``CorrelationTable._SCOPE_LOCAL_ACCOUNTING_IDS``): its type tag,
+    heap owner, optional payload, iterable target and tensor metadata.  They
+    are part of ``value``'s identity, so a retained value keeps them -- every
+    dead-value and dead-formal pass reads this one definition."""
+
+    accounting = getattr(value, "accounting", None) or {}
+    return tuple(
+        int(accounting[key])
+        for key in CorrelationTable._SCOPE_LOCAL_ACCOUNTING_IDS
+        if accounting.get(key) is not None
+        and not isinstance(accounting.get(key), bool)
+    )
+
+
 class CorrelationTable:
     """Every identity claim the module makes, keyed by (function, value id)."""
 
@@ -2086,6 +2102,9 @@ class CorrelationTable:
         "ssa_optional_payload_id",
         "iterable_target_value_id",
         "native_type_tag_value_id",
+        "tensor_shape_value_id",
+        "tensor_rank_value_id",
+        "tensor_element_count_value_id",
     )
 
     @staticmethod

@@ -53867,12 +53867,9 @@ def _class_surface_ssa_program(
             protected.update(int(record.record_id) for record in record_table.records.values())
         sequence_table = all_sequence_tables.get(symbol)
         if sequence_table is not None:
+            from .ir_sequence_tables import _sequence_descriptor_identity_ids
             for sequence in sequence_table.sequences.values():
-                protected.update(int(value_id) for value_id in (
-                    *sequence.column_value_ids, sequence.length_address_id,
-                    sequence.capacity_value_id, sequence.status_address_id,
-                    sequence.live_flags_value_id,
-                ) if value_id is not None)
+                protected.update(map(int, _sequence_descriptor_identity_ids(sequence)))
         function.metadata["unused_phi_removals"] = prune_unused_phis(function, protected)
     _prune_unused_callee_formals(
         all_functions, call_records, all_sequence_tables,
