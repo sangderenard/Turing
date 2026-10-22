@@ -16537,8 +16537,77 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
                 continue
             required = predicate_fact(parents["test"], present_arm == 0)
             consumers = tuple(graph.G.successors(node_id))
+            # Program: ``fork = t if c else None``; ``if fork is None or x:
+            # return ...``; ``a, b = fork`` (IdentityPage._resolved, unit 33).
+            # Wrong record: ``fork is None`` was itself counted as a consumer
+            # needing a guard, and the fact a guarding ``or`` establishes on
+            # its fallthrough edge was kept whole, so the unpack read no
+            # presence guard although Python proves one.  Rule: a ``None``
+            # comparison of the optional IS its presence test -- it reads the
+            # optional's predicate (``fork is None`` is ``not c`` when the
+            # body is the present arm) -- and a consumer is guarded by the
+            # predicate fact or by that presence test being false.  Facts
+            # close over ``or`` read false, ``and`` read true and ``not``.
+            presence_tests = {}
+            for consumer in consumers:
+                consumer_data = graph.G.nodes[int(consumer)]
+                expression = consumer_data.get("expr_obj")
+                if not (
+                    isinstance(expression, ast.Compare)
+                    and len(expression.ops) == 1
+                    and isinstance(
+                        expression.ops[0], (ast.Is, ast.IsNot, ast.Eq, ast.NotEq),
+                    )
+                ):
+                    continue
+                operands = tuple(
+                    int(parent) for parent, role in consumer_data.get("parents") or ()
+                    if str(role) in {"lhs", "rhs"}
+                )
+                others = tuple(item for item in operands if item != int(node_id))
+                if (
+                    len(operands) != 2 or len(others) != 1
+                    or others[0] not in graph.G
+                    or graph.G.nodes[others[0]].get("type")
+                    not in {"Constant", "Const", "const"}
+                    or _constant_value(graph.G.nodes[others[0]]) is not None
+                ):
+                    continue
+                presence_tests[int(consumer)] = isinstance(
+                    expression.ops[0], (ast.Is, ast.Eq),
+                )
+
+            def closed(facts):
+                pending = list(facts)
+                result = set()
+                while pending:
+                    value_id, truth = pending.pop()
+                    if (value_id, truth) in result:
+                        continue
+                    result.add((value_id, truth))
+                    data_item = graph.G.nodes.get(int(value_id), {})
+                    expression = data_item.get("expr_obj")
+                    if isinstance(expression, ast.BoolOp) and (
+                        isinstance(expression.op, ast.Or) and not truth
+                        or isinstance(expression.op, ast.And) and truth
+                    ):
+                        pending.extend(
+                            predicate_fact(int(parent), truth)
+                            for parent, role in data_item.get("parents") or ()
+                            if str(role).startswith("value:")
+                        )
+                    if int(value_id) in presence_tests:
+                        # ``fork is None`` read ``truth``: the optional is
+                        # present exactly when that test reads false.
+                        present = (not truth) if presence_tests[int(value_id)] else truth
+                        if present:
+                            result.add(required)
+                return frozenset(result)
+
             guarded = []
             for consumer in consumers:
+                if int(consumer) in presence_tests:
+                    continue
                 facts = {
                     predicate_fact(controls[control]["predicate_id"], arm == "body")
                     for control, arm in memberships.get(int(consumer), ())
@@ -16547,13 +16616,37 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
                 }
                 if fallthrough_facts is not None:
                     facts = fallthrough_facts.get(int(consumer), frozenset())
-                if required not in facts:
+                if required not in closed(facts):
                     raise ValueError(
                         f"optional tuple {node_id} consumer {consumer} has no "
                         "proven presence guard in function "
                         f"{graph.G.graph.get('function_name')!r}"
                     )
                 guarded.append(int(consumer))
+            for test_id, tests_absent in presence_tests.items():
+                # The presence test reads the optional's predicate:
+                # absent  <=>  predicate != (present arm is the body).
+                predicate = int(parents["test"])
+                negate = tests_absent == (present_arm == 0)
+                test_data = graph.G.nodes[int(test_id)]
+                test_attributes = dict(test_data.get("attributes") or {})
+                test_attributes["optional_presence_test_of"] = int(node_id)
+                test_data["attributes"] = test_attributes
+                if negate:
+                    test_data["type"] = test_data["op"] = "logical_not"
+                    _set_operands(
+                        graph, int(test_id), [(predicate, "operand")],
+                        cause=_AGGREGATE_MEMBER,
+                    )
+                else:
+                    test_data["type"] = test_data["op"] = "Cast"
+                    test_attributes["target_dtype"] = "bool"
+                    _set_operands(
+                        graph, int(test_id), [(predicate, "operand")],
+                        cause=_AGGREGATE_MEMBER,
+                    )
+            if presence_tests:
+                changed = True
             if not consumers or any(node_id in values for values in
                                     (graph.G.graph.get("return_slot_values") or {}).values()):
                 raise ValueError(f"optional tuple {node_id} escapes without a presence ABI")
