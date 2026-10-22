@@ -10427,12 +10427,14 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
 
     _retain_source_sequence_mutation_records(graph.G)
     records = graph.G.graph.get("source_sequence_mutation_records") or {}
-    loops = [
-        (int(expression.lineno), int(getattr(expression, "end_lineno", expression.lineno)))
+    loop_nodes = [
+        (int(expression.lineno), int(getattr(expression, "end_lineno", expression.lineno)),
+         int(_node_id), expression)
         for _node_id, data in graph.G.nodes(data=True)
         for expression in (data.get("expr_obj"),)
         if isinstance(expression, (ast.For, ast.AsyncFor, ast.While))
     ]
+    loops = [(start, end) for start, end, _node, _expression in loop_nodes]
     readers_by_sequence: dict[int, list[tuple[tuple[int, int], int]]] = {}
     for node_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
@@ -10451,11 +10453,35 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     for effect_id, record in records.items():
         expression = record.get("expression")
         end_line = getattr(expression, "end_lineno", None)
-        if (
-            int(effect_id) not in graph.G
-            or end_line is None
-            or any(start <= int(expression.lineno) <= end for start, end in loops)
-        ):
+        if int(effect_id) not in graph.G or end_line is None:
+            continue
+        enclosing = [
+            (start, end, node, loop)
+            for start, end, node, loop in loop_nodes
+            if start <= int(expression.lineno) <= end
+        ]
+        if enclosing:
+            # Program: ``while k > 0: xs.append(k); k -= 2`` then ``return
+            # len(xs) * 10 + xs[0]`` (fuzzer p3_13).  Wrong record: an
+            # effect inside a loop was left to the loop composer, which
+            # orders the body only; nothing ordered the loop before the
+            # reads after it, so the reducer fused ``k = n % 5 + 2`` (which
+            # the loop reads) with the post-loop arithmetic into one region
+            # that both fed and followed the loop.  Rule: an effect inside a
+            # loop is observed after its outermost enclosing loop; that loop
+            # precedes every later read of the receiver.
+            _start, _end, loop_node, loop = min(
+                enclosing, key=lambda item: (item[0], -item[1]),
+            )
+            end = (
+                int(getattr(loop, "end_lineno", loop.lineno)),
+                int(getattr(loop, "end_col_offset", 0) or 0),
+            )
+            for start, reader in readers_by_sequence.get(
+                int(record["sequence_value_id"]), (),
+            ):
+                if start >= end and reader != int(loop_node):
+                    edges.add((int(loop_node), reader))
             continue
         end = (int(end_line), int(getattr(expression, "end_col_offset", 0) or 0))
         for start, reader in readers_by_sequence.get(

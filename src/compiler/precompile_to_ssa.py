@@ -20543,6 +20543,26 @@ class _ControlSSABuilder(TiledObject):
 
         for descriptor in self.sequence_descriptors.values():
             register_sequence(sequence_table, descriptor)
+        # Program: ``xs = [6, 6, 6, n]; return xs.count(6) * 10 +
+        # xs.index(6)`` (fuzzer p3_7).  Wrong record: no lowering produced
+        # the two method-call results, so each became a function formal and
+        # the native call read 0.0 for them (the audit's unaccounted-formal,
+        # nothing refused).  Rule: a source method call's result is never a
+        # function input; one still reaching the formals is a refused
+        # lowering, named by its receipt.
+        for argument in self.arguments:
+            receipt = self.source_execution_receipts.get(int(argument.id))
+            if (
+                receipt is not None
+                and receipt.get("construct") == "Call"
+                and receipt.get("planner_rule") == "method_call"
+            ):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "unlowered-method-call", self.function_name,
+                    f"{receipt.get('source')!r} (value {int(argument.id)}) "
+                    "has no lowering; its result would be an unproduced "
+                    "function input",
+                ))
         function = Function(
                 self.function_name,
                 self.arguments,
@@ -23538,6 +23558,20 @@ def _schedule_loop_callsites(
                                 and last_write[arena] == last_access[arena]
                                 else "sequence_war"
                             )
+                            # Program: ``xs = [5, 7] + [n, 7]`` (fuzzer
+                            # p3_54).  Wrong record: the concat region (placed
+                            # at the ``+``, which starts at its left operand)
+                            # read ``[n, 7]`` before that display's member
+                            # append, so WAR ordered the reader before the
+                            # birth while the birth rule above ordered it
+                            # after: a cycle.  Rule: a birth is not a write
+                            # after a read -- nothing existed to read -- so
+                            # an earlier reader takes the birth edge only.
+                            if (
+                                access_kind == "sequence_war"
+                                and position in births.get(int(arena), ())
+                            ):
+                                continue
                             require(position, last_access[arena], (
                                 access_kind, int(arena)
                             ))
@@ -25280,7 +25314,12 @@ def lower_control_sections_to_ssa(
             # the opposite syntactic direction (loop-result versus final
             # IndexedStore).  It is already one concordance row; recording the
             # reverse edge would manufacture a cycle from an agreement.
-            region_value_aliases[alias_id] = resident_root
+            # A value is not an alias of itself: a concat result binds its
+            # own resident (``bind_resident(6, 6)``) and the mirror recorded
+            # ``6 -> 6``, an alias no concordance row states (``xs = [5, 7]
+            # + [n, 7]``: the audit's value_aliases disagreement).
+            if alias_id != resident_root:
+                region_value_aliases[alias_id] = resident_root
             return
         if alias_root != alias_id:
             raise ValueError(
