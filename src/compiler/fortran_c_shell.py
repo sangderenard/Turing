@@ -12605,23 +12605,31 @@ def _member_completion_position(
 
     position = _authored_node_position(graph_obj, int(node_id))
     data = graph_obj.nodes.get(int(node_id)) if int(node_id) in graph_obj else None
-    if data is None or str(data.get("type") or data.get("op") or "").casefold() not in {
-        "indexedstore", "setitem", "setattr",
-    }:
-        # Program: ``d[3] = n; xs = [1, 2] + [n, 8]; xs[2]`` (c220).
-        # Wrong record: the concatenation's region sat at the ``+``'s start,
-        # which precedes its right operand's display, so the concat copied
-        # ``[n, 8]`` before that display's birth wrote it and ``xs[2]`` read
-        # 0 (clean audit).  Rule: an expression executes after its operands;
-        # it completes where it ends.
-        expression = None if data is None else data.get("expr_obj")
-        if (isinstance(expression, ast.expr)
-                and getattr(expression, "end_lineno", None) is not None):
-            return max(position, (
-                int(expression.end_lineno),
-                int(getattr(expression, "end_col_offset", 0) or 0),
+    if data is None:
+        return position
+    # Program: ``xs0 = [1, -1] + [n, 1]; d1 = {1: 6}; return xs0[2] * 10 +
+    # d1[1]`` (fuzzer p16_29; corpus c218).  Wrong record: the ``+``
+    # region completed at its own start, which precedes its right operand
+    # display ``[n, 1]``, whose birth is placed at the display; the fill
+    # copied that operand before it was born (``xs0[2]`` read 0; silent).
+    # Rule: a member reading a display operand completes after that
+    # display ends, where the display's birth has already run.
+    for parent, _role in data.get("parents") or ():
+        if int(parent) not in graph_obj:
+            continue
+        display = graph_obj.nodes[int(parent)].get("expr_obj")
+        if (
+            isinstance(display, (ast.List, ast.Tuple, ast.Set, ast.Dict))
+            and getattr(display, "end_lineno", None) is not None
+        ):
+            position = max(position, (
+                int(display.end_lineno),
+                int(getattr(display, "end_col_offset", 0) or 0),
                 int(node_id),
             ))
+    if str(data.get("type") or data.get("op") or "").casefold() not in {
+        "indexedstore", "setitem", "setattr",
+    }:
         return position
     value_id = next((
         int(parent) for parent, role in data.get("parents") or ()
@@ -26906,7 +26914,7 @@ def _class_surface_ssa_program(
             and int(mutation.sequence_value_id) not in output_history_ids
         )
         # Program: ``xs = []; for i in range(n): xs.append(i); ys = [7] + xs;
-        # len(ys)`` (c221).  Wrong record: a concatenation no bound covers
+        # len(ys)`` (c243).  Wrong record: a concatenation no bound covers
         # was neither bounded nor DYNAMIC, so its arena took the planner's
         # elementwise extent and the slice copy stopped there (``len(ys)``
         # 1 for 4; clean audit).  Rule: a concatenation is born here and

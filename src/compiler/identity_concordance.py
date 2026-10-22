@@ -3611,7 +3611,7 @@ class CorrelationTable:
     def _unborn_display_findings(module: Any) -> list[Finding]:
         """Report a display whose resident length is read but never written.
 
-        Program: ``t = (n + 1, n + 2, n * 3); len(t)`` (c218).  The
+        Program: ``t = (n + 1, n + 2, n * 3); len(t)`` (c240).  The
         SOURCE_AGGREGATE_LAYOUT row said three members; the module read the
         tuple's length cell, and no instruction anywhere cleared or wrote
         that sequence, so ``len(t)`` read the frame's zeroed cell and
@@ -3661,7 +3661,7 @@ class CorrelationTable:
                             (str(name), int(attributes["sequence_value_id"]))
                         )
         found = []
-        # Program: ``d[3] = n; xs = [1, 2] + [n, 8]; xs[2]`` (c220).  The
+        # Program: ``d[3] = n; xs = [1, 2] + [n, 8]; xs[2]`` (c242).  The
         # concatenation copied ``[n, 8]`` before that display's birth cleared
         # and wrote it, in one straight-line block.  The two records are the
         # birth (the display's ``ssa_sequence_clear``) and the copy that
