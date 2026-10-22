@@ -21615,13 +21615,26 @@ def _tensor_descriptor_rule(
                     # An authored scalar literal member states its Python
                     # class; the shape query has no rule for a bare int.
                     member = graph.G.nodes[node_by_value[value]]
-                    if str(member.get("type")) != "Constant" or (
-                        member.get("attributes") or {}
-                    ).get("aggregate_kind") is not None:
+                    if (member.get("attributes") or {}).get(
+                        "aggregate_kind"
+                    ) is not None:
                         return None
-                    literal = member.get("constant")
-                    if literal is None:
-                        literal = (member.get("attributes") or {}).get("value")
+                    if str(member.get("type")) == "Constant":
+                        literal = member.get("constant")
+                        if literal is None:
+                            literal = (member.get("attributes") or {}).get("value")
+                    else:
+                        # Program: ``ys = [x * n for x in [5, -1]]; sum(ys)``
+                        # (c268).  Wrong record: ``-1`` is a ``neg`` node,
+                        # not a Constant, so its class went unread, the
+                        # row's writers disagreed and the target took the
+                        # domain's float64 (``sum`` returned a float).
+                        # Rule: a member the authored source spells as a
+                        # literal (``ast.literal_eval``) states its class.
+                        try:
+                            literal = ast.literal_eval(member.get("expr_obj"))
+                        except (ValueError, TypeError, SyntaxError):
+                            return None
                     dtype = (
                         "bool" if isinstance(literal, bool)
                         else "int64" if isinstance(literal, int)
