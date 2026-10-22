@@ -656,10 +656,17 @@ Placement and identity faults found and fixed:
     (c211).
   - Nested list stores: no source cell for the control block (c212).
   - Early `return` from a loop over a list parameter (c216).
-  - `n in xs` with `xs` a folded constant list: no membership is produced
-    (the structural recovery only covers fields and dicts).
-  - `xs.count(v)`, `xs.index(v)`, `del xs[i]` on a list: no lowering.
+  - `n in xs` with `xs` a folded constant list VARIABLE: no membership is
+    produced (the structural recovery only covers fields and dicts). An
+    inline numeric literal (`n in [6, 3, 4]`) is now spelled as the
+    disjunction of equalities (ast_control_normalization).
+  - Dict `del d[k]` and `d.pop(k)` on a display dict: the deletion is
+    placed by graph-id order (`value_id < effect_id`) into a neighbouring
+    region (a cycle), and `pop` has no lowering. Both should be one lexical
+    mapping effect.
   - Runtime-count replication `[v] * k`: see above.
+- Now lowered: `xs.count(v)` / `xs.index(v)` (resident queries; a missing
+  `index` raises), `del xs[i]` on a list (positional pop), bare `zip`.
 - `xs = [0, 0]; for ...: t += xs[0]; xs = [i + n, i]` (a display re-bound
   inside a loop) is wrong at 4c70971 and after, with two audit findings
   (`descriptor-member-shared`, `unaccounted-formal`).

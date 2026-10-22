@@ -1,3 +1,44 @@
+2026-10-22 DIFFERENTIAL FUZZING ROUND (MEASURED):
+A differential fuzzer (snippet grammar over lists, dicts, sets, tuples,
+loops, short-circuit, helpers, enumerate/zip, membership, count/index,
+concat/replication, del, while-grown lists) compiled 340 generated programs
+through `lower_ast_source_to_ssa` and C. Each run compares value and type
+with Python. Native calls run in a forked child, and the harness applies
+the native product's own root-input refusal.
+Silent wrong answers found and fixed:
+- a list copy sharing its source's storage;
+- a copy's own appends not counted;
+- concat and replication arenas sized from the planner's elementwise
+  extents;
+- a dropped fill count;
+- a concat skipping its region's other work.
+Refusals turned into lowerings:
+- `zip`;
+- `del xs[i]`;
+- `xs.count`/`xs.index`;
+- inline-literal membership;
+- while-grown lists read after the loop;
+- index-loop stores over `range(len(xs))`;
+- comprehension iterables;
+- set.add;
+- dicts grown in loops.
+Placement now has one rule: one block position for five passes, and a
+region placed where its last member completes.
+Corpus: 125 programs, all value- and type-correct with 0 concordance
+findings at 0f21338.
+Gate (gate12 49-file split + focused rec suite): unchanged from g16
+(aa 90, ab 7, ac 26, rec 20) at g23-g29.
+`main` follows each gated commit (108dd8e at this writing).
+Seeds 4-6 (180 programs): 0 silent wrong answers. The remaining
+refusals are all loud:
+- runtime-count replication;
+- standalone slices;
+- membership in a folded list variable;
+- dict `del`/`pop`;
+- `d.get` in a loop;
+- the batch-2 refusals.
+See docs/compiler_convergence/33 ("Differential fuzzing").
+
 2026-10-22 LOOP EXITS, SEQUENCE EFFECTS, DISPLAY IDENTITIES, PLANNED TYPES (MEASURED):
 Native corpus (C lane against the authored Python, with result-type check):
 107 programs, all value-correct with 0 concordance findings at 6300d55.
