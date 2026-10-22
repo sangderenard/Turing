@@ -1,3 +1,18 @@
+2026-10-22 CONCATENATION FAMILY (W2) (MEASURED):
+Three silent wrong answers at `main` fixed (clean audit at `main`): a
+concat of a concat had no bound (len 2 for 4); a concat's row typed
+float64; a concat placed before its operand's birth (PR #786's rule,
+carried verbatim). An unbounded concat is now DYNAMIC and refuses by name
+(`append_slice` cannot grow yet). Audit: `display-read-before-birth`.
+See docs/compiler_convergence/35 section 2.
+Corpus (this container): 164/164 PASS at f7e9b237 (c260-c264 then
+numbered c240-c244; d4adaba8 only renames programs and comments).
+Fuzz seed 15 (base, 40): 40 PASS. Seed 14 (FUZZ_EXT=1, 40): 39 PASS,
+1 LOUD (p14_17, control-order cycle, LOUD at `main` too). Seeds 12 and 13
+on ca20c8ec: 80/80 PASS.
+Gate (this container) at f7e9b237: failure names identical to `main`
+2532577 in all four parts (aa 96, ab 20, ac 57, rec 39).
+
 2026-10-22 TUPLE DISPLAY BIRTH (MEASURED):
 Silent wrong answer found and fixed (clean audit at `main`): `len()` of a
 computed tuple display read an unwritten length cell (0 for 3). Tuples are
