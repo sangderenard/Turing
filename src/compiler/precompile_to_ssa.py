@@ -5280,6 +5280,11 @@ class _ControlSSABuilder(TiledObject):
             accounting=dict(value.accounting),
         )
 
+    def _defines(self, value: SSAValue) -> bool:
+        """Whether an emitted instruction already defines ``value``."""
+
+        return self.__dict__.get("_defined_results", {}).get(id(value)) is value
+
     def produced_value(
         self,
         value_id: int,
@@ -5344,6 +5349,36 @@ class _ControlSSABuilder(TiledObject):
                         {"ssa_inout_write_version": True}
                         if value_id in self.inout_value_ids else {}
                     ),
+                })
+                self._bind(
+                    value_id, value, BindingKind.VERSIONED_WRITE, *producer,
+                )
+                return value
+            if self._defines(value) and self.__dict__.get("_latch_test_generation"):
+                # Program: ``while index < count and everything[index] ==
+                # position:`` (c37_while_in_for).  Wrong record: the latch
+                # re-evaluates the test, re-emitting the row load of 11 with
+                # the SAME SSAValue object as the entry evaluation; region
+                # calls bind arguments by id, so the later repair clone
+                # (``freshen_redefined_ssa_objects``) never reached them and
+                # the latch compared the entry's row.  Rule: a value the
+                # latch's re-evaluation of the test defines again is the
+                # test's next generation -- a VERSIONED_WRITE bound to the
+                # id, exactly as for a preallocated argument.  The
+                # generation keeps the identity's recorded type (the reuse
+                # it replaces kept the incumbent object's dtype): a
+                # redefining producer's own claim (a region view's float64,
+                # tuple_loop_row_handle_contract value 18) does not retype it.
+                previous = value
+                value = self.fresh_value(
+                    dtype=value.dtype or dtype,
+                    shape=tuple(value.shape),
+                    transform=VERSIONED_WRITE,
+                    operands=(self._binding_cell(value_id), previous),
+                )
+                value.accounting.update({
+                    **dict(previous.accounting or {}),
+                    "source_value_id": value_id,
                 })
                 self._bind(
                     value_id, value, BindingKind.VERSIONED_WRITE, *producer,
@@ -9013,6 +9048,10 @@ class _ControlSSABuilder(TiledObject):
             result,
             attributes=resolved_attributes,
         )
+        if result is not None:
+            # Every emitted definition, by object: ``produced_value`` versions
+            # a second definition of a defined object (``_defines``).
+            self.__dict__.setdefault("_defined_results", {})[id(result)] = result
         captured_sink = getattr(self, "_captured_instruction_sink", None)
         if captured_sink is not None:
             captured_sink.append(instruction)
@@ -16082,6 +16121,11 @@ class _ControlSSABuilder(TiledObject):
                 attributes={
                     "incoming_blocks": (true_exit.name, false_exit.name),
                     "binding": "conditional_result",
+                    # The merge of a short-circuit operator IS the operator.
+                    **({
+                        "structural_operation": "boolop",
+                        "semantic_family": conditional.short_circuit_operator,
+                    } if conditional.short_circuit_operator else {}),
                 },
             )
             self.merge_native_type_tags(
@@ -18279,6 +18323,8 @@ class _ControlSSABuilder(TiledObject):
         latch_frame = self.loop_frames.get(loop_state)
         if latch_frame is not None:
             latch_frame["latch"] = True
+        latch_generation = self.__dict__.get("_latch_test_generation", False)
+        self._latch_test_generation = True
         try:
             if not carried_test:
                 # A carried test (``while go:``) has no latch computation:
@@ -18300,6 +18346,7 @@ class _ControlSSABuilder(TiledObject):
                     header_condition.args[1] = latch_predicate
                     latch_leaf = latch_predicate
         finally:
+            self._latch_test_generation = latch_generation
             if latch_frame is not None:
                 latch_frame["latch"] = False
             self.enclosing_loop_states.pop()
@@ -18321,6 +18368,30 @@ class _ControlSSABuilder(TiledObject):
             ))
         if not self.current.successors:
             self.branch(header)
+        # Program: ``while d != 0 and 12 // d > 1:`` (c42_while_and_guard_div).
+        # Wrong record: the latch test owns a short-circuit conditional, so
+        # the latch lowering ends in that conditional's merge block, which
+        # is the block that branches to the header; the header Phis still
+        # named ``while_latch`` as their incoming block and the backedge
+        # operands were dropped as coming from a non-predecessor (the loop
+        # never re-tested and ran forever).  Rule: a header Phi's backedge
+        # incoming block is the block that emits the backedge.
+        backedge_block = self.current
+        if (
+            backedge_block is not latch
+            and header.name in backedge_block.successors
+        ):
+            for instruction in header.instrs:
+                if instruction.op != "Phi":
+                    continue
+                incoming = tuple(
+                    instruction.attributes.get("incoming_blocks") or ()
+                )
+                if latch.name in incoming:
+                    instruction.attributes["incoming_blocks"] = tuple(
+                        backedge_block.name if name == latch.name else name
+                        for name in incoming
+                    )
 
         if recursion_region_id is not None:
             source = self.recursion_regions[int(recursion_region_id)]
@@ -18338,7 +18409,7 @@ class _ControlSSABuilder(TiledObject):
                     int(current_predicate.id),
                     *(int(current.id) for *_prefix, current in carried),
                 ),
-                "backedge": (latch.name, header.name),
+                "backedge": (backedge_block.name, header.name),
                 "domain": "condition",
                 "source_loop_node_id": loop.source_loop_node_id,
             })
@@ -20666,6 +20737,25 @@ def _settle_child_pool_operation_dtypes(
     disagreement and are refused.
     """
 
+    # Program: IdentityPage._resolved (bootstrap unit 33), a child-table
+    # column arena minted ``unknown``.  Wrong record: the settled element
+    # dtype was written onto every occurrence with no ``ssa_value``
+    # revision, so the composed product's row said None while the GEP base
+    # carried int64.  Rule: the settlement is a REVISE of the arena's row and
+    # of each operation value's row, DERIVED from the cells of the Load/Store
+    # values that witness it; occurrences follow the rows.  An accepted
+    # component is an immutable source and is not settled here.
+    from .concordance_declarations import FRAME_LINK as _SETTLE_STAGE
+    from .ssa_record_return_state import (
+        accepted_ssa_component as _accepted_pool_owner,
+        revise_ssa_value as _revise_pool_value,
+        ssa_value_identity_cell as _pool_value_cell,
+    )
+
+    functions = {
+        name: function for name, function in functions.items()
+        if not _accepted_pool_owner(function)
+    }
     addresses: dict[tuple[str, int], tuple[int, int]] = {}
     for function_name, function in functions.items():
         for block in function.blocks.values():
@@ -20721,6 +20811,26 @@ def _settle_child_pool_operation_dtypes(
                 f"dtypes={tuple(sorted(dtypes))!r}"
             )
         dtype = next(iter(dtypes))
+        function = functions[function_name]
+        witnesses = tuple(
+            cell for cell in (
+                _pool_value_cell(function, int(value.id))
+                for value in operation_values.get(
+                    (function_name, arena_id, column), (),
+                )
+            ) if cell is not None
+        )
+        revised_ids: set[int] = set()
+
+        def settle_row(value_id: int, shape) -> None:
+            if int(value_id) in revised_ids:
+                return
+            revised_ids.add(int(value_id))
+            _revise_pool_value(
+                function, int(value_id), dtype=dtype, shape=tuple(shape or ()),
+                stage=_SETTLE_STAGE, sources=witnesses,
+            )
+
         for value in operation_values.get(
             (function_name, arena_id, column), (),
         ):
@@ -20737,8 +20847,9 @@ def _settle_child_pool_operation_dtypes(
                     f"column={column}, "
                     f"operation={incumbent!r}, settled={dtype!r}"
                 )
+            if str(value.dtype or "unknown") != dtype:
+                settle_row(int(value.id), value.shape)
             value.dtype = dtype
-        function = functions[function_name]
         if function is not None:
             values = (
                 *function.args,
@@ -20775,6 +20886,8 @@ def _settle_child_pool_operation_dtypes(
                         f"declared={incumbent!r}, "
                         f"settled={dtype!r}"
                     )
+                if incumbent != dtype:
+                    settle_row(int(value.id), value.shape)
                 value.dtype = dtype
         table = sequence_tables.get(function_name)
         if table is not None:

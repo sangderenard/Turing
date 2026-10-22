@@ -44,8 +44,20 @@ def publish_authored_ssa(functions):
                 for value in item.args:
                     values.setdefault(int(value.id), value)
         for value_id, value in values.items():
+            # A producer posts the physical facts it states (precompile's
+            # ``_value_cell``/``_revise_value``); this stand-in states the
+            # ones the authored accounting carries, so readers that take the
+            # row as truth see what a real producer would have posted.
+            accounting = dict(value.accounting or {})
             book.post(SSA_VALUE, (scope, value_id),
-                      SSAValueFact(value.dtype, tuple(value.shape), SSAValueOrigin.ADOPTED_GRAPH_ID),
+                      SSAValueFact(
+                          value.dtype, tuple(value.shape), SSAValueOrigin.ADOPTED_GRAPH_ID,
+                          physical_dtype=accounting.get("physical_dtype"),
+                          storage=accounting.get("program_abi_storage"),
+                          rank=accounting.get("program_abi_rank"),
+                          arena=bool(accounting.get("sequence_arena", False)),
+                          device=accounting.get("device"),
+                      ),
                       stage=stage, provenance=Derived((source,)), mode=Mode.CONCORD)
         for label in function.blocks:
             book.post(SSA_BLOCK, (scope, function.name, label),

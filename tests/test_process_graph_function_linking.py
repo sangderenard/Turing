@@ -2774,8 +2774,10 @@ def test_direct_source_lowers_declared_record_literal_and_bool_return():
     layouts = dict(root.metadata["record_return_layouts"])
     assert metrics.record_id in layouts
     assert len(outputs[root.name]) == 1 + len(layouts[metrics.record_id])
+    # ``a and b`` is the short-circuit conditional ``b if a else a``; its
+    # merge is the operator's definition and carries the operator's family.
     assert any(
-        instruction.op in {"LAnd", "Select"}
+        instruction.op in {"LAnd", "Select", "Phi"}
         and instruction.attributes.get("semantic_family") == "logical_and"
         for block in root.blocks.values()
         for instruction in block.instrs
@@ -3355,8 +3357,12 @@ def test_structural_boolean_call_feed_is_materialized_before_linking():
     assert outputs[root.name]
     assert not root.metadata.get("unresolved_call_diagnostics")
     assert not root.metadata.get("structural_output_shortfalls")
+    # ``left or right`` is ``left if left else right``: its merge is the
+    # operator's definition (a value, not a bool) and carries its family.
     assert any(
         instruction.op == "LOr"
+        or instruction.op == "Phi"
+        and instruction.attributes.get("semantic_family") == "logical_or"
         for block in root.blocks.values()
         for instruction in block.instrs
     )

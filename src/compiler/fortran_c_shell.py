@@ -82,6 +82,7 @@ from .declared_piece_signature import (
     _declared_piece_signature_definition as _declared_piece_signature_definition,
 )
 from .ast_control_normalization import (
+    _normalize_binary_short_circuit as _normalize_binary_short_circuit,
     _normalize_direct_tail_recursion as _normalize_direct_tail_recursion,
     _normalize_none_default_assignments as _normalize_none_default_assignments,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
@@ -147,6 +148,7 @@ from .resident_sequence_materialization import (
     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
+    _loop_carried_initial_ids as _loop_carried_initial_ids,
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
     _loop_carried_storage_aliases as _loop_carried_storage_aliases,
     _promote_conditional_sequence_aliases as _promote_conditional_sequence_aliases,
@@ -11161,6 +11163,8 @@ _TRUTHINESS_AGGREGATE_KINDS = frozenset({
 def _graph_control_expression(
     graph_obj: Any, node_id: int, visiting: frozenset[int] = frozenset(),
     *, resident: frozenset[int] = frozenset(),
+    read: tuple | None = None,
+    _carried: frozenset[int] | None = None,
 ):
     """Translate a retained scalar predicate from ProcessGraph structure.
 
@@ -11171,12 +11175,24 @@ def _graph_control_expression(
     """
 
     from .control_source import ControlExpression
+    from ..common.tensors.topological_reducer import _operand_positions
 
+    # Program: ``best = 0; for k in range(n): d = k - 2; if d != 0 and
+    # 12 // d > best: best = 12 // d`` (c47_and_guard_carried_in_for).
+    # Wrong record: leaves were built with no operand position, so inside the
+    # loop ``best`` resolved to its graph id -- the literal 0 that is the
+    # ENTRY arm of the loop's carried Phi -- and was even folded to a const
+    # (n=7 gave 3, not 12).  Rule (the loop composer's): a leaf carries the
+    # operand position it is read at, so lowering resolves it through its
+    # ``lexical_read_binding``; a loop-carried initial is a leaf, never a
+    # literal.
+    if _carried is None:
+        _carried = _loop_carried_initial_ids(graph_obj)
     node_id = int(node_id)
     if node_id in visiting or node_id not in graph_obj:
-        return ControlExpression("value", value_id=node_id)
-    if node_id in resident:
-        return ControlExpression("value", value_id=node_id)
+        return ControlExpression("value", value_id=node_id, read=read)
+    if node_id in resident or node_id in _carried:
+        return ControlExpression("value", value_id=node_id, read=read)
     data = graph_obj.nodes[node_id]
     expression = data.get("expr_obj")
     attributes = data.get("attributes") or {}
@@ -11199,25 +11215,32 @@ def _graph_control_expression(
             },
         )
     parents = tuple(data.get("parents") or ())
-    ordered = tuple(
-        int(parent)
-        for parent, role in sorted(
-            parents,
-            key=lambda item: (
-                int(str(item[1]).split(":")[-1])
-                if str(item[1]).split(":")[-1].isdigit() else 0
-            ),
-        )
+    positioned = sorted(
+        (
+            (int(parent), role, ordinal)
+            for role, ordinal, parent in _operand_positions(parents)
+        ),
+        key=lambda item: (
+            int(str(item[1]).split(":")[-1])
+            if str(item[1]).split(":")[-1].isdigit() else 0
+        ),
+    )
+    ordered_reads = tuple(
+        (parent, (node_id, role, ordinal))
+        for parent, role, ordinal in positioned
         if str(role) not in {"callee", "ops", "operator"}
     )
+    ordered = tuple(parent for parent, _read in ordered_reads)
+
+    def operand(position: int):
+        parent, parent_read = ordered_reads[position]
+        return _graph_control_expression(
+            graph_obj, parent, visiting | {node_id}, resident=resident,
+            read=parent_read, _carried=_carried,
+        )
     if isinstance(expression, ast.BoolOp):
         operator = "and" if isinstance(expression.op, ast.And) else "or"
-        operands = tuple(
-            _graph_control_expression(
-                graph_obj, parent, visiting | {node_id}, resident=resident,
-            )
-            for parent in ordered
-        )
+        operands = tuple(operand(position) for position in range(len(ordered)))
         if operands:
             result = operands[0]
             for operand in operands[1:]:
@@ -11256,10 +11279,8 @@ def _graph_control_expression(
                     .get("aggregate_kind") in _TRUTHINESS_AGGREGATE_KINDS
                     and int(parent) not in visiting
                 )
-                else _graph_control_expression(
-                    graph_obj, parent, visiting | {node_id}, resident=resident,
-                )
-                for parent in ordered[:2]
+                else operand(position)
+                for position, parent in enumerate(ordered[:2])
             ),
             value_id=node_id,
         )
@@ -11289,14 +11310,11 @@ def _graph_control_expression(
             "isfinite",
         } else 2
         operands = tuple(
-            _graph_control_expression(
-                graph_obj, parent, visiting | {node_id}, resident=resident,
-            )
-            for parent in ordered[:arity]
+            operand(position) for position in range(min(arity, len(ordered)))
         )
         if len(operands) == arity:
             return ControlExpression(operation, operands, value_id=node_id)
-    return ControlExpression("value", value_id=node_id)
+    return ControlExpression("value", value_id=node_id, read=read)
 
 
 def _region_resident_value_ids(dispatch_subgraphs: Iterable[Any]) -> frozenset[int]:
@@ -11365,8 +11383,8 @@ def _attach_graph_control_expressions(
     """Recover structured predicates for every retained conditional."""
 
     from .control_source import (
-        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock,
-        SequenceMutationBlock, ValidationBlock, WhileBlock,
+        CallBlock, ConditionalBlock, ControlExpression, LoopBlock,
+        SequenceBlock, SequenceMutationBlock, ValidationBlock, WhileBlock,
     )
 
     def owns_optional_presence(expression: Any) -> bool:
@@ -11376,6 +11394,52 @@ def _attach_graph_control_expressions(
             str(expression.op) == "optional_presence"
             or any(owns_optional_presence(item) for item in expression.operands)
         )
+
+    # A value a ConditionalBlock merges is defined by that merge, exactly as
+    # a region publication defines a resident value.  Program:
+    # ``if d != 0 and 10 // d > 1`` (c41_and_guard_div): the BoolOp node is
+    # the merge of its short-circuit arms, so a consumer's predicate reads
+    # it; re-deriving ``and(...)`` from its parents would read the guarded
+    # operand after the merge, where only one arm defined it.
+    def control_merges(block) -> set[int]:
+        found: set[int] = set()
+        if isinstance(block, ConditionalBlock):
+            found.update(int(merged) for *_arms, merged in block.result_aliases)
+        for child in (
+            getattr(block, "blocks", None) or ()
+        ):
+            found.update(control_merges(child))
+        for attribute in ("body", "orelse", "condition"):
+            child = getattr(block, attribute, None)
+            if child is not None and not isinstance(child, (str, int)):
+                found.update(control_merges(child))
+        return found
+
+    resident = frozenset((*resident, *control_merges(control.root)))
+    merged_values = frozenset(control_merges(control.root))
+
+    def read_merges(expression):
+        """An expression node a ConditionalBlock merge defines is that value.
+
+        Program: ``while d != 0 and 12 // d > 1:`` (c42_while_and_guard_div).
+        Wrong record: the loop composer's predicate re-spelled the BoolOp as
+        ``and(ne, gt(floordiv))`` after its short-circuit conditional had
+        merged it, so the latch recomputed ``gt`` from the division the arm
+        alone defines.  Rule: the merge is the operator's one definition.
+        """
+
+        if expression is None:
+            return None
+        if (
+            expression.value_id is not None
+            and int(expression.value_id) in merged_values
+            and str(expression.op) != "value"
+        ):
+            return ControlExpression("value", value_id=int(expression.value_id))
+        operands = tuple(read_merges(operand) for operand in expression.operands)
+        if operands == tuple(expression.operands):
+            return expression
+        return replace(expression, operands=operands)
 
     def attach(block):
         if isinstance(block, ConditionalBlock):
@@ -11731,7 +11795,25 @@ def _attach_graph_control_expressions(
             # honest missing producer instead of becoming a fabricated scalar.
             def arm_expressions(index: int):
                 result = []
-                for alias in block.carried_aliases:
+                # A short-circuit operator's guarded operand (its ``value:1``
+                # edge) is evaluated in its arm, never before the branch.
+                source = (
+                    graph_obj.nodes.get(int(block.source_node_id))
+                    if block.source_node_id is not None else None
+                ) or {}
+                guarded_operand = next((
+                    int(graph_obj.nodes[int(parent)].get("value_id", parent))
+                    for parent, role in source.get("parents") or ()
+                    if str(role) == "value:1" and int(parent) in graph_obj
+                ), None) if isinstance(
+                    source.get("expr_obj"), ast.BoolOp
+                ) else None
+                guarded_results = tuple(
+                    alias for alias in block.result_aliases
+                    if guarded_operand is not None
+                    and int(alias[index]) == guarded_operand
+                )
+                for alias in (*block.carried_aliases, *guarded_results):
                     value_id = int(alias[index])
                     if value_id == int(alias[2]):
                         continue
@@ -11832,6 +11914,7 @@ def _attach_graph_control_expressions(
                 block,
                 condition=attach(block.condition),
                 body=attach(block.body),
+                predicate_expression=read_merges(block.predicate_expression),
             )
         if isinstance(block, CallBlock):
             return replace(block, callee=attach(block.callee))
@@ -15981,7 +16064,17 @@ def _sequence_row_operations(
     def value_id(node_id: int) -> int:
         return int(graph_obj.nodes[node_id].get("value_id", node_id))
 
+    # Program: ``index = 0``; ``for k in range(n): total += xs[index];
+    # index += 1`` (c35_index_carried_for).  Wrong record: the row index's
+    # graph parent is the literal 0 that enters the loop's carried Phi; read
+    # as a literal it made every iteration load row 0 (n=3 gave 15, not 23).
+    # Rule: a loop-carried initial is not a literal index; the row reads the
+    # carried value through its ordinary SSA identity.
+    carried_initials = _loop_carried_initial_ids(graph_obj)
+
     def integer_literal(node_id: int) -> int | None:
+        if int(node_id) in carried_initials or value_id(node_id) in carried_initials:
+            return None
         data = graph_obj.nodes[node_id]
         expression = data.get("expr_obj")
         literal = (
@@ -18437,8 +18530,34 @@ def _rehome_structured_while_predicate_regions(
 
     present_regions: set[int] = set()
 
+    # Program: ``while index < count and everything[index] == position:``
+    # (c37_while_in_for).  Wrong record: the predicate still spells the
+    # BoolOp as ``and(lt, eq)``; its ``eq`` is the guarded operand of the
+    # operator's short-circuit conditional (whose merge defines the BoolOp),
+    # yet this pass took the ``eq`` region as predicate work and moved it out
+    # of that arm, ahead of the row load it reads.  Rule: a value a
+    # ConditionalBlock merges is a leaf of the predicate, like a capture.
+    def merged_ids(block: Any) -> set[int]:
+        found: set[int] = set()
+        if isinstance(block, ConditionalBlock):
+            found.update(int(merged) for *_arms, merged in block.result_aliases)
+        for child in (getattr(block, "blocks", None) or ()):
+            found.update(merged_ids(child))
+        for attribute in ("body", "orelse", "condition", "callee"):
+            child = getattr(block, attribute, None)
+            if child is not None and not isinstance(child, (str, int)):
+                found.update(merged_ids(child))
+        return found
+
+    control_merged = frozenset(merged_ids(control.root))
+
     def computed_expression_ids(expression: Any) -> frozenset[int]:
         if expression is None or str(expression.op) == "value":
+            return frozenset()
+        if (
+            expression.value_id is not None
+            and int(expression.value_id) in control_merged
+        ):
             return frozenset()
         found = {
             int(expression.value_id)
@@ -21959,7 +22078,27 @@ def _class_surface_ssa_program(
                 id(planned_graph), {}
             )
             for node_id, data in planned_graph.nodes(data=True):
-                if not isinstance(data.get("expr_obj"), ast.IfExp):
+                # Program: ``origin, stamp = fork`` where ``fork`` is an
+                # optional tuple merge, then ``asof = stamp if ... else asof``
+                # (IdentityPage._resolved).  Wrong record: the member Phi of
+                # a merged aggregate carried no contract, so the union join
+                # on ``asof`` found no exact type for ``stamp`` although the
+                # present arm's call projection is declared ``int``.  Rule: a
+                # member merge settles from its arms exactly as an IfExp
+                # does; an arm that is an inactive optional filler is not a
+                # value of the merge (it is never read) and contributes none.
+                member_attributes = data.get("attributes") or {}
+                member_merge = (
+                    str(data.get("type") or "") == "Phi"
+                    and (
+                        member_attributes.get("conditional_result_of") is not None
+                        or member_attributes.get("aggregate_parent_value_id")
+                        is not None
+                    )
+                )
+                if not (
+                    isinstance(data.get("expr_obj"), ast.IfExp) or member_merge
+                ):
                     continue
                 arms_by_role = {
                     str(role): int(parent)
@@ -21968,14 +22107,25 @@ def _class_surface_ssa_program(
                 }
                 if set(arms_by_role) != {"body", "orelse"}:
                     continue
+                active_arms = tuple(
+                    arm_id
+                    for arm_id in (
+                        arms_by_role["body"], arms_by_role["orelse"],
+                    )
+                    if not (
+                        (planned_graph.nodes.get(int(arm_id), {}).get(
+                            "attributes"
+                        ) or {}).get("optional_inactive_payload")
+                    )
+                )
+                if not active_arms:
+                    continue
                 arm_contracts = tuple(
                     (
                         arm_id,
                         contracts.get(int(arm_id)),
                     )
-                    for arm_id in (
-                        arms_by_role["body"], arms_by_role["orelse"],
-                    )
+                    for arm_id in active_arms
                 )
                 if any(contract is None for _arm_id, contract in arm_contracts):
                     continue
@@ -49787,6 +49937,15 @@ def _class_surface_ssa_program(
                     # An imported repository kernel is shared by every
                     # caller; no caller's ownership is its formal's.
                     continue
+                # An accepted (dependency) callee is an immutable source; its
+                # formals' ABI is its own book's (unit 33 composing
+                # IdentityPage._reindex labelled its formal 'span' with no
+                # row behind the label).
+                from .ssa_record_return_state import (
+                    accepted_ssa_component as _accepted_ownership_callee,
+                )
+                if _accepted_ownership_callee(callee):
+                    continue
                 for fed, formal in zip(instruction.args, callee.args):
                     accounting = dict(fed.accounting or {})
                     if not accounting.get("program_abi_storage"):
@@ -52811,6 +52970,14 @@ def _class_surface_ssa_program(
                     # An imported repository kernel is shared by every
                     # caller; no caller's field identity is its formal's.
                     continue
+                # An accepted (dependency) callee is an immutable source: its
+                # formals keep the ABI its own book proved (unit 33 composing
+                # IdentityPage._reindex gained a 'span' label with no row).
+                from .ssa_record_return_state import (
+                    accepted_ssa_component as _accepted_formal_owner,
+                )
+                if _accepted_formal_owner(callee):
+                    continue
                 for fed, formal in zip(instruction.args, callee.args):
                     accounting = dict(fed.accounting or {})
                     if not accounting.get("program_abi_storage"):
@@ -52827,9 +52994,32 @@ def _class_surface_ssa_program(
                         "program_abi_keyed_values",
                     ):
                         accounting.pop(frame_local, None)
-                    formal.accounting = {
-                        **dict(formal.accounting or {}), **accounting,
-                    }
+                    # Rule: post first; accounting is a view.  The formal's
+                    # physical fields are the actual's POSTED fields (as the
+                    # ProgramABI ownership pass above posts them), never the
+                    # actual's accounting copied across the edge.
+                    _formal_physical = _frame_physical_fields(
+                        caller, int(fed.id),
+                    )
+                    if isinstance(_formal_physical, dict):
+                        _revise_ssa_value(
+                            callee, int(formal.id), dtype=formal.dtype,
+                            shape=tuple(formal.shape or ()),
+                            stage=_FRAME_LINK,
+                            sources=_frame_cells(
+                                _frame_value_cell(caller, int(fed.id)),
+                            ),
+                            physical=_formal_physical,
+                        )
+                    formal.accounting = _frame_accounting_from_posted({
+                        **dict(formal.accounting or {}), **{
+                            key: item for key, item in accounting.items()
+                            if key not in {
+                                "physical_dtype", "program_abi_storage",
+                                "program_abi_rank", "sequence_arena", "device",
+                            }
+                        },
+                    }, _frame_physical_fields(callee, int(formal.id)))
                     if formal.dtype in {None, "unknown"} and fed.dtype:
                         formal.dtype = fed.dtype
                     # Program: ``IdentityPage._reindex``'s
@@ -53593,6 +53783,20 @@ def _class_surface_ssa_program(
         table = all_sequence_tables.get(function_name)
         if table is None:
             continue
+        # Program: IdentityPage._resolved composing the accepted
+        # IdentityPage._reindex (bootstrap unit 33).  Wrong record: this
+        # sweep retyped an ACCEPTED body's value 53 from bool to int64 in
+        # the composing unit, and retyped every occurrence with no
+        # ``ssa_value`` revision, so the composed module's row said bool and
+        # its occurrence int64.  Rule: an accepted component is an immutable
+        # source; in this unit's own functions the descriptor's column dtype
+        # is a REVISE of the value's row, DERIVED from the descriptor's cell,
+        # and the occurrences follow the row.
+        from .ssa_record_return_state import (
+            accepted_ssa_component as _accepted_sequence_owner,
+        )
+        if _accepted_sequence_owner(function):
+            continue
         canonical_dtypes = {
             # The descriptor's dtype is the ELEMENT contract. Heap columns
             # themselves are ptr cells. The native context source-link micro
@@ -53615,10 +53819,21 @@ def _class_surface_ssa_program(
                 values.extend(instruction.args)
                 if instruction.res is not None:
                     values.append(instruction.res)
+        # The occurrences take the descriptor's column dtype; the row is NOT
+        # revised here.  Program: c25_list_static_membership.  Revising the
+        # arena row (3) to the descriptor's int64 split the ABI: the
+        # structural ``contains`` helper's formal kept the row's float64 and
+        # the helper-type correlation pass retyped the caller back to float64
+        # while the append helper kept int64 (n=0 returned 6, not 136).  The
+        # float64 is the planner's ``declared()`` default for the unannotated
+        # loop target ``x``, imposed on the arena by the builder's iterable
+        # binding before the append settles the row concordance to int64.
+        # That writer is the open fault; this sweep does not paper over it.
         for value in values:
             dtype = canonical_dtypes.get(int(value.id))
-            if dtype is not None:
-                value.dtype = dtype
+            if dtype is None:
+                continue
+            value.dtype = dtype
 
     # Native heap cell/owner contracts cross the SAME exact linked call edge
     # as its values. Raw ptr alone cannot state pointer-cell storage at the
@@ -53635,6 +53850,13 @@ def _class_surface_ssa_program(
     compile_substage("correlate physical sequence helper value types")
     for function in compile_iter(all_functions.values(), "sequence-helper-types",
             label="Sequence helper value types correlated"):
+        # An accepted body's actuals were typed by its own book (unit 33
+        # retyped IdentityPage._reindex's value 25 from int64 to int here).
+        from .ssa_record_return_state import (
+            accepted_ssa_component as _accepted_helper_caller,
+        )
+        if _accepted_helper_caller(function):
+            continue
         occurrences: dict[int, list[SSAValue]] = {}
         for value in function.args:
             occurrences.setdefault(int(value.id), []).append(value)
@@ -56451,6 +56673,12 @@ def _lower_ast_source_to_ssa_impl(
     from .assignment_normalization import normalize_destructuring_assignments
 
     compile_substage("source normalisation: authored control and record schemas")
+    short_circuit_receipts = _normalize_binary_short_circuit(tree)
+    if short_circuit_receipts:
+        report(
+            "ssa-source: normalized "
+            f"{len(short_circuit_receipts)} n-ary short-circuit operator(s)"
+        )
     none_default_receipts = _normalize_none_default_assignments(tree)
     if none_default_receipts:
         report(

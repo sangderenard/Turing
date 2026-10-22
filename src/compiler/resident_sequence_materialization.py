@@ -690,6 +690,27 @@ def _source_optional_glyph_materializations(graph_obj: Any):
     )
 
 
+def _loop_carried_initial_ids(graph_obj) -> frozenset[int]:
+    """Entry-arm identities of every loop's carried bindings.
+
+    The reducer records ``loop_carried_bindings[name] = (initial, updated)``
+    on each loop.  Inside the loop the graph names a carried value by its
+    INITIAL producer; that producer (often a literal) is the entry arm of the
+    loop's Phi, not an invariant.  Every consumer that would read such a node
+    as a constant reads this record instead of the literal.
+    """
+
+    return frozenset(
+        int(initial)
+        for _loop_id, data in graph_obj.nodes(data=True)
+        for initial, _updated in (
+            (data.get("attributes") or {}).get(
+                "loop_carried_bindings", {}
+            ) or {}
+        ).values()
+    )
+
+
 def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
     """Graph-derived storage aliases for loop-carried in-place mutation.
 
@@ -1905,6 +1926,25 @@ def _joined_byte_sequence_ids(
     return tuple(sorted(joined))
 
 
+def _scalar_constant_member(row: Mapping[str, Any]) -> Any:
+    """The literal a folded aggregate member carries, or None.
+
+    Only a Constant node's own recorded literal counts; an aggregate member
+    (a nested tuple/list) is not a scalar literal.
+    """
+
+    if str(row.get("type")) != "Constant":
+        return None
+    attributes = row.get("attributes") or {}
+    if attributes.get("aggregate_kind") is not None:
+        return None
+    expression = row.get("expr_obj")
+    if isinstance(expression, ast.Constant):
+        return expression.value
+    literal = attributes.get("value", row.get("constant"))
+    return literal if isinstance(literal, (bool, int, float, str)) else None
+
+
 def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tuple[Any, ...]:
     """Publish ordinary list rows at their exact authored construction site.
 
@@ -1926,18 +1966,19 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
     aggregate_scope = graph_obj.graph.get("source_aggregate_layout_scope")
     aggregate_page = current_identity_book().page(SOURCE_AGGREGATE_LAYOUT)
     mutations = []
+    nodes_by_value: dict[int, list[int]] = {}
+    for candidate_id, candidate in graph_obj.nodes(data=True):
+        nodes_by_value.setdefault(
+            int(candidate.get("value_id", candidate_id)), []
+        ).append(candidate_id)
     for node_id, data in graph_obj.nodes(data=True):
         sequence_id = int(data.get("value_id", node_id))
         expression = data.get("expr_obj")
         attributes = data.get("attributes") or {}
-        if (sequence_id not in accepted or not isinstance(expression, ast.List)
-                or not expression.elts
+        if (sequence_id not in accepted
                 or attributes.get("producer_kind") != "aggregate"
                 or attributes.get("materialization_kind") is not None):
             continue
-        parents = tuple((int(parent), graph_obj.nodes[parent])
-                        for parent, role in data.get("parents", ())
-                        if str(role).startswith("elts") and parent in graph_obj)
         layout = (
             aggregate_page.latest((aggregate_scope, sequence_id))
             if aggregate_scope is not None else None
@@ -1948,35 +1989,69 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             and str(layout.aggregate_kind) == "list"
             else ()
         )
-        if layout_members and len(layout_members) != len(expression.elts):
+        # Program: ``xs = [5, 7, 11]; return xs[n]`` (c36_literal_index_param).
+        # Wrong record: the structural fold turned the all-constant List into
+        # a Constant node (no AST, no ``elts`` edges), and this birth keyed on
+        # ``isinstance(expr_obj, ast.List)``, so the arena kept its zero
+        # length and every ``xs[n]`` read 0.  Rule: the list birth is the
+        # SOURCE_AGGREGATE_LAYOUT record's ordered members; the AST, when it
+        # survives, only refines a member's spelling.
+        if isinstance(expression, ast.List):
+            if not expression.elts:
+                continue
+            elements = tuple(expression.elts)
+        elif layout_members:
+            elements = (None,) * len(layout_members)
+        else:
+            continue
+        parents = tuple((int(parent), graph_obj.nodes[parent])
+                        for parent, role in data.get("parents", ())
+                        if str(role).startswith("elts") and parent in graph_obj)
+        if layout_members and len(layout_members) != len(elements):
             raise ValueError(
                 f"List {sequence_id} aggregate layout has "
                 f"{len(layout_members)} member(s), source has "
-                f"{len(expression.elts)}"
+                f"{len(elements)}"
             )
         rows = []
-        for ordinal, element in enumerate(expression.elts):
+        for ordinal, element in enumerate(elements):
             member_id = (
                 layout_members[ordinal] if layout_members else None
             )
-            exact = tuple(
-                (parent, row) for parent, row in parents
-                if (
-                    int(row.get("value_id", parent)) == int(member_id)
-                    if member_id is not None
-                    else row.get("expr_obj") is element
+            if element is None:
+                exact = tuple(
+                    (int(parent), graph_obj.nodes[parent])
+                    for parent in nodes_by_value.get(int(member_id), ())
                 )
-            )
+            else:
+                exact = tuple(
+                    (parent, row) for parent, row in parents
+                    if (
+                        int(row.get("value_id", parent)) == int(member_id)
+                        if member_id is not None
+                        else row.get("expr_obj") is element
+                    )
+                )
             if len(exact) != 1 or isinstance(element, ast.Starred):
                 raise ValueError(f"List {sequence_id} lacks one exact element producer")
             parent, row = exact[0]
             value_id = int(row.get("value_id", parent))
-            leaves = tuple(map(int, (row.get("attributes") or {}).get(
+            row_attributes = row.get("attributes") or {}
+            leaves = tuple(map(int, row_attributes.get(
                 "aggregate_leaf_value_ids", ())))
-            arguments = (leaves if isinstance(element, ast.Tuple) and leaves else (value_id,))
+            is_tuple = (
+                isinstance(element, ast.Tuple) if element is not None
+                else row_attributes.get("aggregate_kind") == "tuple"
+            )
+            arguments = (leaves if is_tuple and leaves else (value_id,))
             expressions = ()
-            if isinstance(element, ast.Constant) and isinstance(element.value, (bool, int, float, str)):
-                literal = string_token(element.value) if isinstance(element.value, str) else element.value
+            literal = (
+                element.value if isinstance(element, ast.Constant)
+                else _scalar_constant_member(row) if element is None
+                else None
+            )
+            if isinstance(literal, (bool, int, float, str)):
+                literal = string_token(literal) if isinstance(literal, str) else literal
                 expressions = (ControlExpression("const", literal=literal),)
             rows.append(ControlSequenceMutation(
                 sequence_value_id=sequence_id, operator="append",

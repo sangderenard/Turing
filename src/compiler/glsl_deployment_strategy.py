@@ -2890,10 +2890,32 @@ def _build_shell_hierarchy_plan(
                     or abi_shape
                     else tuple(int(dim) for dim in shape if int(dim) != 1)
                 )
+                # Program: ``for x in xs`` over a local list of ints
+                # (c25_list_static_membership).  Wrong record: an untyped
+                # Input took the DomainNode's provisional float64 although the
+                # descriptor rule proves its type (here the list's appends).
+                # Rule: an Input with no declared tensor/specialization/node
+                # dtype is described by the planner's descriptor rule; the
+                # domain default is only the last resort.
+                described_dtype = None
+                if (
+                    node.get("type") == "Input"
+                    and not tensor.get("dtype")
+                    and getattr(specialization, "dtype", None) is None
+                    and not node.get("dtype")
+                ):
+                    described = planned_descriptor(int(current))
+                    if (
+                        isinstance(described, Mapping)
+                        and described.get("dtype")
+                        and not tuple(described.get("shape") or ())
+                    ):
+                        described_dtype = str(described["dtype"])
                 dtype = str(
                     tensor.get("dtype")
                     or getattr(specialization, "dtype", None)
                     or node.get("dtype")
+                    or described_dtype
                     or getattr(domain, "dtype", None)
                     or "float64"
                 )
@@ -7982,11 +8004,15 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
             }
         elif isinstance(expression, ast.BoolOp):
             # Only the first operand of a short-circuiting operator is
-            # guaranteed to run; the rest are guarded by its outcome.
+            # guaranteed to run; the rest are guarded by its outcome.  The
+            # operator is the conditional ``b if a else a`` (``and``) or
+            # ``a if a else b`` (``or``): its guarded operands ARE that
+            # conditional's body or orelse arm (``_short_circuit_control_
+            # program``), so they carry that arm's role.
             branches = {
-                f"operand:{index}": (value,)
-                for index, value in enumerate(expression.values)
-                if index
+                "body" if isinstance(expression.op, ast.And) else "orelse": tuple(
+                    expression.values[1:]
+                ),
             }
         else:
             continue
@@ -8133,6 +8159,109 @@ def _post_source_optional_glyph_carries(
         retained.append(cell)
     return tuple(dict.fromkeys(retained))
 
+def _short_circuit_control_program(
+    graph: Any,
+    control_id: int,
+    expression: ast.BoolOp,
+    memberships: Mapping[int, frozenset[tuple[int, str]]],
+    retained: frozenset[int],
+    subgraphs: tuple[Any, ...],
+) -> ControlProgram | None:
+    """The conditional a short-circuit operator owns over its guarded work.
+
+    Program: ``if d != 0 and 10 // d > 1:`` (c41_and_guard_div).  Wrong
+    record: ``_branch_compartments`` recorded ``10 // d`` as guarded by the
+    BoolOp (``operand:1``), but no control program owned that membership, so
+    its region ran in the flat schedule and the native program trapped on
+    ``d == 0`` where Python never evaluates the division.  Rule: ``a and b``
+    IS ``b if a else a`` and ``a or b`` IS ``a if a else b`` (one evaluation
+    of ``a``); the operator's node is the merge of the two arms, exactly as
+    an IfExp node is, and the guarded operand's regions and calls run only
+    in its arm.  Source normalization makes every authored BoolOp binary
+    (``a and b and c`` -> ``a and (b and c)``), so the second operand is the
+    whole guarded arm, recorded by ``_branch_compartments`` under that arm's
+    role.  Every BoolOp is this conditional, in a test or a value context
+    (``x = n or 7``): the merge is the operator's one definition, so no
+    eager ``Select``/``LAnd`` evaluates a guarded operand beside the first.
+    """
+
+    from .control_source import ConditionalBlock, ControlExpression
+
+    if len(expression.values) != 2:
+        raise ValueError(
+            "short-circuit operator reached control construction with "
+            f"{len(expression.values)} operands; source normalization makes "
+            f"every BoolOp binary (node {control_id})"
+        )
+    data = graph.G.nodes.get(int(control_id))
+    if data is None:
+        return None
+    parents = {
+        str(role): int(parent)
+        for parent, role in data.get("parents") or ()
+        if parent in graph.G
+    }
+    if "value:0" not in parents or "value:1" not in parents:
+        return None
+    guard = (
+        int(control_id),
+        "body" if isinstance(expression.op, ast.And) else "orelse",
+    )
+    arm_regions = tuple(
+        region_index
+        for region_index, subgraph in enumerate(subgraphs)
+        if region_index in retained
+        and any(
+            guard in memberships.get(int(node_id), ())
+            for node_id in subgraph.G.graph.get("deployment_nodes", ())
+        )
+    )
+    arm_callsites = tuple(sorted(
+        int(node_id)
+        for node_id, roles in memberships.items()
+        if guard in roles
+        and int(node_id) in graph.G
+        for node in (graph.G.nodes[int(node_id)],)
+        if str(node.get("op") or node.get("type") or "").casefold() == "call"
+        or (
+            isinstance(node.get("expr_obj"), ast.Call)
+            and any((node.get("attributes") or {}).get(key) is not None
+                    for key in ("method_ref", "callee_ref"))
+        )
+    ))
+
+    def value_of(node_id: int) -> int:
+        return int(graph.G.nodes[int(node_id)].get("value_id", node_id))
+
+    first = value_of(parents["value:0"])
+    second = value_of(parents["value:1"])
+    merged = value_of(int(control_id))
+    guarded = SequenceBlock(tuple(
+        StatementBlock((f"__scheduled_region_{index}__",))
+        for index in arm_regions
+    ))
+    conjunction = isinstance(expression.op, ast.And)
+    return ControlProgram(
+        root=SequenceBlock((ConditionalBlock(
+            int(first),
+            guarded if conjunction else SequenceBlock(()),
+            None if conjunction else guarded,
+            predicate_expression=ControlExpression("value", value_id=first),
+            source_node_id=int(control_id),
+            body_callsite_ids=arm_callsites if conjunction else (),
+            orelse_callsite_ids=() if conjunction else arm_callsites,
+            result_aliases=(
+                (second, first, merged) if conjunction
+                else (first, second, merged),
+            ),
+            short_circuit_operator=(
+                "logical_and" if conjunction else "logical_or"
+            ),
+        ),)),
+        region_indices=arm_regions,
+    )
+
+
 def _ordinary_conditional_control_programs(
     graph: Any,
     retained_regions: Iterable[int],
@@ -8181,6 +8310,15 @@ def _ordinary_conditional_control_programs(
             # post-merge consumers remain straight-line.
             continue
         expression = record.get("expression")
+        if isinstance(expression, ast.BoolOp):
+            boolean_program = _short_circuit_control_program(
+                graph, int(control_id), expression, memberships,
+                retained, subgraphs,
+            )
+            if boolean_program is not None:
+                programs.append(boolean_program)
+                program_expressions.append((int(control_id), expression))
+            continue
         if not isinstance(expression, (ast.If, ast.IfExp)):
             continue
         is_expression = isinstance(expression, ast.IfExp)
@@ -8841,6 +8979,13 @@ def _nest_region_less_conditionals(
         return start, int(getattr(expression, "end_lineno", start))
 
     def arm_statements(expression: ast.AST, arm: str):
+        if isinstance(expression, ast.BoolOp):
+            # The guarded operand is the body of ``and`` and the orelse of
+            # ``or`` (``_short_circuit_control_program``).
+            guarded_arm = (
+                "body" if isinstance(expression.op, ast.And) else "orelse"
+            )
+            return list(expression.values[1:]) if arm == guarded_arm else []
         statements = getattr(expression, arm)
         return statements if isinstance(statements, list) else [statements]
 
@@ -9283,6 +9428,15 @@ def _source_control_nesting_hints(
                 )
                 descendants = tuple(member for statement in statements
                                     for member in ast.walk(statement))
+            elif isinstance(parent_expression, ast.BoolOp):
+                # Only the guarded operand is the operator's arm; the first
+                # operand runs before its branch (c07_bool_logic: the inner
+                # ``a > 0 and b > 0`` of ``(...) or flag``).
+                descendants = tuple(
+                    member
+                    for operand in parent_expression.values[1:]
+                    for member in ast.walk(operand)
+                )
             else:
                 descendants = tuple(ast.walk(parent_expression))
             child_signature = _ast_source_signature(child_expression)
@@ -9382,6 +9536,14 @@ def _source_control_nesting_hints(
                 ("body", 0, parent.body),
                 ("orelse", 0, parent.orelse),
             ))
+        elif isinstance(parent, ast.BoolOp):
+            fields.extend(
+                (
+                    "body" if isinstance(parent.op, ast.And) else "orelse",
+                    0, operand,
+                )
+                for operand in parent.values[1:]
+            )
 
         matches = []
         for slot, ordinal, member in fields:
@@ -16890,14 +17052,17 @@ def _publish_conditional_tuple_members(
     # and one presence member, each a result merge of the source conditional,
     # replace the merged handle; presence tests read the presence member and
     # every other consumer must be guarded by it.
-    def constant(value, origin, *cells):
+    def constant(value, origin, *cells, inactive=False):
         node = next_process_value_id(graph)
         graph.G.add_node(
             node, type="Constant", op="const", value_id=node,
             constant=value, parents=[], children=[],
             **({"tensor": {"shape": (), "dtype": "bool"}}
                if isinstance(value, bool) else {}),
-            attributes={"value": value, "conditional_result_of": int(origin)},
+            attributes={
+                "value": value, "conditional_result_of": int(origin),
+                **({"optional_inactive_payload": True} if inactive else {}),
+            },
         )
         post_derived_node_identity(
             graph, node, tuple(cell for cell in cells if cell is not None),
@@ -16980,7 +17145,8 @@ def _publish_conditional_tuple_members(
             if kind == "none":
                 presences.append(constant(False, node_id, arm_cell))
                 payloads.append(tuple(
-                    constant(0, node_id, arm_cell) for _ in range(width)
+                    constant(0, node_id, arm_cell, inactive=True)
+                    for _ in range(width)
                 ))
                 continue
             if kind == "tuple":
@@ -20609,6 +20775,61 @@ def _tensor_descriptor_rule(
             described = descriptor_from_shape_transformation_state(state)
             if described is not None:
                 return described
+            # Program: ``xs = []; for i in range(6): xs.append(i * 2 + n)``
+            # then ``for x in xs`` (c25_list_static_membership).  Wrong
+            # record: the target took the descriptor domain's provisional
+            # float64, the builder imposed it on the arena's ``ssa_value``
+            # row, and the list of ints was stored and summed as doubles
+            # while its sequence row concorded int64.  Rule: a single-column
+            # local list's row is what its authored appends (and literal
+            # leaves) put in it; when every one of them describes the same
+            # scalar, that is the target's descriptor.
+            iterable_attributes = graph.G.nodes[iterable].get("attributes") or {}
+            if (
+                len(targets) == 1
+                and iterable_attributes.get("aggregate_kind") == "list"
+            ):
+                _retain_source_sequence_mutation_records(graph.G)
+                node_by_value = {
+                    int(member_data.get("value_id", member)): int(member)
+                    for member, member_data in graph.G.nodes(data=True)
+                }
+                row_values = [
+                    int(argument)
+                    for record in (
+                        graph.G.graph.get("source_sequence_mutation_records")
+                        or {}
+                    ).values()
+                    if int(record.get("sequence_value_id", -1))
+                    == iterable_value
+                    and str(record.get("operator")) == "append"
+                    for argument in tuple(
+                        record.get("argument_value_ids") or ()
+                    )[:1]
+                ]
+                row_values.extend(map(int, iterable_attributes.get(
+                    "aggregate_leaf_value_ids", ()
+                )))
+                row_descriptors = [
+                    _tensor_descriptor(graph, node_by_value[value], seen)
+                    if value in node_by_value else None
+                    for value in row_values
+                ]
+                agreed = {
+                    (tuple(item.get("shape") or ()), str(item.get("dtype")))
+                    for item in row_descriptors
+                    if isinstance(item, Mapping)
+                }
+                if (
+                    row_descriptors
+                    and all(isinstance(item, Mapping) for item in row_descriptors)
+                    and len(agreed) == 1
+                    and next(iter(agreed))[0] == ()
+                    and next(iter(agreed))[1] not in {"", "None", "unknown"}
+                ):
+                    return {
+                        "shape": (), "dtype": next(iter(agreed))[1], "rank": 0,
+                    }
             break
     if "shape" not in tensor and data.get("type") == "Input":
         binding_name = (data.get("attributes") or {}).get("binding_name")
@@ -21897,15 +22118,10 @@ def _fold_callsite_structural_values(
             }:
                 pending_bases.extend(int(parent) for parent, role in base.get("parents") or ()
                                      if str(role) == "base")
-    loop_carried_initial_ids = {
-        int(initial)
-        for _loop_id, data in graph.G.nodes(data=True)
-        for initial, _updated in (
-            (data.get("attributes") or {}).get(
-                "loop_carried_bindings", {}
-            ).values()
-        )
-    }
+    from .resident_sequence_materialization import (
+        _loop_carried_initial_ids,
+    )
+    loop_carried_initial_ids = set(_loop_carried_initial_ids(graph.G))
 
     def constant(data: Mapping[str, Any]) -> Any:
         try:
@@ -23568,8 +23784,22 @@ def _fold_callsite_structural_values(
                     # aggregate's ledger is its member Phis by position
                     # (the reducer's conditional layout), so the projection
                     # by literal index IS that member.
+                    # Program: ``index = 0`` then ``for k in range(n): total
+                    # += everything[index]; index += 1`` over a literal list
+                    # (c35_index_carried_for).  Wrong record: the index's
+                    # graph parent is the literal 0 that is the ENTRY arm of
+                    # the loop's carried Phi; reading it as the index folded
+                    # every iteration to ``everything[0]`` (n=3 gave 15, not
+                    # 23).  Rule: a loop-carried initial is not an invariant
+                    # (``loop_carried_initial_ids``, the record this pass
+                    # already keeps out of ``known``), and neither is a
+                    # mutated or carried base's initializer ledger; neither
+                    # proves a projection.
                     if (
-                        base_attributes.get("producer_kind")
+                        index_ids[0] not in loop_carried_initial_ids
+                        and base_ids[0] not in loop_carried_initial_ids
+                        and base_ids[0] not in mutated_sequence_ids
+                        and base_attributes.get("producer_kind")
                         in {"aggregate", "aggregate_phi"}
                         and leaves
                         and all(int(leaf) in graph.G for leaf in leaves)

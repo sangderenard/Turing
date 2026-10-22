@@ -517,3 +517,44 @@ def _normalize_none_default_assignments(
     if receipts:
         ast.fix_missing_locations(tree)
     return tuple(receipts)
+
+
+def _normalize_binary_short_circuit(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """Right-nest every n-ary ``and``/``or`` into binary operators.
+
+    Python evaluates ``a and b and c`` exactly as ``a and (b and c)``: the
+    same operands, in the same order, each at most once, with the same
+    result value.  A binary operator's second operand is then the whole
+    guarded remainder, which is the arm the short-circuit conditional owns
+    (``_short_circuit_control_program``).  The nested operator spans its
+    operands' authored source, so lexical ownership reads real extents.
+    """
+
+    receipts: list[dict[str, Any]] = []
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_BoolOp(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if len(node.values) <= 2:
+                return node
+            receipts.append({
+                "line": int(getattr(node, "lineno", -1)),
+                "column": int(getattr(node, "col_offset", -1)),
+                "operands": len(node.values),
+                "operator": type(node.op).__name__,
+            })
+            remainder = node.values[-1]
+            for operand in reversed(node.values[1:-1]):
+                nested = ast.BoolOp(op=type(node.op)(), values=[operand, remainder])
+                nested.lineno = operand.lineno
+                nested.col_offset = operand.col_offset
+                nested.end_lineno = remainder.end_lineno
+                nested.end_col_offset = remainder.end_col_offset
+                remainder = nested
+            node.values = [node.values[0], remainder]
+            return node
+
+    Rewriter().visit(tree)
+    return tuple(receipts)

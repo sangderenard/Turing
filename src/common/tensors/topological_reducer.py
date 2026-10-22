@@ -21603,14 +21603,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 ((id(expression.operand), "operand"),),
             )
         elif isinstance(expression, ast.BoolOp):
+            # The guarded operand is ordinary work owned by the operator's
+            # short-circuit arm (``_short_circuit_control_program``), never
+            # coordinator work evaluated beside the first operand.
             data.setdefault("attributes", {})["source_type"] = "BoolOp"
-            for value in expression.values[1:]:
-                value_id = id(value)
-                if value_id in graph.G:
-                    graph.G.nodes[value_id].setdefault(
-                        "attributes",
-                        {},
-                    )["coordinator_short_circuit"] = True
             _replace_inputs(
                 graph,
                 node_id,

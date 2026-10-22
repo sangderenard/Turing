@@ -161,6 +161,21 @@ class TransformationLedger:
             )
             if previous == (rule, proof) and after == decision[2] and not refreshed:
                 return True
+            # Program: ``relay(state)`` specialized to the caller's record
+            # (test_callsite_specializes_generic_state_parameter_to_caller_
+            # record).  Wrong record: the caller's formal row records no
+            # physical dtype, ``('float64', (), None, None)``, and the
+            # callee's output records ``'float64'``; the equal-rank tie
+            # raised as a conflict.  Rule: an unrecorded field is the absence
+            # of a claim (as ``concord_sequence_row_dtypes`` reads
+            # ``unknown``); a proposal that agrees on every recorded field
+            # and only records more refines the decision.
+            if (
+                not refreshed
+                and rank == old_rank
+                and _refines(decision[2], after)
+            ):
+                refreshed = True
             if rank <= old_rank and not refreshed:
                 if self.concordant_ties and rank == old_rank and after != decision[2]:
                     raise TransformationConflict(
@@ -225,6 +240,21 @@ class TransformationLedger:
     def incumbent_priority(self, identity: Hashable) -> int | None:
         decision = self._decision(identity)
         return None if decision is None else self.rules[decision[0]].priority
+
+
+def _refines(incumbent, proposed) -> bool:
+    """Whether ``proposed`` states every field ``incumbent`` records, plus
+    at least one field ``incumbent`` leaves unrecorded (``None``)."""
+
+    if not (
+        isinstance(incumbent, tuple) and isinstance(proposed, tuple)
+        and len(incumbent) == len(proposed) and incumbent != proposed
+    ):
+        return False
+    return all(
+        old is None or old == new
+        for old, new in zip(incumbent, proposed)
+    )
 
 
 def frame_transformation_ledger(scope: Hashable = None) -> TransformationLedger:

@@ -190,6 +190,94 @@ Open: a statement-level merge with an optional call or `None` arm
 (`if c: fork = f(x) else: fork = None`) still has no presence member; the
 planner's aggregate merge leaves such arms out.
 
+## Carried indices, literal lists and the while test
+
+Corpus programs c35-c40 index a list by a value that changes per iteration.
+All failed on base, not only on this branch.
+
+- **Carried index folded.** `index = 0; for ...: total += xs[index];
+  index += 1` read `xs[0]` every iteration. Two consumers read the index
+  operand's graph parent, the literal 0, as an invariant. That literal is the
+  entry arm of the loop's carried Phi. The consumers are the structural fold's
+  aggregate alias (`_fold_callsite_structural_values`) and the shell's row-op
+  recovery (`_sequence_row_operations.integer_literal`). Both now consult one
+  reader of the reducer's `loop_carried_bindings`
+  (`_loop_carried_initial_ids`).
+- **Literal list never written.** `xs = [5, 7, 11]; return xs[n]` returned 0.
+  The all-constant list had been folded to a Constant node, and the list birth
+  (`_list_literal_mutations`) keyed on the AST being `ast.List`. The birth now
+  reads the list's SOURCE_AGGREGATE_LAYOUT members and takes each member from
+  the graph by identity.
+- **While-test region outside the loop.** A region that a while test
+  evaluates lexically (`everything[index]` in `while index < count and ...`)
+  was scheduled after the loop. Only the test root counted as the condition,
+  so the header and latch read a value defined at `while_exit` (bootstrap
+  unit 43, use-not-dominated). The condition is now the test root's dataflow
+  ancestors inside the test's source span.
+
+## Short-circuit operators
+
+`if d != 0 and 10 // d > 1` trapped with SIGFPE at `d == 0`. The reducer
+recorded the division as guarded by the BoolOp, but no control program owned
+that membership. The shell also had a second evaluator: structural recovery
+lowered BoolOps as eager `Select` chains. As a result `x = d and 60 // d` had
+no definition, and `x = n or 7` lost its parameter.
+
+The operator is now what Python says it is. `a and b` is `b if a else a`;
+`a or b` is `a if a else b`.
+
+- **Source normalization.** It makes every BoolOp binary
+  (`a and (b and c)`), with a receipt.
+- **Membership.** The guarded operand is recorded under the conditional's
+  `body` (and) or `orelse` (or) arm. It is no longer coordinator work.
+- **Control program.** `_short_circuit_control_program` builds the
+  ConditionalBlock. Its result alias merge is the BoolOp node's one
+  definition.
+- **Consumers.** Control expressions read a merged value as a leaf, in
+  `_attach_graph_control_expressions` and in while predicates. Overlay
+  nesting reads only the guarded operand as the arm. The while-predicate
+  rehome does not treat a merged node as predicate work.
+
+Lowering made this visible in three places:
+
+- **Latch incoming block.** When the latch test owns a conditional, the
+  header Phis' backedge incoming block is the block that branches back.
+- **Latch redefinition.** A second definition of an already-defined value at
+  the latch is now a VERSIONED_WRITE. Before, it reused the SSAValue object,
+  and region calls keep argument copies by id that the redefinition clone
+  never reached.
+- **Read positions.** `_graph_control_expression` leaves carry the operand
+  position they are read at, so a carried name resolves through its
+  `lexical_read_binding`. Before, it resolved to the pre-loop literal (c47).
+
+Corpus c41-c49 cover `and`/`or` guards in `if` and `while`, n-ary chains,
+guarded calls, guards inside loops and value contexts.
+
+## Typed loop targets and the d10dce2 follow-ups
+
+- **Loop-target type.** In `for x in xs`, `xs` is a local list built by
+  appends (c25). The planner's `declared()` took the DomainNode's provisional
+  float64 for the untyped Input `x`. The builder then imposed that dtype on
+  the arena row, and the helpers disagreed with the int64 the sequence row
+  concorded.
+  - The descriptor rule now gives a single-column local list's target the
+    descriptor its appends and literal leaves agree on.
+  - `declared()` asks the descriptor rule for an Input with no declared
+    tensor/specialization/node dtype before falling back to the domain.
+- **Rank 0 in the accounting view.** `_frame_accounting_from_posted`
+  mirrored a field only when `not in (None, False)`, so a recorded rank of 0
+  never mirrored. It now uses `_frame_field_recorded`.
+- **Equal-rank refinement.** The transformation ledger treats an equal-rank
+  proposal that agrees on every recorded field and only records more as a
+  refinement. Absence is not a claim.
+- **Test stand-in.** `tests/compiler_provenance_inputs.publish_authored_ssa`
+  posts the physical facts its authored accounting states, as a real
+  producer does.
+- **Open: `pieces` arena.** In test_forwarded_tuple_field, ensure's arena
+  row says `opaque_ref` when total's lease copies it. The shell's
+  canonical-sequence sweep retypes only the occurrences to float64, later.
+  The descriptor column dtype has to reach the arena's row at precompile.
+
 ## Open frontier (stated, not worked around)
 
 - Generic `str()`/`!r` of `Any`-typed facts (ten f-string units): needs a

@@ -169,7 +169,10 @@ def _frame_accounting_from_posted(accounting: Any, physical: Any) -> dict:
             ("arena", "sequence_arena"),
             ("device", "device"),
         ):
-            if physical.get(field) not in (None, False):
+            # A recorded rank of 0 is a fact (``0 == False`` made the old
+            # ``not in (None, False)`` test drop it: a scalar formal's
+            # ``program_abi_rank`` never mirrored its row).
+            if _frame_field_recorded(field, physical.get(field)):
                 accounting[label] = physical[field]
     return accounting
 

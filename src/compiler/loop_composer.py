@@ -5431,6 +5431,50 @@ def analyze_shader_loop_reductions(
         predicate_operation_values = expression_value_ids(
             while_predicate_expression
         )
+        # Program: ``while index < count and everything[index] ==
+        # position:`` inside a ``for`` (c37_while_in_for; bootstrap unit 43,
+        # ``_merge_partitions.<locals>.resident``).  Wrong record: the test's
+        # ``everything[index]`` is a ``value`` leaf of the predicate
+        # expression, so its row-load region (11) was left to "ordinary
+        # lexical ownership" -- but only the test ROOT was in ``condition``,
+        # and the region fell after the loop: the header and latch tests read
+        # a value defined at ``while_exit`` (use-not-dominated).  Rule: the
+        # ordinary lexical owner of a producer is the construct whose source
+        # extent contains it; a dataflow ancestor of the test root that lies
+        # inside the test's source span is evaluated by the test, at every
+        # header and latch.
+        if loop.source_type == "While" and loop.condition_nodes:
+            test_root = int(loop.condition_nodes[0])
+
+            def span_of(node_id: int):
+                span = graph.G.nodes[int(node_id)].get("source_span") or {}
+                if span.get("line") is None or span.get("end_line") is None:
+                    return None
+                return (
+                    (int(span["line"]), int(span.get("column") or 0)),
+                    (int(span["end_line"]), int(span.get("end_column") or 0)),
+                )
+
+            test_span = span_of(test_root) if test_root in graph.G else None
+            if test_span is not None:
+                pending_tests = [test_root]
+                while pending_tests:
+                    current = pending_tests.pop()
+                    for parent, _role in (
+                        graph.G.nodes[current].get("parents") or ()
+                    ):
+                        parent = int(parent)
+                        if parent in condition or parent not in graph.G:
+                            continue
+                        parent_span = span_of(parent)
+                        if (
+                            parent_span is None
+                            or parent_span[0] < test_span[0]
+                            or parent_span[1] > test_span[1]
+                        ):
+                            continue
+                        condition.add(parent)
+                        pending_tests.append(parent)
         condition_region_indices = tuple(
             index
             for index, nodes in enumerate(regions)

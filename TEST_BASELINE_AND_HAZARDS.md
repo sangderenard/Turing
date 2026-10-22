@@ -1,3 +1,37 @@
+2026-10-22 SHORT-CIRCUIT, CARRIED-INDEX AND LITERAL-LIST SEMANTICS (MEASURED):
+Native corpus (`tests/native_semantics_corpus`, C lane, run against the
+authored Python): 48/48 programs pass with 0 concordance findings. c35-c49 are
+new; each failed or trapped on base 913e4c2:
+- c35/c38: a loop-carried index read element 0.
+- c36/c39: a literal list read 0.
+- c37: a while-test row load ran after the loop.
+- c41-c47: `and`/`or` guards ran their guarded operand eagerly
+  (SIGFPE on `d != 0 and 10 // d`).
+- c48/c49: value-context BoolOps.
+Bootstrap snap5 (HEAD 7e23934 tree): 367 units; 244 failed, 73 partial,
+50 compiled-unverified; 28 units up and 0 down versus snap2. Unit 33 now
+compiles on a live replay against snap5's growth. That replay uses snap5's
+frozen graph, so a fresh bootstrap is still required.
+Focused suites (record/sequence/optional, 13 files): 22 failed versus 24 on
+base.
+Gate (49 files, run as four shards with --timeout 900): 126 failed versus
+128 in the previous full run. Three representation tests were updated: they
+asserted the eager `LAnd`/`LOr`, and now read the operator's merge Phi, which
+carries its `semantic_family`.
+test_sympy_process_graph_is_registered_before_python_dependency_pursuit is
+NONDETERMINISTIC on clean HEAD f4a48b3 (passed 1 of 3 runs); it is not a
+regression, and it is an open determinism fault. Six earlier failures were
+regressions from d10dce2. Fixed since:
+- a scalar's rank 0 was not mirrored by the accounting view;
+- the test stand-in posted no physical fields;
+- an equal-rank refinement raised.
+Still failing from that set: test_forwarded_tuple_field_has_one_sequence_
+resident. Ensure's `pieces` arena row is `opaque_ref` when total's lease is
+minted; the shell's reconcile sweep retypes only its occurrences to float64
+later.
+Open: f-strings stop at dynamic sequence growth in the C lane (task in doc 33).
+See docs/compiler_convergence/33_identity_repairs_and_bootstrap_chain_2026_10_22.md.
+
 2026-10-21 DETERMINISTIC OWNERSHIP/PUBLICATION REPAIR (UNVERIFIED):
 The 12:27 bootstrap receipts were diagnosed without compiling. Source repairs
 now transport accepted dependency proofs through digest-qualified IdentityBook

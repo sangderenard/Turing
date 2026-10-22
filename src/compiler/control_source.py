@@ -165,6 +165,10 @@ class ConditionalBlock(TiledObject):
     # explicit presence bit; lowering must not manufacture a scalar Phi for
     # the sequence identity.
     optional_glyph_carry_cells: tuple[Any, ...] = ()
+    # ``"logical_and"`` / ``"logical_or"`` when this block IS a short-circuit
+    # operator (``_short_circuit_control_program``): its result merge is the
+    # operator's definition and carries that semantic family.
+    short_circuit_operator: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3395,6 +3399,7 @@ def project_control_regions(
                 body_value_expressions=block.body_value_expressions,
                 orelse_value_expressions=block.orelse_value_expressions,
                 optional_glyph_carry_cells=block.optional_glyph_carry_cells,
+                short_circuit_operator=block.short_circuit_operator,
             )
         if isinstance(block, LoopBlock):
             body = project(block.body)
