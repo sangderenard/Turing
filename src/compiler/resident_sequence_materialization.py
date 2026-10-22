@@ -1274,6 +1274,7 @@ def _static_mapping_capacity_bounds(
     aliases = _loop_carried_storage_aliases(graph_obj)
     nonmutating_calls = set(map(int, nonmutating_call_ids))
     keys, copies, unknown = {}, {}, set()
+    set_universes: set[int] = set()
     for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
         attributes = data.get("attributes") or {}
@@ -1303,6 +1304,7 @@ def _static_mapping_capacity_bounds(
         # a keyed arena whose literal members are its key universe, exactly
         # as a dict display's keys are; any other writer unbounds it below.
         if isinstance(expression, ast.Set):
+            set_universes.add(int(node_id))
             try:
                 keys[int(node_id)] = {
                     ast.literal_eval(element) for element in expression.elts
@@ -1316,6 +1318,7 @@ def _static_mapping_capacity_bounds(
         ):
             # The structural fold's literal of an unchanged set display
             # (scratch c_n3): the same key universe, read from the literal.
+            set_universes.add(int(node_id))
             try:
                 keys[int(node_id)] = set(attributes["value"])
             except TypeError:
@@ -1339,7 +1342,12 @@ def _static_mapping_capacity_bounds(
     # two-member universe stood as the bound and every later add was
     # refused into a dropped status.  Rule: a retained insertion into a
     # keyed universe adds its literal key; any other key unbounds it.
-    for mutation in _sequence_append_call_mutations(graph_obj):
+    # Only a set universe is adjusted here (a dict's writers are the store
+    # and call scans below); with none, the records are not read -- a bare
+    # graph with no source scope has none to read.
+    for mutation in (
+        _sequence_append_call_mutations(graph_obj) if set_universes else ()
+    ):
         destination = int(aliases.get(
             int(mutation.sequence_value_id), int(mutation.sequence_value_id),
         ))
