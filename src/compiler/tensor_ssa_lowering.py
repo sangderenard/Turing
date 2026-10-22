@@ -36,6 +36,48 @@ from .ssa_aggregate_abi import (
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
 
 
+def _accounting_view(owner: Any, value: Any, module: Any, labels=None) -> dict:
+    """``value``'s accounting with its physical labels read from the row
+    ``owner`` posted for it (none when ``owner`` is unknown or has no row)."""
+
+    from .frame_identity_book import (
+        _frame_accounting_from_posted, _frame_physical_fields,
+    )
+
+    accounting = {**dict(value.accounting or {}), **dict(labels or {})}
+    if owner is None:
+        return accounting
+    return _frame_accounting_from_posted(
+        accounting,
+        _frame_physical_fields(owner, int(value.id), book=identity_book(module)),
+    )
+
+
+def _post_double_backed_boolean(owner: Any, value: Any, module: Any,
+                                sources: tuple = ()) -> None:
+    """The repository stores a Boolean tensor in double-backed spans.
+
+    Program: tensor comparison masks and Boolean reductions in
+    ``lower_tensor_calls_to_repository_ssa``.  Wrong record: the float64
+    physical dtype of a Boolean tensor was stamped on accounting alone, so its
+    ``ssa_value`` row kept no physical dtype.  Rule: the stamp is a REVISE of
+    the value's row (DERIVED from its previous cell and ``sources``), and the
+    accounting is a view of it."""
+
+    if owner is None:
+        return
+    from .concordance_declarations import TENSOR_SSA_LOWERING
+    from .ssa_record_return_state import revise_ssa_value
+
+    revise_ssa_value(
+        owner, int(value.id), dtype=value.dtype,
+        shape=tuple(value.shape or ()), stage=TENSOR_SSA_LOWERING,
+        sources=tuple(cell for cell in sources if cell is not None),
+        book=identity_book(module), physical={"physical_dtype": "float64"},
+    )
+    value.accounting = _accounting_view(owner, value, module)
+
+
 @dataclass(frozen=True, order=True)
 class TensorSSALoweringShortfall:
     function: str
@@ -1671,8 +1713,7 @@ def propagate_repository_ssa_call_metadata(
                 # carried across this transport edge is revised onto the
                 # target value's ``ssa_value`` row, DERIVED from the source
                 # value's cell (the edge's own source cell) and the target's
-                # previous cell; the accounting is then set FROM that fact (a
-                # value with no row keeps the source's literal).
+                # previous cell; the accounting is then set FROM that fact.
                 from .ssa_record_return_state import (
                     posted_ssa_value_fact as _posted_physical_fact,
                     revise_ssa_value as _revise_physical,
@@ -1689,18 +1730,7 @@ def propagate_repository_ssa_call_metadata(
                     book=_physical_book,
                     physical={"physical_dtype": str(source_physical_dtype)},
                 )
-                _physical_fact = _posted_physical_fact(
-                    function, int(value.id), book=_physical_book,
-                )
-                value.accounting = {
-                    **dict(value.accounting or {}),
-                    "physical_dtype": (
-                        _physical_fact.physical_dtype
-                        if _physical_fact is not None
-                        and _physical_fact.physical_dtype is not None
-                        else str(source_physical_dtype)
-                    ),
-                }
+                value.accounting = _accounting_view(function, value, module)
                 changed = True
             if (
                 source_aggregate
@@ -3197,7 +3227,6 @@ def lower_tensor_calls_to_repository_ssa(
                     if kernel is not None and formal_position is not None
                     and 0 <= formal_position < len(kernel.args) else None
                 )
-                kernel_fact = None
                 if kernel_owner is not None:
                     _revise_kernel_value(
                         kernel_owner, int(value.id), dtype=value.dtype,
@@ -3210,18 +3239,7 @@ def lower_tensor_calls_to_repository_ssa(
                         book=kernel_book,
                         physical={"physical_dtype": "float64"},
                     )
-                    kernel_fact = _posted_kernel_fact(
-                        kernel_owner, int(value.id), book=kernel_book,
-                    )
-                value.accounting = {
-                    **dict(value.accounting or {}),
-                    "physical_dtype": (
-                        kernel_fact.physical_dtype
-                        if kernel_fact is not None
-                        and kernel_fact.physical_dtype is not None
-                        else "float64"
-                    ),
-                }
+                value.accounting = _accounting_view(kernel_owner, value, module)
         linked_roots.add(callee)
         attributes = {
             key: value for key, value in source.attributes.items()
@@ -4395,10 +4413,39 @@ def lower_tensor_calls_to_repository_ssa(
                             selection_count, selection_count_def = constant(
                                 1, "int32"
                             )
+                            # Rule: post first; accounting is a view.  The
+                            # axis-dropping view's span storage and rank are
+                            # a REVISE of the result's row, DERIVED from the
+                            # source tensor's cell.
+                            if lowering_at[0] is not None:
+                                from .concordance_declarations import (
+                                    TENSOR_SSA_LOWERING as _INDEX_STAGE,
+                                )
+                                from .ssa_record_return_state import (
+                                    revise_ssa_value as _revise_index_view,
+                                    ssa_value_identity_cell as _index_cell,
+                                )
+                                _revise_index_view(
+                                    lowering_at[0], int(result.id),
+                                    dtype=result.dtype,
+                                    shape=tuple(result.shape or ()),
+                                    stage=_INDEX_STAGE,
+                                    sources=tuple(
+                                        cell for cell in (_index_cell(
+                                            lowering_at[0], int(source.id),
+                                            book=identity_book(module),
+                                        ),) if cell is not None
+                                    ),
+                                    book=identity_book(module),
+                                    physical={
+                                        "storage": "span",
+                                        "rank": int(source_rank - 1),
+                                    },
+                                )
                             result.accounting = {
-                                **dict(result.accounting or {}),
-                                "program_abi_storage": "span",
-                                "program_abi_rank": source_rank - 1,
+                                **_accounting_view(
+                                    lowering_at[0], result, module,
+                                ),
                                 "tensor_metadata_state": "dynamic",
                                 # Dropping the final axis leaves the leading
                                 # source extents contiguous at this pointer.
@@ -5187,7 +5234,6 @@ def lower_tensor_calls_to_repository_ssa(
                         )
                         _opcode_owner = lowering_at[0]
                         _opcode_book = identity_book(module)
-                        _opcode_fact = None
                         if _opcode_owner is not None:
                             _revise_opcode_value(
                                 _opcode_owner, int(result.id),
@@ -5210,34 +5256,12 @@ def lower_tensor_calls_to_repository_ssa(
                                     ),
                                 },
                             )
-                            _opcode_fact = _posted_opcode_fact(
-                                _opcode_owner, int(result.id),
-                                book=_opcode_book,
-                            )
-                        result.accounting = {
-                            **dict(result.accounting or {}),
-                            # Both authored C dispatch kernels take
-                            # ``double *`` outputs. Tensor comparison masks
-                            # may remain semantically Boolean while retaining
-                            # that physical storage ABI.
-                            "physical_dtype": (
-                                _opcode_fact.physical_dtype
-                                if _opcode_fact is not None
-                                and _opcode_fact.physical_dtype is not None
-                                else "float64"
-                            ),
-                        }
-                        if _opcode_fact is not None:
-                            # Accounting is the view of the posted storage
-                            # and rank, as it is of the physical dtype.
-                            if _opcode_fact.storage is not None:
-                                result.accounting["program_abi_storage"] = (
-                                    _opcode_fact.storage
-                                )
-                            if _opcode_fact.rank is not None:
-                                result.accounting["program_abi_rank"] = int(
-                                    _opcode_fact.rank
-                                )
+                        # Both authored C dispatch kernels take ``double *``
+                        # outputs; a Boolean mask keeps that physical ABI.
+                        # Accounting is the view of the posted row.
+                        result.accounting = _accounting_view(
+                            _opcode_owner, result, module,
+                        )
                     if opcode_contract[0] == "binary":
                         shaped_operands = [
                             tuple(operand.shape or ())
@@ -5318,10 +5342,9 @@ def lower_tensor_calls_to_repository_ssa(
                         tuple(value.shape or ())
                         and str(value.dtype or "").casefold() in {"bool", "i1"}
                     ):
-                        value.accounting = {
-                            **dict(value.accounting or {}),
-                            "physical_dtype": "float64",
-                        }
+                        _post_double_backed_boolean(
+                            lowering_at[0], value, module,
+                        )
                 if operation == "tensor" and source is not None:
                     sequence = resident_sequence(source)
                     row_shape: tuple[int, ...] | None = None
@@ -5780,12 +5803,27 @@ def lower_tensor_calls_to_repository_ssa(
                                 module, function, domain_row, domain_fact,
                                 (result, source),
                             )
+                        # A full reduction's result is a scalar: the shape
+                        # change is a REVISE of its row, as the domain row
+                        # just posted says (no in-place-only reshape).
                         result.shape = ()
+                        if lowering_at[0] is not None:
+                            from .concordance_declarations import (
+                                TENSOR_SSA_LOWERING as _REDUCTION_STAGE,
+                            )
+                            from .ssa_record_return_state import (
+                                revise_ssa_value as _revise_reduction,
+                            )
+                            _revise_reduction(
+                                lowering_at[0], int(result.id),
+                                dtype=result.dtype, shape=(),
+                                stage=_REDUCTION_STAGE,
+                                book=identity_book(module),
+                            )
                         if str(result.dtype or "").casefold() in {"bool", "i1"}:
-                            result.accounting = {
-                                **dict(result.accounting or {}),
-                                "physical_dtype": "float64",
-                            }
+                            _post_double_backed_boolean(
+                                lowering_at[0], result, module,
+                            )
                         prefix.extend((
                             flat_shape_def, flat_rank_def, flat_axis_def,
                             code_def,

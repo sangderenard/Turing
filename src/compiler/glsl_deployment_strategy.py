@@ -16622,6 +16622,214 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
     return changed
 
 
+def _publish_conditional_call_aggregate_merges(
+    graph: Any, function_table: Any,
+) -> bool:
+    """Complete a statement-level tuple merge once its call arm has a ledger.
+
+    Program: ``if f: t = pair(x) else: t = (7, 8)``; ``a, b = t``.  Wrong
+    record: the reducer builds an ``aggregate_phi`` (member Phis and the
+    conditional ``source_aggregate_layout`` row) only when both arms already
+    have layout rows; a call result gets its member ledger here, in planning,
+    so the merge stayed a plain Phi of the call's aggregate handle and the
+    literal tuple -- a value with no producer that the C lane typed float64.
+    Rule: when both arms carry an exact leaf ledger of one arity, the call
+    arm's layout is posted from its callsite projections (DERIVED from each
+    leaf's and the call's identity cells) and the merge becomes the same
+    ``aggregate_phi`` the reducer builds: one member Phi per differing
+    position, and the merged layout DERIVED from the conditional's cell and
+    both arm layouts.  Control lowering then expands it by that layout.
+    """
+
+    from .concordance_declarations import (
+        PLANNER_TENSOR_SPECIALIZATION, SOURCE_AGGREGATE_LAYOUT,
+        SourceAggregateLayout, SourceAggregateMember,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from ..common.tensors.topological_reducer import (
+        node_identity_cell, post_derived_node_identity,
+    )
+
+    scope = graph.G.graph.get("source_aggregate_layout_scope")
+    if scope is None:
+        return False
+    book = current_identity_book()
+    page = book.page(SOURCE_AGGREGATE_LAYOUT)
+
+    def layout_of(value_id: int):
+        cell = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, (scope, int(value_id)))
+        if cell is None:
+            return None, None
+        return page.cell(cell.row, cell.column), cell
+
+    def post_layout(value_id, kind, members, conditional_cell=None, arms=()):
+        fact = SourceAggregateLayout(
+            str(kind), tuple(members), conditional_cell, tuple(arms),
+        )
+        sources = [node_identity_cell(graph, int(value_id)), *arms]
+        if conditional_cell is not None:
+            sources.append(conditional_cell)
+        for member in members:
+            sources.append(member.value_cell)
+            sources.extend(member.source_cells)
+        cell = book.post(
+            SOURCE_AGGREGATE_LAYOUT, (scope, int(value_id)), fact,
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived(tuple(dict.fromkeys(
+                item for item in sources if item is not None
+            ))),
+            mode=Mode.CONCORD,
+        )
+        graph.G.nodes[int(value_id)].setdefault("attributes", {})[
+            "source_aggregate_layout_row"
+        ] = (scope, int(value_id))
+        return fact, cell
+
+    def arm_layout(value_id: int):
+        """The arm's layout row; a call arm's is posted from its ledger."""
+        layout, cell = layout_of(value_id)
+        if layout is not None:
+            return layout, cell
+        data = graph.G.nodes[int(value_id)]
+        attributes = data.get("attributes") or {}
+        leaves = _authored_aggregate_leaves(graph, int(value_id))
+        if (
+            str(data.get("type") or data.get("op") or "").casefold() != "call"
+            or attributes.get("aggregate_kind") != "tuple"
+            or not leaves
+            or any(int(leaf) not in graph.G for leaf in leaves)
+        ):
+            return None, None
+        reference = attributes.get("callee_ref")
+        if reference is None:
+            reference = attributes.get("method_ref")
+        try:
+            entry = function_table.entry(int(reference))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None, None
+        callee = getattr(entry, "graph", None)
+        if callee is None and (
+            getattr(entry, "metadata", None) or {}
+        ).get("host_ssa_module") is None:
+            return None, None
+        optional = (
+            _linked_optional_aggregate_record(entry) if callee is None
+            else _callee_optional_aggregate_members(callee)
+        )
+        if optional is not None:
+            return None, None
+        call_cell = node_identity_cell(graph, int(value_id))
+        members = tuple(
+            SourceAggregateMember(
+                int(leaf), node_identity_cell(graph, int(leaf)),
+                tuple(item for item in (call_cell,) if item is not None),
+            )
+            for leaf in leaves
+        )
+        if any(member.value_cell is None for member in members):
+            return None, None
+        return post_layout(int(value_id), "tuple", members)
+
+    def merge(merged_id, test_id, body_id, else_id, conditional_cell):
+        body, body_cell = arm_layout(body_id)
+        orelse, else_cell = arm_layout(else_id)
+        if not (
+            isinstance(body, SourceAggregateLayout)
+            and isinstance(orelse, SourceAggregateLayout)
+            and body.aggregate_kind == orelse.aggregate_kind
+            and len(body.members) == len(orelse.members)
+        ):
+            return None
+        incumbent, incumbent_cell = layout_of(merged_id)
+        if incumbent is not None:
+            return incumbent_cell
+        members = []
+        for index, (left, right) in enumerate(zip(body.members, orelse.members)):
+            member_sources = tuple(dict.fromkeys(filter(None, (
+                body_cell, else_cell, left.value_cell, right.value_cell,
+                *left.source_cells, *right.source_cells, conditional_cell,
+            ))))
+            if int(left.value_id) == int(right.value_id):
+                members.append(SourceAggregateMember(
+                    int(left.value_id), left.value_cell, member_sources,
+                ))
+                continue
+            member_id = next_process_value_id(graph)
+            left_tensor = graph.G.nodes[int(left.value_id)].get("tensor")
+            right_tensor = graph.G.nodes[int(right.value_id)].get("tensor")
+            graph.G.add_node(
+                member_id, type="Phi", op="Phi", value_id=member_id,
+                label=f"aggregate member {index}", parents=[], children=[],
+                attributes={
+                    "aggregate_parent_value_id": int(merged_id),
+                    "aggregate_index": int(index),
+                },
+                **({"tensor": copy.deepcopy(left_tensor)}
+                   if left_tensor is not None and left_tensor == right_tensor
+                   else {}),
+            )
+            post_derived_node_identity(
+                graph, member_id, member_sources,
+                stage=PLANNER_TENSOR_SPECIALIZATION,
+            )
+            _set_operands(graph, member_id, [
+                (int(test_id), "test"), (int(left.value_id), "body"),
+                (int(right.value_id), "orelse"),
+            ], cause=_AGGREGATE_MEMBER)
+            merge(
+                member_id, test_id, int(left.value_id), int(right.value_id),
+                conditional_cell,
+            )
+            members.append(SourceAggregateMember(
+                int(member_id), node_identity_cell(graph, member_id),
+                member_sources,
+            ))
+        attributes = graph.G.nodes[int(merged_id)].setdefault("attributes", {})
+        attributes.update({
+            "producer_kind": "aggregate_phi",
+            "aggregate_kind": str(body.aggregate_kind),
+            "aggregate_leaf_value_ids": tuple(
+                int(member.value_id) for member in members
+            ),
+        })
+        graph.G.nodes[int(merged_id)].pop("tensor", None)
+        return post_layout(
+            int(merged_id), body.aggregate_kind, members,
+            conditional_cell, (body_cell, else_cell),
+        )[1]
+
+    changed = False
+    for node_id, data in tuple(graph.G.nodes(data=True)):
+        if str(data.get("type") or "") != "Phi":
+            continue
+        attributes = data.get("attributes") or {}
+        if (
+            attributes.get("producer_kind") == "aggregate_phi"
+            or attributes.get("binding_name") is None
+        ):
+            continue
+        roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        if set(roles) != {"test", "body", "orelse"} or not all(
+            item in graph.G for item in roles.values()
+        ):
+            continue
+        # The conditional's cell, as the reducer names it: the ``If`` the
+        # test predicates, else the test value.
+        branches = tuple(
+            successor for successor in graph.G.successors(roles["test"])
+            if str(graph.G.nodes[successor].get("type") or "") == "If"
+        )
+        conditional_cell = node_identity_cell(
+            graph, branches[0] if len(branches) == 1 else roles["test"],
+        )
+        if merge(
+            int(node_id), roles["test"], roles["body"], roles["orelse"],
+            conditional_cell,
+        ) is not None:
+            changed = True
+    return changed
+
+
 def _invalidate_tensor_descriptor_dependents(
     graph: Any, source_ids: Any, reason: str, *, _dependents=None,
     source_cells: tuple = (),
@@ -17642,6 +17850,9 @@ def _propagate_callsite_tensor_specializations(
         candidates: dict[tuple[int, str], list[dict[str, Any]]] = {}
         for caller in graphs:
             conditional_changed = _publish_conditional_tuple_members(caller)
+            conditional_changed |= _publish_conditional_call_aggregate_merges(
+                caller, function_table,
+            )
             changed |= conditional_changed
             mutation_counts["conditional_members"] += int(conditional_changed)
             for _node_id, data in tuple(caller.G.nodes(data=True)):
@@ -22925,8 +23136,18 @@ def _fold_callsite_structural_values(
                         "aggregate_leaf_value_ids", ()
                     )))
                     index_value = constant(graph.G.nodes[index_ids[0]])
+                    # Program: ``if f: t = (x, y) else: t = (7, 8)``
+                    # then ``a, b = t`` (an ``aggregate_phi``).  Wrong
+                    # record: only a literal aggregate's ledger was read, so
+                    # ``t[0]`` stayed an Indexed of the merged tuple, which
+                    # no producer defines; the region took it as a public
+                    # input and the program returned 0.  Rule: a merged
+                    # aggregate's ledger is its member Phis by position
+                    # (the reducer's conditional layout), so the projection
+                    # by literal index IS that member.
                     if (
-                        base_attributes.get("producer_kind") == "aggregate"
+                        base_attributes.get("producer_kind")
+                        in {"aggregate", "aggregate_phi"}
                         and leaves
                         and all(int(leaf) in graph.G for leaf in leaves)
                         and isinstance(index_value, int)

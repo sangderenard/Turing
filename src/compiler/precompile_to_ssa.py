@@ -7269,6 +7269,10 @@ class _ControlSSABuilder(TiledObject):
                 view["program_abi_storage"] = fact.storage
             if fact.rank is not None and "program_abi_rank" in keys:
                 view["program_abi_rank"] = fact.rank
+            if fact.arena and "sequence_arena" in keys:
+                view["sequence_arena"] = True
+            if fact.physical_dtype is not None and "physical_dtype" in keys:
+                view["physical_dtype"] = fact.physical_dtype
         return view
 
     def _revise_value(
@@ -10624,7 +10628,6 @@ class _ControlSSABuilder(TiledObject):
             "compiler_frame_storage": str(self.function_name),
             "compiler_frame_sequence_id": value_id,
             "compiler_frame_member": 0,
-            "sequence_arena": True,
             "transformation_priority": "compiler_storage_identity",
             "transformation_tie_policy": "incumbent",
             "sequence_row_shape": proposed_column_shapes[0],
@@ -10661,6 +10664,10 @@ class _ControlSSABuilder(TiledObject):
             stage=self._stage(),
             physical={"arena": True},
         )
+        data.accounting = {
+            **dict(data.accounting or {}),
+            **self._posted_physical_accounting(data, ("sequence_arena",)),
+        }
         # Every storage cell of the descriptor descends from the data arena
         # (the authored sequence's value) and its contract cell.
         descriptor_operands = (data, self._sequence_contract_cell(int(value_id)))
@@ -10701,7 +10708,7 @@ class _ControlSSABuilder(TiledObject):
                 "compiler_frame_storage": str(self.function_name),
                 "compiler_frame_sequence_id": value_id,
                 "compiler_frame_member": int(index),
-                "sequence_arena": True,
+                **self._posted_physical_accounting(column, ("sequence_arena",)),
                 "sequence_row_shape": proposed_column_shapes[index],
                 "transformation_priority": "compiler_storage_identity",
                 "transformation_tie_policy": "incumbent",

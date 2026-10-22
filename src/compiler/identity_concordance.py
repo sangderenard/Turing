@@ -755,6 +755,45 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                 continue
             length = call.args[positions[0]]
             changed = False
+
+            def post_view(value_id, dtype, shape, physical=None):
+                """Program: a generator call whose projected row columns,
+                result and row loads take the callee descriptor's layout.
+                Wrong record: their occurrences were retyped and reshaped
+                in place (rank in accounting only) with no ``ssa_value``
+                revision.  Rule: one REVISE per value of its row, DERIVED
+                from the callee's sequence descriptor cell; the occurrences
+                and their accounting are views of that row."""
+
+                from .concordance_declarations import (
+                    KEEP_PHYSICAL, SEQUENCE_DESCRIPTOR as _DESCRIPTOR,
+                )
+                from .frame_identity_book import _frame_table_cell
+                from .ssa_record_return_state import revise_ssa_value
+
+                descriptor_cell = _frame_table_cell(
+                    table, int(descriptor.sequence_id), _DESCRIPTOR,
+                    function=callee,
+                )
+                revise_ssa_value(
+                    function, int(value_id), dtype=dtype, shape=tuple(shape),
+                    stage="projected_iterable_layout",
+                    sources=tuple(
+                        cell for cell in (descriptor_cell,) if cell is not None
+                    ),
+                    physical=KEEP_PHYSICAL if physical is None else physical,
+                )
+
+            def accounting_view(value, labels):
+                from .frame_identity_book import (
+                    _frame_accounting_from_posted, _frame_physical_fields,
+                )
+
+                return _frame_accounting_from_posted(
+                    {**dict(value.accounting or {}), **labels},
+                    _frame_physical_fields(function, int(value.id)),
+                )
+
             if call.res is not None:
                 result_id = int(call.res.id)
                 result_contract = tuple(
@@ -772,6 +811,13 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                     and len(result_contract[0]) >= 2
                     and result_contract[0][1] not in {None, "", "unknown"}
                     else call.res.dtype
+                )
+                post_view(
+                    result_id,
+                    result_dtype
+                    if result_dtype not in {None, "", "unknown"}
+                    else call.res.dtype,
+                    result_shape,
                 )
                 for value in occurrences:
                     if int(value.id) != result_id:
@@ -864,19 +910,30 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                     descriptor.column_dtypes[0]
                     if descriptor.column_dtypes else None
                 )
+                source_occurrence = next((
+                    value for value in occurrences
+                    if int(value.id) == source_id
+                ), None)
+                if source_occurrence is not None:
+                    post_view(
+                        source_id,
+                        str(column_dtype)
+                        if column_dtype not in {None, "", "unknown"}
+                        else source_occurrence.dtype,
+                        tuple(source_occurrence.shape or ()),
+                        {"rank": 1 + len(row_shape)},
+                    )
                 for value in occurrences:
                     if int(value.id) != source_id:
                         continue
                     if column_dtype not in {None, "", "unknown"}:
                         value.dtype = str(column_dtype)
-                    value.accounting = {
-                        **dict(value.accounting or {}),
+                    value.accounting = accounting_view(value, {
                         "sequence_id": int(descriptor.sequence_id),
                         "sequence_length_value_id": int(length.id),
                         "tensor_metadata_state": "dynamic",
                         "sequence_row_shape": row_shape,
-                        "program_abi_rank": 1 + len(row_shape),
-                    }
+                    })
                     changed = True
             for value in occurrences:
                 accounting = dict(value.accounting or {})
@@ -906,13 +963,19 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                     if column < len(descriptor.column_dtypes)
                     else value.dtype
                 )
+                post_view(
+                    int(value.id),
+                    str(column_dtype)
+                    if column_dtype not in {None, "", "unknown"}
+                    else value.dtype,
+                    tuple(value.shape or ()),
+                    {"rank": 1 + len(row_shape)},
+                )
                 if column_dtype not in {None, "", "unknown"}:
                     value.dtype = str(column_dtype)
-                value.accounting = {
-                    **value.accounting,
+                value.accounting = accounting_view(value, {
                     "sequence_row_shape": row_shape,
-                    "program_abi_rank": 1 + len(row_shape),
-                }
+                })
                 changed = True
             for block in function.blocks.values():
                 for instruction in block.instrs:
@@ -964,17 +1027,22 @@ def publish_projected_iterable_layouts(module: Any) -> None:
                         else instruction.res.dtype
                     )
                     target_id = int(instruction.res.id)
+                    post_view(
+                        target_id,
+                        str(column_dtype)
+                        if column_dtype not in {None, "", "unknown"}
+                        else instruction.res.dtype,
+                        row_shape, {"rank": len(row_shape)},
+                    )
                     for value in occurrences:
                         if int(value.id) != target_id:
                             continue
                         value.shape = row_shape
                         if column_dtype not in {None, "", "unknown"}:
                             value.dtype = str(column_dtype)
-                        value.accounting = {
-                            **dict(value.accounting or {}),
+                        value.accounting = accounting_view(value, {
                             "sequence_row_shape": row_shape,
-                            "program_abi_rank": len(row_shape),
-                        }
+                        })
                     state = {
                         "shape": row_shape, "rank": len(row_shape),
                         "dtype": str(column_dtype or "unknown"),

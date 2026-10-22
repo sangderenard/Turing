@@ -623,22 +623,24 @@ def _intern_unshadowed_formal_uses(functions):
 
 
 def _infer_pointer_storage(functions, native_storage=None):
-    """Recover typed LLVM load/store contracts without changing pointer types."""
-    if native_storage is not None:
-        for function in functions.values():
-            for formal in function.args:
-                if formal.dtype != 'ptr' or (formal.accounting or {}).get('physical_dtype'):
-                    continue
-                dtype = native_storage.get((function.name, int(formal.id)))
-                if dtype is not None:
-                    formal.accounting = {**dict(formal.accounting or {}),
-                        'physical_dtype': dtype, 'physical_dtype_provenance': 'typed_memory_operations'}
-        return
+    """Recover typed LLVM load/store contracts without changing pointer types.
+
+    Program: every pointer formal typed by its Load/Store witnesses.  Wrong
+    record: when the native storage-effects accelerator ran, its element
+    types went into accounting with no ``ssa_value`` row, while the Python
+    scan posted the same inference DERIVED from its witnesses -- one decision,
+    two authorities depending on which implementation was installed.  Rule:
+    the witness scan below is the one publisher; the accelerator's answer is
+    a cross-check, and a disagreement refuses."""
     canonical = {'double': 'float64', 'float': 'float32', 'i64': 'int64', 'i32': 'int32', 'i1': 'bool'}
     for function in functions.values():
         instructions = [instruction for block in function.blocks.values() for instruction in block.instrs]
         for formal in function.args:
-            if formal.dtype != 'ptr' or (formal.accounting or {}).get('physical_dtype'):
+            posted_formal = posted_ssa_value_fact(function, formal.id)
+            if formal.dtype != 'ptr' or (
+                posted_formal is not None
+                and posted_formal.physical_dtype is not None
+            ):
                 continue
             aliases = {int(formal.id)}
             alias_values = []
@@ -665,8 +667,20 @@ def _infer_pointer_storage(functions, native_storage=None):
                     witnesses.append(instruction.args[0])
                 if dtype is not None:
                     types.add(canonical.get(dtype, dtype))
+            native = (
+                None if native_storage is None
+                else native_storage.get((function.name, int(formal.id)))
+            )
             if len(types) == 1 and 'ptr' not in types:
                 inferred = next(iter(types))
+                if native is not None and canonical.get(native, native) != inferred:
+                    from .identity_concordance import ConcordanceRefusal
+                    raise ConcordanceRefusal(
+                        'pointer storage inference disagrees with the native '
+                        f'accelerator: function={function.name!r}, '
+                        f'formal={int(formal.id)}, witnesses={inferred!r}, '
+                        f'native={native!r}'
+                    )
                 # Rule: post first; accounting is a view.  The element type
                 # read from the Load results / Store values over the formal's
                 # alias set is revised onto the formal's row, DERIVED from the
@@ -697,12 +711,22 @@ def _infer_pointer_storage(functions, native_storage=None):
                     # ProgramABI settlement, not by typed memory operations.
                     physical={'physical_dtype': inferred},
                 )
-                posted = posted_ssa_value_fact(function, formal.id)
-                formal.accounting = {**dict(formal.accounting or {}),
-                    'physical_dtype': (
-                        posted.physical_dtype if posted is not None
-                        and posted.physical_dtype is not None else inferred),
-                    'physical_dtype_provenance': 'typed_memory_operations'}
+                from .frame_identity_book import (
+                    _frame_accounting_from_posted, _frame_physical_fields,
+                )
+                formal.accounting = _frame_accounting_from_posted(
+                    {**dict(formal.accounting or {}),
+                     'physical_dtype_provenance': 'typed_memory_operations'},
+                    _frame_physical_fields(function, int(formal.id)),
+                )
+            elif native is not None:
+                from .identity_concordance import ConcordanceRefusal
+                raise ConcordanceRefusal(
+                    'native accelerator typed a pointer formal its witnesses '
+                    f'do not prove: function={function.name!r}, '
+                    f'formal={int(formal.id)}, witnesses={sorted(types)!r}, '
+                    f'native={native!r}'
+                )
 
 
 def scalar_region_formal(callee, formal):
@@ -1279,17 +1303,15 @@ def _adapt_physical_call_inputs_round(
                                 ),
                                 physical={'physical_dtype': target_dtype},
                             )
-                            formal_fact = posted_ssa_value_fact(
-                                callee, formal.id,
+                            from .frame_identity_book import (
+                                _frame_accounting_from_posted,
+                                _frame_physical_fields,
                             )
-                            formal.accounting = {
-                                **dict(formal.accounting or {}),
-                                'source_physical_dtype': source_dtype,
-                                'physical_dtype': (
-                                    formal_fact.physical_dtype
-                                    if formal_fact is not None
-                                    and formal_fact.physical_dtype is not None
-                                    else target_dtype)}
+                            formal.accounting = _frame_accounting_from_posted(
+                                {**dict(formal.accounting or {}),
+                                 'source_physical_dtype': source_dtype},
+                                _frame_physical_fields(callee, int(formal.id)),
+                            )
                         conversion = {
                             'caller': str(caller.name),
                             'actual_id': int(actual.id),

@@ -338,8 +338,7 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                 # records are revised onto their ``ssa_value`` rows DERIVED
                 # from the record descriptor's cell and each member's own
                 # ``record_member`` cell; the accounting stamped below is set
-                # FROM the posted facts (the literals are kept only for a
-                # value no pass posted a row for).
+                # FROM the posted facts.
                 _pair_sources = (
                     record_descriptor_cell(table, record_id),
                     record_member_cell(table, payload_id),
@@ -363,31 +362,10 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         "device": presence_values[0].device,
                     },
                 )
-                _book = current_identity_book()
-                _payload_fact = (
-                    None if _payload_cell is None else
-                    _book.page(SSA_VALUE).cell(
-                        _payload_cell.row, _payload_cell.column,
-                    )
+                from .frame_identity_book import (
+                    _frame_accounting_from_posted, _frame_physical_fields,
                 )
-                _presence_fact = (
-                    None if _presence_cell is None else
-                    _book.page(SSA_VALUE).cell(
-                        _presence_cell.row, _presence_cell.column,
-                    )
-                )
-                _payload_storage = (
-                    _payload_fact.storage if _payload_fact is not None
-                    and _payload_fact.storage is not None else "scalar"
-                )
-                _presence_storage = (
-                    _presence_fact.storage if _presence_fact is not None
-                    and _presence_fact.storage is not None else "scalar"
-                )
-                _presence_physical = (
-                    _presence_fact.physical_dtype if _presence_fact is not None
-                    and _presence_fact.physical_dtype is not None else "bool"
-                )
+
                 for payload in payload_values:
                     accounting = dict(payload.accounting or {})
                     leased_from = accounting.pop(
@@ -397,7 +375,6 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         **accounting,
                         "program_abi_record": str(record.identity),
                         "program_abi_field": str(payload_name),
-                        "program_abi_storage": _payload_storage,
                         "program_abi_optional_payload": True,
                         "ssa_optional_presence_id": presence_id,
                         **({
@@ -409,9 +386,16 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                             ),
                         } if leased_from is not None else {}),
                     }
+                    payload.accounting = _frame_accounting_from_posted(
+                        payload.accounting,
+                        _frame_physical_fields(function, payload_id),
+                    )
                 for presence in presence_values:
-                    presence.dtype = "bool"
-                    presence.shape = ()
+                    if _presence_cell is not None:
+                        # The row was revised to the scalar Boolean above;
+                        # the occurrence follows it.
+                        presence.dtype = "bool"
+                        presence.shape = ()
                     accounting = dict(presence.accounting or {})
                     leased_from = accounting.pop(
                         "linked_call_frame_storage", None,
@@ -420,11 +404,9 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         **accounting,
                         "program_abi_record": str(record.identity),
                         "program_abi_field": str(payload_name),
-                        "program_abi_storage": _presence_storage,
                         "program_abi_optional_presence": True,
                         "program_abi_optional_present_when": True,
                         "ssa_optional_payload_id": payload_id,
-                        "physical_dtype": _presence_physical,
                         **({
                             "record_descriptor_reconciled_frame_storage": (
                                 str(leased_from)
@@ -444,7 +426,10 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                     accounting.setdefault(
                         "physical_dtype_tie_policy", "incumbent",
                     )
-                    presence.accounting = accounting
+                    presence.accounting = _frame_accounting_from_posted(
+                        accounting,
+                        _frame_physical_fields(function, presence_id),
+                    )
                 record_presence_receipts.append({
                     "function": str(function_name),
                     "record": str(record.identity),

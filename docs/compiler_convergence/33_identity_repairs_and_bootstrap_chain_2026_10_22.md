@@ -1,0 +1,187 @@
+# Identity repairs and the bootstrap core chain — 2026-10-21/22
+
+Branch `claude/nice-cerf-7w6uk5`, commits `5d02b30..8cbc54a` on top of
+`913e4c2`.  Every repair below was found by observation (a trap on the writer,
+the two records printed side by side) and is recorded in a receipt comment at
+the pass that now holds the rule.  Numbers are measured; nothing here claims
+the bootstrap or the managed tire is complete.
+
+## How the evidence was taken
+
+- Bootstrap: `python -u -m tools.bootstrap_compiler_concordance --lower-only
+  --jobs 3 --continue-after-failure`, each run in its own clean worktree of one
+  commit.  Units are compared by `qualified_names`, never by unit index (the
+  plan renumbers when the source changes).
+- Single-unit replay (`scratchpad/s/unit_run.py`, not committed): runs the
+  worker's own `tools.compile_project_catalogue` on a frozen plan with only
+  the toolchain-fingerprint check stubbed, linking each dependency from a
+  replay directory or the run's own product.  A trap is a `PRELUDE` file.
+  This is how the core chain below was walked unit by unit on the live tree.
+- Gate: the 49 files of the ~40-second gate list, serially, against the clean
+  `913e4c2` worktree.  Tail tests of `test_loop_carried_producers.py` hang on
+  base and on every branch run alike (per-test timeout 1200 s).
+- Native corpus: `tests/test_native_semantics_corpus.py` lowers each
+  `tests/native_semantics_corpus/c*.py` through `lower_ast_source_to_ssa`,
+  requires zero concordance findings, emits C, compiles, and compares every
+  input against Python.
+
+## Repairs (program — wrong record — rule)
+
+Identity and provenance:
+
+- `semantic_output`: structural recovery takes output identity from the
+  reducer's rows through one helper; the finish writer still compares
+  independently (`_reducer_declared_output_ids`).
+- Optional aggregate return (`IdentityPage._fork_of_scope`): the one semantic
+  output was revised to leaf 0, so `Ret` dropped leaf 1.  The
+  `semantic_output` row of an optional aggregate names the aggregate;
+  `function_output` rows stay physical.  `Ret` is now `(p0, q0, p1, q1)`.
+- One executable per symbol: two shells with one specialization contract were
+  both lowered under one name (the second `loop_scope` post was refused).  A
+  symbol is lowered once; a different contract under one symbol refuses.
+- `formal_literal`: only literal callsites posted, so one `1000` callsite read
+  as unanimous and the generic `decimal_integer_glyph_tokens` copy formatted
+  every integer as 1000.  A runtime callsite revises the row to
+  `Unresolved(SPECIALIZATION_DYNAMIC_ARGUMENT)`.
+- Structural If fold retires the rejected arm's effects from
+  `source_sequence_mutation_records`.
+- Call-metadata fixed point snapshots the same contract keys the edge
+  transports (`sequence_row_shape` was missing).
+- Record-field call edges post storage/rank on the callee formal's row
+  (`_reindex`'s sequence helper; four core units each blocking ~100).
+- Accepted (dependency) callees are immutable sources: neither physical call
+  input adaptation nor settled call-value propagation writes onto them.
+- The table-store column retype is a REVISE of the column's row.
+- `external_value` refines only to a resolved dtype.
+
+Types and storage:
+
+- Primitive class key is physical only for scalar/span carriers
+  (`argument_binding_history` tuple arms; `_validate_fact`'s shared union).
+- An arena row is a span in the structural view whatever its extent
+  (`_reindex_in_place`).
+- `builtins.range` declares its comprehension target `int`; an `Input` with a
+  builtin scalar class is a rank-0 descriptor of that dtype; an int literal
+  operand is int64 (weak against float tensors).
+- Only a scalar resident's settled row revises a region's cut-time feed dtype.
+
+Control and features:
+
+- A membership query on a sequence the control tree mutates is placed at its
+  authored node (c20: `root(2)` returned -1).
+- A validation guard nested in a loop-body arm is placed inside that arm
+  (`use-not-dominated` in `_validate_row`).
+- `sum(collection[, start])` over a resident generator arena is a resident
+  query (integer rows); float rows are a named shortfall (Python's empty float
+  sum is the int 0).  Static-range generators take the same query instead of a
+  region tensor sum over a shapeless span (`k=0` gave 10 for 416).  The C lane
+  no longer reduces a shapeless span as one element.
+- Storage requirements read `sequence_static_capacity_bounds` (written by the
+  control builder, never read).
+
+## Measurements
+
+Bootstrap (by qualified name):
+
+| run | commit | compiled-unverified | partial | failed |
+|---|---|---|---|---|
+| base | 913e4c2 | 37 | 47 | 270 |
+| cur | 5d02b30 snapshot | 42 | 51 | 262 |
+| snap2 | 4709ba1 | 40 | 53 | 263 |
+
+`4709ba1` regressed six units (the primitive-reference union key); `7faa2df`
+restored them.  Of the 262 failures in `cur`, 185 were dependency cascades;
+eight core units (`IdentityPage`/`IdentityBook` methods and
+`MonotonicIdSource.mint`) each blocked about 100.
+
+Core chain on the live tree (single-unit replay, linked in order):
+`IdentityBook._ref_from_key`, `IdentityPage._fork_of_scope`,
+`LiveScopeProjection.excludes/.reaches`, `IdentityPage._reaches_origin`,
+`identity_compression.thaw_page`, `IdentityPage._reindex`,
+`identity_spill._reindex_in_place`, `_replace_cells`, `_truncate_fact`,
+`_validate_fact`, `_hashable`, `RowField.admits`, `_validate_row`,
+`_detached_ordinals`, `MonotonicIdSource.mint`, `id_space.compose`: all
+compile; the composed products audit clean except `_validate_row` (below).
+
+Gate: the `cur` snapshot run reported 130 failed, 1010 passed against base's
+positions; 12 base failures pass and one new failure
+(`test_writer_refuses_when_recovery_and_posted_row_disagree`) was repaired in
+`1e8fc64`.  Later targeted comparisons (same files, branch vs base) show no
+new failures and 7 + 16 + 2 additional base failures passing.
+
+Native corpus: 27 programs plus the unbounded-list boundary and the nested
+loop-guard audit test pass.
+
+## Accounting is a view of the posted row: the writer inventory
+
+The `ssa-physical-unposted` audit only reports a value whose accounting label
+reached the final module without a row.  A static inventory (every write of
+`physical_dtype`, `program_abi_storage`, `program_abi_rank` and
+`sequence_arena` in `src/`, classified by whether the written value is the
+posted fact, a fallback literal beside it, or an unposted literal) found the
+writers the audit cannot see because they record nothing.  Every SSA
+accounting writer in the compiler proper now posts on the row first and sets
+its labels through `_frame_accounting_from_posted` (or the builder's
+`_posted_physical_accounting`):
+
+- A record formal, keyed-mapping handle, nested leaf, sequence member or
+  `table` member that entered a frame as a bare `SSAValue` had no row; the
+  REVISE that followed was a no-op and the declared literals stood in
+  accounting.  `_adopt_graph_formal` posts the row (ADOPTED from the graph
+  cell, or MINTED from its declaring cells, exactly as structural recovery
+  adopts a value) with its declared physical fields.  Unit 81
+  (`_result_layout`, keyed `function.blocks`) moved from failed to partial.
+- Linked-contract formals (`linked_value_abi`): the `table` contract never
+  posted because the dtype test compared an absent contract dtype with the
+  row's; accounting then fell back to the dict.  Both branches are views.
+- Existing formals whose dtype/shape were rewritten in place (record fields,
+  reused keyed parts, keyed lookup helpers, `eps` constants, the reduced
+  scalar of a full tensor reduction, returned-record call arguments) are now
+  REVISEs of their rows; a settled Phi with no row refuses.
+- The native storage-effects accelerator wrote pointer element types into
+  accounting with no row while the Python scan posted the same inference: the
+  witness scan is the one publisher, the accelerator a refusing cross-check.
+- Result-type settlement copied a base's or source's accounting dtype onto
+  the target; only the target's posted row is mirrored.
+- Boolean tensors' double-backed ABI, the axis-dropping index view, projected
+  iterable layouts and optional record pairs post before they label.
+
+Readers keep reading accounting: emission runs with no attached book by
+design (`emission_book`), and agreement of every label with its row is the
+audit's to enforce.
+
+Record schemas: `{**projection_schemas, **complete_schemas}` replaced the
+book-backed view of a class (`source_record_view_schema` row) by the AST-only
+constructor schema of the same fields, so no record field could be joined to
+its `class_field_declaration` (unit 41, `page.row_fields`).  One record per
+class now keeps the view's row and adds constructor completeness.
+
+## Tuple merges across statements
+
+`if f: t = (x, y) else: t = (7, 8)` followed by `a, b = t` returned 0 on base
+and branch alike: the structural fold aliased `t[k]` to ledger leaf `k` only
+for a literal aggregate, never for the reducer's `aggregate_phi`.  The merged
+ledger is its member Phis by position, so the fold now reads it (corpus c28).
+A call arm (`t = pair(x)`) has no layout at reduction; once its callsite
+projections publish, the planner posts its layout and builds the same
+`aggregate_phi` (corpus c29).  An OPTIONAL_AGGREGATE call arm is left out:
+its presence exists only at SSA level, where the merge must compose it.
+
+## Open frontier (stated, not worked around)
+
+- `IdentityPage._resolved` (unit 33): `fork = call() if cond else None` where
+  the call itself returns an optional tuple.  The optional-tuple model makes
+  presence the `IfExp` test; the true presence is test AND the callee's
+  presence.  The refusal ("no proven presence guard") is correct until the
+  callee's presence flags compose into the `IfExp`.
+- `_validate_row` formal 13 (`page.row_fields`): a `table` contract with no
+  source cells reaches accounting only; posting it needs the contract's
+  declaration cell.
+- Generic `str()`/`!r` of `Any`-typed facts (ten f-string units): needs a
+  runtime type dispatch over every fact class.
+- Planner region inputs default to float64 when the graph domain has no type;
+  unit 64/254 read that provisional as a sequence column dtype.
+- Native validation runtime is absent from the C module lane (no corpus
+  program with a reachable `raise` can be emitted there).
+- Local class construction from a source-derived schema is
+  `constructor_complete=False` by design (c19).

@@ -41,6 +41,14 @@ def _posted_physical(function, value):
     return fields
 
 
+def _row_physical(function, value):
+    """The physical fields recorded on ``value``'s own row ({} for none)."""
+    from .frame_identity_book import _frame_physical_fields
+
+    fields = _frame_physical_fields(function, int(value.id))
+    return dict(fields) if isinstance(fields, dict) else {}
+
+
 def _publish_type(function, value, winner, decision, carried=None):
     """Commit the retained decision before changing its resident SSA view.
 
@@ -70,9 +78,13 @@ def _publish_type(function, value, winner, decision, carried=None):
         physical=physical or KEEP_PHYSICAL,
     )
     value.device = winner[2]
-    if winner[3] is not None and resident[3] != winner[3]:
-        value.accounting = {**dict(value.accounting or {}),
-                            'physical_dtype': winner[3]}
+    # Accounting is a view of the row just published.
+    from .frame_identity_book import (
+        _frame_accounting_from_posted, _frame_physical_fields,
+    )
+    value.accounting = _frame_accounting_from_posted(
+        value.accounting, _frame_physical_fields(function, int(value.id)),
+    )
     return changed
 
 
@@ -340,12 +352,15 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 winner = ledger.incumbent_target(identity)
                 if _publish_type(owner, target, winner, ledger.decision_cell(identity)):
                     changed = True
-                # Rule: accounting is a view of the posted winner; the base's
-                # accounting stands only where no physical dtype was posted.
-                physical = winner[3] or (base.accounting or {}).get('physical_dtype')
-                if physical:
+                # Rule: accounting is a view of the posted winner.  Program:
+                # an addressed element whose winner posted no physical dtype.
+                # Wrong record: the base's accounting dtype was copied onto
+                # the target with no row behind it.  Rule: only the target's
+                # posted row is mirrored.
+                posted_target = _row_physical(owner, target)
+                if posted_target.get('physical_dtype'):
                     target.accounting = {**dict(target.accounting or {}),
-                        'physical_dtype': physical,
+                        'physical_dtype': posted_target['physical_dtype'],
                         'physical_dtype_provenance': ('addressed_element', owner.name, int(base.id))}
         for caller, target, callee, source in bindings():
             # Imported bodies remain immutable. Their exact producer proof
@@ -377,9 +392,10 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             if accepted:
                 target.accounting = {**dict(target.accounting or {}),
                     'ssa_call_result_from': (callee.name, int(source.id))}
-                # Rule: accounting is a view of the posted winner; the source's
-                # accounting stands only where no physical dtype was posted.
-                physical_dtype = winner[3] or (source.accounting or {}).get('physical_dtype')
+                # Rule: accounting is a view of the target's posted row; a
+                # source's accounting dtype with no row behind it is not
+                # copied onto the target.
+                physical_dtype = _row_physical(caller, target).get('physical_dtype')
                 if physical_dtype and previous_priority != 3:
                     target.accounting['physical_dtype'] = physical_dtype
                     target.accounting['physical_dtype_provenance'] = (

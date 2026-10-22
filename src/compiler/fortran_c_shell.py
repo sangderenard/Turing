@@ -5859,6 +5859,44 @@ def _complete_program_abi_declared_fields(
     return result
 
 
+def _record_schemas_with_constructors(
+    projection_schemas: Mapping[str, Mapping[str, Any]],
+    complete_schemas: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """One record per class: the book-backed view, with constructor
+    completeness where the class's whole layout is proven.
+
+    Program: ``_validate_row(page: Page, ...)`` (bootstrap unit 41).  Wrong
+    record: ``{**projection_schemas, **complete_schemas}`` replaced the
+    ``Page`` view that ingestion had posted as ``source_record_view_schema``
+    row ``('src.compiler.identity_concordance', 'Page')`` with the AST-only
+    constructor schema of the same four fields, which names no row.  The
+    linker then found no ``class_field_declaration`` cell for ``row_fields``,
+    its ``table`` contract had no source cell, and storage/rank reached the
+    formal's accounting with no ``ssa_value`` row behind them.  Rule: a class
+    with a posted view keeps that view's row; the constructor schema adds its
+    proven fields and ``constructor_complete``.  A class with no posted view
+    is the constructor schema alone, as before."""
+
+    merged: dict[str, Mapping[str, Any]] = dict(projection_schemas)
+    for name, complete in complete_schemas.items():
+        view = projection_schemas.get(name)
+        if view is None or view.get("source_record_view_schema") is None:
+            merged[name] = complete
+            continue
+        merged[name] = {
+            **dict(complete),
+            "fields": {
+                **dict(view.get("fields") or {}),
+                **dict(complete.get("fields") or {}),
+            },
+            "source_record_view_schema": view["source_record_view_schema"],
+            "projection_complete": bool(view.get("projection_complete")),
+            "constructor_complete": True,
+        }
+    return merged
+
+
 def _authored_complete_record_schemas(
     tree: ast.Module,
 ) -> dict[str, Mapping[str, Any]]:
@@ -17465,18 +17503,22 @@ def _propagate_native_type_tag_demand(
                                         callee, int(formal.id)
                                     ),),
                                     dtype="int64",
+                                    physical={
+                                        "physical_dtype": "int64",
+                                        "storage": "span", "rank": 1,
+                                    },
                                 ),
                                 dtype="int64",
-                                accounting={
-                                    **accounting,
-                                    "native_type_tag_sequence_for_value_id": (
-                                        int(actual.id)
-                                    ),
-                                    "propagated_formal_id": int(formal.id),
-                                    "program_abi_storage": "span",
-                                    "program_abi_rank": 1,
-                                },
                             )
+                            # The tag span's storage and rank are posted at
+                            # its mint; accounting is a view of that row.
+                            tag_actual.accounting = _frame_accounting_from_posted({
+                                **accounting,
+                                "native_type_tag_sequence_for_value_id": (
+                                    int(actual.id)
+                                ),
+                                "propagated_formal_id": int(formal.id),
+                            }, _frame_physical_fields(caller, int(tag_actual.id)))
                             caller.args.append(tag_actual)
                             caller_values[int(tag_actual.id)] = tag_actual
                             columns[projection] = int(tag_actual.id)
@@ -19430,11 +19472,16 @@ def _post_numeral_leaf_width(
 # ``function.blocks`` names (graph id 6) entered the frame as a bare
 # ``SSAValue`` with no ``ssa_value`` row; the ``keyed`` REVISE that followed
 # found no row to revise and returned None, and the call-result settlement
-# refused "physical structure lacks SSA identity".  Rule: a mapping handle that
-# enters as a formal is the graph id itself, so its row is posted ADOPTED from
-# that graph id's cell and the record declaration, with its declared ``keyed``
-# storage, before any accounting is written from it.
-def _adopt_keyed_mapping_handle(function, graph, value_id, *declaration_cells):
+# refused "physical structure lacks SSA identity".  A nested record leaf
+# entering the same way kept its declared storage/rank in accounting only.
+# Rule: a formal that enters as a graph id IS that graph id, so its row is
+# posted ADOPTED from that graph id's cell and its declaration cells (a minted
+# id: MINTED from its declaration cells), with its declared physical fields,
+# before any accounting is written from it.
+def _adopt_graph_formal(
+    function, graph, value_id, *declaration_cells, dtype=None, shape=(),
+    physical=None,
+):
     from .concordance_declarations import (
         RECORD_ABI_MATERIALIZATION as _STAGE, SSA_VALUE, SSAValueFact,
         SSAValueOrigin,
@@ -19443,25 +19490,42 @@ def _adopt_keyed_mapping_handle(function, graph, value_id, *declaration_cells):
         ConcordanceRefusal, Derived, Mode, current_identity_book,
     )
     from ..transmogrifier.ssa import SSAValue
+    from .id_space import MINTED, has_flag
 
-    source = _frame_graph_cell(graph, int(value_id))
-    if source is None:
-        raise ConcordanceRefusal(
-            "keyed mapping handle has no source graph identity: "
-            f"function={function.name!r}, value={int(value_id)}"
-        )
-    mapping = SSAValue(int(value_id))
+    value = SSAValue(
+        int(value_id), dtype=dtype,
+        shape=tuple(shape) if shape is not None else (),
+    )
     if _frame_value_cell(function, int(value_id)) is None:
+        # As structural recovery adopts a value: a graph id from its graph
+        # cell, a minted id from the cells it is declared by.
+        source = _frame_graph_cell(graph, int(value_id))
+        if source is not None:
+            origin = SSAValueOrigin.ADOPTED_GRAPH_ID
+        elif has_flag(int(value_id), MINTED) and _frame_cells(
+            *declaration_cells
+        ):
+            origin = SSAValueOrigin.MINTED
+        else:
+            raise ConcordanceRefusal(
+                "formal has no row and is neither a graph id nor a minted id "
+                f"with declaring cells: function={function.name!r}, "
+                f"value={int(value_id)}"
+            )
         current_identity_book().post(
             SSA_VALUE, (_frame_book_scope(function), int(value_id)),
             SSAValueFact(
-                None, (), SSAValueOrigin.ADOPTED_GRAPH_ID, storage="keyed",
+                dtype, tuple(value.shape), origin,
+                **{
+                    key: item for key, item in dict(physical or {}).items()
+                    if item not in (None, False)
+                },
             ),
             stage=_STAGE,
             provenance=Derived(_frame_cells(source, *declaration_cells)),
             mode=Mode.CONCORD,
         )
-    return mapping
+    return value
 
 
 def _class_surface_ssa_program(
@@ -19516,7 +19580,7 @@ def _class_surface_ssa_program(
             GRAPH_ID_WITHOUT_CANONICAL_CELL,
             NESTED_RECORD_PART, PLANNER_OUTPUT_UNROUTED, PLANNING_VALUE,
             RECORD_ABI_MATERIALIZATION, RECORD_DESCRIPTOR, RECORD_FIELD_RESIDENT,
-            SEQUENCE_DESCRIPTOR,
+            SEQUENCE_DESCRIPTOR, SEQUENCE_MEMBER,
         ROW_LEAF_VIEW,
         RECORD_FIELD_DEMAND,
         RECORD_FORWARDING, RECORD_MEMBER, RECORD_PARAMETER_ROW_HANDLE,
@@ -26206,21 +26270,10 @@ def _class_surface_ssa_program(
                         _abi_fact = _posted_ssa_value_fact(
                             lowered_control, int(formal.id),
                         )
-                    accounting.setdefault(
-                        "program_abi_storage", (
-                            _abi_fact.storage
-                            if _abi_fact is not None
-                            and _abi_fact.storage is not None
-                            else _formal_row[0]["storage"]
-                        ),
-                    )
-                    accounting.setdefault(
-                        "program_abi_rank", (
-                            _abi_fact.rank
-                            if _abi_fact is not None
-                            and _abi_fact.rank is not None
-                            else _formal_row[0]["rank"]
-                        ),
+                    # Accounting is a view of the posted row only: a row
+                    # that could not be revised leaves the labels absent.
+                    accounting = _frame_accounting_from_posted(
+                        accounting, _frame_physical_fields(lowered_control, int(formal.id)),
                     )
                 else:
                     # Program: the oscillator's ``cos_series(peak)``; the
@@ -26255,8 +26308,13 @@ def _class_surface_ssa_program(
                         and set(_edge_physical) == {"storage", "rank"}
                         and _edge_physical["storage"]
                         in SSA_VALUE_PHYSICAL_STORAGES
-                        and str(contract.get("dtype") or "")
-                        == str(_edge_fact.dtype or "")
+                        # A contract that declares no dtype (a ``table``
+                        # handle) makes no dtype claim to disagree with.
+                        and (
+                            contract.get("dtype") is None
+                            or str(contract["dtype"])
+                            == str(_edge_fact.dtype or "")
+                        )
                         and not (
                             _edge_physical["storage"] == "scalar"
                             and tuple(_edge_fact.shape or ())
@@ -26276,24 +26334,14 @@ def _class_surface_ssa_program(
                         _edge_fact = _posted_ssa_value_fact(
                             lowered_control, int(formal.id),
                         )
-                    if contract.get("storage") is not None:
-                        accounting.setdefault(
-                            "program_abi_storage", str(
-                                _edge_fact.storage
-                                if _edge_fact is not None
-                                and _edge_fact.storage is not None
-                                else contract["storage"]
-                            ),
-                        )
-                    if contract.get("rank") is not None:
-                        accounting.setdefault(
-                            "program_abi_rank", int(
-                                _edge_fact.rank
-                                if _edge_fact is not None
-                                and _edge_fact.rank is not None
-                                else contract["rank"]
-                            ),
-                        )
+                    # Program: ``_validate_row`` formal 13 (``page.row_fields``,
+                    # a ``table`` contract).  Wrong record: when the row could
+                    # not be revised, storage/rank were copied into accounting
+                    # from the contract dict (``ssa-physical-unposted``).
+                    # Rule: accounting is a view of the posted row only.
+                    accounting = _frame_accounting_from_posted(
+                        accounting, _frame_physical_fields(lowered_control, int(formal.id)),
+                    )
                 if (
                     str(contract.get("storage") or "") == "span"
                     and contract.get("shape") is None
@@ -32855,25 +32903,25 @@ def _class_surface_ssa_program(
                     for value_id in candidates:
                         mapping = values.get(int(value_id))
                         if mapping is None:
-                            mapping = _adopt_keyed_mapping_handle(
+                            mapping = _adopt_graph_formal(
                                 function, graph, int(value_id),
                                 GLOBAL_MONOTONIC_IDS.declaration,
+                                physical={"storage": "keyed"},
                             )
                             function.args.append(mapping)
                             values[int(value_id)] = mapping
-                        mapping.accounting = {
+                        mapping.accounting = _frame_accounting_from_posted({
                             **dict(mapping.accounting or {}),
                             "program_abi_record": schema_identity,
                             "program_abi_parameter": str(parameter_name),
                             "program_abi_field": nested_path,
-                            "program_abi_storage": "keyed",
                             "program_abi_keyed_length": part_ids["length"],
                             "program_abi_keyed_keys": part_ids["keys"],
                             "program_abi_keyed_values": part_ids["values"],
                             "program_abi_key_encoding": key_encoding,
                             "program_abi_value_record": value_record,
                             "program_abi_value_identity": value_identity,
-                        }
+                        }, _frame_physical_fields(function, int(value_id)))
                     if value_record is not None:
                         for row_id in indexed_value_candidates(set(candidates)):
                             materialize_nested_record(
@@ -33283,11 +33331,6 @@ def _class_surface_ssa_program(
                                         parameter_name
                                     ),
                                     "program_abi_field": nested_path,
-                                    "program_abi_storage": nested_storage,
-                                    "program_abi_rank": (
-                                        0 if nested_storage == "scalar"
-                                        else len(nested_shape)
-                                    ),
                                     "program_abi_mutable": mutable,
                                     "program_abi_field_written": False,
                                     "program_abi_row_handle": int(
@@ -33512,6 +33555,16 @@ def _class_surface_ssa_program(
                                 from .concordance_declarations import (
                                     SSA_VALUE, SSAValueFact, SSAValueOrigin,
                                 )
+                                # The leaf's declared storage and rank are
+                                # posted on the result's row (accounting is
+                                # a view of it, set below).
+                                leaf_physical = {
+                                    "storage": str(nested_storage),
+                                    "rank": (
+                                        0 if nested_storage == "scalar"
+                                        else len(nested_shape)
+                                    ),
+                                }
                                 for adopted in (
                                     result,
                                     *(values[predicate_id]
@@ -33520,6 +33573,23 @@ def _class_surface_ssa_program(
                                     if _frame_value_cell(
                                         function, int(adopted.id),
                                     ) is not None:
+                                        if adopted is result:
+                                            _revise_ssa_value(
+                                                function, int(result.id),
+                                                dtype=result.dtype,
+                                                shape=result.shape,
+                                                stage=RECORD_ABI_MATERIALIZATION,
+                                                sources=(
+                                                    *_schema_declaration_cells(
+                                                        schema_identity,
+                                                        schema_name,
+                                                    ),
+                                                    _frame_value_cell(
+                                                        function, int(column.id),
+                                                    ),
+                                                ),
+                                                physical=leaf_physical,
+                                            )
                                         continue
                                     _frame_post(
                                         SSA_VALUE,
@@ -33531,6 +33601,10 @@ def _class_surface_ssa_program(
                                             adopted.dtype,
                                             tuple(adopted.shape or ()),
                                             SSAValueOrigin.ADOPTED_GRAPH_ID,
+                                            **(
+                                                leaf_physical
+                                                if adopted is result else {}
+                                            ),
                                         ),
                                         stage=RECORD_ABI_MATERIALIZATION,
                                         cells=(
@@ -33552,6 +33626,14 @@ def _class_surface_ssa_program(
                                             ),
                                         ),
                                     )
+                                result.accounting = (
+                                    _frame_accounting_from_posted(
+                                        result.accounting,
+                                        _frame_physical_fields(
+                                            function, int(result.id),
+                                        ),
+                                    )
+                                )
                                 if row_leaf_pointer is not None:
                                     values[int(row_leaf_pointer.id)] = (
                                         row_leaf_pointer
@@ -33562,13 +33644,20 @@ def _class_surface_ssa_program(
                         break
                     value = values.get(int(value_id))
                     if value is None:
-                        value = SSAValue(
-                            int(value_id),
+                        value = _adopt_graph_formal(
+                            function, graph, int(value_id),
+                            *_schema_declaration_cells(
+                                schema_identity, schema_name,
+                            ),
                             dtype=(
                                 None if nested_dtype is None
                                 else str(nested_dtype)
                             ),
                             shape=() if nested_shape is None else nested_shape,
+                            physical={
+                                "storage": nested_storage or None,
+                                "rank": nested_rank,
+                            },
                         )
                         function.args.append(value)
                         values[int(value_id)] = value
@@ -33601,21 +33690,11 @@ def _class_surface_ssa_program(
                             "device": value.device,
                         },
                     )
-                    leaf_fact = _posted_ssa_value_fact(function, int(value.id))
                     value.accounting = {
                         **dict(value.accounting or {}),
                         "program_abi_record": schema_identity,
                         "program_abi_parameter": str(parameter_name),
                         "program_abi_field": nested_path,
-                        "program_abi_storage": (
-                            leaf_fact.storage if leaf_fact is not None
-                            and leaf_fact.storage is not None
-                            else nested_storage
-                        ),
-                        "program_abi_rank": (
-                            leaf_fact.rank if leaf_fact is not None
-                            and leaf_fact.rank is not None else nested_rank
-                        ),
                         "program_abi_mutable": mutable,
                         "program_abi_field_written": False,
                         "program_abi_token_vocabulary": token_vocabulary,
@@ -33639,6 +33718,11 @@ def _class_surface_ssa_program(
                             if nested_field.get("precision_limbs") else {}
                         ),
                     }
+                    # Storage and rank are a view of the leaf's posted row.
+                    value.accounting = _frame_accounting_from_posted(
+                        value.accounting,
+                        _frame_physical_fields(function, int(value.id)),
+                    )
                     physical_ids.append(int(value_id))
                 descriptor_storage = {
                     "scalar": SSARecordFieldStorage.SCALAR,
@@ -34329,9 +34413,12 @@ def _class_surface_ssa_program(
                         for member_id, member_dtype, member_shape in members:
                             value = values.get(int(member_id))
                             if value is None:
-                                value = SSAValue(
-                                    int(member_id), dtype=str(member_dtype),
+                                value = _adopt_graph_formal(
+                                    function, graph, int(member_id),
+                                    GLOBAL_MONOTONIC_IDS.declaration,
+                                    dtype=str(member_dtype),
                                     shape=tuple(member_shape),
+                                    physical={"storage": "sequence"},
                                 )
                                 function.args.append(value)
                                 values[int(member_id)] = value
@@ -34356,23 +34443,14 @@ def _class_surface_ssa_program(
                                     "device": value.device,
                                 },
                             )
-                            member_fact = _posted_ssa_value_fact(
-                                function, int(member_id),
-                            )
-                            value.accounting = {
+                            value.accounting = _frame_accounting_from_posted({
                                 **dict(value.accounting or {}),
                                 "program_abi_record": str(record["identity"]),
                                 "program_abi_parameter": str(parameter_name),
                                 "program_abi_field": str(field_name),
-                                "program_abi_storage": (
-                                    member_fact.storage
-                                    if member_fact is not None
-                                    and member_fact.storage is not None
-                                    else "sequence"
-                                ),
                                 "program_abi_mutable": mutable,
                                 "record_field_sequence_view": True,
-                            }
+                            }, _frame_physical_fields(function, int(member_id)))
                         sequence = _frame_register_sequence(
                             function, sequence_table,
                             SSASequenceDescriptor(
@@ -34472,23 +34550,14 @@ def _class_surface_ssa_program(
                                 "device": member.device,
                             },
                         )
-                        member_fact = _posted_ssa_value_fact(
-                            function, int(member_id),
-                        )
-                        member.accounting = {
+                        member.accounting = _frame_accounting_from_posted({
                             **dict(member.accounting or {}),
                             "program_abi_record": str(record["identity"]),
                             "program_abi_parameter": str(parameter_name),
                             "program_abi_field": str(field_name),
-                            "program_abi_storage": (
-                                member_fact.storage
-                                if member_fact is not None
-                                and member_fact.storage is not None
-                                else "sequence"
-                            ),
                             "program_abi_mutable": mutable,
                             "record_field_sequence_view": True,
-                        }
+                        }, _frame_physical_fields(function, int(member_id)))
                     fields.append(SSARecordFieldDescriptor(
                         str(field_name),
                         SSARecordFieldStorage.SEQUENCE,
@@ -34609,15 +34678,29 @@ def _class_surface_ssa_program(
                             part_storage, part_dtype, _part_rank,
                         ) in parts.items():
                             part_value = values[existing_parts[part_name]]
+                            # Rule: post first; accounting is a view.  The
+                            # reused part's row is revised with the field's
+                            # declared part view (it was mutated in place
+                            # with no revision before).
+                            _revise_ssa_value(
+                                function, int(part_value.id), dtype=part_dtype,
+                                shape=part_value.shape,
+                                stage=RECORD_ABI_MATERIALIZATION,
+                                sources=(GLOBAL_MONOTONIC_IDS.declaration,),
+                                physical={
+                                    "physical_dtype": part_dtype,
+                                    "storage": part_storage,
+                                    "rank": int(_part_rank),
+                                },
+                            )
                             part_value.dtype = part_dtype
-                            part_value.accounting = {
+                            part_value.accounting = _frame_accounting_from_posted({
                                 **dict(part_value.accounting or {}),
-                                "physical_dtype": part_dtype,
                                 "physical_dtype_provenance": (
                                     "program_abi_keyed_member"
                                 ),
                                 "physical_dtype_tie_policy": "incumbent",
-                            }
+                            }, _frame_physical_fields(function, int(part_value.id)))
                             fields.append(SSARecordFieldDescriptor(
                                 f"{field_name}.{part_name}",
                                 SSARecordFieldStorage.SCALAR
@@ -34717,9 +34800,10 @@ def _class_surface_ssa_program(
                             # input: consumers that have not yet been resolved
                             # against the three slots continue to name it, and
                             # it is what carries the slot correlation.
-                            mapping = _adopt_keyed_mapping_handle(
+                            mapping = _adopt_graph_formal(
                                 function, graph, int(value_id),
                                 GLOBAL_MONOTONIC_IDS.declaration,
+                                physical={"storage": "keyed"},
                             )
                             function.args.append(mapping)
                             values[int(value_id)] = mapping
@@ -34743,27 +34827,18 @@ def _class_surface_ssa_program(
                                 "device": mapping.device,
                             },
                         )
-                        mapping_fact = _posted_ssa_value_fact(
-                            function, int(value_id),
-                        )
-                        mapping.accounting = {
+                        mapping.accounting = _frame_accounting_from_posted({
                             **dict(mapping.accounting or {}),
                             "program_abi_record": str(record["identity"]),
                             "program_abi_parameter": str(parameter_name),
                             "program_abi_field": str(field_name),
-                            "program_abi_storage": (
-                                mapping_fact.storage
-                                if mapping_fact is not None
-                                and mapping_fact.storage is not None
-                                else "keyed"
-                            ),
                             "program_abi_keyed_length": part_ids["length"],
                             "program_abi_keyed_keys": part_ids["keys"],
                             "program_abi_keyed_values": part_ids["values"],
                             "program_abi_key_encoding": key_encoding,
                             "program_abi_value_record": value_record,
                             "program_abi_value_identity": value_identity,
-                        }
+                        }, _frame_physical_fields(function, int(value_id)))
                     if value_record is not None:
                         value_identity_text = str(
                             dict(abi_records.get(str(value_record)) or {})
@@ -34904,9 +34979,15 @@ def _class_surface_ssa_program(
                         ):
                             value = values.get(int(member_id))
                             if value is None:
-                                value = SSAValue(
-                                    int(member_id), dtype=member_dtype,
+                                value = _adopt_graph_formal(
+                                    function, graph, int(member_id),
+                                    GLOBAL_MONOTONIC_IDS.declaration,
+                                    dtype=member_dtype,
                                     shape=(1,) if member_name in {"length", "status"} else (),
+                                    physical={
+                                        "storage": "table",
+                                        "rank": int(member_rank),
+                                    },
                                 )
                                 function.args.append(value)
                                 values[int(member_id)] = value
@@ -34934,33 +35015,18 @@ def _class_surface_ssa_program(
                                     "device": value.device,
                                 },
                             )
-                            member_fact = _posted_ssa_value_fact(
-                                function, int(member_id),
-                            )
-                            value.accounting = {
+                            value.accounting = _frame_accounting_from_posted({
                                 **dict(value.accounting or {}),
                                 "program_abi_record": str(record["identity"]),
                                 "program_abi_parameter": str(parameter_name),
                                 "program_abi_field": (
                                     f"{field_name}.{member_name}"
                                 ),
-                                "program_abi_storage": (
-                                    member_fact.storage
-                                    if member_fact is not None
-                                    and member_fact.storage is not None
-                                    else "table"
-                                ),
-                                "program_abi_rank": (
-                                    member_fact.rank
-                                    if member_fact is not None
-                                    and member_fact.rank is not None
-                                    else int(member_rank)
-                                ),
                                 "program_abi_mutable": bool(mutable),
                                 "program_abi_field_written": (
                                     str(field_name) in written_fields
                                 ),
-                            }
+                            }, _frame_physical_fields(function, int(member_id)))
                         _frame_register_sequence(
                             function, sequence_table,
                             SSASequenceDescriptor(
@@ -35168,81 +35234,78 @@ def _class_surface_ssa_program(
                     else tuple(map(int, field["shape"]))
                 )
                 physical_ids = []
+                declared_value_shape = (
+                    declared_shape
+                    if declared_shape is not None
+                    else (int(fixed_length),)
+                    if fixed_length is not None
+                    else None
+                )
                 for value_id in candidate_ids:
                     value = values.get(value_id)
+                    # Program: a record field read by the control builder or
+                    # first seen here (``self.restricts`` in
+                    # ``LiveScopeProjection.reaches``, graph id 6, read only by
+                    # the structural return expression).  Wrong record: the
+                    # new formal's row carried no storage/rank, and an existing
+                    # formal's dtype/shape were rewritten in place with no
+                    # revision, while storage/rank went to accounting only.
+                    # Rule: the formal IS the authored GetAttr's graph id; its
+                    # row is posted (or revised) with the field's declared
+                    # dtype, shape, storage and rank, DERIVED from that node's
+                    # cell and the record's declaration cell, and accounting is
+                    # a view of the posted row.
                     if value is None:
-                        value = SSAValue(
-                            value_id,
+                        value = _adopt_graph_formal(
+                            function, graph, int(value_id),
+                            GLOBAL_MONOTONIC_IDS.declaration,
                             dtype=None if dtype is None else str(dtype),
                             shape=(
-                                declared_shape
-                                if declared_shape is not None
-                                else (int(fixed_length),)
-                                if fixed_length is not None
-                                else ()
+                                () if declared_value_shape is None
+                                else declared_value_shape
                             ),
-                            accounting={
-                                "program_abi_record": str(record["identity"]),
-                                "program_abi_parameter": str(parameter_name),
-                                "program_abi_field": str(field_name),
-                                "program_abi_storage": storage,
-                                "program_abi_rank": rank,
-                                "program_abi_mutable": mutable,
-                                "program_abi_field_written": field_written,
-                                "program_abi_fixed_length": fixed_length,
-                                "program_abi_optional_payload": optional,
-                            },
+                            physical={"storage": storage, "rank": rank},
                         )
                         function.args.append(value)
                         values[value_id] = value
-                        # A field the control builder never read is first
-                        # seen here (observed: ``self.restricts`` in
-                        # ``LiveScopeProjection.reaches``, graph id 6, read
-                        # only by the structural return expression; the
-                        # formal had no ``ssa_value`` row and the composing
-                        # unit refused the product).  The formal IS the
-                        # authored GetAttr's graph id: ADOPTED_GRAPH_ID
-                        # DERIVED from that node's cell and the declared
-                        # record's demand cell, as the builder's
-                        # ``_value_cell`` adopts a graph id.
-                        if _frame_value_cell(function, int(value_id)) is None:
-                            from .concordance_declarations import (
-                                SSA_VALUE, SSAValueFact, SSAValueOrigin,
-                            )
-                            _frame_post(
-                                SSA_VALUE,
-                                (_frame_book_scope(function), int(value_id)),
-                                SSAValueFact(
-                                    value.dtype, tuple(value.shape or ()),
-                                    SSAValueOrigin.ADOPTED_GRAPH_ID,
-                                ),
-                                stage=RECORD_ABI_MATERIALIZATION,
-                                cells=(
-                                    _frame_graph_cell(graph, int(value_id)),
-                                    GLOBAL_MONOTONIC_IDS.declaration,
-                                ),
-                            )
                     else:
-                        if dtype is not None:
-                            # The explicit program ABI is authoritative over
-                            # the graph domain's numerical default.
-                            value.dtype = str(dtype)
-                        if declared_shape is not None:
-                            value.shape = declared_shape
-                        elif fixed_length is not None:
-                            value.shape = (int(fixed_length),)
-                        value.accounting = {
-                            **dict(value.accounting or {}),
-                            "program_abi_record": str(record["identity"]),
-                            "program_abi_parameter": str(parameter_name),
-                            "program_abi_field": str(field_name),
-                            "program_abi_storage": storage,
-                            "program_abi_rank": rank,
-                            "program_abi_mutable": mutable,
-                            "program_abi_field_written": field_written,
-                            "program_abi_fixed_length": fixed_length,
-                            "program_abi_optional_payload": optional,
-                        }
+                        # The explicit program ABI is authoritative over the
+                        # graph domain's numerical default.
+                        revised_dtype = (
+                            value.dtype if dtype is None else str(dtype)
+                        )
+                        revised_shape = (
+                            value.shape if declared_value_shape is None
+                            else declared_value_shape
+                        )
+                        if _frame_value_cell(function, int(value_id)) is None:
+                            _adopt_graph_formal(
+                                function, graph, int(value_id),
+                                GLOBAL_MONOTONIC_IDS.declaration,
+                                dtype=revised_dtype, shape=revised_shape,
+                            )
+                        _revise_ssa_value(
+                            function, int(value_id), dtype=revised_dtype,
+                            shape=revised_shape,
+                            stage=RECORD_ABI_MATERIALIZATION,
+                            sources=(
+                                _frame_graph_cell(graph, int(value_id)),
+                                GLOBAL_MONOTONIC_IDS.declaration,
+                            ),
+                            physical={"storage": storage, "rank": rank},
+                        )
+                        value.dtype = revised_dtype
+                        value.shape = revised_shape
+                    value.accounting = _frame_accounting_from_posted({
+                        **dict(value.accounting or {}),
+                        "program_abi_record": str(record["identity"]),
+                        "program_abi_parameter": str(parameter_name),
+                        "program_abi_field": str(field_name),
+                        "program_abi_mutable": mutable,
+                        "program_abi_field_written": field_written,
+                        "program_abi_fixed_length": fixed_length,
+                        "program_abi_optional_payload": optional,
+                    }, _frame_physical_fields(function, int(value_id)))
                     physical_ids.append(value_id)
                 descriptor_storage = {
                     "scalar": SSARecordFieldStorage.SCALAR,
@@ -35362,25 +35425,11 @@ def _class_surface_ssa_program(
                                 ),
                                 physical=_presence_physical,
                             )
-                        _presence_fact = _posted_ssa_value_fact(
-                            function, int(presence.id),
-                        )
-                        _presence_posted = (
-                            _presence_fact is not None
-                            and _presence_fact.storage is not None
-                        )
-                        presence.accounting = {
+                        presence.accounting = _frame_accounting_from_posted({
                             **prior_presence_accounting,
                             "program_abi_record": str(record["identity"]),
                             "program_abi_parameter": str(parameter_name),
                             "program_abi_field": str(field_name),
-                            "program_abi_storage": (
-                                _presence_fact.storage if _presence_posted
-                                else "scalar"
-                            ),
-                            "program_abi_rank": (
-                                _presence_fact.rank if _presence_posted else 0
-                            ),
                             "program_abi_mutable": mutable,
                             "program_abi_field_written": field_written,
                             "program_abi_optional_presence": True,
@@ -35391,10 +35440,6 @@ def _class_surface_ssa_program(
                             # default float representation before this exact
                             # role was known; that lower-priority guess cannot
                             # survive the explicit boundary declaration.
-                            "physical_dtype": (
-                                _presence_fact.physical_dtype
-                                if _presence_posted else "bool"
-                            ),
                             "physical_dtype_provenance": (
                                 "program_abi_optional_presence"
                             ),
@@ -35411,7 +35456,7 @@ def _class_surface_ssa_program(
                                     None, "", "unknown", "bool",
                                 }
                             ) else {}),
-                        }
+                        }, _frame_physical_fields(function, int(presence.id)))
                         presence_values.append(presence)
                     for payload_id in physical_ids:
                         payload = values[int(payload_id)]
@@ -36166,30 +36211,15 @@ def _class_surface_ssa_program(
                             "device": value.device,
                         },
                     )
-                    constructor_fact = _posted_ssa_value_fact(
-                        function, int(value.id),
-                    )
-                    value.accounting = {
+                    value.accounting = _frame_accounting_from_posted({
                         **dict(value.accounting or {}),
                         "program_abi_record": str(record["identity"]),
                         "program_abi_field": str(field_name),
-                        "program_abi_storage": (
-                            constructor_fact.storage
-                            if constructor_fact is not None
-                            and constructor_fact.storage is not None
-                            else str(field.get("storage") or "")
-                        ),
-                        "program_abi_rank": (
-                            constructor_fact.rank
-                            if constructor_fact is not None
-                            and constructor_fact.rank is not None
-                            else int(field.get("rank", 0))
-                        ),
                         "program_abi_mutable": bool(
                             field.get("mutable", False)
                         ),
                         "record_constructor_value": int(record_id),
-                    }
+                    }, _frame_physical_fields(function, int(value.id)))
                     source_node = source_nodes_by_value_id.get(
                         int(physical_value_id), {}
                     )
@@ -36330,28 +36360,14 @@ def _class_surface_ssa_program(
                                 "device": part_value.device,
                             },
                         )
-                        part_fact = _posted_ssa_value_fact(
-                            function, int(part_id),
-                        )
                         part_value.dtype = part_dtype
                         prior_physical_dtype = prior_part_accounting.get(
                             "physical_dtype"
                         )
-                        part_value.accounting = {
+                        part_value.accounting = _frame_accounting_from_posted({
                             **prior_part_accounting,
                             "program_abi_record": str(record["identity"]),
                             "program_abi_field": f"{field_name}.{part_name}",
-                            "program_abi_storage": (
-                                part_fact.storage if part_fact is not None
-                                and part_fact.storage is not None
-                                else "scalar"
-                                if part_storage is SSARecordFieldStorage.SCALAR
-                                else "span"
-                            ),
-                            "program_abi_rank": (
-                                part_fact.rank if part_fact is not None
-                                and part_fact.rank is not None else int(rank)
-                            ),
                             "program_abi_mutable": bool(
                                 field.get("mutable", False)
                             ),
@@ -36359,12 +36375,6 @@ def _class_surface_ssa_program(
                             "program_abi_keyed_part": str(part_name),
                             "program_abi_key_encoding": str(
                                 field.get("key_encoding") or "string_token"
-                            ),
-                            "physical_dtype": (
-                                part_fact.physical_dtype
-                                if part_fact is not None
-                                and part_fact.physical_dtype is not None
-                                else str(part_dtype)
                             ),
                             "physical_dtype_provenance": (
                                 "program_abi_keyed_member"
@@ -36382,7 +36392,7 @@ def _class_surface_ssa_program(
                                     None, "", "unknown", part_dtype,
                                 }
                             ) else {}),
-                        }
+                        }, _frame_physical_fields(function, int(part_id)))
                         fields.append(SSARecordFieldDescriptor(
                             f"{field_name}.{part_name}",
                             part_storage,
@@ -37857,21 +37867,12 @@ def _class_surface_ssa_program(
                             sources=(_frame_graph_cell(graph, iterable_id),),
                             physical={"rank": projected_rank},
                         )
-                        projected_fact = _posted_ssa_value_fact(
-                            function, int(value.id),
-                        )
-                        value.accounting = {
+                        value.accounting = _frame_accounting_from_posted({
                             **accounting,
                             "sequence_id": iterable_id,
                             "sequence_static_length": int(static_length),
                             "tensor_metadata_state": "dynamic",
-                            "program_abi_rank": (
-                                projected_fact.rank
-                                if projected_fact is not None
-                                and projected_fact.rank is not None
-                                else projected_rank
-                            ),
-                        }
+                        }, _frame_physical_fields(function, int(value.id)))
                     receipts.append((
                         iterable_id, int(owner), method,
                         int(static_length),
@@ -38383,18 +38384,41 @@ def _class_surface_ssa_program(
                                 (argument.dtype, None) for argument in helper.args[4:]
                             ))
                         typed: dict[int, str] = {}
-                        for argument, (dtype, shape) in zip(
+                        for position, (argument, (dtype, shape)) in enumerate(zip(
                             helper.args, helper_dtypes
-                        ):
+                        )):
                             prior_dtype = argument.dtype
+                            revised_shape = (
+                                shape if shape is not None and not tuple(
+                                    argument.shape or ()
+                                ) else argument.shape
+                            )
+                            # Program: a keyed-mapping lookup helper bound to
+                            # a record's keys/values/length parts.  Wrong
+                            # record: the helper formal was retyped in place
+                            # and its physical dtype set in accounting only.
+                            # Rule: the formal's row is revised with the
+                            # dtype of the caller operand bound at this
+                            # position, DERIVED from that operand's cell;
+                            # accounting is a view of the row.
+                            _revise_ssa_value(
+                                helper, int(argument.id), dtype=dtype,
+                                shape=revised_shape,
+                                stage=RECORD_ABI_MATERIALIZATION,
+                                sources=_frame_cells(*(
+                                    (_frame_value_cell(
+                                        function,
+                                        int(instruction.args[position].id),
+                                    ),)
+                                    if position < len(instruction.args)
+                                    else ()
+                                )),
+                                physical={"physical_dtype": dtype},
+                            )
                             argument.dtype = dtype
-                            if shape is not None and not tuple(
-                                argument.shape or ()
-                            ):
-                                argument.shape = shape
-                            argument.accounting = {
+                            argument.shape = revised_shape
+                            argument.accounting = _frame_accounting_from_posted({
                                 **dict(argument.accounting or {}),
-                                "physical_dtype": dtype,
                                 "physical_dtype_provenance": (
                                     "keyed_helper_contract"
                                 ),
@@ -38407,7 +38431,7 @@ def _class_surface_ssa_program(
                                 } if prior_dtype not in {
                                     None, "", "unknown", "None", dtype,
                                 } else {}),
-                            }
+                            }, _frame_physical_fields(helper, int(argument.id)))
                             typed[int(argument.id)] = str(argument.dtype)
                         # The body holds its own SSAValue instances for the same
                         # ids; retype them too, and give each Load the element
@@ -41924,12 +41948,32 @@ def _class_surface_ssa_program(
                 # The source-call placeholder may have inherited a caller's
                 # tensor descriptor before decomposition; none of that shape
                 # belongs to the constant which replaces the call.
+                # Rule: post first; accounting is a view.  The callsite
+                # result's row is revised to the constant's scalar float64,
+                # DERIVED from its prior row and the call's graph cell.
+                if _frame_value_cell(caller, int(caller_result_id)) is None:
+                    _adopt_graph_formal(
+                        caller, getattr(caller_graph, "G", caller_graph),
+                        int(caller_result_id), dtype="float64", shape=(),
+                    )
+                _revise_ssa_value(
+                    caller, int(caller_result_id), dtype="float64", shape=(),
+                    stage=_FRAME_LINK,
+                    sources=(_frame_graph_cell(
+                        getattr(caller_graph, "G", caller_graph),
+                        int(caller_result_id),
+                    ),),
+                    physical={
+                        "physical_dtype": "float64", "storage": "scalar",
+                        "rank": 0,
+                    },
+                )
                 result.dtype = "float64"
                 result.shape = ()
-                result.accounting = {
-                    **dict(result.accounting or {}),
-                    "physical_dtype": "float64",
-                }
+                result.accounting = _frame_accounting_from_posted(
+                    result.accounting,
+                    _frame_physical_fields(caller, int(caller_result_id)),
+                )
                 intrinsic = Instr(
                     "Const", [], result,
                     attributes={
@@ -42321,7 +42365,7 @@ def _class_surface_ssa_program(
 
     def mint_compiler_value_id(
         function: Any = None, transform: Any = None, operands: Any = (), *,
-        dtype: Any = None, shape: Any = (),
+        dtype: Any = None, shape: Any = (), physical: Any = None,
     ) -> int:
         """Mint one compiler value id: a NOVEL ``ssa_value`` row under
         ``function``'s scope (``transform``, default FRAME_SCAFFOLD, from
@@ -42335,6 +42379,7 @@ def _class_surface_ssa_program(
         return _frame_mint(
             function, FRAME_SCAFFOLD if transform is None else transform,
             operands, dtype=dtype, shape=shape, stage=FRAME_LINK,
+            physical=physical,
         )
 
     def frame_fixed_point_digest() -> str:
@@ -48073,8 +48118,7 @@ def _class_surface_ssa_program(
                     # row is revised with the settled dtype, shape and
                     # physical dtype, DERIVED from the cells of the incoming
                     # values it was read from; the resident view is then set
-                    # FROM that posted fact (a result with no row keeps the
-                    # settled literals).
+                    # FROM that posted fact.
                     _revise_ssa_value(
                         function, int(instruction.res.id),
                         dtype=physical_dtype, shape=next(iter(shaped), ()),
@@ -48088,23 +48132,23 @@ def _class_surface_ssa_program(
                     phi_fact = _posted_ssa_value_fact(
                         function, int(instruction.res.id),
                     )
-                    instruction.res.dtype = (
-                        phi_fact.dtype if phi_fact is not None
-                        else physical_dtype
+                    if phi_fact is None:
+                        # The control builder mints every Phi with its row;
+                        # a Phi without one has lost its identity, and a
+                        # settled type written onto it would be unrecorded.
+                        from .identity_concordance import ConcordanceRefusal
+
+                        raise ConcordanceRefusal(
+                            "settled Phi has no ssa_value row: "
+                            f"function={function.name!r}, "
+                            f"value={int(instruction.res.id)}"
+                        )
+                    instruction.res.dtype = phi_fact.dtype
+                    instruction.res.shape = phi_fact.shape
+                    instruction.res.accounting = _frame_accounting_from_posted(
+                        instruction.res.accounting,
+                        _frame_physical_fields(function, int(instruction.res.id)),
                     )
-                    instruction.res.shape = (
-                        phi_fact.shape if phi_fact is not None
-                        else next(iter(shaped), ())
-                    )
-                    instruction.res.accounting = {
-                        **dict(instruction.res.accounting or {}),
-                        "physical_dtype": (
-                            phi_fact.physical_dtype
-                            if phi_fact is not None
-                            and phi_fact.physical_dtype is not None
-                            else physical_dtype
-                        ),
-                    }
                     phi_types_changed = True
 
     # A record-valued sequence insertion is initially expressed with the
@@ -48866,22 +48910,43 @@ def _class_surface_ssa_program(
                     ):
                         if int(value_id) in current_values:
                             continue
-                        value = SSAValue(
-                            int(value_id), dtype=str(dtype), shape=tuple(shape),
-                            accounting={
-                                "compiler_frame_storage": str(function_name),
-                                "compiler_frame_sequence_id": int(
-                                    source_sequence.sequence_id
-                                ),
-                                "compiler_frame_member": int(member_index),
-                                "returned_record_sequence_storage": str(
-                                    nested_field.storage_identity
-                                ),
-                                "sequence_arena": int(value_id) in set(map(
+                        # Program: a returned record row with a nested sequence.  Wrong
+                        # record: the source sequence's members entered this frame as bare
+                        # formals with no row (arena in accounting only).  Rule: each
+                        # member's row is posted from the sequence descriptor and member
+                        # cells with its descriptor storage; accounting is a view of it.
+                        is_capacity = int(value_id) == int(
+                            source_sequence.capacity_value_id
+                        )
+                        value = _adopt_graph_formal(
+                            function, source_graphs_by_symbol.get(function_name),
+                            int(value_id),
+                            _frame_table_cell(
+                                sequence_table, int(source_sequence.sequence_id),
+                                SEQUENCE_DESCRIPTOR,
+                            ),
+                            _frame_table_cell(
+                                sequence_table, int(value_id), SEQUENCE_MEMBER,
+                            ),
+                            dtype=str(dtype), shape=tuple(shape),
+                            physical={
+                                "storage": "scalar" if is_capacity else "span",
+                                "rank": 0 if is_capacity else 1,
+                                "arena": int(value_id) in set(map(
                                     int, source_sequence.column_value_ids
                                 )),
                             },
                         )
+                        value.accounting = _frame_accounting_from_posted({
+                            "compiler_frame_storage": str(function_name),
+                            "compiler_frame_sequence_id": int(
+                                source_sequence.sequence_id
+                            ),
+                            "compiler_frame_member": int(member_index),
+                            "returned_record_sequence_storage": str(
+                                nested_field.storage_identity
+                            ),
+                        }, _frame_physical_fields(function, int(value_id)))
                         function.args.append(value)
                         current_values[int(value_id)] = value
                     handle_column = next(
@@ -49101,20 +49166,11 @@ def _class_surface_ssa_program(
                                 "device": value.device,
                             },
                         )
-                        row_fact = _posted_ssa_value_fact(
-                            function, int(value.id),
-                        )
                         value.dtype = dtype
-                        value.accounting = {
+                        value.accounting = _frame_accounting_from_posted({
                             **dict(value.accounting or {}),
                             "returned_record_storage": str(expected_identity),
-                            "physical_dtype": (
-                                row_fact.physical_dtype
-                                if row_fact is not None
-                                and row_fact.physical_dtype is not None
-                                else dtype
-                            ),
-                        }
+                        }, _frame_physical_fields(function, int(value.id)))
                 callee = all_functions.get(str(
                     instruction.attributes.get("callee") or ""
                 ))
@@ -49145,20 +49201,11 @@ def _class_surface_ssa_program(
                                 "device": formal.device,
                             },
                         )
-                        formal_fact = _posted_ssa_value_fact(
-                            callee, int(formal.id),
-                        )
                         formal.dtype = dtype
-                        formal.accounting = {
+                        formal.accounting = _frame_accounting_from_posted({
                             **dict(formal.accounting or {}),
-                            "physical_dtype": (
-                                formal_fact.physical_dtype
-                                if formal_fact is not None
-                                and formal_fact.physical_dtype is not None
-                                else dtype
-                            ),
                             "ssa_record_row_identity": str(expected_identity),
-                        }
+                        }, _frame_physical_fields(callee, int(formal.id)))
                 instruction.attributes = {
                     **instruction.attributes,
                     "ssa_record_row_expanded_from": int(semantic_id),
@@ -49328,22 +49375,13 @@ def _class_surface_ssa_program(
                                     "device": value.device,
                                 },
                             )
-                            slot_fact = _posted_ssa_value_fact(
-                                function, int(value.id),
-                            )
                             value.dtype = dtype
-                            value.accounting = {
+                            value.accounting = _frame_accounting_from_posted({
                                 **dict(value.accounting or {}),
                                 "returned_record_storage": str(
                                     expected_identity
                                 ),
-                                "physical_dtype": (
-                                    slot_fact.physical_dtype
-                                    if slot_fact is not None
-                                    and slot_fact.physical_dtype is not None
-                                    else dtype
-                                ),
-                            }
+                            }, _frame_physical_fields(function, int(value.id)))
                         replacement.append(value)
                     arguments[index:index + 1] = replacement
                     expanded_dtypes[index] = tuple(
@@ -49435,21 +49473,43 @@ def _class_surface_ssa_program(
                     ):
                         if int(value_id) in current_values:
                             continue
-                        value = SSAValue(
-                            int(value_id), dtype=str(dtype), shape=tuple(shape),
-                            accounting={
-                                "compiler_frame_storage": str(function_name),
-                                "compiler_frame_sequence_id": int(
-                                    source_sequence.sequence_id
-                                ),
-                                "compiler_frame_member": int(member_index),
-                                "returned_record_sequence_storage": str(
-                                    nested_field.storage_identity
-                                ),
-                                "sequence_arena": int(value_id)
-                                in source_columns,
+                        # Program: a returned record row with a nested sequence.  Wrong
+                        # record: the source sequence's members entered this frame as bare
+                        # formals with no row (arena in accounting only).  Rule: each
+                        # member's row is posted from the sequence descriptor and member
+                        # cells with its descriptor storage; accounting is a view of it.
+                        is_capacity = int(value_id) == int(
+                            source_sequence.capacity_value_id
+                        )
+                        value = _adopt_graph_formal(
+                            function, source_graphs_by_symbol.get(function_name),
+                            int(value_id),
+                            _frame_table_cell(
+                                sequence_table, int(source_sequence.sequence_id),
+                                SEQUENCE_DESCRIPTOR,
+                            ),
+                            _frame_table_cell(
+                                sequence_table, int(value_id), SEQUENCE_MEMBER,
+                            ),
+                            dtype=str(dtype), shape=tuple(shape),
+                            physical={
+                                "storage": "scalar" if is_capacity else "span",
+                                "rank": 0 if is_capacity else 1,
+                                "arena": int(value_id) in set(map(
+                                    int, source_sequence.column_value_ids
+                                )),
                             },
                         )
+                        value.accounting = _frame_accounting_from_posted({
+                            "compiler_frame_storage": str(function_name),
+                            "compiler_frame_sequence_id": int(
+                                source_sequence.sequence_id
+                            ),
+                            "compiler_frame_member": int(member_index),
+                            "returned_record_sequence_storage": str(
+                                nested_field.storage_identity
+                            ),
+                        }, _frame_physical_fields(function, int(value_id)))
                         function.args.append(value)
                         current_values[int(value_id)] = value
                     child_columns = []
@@ -49655,19 +49715,10 @@ def _class_surface_ssa_program(
                                 "device": formal.device,
                             },
                         )
-                        slot_formal_fact = _posted_ssa_value_fact(
-                            callee, int(formal.id),
-                        )
                         formal.dtype = dtype
-                        formal.accounting = {
+                        formal.accounting = _frame_accounting_from_posted({
                             **dict(formal.accounting or {}),
-                            "physical_dtype": (
-                                slot_formal_fact.physical_dtype
-                                if slot_formal_fact is not None
-                                and slot_formal_fact.physical_dtype is not None
-                                else dtype
-                            ),
-                        }
+                        }, _frame_physical_fields(callee, int(formal.id)))
                 instruction.attributes = {
                     **instruction.attributes,
                     "ssa_record_slots_expanded": tuple(slots),
@@ -51260,16 +51311,32 @@ def _class_surface_ssa_program(
                     int(argument.id) == int(load.res.id)
                     for argument in function.args
                 ):
+                    # Rule: post first; accounting is a view.  The promoted
+                    # load result IS the record's sequence column: its row
+                    # is revised to the column's dtype as an arena span,
+                    # DERIVED from the sequence descriptor's cell.
+                    _revise_ssa_value(
+                        function, int(load.res.id), dtype=dtype,
+                        shape=tuple(load.res.shape or ()),
+                        stage=_FRAME_LINK,
+                        sources=(_frame_table_cell(
+                            sequence_table, int(descriptor.sequence_id),
+                            SEQUENCE_DESCRIPTOR,
+                        ),),
+                        physical={
+                            "storage": "span", "rank": 1, "arena": True,
+                        },
+                    )
                     function.args.append(SSAValue(
                         int(load.res.id),
                         dtype=dtype,
-                        accounting={
-                            "sequence_arena": True,
+                        shape=tuple(load.res.shape or ()),
+                        accounting=_frame_accounting_from_posted({
                             "record_sequence_field": (
                                 f"{field_identity[0]}.{field_identity[1]}"
                             ),
                             "compiler_frame_storage": str(function_name),
-                        },
+                        }, _frame_physical_fields(function, int(load.res.id))),
                     ))
                 promoted_sequence_columns.append((
                     int(descriptor.sequence_id), int(load.res.id),
@@ -51457,27 +51524,51 @@ def _class_surface_ssa_program(
                             continue
                         value = caller_values.get(int(caller_member))
                         if value is None:
-                            value = SSAValue(
-                                int(caller_member), dtype=str(dtype),
-                                shape=tuple(shape),
-                                accounting={
-                                    "sequence_arena": (
-                                        int(caller_member)
-                                        in set(map(int,
-                                            caller_sequence.column_value_ids
-                                        ))
+                            # The caller's sequence member enters this frame
+                            # with its row posted from the caller's sequence
+                            # descriptor and member cells (as the returned
+                            # record row members above); accounting is a
+                            # view of that row.
+                            is_capacity = int(caller_member) == int(
+                                caller_sequence.capacity_value_id
+                            )
+                            value = _adopt_graph_formal(
+                                caller,
+                                source_graphs_by_symbol.get(caller_symbol),
+                                int(caller_member),
+                                _frame_table_cell(
+                                    caller_sequences,
+                                    int(caller_sequence.sequence_id),
+                                    SEQUENCE_DESCRIPTOR,
+                                ),
+                                _frame_table_cell(
+                                    caller_sequences, int(caller_member),
+                                    SEQUENCE_MEMBER,
+                                ),
+                                dtype=str(dtype), shape=tuple(shape),
+                                physical={
+                                    "storage": (
+                                        "scalar" if is_capacity else "span"
                                     ),
-                                    "compiler_frame_storage": str(
-                                        caller_symbol
-                                    ),
-                                    "compiler_frame_sequence_id": int(
-                                        caller_sequence.sequence_id
-                                    ),
-                                    "returned_record_sequence_storage": str(
-                                        caller_field.storage_identity
-                                    ),
+                                    "rank": 0 if is_capacity else 1,
+                                    "arena": int(caller_member) in set(map(
+                                        int, caller_sequence.column_value_ids,
+                                    )),
                                 },
                             )
+                            value.accounting = _frame_accounting_from_posted({
+                                "compiler_frame_storage": str(
+                                    caller_symbol
+                                ),
+                                "compiler_frame_sequence_id": int(
+                                    caller_sequence.sequence_id
+                                ),
+                                "returned_record_sequence_storage": str(
+                                    caller_field.storage_identity
+                                ),
+                            }, _frame_physical_fields(
+                                caller, int(caller_member),
+                            ))
                             caller.args.append(value)
                             caller_values[int(caller_member)] = value
                         caller_member_values[int(callee_member)] = value
@@ -51804,6 +51895,7 @@ def _class_surface_ssa_program(
             callee_record_table = all_record_tables.get(callee_symbol)
             rebound_storage: dict[int, int] = {}
             returned_field_dtypes: dict[int, str] = {}
+            returned_field_cells: dict[int, Any] = {}
             authored_argument_bindings = tuple(record.argument_bindings)
             resolved_argument_bindings = tuple(
                 (resident_argument_record_id(caller_id), int(callee_id))
@@ -51864,6 +51956,12 @@ def _class_surface_ssa_program(
                         for value_id in field.value_ids:
                             returned_field_dtypes.setdefault(
                                 int(value_id), str(field.dtype)
+                            )
+                            returned_field_cells.setdefault(
+                                int(value_id), _frame_table_cell(
+                                    caller_record_table,
+                                    int(caller_record_id), RECORD_DESCRIPTOR,
+                                ),
                             )
                     for callee_field in callee_descriptor.fields:
                         caller_field = caller_fields.get(
@@ -51966,11 +52064,30 @@ def _class_surface_ssa_program(
                             continue
                         field_dtype = returned_field_dtypes.get(int(caller_id))
                         if field_dtype is not None:
+                            # Program: a returned record forwarded as a call
+                            # argument.  Wrong record: the argument occurrence
+                            # was cloned with the field's dtype while the
+                            # value's row kept another (one id, two types).
+                            # Rule: the caller record descriptor's field dtype
+                            # is a REVISE of the value's own row, DERIVED from
+                            # that descriptor's cell; the occurrence is a view
+                            # of the row.
+                            caller_function = all_functions[str(caller_symbol)]
+                            _revise_ssa_value(
+                                caller_function, int(value.id),
+                                dtype=field_dtype,
+                                shape=tuple(value.shape or ()),
+                                stage=_FRAME_LINK,
+                                sources=_frame_cells(
+                                    returned_field_cells.get(int(caller_id)),
+                                ),
+                                physical={"physical_dtype": field_dtype},
+                            )
+                            value.dtype = field_dtype
                             value = clone_value(
                                 value,
                                 int(value.id),
-                                accounting={
-                                    "physical_dtype": field_dtype,
+                                accounting=_frame_accounting_from_posted({
                                     "physical_dtype_provenance": (
                                         "exact_returned_record_field"
                                     ),
@@ -51978,7 +52095,9 @@ def _class_surface_ssa_program(
                                     "returned_record_argument_view": (
                                         int(record.callsite_id), callee_id,
                                     ),
-                                },
+                                }, _frame_physical_fields(
+                                    caller_function, int(value.id),
+                                )),
                             )
                             value.dtype = field_dtype
                         linked_call.args[position] = value
@@ -56366,10 +56485,10 @@ def _lower_ast_source_to_ssa_impl(
         tree, projection_schemas=inferred_projection_record_schemas,
         source_module=source_module,
     )
-    inferred_record_schemas = {
-        **inferred_projection_record_schemas,
-        **_authored_complete_record_schemas(tree),
-    }
+    inferred_record_schemas = _record_schemas_with_constructors(
+        inferred_projection_record_schemas,
+        _authored_complete_record_schemas(tree),
+    )
 
     def numeric_record_schema(descriptor: Any) -> tuple[str, dict[str, Any]] | None:
         """Materialize a composite numeric annotation as its physical record.
@@ -56598,8 +56717,10 @@ def _lower_ast_source_to_ssa_impl(
             body=declared_classes, type_ignores=[]
         )
         inferred_record_schemas = {
-            **declared_projection_schemas,
-            **_authored_complete_record_schemas(declared_class_tree),
+            **_record_schemas_with_constructors(
+                declared_projection_schemas,
+                _authored_complete_record_schemas(declared_class_tree),
+            ),
             **inferred_record_schemas,
         }
         inferred_record_views = {
@@ -56995,8 +57116,9 @@ def _lower_ast_source_to_ssa_impl(
             expanded_tree
         )
         inferred_record_schemas = {
-            **expanded_projection_schemas,
-            **expanded_record_schemas,
+            **_record_schemas_with_constructors(
+                expanded_projection_schemas, expanded_record_schemas,
+            ),
             **inferred_record_schemas,
         }
         inferred_record_views = {
