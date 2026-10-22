@@ -12036,6 +12036,153 @@ class _ControlSSABuilder(TiledObject):
             )
             self._bind_sequence_query_result(query, result, accumulator)
             return
+        if query.operation in {"count", "index"}:
+            # ``xs.count(v)``: rows equal to ``v``.  ``xs.index(v)``: the
+            # first such row; Python raises ValueError when there is none
+            # (validation error 76).  The comparison is one dtype: a key of
+            # another dtype is a named shortfall, not a conversion.
+            row_dtype = str((descriptor.column_dtypes or ("unknown",))[0])
+            key = self.external_value(int(query.key_value_ids[0]))
+            if len(descriptor.column_value_ids) != 1 or str(
+                key.dtype or "unknown"
+            ) != row_dtype or row_dtype not in {
+                "int64", "float64", "bool",
+            }:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", query.operation, self.function_name,
+                    f"resident {query.operation} over {row_dtype!r} rows "
+                    f"with a {key.dtype!r} key",
+                ))
+                return
+            counting = query.operation == "count"
+            preheader = self.current
+            header = self.new_block(f"sequence_{query.operation}_header")
+            body = self.new_block(f"sequence_{query.operation}_body")
+            latch = self.new_block(f"sequence_{query.operation}_latch")
+            exit_block = self.new_block(f"sequence_{query.operation}_exit")
+            found = None if counting else self.new_block("sequence_index_found")
+            missing = None if counting else self.new_block("sequence_index_missing")
+            zero = self.constant_value(0, length)
+            one = self.constant_value(1, length)
+            next_index = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
+            )
+            next_count = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(storage[0], key),
+            ) if counting else None
+            self.branch(header)
+
+            self.current = header
+            index = self.fresh_value(
+                dtype="int64", transform=PHI_LOOP_HEADER,
+                operands=(zero, next_index),
+            )
+            self.emit(
+                Handler.Phi, [zero, next_index], index,
+                attributes={
+                    **attributes,
+                    "incoming_blocks": (preheader.name, latch.name),
+                    "binding": f"ssa_sequence_{query.operation}_index",
+                },
+            )
+            tally = None
+            if counting:
+                tally = self.fresh_value(
+                    dtype="int64", transform=PHI_LOOP_HEADER,
+                    operands=(zero, next_count),
+                )
+                self.emit(
+                    Handler.Phi, [zero, next_count], tally,
+                    attributes={
+                        **attributes,
+                        "incoming_blocks": (preheader.name, latch.name),
+                        "binding": "ssa_sequence_count_tally",
+                    },
+                )
+            has_item = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(index, length),
+            )
+            self.emit(Handler.Lt, [index, length], has_item, attributes=attributes)
+            self.conditional_branch(
+                has_item, body, exit_block if counting else missing,
+            )
+
+            self.current = body
+            address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(storage[0], index),
+            )
+            self.emit(
+                Handler.GetElementPtr, [storage[0], index], address,
+                attributes=attributes,
+            )
+            item = self.fresh_value(
+                dtype=row_dtype, transform=LOAD, operands=(address,),
+            )
+            self.emit(Handler.Load, [address], item, attributes=attributes)
+            equal = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(item, key),
+            )
+            self.emit(Handler.Eq, [item, key], equal, attributes=attributes)
+            if counting:
+                hit = self.fresh_value(
+                    dtype="int64", transform=CONTROL_CAST, operands=(equal,),
+                )
+                self.emit(
+                    Handler.Cast, [equal], hit,
+                    attributes={**attributes, "target_dtype": "int64"},
+                )
+                self.emit(Handler.Add, [tally, hit], next_count, attributes=attributes)
+                self.branch(latch)
+            else:
+                self.conditional_branch(equal, found, latch)
+
+            self.current = latch
+            self.emit(Handler.Add, [index, one], next_index, attributes=attributes)
+            self.branch(header)
+
+            if counting:
+                self.current = exit_block
+                answer = tally
+            else:
+                self.current = missing
+                self.emit(
+                    Handler.Call, [],
+                    attributes={
+                        "callee": "turing_validation_error", "error_code": 76,
+                        **attributes,
+                    },
+                )
+                absent = self.constant_value(-1, length)
+                self.branch(exit_block)
+                self.current = found
+                self.branch(exit_block)
+                self.current = exit_block
+                answer = self.fresh_value(
+                    dtype="int64", transform=PHI_LOOP_HEADER,
+                    operands=(index, absent),
+                )
+                self.emit(
+                    Handler.Phi, [index, absent], answer,
+                    attributes={
+                        **attributes,
+                        "incoming_blocks": (found.name, missing.name),
+                        "binding": "ssa_sequence_index_result",
+                    },
+                )
+            result = self.produced_value(
+                int(query.result_value_id),
+                dtype="int64",
+                claim_provisional_definition=True,
+                cause=(answer,),
+            )
+            self.emit(
+                Handler.Cast, [answer], result,
+                attributes={**attributes, "target_dtype": "int64"},
+            )
+            self._bind_sequence_query_result(query, result, answer)
+            return
         if query.operation in {"length", "truth"}:
             result = self.produced_value(
                 int(query.result_value_id),

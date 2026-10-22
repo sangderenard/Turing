@@ -14518,6 +14518,47 @@ def _install_lexical_sequence_queries(
     unsupported = []
     for node_id, data in sorted(graph_obj.nodes(data=True)):
         expression = data.get("expr_obj")
+        # Program: ``xs = [6, 6, 6, n]; xs.count(6) * 10 + xs.index(6)``
+        # (fuzzer p3_7).  Wrong record: nothing lowered the two list
+        # methods, so their results became public inputs (the native
+        # product refused the root).  Rule: ``count``/``index`` of a local
+        # list are resident queries over its rows, read at the call.
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and expression.func.attr in {"count", "index"}
+            and len(expression.args) == 1
+            and not expression.keywords
+        ):
+            receiver_id = next((
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) == "operand" and int(parent) in graph_obj
+            ), None)
+            key_id = next((
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) == "arg:0" and int(parent) in graph_obj
+            ), None)
+            receiver_attributes = (
+                {} if receiver_id is None
+                else graph_obj.nodes[receiver_id].get("attributes") or {}
+            )
+            if (
+                receiver_id is not None
+                and key_id is not None
+                and receiver_attributes.get("aggregate_kind") == "list"
+            ):
+                queries.append(SequenceQueryBlock(
+                    result_value_id=int(data.get("value_id", node_id)),
+                    sequence_value_id=int(
+                        graph_obj.nodes[receiver_id].get("value_id", receiver_id)
+                    ),
+                    operation=str(expression.func.attr),
+                    source_call_node_id=int(node_id),
+                    key_value_ids=(int(
+                        graph_obj.nodes[key_id].get("value_id", key_id)
+                    ),),
+                ))
+            continue
         if not (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Name)
@@ -26511,6 +26552,15 @@ def _class_surface_ssa_program(
         from .identity_concordance import shape_scope_of
         for value_id in native_constructor_ids:
             constant_values.pop(int(value_id), None)
+        # Program: ``xs.count(6)`` (fuzzer p3_7).  Wrong record: a literal
+        # no region typed reached the builder with no dtype, so a query
+        # comparing rows with it could not state one comparison type.
+        # Rule: an authored scalar literal's class is its dtype
+        # (``scalar_fact_dtype``, as for field writes); a stated dtype wins.
+        for value_id, literal in constant_values.items():
+            literal_dtype = scalar_fact_dtype(literal)
+            if literal_dtype is not None:
+                parameter_value_dtypes.setdefault(int(value_id), literal_dtype)
 
         # A schema-known record constructor only packages its field
         # residents. It cannot mutate a keyed/list field while doing so,

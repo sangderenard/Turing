@@ -669,12 +669,12 @@ class SequenceQueryBlock(TiledObject):
     def __post_init__(self) -> None:
         if self.operation not in {
             "length", "truth", "first_or_default", "lookup", "membership",
-            "maximum", "any", "first", "sum",
+            "maximum", "any", "first", "sum", "count", "index",
         }:
             raise ValueError("unknown resident sequence query")
         if self.operation == "first_or_default" and self.default_value_id is None:
             raise ValueError("first_or_default requires an explicit default")
-        if self.operation in {"lookup", "membership"} and not self.key_value_ids:
+        if self.operation in {"lookup", "membership", "count", "index"} and not self.key_value_ids:
             raise ValueError(
                 f"{self.operation} requires at least one exact key identity"
             )
