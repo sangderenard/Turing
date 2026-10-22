@@ -70,6 +70,10 @@ EXTENDED = [
     (["bs{v} = [n > {a}, n < {b}, True]"], "sum(1 for b{v} in bs{v} if b{v})"),
     (["xs{v} = [{a}, n, {b}]", "ys{v} = list(xs{v})", "ys{v}.append(n)"], "len(xs{v}) * 10 + len(ys{v})"),
     (["xs{v} = [{a}, n, {b}, {c}]"], "xs{v}[-1] * 10 + xs{v}[-2]"),
+    # chained comparisons whose middle is a builtin conversion or measure,
+    # one behind a guarding ``and`` (lanes plan A0)
+    (["f{v} = n * 0.5 + {a}"], "1 if 0 <= int(f{v}) <= {b} + 3 else 2"),
+    (["xs{v} = [{a}, n, {b}]"], "(1 if 1 < len(xs{v}) <= n else 0) + (2 if n != 0 and 0 < abs({a} // n) < 3 else 0)"),
 ]
 EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
