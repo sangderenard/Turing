@@ -20543,26 +20543,6 @@ class _ControlSSABuilder(TiledObject):
 
         for descriptor in self.sequence_descriptors.values():
             register_sequence(sequence_table, descriptor)
-        # Program: ``xs = [6, 6, 6, n]; return xs.count(6) * 10 +
-        # xs.index(6)`` (fuzzer p3_7).  Wrong record: no lowering produced
-        # the two method-call results, so each became a function formal and
-        # the native call read 0.0 for them (the audit's unaccounted-formal,
-        # nothing refused).  Rule: a source method call's result is never a
-        # function input; one still reaching the formals is a refused
-        # lowering, named by its receipt.
-        for argument in self.arguments:
-            receipt = self.source_execution_receipts.get(int(argument.id))
-            if (
-                receipt is not None
-                and receipt.get("construct") == "Call"
-                and receipt.get("planner_rule") == "method_call"
-            ):
-                self.shortfalls.append(SSALoweringShortfall(
-                    "control", "unlowered-method-call", self.function_name,
-                    f"{receipt.get('source')!r} (value {int(argument.id)}) "
-                    "has no lowering; its result would be an unproduced "
-                    "function input",
-                ))
         function = Function(
                 self.function_name,
                 self.arguments,

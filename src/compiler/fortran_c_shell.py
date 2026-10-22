@@ -12079,30 +12079,7 @@ def _nest_lexical_conditionals_in_loops(
     )
 
     def block_position(block) -> tuple[int, int, int]:
-        if isinstance(block, SequenceMutationBlock):
-            return node_position(_sequence_mutation_owner_id(block.mutation))
-        if isinstance(block, StatementBlock) and len(block.lines) == 1:
-            line = block.lines[0]
-            if line.startswith("__scheduled_region_") and line.endswith("__"):
-                return region_positions.get(
-                    int(line[len("__scheduled_region_"):-2]),
-                    (1 << 30, 0, 0),
-                )
-            if line.startswith("__plan_callsite_") and line.endswith("__"):
-                return node_position(int(line[len("__plan_callsite_"):-2]))
-        if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return _conditional_block_position(graph.G, int(block.source_node_id))
-        if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
-            return _loop_control_block_position(graph.G, block, node_position)
-        if isinstance(block, (LoopBlock, WhileBlock)):
-            source_id = getattr(block, "source_loop_node_id", None)
-            if source_id is not None:
-                return node_position(int(source_id))
-        if isinstance(block, CallBlock):
-            return node_position(int(block.callsite_id))
-        if isinstance(block, SequenceBlock) and block.blocks:
-            return min(map(block_position, block.blocks))
-        return (1 << 30, 0, 0)
+        return _control_block_position(graph.G, block, region_positions)
 
     def loop_span(block) -> tuple[int, int] | None:
         source_id = getattr(block, "source_loop_node_id", None)
@@ -12461,6 +12438,115 @@ def _conditional_block_position(
     )
 
 
+def _control_block_position(
+    graph_obj: Any, block: Any, region_positions: Mapping[int, tuple[int, int, int]],
+) -> tuple[int, int, int]:
+    """The one authored position of a control block, for every lexical
+    placement pass.
+
+    Program: ``for j in range(len(xs)): xs[j] = xs[j] * 2`` (fuzzer p3_46).
+    Wrong record: five placement passes each kept a private copy of this
+    rule, and only one knew a ``SequenceQueryBlock``; the next pass sorted
+    the ``len(xs)`` query to the end of the function, after the loop whose
+    bound it is.  Rule: one position per block kind, read by every pass.
+    """
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, DispatchBlock, ExternalReferenceCallBlock,
+        LoopBlock, LoopControlBlock, ResourceScopeBlock, ScalarFieldWriteBlock,
+        SequenceBlock, SequenceMutationBlock, SequenceQueryBlock,
+        StatementBlock, WhileBlock,
+    )
+
+    def node_position(node_id: int) -> tuple[int, int, int]:
+        return _authored_node_position(graph_obj, int(node_id))
+
+    if isinstance(block, ScalarFieldWriteBlock):
+        return node_position(int(block.effect_node_id))
+    if isinstance(block, SequenceMutationBlock):
+        return node_position(_sequence_mutation_owner_id(block.mutation))
+    if isinstance(block, SequenceQueryBlock) and block.source_call_node_id is not None:
+        return node_position(int(block.source_call_node_id))
+    if isinstance(block, ResourceScopeBlock):
+        return node_position(block.source_scope_id)
+    if isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
+        return node_position(block.callsite_id)
+    if isinstance(block, StatementBlock) and len(block.lines) == 1:
+        line = block.lines[0]
+        if line.startswith("__scheduled_region_") and line.endswith("__"):
+            return region_positions.get(
+                int(line[len("__scheduled_region_"):-2]),
+                (1 << 30, 0, 0),
+            )
+        if line.startswith("__plan_callsite_") and line.endswith("__"):
+            return node_position(int(line[len("__plan_callsite_"):-2]))
+    if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
+        return _conditional_block_position(graph_obj, int(block.source_node_id))
+    if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
+        return _loop_control_block_position(graph_obj, block, node_position)
+    if isinstance(block, (LoopBlock, WhileBlock)):
+        source_id = getattr(block, "source_loop_node_id", None)
+        if source_id is not None:
+            return _loop_block_position(graph_obj, int(source_id))
+    if isinstance(block, CallBlock):
+        return node_position(int(block.callsite_id))
+    if isinstance(block, SequenceBlock) and block.blocks:
+        return min(
+            _control_block_position(graph_obj, child, region_positions)
+            for child in block.blocks
+        )
+    return (1 << 30, 0, 0)
+
+
+def _loop_block_position(graph_obj: Any, node_id: int) -> tuple[int, int, int]:
+    """Authored position at which a retained loop begins iterating.
+
+    A ``for`` loop evaluates its iterable once, then iterates: like a
+    conditional (placed where its test ends), it is placed where its
+    ``iter`` ends, so ``len(xs)`` in ``for j in range(len(xs)):`` sorts
+    before the loop (fuzzer p3_46: it sorted after the ``for`` keyword's
+    position and the loop's bound read a value defined after the loop).
+    A ``while`` test is re-evaluated per iteration; it keeps its start.
+    """
+
+    position = _authored_node_position(graph_obj, int(node_id))
+    data = graph_obj.nodes.get(int(node_id)) if int(node_id) in graph_obj else None
+    expression = None if data is None else data.get("expr_obj")
+    iterable = getattr(expression, "iter", None)
+    if not isinstance(expression, (ast.For, ast.AsyncFor)) or getattr(
+        iterable, "end_lineno", None
+    ) is None:
+        return position
+    return (
+        int(iterable.end_lineno),
+        int(getattr(iterable, "end_col_offset", 0) or 0),
+        int(node_id),
+    )
+
+
+def _loop_body_line_span(expression: Any) -> tuple[int | None, int | None]:
+    """The lines a retained loop executes per iteration.
+
+    Program: ``for j in range(len(xs)): xs[j] = xs[j] * 2`` (fuzzer
+    p3_46).  Wrong record: containment used the ``for`` statement's whole
+    span, so ``len(xs)`` -- the iterable, evaluated once before the loop --
+    was placed in the loop body and the loop's bound read a value defined
+    inside it.  Rule: a ``for`` loop's iterations are its body lines; a
+    ``while`` test is re-evaluated per iteration, so its span is the whole
+    statement.
+    """
+
+    if isinstance(expression, (ast.For, ast.AsyncFor)) and expression.body:
+        return (
+            int(expression.body[0].lineno),
+            getattr(expression, "end_lineno", None),
+        )
+    return (
+        getattr(expression, "lineno", None),
+        getattr(expression, "end_lineno", None),
+    )
+
+
 def _dispatch_region_completion_positions(
     graph_obj: Any,
     dispatch_subgraphs: Iterable[Any],
@@ -12502,34 +12588,7 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
     )
 
     def block_position(block) -> tuple[int, int, int]:
-        if isinstance(block, ScalarFieldWriteBlock):
-            return node_position(int(block.effect_node_id))
-        if isinstance(block, SequenceMutationBlock):
-            return node_position(_sequence_mutation_owner_id(block.mutation))
-        if isinstance(block, SequenceQueryBlock) and block.source_call_node_id is not None:
-            return node_position(int(block.source_call_node_id))
-        if isinstance(block, StatementBlock) and len(block.lines) == 1:
-            line = block.lines[0]
-            if line.startswith("__scheduled_region_") and line.endswith("__"):
-                return region_positions.get(
-                    int(line[len("__scheduled_region_"):-2]),
-                    (1 << 30, 0, 0),
-                )
-            if line.startswith("__plan_callsite_") and line.endswith("__"):
-                return node_position(int(line[len("__plan_callsite_"):-2]))
-        if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return _conditional_block_position(graph.G, int(block.source_node_id))
-        if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
-            return _loop_control_block_position(graph.G, block, node_position)
-        if isinstance(block, (LoopBlock, WhileBlock)):
-            source_id = getattr(block, "source_loop_node_id", None)
-            if source_id is not None:
-                return node_position(int(source_id))
-        if isinstance(block, CallBlock):
-            return node_position(int(block.callsite_id))
-        if isinstance(block, SequenceBlock) and block.blocks:
-            return min(map(block_position, block.blocks))
-        return (1 << 30, 0, 0)
+        return _control_block_position(graph.G, block, region_positions)
 
     def insert_ordered(block, candidate):
         decorated = [
@@ -12561,8 +12620,7 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
             if source_id is not None:
                 present.add(int(source_id))
                 expression = graph.G.nodes.get(int(source_id), {}).get("expr_obj")
-                start = getattr(expression, "lineno", None)
-                end = getattr(expression, "end_lineno", None)
+                start, end = _loop_body_line_span(expression)
                 if start is not None and end is not None:
                     loop_spans.append((int(start), int(end), int(source_id)))
             survey(block.body)
@@ -12767,30 +12825,7 @@ def _place_plan_callsites_lexically(
     )
 
     def block_position(block) -> tuple[int, int, int]:
-        if isinstance(block, SequenceMutationBlock):
-            return node_position(_sequence_mutation_owner_id(block.mutation))
-        if isinstance(block, StatementBlock) and len(block.lines) == 1:
-            line = block.lines[0]
-            if line.startswith("__scheduled_region_") and line.endswith("__"):
-                return region_positions.get(
-                    int(line[len("__scheduled_region_"):-2]),
-                    (1 << 30, 0, 0),
-                )
-            if line.startswith("__plan_callsite_") and line.endswith("__"):
-                return node_position(int(line[len("__plan_callsite_"):-2]))
-        if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return _conditional_block_position(graph.G, int(block.source_node_id))
-        if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
-            return _loop_control_block_position(graph.G, block, node_position)
-        if isinstance(block, (LoopBlock, WhileBlock)):
-            source_id = getattr(block, "source_loop_node_id", None)
-            if source_id is not None:
-                return node_position(int(source_id))
-        if isinstance(block, CallBlock):
-            return node_position(int(block.callsite_id))
-        if isinstance(block, SequenceBlock) and block.blocks:
-            return min(map(block_position, block.blocks))
-        return (1 << 30, 0, 0)
+        return _control_block_position(graph.G, block, region_positions)
 
     def insert_ordered(block, item):
         decorated = [
@@ -12831,8 +12866,7 @@ def _place_plan_callsites_lexically(
                 present_loops.add(int(source_id))
                 scope_depths[int(source_id)] = depth
                 expression = graph.G.nodes.get(int(source_id), {}).get("expr_obj")
-                start = getattr(expression, "lineno", None)
-                end = getattr(expression, "end_lineno", None)
+                start, end = _loop_body_line_span(expression)
                 if start is not None and end is not None:
                     loop_spans.append((int(start), int(end), int(source_id)))
             survey(block.body, depth + 1)
@@ -13385,32 +13419,7 @@ def _install_lexical_sequence_mutations(
     )
 
     def block_position(block) -> tuple[int, int, int]:
-        if isinstance(block, ScalarFieldWriteBlock):
-            return node_position(int(block.effect_node_id))
-        if isinstance(block, SequenceMutationBlock):
-            return node_position(_sequence_mutation_owner_id(block.mutation))
-        if isinstance(block, StatementBlock) and len(block.lines) == 1:
-            line = block.lines[0]
-            if line.startswith("__scheduled_region_") and line.endswith("__"):
-                return region_positions.get(
-                    int(line[len("__scheduled_region_"):-2]),
-                    (1 << 30, 0, 0),
-                )
-            if line.startswith("__plan_callsite_") and line.endswith("__"):
-                return node_position(int(line[len("__plan_callsite_"):-2]))
-        if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return _conditional_block_position(graph.G, int(block.source_node_id))
-        if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
-            return _loop_control_block_position(graph.G, block, node_position)
-        if isinstance(block, (LoopBlock, WhileBlock)):
-            source_id = getattr(block, "source_loop_node_id", None)
-            if source_id is not None:
-                return node_position(int(source_id))
-        if isinstance(block, CallBlock):
-            return node_position(int(block.callsite_id))
-        if isinstance(block, SequenceBlock) and block.blocks:
-            return min(map(block_position, block.blocks))
-        return (1 << 30, 0, 0)
+        return _control_block_position(graph.G, block, region_positions)
 
     def insert_ordered(block, mutation_block):
         decorated = [
@@ -13928,29 +13937,8 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
         graph.G, dispatch_subgraphs,
     )
 
-    def block_position(block):
-        if isinstance(block, ResourceScopeBlock):
-            return node_position(block.source_scope_id)
-        if isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
-            return node_position(block.callsite_id)
-        if isinstance(block, StatementBlock) and len(block.lines) == 1:
-            line = block.lines[0]
-            if line.startswith("__scheduled_region_") and line.endswith("__"):
-                return region_positions.get(
-                    int(line[len("__scheduled_region_"):-2]),
-                    (1 << 30, 0, 0),
-                )
-        if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
-            return _conditional_block_position(graph.G, int(block.source_node_id))
-        if isinstance(block, (LoopBlock, WhileBlock)):
-            source_id = block.source_loop_node_id
-            if source_id is not None:
-                return node_position(source_id)
-        if isinstance(block, CallBlock):
-            return node_position(block.callsite_id)
-        if isinstance(block, SequenceBlock) and block.blocks:
-            return min(map(block_position, block.blocks))
-        return (1 << 30, 0, 0)
+    def block_position(block) -> tuple[int, int, int]:
+        return _control_block_position(graph.G, block, region_positions)
 
     def insert_ordered(block, external):
         decorated = [
