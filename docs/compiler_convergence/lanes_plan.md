@@ -43,7 +43,7 @@ silent-capable items first.
 
 | rank | item | where the record is missing (doc 33) | claimed functions | branch | status |
 |---|---|---|---|---|---|
-| C1 | Reductions over a structural aggregate: `any((1 > n, 2 > n))`, `sum(x * n for x in xs)` with `xs` literal | the region takes the aggregate as an unproduced input, and no layer assembles it from its unrolled members (loud in the product at `main`, silent under `emit_ssa_to_c` alone) | region input assembly in `glsl_deployment_strategy`; structural recovery | | open |
+| C1 | Reductions over a structural aggregate: `any((1 > n, 2 > n))`, `sum(x * n for x in xs)` with `xs` literal | the region takes the aggregate as an unproduced input, and no layer assembles it from its unrolled members (loud in the product at `main`, silent under `emit_ssa_to_c` alone) | `resident_sequence_materialization._list_literal_mutations`; `glsl_deployment_strategy._tensor_descriptor_rule` (loop-target branch) | `claude/project-thread-2nw77p` | fixed on the branch, no PR: corpus 163/163 PASS, but fuzz tier 1 seed 11 has 2 WRONG, both C15 (wrong at `main` too). Gate not run. Generator and tuple forms still refuse by name |
 | C2 | A display rebound inside a loop: `xs = [i + n, i]` | `descriptor-member-shared`; unaccounted formal (loud in the product at `main`) | descriptor birth in `precompile_to_ssa` | | open |
 | C3 | Dict `del d[k]` / `d.pop(k)` | placed by graph-id order into a neighbouring region (a cycle); `pop` has no lowering. It should be one lexical mapping effect. | `_control_block_position` (read only); mapping effect lowering | | open |
 | C4 | `d.get(k, 0)` in a loop | control order cycle (c202) | `_sequence_effect_read_edges` | | open |
@@ -54,6 +54,48 @@ silent-capable items first.
 | C9 | Multi-element replication `[a, b] * k` | no operation writes its rows; fill repeats one value | `_sequence_concat_ops` | | open |
 | C10 | Strings as values (`s = "a" if c else "b"`, `len(s)`, `==`, `startswith`) | dispatch metadata; minted as a root input (c114, c217) | to be scoped | | open: large |
 | C11 | Variadic returns | shared with A6; take it in Lane A | | | see A6 |
+| C12 | A comprehension result mutated afterwards: `ys = [x * n for x in xs]; ys.append(n)` then `len(ys)`, `sum(ys)` | the append is emitted after the reads (silent WRONG at `main`, resident and folded `xs` alike) | `_sequence_effect_read_edges` (inferred) | | open: silent |
+| C13 | A list whose rows mix int and float: `ys = [1 * n, 2.5 * n]; sum(ys)` | the arena is int64 and the float row is cast (silent WRONG at `main`) | element join for list arenas (to be trapped) | | open: silent |
+| C14 | A loop over an inline comprehension of a folded list: `for y in [x * n for x in xs]` | the loop reads an empty sequence (silent WRONG at `main`) | to be trapped | | open: silent |
+| C15 | A loop over a literal list, then an in-place `reverse()`/`sort()` of another list: `for x in [3, -2, 0]: t += x * n` then `xs = [6, 7, n]; xs.reverse(); xs[0] - xs[2]` | the reverse/sort is dropped (reads the display order). Silent WRONG at `main` 2532577, clean audit; also with a comprehension in place of the loop. Found by fuzz tier 1 seed 11 (p11_29, p11_116) | to be trapped (inferred: loop evaporation over a literal) | | open: silent, blocks the C1 PR's fuzz seed |
+
+### C1 notes (Lane C worker, 2026-10-22, branch `claude/project-thread-2nw77p`)
+
+**Observed** at `main` 2532577, all silent in the product (no refusal,
+clean or near-clean audit), each compared with Python by
+`tools/native_corpus_typed_check.py`:
+
+- `xs = [1, 4, 9]; any([x > n for x in xs])`, `sum([x * n for x in xs])`,
+  `len(...)`, `ys[i]`, `{x % n for x in xs}` all read an EMPTY list (0 /
+  0.0). The all-constant display is folded; the comprehension over it is
+  evaporated into a ListComp/SetComp materializer whose rows are
+  `materialized_value_ids` (`arg0..` edges), and `_list_literal_mutations`
+  skipped every `materialization_kind` node, so the arena kept length 0.
+  The unrolled DICT comprehension already had a birth (`_dict_literal_mutations`).
+- The same comprehension's row was committed float64 before evaporation:
+  the loop target `x` over an authored list display found no writer
+  (`aggregate_kind` is absent before the fold, and a bare int Constant has
+  no shape-query rule), so `sum` returned a float.
+
+Fix on the branch (commit b1da6a5e). Measured there: typed corpus 163/163 PASS; fuzz `FUZZ_EXT=1` seed 11, 120 programs: 118 PASS, 2 WRONG. Both minimize to C15, which is equally wrong on `main` (a plain loop over a literal list is enough). Gate not run, since the fuzz condition already blocks the PR.
+
+Fix: an unrolled list/set comprehension is
+born like a display (clear, then one append/add per row); a loop target
+over a list display is typed from the display's members. Corpus c240 to
+c243. Four tier-1 fuzz snippets.
+
+Still open in this family (**observed**, all also wrong or loud on `main`):
+
+| case | status | note |
+|---|---|---|
+| `any(x > n for x in xs)`, `sum(x * n for x in xs)` (generator over a folded list) | loud: PRODUCT-REFUSES | the GeneratorExp materializer has no `aggregate_kind` and is not a declared sequence |
+| `any((1 > n, 2 > n))` | loud: PRODUCT-REFUSES | tuple birth is A1 |
+| `[(x, x * n) for x in xs]` (aggregate rows) | loud: named refusal (new) | was silent 0 on `main` |
+| `ys = [x * n for x in xs]; ys.append(n)` then `len`/`sum` | **silent WRONG** (also with a resident `xs = [n, 4, 9]`) | the append is placed after the reads of `ys` (observed in the SSA); that `_sequence_effect_read_edges` misses it is *inferred*. New item C12 |
+| `ys = [1 * n, 2.5 * n]; sum(ys)` | **silent WRONG** (10 for 10.5) | a list whose rows mix int and float gets an int64 arena and the float row is cast. Not comprehension-specific. New item C13 |
+| `for y in [x * n for x in xs]: t += y` | **silent WRONG** (0) | loop over an inline comprehension of a folded list. New item C14 |
+| `[i * n for i in (1, 2, 3)]` then `sum` | TYPE (float for int) | the target rule reads list displays only; a tuple iterable is the same rule |
+| `[x for x in xs if x > n]` over a folded list | loud: no proven capacity | was a root with no `n` parameter on `main` |
 
 ## Lane D: defaults and fallbacks
 
