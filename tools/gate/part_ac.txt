@@ -1,0 +1,16 @@
+tests/test_audit_physical_accounting_disagreement.py
+tests/test_contract_rows_for_every_value.py
+tests/test_extraction_contract.py
+tests/test_glyph_sequence_provenance.py
+tests/test_keyed_descriptor_member_rows.py
+tests/test_loop_composer.py
+tests/test_native_formal_provenance.py
+tests/test_passthrough_rebinding_keeps_view.py
+tests/test_precompile_to_ssa.py
+tests/test_proven_shape_repost_guard.py
+tests/test_scheduled_process_graph_dispatches.py
+tests/test_ssa_call_input_adapters.py
+tests/test_ssa_value_fact_physical_fields.py
+tests/test_tensor_ssa_call_metadata.py
+tests/test_native_boolean_region_feed.py
+tests/test_sequence_contract_concordance.py

@@ -1,0 +1,13 @@
+tests/test_keyed_descriptor_member_rows.py
+tests/test_ir_sequence_tables.py
+tests/test_container_store_lowering.py
+tests/test_native_memo_membership.py
+tests/test_loop_composer.py
+tests/test_sequence_contract_concordance.py
+tests/test_precompile_contract_rows.py
+tests/test_sequence_helper_physical_rows.py
+tests/test_structural_concordance.py
+tests/test_ssa_call_input_adapters.py
+tests/test_native_optional_merge_contract.py
+tests/test_ssa_optional_values.py
+tests/test_aggregate_call_identity.py

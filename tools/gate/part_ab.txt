@@ -1,0 +1,16 @@
+tests/test_aggregate_call_identity.py
+tests/test_constant_and_sequence_dtype_rows.py
+tests/test_diagnose_translation.py
+tests/test_function_output_rows_are_authority.py
+tests/test_id_builtin_lowers.py
+tests/test_lease_cells_through_owner_book.py
+tests/test_native_call_input_receipts.py
+tests/test_nested_loop_shape_transport.py
+tests/test_precompile_contract_rows.py
+tests/test_project_compilation_product.py
+tests/test_region_call_not_record_covered.py
+tests/test_shell_reference_tables.py
+tests/test_ssa_result_type_resolution.py
+tests/test_structural_recovery_output_identity.py
+tests/test_concordance_audit_contracts.py
+tests/test_ir_sequence_tables.py

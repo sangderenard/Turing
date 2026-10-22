@@ -1,0 +1,17 @@
+tests/test_abstract_tensor_topological_reducer.py
+tests/test_callsite_formal_shape_concordance.py
+tests/test_control_branch_compartments.py
+tests/test_finish_step_book_authority.py
+tests/test_hierarchical_plan.py
+tests/test_lease_and_retained_rank_rows.py
+tests/test_loop_scope_concordance.py
+tests/test_native_loop_call_argument.py
+tests/test_precompile_built_function_rows.py
+tests/test_process_graph_function_linking.py
+tests/test_recovery_formals_post_rows.py
+tests/test_sequence_helper_physical_rows.py
+tests/test_ssa_optional_values.py
+tests/test_structural_concordance.py
+tests/test_value_union_abi.py
+tests/test_native_call_predicate.py
+tests/test_loop_carried_producers.py
