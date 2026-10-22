@@ -1043,7 +1043,11 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                     "caller_presence_value_id": int(presence.id),
                     "aggregate_value_id": int(aggregate.id),
                 })
-                index += 1
+                # Program: ``o1 = maybe(n, 3); o2 = maybe(n, 5)``.  Wrong
+                # record: a second ``index += 1`` here skipped the instruction
+                # after the projection -- the next optional call -- so its
+                # ``is not None`` test read the bare payload.  Rule: the
+                # index already stands past the call and its projection.
 
     if receipts:
         metadata = getattr(module, "metadata", None)
