@@ -10669,7 +10669,10 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     # placed before the call and the callee's rows were never read.  Rule:
     # every escape of a collection the one mutation definition names
     # (``_mutated_sequence_node_ids``) is an effect of that call on it.
-    from .resident_sequence_materialization import _call_escaped_argument_edges
+    from .resident_sequence_materialization import (
+        _call_escaped_argument_edges,
+        _dict_update_mutations,
+    )
 
     mutated = _mutated_sequence_node_ids(graph.G)
     effects = [
@@ -10684,6 +10687,19 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         })
         for call_id, argument_id in sorted(_call_escaped_argument_edges(graph.G))
         if int(argument_id) in mutated and int(argument_id) in graph.G
+    ] + [
+        # Program: ``d = {1: 1, 2: n}; d.update({1: n + 2})`` then ``return
+        # d[1] * 10 + d[2]`` (fuzzer p13_31).  Wrong record: the update's
+        # stores were no effect here, so the reducer fused ``n + 2`` with
+        # the post-update reads into one region that both fed and followed
+        # the update (a control order cycle).  Rule: a dict update is an
+        # in-place effect on its receiver, as an append is.
+        (int(mutation.effect_node_id), {
+            "expression": graph.G.nodes[int(mutation.effect_node_id)].get("expr_obj"),
+            "sequence_value_id": int(mutation.sequence_value_id),
+        })
+        for mutation in _dict_update_mutations(graph.G)
+        if int(mutation.effect_node_id) in graph.G
     ]
     for effect_id, record in effects:
         expression = record.get("expression")

@@ -9,6 +9,9 @@ def root(n: int) -> int:
     if n > 0:
         f.update({2: n})
     r += f[2] * 10000
+    g = {1: 1, 2: n}
+    g.update({1: n + 2, 3: 2})
+    r += (g[1] * 10 + g[2] + len(g) * 100 + g[3]) * 100000000
     t = 0
     for i in range(n):
         t += d[1]
