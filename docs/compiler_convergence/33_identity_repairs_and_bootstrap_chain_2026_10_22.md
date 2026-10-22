@@ -368,8 +368,9 @@ Each repair below names the program, the wrong record and the rule.
   last, so every helper built from a heap descriptor takes it. The
   hand-added owners in allocate, reserve, the dynamic entry and extend are
   gone.
-  - Pruners keep it: `_live_sequence_member_ids`, callee pruning, and the
-    structural-recovery formal filter.
+  - Pruners keep it through one rule, `_retain_companion_formals` (see
+    the next section); the descriptor-liveness protection first added to
+    the structural-recovery filter was circular and is gone.
   - Before this, f"a@{n}"'s token list lost its owner. The caller then
     leased a second owner for the same arena.
 - **Binding refuses two contracts.** `_bind_sequence_storage_members` now
@@ -407,7 +408,77 @@ Each repair below names the program, the wrong record and the rule.
   `sum`, ...) do not escape it. Before a call's extraction identity is
   resolved, its static builtin symbol names it.
 
+## Scope-local identities, one owner per arena, returned lists
+
+The user asked for whole categories, not single exceptions. A static scan of
+`src/` (scratch `inventory.py`) listed the writers that bypass the books:
+descriptor rebuilds that drop fields, accounting copied from another value,
+dtype/shape assignments, positional function picks and formal-list rewrites.
+Each category below now has one rule and one helper.
+
+- **Descriptor remaps.** Five linker sites rebuilt a descriptor field by
+  field and dropped the fields they did not name, the heap owner among them.
+  `map_sequence_descriptor` maps every identity and keeps every other field.
+  The "all members mapped" guards read `_sequence_descriptor_identity_ids`.
+- **Accounting across a call.** `_accounting_across_call` is the one
+  translator for the callee result, the aggregate-unpacked output, and both
+  caller-actual -> callee-formal ownership passes.
+  - A scope-local id (type tag, heap owner, optional payload, iterable
+    target, tensor shape/rank/count) crosses only through the call's exact
+    binding.
+  - A formal fed a heap cell without its owner takes no heap contract.
+    `found.append(Finding(..., detail))` had copied the root's owner id
+    onto the append helper's row formal.
+- **The audit checks it.** New finding `accounting-foreign-value-id`: a
+  scope-local id must name a value of the same function. Its first catches:
+  - unit 24 (`page`'s tag formal pruned);
+  - `concordance_controller` `pi_update` (a union merge's tag Phi pruned).
+- **Companions are retained.** `scope_local_accounting_ids` is the single
+  definition:
+  - `_retain_companion_formals` applies it in every formal pruner;
+  - `prune_unused_phis` counts named ids as uses;
+  - `drop_dead_pure_structural_instructions` protects them, replacing its
+    own tensor-key list.
+- **Dynamic dtype at birth applies to the dynamic set only.** `key: str`'s
+  span contract had been declared as a sequence column, and the lookup's
+  `Eq` became the tensor kernel `binary_double`.
+- **One owner per arena.**
+  - An optional glyph payload (seq 19) is born on its f-string arena's data
+    cell (seq 11). It adopts that cell's owner.
+  - Optional-glyph payload copies join the dynamic closure.
+  - `replace` grows a DYNAMIC destination through its checked reserve, and
+    publishes only the length when source and destination share the arena.
+- **Builtin collection methods do not escape.**
+  `scopes.setdefault(k, {})`'s `{}` is the table operation's default, not
+  an escape into unknown code.
+- **Arena order is access order.** `r = []; if n < 0: return r;
+  r.append(2*n); return r` (c60).
+  - The append publishes its arena id as a value, and `dependency_order`'s
+    later-producer rule pulled it ahead of the guard. An arena feed now
+    never takes a later mutation as its producer, and a return reads the
+    arenas it returns.
+  - The exit merge `Phi(1, 1)` minted a phantom sequence. A merge of one
+    identity is that identity.
+  - A local list returned to a binding caller seeds the dynamic settlement.
+- **Accepted components are immutable in optional lowering.** Unit 35
+  lowered unit 33's record-covered call a second time (4 projections for 2
+  receipts).
+
+Measured: corpus 59/59, 0 findings. Gate at a8ad2b0: 125 failed, versus 128
+at g11 (3 fixed); the 2 new ones are fixed at 9f1643c. Focused suites: 20
+failed versus 22. Units 24, 33 and 35 compile on replay; 34 stops at the
+variadic return lane.
+
 ## Open frontier (stated, not worked around)
+
+- **Variadic returns.** `return ()` / `return (x,)` and `return []` /
+  `return [x]`: the reducer classifies VARIADIC, but the sequence-lane
+  lowering is not built (units 34, 162, 212; scratch c60_vartuple and
+  c61_varlist).
+- **`'|'.join(tokens)` in an f-string** has no glyph recipe (unit 6).
+- `test_forwarded_tuple_field_has_one_sequence_resident`: `ensure`'s arena
+  row says `opaque_ref` while its descriptor says float64. `total`'s lease
+  copies the row before the canonical sweep retypes the occurrences.
 
 - Generic `str()`/`!r` of `Any`-typed facts (ten f-string units): needs a
   runtime type dispatch over every fact class.
@@ -415,12 +486,9 @@ Each repair below names the program, the wrong record and the rule.
   unit 64/254 read that provisional as a sequence column dtype.
 - Native validation runtime is absent from the C module lane (no corpus
   program with a reachable `raise` can be emitted there).
-- Lists across call edges:
-  - A list a callee grows (c125) or returns (c126) refuses honestly. It
-    needs the DYNAMIC contract settled across the exact call bindings
-    (`linked_value_edges`), with the owner as a bound descriptor member.
-  - A constant list literal passed to a reader fails with "aggregate call
-    binding arity 3 != 0" on clean HEAD (c127).
+- Lists across call edges: growing (c55) and returning (c56, c60) now
+  pass. A constant list literal passed to a reader still fails with
+  "aggregate call binding arity 3 != 0" (c127).
 - `any(generator)` as a short-circuit operand stays a flat region
   reduction with no element count (c129/c130, also on HEAD).
 - Local class construction from a source-derived schema is
