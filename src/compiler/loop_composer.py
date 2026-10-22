@@ -1657,6 +1657,26 @@ def evaporate_unrolled_loops(
         # function result roots and must not be recast as such merely to
         # survive ancestry pruning.
         live.update(effect_live_call_clones)
+        # Program: ``ys = [x * n for x in xs]; ys.append(n)`` with ``xs`` a
+        # folded literal, then ``len(ys) * 100 + sum(ys)`` (c266).  Wrong
+        # record: the ``append`` after the comprehension has no consumer, so
+        # this ancestry pruning deleted its node; its retained mutation
+        # record then named a missing node, the effect was placed after
+        # every read and the arena kept the comprehension's three rows
+        # (306 for 407; clean audit).  Rule: a node a retained sequence
+        # mutation names as its effect is live, as in the dead-call pruning
+        # (``_retain_source_sequence_mutation_records``).
+        from .glsl_deployment_strategy import (
+            _retain_source_sequence_mutation_records,
+        )
+
+        _retain_source_sequence_mutation_records(graph.G)
+        live.update(
+            int(effect_id)
+            for effect_id in (
+                graph.G.graph.get("source_sequence_mutation_records") or {}
+            )
+        )
         # Dataflow ancestry alone is insufficient to retain source control:
         # loop nodes own their bodies semantically, and are not necessarily a
         # value predecessor of the function's return roots.  Evaporating an

@@ -21842,7 +21842,18 @@ def _tensor_descriptor_rule(
                 iterable_shape = tuple(
                     map(int, (iterable or {}).get("shape") or ())
                 )
-                if exact_one_per_input and iterable_shape:
+                # Program: ``ys = [x * n for x in xs]; ys.append(n)``
+                # then ``sum(ys)`` (c266).  Wrong record: the comprehension's
+                # extent was proven from its iterable although ``ys`` is
+                # mutated afterwards, so ``sum`` reduced over three rows of
+                # four (406 for 407; clean audit).  Rule: a mutated
+                # collection's leading extent is its length cell's, as for a
+                # dynamic iterable (``_mutated_sequence_node_ids``).
+                if (
+                    exact_one_per_input and iterable_shape
+                    and int(data.get("value_id", node_id))
+                    not in _mutated_sequence_node_ids(graph.G)
+                ):
                     return {
                         "shape": (int(iterable_shape[0]), *element_shape),
                         "dtype": str(element.get("dtype") or "float64"),

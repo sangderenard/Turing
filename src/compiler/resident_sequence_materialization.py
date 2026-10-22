@@ -1745,6 +1745,23 @@ def _static_sequence_capacity_survey(
     local_lists = {int(node_id): len(data["expr_obj"].elts)
                    for node_id, data in graph_obj.nodes(data=True)
                    if isinstance(data.get("expr_obj"), ast.List)}
+    # Program: ``ys = [x * n for x in xs]; ys.append(n)`` with ``xs`` a
+    # folded literal, then ``len(ys) * 100 + sum(ys)`` (c266).  Wrong
+    # record: the unrolled comprehension is born here like a display
+    # (``_list_literal_mutations``) but was not a local list, so its later
+    # append was never counted; the arena took the planner's extent (3,),
+    # the append found it full and its status was dropped (306 for 407;
+    # clean audit).  Rule: an unrolled list comprehension is a local list
+    # of its materialized rows.
+    local_lists.update({
+        int(data.get("value_id", node_id)): len(tuple(
+            attributes.get("materialized_value_ids", ())
+        ))
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in ((data.get("attributes") or {}),)
+        if attributes.get("materialization_kind") == "unrolled_loop"
+        and attributes.get("aggregate_kind") == "list"
+    })
     unknown = set()
     escaped = set()
     loops = [data["expr_obj"] for _, data in graph_obj.nodes(data=True)

@@ -65,6 +65,7 @@ EXTENDED = [
     (["d{v} = {{1: {a}}}", "d{v}[2] = n", "xs{v} = [{b}] + [n, {c}]"], "xs{v}[1] * 10 + len(xs{v}) + d{v}[2]"),
     (["xs{v} = [n] + [{a}, {b}] + [n * {c}]"], "len(xs{v}) * 10 + xs{v}[3]"),
     (["t{v} = 0", "for y{v} in [x{v} * n for x{v} in [{a}, {b}, {c}]]:", "    t{v} += y{v}"], "t{v}"),
+    (["ys{v} = [x{v} * n for x{v} in [{a}, {b}]]", "ys{v}.append(n + {c})"], "len(ys{v}) * 100 + sum(ys{v}) + ys{v}[2] * 1000"),
     (["xs{v} = [{a}] * (n % 4 + 1)"], "len(xs{v}) * 10 + xs{v}[0]"),
     (["xs{v} = [{a}, n, {b}, {c}]", "del xs{v}[1]"], "len(xs{v}) * 10 + xs{v}[1]"),
     (["q{v}, r{v} = pair(n, {a})"], "q{v} * 10 + r{v}"),
