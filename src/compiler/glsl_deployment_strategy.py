@@ -22938,6 +22938,7 @@ def _remove_dead_metadata_nodes(
 
 def _mutated_sequence_node_ids(
     graph_obj: Any, *, include_call_escapes: bool = True,
+    include_merge_aliases: bool = True,
 ) -> frozenset[int]:
     """Collections whose contents change after their initializer.
 
@@ -22947,7 +22948,8 @@ def _mutated_sequence_node_ids(
     capture folded to a ``Const`` literal).  ``include_call_escapes=False``
     leaves out escapes into calls: the mutations this graph itself makes,
     for a reader that decides about one call's binding by itself
-    (``_aggregate_binds_by_member``).
+    (``_aggregate_binds_by_member``).  ``include_merge_aliases=False``
+    leaves out arms changed only through a branch merge.
     """
 
     mutated_sequence_ids = {
@@ -23018,6 +23020,29 @@ def _mutated_sequence_node_ids(
             }:
                 pending_bases.extend(int(parent) for parent, role in base.get("parents") or ()
                                      if str(role) == "base")
+    if include_merge_aliases:
+        # Program: ``a = [1, 2]; if n > 2: t = a else: t = [3, 4]`` then
+        # ``t.append(9); return len(a) * 10 + len(t)`` (scratch c961).
+        # Wrong record: ``t`` is ``a`` on one path, but only ``t`` was
+        # changed, so ``len(a)`` folded to 2 (silent).  Rule: a list merged
+        # from branches is one storage with each arm, so a change to the
+        # merge changes its arms.
+        pending = [
+            int(node_id) for node_id in mutated_sequence_ids
+            if int(node_id) in graph_obj
+        ]
+        while pending:
+            merged = graph_obj.nodes[pending.pop()]
+            if (merged.get("attributes") or {}).get("producer_kind") != "aggregate_phi":
+                continue
+            for parent, role in merged.get("parents") or ():
+                if (
+                    str(role) in {"body", "orelse"}
+                    and int(parent) in graph_obj
+                    and int(parent) not in mutated_sequence_ids
+                ):
+                    mutated_sequence_ids.add(int(parent))
+                    pending.append(int(parent))
     return frozenset(mutated_sequence_ids)
 
 

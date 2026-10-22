@@ -12409,6 +12409,25 @@ def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int
 
     data = graph_obj.nodes.get(int(node_id)) if int(node_id) in graph_obj else None
     expression = None if data is None else data.get("expr_obj")
+    # Program: ``if n > 2: t = [n, 1] else: t = [5, 6]`` then ``return
+    # len(t) * 10 + t[0]`` (corpus c220).  A list merged from its arms'
+    # displays is born from its member Phis where the conditional completes
+    # (``_list_literal_mutations``); the merge has no coordinate of its own,
+    # so its birth sorted to the end of the function, after its reads.
+    attributes = {} if data is None else (data.get("attributes") or {})
+    conditional_id = attributes.get("source_conditional_id")
+    if (
+        attributes.get("producer_kind") == "aggregate_phi"
+        and conditional_id is not None
+        and int(conditional_id) in graph_obj
+    ):
+        statement = graph_obj.nodes[int(conditional_id)].get("expr_obj")
+        if getattr(statement, "end_lineno", None) is not None:
+            return (
+                int(statement.end_lineno),
+                int(getattr(statement, "end_col_offset", 0) or 0),
+                int(node_id),
+            )
     if isinstance(expression, ast.comprehension):
         # comprehension is a control AST node without its own location;
         # its authored target still places the producer before its consumers.
@@ -13913,8 +13932,15 @@ def _install_lexical_sequence_mutations(
             elif guarded:
                 unplaced.append(int(mutation.effect_node_id))
             else:
+                # A display member's append is placed by its display
+                # (``_sequence_mutation_owner_id``), in its loop too: the
+                # member of a list merged from branches is a Phi with no
+                # coordinate, which put the birth after the loop (c969).
                 root = insert_in_enclosing_loop(
-                    root, mutation_block, int(mutation.effect_node_id)
+                    root, mutation_block,
+                    int(mutation.effect_node_id)
+                    if isinstance(mutation, ScalarFieldWriteBlock)
+                    else _sequence_mutation_owner_id(mutation),
                 )
     # A source effect now owned by lexical control must not also leave a
     # numerical-region marker. Copier stores40/85/92 were removed from their
