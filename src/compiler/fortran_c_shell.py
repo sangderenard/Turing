@@ -86,6 +86,7 @@ from .ast_control_normalization import (
     _normalize_loop_else as _normalize_loop_else,
     _normalize_chained_comparisons as _normalize_chained_comparisons,
     _normalize_constant_membership as _normalize_constant_membership,
+    _normalize_builtin_divmod as _normalize_builtin_divmod,
     _normalize_direct_tail_recursion as _normalize_direct_tail_recursion,
     _normalize_none_default_assignments as _normalize_none_default_assignments,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
@@ -20114,6 +20115,43 @@ def _settle_linked_dynamic_sequences(
                 or any(loop.lineno <= line <= loop.end_lineno for loop in loops)
             ):
                 seeds.add((id(graph_obj), sequence_id))
+        # Program: ``def put(d, k): d[k] = k * 3`` called on the caller's
+        # ``{1: 10}`` (scratch c_h3).  Wrong record: a keyed store may add a
+        # row, but only append-family records seeded growth, so the linked
+        # dict had no capacity contract in either function (refused).
+        # Rule: a keyed store into a dict that is not this function's own
+        # display grows its storage, as an append to a parameter does; the
+        # local display's own key universe is the survey's (bounded or
+        # DYNAMIC there).
+        local_dicts = {
+            int(node_id) for node_id, data in graph_obj.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Dict)
+        }
+        for _node_id, data in graph_obj.nodes(data=True):
+            if str(data.get("op") or data.get("type") or "").casefold() not in {
+                "indexedstore", "index_set", "setitem",
+            }:
+                continue
+            base_id = next((
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) == "base"
+            ), None)
+            while base_id is not None and str(
+                graph_obj.nodes.get(base_id, {}).get("op")
+                or graph_obj.nodes.get(base_id, {}).get("type") or ""
+            ).casefold() in {"indexedstore", "index_set", "setitem"}:
+                base_id = next((
+                    int(parent) for parent, role
+                    in graph_obj.nodes[base_id].get("parents") or ()
+                    if str(role) == "base"
+                ), None)
+            if (
+                base_id is not None
+                and base_id not in local_dicts
+                and (graph_obj.nodes.get(base_id, {}).get("attributes") or {})
+                .get("aggregate_kind") == "dict"
+            ):
+                seeds.add((id(graph_obj), int(base_id)))
     dynamic_roots = {find(seed) for seed in seeds if seed in linked}
     from .resident_sequence_materialization import _call_escaped_argument_edges
 
@@ -57494,6 +57532,7 @@ def _lower_ast_source_to_ssa_impl(
     # Membership in an inline numeric literal becomes a disjunction before
     # the short-circuit normalization nests it.
     chained_comparison_receipts.extend(_normalize_constant_membership(tree))
+    chained_comparison_receipts.extend(_normalize_builtin_divmod(tree))
     short_circuit_receipts = list(_normalize_binary_short_circuit(tree))
     loop_else_receipts = list(_normalize_loop_else(tree))
     if chained_comparison_receipts:
@@ -57904,6 +57943,9 @@ def _lower_ast_source_to_ssa_impl(
         )
         chained_comparison_receipts.extend(
             _normalize_constant_membership(discovered_tree)
+        )
+        chained_comparison_receipts.extend(
+            _normalize_builtin_divmod(discovered_tree)
         )
         short_circuit_receipts.extend(
             _normalize_binary_short_circuit(discovered_tree)

@@ -4453,9 +4453,21 @@ class _ControlSSABuilder(TiledObject):
         index = self._sequence_row_index(
             int(sequence_id), int(index_id), index_literal
         )
+        # Program: ``xs = [5] * (n % 4 + 1); xs[0]`` (scratch c_k1).  Wrong
+        # record: the row load demanded the heap column at its element
+        # dtype, so ``external_value`` revised the ``ptr`` cell's row back
+        # to int64; the structural view then completed its shape from the
+        # planner's (1,) extent and the reserve's heap copy refused the
+        # shaped "handle".  Rule: a heap column is its ``ptr`` cell (the
+        # element type is ``heap_element_dtype``, which ``indexed_load``
+        # reads); a row load demands the element dtype only of a column
+        # that holds its rows.
         source = self.external_value(
             int(descriptor.column_value_ids[int(column)]),
-            dtype=str(descriptor.column_dtypes[int(column)]),
+            dtype=(
+                None if descriptor.heap_owner_value_id is not None
+                else str(descriptor.column_dtypes[int(column)])
+            ),
         )
         projected_value = self.indexed_load(
             source, index, int(result_id),
@@ -5537,6 +5549,7 @@ class _ControlSSABuilder(TiledObject):
         *,
         attributes: dict[str, Any],
         claim_provisional_definition: bool = False,
+        element_dtype: str | None = None,
     ) -> SSAValue:
         indices = (
             tuple(index)
@@ -5614,7 +5627,7 @@ class _ControlSSABuilder(TiledObject):
         )
         if dtype == "ssa.aggregate":
             declared = self._value_from_meta(int(result_id))
-            dtype = str(declared.dtype or "unknown")
+            dtype = str(declared.dtype or element_dtype or "unknown")
         result = self.produced_value(
             result_id,
             dtype=dtype,
@@ -11235,11 +11248,14 @@ class _ControlSSABuilder(TiledObject):
                 "heap_element_dtype": layout.name,
                 "heap_owner_value_id": int(owner.id),
             }
+            # The cell is DECLARED a reference: one address, which no graph
+            # extent shapes (``structural_concordance._ssa_structure``).
             self._revise_value(
                 column, self._sequence_contract_cell(
                     int(descriptor.sequence_id)
                 ),
                 stage=self._stage(),
+                physical={"storage": "reference"},
             )
         # The owner is a storage member, last (``_storage_values``): every
         # helper call that passes the sequence's storage passes its owner.
@@ -18209,6 +18225,27 @@ class _ControlSSABuilder(TiledObject):
                     "source_value_id": int(iterable_id),
                 },
             )
+            # Program: ``for v in src`` with ``src`` specialized to the
+            # caller's literal ``[2, 3]`` (scratch c_h7).  Wrong record: the
+            # element had no region meta, so its row posted ``unknown`` while
+            # a later reader typed the instruction ``int``; the width check
+            # refused.  Rule: a static iterable's element type is the join
+            # of its literals, the planner's join (``_planned_scalar_dtypes``):
+            # one kind is itself, ints with bools are int64, any other mix
+            # proves nothing.
+            literal_kinds = {
+                "bool" if isinstance(value, bool)
+                else "int64" if isinstance(value, int)
+                else "float64" if isinstance(value, float)
+                else None
+                for value in values
+            }
+            static_element_dtype = (
+                None if not literal_kinds or None in literal_kinds
+                else next(iter(literal_kinds)) if len(literal_kinds) == 1
+                else "int64" if literal_kinds <= {"int64", "bool"}
+                else None
+            )
             self.indexed_load(
                 aggregate,
                 induction,
@@ -18217,6 +18254,7 @@ class _ControlSSABuilder(TiledObject):
                     "binding": "static_iterable",
                     "induction": loop.induction,
                 },
+                element_dtype=static_element_dtype,
             )
         for aggregate_id, target_id, induction_name, source_ids in (
             self.program.closure_iterable_bindings

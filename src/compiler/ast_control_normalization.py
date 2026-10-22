@@ -667,6 +667,74 @@ def _normalize_constant_membership(
     return tuple(receipts)
 
 
+def _normalize_builtin_divmod(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """Spell ``divmod(a, b)`` as ``(a // b, a % b)``.
+
+    Program: ``q = divmod(n + 7, 5); q[0] * 10 + q[1]`` (fuzzer p8_25).
+    Wrong record: the builtin reached the graph as an unlowered call whose
+    tuple result had no producer (refused at C emission: "operand has no
+    value").  Rule: for numbers Python defines ``divmod(a, b)`` as the pair
+    ``(a // b, a % b)`` -- CPython computes float floor division through
+    the same divmod -- so the pair of the two operators the compiler
+    already lowers is the call.  Only the builtin is rewritten (a module
+    that binds the name ``divmod`` keeps its call), and only over pure
+    operands, which the pair evaluates twice.  An operand of a class with
+    its own ``__divmod__`` is outside this rule.
+    """
+
+    receipts: list[dict[str, Any]] = []
+    shadowed = any(
+        (isinstance(node, ast.Name) and node.id == "divmod"
+         and isinstance(node.ctx, (ast.Store, ast.Del)))
+        or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef)) and node.name == "divmod")
+        or (isinstance(node, ast.arg) and node.arg == "divmod")
+        or (isinstance(node, ast.alias)
+            and (node.asname or node.name) == "divmod")
+        for node in ast.walk(tree)
+    )
+    if shadowed:
+        return ()
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if (
+                not isinstance(node.func, ast.Name)
+                or node.func.id != "divmod"
+                or len(node.args) != 2
+                or node.keywords
+                or any(isinstance(arg, ast.Starred) for arg in node.args)
+                or not all(_pure_operand(arg) for arg in node.args)
+            ):
+                return node
+            left, right = node.args
+            pair = ast.Tuple(
+                elts=[
+                    ast.copy_location(ast.BinOp(
+                        left=left, op=ast.FloorDiv(), right=right,
+                    ), node),
+                    ast.copy_location(ast.BinOp(
+                        left=copy.deepcopy(left), op=ast.Mod(),
+                        right=copy.deepcopy(right),
+                    ), node),
+                ],
+                ctx=ast.Load(),
+            )
+            receipts.append({
+                "line": int(getattr(node, "lineno", -1)),
+                "column": int(getattr(node, "col_offset", -1)),
+            })
+            return ast.copy_location(pair, node)
+
+    Rewriter().visit(tree)
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
 def _normalize_binary_short_circuit(
     tree: ast.Module,
 ) -> tuple[dict[str, Any], ...]:

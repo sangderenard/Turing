@@ -695,6 +695,30 @@ Corpus c180 to c193 hold the family. A new fuzz tier (`FUZZ_EXT=3`) adds
 helpers that store into, append to, grow, swap, index and measure a
 caller's list.
 
+Four refusals on the same frontier became lowerings:
+- A dict passed to a callee that adds a key had no capacity contract in
+  either function. A keyed store into a dict that is not the function's
+  own display now seeds growth in the settlement, as an append to a
+  parameter does (c194, c195).
+- A callee's `for v in src`, with `src` specialized to the caller's
+  literal, loaded its element with no type (its row said `unknown` and a
+  later reader typed the instruction `int`). A static iterable's element
+  type is the join of its literals, by the planner's join (c196, c197).
+- `divmod(a, b)` is spelled `(a // b, a % b)` over pure operands
+  (`_normalize_builtin_divmod`). CPython defines it so for numbers and
+  computes float floor division through the same divmod (c198 to c200).
+- Runtime-count replication `[v] * k` now runs (c201, c202). Three
+  records were wrong:
+  1. The row load demanded the heap column at its element dtype, which
+     revised the `ptr` cell's row back to int64.
+  2. The structural view then completed the cell's empty shape from the
+     planner's (1,) extent. The heap contract now declares the cell
+     `storage="reference"`, and a declared reference takes no graph
+     extent.
+  3. The fixed fill raised code 75 inside the DYNAMIC protocol, whose
+     insert step must report "full" so its caller grows and retries
+     (`raise_when_full=False`).
+
 ## Open frontier (stated, not worked around)
 
 - **Variadic returns.** `return ()` / `return (x,)` and `return []` /
@@ -736,20 +760,19 @@ caller's list.
     placed by graph-id order (`value_id < effect_id`) into a neighbouring
     region (a cycle), and `pop` has no lowering. Both should be one lexical
     mapping effect.
-  - Runtime-count replication `[v] * k`: see above.
+  - Multi-element replication `[a, b] * k`: no operation writes its rows
+    (fill repeats one value); C emission refuses the arena.
 - Now lowered: `xs.count(v)` / `xs.index(v)` (resident queries; a missing
   `index` raises), `del xs[i]` on a list (positional pop), bare `zip`.
 - `xs = [0, 0]; for ...: t += xs[0]; xs = [i + n, i]` (a display re-bound
   inside a loop) is wrong at 4c70971 and after, with two audit findings
   (`descriptor-member-shared`, `unaccounted-formal`).
+- Now lowered as well: `divmod`, runtime-count replication, dict
+  displays a callee adds keys to.
 - Lists across call edges: growing (c55), returning (c56, c60), storing,
   appending, iterating, indexing and measuring (c180 to c193) pass.
-  Still loud:
-  a dict display passed to a callee that adds a key has no capacity
-  contract (dict escapes are not settled); a `list[int]` parameter bound
-  whole and iterated into another list types its loaded rows with the
-  provisional `int` element spelling ("declared integer width
-  disagreement").
+  The two loud cases recorded at af84217 (a dict a callee adds keys to;
+  a static `list[int]` iterated into another list) now pass.
 - The exported C wrapper still sizes private root storage with no storage
   requirement at one row (`ssa_c_backend`, `element_count ... else 1`).
   No program reaches it now that escaped lists are bounded or refused, but

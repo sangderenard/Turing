@@ -100,7 +100,16 @@ def _ssa_structure(read, scope, value_id, shape_scope=None, storage_scope=None):
             # result lease), but do not erase a separately published physical
             # reshape/view. In particular a graph scalar is not authority to
             # collapse an existing span to ().
-            if not shape and metadata_state == "static" and rank == len(extents):
+            # Program: ``xs = [5] * (n % 4 + 1)`` (scratch c_k1).  Wrong
+            # record: the heap column's ``ptr`` cell, posted shape (), took
+            # the planner's (1,) extent here and its reserve's heap copy
+            # refused the shaped "handle".  Rule: a declared reference is
+            # one address; no graph extent shapes it.
+            if (
+                not shape and metadata_state == "static"
+                and rank == len(extents)
+                and getattr(fact, "storage", None) != "reference"
+            ):
                 shape = extents
             if dtype is None and element_type not in ("", "unknown"):
                 dtype = element_type

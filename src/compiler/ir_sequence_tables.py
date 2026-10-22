@@ -559,7 +559,8 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
     fills = {"fill": lower_sequence_fill, "append_fill": lower_sequence_append_fill}
     fixed = (lower_table_store(fixed_descriptor, function_name=name + "__fixed", first_value_id=first_value_id)
              if is_store else fills[operation](fixed_descriptor,
-                 function_name=name + "__fixed", first_value_id=first_value_id)
+                 function_name=name + "__fixed", first_value_id=first_value_id,
+                 raise_when_full=False)
              if operation in fills else lower_sequence_insert_at(fixed_descriptor,
                  function_name=name + "__fixed", first_value_id=first_value_id)
              if operation == "insert_at" else lower_sequence_insert(fixed_descriptor,
@@ -1755,6 +1756,7 @@ def lower_sequence_fill(
     *,
     function_name: str | None = None,
     first_value_id: int | None = None,
+    raise_when_full: bool = True,
 ) -> SSASequenceLowering:
     """Fill a caller arena with one repeated value and publish its length.
 
@@ -1820,13 +1822,17 @@ def lower_sequence_fill(
     # the arena took the literal's one-row extent, the fill reported "full"
     # into a status nobody reads and ``len(xs)`` was 0.  Rule: exhausting
     # a fixed fill raises (validation error 75), never a silent short list.
-    builder.emit(full, "Call", [], attributes={
-        "callee": "turing_validation_error",
-        "error_code": 75,
-        "source_linked": True,
-        "ssa_sequence_operation": "fill",
-        "failure": "fixed_capacity_exhausted",
-    })
+    # The DYNAMIC protocol's insert step (``raise_when_full=False``) reports
+    # "full" instead: its caller grows the arena and retries (scratch c_k1,
+    # ``[5] * (n % 4 + 1)``, raised 75 on its first insert).
+    if raise_when_full:
+        builder.emit(full, "Call", [], attributes={
+            "callee": "turing_validation_error",
+            "error_code": 75,
+            "source_linked": True,
+            "ssa_sequence_operation": "fill",
+            "failure": "fixed_capacity_exhausted",
+        })
     status_full = builder.const(full, 2)
     builder.emit(full, "Ret", [status_full])
     function = Function(
@@ -1851,6 +1857,7 @@ def lower_sequence_append_fill(
     *,
     function_name: str | None = None,
     first_value_id: int | None = None,
+    raise_when_full: bool = True,
 ) -> SSASequenceLowering:
     """Append one repeated value without discarding resident rows."""
 
@@ -1917,13 +1924,17 @@ def lower_sequence_append_fill(
     # the arena took the literal's one-row extent, the fill reported "full"
     # into a status nobody reads and ``len(xs)`` was 0.  Rule: exhausting
     # a fixed fill raises (validation error 75), never a silent short list.
-    builder.emit(full, "Call", [], attributes={
-        "callee": "turing_validation_error",
-        "error_code": 75,
-        "source_linked": True,
-        "ssa_sequence_operation": "fill",
-        "failure": "fixed_capacity_exhausted",
-    })
+    # The DYNAMIC protocol's insert step (``raise_when_full=False``) reports
+    # "full" instead: its caller grows the arena and retries (scratch c_k1,
+    # ``[5] * (n % 4 + 1)``, raised 75 on its first insert).
+    if raise_when_full:
+        builder.emit(full, "Call", [], attributes={
+            "callee": "turing_validation_error",
+            "error_code": 75,
+            "source_linked": True,
+            "ssa_sequence_operation": "fill",
+            "failure": "fixed_capacity_exhausted",
+        })
     status_full = builder.const(full, 2)
     builder.emit(full, "Ret", [status_full])
     function = Function(
