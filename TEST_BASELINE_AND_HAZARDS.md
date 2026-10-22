@@ -1,3 +1,16 @@
+2026-10-22 LANE A ITEM A0 (MEASURED, cloud container):
+A chained comparison whose middle is int/float/len/abs/ord of a pure
+operand now lowers, the middle spelled in place in both comparisons
+(never hoisted past a guarding `and`). Other call middles still refuse.
+This was the first refusal of both the bootstrap and the managed tire.
+At 0d98ef1: corpus 161/161 PASS, 0 findings; fuzz FUZZ_EXT=1 seed 10,
+30/30 PASS; gate aa 90 / ab 7 / ac 26 / rec 20 vs parent 2532577 aa 89 /
+7 / 26 / 20 in the same container. The extra aa name
+(test_sympy_process_graph_is_registered_before_python_dependency_pursuit)
+fails the same way alone on the parent: order-dependent, not A0.
+Not measured: the bootstrap and the tire themselves (Albert's machine).
+See docs/compiler_convergence/35.
+
 2026-10-22 CALL-BOUNDARY AND SET ROUND (MEASURED):
 Silent wrong answers found and fixed (each with a clean audit):
 - a callee storing into, appending to or growing a caller's list

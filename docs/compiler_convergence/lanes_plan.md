@@ -24,7 +24,6 @@ the full typed corpus check (0 non-PASS), a fuzz seed in the lane's tier
 
 | rank | item | group (doc 34) | claimed functions | branch | status |
 |---|---|---|---|---|---|
-| A0 | Lower a chained comparison whose middle operand is a call. The middle is evaluated once, in place, never hoisted ahead of a guarding `and`. Duplicating it is allowed only for a proven-pure builtin conversion of a pure operand. Every other call still refuses by name. Then hand Albert both whole-program commands. | R0 | `ast_control_normalization._normalize_chained_comparisons`, `ast_control_normalization._pure_operand` | `claude/project-thread-kbkzp7` | claimed 2026-10-22: blocks 100% of both targets |
 | A1 | Give tuple displays a birth. Place the predicate region that produces the members before the effects that consume them, then birth tuples as lists are born. | S1 | `resident_sequence_materialization._list_literal_mutations`; the region-ownership rule that assigns the members' region to the later conditional (find it with a trap first); `resident_sequence_materialization._static_sequence_capacity_survey` | `claude/project-thread-kbkzp7` (after A0) | claimed 2026-10-22: silent on `main` with a clean audit |
 | A2 | Keep a return surface whole. `emit_outputs` must not fall back to `(output_id,)` when an aggregate layout is absent. The control finish publishes the layout. Accepted-unit accounting must not let one value stand for a tuple/optional. Add the false-acceptance check from doc 34 §1.4 to the bootstrap status tool. | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs` (nested, line ~28034); the control-finish member Phi publisher; accepted-unit result accounting | | open: false acceptance |
 | A3 | Make `dict.update()` a recorded mutation, so `_mutated_sequence_node_ids` sees it. | B4 | `glsl_deployment_strategy._mutated_sequence_node_ids` (read only); the mutation-record writer for dict methods | | open: inferred silent-capable |
@@ -80,4 +79,4 @@ committed inventory script and classify every hit.
 
 ## Done
 
-(none yet)
+- A0 (chained comparison with a builtin conversion middle): branch `claude/project-thread-kbkzp7`, receipts in doc 35.
