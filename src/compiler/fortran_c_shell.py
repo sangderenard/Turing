@@ -47196,9 +47196,26 @@ def _class_surface_ssa_program(
                         from .ssa_record_return_state import publish_ssa_value_type
 
                         structure, source_cell = function_value_structure(callee, int(callee_output.id))
+                        # Program: ``id_space.is_legacy`` composing the
+                        # accepted ``flags_of`` (bootstrap units 8/9).  Wrong
+                        # record: the result row posted dtype/shape only while
+                        # the callee output's accounting (scalar, rank 0) was
+                        # copied on, so the row had no storage/rank
+                        # (``ssa-physical-unposted``; unit 9 refused unit 8).
+                        # Rule: as for an aggregate member output -- the result
+                        # posts the physical fields recorded on the callee
+                        # output's own row, and its accounting labels follow
+                        # the posted fact.
+                        result_physical = _frame_physical_fields(
+                            callee, int(callee_output.id),
+                        )
                         publish_ssa_value_type(
                             caller, result, dtype=structure.dtype, shape=structure.shape,
-                            sources=(source_cell,), stage=FRAME_LINK,
+                            sources=_frame_cells(
+                                source_cell,
+                                _frame_value_cell(callee, int(callee_output.id)),
+                            ),
+                            stage=FRAME_LINK, physical=result_physical,
                         )
                         result.device = callee_output.device
                         callee_accounting = _callee_accounting_in_caller(
@@ -47209,10 +47226,10 @@ def _class_surface_ssa_program(
                             caller_symbol=caller_symbol,
                             callsite_id=int(record.callsite_id),
                         )
-                        result.accounting = {
+                        result.accounting = _frame_accounting_from_posted({
                             **dict(result.accounting or {}),
                             **callee_accounting,
-                        }
+                        }, result_physical)
                     elif returns_bound_aggregate:
                         _callee_result_id, caller_result_id = result_binding
                         result = values.get(
