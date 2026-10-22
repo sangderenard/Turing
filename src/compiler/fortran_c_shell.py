@@ -26914,7 +26914,7 @@ def _class_surface_ssa_program(
             and int(mutation.sequence_value_id) not in output_history_ids
         )
         # Program: ``xs = []; for i in range(n): xs.append(i); ys = [7] + xs;
-        # len(ys)`` (c243).  Wrong record: a concatenation no bound covers
+        # len(ys)`` (c263).  Wrong record: a concatenation no bound covers
         # was neither bounded nor DYNAMIC, so its arena took the planner's
         # elementwise extent and the slice copy stopped there (``len(ys)``
         # 1 for 4; clean audit).  Rule: a concatenation is born here and

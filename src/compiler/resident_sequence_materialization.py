@@ -1770,7 +1770,7 @@ def _static_sequence_capacity_survey(
             unknown.add(parent)
             escaped.add(parent)
     bounds.update({key: count for key, count in local_lists.items() if key not in unknown})
-    # Program: ``t = (n + 1, n + 2, n * 3); len(t)`` (c240).  Wrong record:
+    # Program: ``t = (n + 1, n + 2, n * 3); len(t)`` (c260).  Wrong record:
     # a tuple display had resident storage but no birth and no bound, so
     # ``len(t)`` read the frame's zeroed length cell (0 for 3; clean audit).
     # Rule: a tuple display is born like a list display, and nothing grows
@@ -1836,7 +1836,7 @@ def _static_sequence_capacity_survey(
             return len(literal)
         return None
 
-    # Program: ``xs = [1, 2] + [n, 8]; ys = [n * 2] + xs; len(ys)`` (c243).
+    # Program: ``xs = [1, 2] + [n, 8]; ys = [n * 2] + xs; len(ys)`` (c263).
     # Wrong record: a concatenation operand that is itself a concatenation
     # (an ``Add`` with no aggregate kind) was not a list here, so ``ys`` had
     # no bound, took the planner's elementwise extent (2,) and ``len(ys)``

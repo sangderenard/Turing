@@ -4,7 +4,7 @@ computed tuple display read an unwritten length cell (0 for 3). Tuples are
 now born like lists and bounded by member count. The audit reports a
 display whose length is read while nothing writes its sequence
 (`display-length-unborn`). See docs/compiler_convergence/35 section 1.
-Corpus (this container, Linux): 161/161 PASS with c240 and c241 (then numbered c218, c219) at
+Corpus (this container, Linux): 161/161 PASS with c260 and c261 (then numbered c218, c219) at
 01e2613; `main` 2532577 is 159/159 on the same container.
 Fuzz seed 11 (base tier, 40 programs, new tuple snippets): 39 PASS, 1 LOUD
 (p11_30, a control-order cycle, loud at `main` too), 0 WRONG, 0 TYPE.

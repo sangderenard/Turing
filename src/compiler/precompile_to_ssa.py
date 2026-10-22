@@ -4824,7 +4824,7 @@ class _ControlSSABuilder(TiledObject):
                 f"descriptors: destination={destination_id}, source={source_id}",
             ))
             return
-        # Program: ``xs = [1, 2] + [n, 8]; return xs[2]`` (c244).  Wrong
+        # Program: ``xs = [1, 2] + [n, 8]; return xs[2]`` (c264).  Wrong
         # record: the concatenation's arena had no row writer but these
         # slice appends, so its row stayed ``unknown`` and scalar settlement
         # typed it float64 (3.0 for 3).  Rule: a slice append is a row
