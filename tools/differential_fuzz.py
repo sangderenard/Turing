@@ -102,7 +102,7 @@ EXTENDED2 = [
     (["xs{v} = [{a}, {b}]", "xs{v} += [n]"], "len(xs{v}) * 10 + xs{v}[-1]"),
     (["b{v} = n > {a} or n < -{b}"], "int(b{v}) + (3 if not b{v} else 0)"),
     # dict.update from a display stores its rows (A3)
-    (["d{v} = {1: {a}, 2: n}", "d{v}.update({1: n + {b}, 3: {c}})"], "d{v}[1] * 10 + d{v}[2] + len(d{v}) * 100 + d{v}[3]"),
+    (["d{v} = {{1: {a}, 2: n}}", "d{v}.update({{1: n + {b}, 3: {c}}})"], "d{v}[1] * 10 + d{v}[2] + len(d{v}) * 100 + d{v}[3]"),
 ]
 EXTENDED3 = [
     (["xs{v} = [n, {a}]", "setfirst(xs{v}, {b})"], "len(xs{v}) * 100 + xs{v}[0] * 10 + xs{v}[1]"),
