@@ -519,6 +519,88 @@ def _normalize_none_default_assignments(
     return tuple(receipts)
 
 
+def _pure_operand(node: ast.AST) -> bool:
+    """Whether evaluating ``node`` twice is the same as evaluating it once:
+    reads of names, constants, attributes and subscripts, and arithmetic or
+    comparison over such reads.  A call (or anything else) is not."""
+
+    if isinstance(node, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(node, ast.Attribute):
+        return _pure_operand(node.value)
+    if isinstance(node, ast.Subscript):
+        return _pure_operand(node.value) and _pure_operand(node.slice)
+    if isinstance(node, ast.UnaryOp):
+        return _pure_operand(node.operand)
+    if isinstance(node, ast.BinOp):
+        return _pure_operand(node.left) and _pure_operand(node.right)
+    if isinstance(node, ast.Tuple):
+        return all(_pure_operand(element) for element in node.elts)
+    return False
+
+
+def _normalize_chained_comparisons(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """Spell ``a < b < c`` as ``a < b and b < c``.
+
+    Program: ``if 0 < n < 10: r += 1`` (scratch c208).  Wrong record: the
+    planner classifies a chained Compare as dispatch metadata and nothing
+    lowered it, so the predicate became a minted root input (always 0).
+    Rule: Python defines the chain as the conjunction of its adjacent
+    comparisons, each middle operand evaluated once.  A pure middle operand
+    reads the same value twice; a chain with an impure middle operand (a
+    call) is refused by name rather than evaluated twice.
+    """
+
+    receipts: list[dict[str, Any]] = []
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Compare(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if len(node.ops) <= 1:
+                return node
+            middles = node.comparators[:-1]
+            impure = next((
+                middle for middle in middles if not _pure_operand(middle)
+            ), None)
+            if impure is not None:
+                raise ValueError(
+                    "chained comparison at line "
+                    f"{getattr(node, 'lineno', '?')} has a middle operand "
+                    f"with effects ({ast.unparse(impure)!r}); the chain "
+                    "evaluates it once, which this lowering cannot spell"
+                )
+            operands = [node.left, *node.comparators]
+            comparisons = []
+            for index, operator in enumerate(node.ops):
+                # A middle operand is the right side of one comparison and
+                # the left side of the next: two occurrences, two AST
+                # objects (graph nodes are keyed by occurrence).
+                left = (
+                    copy.deepcopy(operands[index]) if index > 0
+                    else operands[index]
+                )
+                comparison = ast.Compare(
+                    left=left, ops=[operator],
+                    comparators=[operands[index + 1]],
+                )
+                ast.copy_location(comparison, operands[index])
+                comparison.end_lineno = operands[index + 1].end_lineno
+                comparison.end_col_offset = operands[index + 1].end_col_offset
+                comparisons.append(comparison)
+            receipts.append({
+                "line": int(getattr(node, "lineno", -1)),
+                "column": int(getattr(node, "col_offset", -1)),
+                "comparisons": len(comparisons),
+            })
+            conjunction = ast.BoolOp(op=ast.And(), values=comparisons)
+            return ast.copy_location(conjunction, node)
+
+    Rewriter().visit(tree)
+    return tuple(receipts)
+
+
 def _normalize_binary_short_circuit(
     tree: ast.Module,
 ) -> tuple[dict[str, Any], ...]:
