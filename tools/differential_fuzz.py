@@ -70,9 +70,27 @@ EXTENDED = [
     (["bs{v} = [n > {a}, n < {b}, True]"], "sum(1 for b{v} in bs{v} if b{v})"),
     (["xs{v} = [{a}, n, {b}]", "ys{v} = list(xs{v})", "ys{v}.append(n)"], "len(xs{v}) * 10 + len(ys{v})"),
     (["xs{v} = [{a}, n, {b}, {c}]"], "xs{v}[-1] * 10 + xs{v}[-2]"),
+    # Optional scalar returns: a statement merge with a None arm, and an
+    # early ``return None`` guard, each tested for presence by the caller.
+    (["o{v} = maybe_inc(n, {a})"], "(-1 if o{v} is None else o{v})"),
+    (["o{v} = maybe_guard(n, {a})", "t{v} = 0", "if o{v} is not None:", "    t{v} = o{v} * 3"], "t{v}"),
 ]
 EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
+
+
+def maybe_inc(x: int, y: int):
+    if x > y:
+        r = x + y
+    else:
+        r = None
+    return r
+
+
+def maybe_guard(x: int, y: int):
+    if x < y:
+        return None
+    return x - y
 
 
 def first_over(x: int, y: int) -> int:
