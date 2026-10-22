@@ -719,6 +719,40 @@ Four refusals on the same frontier became lowerings:
      insert step must report "full" so its caller grows and retries
      (`raise_when_full=False`).
 
+## Sets and memberships
+
+A set grown after its display returned a wrong length with a clean audit
+(present at dc24ef3): `s = {1, 2}; for i in ...: s.add(i * 3); len(s)`.
+Three records were wrong:
+1. Only list displays were born, so a set display's members were never
+   inserted. A set birth is now the same lexical clear followed by one
+   `add` per member under the unique policy (`_list_literal_mutations`).
+   A set from a compile-time table keeps that initializer.
+2. The capacity survey bounded no set. A set display, or its folded
+   literal, is a keyed arena whose literal members are its key universe,
+   as a dict display's keys are. A retained `add` of a literal key joins
+   the universe; any other add unbounds it (DYNAMIC when it never
+   escapes). The add's node is a method call that the survey's call scan
+   did not match, so the display's two members had stood as the bound.
+3. `s.add(n)` carries `tensor_candidate` (`add` reads as a tensor op),
+   so dead-metadata pruning removed it as an unconsumed pure call. Its
+   mutation record then named a missing node and the effect was placed
+   after every read. A node that a retained sequence mutation names as
+   its effect is never dead metadata.
+
+Membership:
+- `n in xs`, with `xs` an unchanged literal list folded to a constant,
+  had no producer. Structural recovery now spells it as the disjunction
+  of equalities with the folded leaf ledger's numeric members, as it
+  already did for literal string sets, and marks a parameter query as
+  used (`mark_structural_parameter_use`).
+- A list's membership inside a loop fell to that entry-level recovery,
+  which cannot read a loop target. The membership survey now admits
+  lists. The resident contains-scan is placed at the authored node, as
+  for dicts and sets.
+
+Corpus c203 to c210.
+
 ## Open frontier (stated, not worked around)
 
 - **Variadic returns.** `return ()` / `return (x,)` and `return []` /
@@ -752,10 +786,11 @@ Four refusals on the same frontier became lowerings:
     (c211).
   - Nested list stores: no source cell for the control block (c212).
   - Early `return` from a loop over a list parameter (c216).
-  - `n in xs` with `xs` a folded constant list VARIABLE: no membership is
-    produced (the structural recovery only covers fields and dicts). An
-    inline numeric literal (`n in [6, 3, 4]`) is now spelled as the
-    disjunction of equalities (ast_control_normalization).
+  - `i in ts` inside a loop, with `ts` an unchanged literal folded to a
+    constant: structural recovery builds at function entry, where the
+    loop target does not exist, and the folded literal has no resident
+    sequence for the lexical membership. Outside loops this lowers
+    (c208), as does a resident list inside a loop (c209).
   - Dict `del d[k]` and `d.pop(k)` on a display dict: the deletion is
     placed by graph-id order (`value_id < effect_id`) into a neighbouring
     region (a cycle), and `pop` has no lowering. Both should be one lexical

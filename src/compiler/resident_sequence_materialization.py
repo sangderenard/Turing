@@ -1297,6 +1297,29 @@ def _static_mapping_capacity_bounds(
                 keys[int(node_id)] = {ast.literal_eval(key) for key in expression.keys}
             except (ValueError, TypeError):
                 unknown.add(int(node_id))
+        # Program: ``ss = {4, 6}; n in ss`` (scratch c_n3).  Wrong record: a
+        # set display had neither a bound nor the dynamic contract, so its
+        # arena was refused ("no proven capacity").  Rule: a set display is
+        # a keyed arena whose literal members are its key universe, exactly
+        # as a dict display's keys are; any other writer unbounds it below.
+        if isinstance(expression, ast.Set):
+            try:
+                keys[int(node_id)] = {
+                    ast.literal_eval(element) for element in expression.elts
+                }
+            except (ValueError, TypeError):
+                unknown.add(int(node_id))
+        elif (
+            attributes.get("aggregate_kind") in {"set", "frozenset"}
+            and str(data.get("type")) in {"Constant", "Const", "const"}
+            and isinstance(attributes.get("value"), (set, frozenset, list, tuple))
+        ):
+            # The structural fold's literal of an unchanged set display
+            # (scratch c_n3): the same key universe, read from the literal.
+            try:
+                keys[int(node_id)] = set(attributes["value"])
+            except TypeError:
+                unknown.add(int(node_id))
     for mutation in _source_mapping_mutations(graph_obj):
         destination = int(mutation.sequence_value_id)
         if mutation.operator == "replace":
@@ -1310,6 +1333,30 @@ def _static_mapping_capacity_bounds(
                     keys.setdefault(destination, set()).add(key)
                 except (ValueError, TypeError):
                     unknown.add(destination)
+    # Program: ``s = {1, 2}; for i in ...: s.add(i * 3)`` (scratch c_s2).
+    # Wrong record: the add's node is a method call of the recorded
+    # mutation, which the call scan below does not match, so the display's
+    # two-member universe stood as the bound and every later add was
+    # refused into a dropped status.  Rule: a retained insertion into a
+    # keyed universe adds its literal key; any other key unbounds it.
+    for mutation in _sequence_append_call_mutations(graph_obj):
+        destination = int(aliases.get(
+            int(mutation.sequence_value_id), int(mutation.sequence_value_id),
+        ))
+        if destination not in keys or mutation.operator == "clear":
+            continue
+        try:
+            literal_keys = [
+                ast.literal_eval(graph_obj.nodes[int(argument)].get("expr_obj"))
+                for argument in mutation.argument_value_ids
+            ]
+        except (KeyError, ValueError, TypeError):
+            unknown.add(destination)
+            continue
+        if mutation.operator != "add" or len(literal_keys) != 1:
+            unknown.add(destination)
+            continue
+        keys[destination].add(literal_keys[0])
     for _node_id, data in graph_obj.nodes(data=True):
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
         operation = str(data.get("type") or data.get("op") or "").casefold()
@@ -1791,7 +1838,7 @@ def _static_sequence_capacity_survey(
     # function's own storage and takes the dynamic contract, as a list does.
     local_dicts = {
         int(node_id) for node_id, data in graph_obj.nodes(data=True)
-        if isinstance(data.get("expr_obj"), ast.Dict)
+        if isinstance(data.get("expr_obj"), (ast.Dict, ast.Set))
     }
     escaped_dicts = {
         parent for parent in _call_escaped_argument_ids(graph_obj)
@@ -2288,10 +2335,23 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             aggregate_page.latest((aggregate_scope, sequence_id))
             if aggregate_scope is not None else None
         )
+        # Program: ``s = {1, 2}; for i in ...: s.add(i * 3); len(s)``
+        # (scratch c_s2).  Wrong record: only list displays were born, so a
+        # set display's members were never inserted and ``len(s)`` counted
+        # the loop's adds alone (silently; clean audit).  Rule: a set
+        # display's birth is the same lexical clear followed by one ``add``
+        # per member, in order, under the unique policy ``s.add`` uses.  A
+        # set initialized from a compile-time table keeps that initializer.
+        is_set = (
+            isinstance(expression, ast.Set)
+            or attributes.get("aggregate_kind") in {"set", "frozenset"}
+        )
+        if is_set and attributes.get("compile_time_sequence_items") is not None:
+            continue
         layout_members = (
             tuple(int(member.value_id) for member in layout.members)
             if isinstance(layout, SourceAggregateLayout)
-            and str(layout.aggregate_kind) == "list"
+            and str(layout.aggregate_kind) in {"list", "set", "frozenset"}
             else ()
         )
         # Program: ``xs = [5, 7, 11]; return xs[n]`` (c36_literal_index_param).
@@ -2301,7 +2361,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         # length and every ``xs[n]`` read 0.  Rule: the list birth is the
         # SOURCE_AGGREGATE_LAYOUT record's ordered members; the AST, when it
         # survives, only refines a member's spelling.
-        if isinstance(expression, ast.List):
+        if isinstance(expression, (ast.List, ast.Set)):
             if not expression.elts:
                 continue
             elements = tuple(expression.elts)
@@ -2338,7 +2398,10 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                     )
                 )
             if len(exact) != 1 or isinstance(element, ast.Starred):
-                raise ValueError(f"List {sequence_id} lacks one exact element producer")
+                raise ValueError(
+                    f"{'Set' if is_set else 'List'} {sequence_id} lacks one "
+                    "exact element producer"
+                )
             parent, row = exact[0]
             value_id = int(row.get("value_id", parent))
             row_attributes = row.get("attributes") or {}
@@ -2359,15 +2422,18 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 literal = string_token(literal) if isinstance(literal, str) else literal
                 expressions = (ControlExpression("const", literal=literal),)
             rows.append(ControlSequenceMutation(
-                sequence_value_id=sequence_id, operator="append",
+                sequence_value_id=sequence_id,
+                operator="add" if is_set else "append",
                 argument_value_ids=arguments, effect_node_id=parent,
-                policy="duplicates", argument_kind="row" if len(arguments) > 1 else "value",
+                policy="unique" if is_set else "duplicates",
+                argument_kind="row" if len(arguments) > 1 else "value",
                 argument_expressions=expressions,
                 display_member=(int(node_id), int(ordinal)),
             ))
         mutations.append(ControlSequenceMutation(
             sequence_value_id=sequence_id, operator="clear", argument_value_ids=(),
-            effect_node_id=int(node_id), policy="duplicates",
+            effect_node_id=int(node_id),
+            policy="unique" if is_set else "duplicates",
         ))
         mutations.extend(rows)
     return tuple(mutations)

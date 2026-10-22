@@ -22720,7 +22720,24 @@ def _remove_dead_metadata_nodes(
     node each step, which is exactly what the restarted scan found.
     """
 
+    # Program: ``s = {1, 2}; s.add(n); len(s)`` (scratch c_s5).  Wrong
+    # record: ``s.add(n)`` carries ``tensor_candidate`` (``add`` reads as a
+    # tensor op) and its ``None`` result has no consumer, so it was pruned
+    # here as a dead pure call; its retained mutation record then named a
+    # missing node, the effect was placed after every read, and ``len(s)``
+    # missed the row (silently).  Rule: a node a retained sequence mutation
+    # names as its effect is an effect, never dead metadata.
+    _retain_source_sequence_mutation_records(graph.G)
+    effect_ids = {
+        int(effect_id)
+        for effect_id in (
+            graph.G.graph.get("source_sequence_mutation_records") or {}
+        )
+    }
+
     def is_candidate(node_id: int, data: Mapping[str, Any]) -> bool:
+        if int(node_id) in effect_ids:
+            return False
         attributes = data.get("attributes") or {}
         dead_pure_tensor_call = bool(
             attributes.get("tensor_candidate") is not None

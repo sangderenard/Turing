@@ -10353,8 +10353,15 @@ def _field_slot_ops(
         }:
             sequence_id = field_sequence_ids[canonical_field(str(field_name))]
         elif field_attributes.get("aggregate_kind") in {
-            "dict", "set", "frozenset",
+            "dict", "set", "frozenset", "list",
         }:
+            # Program: ``ts = [2, 3]; ts.append(9); for i in ...: if i in
+            # ts`` (scratch c_n5).  Wrong record: only keyed and set kinds
+            # were memberships here, so a list's membership fell to the
+            # entry-level structural recovery, which cannot read a loop
+            # target (the predicate had no value).  Rule: a list's
+            # membership is the same resident contains-scan
+            # (``lower_sequence_contains``), placed at its authored node.
             # A nested declared field (``book.registry.private_pages``) and
             # an authored module constant (``READ_THROUGH_EXCLUDED_PAGES``)
             # already own sequence declarations under their exact value ids.
@@ -28753,6 +28760,98 @@ def _class_surface_ssa_program(
                         ))
                         values[int(value_id)] = result
                         return result
+            # Program: ``xs = [1, 7, 8]; 1 if n in xs else 0`` (fuzzer
+            # p9_59, scratch c_m1).  Wrong record: an unchanged literal list
+            # folds to a structural constant (``_mutated_sequence_node_ids``
+            # proves its initializer is its contents), so it has no resident
+            # descriptor, and no producer gave the membership a value.  Rule:
+            # as for a literal string set above, membership in a folded
+            # collection of numeric literals is the disjunction of equalities
+            # with its leaf ledger's members, in order (``not in``: negated);
+            # the same rule the source normalization applies to an inline
+            # literal (``_normalize_constant_membership``).
+            literal_leaves = tuple(map(int, field_attributes.get(
+                "aggregate_leaf_value_ids", ()
+            )))
+            if (
+                field_attributes.get("structural_specialization")
+                and str(field_attributes.get("aggregate_kind")) in {
+                    "list", "tuple", "set", "frozenset",
+                }
+                and literal_leaves
+                and all(
+                    leaf in graph
+                    and str(graph.nodes[leaf].get("type")) in {
+                        "Constant", "Const", "const",
+                    }
+                    and isinstance(
+                        (graph.nodes[leaf].get("attributes") or {}).get(
+                            "value", graph.nodes[leaf].get("constant"),
+                        ),
+                        (bool, int, float),
+                    )
+                    for leaf in literal_leaves
+                )
+            ):
+                from .concordance_declarations import CONTROL_PREDICATE
+
+                query = ensure_structural_value(int(query_id))
+                members = tuple(
+                    ensure_structural_value(int(leaf))
+                    for leaf in literal_leaves
+                )
+                if query is not None and all(
+                    member is not None for member in members
+                ):
+                    # A query that is an authored parameter is now used.
+                    mark_structural_parameter_use(
+                        int(query_id), query, value_id,
+                    )
+                    current = None
+                    for member in members:
+                        equal = recovery_value(
+                            "bool", CONTROL_PREDICATE, value_id,
+                            query, member,
+                        )
+                        insertions.append(Instr(
+                            "Eq", [query, member], equal,
+                            attributes={
+                                "structural_operation": (
+                                    "literal_numeric_membership"
+                                ),
+                            },
+                        ))
+                        values[int(equal.id)] = equal
+                        if current is None:
+                            current = equal
+                            continue
+                        combined = recovery_value(
+                            "bool", CONTROL_PREDICATE, value_id,
+                            current, equal,
+                        )
+                        insertions.append(Instr(
+                            "LOr", [current, equal], combined,
+                            attributes={
+                                "structural_operation": (
+                                    "literal_numeric_membership"
+                                ),
+                            },
+                        ))
+                        values[int(combined.id)] = combined
+                        current = combined
+                    result = SSAValue(int(value_id), dtype="bool")
+                    insertions.append(Instr(
+                        "LNot" if negate else "Cast",
+                        [current], result,
+                        attributes={
+                            "structural_operation": (
+                                "literal_numeric_membership"
+                            ),
+                            "membership_negated": bool(negate),
+                        },
+                    ))
+                    values[int(value_id)] = result
+                    return result
             linked_contract = dict(
                 (graph.graph.get("linked_value_abi") or {}).get(
                     int(field_id),
