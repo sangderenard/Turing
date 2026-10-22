@@ -108,9 +108,16 @@ def _ssa_structure(read, scope, value_id, shape_scope=None, storage_scope=None):
         scalar_shape = read(RECORD_SCALAR_SHAPE, (storage_scope, int(value_id)))
         if isinstance(scalar_shape, tuple) and len(scalar_shape) == 2 and scalar_shape[1] == ():
             shape = ()
+    # Program: ``identity_spill._reindex_in_place``'s ``and row`` truth
+    # test over a resident sequence.  Wrong record: the sequence's column
+    # arena (posted ``arena=True``, dynamic extent so shape ``()``) was read
+    # as a scalar, and its transport into the declared rank-1 span formal
+    # refused.  Rule: an arena is resident rows -- never a scalar -- whatever
+    # extent is known for it.
     kind = ("unresolved" if dtype is None or dtype == "ssa.aggregate"
             else "reference" if dtype in {"opaque_ref", "ptr"}
-            else "span" if shape else "scalar")
+            else "span" if shape or bool(getattr(fact, "arena", False))
+            else "scalar")
     # Rule: the view reads the posted row.  A declared storage of scalar/span/
     # reference overrides the derived kind of a resolved leaf; sequence/table/
     # keyed/record are never reinterpreted from ``declared_storage``.

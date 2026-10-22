@@ -52655,6 +52655,63 @@ def _class_surface_ssa_program(
                     }
                     if formal.dtype in {None, "unknown"} and fed.dtype:
                         formal.dtype = fed.dtype
+                    # Program: ``IdentityPage._reindex``'s
+                    # ``self.columns`` row append.  Wrong record: the helper
+                    # ``ssa_sequence_19_append``'s length and capacity formals
+                    # received ``program_abi_storage='sequence'`` here while
+                    # their ``ssa_value`` rows kept no storage; every unit
+                    # composing ``_reindex`` refused the dependency
+                    # (``ssa-physical-unposted``, four core units, each
+                    # blocking ~100).  Rule: the call edge is exact, so the
+                    # actual's posted storage/rank are posted on the formal's
+                    # row, DERIVED from both cells, filling only fields the
+                    # formal's row does not record; accounting follows.
+                    _fed_fact = _posted_ssa_value_fact(caller, int(fed.id))
+                    _formal_fact = _posted_ssa_value_fact(
+                        callee, int(formal.id),
+                    )
+                    _edge_fields = {} if (
+                        _fed_fact is None or _formal_fact is None
+                    ) else {
+                        name: getattr(_fed_fact, name)
+                        for name in ("storage", "rank")
+                        if getattr(_fed_fact, name) is not None
+                        and getattr(_formal_fact, name) is None
+                    }
+                    if _edge_fields:
+                        from .ssa_record_return_state import (
+                            ssa_value_identity_cell as _edge_value_cell,
+                        )
+
+                        _revise_ssa_value(
+                            callee, int(formal.id),
+                            dtype=_formal_fact.dtype,
+                            shape=_formal_fact.shape,
+                            stage=LINKED_VALUE_ABI_SETTLEMENT,
+                            sources=_frame_cells(
+                                _edge_value_cell(caller, int(fed.id)),
+                                _edge_value_cell(callee, int(formal.id)),
+                            ),
+                            physical=_edge_fields,
+                        )
+                        _formal_fact = _posted_ssa_value_fact(
+                            callee, int(formal.id),
+                        )
+                        formal.accounting = {
+                            **dict(formal.accounting or {}),
+                            **{
+                                key: (
+                                    _formal_fact.storage if key ==
+                                    "program_abi_storage"
+                                    else int(_formal_fact.rank)
+                                )
+                                for key, field in (
+                                    ("program_abi_storage", "storage"),
+                                    ("program_abi_rank", "rank"),
+                                )
+                                if getattr(_formal_fact, field) is not None
+                            },
+                        }
                     # The declared rank travels in the field identity, not in
                     # `shape`. Only the rank is known here -- the extents are
                     # measured from the real buffer at call time -- and `shape`

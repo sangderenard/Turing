@@ -1253,27 +1253,43 @@ def _adapt_physical_call_inputs_round(
                         # Rule: post first; accounting is a view.  The callee
                         # formal's row is revised with the physical dtype the
                         # conversion settled, DERIVED from the actual's cell
-                        # and the converted value's cell; a formal with no row
-                        # in the ambient book (an accepted callee's own book)
-                        # keeps its accounting write alone.
-                        revise_ssa_value(
-                            callee, int(formal.id), dtype=formal.dtype,
-                            shape=formal.shape,
-                            stage=PHYSICAL_CALL_INPUT_ADAPTATION,
-                            sources=(
-                                ssa_value_identity_cell(caller, actual.id),
-                                ssa_value_identity_cell(caller, converted.id),
-                            ),
-                            physical={'physical_dtype': target_dtype},
+                        # and the converted value's cell.
+                        #
+                        # Program: ``IdentityPage._reaches_origin`` calling
+                        # the accepted ``LiveScopeProjection.reaches``.  Wrong
+                        # record: an ACCEPTED callee's formal (``restricts``)
+                        # had no row in the ambient book, so only its
+                        # accounting was written -- the dependency product
+                        # then carried ``physical_dtype`` with no row and
+                        # every unit composing it refused it.  Rule: an
+                        # accepted callee is an immutable source; its
+                        # formal's ABI is its own, the caller's conversion
+                        # targets it and writes nothing on the callee.
+                        from .ssa_record_return_state import (
+                            accepted_ssa_component as _accepted_callee,
                         )
-                        formal_fact = posted_ssa_value_fact(callee, formal.id)
-                        formal.accounting = {**dict(formal.accounting or {}),
-                            'source_physical_dtype': source_dtype,
-                            'physical_dtype': (
-                                formal_fact.physical_dtype
-                                if formal_fact is not None
-                                and formal_fact.physical_dtype is not None
-                                else target_dtype)}
+                        if not _accepted_callee(callee):
+                            revise_ssa_value(
+                                callee, int(formal.id), dtype=formal.dtype,
+                                shape=formal.shape,
+                                stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                                sources=(
+                                    ssa_value_identity_cell(caller, actual.id),
+                                    ssa_value_identity_cell(caller, converted.id),
+                                ),
+                                physical={'physical_dtype': target_dtype},
+                            )
+                            formal_fact = posted_ssa_value_fact(
+                                callee, formal.id,
+                            )
+                            formal.accounting = {
+                                **dict(formal.accounting or {}),
+                                'source_physical_dtype': source_dtype,
+                                'physical_dtype': (
+                                    formal_fact.physical_dtype
+                                    if formal_fact is not None
+                                    and formal_fact.physical_dtype is not None
+                                    else target_dtype)}
                         conversion = {
                             'caller': str(caller.name),
                             'actual_id': int(actual.id),

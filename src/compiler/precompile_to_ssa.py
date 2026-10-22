@@ -18601,7 +18601,9 @@ class _ControlSSABuilder(TiledObject):
             published, BindingKind.CONDITIONAL_MERGE, merged, tick_cell,
         )
 
-    def _revise_semantic_output(self, name: str, value_id: int) -> None:
+    def _revise_semantic_output(
+        self, name: str, value_id: int, *cause: Any,
+    ) -> None:
         """Re-mint of a semantic output: revise the reducer's row.
 
         Program shape: a function whose returned name is resolved at finish
@@ -18629,6 +18631,7 @@ class _ControlSSABuilder(TiledObject):
             sources = self._cells(
                 book.latest_ref(SEMANTIC_OUTPUT, row),
                 book.latest_ref(SSA_VALUE, (self._scope(), int(value_id))),
+                *cause,
             )
             book.post(
                 SEMANTIC_OUTPUT, row, (str(name), int(value_id)),
@@ -19683,6 +19686,22 @@ class _ControlSSABuilder(TiledObject):
             # output now.  Wrong record: ``semantic_output`` still naming the
             # pre-merge value.  Rule: revise it where the Phi is minted.
             for name, merged_id in named_returns:
+                if record_kind is ReturnArmsKind.OPTIONAL_AGGREGATE:
+                    # Program: ``IdentityPage._fork_of_scope`` -- ``return
+                    # forks.get(scope)`` is ``(origin, stamp)`` or ``None``.
+                    # Wrong record: the one semantic output (the aggregate,
+                    # 32, whose leaves 33/34 are the layout just recorded)
+                    # was revised to leaf 33, the physical slot-0 value, so
+                    # recovery published ``Ret [33, presence]`` and dropped
+                    # leaf 34.  Rule: ``function_output`` rows stay physical
+                    # (one per returned slot); the ``semantic_output`` row of
+                    # an optional aggregate names the aggregate, DERIVED from
+                    # its ``return_output_arms`` cell.
+                    self._revise_semantic_output(
+                        name, int(output_id),
+                        *aggregate_layout_sources.get(int(output_id), ()),
+                    )
+                    continue
                 self._revise_semantic_output(name, int(merged_id))
             self.emit(Handler.Ret, returned)
         elif fallthrough_open:
