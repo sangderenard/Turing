@@ -3584,7 +3584,7 @@ def lower_sequence_replace(
     positions. This operation preserves keyed rows rather than reinserting
     them under a potentially different uniqueness policy.
     """
-    unsupported = _unsupported_destination(destination, "replace")
+    unsupported = _unsupported_destination(destination, "replace", allow_dynamic=True)
     if unsupported is not None:
         return unsupported
     if (len(destination.column_value_ids) != len(source.column_value_ids)
@@ -3628,14 +3628,59 @@ def lower_sequence_replace(
     nonnegative, source_fits, destination_fits = (builder.fresh("bool") for _ in range(3))
     builder.emit(entry, "Ge", [length, zero], nonnegative)
     builder.emit(entry, "Le", [length, SSAValue(source.capacity_value_id, dtype="int64")], source_fits)
-    builder.emit(entry, "Le", [length, SSAValue(destination.capacity_value_id, dtype="int64")], destination_fits)
     valid_source, fits = builder.fresh("bool"), builder.fresh("bool")
     builder.emit(entry, "And", [nonnegative, source_fits], valid_source)
-    builder.emit(entry, "And", [valid_source, destination_fits], fits)
-    builder.cond(entry, fits, header, exhausted)
+    reserve_function = None
+    shared_arena = tuple(map(int, destination.column_value_ids)) == tuple(
+        map(int, source.column_value_ids)
+    )
+    if shared_arena:
+        # The destination is a view of the source's own arena (an optional
+        # glyph payload aliased to its present arm).  The rows are already
+        # in place (the copy loop reads and writes the same addresses) and
+        # replacement publishes the length.  Neither a reserve nor the
+        # view's capacity cell applies: reserving would reallocate the
+        # shared arena against the view's capacity and copy only its rows.
+        builder.cond(entry, valid_source, header, exhausted)
+    elif destination.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
+        # Program: ``detail = None; if c: detail = f'scope={t!r}'`` -- the
+        # optional glyph payload is replaced from a DYNAMIC f-string arena.
+        # Rule: a DYNAMIC destination grows through its own checked reserve
+        # (the helper insert uses) to the source length before any row is
+        # written; reserve status 2 is capacity exhaustion, and the
+        # destination is left intact.
+        reserve_function = lower_sequence_reserve(
+            destination,
+            function_name=(
+                function_name
+                or f"ssa_sequence_{destination.sequence_id}_replace_{source.sequence_id}"
+            ) + "__reserve",
+        ).functions[0]
+        reserve_block = builder.block("replace_reserve")
+        builder.cond(entry, valid_source, reserve_block, exhausted)
+        storage_by_id = {int(value.id): value for value in storage}
+        reserve_status = builder.fresh("int")
+        builder.emit(reserve_block, "Call", [
+            *(storage_by_id[int(value.id)] for value in reserve_function.args[:-1]),
+            length,
+        ], reserve_status, attributes={
+            "callee": reserve_function.name, "source_linked": True,
+        })
+        reserve_invalid = builder.fresh("bool")
+        builder.emit(reserve_block, "Eq", [
+            reserve_status, builder.const(reserve_block, 2),
+        ], reserve_invalid)
+        builder.cond(reserve_block, reserve_invalid, exhausted, header)
+    else:
+        builder.emit(entry, "Le", [length, SSAValue(destination.capacity_value_id, dtype="int64")], destination_fits)
+        builder.emit(entry, "And", [valid_source, destination_fits], fits)
+        builder.cond(entry, fits, header, exhausted)
     index, next_index = builder.fresh("int64"), builder.fresh("int64")
     builder.emit(header, "Phi", [zero, next_index], index,
-                 attributes={"incoming_blocks": (entry.name, latch.name)})
+                 attributes={"incoming_blocks": (
+                     entry.name if reserve_function is None else "replace_reserve",
+                     latch.name,
+                 )})
     continues = builder.fresh("bool")
     builder.emit(header, "Lt", [index, length], continues)
     builder.cond(header, continues, body, complete)
@@ -3692,6 +3737,8 @@ def lower_sequence_replace(
         ))),
         "named_outputs": (("status", int(status.id)),),
     })
+    if reserve_function is not None:
+        return SSASequenceLowering((function, reserve_function))
     return SSASequenceLowering((function,))
 
 

@@ -1515,6 +1515,11 @@ _NONESCAPING_COLLECTION_CALLS = frozenset({
 })
 
 
+_BUILTIN_COLLECTION_KINDS = frozenset({
+    "list", "dict", "set", "frozenset", "tuple", "str", "bytes", "bytearray",
+})
+
+
 def _call_escaped_argument_ids(graph_obj: Any) -> frozenset[int]:
     """Values passed as an argument into a call that may retain or mutate it.
 
@@ -1541,6 +1546,25 @@ def _call_escaped_argument_ids(graph_obj: Any) -> frozenset[int]:
             identity = f"builtins.{reference}"
         if identity in _NONESCAPING_COLLECTION_CALLS:
             continue
+        # Program: ``scopes.setdefault(row[0], {}).setdefault(row, None)``
+        # (identity_spill._reindex_in_place).  Wrong record: the ``{}`` and
+        # ``[]`` defaults of a builtin collection's own method were counted
+        # as escapes, so the structural fold kept them as unknown-dtype
+        # sequences the compiler's table operations never read.  Rule: a
+        # method of a builtin collection receiver is the compiler's own
+        # table operation on resident storage, not a call into code that
+        # may retain or mutate its argument.
+        if isinstance(expression.func, ast.Attribute):
+            receiver = next((
+                parent for parent, role in data.get("parents") or ()
+                if str(role) == "operand"
+            ), None)
+            if receiver is not None and (
+                (graph_obj.nodes.get(receiver, {}).get("attributes") or {}).get(
+                    "aggregate_kind"
+                )
+            ) in _BUILTIN_COLLECTION_KINDS:
+                continue
         for parent, role in data.get("parents") or ():
             if str(role).startswith("arg:"):
                 escaped.add(int(parent))

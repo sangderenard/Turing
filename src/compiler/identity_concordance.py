@@ -1468,6 +1468,7 @@ class CorrelationTable:
         found.extend(self._native_interface_findings(module))
         found.extend(self._region_instruction_residency_findings(module))
         found.extend(self._repository_ssa_signature_findings(module))
+        found.extend(self._scope_local_accounting_findings(module))
         for name, function in module.functions.items():
             found.extend(self._function_findings(module, str(name), function))
             found.extend(
@@ -2070,6 +2071,46 @@ class CorrelationTable:
                         detail = "worker publication lacks its exact region/policy/copy provenance"
                 if detail is not None:
                     found.append(Finding("graph-work-publication-disagreement", str(row[0]), None, detail))
+        return found
+
+    # Accounting keys whose value is an SSA value id of the SAME function.
+    # Program: ``ys = make(n)`` (list returned by a callee).  Wrong record:
+    # the callee output's accounting was copied onto the caller's result, so
+    # ``heap_owner_value_id`` named the callee's owner cell, a value that
+    # does not exist in the caller.  Rule: these ids are scope-local; one that
+    # names a value absent from its own function is a leaked foreign record.
+    # ``source_value_id`` / ``carried_from_value_id`` are source-graph ids,
+    # not SSA ids, and are not read here.
+    _SCOPE_LOCAL_ACCOUNTING_IDS = (
+        "heap_owner_value_id",
+        "ssa_optional_payload_id",
+        "iterable_target_value_id",
+        "native_type_tag_value_id",
+    )
+
+    @staticmethod
+    def _scope_local_accounting_findings(module: Any) -> list[Finding]:
+        found = []
+        for name, function in module.functions.items():
+            carried = {id(value): value for value in function.args}
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.res is not None:
+                        carried[id(instruction.res)] = instruction.res
+                    for argument in instruction.args:
+                        carried[id(argument)] = argument
+            present = {int(value.id) for value in carried.values()}
+            for value in carried.values():
+                accounting = value.accounting or {}
+                for key in CorrelationTable._SCOPE_LOCAL_ACCOUNTING_IDS:
+                    named = accounting.get(key)
+                    if named is None or isinstance(named, bool):
+                        continue
+                    if int(named) not in present:
+                        found.append(Finding(
+                            "accounting-foreign-value-id", str(name), int(value.id),
+                            f"accounting.{key}={int(named)} names no value of this function",
+                        ))
         return found
 
     @staticmethod

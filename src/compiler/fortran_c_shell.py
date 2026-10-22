@@ -1331,6 +1331,42 @@ def _drop_unused_private_sequences(function: Any, sequence_table: Any) -> int:
     return len(removed_sequences)
 
 
+def _retain_companion_formals(function: Any, removable: set[int]) -> set[int]:
+    """``removable`` less every formal a retained formal's accounting names.
+
+    Program: bootstrap unit 24, ``IdentityBook._admit_raw_write(page, ...)``
+    with ``page`` an ``opaque_ref`` whose ``native_type_tag_value_id`` names
+    its tag formal.  Wrong record: ``_drop_unused_root_private_formals`` saw
+    no instruction read the tag and removed it while ``page`` stayed, so
+    ``page`` named a value its function no longer had (concordance
+    ``accounting-foreign-value-id``; unit 50 refused the dependency).  Rule:
+    a scope-local id on a retained formal
+    (``CorrelationTable._SCOPE_LOCAL_ACCOUNTING_IDS``: type tag, heap owner,
+    optional payload, iterable target) is part of that formal's identity and
+    stays with it, to a fixed point.
+    """
+
+    from .identity_concordance import CorrelationTable
+
+    removable = set(map(int, removable))
+    formal_ids = {int(value.id) for value in function.args}
+    changed = True
+    while changed and removable:
+        changed = False
+        for formal in function.args:
+            if int(formal.id) in removable:
+                continue
+            accounting = formal.accounting or {}
+            for key in CorrelationTable._SCOPE_LOCAL_ACCOUNTING_IDS:
+                named = accounting.get(key)
+                if named is None or isinstance(named, bool):
+                    continue
+                if int(named) in removable and int(named) in formal_ids:
+                    removable.discard(int(named))
+                    changed = True
+    return removable
+
+
 def _drop_unused_root_private_formals(function: Any, sequence_table: Any = None) -> int:
     """Erase late compiler frame formals that the root never references."""
 
@@ -1385,6 +1421,7 @@ def _drop_unused_root_private_formals(function: Any, sequence_table: Any = None)
         )
         and not (argument.accounting or {}).get("program_abi_parameter")
     }
+    removable = _retain_companion_formals(function, removable)
     if removable:
         function.args = [
             argument for argument in function.args
@@ -4039,18 +4076,6 @@ def _prune_unused_callee_formals_once(
             callee, (sequence_tables or {}).get(str(callee_name)),
         ))
         protected.update(sequence_member_ids)
-        # A heap cell formal travels with its owner (``_storage_values``).
-        # Program: f"a@{n}" -- the extend helper reads its DYNAMIC source's
-        # cells but never the owner, so pruning the owner left the cells
-        # naming a formal that no longer existed (the heap-context
-        # projection refused the call).  Rule: the owner a live heap cell
-        # formal names is a sequence member and stays.
-        protected.update(
-            int(owner)
-            for formal in callee.args
-            for owner in ((formal.accounting or {}).get("heap_owner_value_id"),)
-            if owner is not None
-        )
         record_parameter_names = set(map(
             str, dict(metadata.get("parameter_record_abi") or {}),
         ))
@@ -4146,6 +4171,13 @@ def _prune_unused_callee_formals_once(
                     "compiler_frame_storage",
                 )
             )
+        )
+        companion_kept = _retain_companion_formals(
+            callee, {int(callee.args[index].id) for index in removable_indices},
+        )
+        removable_indices = tuple(
+            index for index in removable_indices
+            if int(callee.args[index].id) in companion_kept
         )
         if not removable_indices:
             continue
@@ -19666,6 +19698,117 @@ def _adopt_graph_formal(
     return value
 
 
+def _optional_glyph_payload_copies(block: Any) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """The ``replace`` copies an optional glyph carry performs, as
+    ``(payload destination, (present arm sources...))``.
+
+    Program: ``detail = None; if c: detail = f'scope={t!r}'``.  Wrong
+    record: the carry's payload sequence is filled by a ``replace`` from the
+    present arm's glyph sequence (``lower_optional_arm``), a mutation that
+    lives on the conditional's ``optional_glyph_carry_cells`` fact rather
+    than in a mutation block, so the dynamic closure never saw it and the
+    payload stayed FIXED under a DYNAMIC f-string source.  Rule: the
+    closure reads the same SOURCE_OPTIONAL_GLYPH_CARRY facts lowering does.
+    """
+
+    from .concordance_declarations import SOURCE_OPTIONAL_GLYPH_CARRY
+    from .identity_concordance import current_identity_book
+
+    copies = []
+    pending = [block]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        cells = tuple(getattr(current, "optional_glyph_carry_cells", ()) or ())
+        if cells:
+            page = current_identity_book().page(SOURCE_OPTIONAL_GLYPH_CARRY)
+            for cell in cells:
+                fact = page.cell(cell.row, cell.column)
+                destination = int(fact.payload_sequence_value_id)
+                sources = tuple(
+                    int(arm.sequence_value_id)
+                    for arm in (fact.true_arm, fact.false_arm, fact.initial_arm)
+                    if arm is not None
+                    and arm.presence is not False
+                    and arm.sequence_value_id is not None
+                    and int(arm.sequence_value_id) != destination
+                )
+                if sources:
+                    copies.append((destination, sources))
+        for name in ("blocks", "body", "orelse", "condition", "callee"):
+            child = getattr(current, name, None)
+            if isinstance(child, (list, tuple)):
+                pending.extend(child)
+            elif child is not None and hasattr(child, "__dict__"):
+                pending.append(child)
+    return tuple(copies)
+
+
+def _accounting_across_call(
+    accounting: Any,
+    bindings: Mapping[int, int],
+    *,
+    unbound_owner_is_error: bool,
+    describe: str,
+) -> dict:
+    """``accounting`` of a value in one scope, as a view in the scope its
+    call edge reaches.
+
+    Program: ``ys = make(n)`` with ``make``'s list DYNAMIC (and the same list
+    returned as a tuple member); ``found.append(Finding(..., detail))`` with
+    ``detail`` an f-string arena.  Wrong record: the accounting was copied
+    raw across the edge, so the receiving scope's value named the OTHER
+    scope's owner id (996 vs 955; the append helper's row formal named the
+    root's owner).  Rule: a scope-local value id
+    (``CorrelationTable._SCOPE_LOCAL_ACCOUNTING_IDS``) crosses a call only
+    through that call's exact binding (``bindings``: id in the source scope
+    -> id in the receiving scope).  An owner the call does not bind means
+    the receiving value is not a heap cell there: a returned arena refuses
+    (``unbound_owner_is_error``); a formal fed a heap cell without its owner
+    takes no heap contract (no owner, no element layout).
+    """
+
+    from .identity_concordance import CorrelationTable
+
+    translated = dict(accounting or {})
+    for key in CorrelationTable._SCOPE_LOCAL_ACCOUNTING_IDS:
+        named = translated.get(key)
+        if named is None or isinstance(named, bool):
+            continue
+        bound = bindings.get(int(named))
+        if bound is not None:
+            translated[key] = int(bound)
+            continue
+        if key == "heap_owner_value_id":
+            if unbound_owner_is_error:
+                raise ValueError(
+                    "returned heap arena has no bound owner in its caller: "
+                    f"{describe}, owner={int(named)}"
+                )
+            translated.pop("heap_element_dtype", None)
+        translated.pop(key)
+    return translated
+
+
+def _callee_accounting_in_caller(
+    accounting: Any,
+    storage_bindings: dict,
+    *,
+    caller_symbol: Any,
+    callsite_id: int,
+) -> dict:
+    """A callee output's accounting as a view in its caller, through the
+    call's exact storage bindings (``_accounting_across_call``)."""
+
+    return _accounting_across_call(
+        accounting, storage_bindings, unbound_owner_is_error=True,
+        describe=f"caller={caller_symbol!r}, callsite={int(callsite_id)}",
+    )
+
+
 def _settle_linked_dynamic_sequences(
     graphs: tuple[Any, ...], edges: tuple[tuple[Any, int, Any, int], ...],
 ) -> None:
@@ -26311,7 +26454,7 @@ def _class_surface_ssa_program(
             )))
             for mutation in _control_sequence_mutations(control.root)
             if str(mutation.operator) in {"extend", "replace"}
-        )
+        ) + _optional_glyph_payload_copies(control.root)
         grown = True
         while grown:
             grown = False
@@ -26443,6 +26586,15 @@ def _class_surface_ssa_program(
                     # single-column sequence's settled linked contract (the
                     # exact call binding's element dtype) is its declared
                     # column dtype; an authored contract still wins.
+                    # Only a DYNAMIC sequence needs its dtype at birth (its
+                    # heap contract is stamped there).  Program: keyed
+                    # lookup ``reading.voltage_v[key]`` with ``key: str``.
+                    # Wrong record: the str parameter's span contract was
+                    # declared as sequence 0's column, the scalar key token
+                    # formal took span accounting, and the lookup's Eq became
+                    # the tensor kernel ``binary_double``.  Rule: this
+                    # declaration applies to the dynamic set only; every
+                    # other sequence settles its dtype as before.
                     **{
                         int(value_id): (str(contract["dtype"]),)
                         for value_id, contract in dict(
@@ -26455,6 +26607,7 @@ def _class_surface_ssa_program(
                         and str(contract.get("dtype") or "") not in {
                             "", "None", "unknown",
                         }
+                        and int(value_id) in dynamic_sequence_ids
                         and any(
                             int(sequence_id) == int(value_id)
                             and int(column_count) == 1
@@ -26476,6 +26629,7 @@ def _class_surface_ssa_program(
                             *token_glyph_declarations,
                         )
                         if int(declaration[2]) == 1
+                        and int(declaration[0]) in dynamic_sequence_ids
                     },
                     **_sequence_column_dtype_contracts(
                         graph_obj, sequence_declarations
@@ -29994,17 +30148,25 @@ def _class_surface_ssa_program(
             for argument in function.args
             if int(argument.id) in deferred_record_member_ids
         )
-        # A live descriptor's members are its storage even when no body
-        # instruction reads them (``_live_sequence_member_ids``); f"a@{n}"'s
-        # token list lost its heap owner here and the caller leased a
-        # different owner for the same arena.
-        live_descriptor_members = _live_sequence_member_ids(
-            function, all_sequence_tables.get(symbol),
-        )
+        # A heap owner travels with the cells that name it: f"a@{n}"'s token
+        # list lost its owner here and the caller leased a different owner
+        # for the same arena.  ``_retain_companion_formals`` keeps exactly
+        # the owner a retained cell names.  (Descriptor liveness is not
+        # consulted: it counts a formal handle as live, so it would keep
+        # every unused frame-storage formal -- _reindex_in_place's folded
+        # ``{}``/``[]`` defaults came back as unknown-dtype formals.)
+        frame_removable = {
+            int(argument.id)
+            for argument in function.args
+            if (argument.accounting or {}).get("compiler_frame_storage")
+            and (argument.accounting or {}).get("program_abi_parameter") is None
+            and id(argument) not in used_argument_objects
+        }
+        frame_removable_kept = _retain_companion_formals(function, frame_removable)
         used_argument_objects.update(
             id(argument)
             for argument in function.args
-            if int(argument.id) in live_descriptor_members
+            if int(argument.id) in frame_removable - frame_removable_kept
         )
         function.args[:] = [
             argument for argument in function.args
@@ -39314,6 +39476,40 @@ def _class_surface_ssa_program(
             },
         )
 
+    def map_sequence_descriptor(
+        descriptor: Any, remap: Mapping[int, int], *,
+        sequence_id: int, child_table_pool: Any,
+    ):
+        """One descriptor re-keyed into another frame through ``remap``.
+
+        Program: ``ys = make(n)`` and ``fill(xs, n)`` with DYNAMIC lists.
+        Wrong record: five linker sites rebuilt the caller's descriptor field
+        by field and silently dropped every field they did not name -- the
+        heap owner among them -- so the caller's view of a DYNAMIC arena was
+        FIXED.  Rule: re-keying maps EVERY identity member (columns, counters,
+        status, live flags, heap owner, child pool) through the same map and
+        carries every other field unchanged; an unmapped member refuses.
+        """
+
+        from dataclasses import replace as _replace
+
+        def mapped(value_id):
+            return None if value_id is None else remap[int(value_id)]
+
+        return _replace(
+            descriptor,
+            sequence_id=int(sequence_id),
+            column_value_ids=tuple(
+                remap[int(value_id)] for value_id in descriptor.column_value_ids
+            ),
+            length_address_id=remap[int(descriptor.length_address_id)],
+            capacity_value_id=remap[int(descriptor.capacity_value_id)],
+            status_address_id=mapped(descriptor.status_address_id),
+            live_flags_value_id=mapped(descriptor.live_flags_value_id),
+            heap_owner_value_id=mapped(descriptor.heap_owner_value_id),
+            child_table_pool=child_table_pool,
+        )
+
     def map_child_pool(pool: Any, remap: Mapping[int, int]):
         if pool is None:
             return None
@@ -39951,37 +40147,7 @@ def _class_surface_ssa_program(
                             mapped_sequence_id = remap[
                                 int(source_sequence.sequence_id)
                             ]
-                            _frame_register_sequence(caller, caller_sequences, SSASequenceDescriptor(
-                                sequence_id=mapped_sequence_id,
-                                column_value_ids=tuple(
-                                    remap[int(value_id)]
-                                    for value_id in source_sequence.column_value_ids
-                                ),
-                                length_address_id=remap[
-                                    int(source_sequence.length_address_id)
-                                ],
-                                capacity_value_id=remap[
-                                    int(source_sequence.capacity_value_id)
-                                ],
-                                status_address_id=(
-                                    None
-                                    if source_sequence.status_address_id is None
-                                    else remap[int(source_sequence.status_address_id)]
-                                ),
-                                column_dtypes=tuple(source_sequence.column_dtypes),
-                                column_shapes=tuple(source_sequence.column_shapes),
-                                key_columns=tuple(source_sequence.key_columns),
-                                live_flags_value_id=(
-                                    None
-                                    if source_sequence.live_flags_value_id is None
-                                    else remap[int(source_sequence.live_flags_value_id)]
-                                ),
-                                capacity_policy=source_sequence.capacity_policy,
-                                writable=bool(source_sequence.writable),
-                                child_table_pool=map_child_pool(
-                                    source_sequence.child_table_pool, remap
-                                ),
-                            ), _frame_table_cell(
+                            _frame_register_sequence(caller, caller_sequences, map_sequence_descriptor(source_sequence, remap, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(source_sequence.child_table_pool, remap)), _frame_table_cell(
                                 constructor_sequences,
                                 source_sequence.sequence_id,
                                 SEQUENCE_DESCRIPTOR,
@@ -41438,46 +41604,7 @@ def _class_surface_ssa_program(
                                 _frame_register_sequence(
                                     all_functions[caller_symbol],
                                     caller_result_sequences,
-                                    SSASequenceDescriptor(
-                                        sequence_id=mapped_sequence_id,
-                                        column_value_ids=tuple(
-                                            result_storage_bindings[int(value_id)]
-                                            for value_id in sequence.column_value_ids
-                                        ),
-                                        length_address_id=result_storage_bindings[
-                                            int(sequence.length_address_id)
-                                        ],
-                                        capacity_value_id=result_storage_bindings[
-                                            int(sequence.capacity_value_id)
-                                        ],
-                                        status_address_id=(
-                                            None
-                                            if sequence.status_address_id is None
-                                            else result_storage_bindings[int(
-                                                sequence.status_address_id
-                                            )]
-                                        ),
-                                        column_dtypes=tuple(
-                                            sequence.column_dtypes
-                                        ),
-                                        column_shapes=tuple(
-                                            sequence.column_shapes
-                                        ),
-                                        key_columns=tuple(sequence.key_columns),
-                                        live_flags_value_id=(
-                                            None
-                                            if sequence.live_flags_value_id is None
-                                            else result_storage_bindings[int(
-                                                sequence.live_flags_value_id
-                                            )]
-                                        ),
-                                        capacity_policy=sequence.capacity_policy,
-                                        writable=bool(sequence.writable),
-                                        child_table_pool=map_child_pool(
-                                            sequence.child_table_pool,
-                                            result_storage_bindings,
-                                        ),
-                                    ),
+                                    map_sequence_descriptor(sequence, result_storage_bindings, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(sequence.child_table_pool, result_storage_bindings)),
                                     _frame_table_cell(
                                         callee_result_sequences,
                                         sequence.sequence_id,
@@ -42699,6 +42826,7 @@ def _class_surface_ssa_program(
                 )
                 if dead_generated_storage:
                     removable.add(argument_id)
+        removable = _retain_companion_formals(callee, removable)
         if not removable:
             continue
         callee.args = [
@@ -44792,47 +44920,7 @@ def _class_surface_ssa_program(
                             mapped_sequences[sequence_id] = mapped_sequence_id
                             _frame_register_sequence(
                                 caller, caller_sequence_table,
-                                SSASequenceDescriptor(
-                                    sequence_id=mapped_sequence_id,
-                                    column_value_ids=tuple(
-                                        result_storage_bindings[int(value_id)]
-                                        for value_id
-                                        in sequence.column_value_ids
-                                    ),
-                                    length_address_id=result_storage_bindings[
-                                        int(sequence.length_address_id)
-                                    ],
-                                    capacity_value_id=result_storage_bindings[
-                                        int(sequence.capacity_value_id)
-                                    ],
-                                    status_address_id=(
-                                        None
-                                        if sequence.status_address_id is None
-                                        else result_storage_bindings[int(
-                                            sequence.status_address_id
-                                        )]
-                                    ),
-                                    column_dtypes=tuple(
-                                        sequence.column_dtypes
-                                    ),
-                                    column_shapes=tuple(
-                                        sequence.column_shapes
-                                    ),
-                                    key_columns=tuple(sequence.key_columns),
-                                    live_flags_value_id=(
-                                        None
-                                        if sequence.live_flags_value_id is None
-                                        else result_storage_bindings[int(
-                                            sequence.live_flags_value_id
-                                        )]
-                                    ),
-                                    capacity_policy=sequence.capacity_policy,
-                                    writable=bool(sequence.writable),
-                                    child_table_pool=map_child_pool(
-                                        sequence.child_table_pool,
-                                        result_storage_bindings,
-                                    ),
-                                ),
+                                map_sequence_descriptor(sequence, result_storage_bindings, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(sequence.child_table_pool, result_storage_bindings)),
                                 _frame_table_cell(
                                     callee_sequence_table, sequence_id,
                                     SEQUENCE_DESCRIPTOR,
@@ -47056,28 +47144,14 @@ def _class_surface_ssa_program(
                             sources=(source_cell,), stage=FRAME_LINK,
                         )
                         result.device = callee_output.device
-                        callee_accounting = dict(callee_output.accounting or {})
-                        callee_owner = callee_accounting.get("heap_owner_value_id")
-                        if callee_owner is not None:
-                            # Program: ``ys = make(n)`` with ``make``'s list
-                            # DYNAMIC.  Wrong record: the callee output's
-                            # accounting was copied raw, so the caller's arena
-                            # cell named the CALLEE's owner id (996) while
-                            # its own descriptor and the call's bound actual
-                            # named the caller's (955).  Rule: an owner id is
-                            # scope-local; it crosses the call only through
-                            # the call's exact storage binding.
-                            bound_owner = result_storage_bindings_by_call.get(
+                        callee_accounting = _callee_accounting_in_caller(
+                            callee_output.accounting,
+                            result_storage_bindings_by_call.get(
                                 (str(caller_symbol), int(record.callsite_id)), {},
-                            ).get(int(callee_owner))
-                            if bound_owner is None:
-                                raise ValueError(
-                                    "returned heap arena has no bound owner in "
-                                    f"its caller: caller={caller_symbol!r}, "
-                                    f"callsite={int(record.callsite_id)}, "
-                                    f"callee owner={int(callee_owner)}"
-                                )
-                            callee_accounting["heap_owner_value_id"] = int(bound_owner)
+                            ),
+                            caller_symbol=caller_symbol,
+                            callsite_id=int(record.callsite_id),
+                        )
                         result.accounting = {
                             **dict(result.accounting or {}),
                             **callee_accounting,
@@ -47400,7 +47474,14 @@ def _class_surface_ssa_program(
                             output.device = callee_output.device
                             output.accounting = _frame_accounting_from_posted({
                                 **dict(output.accounting or {}),
-                                **dict(callee_output.accounting or {}),
+                                **_callee_accounting_in_caller(
+                                    callee_output.accounting,
+                                    result_storage_bindings_by_call.get(
+                                        (str(caller_symbol), int(record.callsite_id)), {},
+                                    ),
+                                    caller_symbol=caller_symbol,
+                                    callsite_id=int(record.callsite_id),
+                                ),
                                 "ssa_call_result_from": (
                                     str(record.callee_symbol),
                                     int(callee_id),
@@ -50230,12 +50311,20 @@ def _class_surface_ssa_program(
                 )
                 if _accepted_ownership_callee(callee):
                     continue
+                call_bindings = {
+                    int(fed.id): int(formal.id)
+                    for fed, formal in zip(instruction.args, callee.args)
+                }
                 for fed, formal in zip(instruction.args, callee.args):
-                    accounting = dict(fed.accounting or {})
-                    if not accounting.get("program_abi_storage"):
+                    if not (fed.accounting or {}).get("program_abi_storage"):
                         continue
                     if (formal.accounting or {}).get("program_abi_storage"):
                         continue
+                    accounting = _accounting_across_call(
+                        fed.accounting, call_bindings,
+                        unbound_owner_is_error=False,
+                        describe=f"{caller.name}->{callee.name}",
+                    )
                     for frame_local in (
                         "program_abi_keyed_length",
                         "program_abi_keyed_keys",
@@ -52610,34 +52699,10 @@ def _class_surface_ssa_program(
             )
             if callee_sequences is not None:
                 for descriptor in callee_sequences.sequences.values():
-                    required_ids = {
-                        int(descriptor.sequence_id),
-                        *map(int, descriptor.column_value_ids),
-                        int(descriptor.length_address_id),
-                        int(descriptor.capacity_value_id),
-                        *((int(descriptor.status_address_id),)
-                          if descriptor.status_address_id is not None else ()),
-                        *((int(descriptor.live_flags_value_id),)
-                          if descriptor.live_flags_value_id is not None else ()),
-                    }
-                    pool = descriptor.child_table_pool
-                    if pool is not None:
-                        required_ids.update({
-                            *map(int, pool.column_value_ids),
-                            int(pool.length_value_id),
-                            int(pool.capacity_value_id),
-                            int(pool.row_stride_value_id),
-                            *((int(pool.shape_value_id),)
-                              if pool.shape_value_id is not None else ()),
-                            *((int(pool.rank_value_id),)
-                              if pool.rank_value_id is not None else ()),
-                            *((int(pool.shape_stride_value_id),)
-                              if pool.shape_stride_value_id is not None else ()),
-                            *((int(pool.status_value_id),)
-                              if pool.status_value_id is not None else ()),
-                            *((int(pool.live_flags_value_id),)
-                              if pool.live_flags_value_id is not None else ()),
-                        })
+                    # Every identity member of the descriptor (owner and child pool
+                    # included), from the one definition the helpers reserve.
+                    from .ir_sequence_tables import _sequence_descriptor_identity_ids
+                    required_ids = set(_sequence_descriptor_identity_ids(descriptor))
                     if not required_ids.issubset(frame_map):
                         continue
                     mapped_columns = tuple(
@@ -52740,30 +52805,7 @@ def _class_surface_ssa_program(
                         # claim than deciding what the right dtype would
                         # have been.
                         continue
-                    _frame_register_sequence(caller, caller_sequences, SSASequenceDescriptor(
-                        sequence_id=mapped_sequence_id,
-                        column_value_ids=mapped_columns,
-                        length_address_id=frame_map[int(
-                            descriptor.length_address_id
-                        )],
-                        capacity_value_id=frame_map[int(
-                            descriptor.capacity_value_id
-                        )],
-                        status_address_id=(
-                            None if descriptor.status_address_id is None else
-                            frame_map[int(descriptor.status_address_id)]
-                        ),
-                        column_dtypes=tuple(descriptor.column_dtypes),
-                        column_shapes=tuple(descriptor.column_shapes),
-                        key_columns=tuple(descriptor.key_columns),
-                        live_flags_value_id=(
-                            None if descriptor.live_flags_value_id is None else
-                            frame_map[int(descriptor.live_flags_value_id)]
-                        ),
-                        capacity_policy=descriptor.capacity_policy,
-                        writable=bool(descriptor.writable),
-                        child_table_pool=map_child_pool(pool, frame_map),
-                    ), _frame_table_cell(
+                    _frame_register_sequence(caller, caller_sequences, map_sequence_descriptor(descriptor, frame_map, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(pool, frame_map)), _frame_table_cell(
                         callee_sequences, descriptor.sequence_id,
                         SEQUENCE_DESCRIPTOR,
                     ))
@@ -53262,12 +53304,20 @@ def _class_surface_ssa_program(
                 )
                 if _accepted_formal_owner(callee):
                     continue
+                call_bindings = {
+                    int(fed.id): int(formal.id)
+                    for fed, formal in zip(instruction.args, callee.args)
+                }
                 for fed, formal in zip(instruction.args, callee.args):
-                    accounting = dict(fed.accounting or {})
-                    if not accounting.get("program_abi_storage"):
+                    if not (fed.accounting or {}).get("program_abi_storage"):
                         continue
                     if (formal.accounting or {}).get("program_abi_storage"):
                         continue
+                    accounting = _accounting_across_call(
+                        fed.accounting, call_bindings,
+                        unbound_owner_is_error=False,
+                        describe=f"{caller.name}->{callee.name}",
+                    )
                     # A keyed mapping's slot ids name values in the caller's
                     # own frame. The callee materializes its own slots from the
                     # same contract, so carrying these across would point at
@@ -53652,34 +53702,10 @@ def _class_surface_ssa_program(
                     inherited = proven_ids.get(int(descriptor.sequence_id))
                     if inherited is None:
                         continue
-                    required_ids = {
-                        int(descriptor.sequence_id),
-                        *map(int, descriptor.column_value_ids),
-                        int(descriptor.length_address_id),
-                        int(descriptor.capacity_value_id),
-                        *((int(descriptor.status_address_id),)
-                          if descriptor.status_address_id is not None else ()),
-                        *((int(descriptor.live_flags_value_id),)
-                          if descriptor.live_flags_value_id is not None else ()),
-                    }
-                    pool = descriptor.child_table_pool
-                    if pool is not None:
-                        required_ids.update({
-                            *map(int, pool.column_value_ids),
-                            int(pool.length_value_id),
-                            int(pool.capacity_value_id),
-                            int(pool.row_stride_value_id),
-                            *((int(pool.shape_value_id),)
-                              if pool.shape_value_id is not None else ()),
-                            *((int(pool.rank_value_id),)
-                              if pool.rank_value_id is not None else ()),
-                            *((int(pool.shape_stride_value_id),)
-                              if pool.shape_stride_value_id is not None else ()),
-                            *((int(pool.status_value_id),)
-                              if pool.status_value_id is not None else ()),
-                            *((int(pool.live_flags_value_id),)
-                              if pool.live_flags_value_id is not None else ()),
-                        })
+                    # Every identity member of the descriptor (owner and child pool
+                    # included), from the one definition the helpers reserve.
+                    from .ir_sequence_tables import _sequence_descriptor_identity_ids
+                    required_ids = set(_sequence_descriptor_identity_ids(descriptor))
                     if not required_ids.issubset(frame_map):
                         continue
                     mapped_sequence_id = frame_map[int(
@@ -53695,32 +53721,7 @@ def _class_surface_ssa_program(
                     ):
                         continue
                     if caller_sequences.by_id(mapped_sequence_id) is None:
-                        _frame_register_sequence(caller, caller_sequences, SSASequenceDescriptor(
-                            sequence_id=mapped_sequence_id,
-                            column_value_ids=mapped_columns,
-                            length_address_id=frame_map[int(
-                                descriptor.length_address_id
-                            )],
-                            capacity_value_id=frame_map[int(
-                                descriptor.capacity_value_id
-                            )],
-                            status_address_id=(
-                                None
-                                if descriptor.status_address_id is None else
-                                frame_map[int(descriptor.status_address_id)]
-                            ),
-                            column_dtypes=tuple(descriptor.column_dtypes),
-                            column_shapes=tuple(descriptor.column_shapes),
-                            key_columns=tuple(descriptor.key_columns),
-                            live_flags_value_id=(
-                                None
-                                if descriptor.live_flags_value_id is None else
-                                frame_map[int(descriptor.live_flags_value_id)]
-                            ),
-                            capacity_policy=descriptor.capacity_policy,
-                            writable=bool(descriptor.writable),
-                            child_table_pool=map_child_pool(pool, frame_map),
-                        ), _frame_table_cell(
+                        _frame_register_sequence(caller, caller_sequences, map_sequence_descriptor(descriptor, frame_map, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(pool, frame_map)), _frame_table_cell(
                             callee_sequences, descriptor.sequence_id,
                             SEQUENCE_DESCRIPTOR,
                         ))

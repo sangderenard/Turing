@@ -10957,7 +10957,27 @@ class _ControlSSABuilder(TiledObject):
         # settled call bindings (``linked_dynamic_sequence_ids``); its owner
         # cell is then a parameter member like length and capacity, bound
         # to the caller's owner by ``_bind_sequence_storage_members``.
-        if (
+        # Program: ``detail = None; if c: detail = f'scope={t!r}'``.  The
+        # optional payload (seq 19) resolves by alias to the f-string's own
+        # data cell (seq 11): two descriptors, one arena.  Wrong record: each
+        # minted its own owner and the later stamp overwrote the cell's
+        # ``heap_owner_value_id``, so seq 11's helpers met a cell naming an
+        # owner their call did not bind.  Rule: an arena has one owner; a
+        # descriptor born on a cell that is already a heap cell adopts that
+        # cell's owner.
+        incumbent_owner_id = (data.accounting or {}).get("heap_owner_value_id")
+        incumbent_owner = None if incumbent_owner_id is None else next((
+            cell for cell in self.sequence_heap_owners.values()
+            if int(cell.id) == int(incumbent_owner_id)
+        ), None)
+        if incumbent_owner_id is not None and incumbent_owner is None:
+            raise ValueError(
+                f"{location}: sequence {value_id} data cell names heap owner "
+                f"{int(incumbent_owner_id)}, which this function never declared"
+            )
+        if incumbent_owner is not None:
+            self.sequence_heap_owners[value_id] = incumbent_owner
+        elif (
             value_id in self.dynamic_sequence_ids
             and child_table_pool is None
             and live_flags is None
