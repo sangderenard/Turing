@@ -1,3 +1,66 @@
+2026-10-22 LANE A, AUGMENTED SUBSCRIPT STORE CYCLE (MEASURED, cloud):
+`xs[0] += n` was refused with an effect-order cycle (loud on main; 3 of
+240 FUZZ_EXT=3 programs). A region's local Const no longer counts as a
+produced value. At 57052b8d: corpus 170/170 PASS; FUZZ_EXT=3 seeds 25/29
+60/60; gate same names as the parent.
+
+2026-10-22 LANE A, CALL ORDER SECOND STEP (MEASURED, cloud):
+`swap(xs)` after a list fill (`[1] * k`) or after a loop that appends ran
+after the reads of `xs` (silent on main). Fills and loops now join the
+source-order chain. At efa87006: corpus 169/169 PASS; FUZZ_EXT=3 seeds
+23/24 60/60, seed 25 59 PASS + 1 LOUD that is also loud on main (p25_25,
+augmented store cycle); gate same names as the parent.
+
+2026-10-22 LANE A, CALL ORDER AND BRANCH-MERGED LISTS (MEASURED, cloud):
+Silent wrong answers fixed (both wrong on main): a call after another
+source call whose argument fused with later reads was lost (FUZZ_EXT=3
+seed 18); a list bound to displays on two branches read len 0 and lost
+later appends. Shared, changed or unequal arms now refuse by name. At
+c52f8ef9: corpus 168/168 PASS, 0 findings; fuzz FUZZ_EXT=3 seeds 18/19/21
+and FUZZ_EXT=2 seed 20, 60/60 PASS each; gate aa 89 / ab 7 / ac 26 /
+rec 20, same names as the parent. See docs/compiler_convergence/35.
+
+2026-10-22 LANE A FOLLOW-UPS (MEASURED, cloud container):
+Silent wrong answers fixed: a callee's hoisted list or dict had capacity
+0 in the C wrapper; `[1, -1] + [n, 1]` followed by a dict display copied
+the right operand before its birth (fuzz p16_29, wrong on main). An int
+formal's physical arm is now int64 (rule 7). At a4c29be9: corpus 166/166
+PASS, 0 findings; fuzz FUZZ_EXT=2 seeds 16 and 17, 60/60 PASS each; gate
+aa 89 / ab 7 / ac 26 / rec 20, same names as the parent. See
+docs/compiler_convergence/35.
+
+2026-10-22 LANE A ITEM A6, PART (MEASURED, cloud container):
+Silent wrong answers fixed (all observed on main, clean audit):
+- `return [n]` from a callee read as an empty list in the caller;
+- `return [n]` / `return []` on two edges read the last site (now
+  refused by name);
+- a caller's `t.append(...)` on a returned list was dropped, and later
+  reads went past the length (garbage).
+At 12ee174: corpus 164/164 PASS, 0 findings; fuzz FUZZ_EXT=2 seed 15,
+60/60 PASS; gate aa 89 / ab 7 / ac 26 / rec 20, nothing outside the
+parent's failures. See docs/compiler_convergence/35.
+
+2026-10-22 LANE A ITEM A3 (MEASURED, cloud container):
+Silent wrong answer fixed: `d.update({k: v})` on a dict was dropped,
+so later lookups read the initializer. It is now a keyed store per
+display row. Updates from a changed mapping or with keywords are refused
+by name. At 0718f9a: corpus 162/162 PASS, 0 findings; fuzz FUZZ_EXT=2
+seed 12, 40/40 PASS; gate aa 89 / ab 7 / ac 26 / rec 20, nothing outside
+the parent's failures. See docs/compiler_convergence/35.
+
+2026-10-22 LANE A ITEM A0 (MEASURED, cloud container):
+A chained comparison whose middle is int/float/len/abs/ord of a pure
+operand now lowers, the middle spelled in place in both comparisons
+(never hoisted past a guarding `and`). Other call middles still refuse.
+This was the first refusal of both the bootstrap and the managed tire.
+At 0d98ef1: corpus 161/161 PASS, 0 findings; fuzz FUZZ_EXT=1 seed 10,
+30/30 PASS; gate aa 90 / ab 7 / ac 26 / rec 20 vs parent 2532577 aa 89 /
+7 / 26 / 20 in the same container. The extra aa name
+(test_sympy_process_graph_is_registered_before_python_dependency_pursuit)
+fails the same way alone on the parent: order-dependent, not A0.
+Not measured: the bootstrap and the tire themselves (Albert's machine).
+See docs/compiler_convergence/35.
+
 2026-10-22 CALL-BOUNDARY AND SET ROUND (MEASURED):
 Silent wrong answers found and fixed (each with a clean audit):
 - a callee storing into, appending to or growing a caller's list

@@ -12409,6 +12409,25 @@ def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int
 
     data = graph_obj.nodes.get(int(node_id)) if int(node_id) in graph_obj else None
     expression = None if data is None else data.get("expr_obj")
+    # Program: ``if n > 2: t = [n, 1] else: t = [5, 6]`` then ``return
+    # len(t) * 10 + t[0]`` (corpus c271).  A list merged from its arms'
+    # displays is born from its member Phis where the conditional completes
+    # (``_list_literal_mutations``); the merge has no coordinate of its own,
+    # so its birth sorted to the end of the function, after its reads.
+    attributes = {} if data is None else (data.get("attributes") or {})
+    conditional_id = attributes.get("source_conditional_id")
+    if (
+        attributes.get("producer_kind") == "aggregate_phi"
+        and conditional_id is not None
+        and int(conditional_id) in graph_obj
+    ):
+        statement = graph_obj.nodes[int(conditional_id)].get("expr_obj")
+        if getattr(statement, "end_lineno", None) is not None:
+            return (
+                int(statement.end_lineno),
+                int(getattr(statement, "end_col_offset", 0) or 0),
+                int(node_id),
+            )
     if isinstance(expression, ast.comprehension):
         # comprehension is a control AST node without its own location;
         # its authored target still places the producer before its consumers.
@@ -12605,7 +12624,29 @@ def _member_completion_position(
 
     position = _authored_node_position(graph_obj, int(node_id))
     data = graph_obj.nodes.get(int(node_id)) if int(node_id) in graph_obj else None
-    if data is None or str(data.get("type") or data.get("op") or "").casefold() not in {
+    if data is None:
+        return position
+    # Program: ``xs0 = [1, -1] + [n, 1]; d1 = {1: 6}; return xs0[2] * 10 +
+    # d1[1]`` (fuzzer p16_29; corpus c218).  Wrong record: the ``+``
+    # region completed at its own start, which precedes its right operand
+    # display ``[n, 1]``, whose birth is placed at the display; the fill
+    # copied that operand before it was born (``xs0[2]`` read 0; silent).
+    # Rule: a member reading a display operand completes after that
+    # display ends, where the display's birth has already run.
+    for parent, _role in data.get("parents") or ():
+        if int(parent) not in graph_obj:
+            continue
+        display = graph_obj.nodes[int(parent)].get("expr_obj")
+        if (
+            isinstance(display, (ast.List, ast.Tuple, ast.Set, ast.Dict))
+            and getattr(display, "end_lineno", None) is not None
+        ):
+            position = max(position, (
+                int(display.end_lineno),
+                int(getattr(display, "end_col_offset", 0) or 0),
+                int(node_id),
+            ))
+    if str(data.get("type") or data.get("op") or "").casefold() not in {
         "indexedstore", "setitem", "setattr",
     }:
         return position
@@ -13891,8 +13932,15 @@ def _install_lexical_sequence_mutations(
             elif guarded:
                 unplaced.append(int(mutation.effect_node_id))
             else:
+                # A display member's append is placed by its display
+                # (``_sequence_mutation_owner_id``), in its loop too: the
+                # member of a list merged from branches is a Phi with no
+                # coordinate, which put the birth after the loop (c969).
                 root = insert_in_enclosing_loop(
-                    root, mutation_block, int(mutation.effect_node_id)
+                    root, mutation_block,
+                    int(mutation.effect_node_id)
+                    if isinstance(mutation, ScalarFieldWriteBlock)
+                    else _sequence_mutation_owner_id(mutation),
                 )
     # A source effect now owned by lexical control must not also leave a
     # numerical-region marker. Copier stores40/85/92 were removed from their
@@ -22563,6 +22611,18 @@ def _class_surface_ssa_program(
                 or (primitive_receipt or {}).get("dtype")
                 or ""
             )
+            # Program: ``def table(n: int): return {1: n, 2: 5}`` (corpus
+            # c217).  Wrong record: the formal's contract still spelled the
+            # provisional class ``'int'`` while the literal's arm said
+            # ``int64``, so one dict column held two "different" int arms
+            # and was refused.  Rule 7: Python ``int`` is ``int64``; a
+            # primitive scalar carrier's dtype is its class receipt's.
+            if (
+                primitive_receipt is not None
+                and str(primitive_receipt["storage"]) == "scalar"
+                and dtype == primitive_class
+            ):
+                dtype = str(primitive_receipt["dtype"])
             shape = tuple(map(int, contract.get("shape") or ()))
             rank = int(contract.get(
                 "rank",

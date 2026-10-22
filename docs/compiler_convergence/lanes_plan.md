@@ -24,13 +24,11 @@ the full typed corpus check (0 non-PASS), a fuzz seed in the lane's tier
 
 | rank | item | group (doc 34) | claimed functions | branch | status |
 |---|---|---|---|---|---|
-| A0 | Lower a chained comparison whose middle operand is a call. The middle is evaluated once, in place, never hoisted ahead of a guarding `and`. Duplicating it is allowed only for a proven-pure builtin conversion of a pure operand. Every other call still refuses by name. Then hand Albert both whole-program commands. | R0 | `ast_control_normalization._normalize_chained_comparisons`, `ast_control_normalization._pure_operand` | | open: blocks 100% of both targets |
 | A1 | Give tuple displays a birth. Place the predicate region that produces the members before the effects that consume them, then birth tuples as lists are born. | S1 | `resident_sequence_materialization._list_literal_mutations`; the region-ownership rule that assigns the members' region to the later conditional (find it with a trap first) | | open: silent on `main` with a clean audit |
 | A2 | Keep a return surface whole. `emit_outputs` must not fall back to `(output_id,)` when an aggregate layout is absent. The control finish publishes the layout. Accepted-unit accounting must not let one value stand for a tuple/optional. Add the false-acceptance check from doc 34 §1.4 to the bootstrap status tool. | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs` (nested, line ~28034); the control-finish member Phi publisher; accepted-unit result accounting | | open: false acceptance |
-| A3 | Make `dict.update()` a recorded mutation, so `_mutated_sequence_node_ids` sees it. | B4 | `glsl_deployment_strategy._mutated_sequence_node_ids` (read only); the mutation-record writer for dict methods | | open: inferred silent-capable |
 | A4 | Tire: the result-storage lease mints a record span member's `SSA_VALUE` row as a scalar. Revise it from the record storage contract. `_ssa_structure` reads the registered record storage before calling a shape-empty fact a scalar. | T1 | `structural_concordance._ssa_structure`; the result-storage lease writer in `fortran_c_shell` | | blocked on A0 (re-observe first) |
 | A5 | Measure the core-chain cascade. After A0, ask Albert for a full bootstrap. Fill doc 34 §1.2 and re-file units into groups. | B6, B7 | none (measurement) | | blocked on A0 |
-| A6 | Variadic returns: the sequence-lane lowering for `return ()`/`(x,)`/`[]`/`[x]` (units 034, 162, 212). | B2 | reducer VARIADIC consumer in `precompile_to_ssa`; `ir_sequence_tables` | | open |
+| A6 | Variadic returns: the sequence-lane lowering for `return ()`/`(x,)`/`[]`/`[x]` (units 034, 162, 212). | B2 | reducer VARIADIC consumer in `precompile_to_ssa`; `ir_sequence_tables` | `claude/project-thread-kbkzp7` | claimed 2026-10-22; list returns fixed or refused (doc 35), tuple variadic and two-edge list lowering open |
 | A7 | `Any`-typed receivers and generic `str()`/`!r` of facts: runtime type dispatch over the fact classes. | B3 | to be scoped | | open: needs a design note first |
 | A8 | `'|'.join(tokens)` glyph recipe in f-strings (unit 6). | B5 | f-string glyph recipe builder | | open |
 
@@ -80,4 +78,5 @@ committed inventory script and classify every hit.
 
 ## Done
 
-(none yet)
+- A0 (chained comparison with a builtin conversion middle): branch `claude/project-thread-kbkzp7`, receipts in doc 35.
+- A3 (`dict.update()` from a display is a table mutation): branch `claude/project-thread-kbkzp7`, receipts in doc 35.
