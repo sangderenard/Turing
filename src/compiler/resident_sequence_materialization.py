@@ -1836,20 +1836,33 @@ def _static_sequence_capacity_survey(
             return len(literal)
         return None
 
-    for node_id, data in graph_obj.nodes(data=True):
-        if str(data.get("type") or data.get("op") or "") not in {"Add", "add"}:
-            continue
-        operands = [int(parent) for parent, role in data.get("parents") or ()
-                    if str(role) in {"lhs", "rhs"} and int(parent) in graph_obj]
-        if len(operands) != 2 or not all(
-            (graph_obj.nodes[operand].get("attributes") or {}).get("aggregate_kind") == "list"
-            for operand in operands
-        ):
-            continue
-        operand_bounds = [sequence_bound(operand) for operand in operands]
-        value_id = int(data.get("value_id", node_id))
-        if None not in operand_bounds and value_id not in bounds:
-            bounds[value_id] = sum(operand_bounds)
+    # Program: ``xs = [1, 2] + [n, 8]; ys = [n * 2] + xs; len(ys)`` (c221).
+    # Wrong record: a concatenation operand that is itself a concatenation
+    # (an ``Add`` with no aggregate kind) was not a list here, so ``ys`` had
+    # no bound, took the planner's elementwise extent (2,) and ``len(ys)``
+    # read 1 for 5 (clean audit).  Rule: a bounded concatenation is a list
+    # operand like any other; settle the bounds to a fixed point.
+    concatenations: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node_id, data in graph_obj.nodes(data=True):
+            if str(data.get("type") or data.get("op") or "") not in {"Add", "add"}:
+                continue
+            operands = [int(parent) for parent, role in data.get("parents") or ()
+                        if str(role) in {"lhs", "rhs"} and int(parent) in graph_obj]
+            if len(operands) != 2 or not all(
+                (graph_obj.nodes[operand].get("attributes") or {}).get("aggregate_kind") == "list"
+                or int(operand) in concatenations
+                for operand in operands
+            ):
+                continue
+            operand_bounds = [sequence_bound(operand) for operand in operands]
+            value_id = int(data.get("value_id", node_id))
+            if None not in operand_bounds and value_id not in bounds:
+                bounds[value_id] = sum(operand_bounds)
+                concatenations.add(int(node_id))
+                changed = True
     # Program: ``d = {}; for i in range(n % 4 + 1): d[i % 2] = i`` (fuzzer
     # p1_27).  Wrong record: a local dict whose key universe the survey
     # cannot bound was neither bounded nor unbounded, so C refused it as a

@@ -4824,6 +4824,39 @@ class _ControlSSABuilder(TiledObject):
                 f"descriptors: destination={destination_id}, source={source_id}",
             ))
             return
+        # Program: ``xs = [1, 2] + [n, 8]; return xs[2]`` (c220).  Wrong
+        # record: the concatenation's arena had no row writer but these
+        # slice appends, so its row stayed ``unknown`` and scalar settlement
+        # typed it float64 (3.0 for 3).  Rule: a slice append is a row
+        # writer; the source's row type refines the destination's, as an
+        # append's stored value does.
+        if any(
+            str(column) in {"", "unknown", "None"}
+            and str(source_column) not in {"", "unknown", "None"}
+            for column, source_column in zip(
+                destination.column_dtypes, source.column_dtypes,
+            )
+        ):
+            refined = self._sequence_descriptor(
+                int(destination_id),
+                policy="unique" if destination.key_columns else "duplicates",
+                writable=True,
+                location=f"{self.function_name}.append_slice",
+                column_count=len(destination.column_dtypes),
+                column_dtypes=tuple(
+                    None if str(column) in {"", "unknown", "None"}
+                    else str(column)
+                    for column in source.column_dtypes
+                ),
+                dtype_sources=tuple(
+                    self.sequence_storage_values[int(source_id)][
+                        :len(source.column_dtypes)
+                    ]
+                ),
+            )
+            if refined is None:
+                return
+            destination = refined
         from .ir_sequence_tables import lower_sequence_append_slice
 
         helper_name = self._sequence_helper_name(

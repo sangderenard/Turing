@@ -12608,6 +12608,20 @@ def _member_completion_position(
     if data is None or str(data.get("type") or data.get("op") or "").casefold() not in {
         "indexedstore", "setitem", "setattr",
     }:
+        # Program: ``d[3] = n; xs = [1, 2] + [n, 8]; xs[2]`` (c220).
+        # Wrong record: the concatenation's region sat at the ``+``'s start,
+        # which precedes its right operand's display, so the concat copied
+        # ``[n, 8]`` before that display's birth wrote it and ``xs[2]`` read
+        # 0 (clean audit).  Rule: an expression executes after its operands;
+        # it completes where it ends.
+        expression = None if data is None else data.get("expr_obj")
+        if (isinstance(expression, ast.expr)
+                and getattr(expression, "end_lineno", None) is not None):
+            return max(position, (
+                int(expression.end_lineno),
+                int(getattr(expression, "end_col_offset", 0) or 0),
+                int(node_id),
+            ))
         return position
     value_id = next((
         int(parent) for parent, role in data.get("parents") or ()
@@ -26890,6 +26904,18 @@ def _class_surface_ssa_program(
             for mutation in _control_sequence_mutations(control.root)
             if str(mutation.operator) == "sorted"
             and int(mutation.sequence_value_id) not in output_history_ids
+        )
+        # Program: ``xs = []; for i in range(n): xs.append(i); ys = [7] + xs;
+        # len(ys)`` (c221).  Wrong record: a concatenation no bound covers
+        # was neither bounded nor DYNAMIC, so its arena took the planner's
+        # elementwise extent and the slice copy stopped there (``len(ys)``
+        # 1 for 4; clean audit).  Rule: a concatenation is born here and
+        # holds its operands' rows; with no proven bound it is DYNAMIC.
+        dynamic_sequence_ids.update(
+            int(result_id)
+            for result_id, *_operands in sequence_concats
+            if int(result_id) not in sequence_capacity_bounds
+            and int(result_id) not in output_history_ids
         )
         grown = True
         while grown:

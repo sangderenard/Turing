@@ -3661,6 +3661,30 @@ class CorrelationTable:
                             (str(name), int(attributes["sequence_value_id"]))
                         )
         found = []
+        # Program: ``d[3] = n; xs = [1, 2] + [n, 8]; xs[2]`` (c220).  The
+        # concatenation copied ``[n, 8]`` before that display's birth cleared
+        # and wrote it, in one straight-line block.  The two records are the
+        # birth (the display's ``ssa_sequence_clear``) and the copy that
+        # names it as its source.
+        for name, function in module.functions.items():
+            for block in function.blocks.values():
+                copied: dict[int, int] = {}
+                for position, instruction in enumerate(block.instrs):
+                    attributes = getattr(instruction, "attributes", {}) or {}
+                    source = attributes.get("source_sequence_id")
+                    if (attributes.get("ssa_sequence_operation") == "append_slice"
+                            and source is not None):
+                        copied.setdefault(int(source), position)
+                    if (attributes.get("binding") == "ssa_sequence_clear"
+                            and attributes.get("sequence_id") is not None
+                            and int(attributes["sequence_id"]) in copied
+                            and int(attributes["sequence_id"]) in layouts):
+                        found.append(Finding(
+                            "display-read-before-birth", str(name),
+                            int(attributes["sequence_id"]),
+                            "a slice copy reads this display before its "
+                            "birth clears and writes it in the same block",
+                        ))
         for name, sequence_id in dict.fromkeys(reads):
             layout = layouts.get(sequence_id)
             if layout is None or sequence_id in written:
