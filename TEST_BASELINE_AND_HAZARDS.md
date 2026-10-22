@@ -1,3 +1,28 @@
+2026-10-22 CALL-BOUNDARY AND SET ROUND (MEASURED):
+Silent wrong answers found and fixed (each with a clean audit):
+- a callee storing into, appending to or growing a caller's list
+  (`main` had these at 686fe50 and after);
+- a set display whose members were never stored;
+- `s.add(n)` pruned as a dead tensor call.
+Refusals that now lower:
+- `divmod`;
+- runtime-count replication `[v] * k`;
+- dicts a callee adds keys to;
+- membership in a folded literal list;
+- list membership inside a loop;
+- two callees sharing one list descriptor.
+Corpus: 159 programs, all value- and type-correct, 0 concordance
+findings, at 5e99a7c.
+Gate (gate12 split + rec): aa 89, ab 7, ac 26, rec 20, no new failures,
+at af84217 (gate32), 975588d (gate33) and be8fb47 (gate35 aa; gate34
+ab/ac/rec). Gate34 aa found one regression from faf8134
+(test_record_packaging_call_preserves_exact_mapping_capacity); be8fb47
+fixes it. `main` is at be8fb47.
+Fuzz FUZZ_EXT=3 (list-mutating helpers), seeds 8-9, 120 programs:
+0 silent wrong answers.
+See docs/compiler_convergence/33 ("A list passed to a call is one
+storage at both ends", "Sets and memberships").
+
 2026-10-22 DIFFERENTIAL FUZZING ROUND (MEASURED):
 A differential fuzzer (snippet grammar over lists, dicts, sets, tuples,
 loops, short-circuit, helpers, enumerate/zip, membership, count/index,
