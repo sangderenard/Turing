@@ -50420,6 +50420,9 @@ def _class_surface_ssa_program(
         for conflict in type_conflicts:
             report(f"ssa-result-contract: {conflict}")
     compile_substage("propagate settled call value metadata")
+    from .ssa_record_return_state import (
+        accepted_ssa_component as _accepted_settled_callee,
+    )
     for caller in compile_iter(all_functions.values(), "settled-call-values",
             label="Settled call value metadata propagated"):
         for block in caller.blocks.values():
@@ -50430,6 +50433,15 @@ def _class_surface_ssa_program(
                     instruction.attributes.get("callee") or ""
                 ))
                 if callee is None:
+                    continue
+                if _accepted_settled_callee(callee):
+                    # Program: ``_truncate_fact``'s f-string calling the
+                    # accepted ``decimal_integer_glyph_tokens``.  Wrong
+                    # record: the caller's settled result type was published
+                    # onto the accepted callee's formal, whose row lives on
+                    # its own book ("SSA type change was not published").
+                    # Rule: as in ``settle_call_result_types``, an accepted
+                    # body is an immutable source, never a target.
                     continue
                 if len(instruction.args) != len(callee.args):
                     # Same authority as the dtype-unification loop above:
