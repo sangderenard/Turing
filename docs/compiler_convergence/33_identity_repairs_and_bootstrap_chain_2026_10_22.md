@@ -167,16 +167,31 @@ projections publish, the planner posts its layout and builds the same
 `aggregate_phi` (corpus c29).  An OPTIONAL_AGGREGATE call arm is left out:
 its presence exists only at SSA level, where the merge must compose it.
 
+## Optional tuples: the presence test and an optional call arm
+
+`fork = t if c else None; if fork is None or x: return; a, b = fork` refused
+"no proven presence guard": the `None` comparison was itself counted as a
+consumer needing a guard, and the fact a guarding `or` proves on its
+fallthrough edge was kept whole.  A `None` comparison of the optional is now
+its presence test (rewritten to read the optional's predicate); consumers
+are guarded by the predicate fact or by that test reading false; facts close
+over `or`-false, `and`-true and `not` (corpus c30).  Unguarded, wrong-arm and
+changed-guard consumers still refuse.
+
+When the present arm is itself an OPTIONAL_AGGREGATE call
+(`IdentityPage._resolved`, unit 33: `self._fork_of_scope(row[0]) if c else
+None`), presence is `c` and the callee's presence.  The present arm carries
+`call is not None` -- the comparison optional-call lowering already rewrites
+to the callee's presence -- inheriting the call's branch membership; the
+absent arm carries `False`; one presence member Phi, merged with the payload
+members, is the optional's predicate (corpus c31).
+
+Open: a statement-level merge with an optional call or `None` arm
+(`if c: fork = f(x) else: fork = None`) still has no presence member; the
+planner's aggregate merge leaves such arms out.
+
 ## Open frontier (stated, not worked around)
 
-- `IdentityPage._resolved` (unit 33): `fork = call() if cond else None` where
-  the call itself returns an optional tuple.  The optional-tuple model makes
-  presence the `IfExp` test; the true presence is test AND the callee's
-  presence.  The refusal ("no proven presence guard") is correct until the
-  callee's presence flags compose into the `IfExp`.
-- `_validate_row` formal 13 (`page.row_fields`): a `table` contract with no
-  source cells reaches accounting only; posting it needs the contract's
-  declaration cell.
 - Generic `str()`/`!r` of `Any`-typed facts (ten f-string units): needs a
   runtime type dispatch over every fact class.
 - Planner region inputs default to float64 when the graph domain has no type;
