@@ -2434,7 +2434,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         )
         if attributes.get("producer_kind") == "aggregate_phi":
             # Program: ``if n > 2: t = [n, 1] else: t = [5, 6]`` then
-            # ``return len(t) * 10 + t[0]`` (corpus c220).  Wrong record: a
+            # ``return len(t) * 10 + t[0]`` (corpus c271).  Wrong record: a
             # list merged from its arms had member Phis but no birth, so
             # ``len(t)`` read a never-born arena (0) and appends after the
             # merge were lost (silent).  Rule: the merged list is its own

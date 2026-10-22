@@ -10760,7 +10760,7 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     ]
     # Program: ``xs0 = [2, n]; grow(xs0, n % 3 + 1); xs1 = [n, 4];
     # push(xs1, 3)`` then ``return len(xs1) * 100 + xs1[-1]`` (fuzzer
-    # p18_11; corpus c219).  Wrong record: each effect was ordered only
+    # p18_11; corpus c270).  Wrong record: each effect was ordered only
     # before the reads of its own receiver, but effects execute in source
     # order, so ``push`` followed ``grow``; the reducer fused ``n % 3 + 1``
     # (which ``grow`` reads) with the arithmetic over ``xs1`` into one

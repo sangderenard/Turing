@@ -12410,7 +12410,7 @@ def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int
     data = graph_obj.nodes.get(int(node_id)) if int(node_id) in graph_obj else None
     expression = None if data is None else data.get("expr_obj")
     # Program: ``if n > 2: t = [n, 1] else: t = [5, 6]`` then ``return
-    # len(t) * 10 + t[0]`` (corpus c220).  A list merged from its arms'
+    # len(t) * 10 + t[0]`` (corpus c271).  A list merged from its arms'
     # displays is born from its member Phis where the conditional completes
     # (``_list_literal_mutations``); the merge has no coordinate of its own,
     # so its birth sorted to the end of the function, after its reads.

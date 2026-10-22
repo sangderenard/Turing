@@ -1,7 +1,7 @@
 """A list bound on two branches lowers only from unshared equal displays.
 
 ``if c: t = [n, 1] else: t = [5, 6]`` is born at the merge from its member
-Phis (corpus c220).  That copy is the list only while each arm is its own
+Phis (corpus c271).  That copy is the list only while each arm is its own
 unchanged display, and only arms of equal length publish members.  Every
 other shape used to read a never-born arena or a stale copy silently; it is
 now refused by name.
