@@ -19818,32 +19818,6 @@ class _ControlSSABuilder(TiledObject):
                 # arm assignments rather than a temporal fallthrough. Prefer
                 # the value materialized by control lowering; only use an
                 # owned literal if no arm/join value exists.
-                #
-                # Program: ``if flag > 0: fork = (row + 1, row * 2) else:
-                # fork = None; return fork`` (also the bootstrap's
-                # single-exit rewrite of ``if c: return (a, b)`` /
-                # ``return None``).  Wrong record: neither the join (history
-                # 11) nor the tuple arm (9) had a value, so the owned
-                # ``None`` literal (10) became the output and the tuple arm
-                # vanished from ``Ret``.  Rule: an arm stands for the output only when the
-                # join resolves to it; a missing join is refused by name.
-                def resolves(value_id: int) -> bool:
-                    return (
-                        existing_value(value_id) is not None
-                        or owned_literal(value_id) is not None
-                    )
-
-                if (
-                    len(history) > 1
-                    and not resolves(history[-1])
-                    and any(map(resolves, history[:-1]))
-                ):
-                    raise ValueError(
-                        f"returned name {name!r}: the join of its "
-                        f"conditional arms (value {int(history[-1])}) was "
-                        "not materialized; returning one arm would drop "
-                        "the others"
-                    )
                 value = next((
                     resolved
                     for value_id in reversed(history)
@@ -19851,6 +19825,32 @@ class _ControlSSABuilder(TiledObject):
                     if resolved is not None
                 ), None)
                 if value is None:
+                    # Program: ``if flag > 0: fork = (row + 1, row * 2)
+                    # else: fork = None; return fork`` (also the bootstrap's
+                    # single-exit rewrite of ``if c: return (a, b)`` /
+                    # ``return None``).  Wrong record: history (9, 10, 11)
+                    # had no materialized value -- not the tuple arm (9), not
+                    # the join (11) -- so the owned ``None`` literal (10)
+                    # became the output and the tuple vanished from ``Ret``.
+                    # Rule: an owned literal stands for the output only when
+                    # it is the name's newest binding; a newer binding that
+                    # nothing materialized is refused by name.
+                    literal_position = next((
+                        position
+                        for position in reversed(range(len(history)))
+                        if owned_literal(history[position]) is not None
+                    ), None)
+                    if (
+                        literal_position is not None
+                        and literal_position != len(history) - 1
+                    ):
+                        raise ValueError(
+                            f"returned name {name!r}: its newest binding "
+                            f"(value {int(history[-1])}) was not "
+                            "materialized; returning the older literal "
+                            f"(value {int(history[literal_position])}) "
+                            "would drop it"
+                        )
                     value = next((
                         resolved
                         for value_id in reversed(history)

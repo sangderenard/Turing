@@ -344,7 +344,7 @@ def test_unit_returning_tuple_or_none_refuses_instead_of_returning_the_none():
         "        return (row + 1, row * 2)\n"
         "    return None\n"
     )
-    with pytest.raises(ValueError, match="join of its conditional arms"):
+    with pytest.raises(ValueError, match="newest binding .* was not materialized"):
         lower_ast_source_to_ssa(
             source, "root", name="optional_tuple_unit",
             extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
