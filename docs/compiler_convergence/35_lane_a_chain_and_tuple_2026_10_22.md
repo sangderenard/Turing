@@ -82,3 +82,49 @@ producer").
 - **Measured at `0718f9a`.** Typed corpus 162/162 PASS, 0 findings. Fuzz
   `FUZZ_EXT=2` seed 12, 40/40 PASS. Gate: aa 89, ab 7, ac 26, rec 20, no
   name outside the parent's failures.
+
+### A3 follow-up: the update orders its receiver's reads
+
+The fuzzer's own update snippet (seed 13, p13_31: `d.update({1: n + 2,
+3: 2})` and then reads of `d`) gave a loud control-order cycle. The
+update's stores were not an effect in `_sequence_effect_read_edges`, so
+`n + 2` was fused with the reads that come after the update. A dict update
+is now an in-place effect on its receiver, as an append is. c214 holds it.
+Measured at `b4a59c0`: corpus 162/162, fuzz `FUZZ_EXT=2` seed 14 60/60,
+gate aa 89 / ab 7 / ac 26 / rec 20.
+
+## A6 (part): lists returned by a callee
+
+While I was reproducing the variadic-return item, three silent families
+showed up. Each was **observed** wrong on `main` with a clean audit.
+
+1. **A returned list display.** `def pick(n): return [n]`, then
+   `t = pick(n); len(t) * 10 + t[0]` returned 0. The planner expanded the
+   returned display to its member path `(0, 0)` (`_authored_output_paths`).
+   No caller projection matched it (`t[0]` is `(0,)`), so the call bound no
+   result, and the caller read its own arena, which was never born.
+   **Rule:** a returned mutable collection is one storage, as an argument
+   is (rule 3), so its path is the output itself. Tuples keep their member
+   paths. Corpus c215.
+2. **Different lists on different return edges.** With `return [n]` on one
+   edge and `return []` on the other, the one output named only the last
+   site, so every path read the empty list. The variadic sequence return
+   is not lowered. `_refuse_divergent_collection_returns` now refuses it by
+   name ("returns different collections in return slot k"). Test:
+   `tests/test_divergent_collection_return.py`.
+3. **The caller mutates a returned list.** `t = pick(n); t.append(9)` lost
+   the append, and the caller then read past the length (garbage that
+   changes from run to run). A call result carries `result_class_ref`, not
+   `aggregate_kind`, and only `aggregate_kind` receivers were retained as
+   mutation records. `_receiver_collection_kind` reads either one, for the
+   retained records (`_retain_source_sequence_mutation_records`) and for
+   the one definition of "changed" (`_method_mutated_receiver_ids`).
+   Corpus c216.
+
+Still open in A6: tuple variadic returns (`return (n,)` / `return ()` is
+refused by the product, as before), and the lowering of a list returned on
+two edges. A dict or set display returned by a callee is loud (a column ABI
+conflict, and an undefined CondBr operand). Measured at `12ee174`: corpus
+164/164 PASS, 0 findings; fuzz `FUZZ_EXT=2` seed 15, 60/60 PASS (5
+programs use the new snippets); gate aa 89 / ab 7 / ac 26 / rec 20, nothing
+outside the parent's failures.

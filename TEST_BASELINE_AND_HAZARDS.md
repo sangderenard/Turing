@@ -1,3 +1,14 @@
+2026-10-22 LANE A ITEM A6, PART (MEASURED, cloud container):
+Silent wrong answers fixed (all observed on main, clean audit):
+- `return [n]` from a callee read as an empty list in the caller;
+- `return [n]` / `return []` on two edges read the last site (now
+  refused by name);
+- a caller's `t.append(...)` on a returned list was dropped, and later
+  reads went past the length (garbage).
+At 12ee174: corpus 164/164 PASS, 0 findings; fuzz FUZZ_EXT=2 seed 15,
+60/60 PASS; gate aa 89 / ab 7 / ac 26 / rec 20, nothing outside the
+parent's failures. See docs/compiler_convergence/35.
+
 2026-10-22 LANE A ITEM A3 (MEASURED, cloud container):
 Silent wrong answer fixed: `d.update({k: v})` on a dict was dropped,
 so later lookups read the initializer. It is now a keyed store per
