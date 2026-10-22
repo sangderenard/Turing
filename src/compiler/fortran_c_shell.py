@@ -10919,6 +10919,18 @@ def _sequence_concat_ops(
     resident_by_value: dict[int, int] = {}
     kind_by_value: dict[int, str] = {}
     singleton_by_resident: dict[int, int] = {}
+    # Program: ``ys = list(xs); ys.append(n); len(xs) * 10 + len(ys)``
+    # (fuzzer p3_37).  Wrong record: the one-argument materialization was
+    # aliased to its source, so the snapshot's own storage collapsed onto
+    # ``xs``: the copy replaced xs onto itself, ``ys.append`` grew xs's
+    # arena and both lengths read one cell (33 for 43).  Rule: a recorded
+    # snapshot (``_source_sequence_snapshots``) is a copy that owns its
+    # storage; only a materialization nothing records as a copy is an
+    # immutable view of its source.
+    snapshot_destinations = {
+        int(mutation.sequence_value_id)
+        for mutation in _source_sequence_snapshots(graph_obj)
+    }
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         attributes = data.get("attributes") or {}
@@ -10926,7 +10938,10 @@ def _sequence_concat_ops(
         if kind not in sequence_kinds:
             continue
         value_id = int(data.get("value_id", node_id))
-        if attributes.get("producer_kind") == "aggregate_materialization":
+        if (
+            attributes.get("producer_kind") == "aggregate_materialization"
+            and value_id not in snapshot_destinations
+        ):
             extraction_contract = dict(
                 data.get("extraction_contract")
                 or attributes.get("extraction_contract")
@@ -16236,6 +16251,20 @@ def _sequence_row_operations(
             outer_id = node_roles.get("base")
             column_node = node_roles.get("index")
             if outer_id is None or column_node is None:
+                continue
+            # Program: ``ys = xs[1:n]; sum(ys)`` (scratch c204).  Wrong
+            # record: the slice was collected as a one-row load at index
+            # "slice node 8", so ``ys`` was one element and the Slice node
+            # became an unexplained root formal.  Rule: a slice produces a
+            # new sequence (``producer_kind == "sequence_slice"``, lowered by
+            # its append_slice operation); it is never a row read.
+            if (
+                (data.get("attributes") or {}).get("producer_kind")
+                == "sequence_slice"
+                or str(
+                    graph_obj.nodes[column_node].get("type") or ""
+                ) == "Slice"
+            ):
                 continue
             # A scalar list row is column zero of the SAME resident table.
             # [10,20].append(30); values[2] used to lose its producer because

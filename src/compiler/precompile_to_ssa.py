@@ -298,6 +298,21 @@ def _table_operation_sequence_accesses(
     return reads, writes
 
 
+def _table_operation_value_reads(
+    kind: str, arguments: tuple[Any, ...],
+) -> set[int]:
+    """The scalar values one recorded table operation reads, by the emitter's
+    own signature (a literal beside them is not a value id)."""
+
+    if kind in ("fill", "append_fill"):
+        return {int(arguments[2])}
+    if kind == "append_slice":
+        return {int(value) for value in arguments[2:4] if value is not None}
+    if kind == "append_scalar":
+        return {int(arguments[1])}
+    return set()
+
+
 def _scoped_value_type_abi(
     lexical_read_scope: Any,
     supplied: Mapping[int, Any] | None = None,
@@ -5132,7 +5147,17 @@ class _ControlSSABuilder(TiledObject):
                 pass
             else:
                 raise ValueError(f"unknown scheduled table operation {kind!r}")
-        return replaces_region
+        # Program: ``xs0 = [5, 7] + [n, 7]; xs1 = [2] * (n % 4 + 1)`` (fuzzer
+        # p3_54).  Wrong record: the concat's reset/append_slice claimed to
+        # replace region 0, which still had a lowered body (the count
+        # ``n % 4 + 1``) and a post-operation (the fill); both were skipped
+        # and ``xs1`` stayed empty.  Rule: an operation replaces its region
+        # only when the region has nothing left to publish (its signature's
+        # outputs: a planned region is pure, so a body with no outputs is
+        # no work).
+        return replaces_region and not tuple(
+            self.region_signatures.get(int(region_index), ((), ()))[1]
+        )
 
     def _register_sequence_lowering(self, lowering) -> None:
         """Install helpers through ``register_sequence_lowering``, caused by
@@ -11192,8 +11217,12 @@ class _ControlSSABuilder(TiledObject):
             # ``_storage_values``); the metadata transport posted int64->ptr
             # and ptr->int64 onto one shape edge until the book refused it.
             # Rule: a heap column is a ``ptr`` cell everywhere -- the element
-            # layout lives in ``heap_element_dtype`` (``heap_allocate``).
+            # layout lives in ``heap_element_dtype`` (``heap_allocate``) --
+            # and a cell is one scalar address: ``[2] * k`` kept the
+            # literal's planner extent (1,) and its reserve's heap copy
+            # refused the shaped "handle".
             column.dtype = "ptr"
+            column.shape = ()
             column.accounting = {
                 **dict(column.accounting or {}),
                 "heap_element_dtype": layout.name,
@@ -26348,6 +26377,24 @@ def lower_control_sections_to_ssa(
                     (region_output_value_ids or {}).get(region_index, ()),
                 ))
                 | set(map(int, record_field_write_value_ids))
+                # Program: ``xs = [2] * (n % 4 + 1)`` (fuzzer p3_54).  Wrong
+                # record: the replication left the region as a recorded fill
+                # that reads the count ``n % 4 + 1`` after the region, but
+                # the count's only consumer had been the region's own Mul,
+                # so nothing published it and the fill read an unproduced
+                # formal (0 rows).  Rule: a value this region's recorded
+                # table operations read crosses the region boundary.
+                | {
+                    value_id
+                    for kind, arguments in _region_table_operations(
+                        region_index,
+                        table_region_operations,
+                        table_region_post_operations,
+                    )
+                    for value_id in _table_operation_value_reads(
+                        str(kind), tuple(arguments),
+                    )
+                }
             )
             # Captures cross from the authored control frame into a planned
             # region. Resolve them through the planning concordance before

@@ -4787,6 +4787,29 @@ def analyze_shader_loop_reductions(
         # reversal in the counted-loop bounds below.  There is no native
         # Python iterator object to expose as another public input.
         iterable_source_id = loop.iterable_node
+        # Program: ``xs = [i * 3 for i in range(n)]; any(x > 10 for x in
+        # xs)`` (scratch c214).  Wrong record: the generator loop's iterable
+        # named the ListComp node (19) while the comprehension's rows live
+        # in the collection its loop publishes (30); one collection had two
+        # sequence keys and C refused 19 as a private sequence with no
+        # capacity.  Rule: a loop over a comprehension iterates the result
+        # its producing loop records for that materializer
+        # (``LoopIterationOutput``), the same record the generator routing
+        # above reads in the other direction.
+        if loop.iterable_node is not None:
+            published = {
+                int(output.result_value_id)
+                for producer in plans
+                for output in producer.loop.iteration_outputs
+                if int(output.materializer_node_id) == int(loop.iterable_node)
+                and int(output.result_value_id) != int(loop.iterable_node)
+            }
+            if len(published) > 1:
+                raise ValueError(
+                    "one comprehension has conflicting published results"
+                )
+            if published:
+                iterable_source_id = published.pop()
         reverse_iterable = False
         mapping_projection_columns: tuple[int, ...] | None = None
         if (

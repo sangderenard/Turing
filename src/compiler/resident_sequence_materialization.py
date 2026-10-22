@@ -1704,10 +1704,70 @@ def _static_sequence_capacity_survey(
         bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
             control, local_lists,
         ).items() if key not in escaped})
-    for mutation in _source_sequence_snapshots(graph_obj):
+    # Program: ``ys = list(xs); ys.append(n); len(ys)`` (fuzzer p3_37).
+    # Wrong record: the snapshot took its source's bound and its own later
+    # appends were never counted, so the append found the arena full, its
+    # status was dropped and ``len(ys)`` returned 3 for 4.  Rule: a
+    # snapshot's bound is its source's plus its own straight-line appends;
+    # any other growth leaves it unbounded (the dynamic contract), exactly
+    # as a local list's.
+    snapshots = tuple(_source_sequence_snapshots(graph_obj))
+    snapshot_effects = {int(mutation.effect_node_id) for mutation in snapshots}
+    snapshot_ids = {int(mutation.sequence_value_id) for mutation in snapshots}
+    snapshot_growth = {sequence_id: 0 for sequence_id in snapshot_ids}
+    unbounded_snapshots = set()
+    for mutation in _sequence_append_call_mutations(graph_obj):
+        sequence_id = int(mutation.sequence_value_id)
+        if (sequence_id not in snapshot_ids or mutation.operator == "clear"
+                or int(mutation.effect_node_id) in snapshot_effects):
+            continue
+        expression = graph_obj.nodes.get(int(mutation.effect_node_id), {}).get("expr_obj")
+        line = getattr(expression, "lineno", None)
+        if (mutation.operator != "append" or line is None
+                or any(loop.lineno <= line <= loop.end_lineno for loop in loops)):
+            unbounded_snapshots.add(sequence_id)
+        else:
+            snapshot_growth[sequence_id] += 1
+    escaped_snapshots = {
+        parent for parent in _call_escaped_argument_ids(graph_obj)
+        if parent in snapshot_ids
+    }
+    for mutation in snapshots:
         source = int(mutation.argument_value_ids[0])
+        destination = int(mutation.sequence_value_id)
+        if destination in unbounded_snapshots or destination in escaped_snapshots:
+            bounds.pop(destination, None)
+            continue
         if source in bounds:
-            bounds[int(mutation.sequence_value_id)] = bounds[source]
+            bounds[destination] = bounds[source] + snapshot_growth[destination]
+    # Program: ``xs = [5, 7] + [n, 7]; len(xs)`` (fuzzer p3_54).  Wrong
+    # record: nothing bounded the concatenation, so its arena took the
+    # planner's elementwise-add extent (2,) and the second operand's rows
+    # were written past it.  Rule: a list concatenation holds exactly its
+    # operands' rows; its bound is the sum of their bounds (a folded display
+    # is a constant of its literal length).
+    def sequence_bound(node_id):
+        if node_id in bounds:
+            return bounds[node_id]
+        literal = (graph_obj.nodes.get(node_id, {}).get("attributes") or {}).get("value")
+        if isinstance(literal, (list, tuple)):
+            return len(literal)
+        return None
+
+    for node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("type") or data.get("op") or "") not in {"Add", "add"}:
+            continue
+        operands = [int(parent) for parent, role in data.get("parents") or ()
+                    if str(role) in {"lhs", "rhs"} and int(parent) in graph_obj]
+        if len(operands) != 2 or not all(
+            (graph_obj.nodes[operand].get("attributes") or {}).get("aggregate_kind") == "list"
+            for operand in operands
+        ):
+            continue
+        operand_bounds = [sequence_bound(operand) for operand in operands]
+        value_id = int(data.get("value_id", node_id))
+        if None not in operand_bounds and value_id not in bounds:
+            bounds[value_id] = sum(operand_bounds)
     # Program: ``d = {}; for i in range(n % 4 + 1): d[i % 2] = i`` (fuzzer
     # p1_27).  Wrong record: a local dict whose key universe the survey
     # cannot bound was neither bounded nor unbounded, so C refused it as a
@@ -1722,8 +1782,44 @@ def _static_sequence_capacity_survey(
         parent for parent in _call_escaped_argument_ids(graph_obj)
         if parent in local_dicts
     }
+    # Program: ``xs = [2] * (n % 4 + 1)`` (fuzzer p3_54).  Wrong record: a
+    # replication with a runtime count took the literal's one-row extent as
+    # its capacity, so the fill ran out of rows.  Rule: a replication born
+    # here whose count is not a literal is unbounded (the dynamic contract;
+    # its fill reserves the count); a literal count bounds it exactly.
+    mutated = {int(mutation.sequence_value_id)
+               for mutation in _sequence_append_call_mutations(graph_obj)}
+    local_replications = set()
+    for node_id, data in graph_obj.nodes(data=True):
+        if (data.get("attributes") or {}).get("producer_kind") != "sequence_replication":
+            continue
+        operands = [int(parent) for parent, role in data.get("parents") or ()
+                    if str(role) in {"lhs", "rhs"} and int(parent) in graph_obj]
+        rows = [operand for operand in operands
+                if (graph_obj.nodes[operand].get("attributes") or {}).get(
+                    "aggregate_kind") in {"list", "tuple"}]
+        counts = [operand for operand in operands if operand not in rows]
+        if len(rows) != 1 or len(counts) != 1:
+            continue
+        count_literal = (graph_obj.nodes[counts[0]].get("attributes") or {}).get("value")
+        leaves = (graph_obj.nodes[rows[0]].get("attributes") or {}).get(
+            "aggregate_leaf_value_ids", ())
+        value_id = int(data.get("value_id", node_id))
+        if (isinstance(count_literal, int) and not isinstance(count_literal, bool)
+                and value_id not in mutated and value_id not in bounds):
+            bounds[value_id] = max(0, int(count_literal)) * len(tuple(leaves))
+        elif value_id not in bounds:
+            local_replications.add(value_id)
+    escaped_replications = {
+        parent for parent in _call_escaped_argument_ids(graph_obj)
+        if parent in local_replications
+    }
     unbounded = frozenset(
         key for key in local_lists if key not in bounds and key not in escaped
+    ) | frozenset(
+        key for key in unbounded_snapshots if key not in escaped_snapshots
+    ) | frozenset(
+        key for key in local_replications if key not in escaped_replications
     ) | frozenset(
         key for key in local_dicts
         if key not in bounds and key not in escaped_dicts

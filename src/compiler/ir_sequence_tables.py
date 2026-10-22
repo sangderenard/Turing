@@ -552,8 +552,15 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
     is_store = operation == "table_store"
     name = function_name or f"ssa_sequence_{descriptor.sequence_id}_{'store' if is_store else 'insert'}"
     fixed_descriptor = replace(descriptor, capacity_policy=SSASequenceCapacityPolicy.FIXED)
+    # A fill writes ``count`` rows from row 0 and an append-fill writes
+    # ``count`` rows after the incumbent ones: their reserve asks for those
+    # rows, not one more (the ``requested`` count is the fixed helper's last
+    # formal).
+    fills = {"fill": lower_sequence_fill, "append_fill": lower_sequence_append_fill}
     fixed = (lower_table_store(fixed_descriptor, function_name=name + "__fixed", first_value_id=first_value_id)
-             if is_store else lower_sequence_insert_at(fixed_descriptor,
+             if is_store else fills[operation](fixed_descriptor,
+                 function_name=name + "__fixed", first_value_id=first_value_id)
+             if operation in fills else lower_sequence_insert_at(fixed_descriptor,
                  function_name=name + "__fixed", first_value_id=first_value_id)
              if operation == "insert_at" else lower_sequence_insert(fixed_descriptor,
                  function_name=name + "__fixed", operation=operation, first_value_id=first_value_id))
@@ -603,10 +610,16 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
     builder.emit(insert_entry, "Eq", [first_status, builder.const(insert_entry, 2)], full)
     builder.cond(insert_entry, full, grow, result)
     zero = builder.const(grow, 0, dtype="int64")
-    length_slot, length, required = (builder.fresh(dtype) for dtype in ("ptr", "int64", "int64"))
+    length_slot, length = (builder.fresh(dtype) for dtype in ("ptr", "int64"))
     builder.emit(grow, "GetElementPtr", [values[descriptor.length_address_id], zero], length_slot)
     builder.emit(grow, "Load", [length_slot], length)
-    builder.emit(grow, "Add", [length, builder.const(grow, 1, dtype="int64")], required)
+    if operation == "fill":
+        required = values[insert.args[-1].id]
+    else:
+        required = builder.fresh("int64")
+        builder.emit(grow, "Add", [length, values[insert.args[-1].id]
+                                   if operation == "append_fill"
+                                   else builder.const(grow, 1, dtype="int64")], required)
     reserve_values = {**values, owner.id: owner,
                       reserve.metadata["required_capacity_value_id"]: required}
     reserve_status = builder.fresh("int")
@@ -1743,11 +1756,21 @@ def lower_sequence_fill(
     function_name: str | None = None,
     first_value_id: int | None = None,
 ) -> SSASequenceLowering:
-    """Fill a caller arena with one repeated value and publish its length."""
+    """Fill a caller arena with one repeated value and publish its length.
 
-    unsupported = _unsupported_destination(descriptor, "fill")
+    The count and every row index are int64, the width of the length and
+    capacity cells they are compared with and stored into
+    (``_storage_values``).  Program ``xs = [2] * (n % 4 + 1)`` (fuzzer
+    p3_54): a 32-bit count formal met the caller's int64 count ("storage
+    types are immutable") and was stored into the int64 length cell.
+    """
+
+    unsupported = _unsupported_destination(descriptor, "fill", allow_dynamic=True)
     if unsupported is not None:
         return unsupported
+    if descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
+        return _lower_dynamic_sequence_mutation(descriptor, function_name=function_name,
+            operation="fill", first_value_id=first_value_id)
     if len(descriptor.column_value_ids) != 1 or descriptor.key_columns:
         raise ValueError("sequence fill requires one duplicate-policy column")
     storage = _storage_values(descriptor)
@@ -1755,22 +1778,22 @@ def lower_sequence_fill(
         descriptor, values=storage, minimum=first_value_id
     ))
     value = builder.fresh(descriptor.column_dtypes[0])
-    requested = builder.fresh("int")
+    requested = builder.fresh("int64")
     entry = builder.block("entry")
     header = builder.block("fill_header")
     body = builder.block("fill_body")
     latch = builder.block("fill_latch")
     complete = builder.block("complete")
     full = builder.block("capacity_exhausted")
-    zero = builder.const(entry, 0)
-    one = builder.const(entry, 1)
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
     within_capacity = builder.fresh("bool")
     builder.emit(entry, "Le", [requested, SSAValue(
         descriptor.capacity_value_id, dtype="int64"
     )], within_capacity)
     builder.cond(entry, within_capacity, header, full)
-    index = builder.fresh("int")
-    next_index = builder.fresh("int")
+    index = builder.fresh("int64")
+    next_index = builder.fresh("int64")
     builder.emit(header, "Phi", [zero, next_index], index, attributes={
         "incoming_blocks": (entry.name, latch.name)
     })
@@ -1792,6 +1815,18 @@ def lower_sequence_fill(
     builder.emit(complete, "Store", [requested, length_slot])
     status_ok = builder.const(complete, 1)
     builder.emit(complete, "Ret", [status_ok])
+    # A fixed arena's capacity is a proof; a fill that exceeds it means the
+    # proof was wrong.  Program ``xs = [2] * (n % 4 + 1)`` (fuzzer p3_54):
+    # the arena took the literal's one-row extent, the fill reported "full"
+    # into a status nobody reads and ``len(xs)`` was 0.  Rule: exhausting
+    # a fixed fill raises (validation error 75), never a silent short list.
+    builder.emit(full, "Call", [], attributes={
+        "callee": "turing_validation_error",
+        "error_code": 75,
+        "source_linked": True,
+        "ssa_sequence_operation": "fill",
+        "failure": "fixed_capacity_exhausted",
+    })
     status_full = builder.const(full, 2)
     builder.emit(full, "Ret", [status_full])
     function = Function(
@@ -1819,9 +1854,12 @@ def lower_sequence_append_fill(
 ) -> SSASequenceLowering:
     """Append one repeated value without discarding resident rows."""
 
-    unsupported = _unsupported_destination(descriptor, "append_fill")
+    unsupported = _unsupported_destination(descriptor, "append_fill", allow_dynamic=True)
     if unsupported is not None:
         return unsupported
+    if descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
+        return _lower_dynamic_sequence_mutation(descriptor, function_name=function_name,
+            operation="append_fill", first_value_id=first_value_id)
     if len(descriptor.column_value_ids) != 1 or descriptor.key_columns:
         raise ValueError(
             "sequence append-fill requires one duplicate-policy column"
@@ -1831,18 +1869,18 @@ def lower_sequence_append_fill(
         descriptor, values=storage, minimum=first_value_id
     ))
     value = builder.fresh(descriptor.column_dtypes[0])
-    requested = builder.fresh("int")
+    requested = builder.fresh("int64")
     entry = builder.block("entry")
     header = builder.block("append_fill_header")
     body = builder.block("append_fill_body")
     latch = builder.block("append_fill_latch")
     complete = builder.block("complete")
     full = builder.block("capacity_exhausted")
-    zero = builder.const(entry, 0)
-    one = builder.const(entry, 1)
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
     length_address = builder.fresh("ptr")
-    old_length = builder.fresh("int")
-    new_length = builder.fresh("int")
+    old_length = builder.fresh("int64")
+    new_length = builder.fresh("int64")
     builder.emit(entry, "GetElementPtr", [SSAValue(
         descriptor.length_address_id, dtype="int64", shape=(1,)
     ), zero], length_address)
@@ -1853,15 +1891,15 @@ def lower_sequence_append_fill(
         descriptor.capacity_value_id, dtype="int64"
     )], within_capacity)
     builder.cond(entry, within_capacity, header, full)
-    index = builder.fresh("int")
-    next_index = builder.fresh("int")
+    index = builder.fresh("int64")
+    next_index = builder.fresh("int64")
     builder.emit(header, "Phi", [zero, next_index], index, attributes={
         "incoming_blocks": (entry.name, latch.name)
     })
     continues = builder.fresh("bool")
     builder.emit(header, "Lt", [index, requested], continues)
     builder.cond(header, continues, body, complete)
-    destination_index = builder.fresh("int")
+    destination_index = builder.fresh("int64")
     address = builder.fresh("ptr")
     builder.emit(body, "Add", [old_length, index], destination_index)
     builder.emit(body, "GetElementPtr", [SSAValue(
@@ -1874,6 +1912,18 @@ def lower_sequence_append_fill(
     builder.emit(complete, "Store", [new_length, length_address])
     status_ok = builder.const(complete, 1)
     builder.emit(complete, "Ret", [status_ok])
+    # A fixed arena's capacity is a proof; a fill that exceeds it means the
+    # proof was wrong.  Program ``xs = [2] * (n % 4 + 1)`` (fuzzer p3_54):
+    # the arena took the literal's one-row extent, the fill reported "full"
+    # into a status nobody reads and ``len(xs)`` was 0.  Rule: exhausting
+    # a fixed fill raises (validation error 75), never a silent short list.
+    builder.emit(full, "Call", [], attributes={
+        "callee": "turing_validation_error",
+        "error_code": 75,
+        "source_linked": True,
+        "ssa_sequence_operation": "fill",
+        "failure": "fixed_capacity_exhausted",
+    })
     status_full = builder.const(full, 2)
     builder.emit(full, "Ret", [status_full])
     function = Function(
