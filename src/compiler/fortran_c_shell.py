@@ -10492,6 +10492,17 @@ def _field_slot_ops(
                   else authored_index_values(data))
         if base_id is None or key_id is None or base_id not in graph_obj:
             continue
+        # ``del xs[i]`` on a list is its positional ``pop(i)`` (retained as
+        # a sequence mutation record), not a keyed table deletion.
+        index_node = by_role.get("index")
+        if (
+            (graph_obj.nodes[base_id].get("attributes") or {}).get(
+                "aggregate_kind"
+            ) == "list"
+            and index_node in graph_obj
+            and str(graph_obj.nodes[index_node].get("type") or "") != "Slice"
+        ):
+            continue
         sequence_value_id, storage_identity = table_sequence(base_id)
         if storage_identity is None:
             storage_identity = f"nested-table-value:{base_id}"

@@ -7949,6 +7949,40 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
     )
     for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
+        # Program: ``xs = [5, n, 9, 8]; del xs[1]`` (fuzzer p3_13).  Wrong
+        # record: the deletion was taken for a dict table delete and refused
+        # ("nested table deletion requires a resident nested-table
+        # descriptor").  Rule: ``del xs[i]`` on a list is ``xs.pop(i)``
+        # whose result nothing reads -- the same positional delete.
+        if (
+            str(data.get("op") or data.get("type") or "").casefold() == "delitem"
+            and isinstance(expression, ast.AST)
+        ):
+            roles = {
+                str(role): int(parent)
+                for parent, role in data.get("parents") or ()
+                if int(parent) in graph_obj
+            }
+            base, index = roles.get("base"), roles.get("index")
+            if (
+                base is not None and index is not None
+                and (graph_obj.nodes[base].get("attributes") or {}).get(
+                    "aggregate_kind"
+                ) == "list"
+                and str(graph_obj.nodes[index].get("type") or "") != "Slice"
+            ):
+                records[int(node_id)] = {
+                    "expression": expression,
+                    "sequence_value_id": int(
+                        graph_obj.nodes[base].get("value_id", base)
+                    ),
+                    "argument_value_ids": (int(
+                        graph_obj.nodes[index].get("value_id", index)
+                    ),),
+                    "operator": "pop",
+                    "policy": "duplicates",
+                }
+            continue
         if not (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Attribute)
