@@ -3508,9 +3508,7 @@ class _ControlSSABuilder(TiledObject):
                     [count, length_address],
                     attributes={"binding": "ssa_sequence_literal_length"},
                 )
-        self.deferred_sequence_membership_instructions: dict[
-            int, tuple[Instr, ...]
-        ] = {}
+        self.lexical_membership_arguments: dict[int, tuple[Any, ...]] = {}
         self._captured_instruction_sink: list[Instr] | None = None
         lexical_membership_ids = {
             int(query.result_value_id)
@@ -3518,207 +3516,20 @@ class _ControlSSABuilder(TiledObject):
             if query.operation == "membership"
         }
         for result_id, query_id, sequence_id, negate in sequence_memberships:
-            self._captured_instruction_sink = None
-            deferred = int(result_id) in lexical_membership_ids
-            if deferred:
-                captured: list[Instr] = []
-                self._captured_instruction_sink = captured
-            descriptor = self.sequence_descriptors.get(int(sequence_id))
-            query_ids = (
-                tuple(map(int, query_id))
-                if isinstance(query_id, tuple)
-                else (int(query_id),)
-            )
-            logical_query_values = tuple(
-                self._table_query_values(query_id, descriptor)
-            )
-            query_values = list(logical_query_values)
-            tag_columns = self.sequence_native_type_tag_columns(
-                int(sequence_id)
-            ) if descriptor is not None else {}
-            physical_descriptor = descriptor
-            physical_columns = []
-            if descriptor is not None and tag_columns:
-                union_columns = self.sequence_native_value_union_columns(
-                    int(sequence_id)
+            # Program: ``for k in range(4): if k in d: ...`` (scratch c202).
+            # Wrong record: a lexical membership's instructions were built
+            # here, at function entry, and replayed at the query; its key
+            # ``k`` was read at entry, outside its loop, and became a root
+            # input.  Rule: a lexical membership is built where its query is
+            # lowered; only an entry-resident one is built here.
+            if int(result_id) in lexical_membership_ids:
+                self.lexical_membership_arguments[int(result_id)] = (
+                    result_id, query_id, sequence_id, negate,
                 )
-                physical_dtypes = []
-                physical_shapes = []
-                physical_keys = []
-                physical_queries = []
-                key_ordinal = {
-                    int(column): ordinal for ordinal, column in enumerate(
-                        descriptor.key_columns or (
-                            (0,)
-                            if len(descriptor.column_value_ids) == 1 else ()
-                        )
-                    )
-                }
-                logical_shapes = tuple(descriptor.column_shapes or (
-                    () for _value in descriptor.column_value_ids
-                ))
-                for column, (column_id, dtype, shape) in enumerate(zip(
-                    descriptor.column_value_ids,
-                    descriptor.column_dtypes,
-                    logical_shapes,
-                    strict=True,
-                )):
-                    tagged = tag_columns.get(int(column))
-                    if tagged is None:
-                        physical_index = len(physical_columns)
-                        physical_columns.append(
-                            self.sequence_storage_values[int(sequence_id)][
-                                int(column)
-                            ]
-                        )
-                        physical_dtypes.append(str(dtype))
-                        physical_shapes.append(tuple(shape))
-                        if int(column) in key_ordinal:
-                            ordinal = key_ordinal[int(column)]
-                            physical_keys.append(physical_index)
-                            physical_queries.append(
-                                logical_query_values[ordinal]
-                            )
-                        continue
-                    tag_column, _target_id, fact = tagged
-                    query_arm_values = ()
-                    query_tag = None
-                    if int(column) in key_ordinal:
-                        ordinal = key_ordinal[int(column)]
-                        if ordinal >= len(query_ids):
-                            raise ValueError(
-                                "native sequence membership tag has no "
-                                "matching authored query component: "
-                                f"sequence={int(sequence_id)}, "
-                                f"column={column}, query={query_ids!r}"
-                            )
-                        authored_query_id = int(query_ids[ordinal])
-                        query_arm_values = (
-                            self._native_value_union_row_payloads(
-                                authored_query_id,
-                                logical_query_values[ordinal], fact,
-                            )
-                        )
-                        query_tag = self.native_type_tag_for(
-                            authored_query_id, fact,
-                        )
-                        if query_tag is None:
-                            raise ValueError(
-                                "native sequence membership query has no "
-                                "exact type evidence: "
-                                f"sequence={int(sequence_id)}, "
-                                f"column={column}, value={authored_query_id}"
-                            )
-                    for arm_index, (arm, arm_column) in enumerate(
-                        union_columns[int(column)]
-                    ):
-                        physical_index = len(physical_columns)
-                        physical_columns.append(arm_column)
-                        physical_dtypes.append(str(
-                            arm_column.dtype or "unknown"
-                        ))
-                        physical_shapes.append(tuple(
-                            arm_column.shape or ()
-                        ))
-                        if int(column) in key_ordinal:
-                            physical_keys.append(physical_index)
-                            physical_queries.append(
-                                query_arm_values[arm_index]
-                            )
-                    physical_index = len(physical_columns)
-                    physical_columns.append(tag_column)
-                    physical_dtypes.append("int64")
-                    physical_shapes.append(())
-                    if int(column) in key_ordinal:
-                        physical_keys.append(physical_index)
-                        physical_queries.append(query_tag)
-                physical_descriptor = replace(
-                    descriptor,
-                    column_value_ids=tuple(
-                        int(value.id) for value in physical_columns
-                    ),
-                    column_dtypes=tuple(physical_dtypes),
-                    column_shapes=tuple(physical_shapes),
-                    key_columns=tuple(physical_keys),
-                )
-                query_values = physical_queries
-            membership_columns = (
-                () if physical_descriptor is None else
-                tuple(physical_descriptor.key_columns) or (
-                    (0,)
-                    if len(physical_descriptor.column_value_ids) == 1 else ()
-                )
-            )
-            if (
-                physical_descriptor is None
-                or not membership_columns
-                or len(query_values) != len(membership_columns)
-            ):
-                self.shortfalls.append(SSALoweringShortfall(
-                    "ssa-sequence",
-                    "contains",
-                    f"{function_name}.sequence_membership[{result_id}]",
-                    "membership requires one exact query component per "
-                    "key/value membership column",
-                ))
-                self._captured_instruction_sink = None
                 continue
-            from .ir_sequence_tables import lower_sequence_contains
-
-            helper_name = self._sequence_helper_name(
-                int(sequence_id), "contains",
+            self._emit_sequence_membership(
+                result_id, query_id, sequence_id, negate,
             )
-            lowering = lower_sequence_contains(
-                physical_descriptor,
-                function_name=helper_name,
-                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
-            )
-            self._register_sequence_lowering(lowering)
-            contract_cell = self._sequence_contract_cell(int(sequence_id))
-            call_result = (
-                self.fresh_value(
-                    dtype="bool", transform=CONTROL_PREDICATE,
-                    operands=(*query_values, contract_cell),
-                )
-                if negate else SSAValue(int(result_id), dtype="bool")
-            )
-            if not negate:
-                self._bind(
-                    int(result_id), call_result, BindingKind.SEQUENCE_RESULT,
-                    *query_values, contract_cell,
-                )
-            self.emit(
-                Handler.Call,
-                [
-                    *(physical_columns if tag_columns else
-                      self.sequence_storage_values[int(sequence_id)][
-                          :len(descriptor.column_value_ids)
-                      ]),
-                    *self.sequence_storage_values[int(sequence_id)][
-                        len(descriptor.column_value_ids):
-                    ],
-                    *query_values,
-                ],
-                call_result,
-                attributes={
-                    "callee": helper_name,
-                    "source_linked": True,
-                    "ssa_sequence_operation": "contains",
-                    "sequence_id": int(sequence_id),
-                },
-            )
-            if negate:
-                result = SSAValue(int(result_id), dtype="bool")
-                self._bind(
-                    int(result_id), result, BindingKind.SEQUENCE_RESULT,
-                    call_result,
-                )
-                self.emit(Handler.LNot, [call_result], result)
-            if deferred:
-                self._captured_instruction_sink = None
-                self.deferred_sequence_membership_instructions[
-                    int(result_id)
-                ] = tuple(captured)
         scheduled_table_operations = {
             (
                 "lookup" if str(kind) == "lookup_capture" else str(kind),
@@ -3782,6 +3593,202 @@ class _ControlSSABuilder(TiledObject):
                 continue
             self._emit_table_delete(effect_id, key_id, sequence_id, storage_identity)
         self.active_stage = CONTROL_SSA
+
+    def _emit_sequence_membership(
+        self, result_id: int, query_id: Any, sequence_id: int, negate: bool,
+    ) -> None:
+        """Emit one resident membership test at the current position."""
+
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        query_ids = (
+            tuple(map(int, query_id))
+            if isinstance(query_id, tuple)
+            else (int(query_id),)
+        )
+        logical_query_values = tuple(
+            self._table_query_values(query_id, descriptor)
+        )
+        query_values = list(logical_query_values)
+        tag_columns = self.sequence_native_type_tag_columns(
+            int(sequence_id)
+        ) if descriptor is not None else {}
+        physical_descriptor = descriptor
+        physical_columns = []
+        if descriptor is not None and tag_columns:
+            union_columns = self.sequence_native_value_union_columns(
+                int(sequence_id)
+            )
+            physical_dtypes = []
+            physical_shapes = []
+            physical_keys = []
+            physical_queries = []
+            key_ordinal = {
+                int(column): ordinal for ordinal, column in enumerate(
+                    descriptor.key_columns or (
+                        (0,)
+                        if len(descriptor.column_value_ids) == 1 else ()
+                    )
+                )
+            }
+            logical_shapes = tuple(descriptor.column_shapes or (
+                () for _value in descriptor.column_value_ids
+            ))
+            for column, (column_id, dtype, shape) in enumerate(zip(
+                descriptor.column_value_ids,
+                descriptor.column_dtypes,
+                logical_shapes,
+                strict=True,
+            )):
+                tagged = tag_columns.get(int(column))
+                if tagged is None:
+                    physical_index = len(physical_columns)
+                    physical_columns.append(
+                        self.sequence_storage_values[int(sequence_id)][
+                            int(column)
+                        ]
+                    )
+                    physical_dtypes.append(str(dtype))
+                    physical_shapes.append(tuple(shape))
+                    if int(column) in key_ordinal:
+                        ordinal = key_ordinal[int(column)]
+                        physical_keys.append(physical_index)
+                        physical_queries.append(
+                            logical_query_values[ordinal]
+                        )
+                    continue
+                tag_column, _target_id, fact = tagged
+                query_arm_values = ()
+                query_tag = None
+                if int(column) in key_ordinal:
+                    ordinal = key_ordinal[int(column)]
+                    if ordinal >= len(query_ids):
+                        raise ValueError(
+                            "native sequence membership tag has no "
+                            "matching authored query component: "
+                            f"sequence={int(sequence_id)}, "
+                            f"column={column}, query={query_ids!r}"
+                        )
+                    authored_query_id = int(query_ids[ordinal])
+                    query_arm_values = (
+                        self._native_value_union_row_payloads(
+                            authored_query_id,
+                            logical_query_values[ordinal], fact,
+                        )
+                    )
+                    query_tag = self.native_type_tag_for(
+                        authored_query_id, fact,
+                    )
+                    if query_tag is None:
+                        raise ValueError(
+                            "native sequence membership query has no "
+                            "exact type evidence: "
+                            f"sequence={int(sequence_id)}, "
+                            f"column={column}, value={authored_query_id}"
+                        )
+                for arm_index, (arm, arm_column) in enumerate(
+                    union_columns[int(column)]
+                ):
+                    physical_index = len(physical_columns)
+                    physical_columns.append(arm_column)
+                    physical_dtypes.append(str(
+                        arm_column.dtype or "unknown"
+                    ))
+                    physical_shapes.append(tuple(
+                        arm_column.shape or ()
+                    ))
+                    if int(column) in key_ordinal:
+                        physical_keys.append(physical_index)
+                        physical_queries.append(
+                            query_arm_values[arm_index]
+                        )
+                physical_index = len(physical_columns)
+                physical_columns.append(tag_column)
+                physical_dtypes.append("int64")
+                physical_shapes.append(())
+                if int(column) in key_ordinal:
+                    physical_keys.append(physical_index)
+                    physical_queries.append(query_tag)
+            physical_descriptor = replace(
+                descriptor,
+                column_value_ids=tuple(
+                    int(value.id) for value in physical_columns
+                ),
+                column_dtypes=tuple(physical_dtypes),
+                column_shapes=tuple(physical_shapes),
+                key_columns=tuple(physical_keys),
+            )
+            query_values = physical_queries
+        membership_columns = (
+            () if physical_descriptor is None else
+            tuple(physical_descriptor.key_columns) or (
+                (0,)
+                if len(physical_descriptor.column_value_ids) == 1 else ()
+            )
+        )
+        if (
+            physical_descriptor is None
+            or not membership_columns
+            or len(query_values) != len(membership_columns)
+        ):
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence",
+                "contains",
+                f"{self.function_name}.sequence_membership[{result_id}]",
+                "membership requires one exact query component per "
+                "key/value membership column",
+            ))
+            return
+        from .ir_sequence_tables import lower_sequence_contains
+
+        helper_name = self._sequence_helper_name(
+            int(sequence_id), "contains",
+        )
+        lowering = lower_sequence_contains(
+            physical_descriptor,
+            function_name=helper_name,
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+        )
+        self._register_sequence_lowering(lowering)
+        contract_cell = self._sequence_contract_cell(int(sequence_id))
+        call_result = (
+            self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(*query_values, contract_cell),
+            )
+            if negate else SSAValue(int(result_id), dtype="bool")
+        )
+        if not negate:
+            self._bind(
+                int(result_id), call_result, BindingKind.SEQUENCE_RESULT,
+                *query_values, contract_cell,
+            )
+        self.emit(
+            Handler.Call,
+            [
+                *(physical_columns if tag_columns else
+                  self.sequence_storage_values[int(sequence_id)][
+                      :len(descriptor.column_value_ids)
+                  ]),
+                *self.sequence_storage_values[int(sequence_id)][
+                    len(descriptor.column_value_ids):
+                ],
+                *query_values,
+            ],
+            call_result,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": "contains",
+                "sequence_id": int(sequence_id),
+            },
+        )
+        if negate:
+            result = SSAValue(int(result_id), dtype="bool")
+            self._bind(
+                int(result_id), result, BindingKind.SEQUENCE_RESULT,
+                call_result,
+            )
+            self.emit(Handler.LNot, [call_result], result)
 
     def _sequence_helper_name(
         self, sequence_id: int, operation: str, *related_ids: int,
@@ -11535,21 +11542,15 @@ class _ControlSSABuilder(TiledObject):
             )
             return
         if query.operation == "membership":
-            instructions = self.deferred_sequence_membership_instructions.pop(
-                int(query.result_value_id), ()
+            arguments = self.lexical_membership_arguments.pop(
+                int(query.result_value_id), None
             )
-            if not instructions:
+            if arguments is None:
                 raise ValueError(
                     "lexical sequence membership has no declared emission: "
                     f"{self.function_name} value {int(query.result_value_id)}"
                 )
-            for instruction in instructions:
-                self.emit(
-                    Handler(instruction.op),
-                    list(instruction.args),
-                    instruction.res,
-                    attributes=dict(instruction.attributes or {}),
-                )
+            self._emit_sequence_membership(*arguments)
             return
         sequence_id = int(query.sequence_value_id)
         nested_selection = self.nested_row_selections.get(sequence_id)
@@ -23308,6 +23309,10 @@ def _schedule_loop_callsites(
                     ),
                     *map(int, block.reduction_prefix_value_ids),
                     *map(int, block.reduction_suffix_value_ids),
+                    # A keyed query reads its keys (``d.get(i % 3, 0)``,
+                    # scratch c202: the lookup was scheduled before the
+                    # region computing ``i % 3`` and read it undefined).
+                    *map(int, block.key_value_ids),
                 ))),
                 tuple(dict.fromkeys((
                     int(block.result_value_id),

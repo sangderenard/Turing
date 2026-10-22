@@ -10306,6 +10306,16 @@ def _field_slot_ops(
         field_id = by_role.get("rhs")
         if query_id is None or field_id is None or field_id not in graph_obj:
             continue
+        # Program: ``for i in range(n): d[i % 3] = ...`` then ``if k in d``
+        # (scratch c202).  Wrong record: the membership's operand is the
+        # dict's post-store version (an IndexedStore), which carries no
+        # aggregate kind, so no membership was produced and the predicate
+        # had no value.  Rule: a stored version names its resident storage
+        # through the same alias map every table lookup reads
+        # (``table_sequence``).
+        field_id = int(mapping_storage_aliases.get(int(field_id), field_id))
+        if field_id not in graph_obj:
+            continue
         field_data = graph_obj.nodes[field_id]
         # ``x in (obj.field or {})`` (or a local alias of that expression,
         # e.g. ``channels = metrics.error_channels or {}; ... "k" in
@@ -12478,7 +12488,21 @@ def _control_block_position(
     if isinstance(block, SequenceMutationBlock):
         return node_position(_sequence_mutation_owner_id(block.mutation))
     if isinstance(block, SequenceQueryBlock) and block.source_call_node_id is not None:
-        return node_position(int(block.source_call_node_id))
+        # A query executes after its arguments: ``d.get(i % 3, 0)`` sat at
+        # the call's start, before the region computing its key ``i % 3``
+        # (scratch c202: the lookup read the key before its definition).
+        # It completes where its call ends.
+        position = node_position(int(block.source_call_node_id))
+        call = (graph_obj.nodes.get(int(block.source_call_node_id)) or {}).get(
+            "expr_obj"
+        ) if int(block.source_call_node_id) in graph_obj else None
+        if getattr(call, "end_lineno", None) is None:
+            return position
+        return max(position, (
+            int(call.end_lineno),
+            int(getattr(call, "end_col_offset", 0) or 0),
+            int(block.source_call_node_id),
+        ))
     if isinstance(block, ResourceScopeBlock):
         return node_position(block.source_scope_id)
     if isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
@@ -12559,6 +12583,42 @@ def _loop_body_line_span(expression: Any) -> tuple[int | None, int | None]:
     )
 
 
+def _member_completion_position(
+    graph_obj: Any, node_id: int,
+) -> tuple[int, int, int]:
+    """Where one region member completes.
+
+    Program: ``d[i % 3] = d.get(i % 3, 0) + i`` in a loop (scratch c202).
+    Wrong record: a store sat at its target's start, which precedes its own
+    value, so the store's region was placed before the ``d.get`` lookup
+    that computes what it stores (an effect-order cycle).  Rule: a store
+    executes after its value; it completes where the value expression ends.
+    """
+
+    position = _authored_node_position(graph_obj, int(node_id))
+    data = graph_obj.nodes.get(int(node_id)) if int(node_id) in graph_obj else None
+    if data is None or str(data.get("type") or data.get("op") or "").casefold() not in {
+        "indexedstore", "setitem", "setattr",
+    }:
+        return position
+    value_id = next((
+        int(parent) for parent, role in data.get("parents") or ()
+        if str(role) == "value" and int(parent) in graph_obj
+    ), None)
+    value_expression = (
+        None if value_id is None
+        else graph_obj.nodes[value_id].get("expr_obj")
+    )
+    end_line = getattr(value_expression, "end_lineno", None)
+    if end_line is None:
+        return position
+    return max(position, (
+        int(end_line),
+        int(getattr(value_expression, "end_col_offset", 0) or 0),
+        int(node_id),
+    ))
+
+
 def _dispatch_region_completion_positions(
     graph_obj: Any,
     dispatch_subgraphs: Iterable[Any],
@@ -12568,7 +12628,7 @@ def _dispatch_region_completion_positions(
     return {
         index: max(
             (
-                _authored_node_position(graph_obj, int(node_id))
+                _member_completion_position(graph_obj, int(node_id))
                 for node_id in subgraph.G.graph.get("deployment_nodes", ())
             ),
             default=(1 << 30, 0, index),
