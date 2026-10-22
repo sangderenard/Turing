@@ -5088,14 +5088,14 @@ class IdentityPage:
         """The number of cells the page holds, spilled or not (a spilled page
         is counted from its segment, without reading it back; a private edge
         page counts the rows of owners that are away too)."""
-        segment = self.__dict__.get("spill")
+        # ``spill`` and ``_detached`` are private dynamic page state; their
+        # value-record contract is stated at the read boundary, as in
+        # ``identity_spill._detached_ordinals``.
+        from .identity_spill import Segment
+        segment: Segment | None = self.__dict__.get("spill")
         count = (
             segment.cells if segment is not None else len(self.__dict__["cells"])
         )
-        # ``_detached`` is private dynamic page state; its value-record
-        # contract is stated at the read boundary, as in
-        # ``identity_spill._detached_ordinals``, so ``item`` is a Segment.
-        from .identity_spill import Segment
         away: dict[str, Segment] | None = self.__dict__.get("_detached")
         if away:
             count += sum(item.cells for item in away.values())
@@ -5103,12 +5103,12 @@ class IdentityPage:
 
     def row_count(self) -> int:
         """``len(self.rows())``, without reading back what is spilled."""
-        segment = self.__dict__.get("spill")
+        from .identity_spill import Segment
+        segment: Segment | None = self.__dict__.get("spill")
         count = (
             segment.rows if segment is not None
             else len(self.__dict__["row_columns"])
         )
-        from .identity_spill import Segment
         away: dict[str, Segment] | None = self.__dict__.get("_detached")
         if away:
             count += sum(item.rows for item in away.values())
