@@ -2335,6 +2335,63 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         sequence_id = int(data.get("value_id", node_id))
         expression = data.get("expr_obj")
         attributes = data.get("attributes") or {}
+        # Program: ``xs = [1, 4, 9]; ys = [x > n for x in xs]; any(ys)``
+        # (corpus c240).  Wrong record: the comprehension over a folded
+        # literal evaporated into a ListComp materializer whose rows are
+        # ``materialized_value_ids``, but only displays were born, so the
+        # resident arena kept its zero length and ``any``/``sum``/``len``
+        # read an empty list (silently; the audit saw an operand with no
+        # producer).  Rule: an unrolled list or set comprehension is born
+        # like a display -- one lexical clear, then one append (``add``)
+        # per materialized row, in iteration order -- as the unrolled dict
+        # comprehension already is.
+        if (sequence_id in accepted
+                and attributes.get("materialization_kind") == "unrolled_loop"
+                and attributes.get("aggregate_kind") in {"list", "set"}):
+            is_set = attributes.get("aggregate_kind") == "set"
+            rows = []
+            for ordinal, row_id in enumerate(
+                attributes.get("materialized_value_ids", ())
+            ):
+                producers = nodes_by_value.get(int(row_id), ())
+                if len(producers) != 1:
+                    raise ValueError(
+                        f"comprehension {sequence_id} row {row_id} lacks one "
+                        "exact producer"
+                    )
+                row = graph_obj.nodes[producers[0]]
+                if (row.get("attributes") or {}).get(
+                    "aggregate_kind"
+                ) is not None:
+                    raise ValueError(
+                        f"comprehension {sequence_id} row {row_id} is an "
+                        "aggregate; unrolled aggregate rows have no birth"
+                    )
+                literal = _scalar_constant_member(row)
+                expressions = ()
+                if isinstance(literal, (bool, int, float, str)):
+                    literal = (
+                        string_token(literal) if isinstance(literal, str)
+                        else literal
+                    )
+                    expressions = (ControlExpression("const", literal=literal),)
+                rows.append(ControlSequenceMutation(
+                    sequence_value_id=sequence_id,
+                    operator="add" if is_set else "append",
+                    argument_value_ids=(int(row_id),),
+                    effect_node_id=int(producers[0]),
+                    policy="unique" if is_set else "duplicates",
+                    argument_kind="value",
+                    argument_expressions=expressions,
+                    display_member=(int(node_id), int(ordinal)),
+                ))
+            mutations.append(ControlSequenceMutation(
+                sequence_value_id=sequence_id, operator="clear",
+                argument_value_ids=(), effect_node_id=int(node_id),
+                policy="unique" if is_set else "duplicates",
+            ))
+            mutations.extend(rows)
+            continue
         if (sequence_id not in accepted
                 or attributes.get("producer_kind") != "aggregate"
                 or attributes.get("materialization_kind") is not None):

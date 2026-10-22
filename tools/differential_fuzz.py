@@ -70,6 +70,11 @@ EXTENDED = [
     (["bs{v} = [n > {a}, n < {b}, True]"], "sum(1 for b{v} in bs{v} if b{v})"),
     (["xs{v} = [{a}, n, {b}]", "ys{v} = list(xs{v})", "ys{v}.append(n)"], "len(xs{v}) * 10 + len(ys{v})"),
     (["xs{v} = [{a}, n, {b}, {c}]"], "xs{v}[-1] * 10 + xs{v}[-2]"),
+    # comprehensions over an all-constant (folded) list (corpus c240-c243)
+    (["xs{v} = [{a}, {b}, {c}]", "ys{v} = [x{v} * n for x{v} in xs{v}]"], "sum(ys{v}) * 10 + len(ys{v})"),
+    (["xs{v} = [{a}, {b}, {c}]"], "int(any([x{v} > n for x{v} in xs{v}])) * 10 + int(all([x{v} > n for x{v} in xs{v}]))"),
+    (["xs{v} = [{a}, {b}, {c}]", "ys{v} = [x{v} - n for x{v} in xs{v}]"], "ys{v}[n % 3] * 10 + sum(ys{v})"),
+    (["s{v} = {{(x{v} + n) % 3 for x{v} in [{a}, {b}, {c}]}}"], "len(s{v})"),
 ]
 EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
