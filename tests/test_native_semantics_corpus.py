@@ -124,3 +124,37 @@ def test_unbounded_local_list_is_an_explicit_boundary():
         "dynamic-growth-unavailable" in shortfall.reason
         for shortfall in artifact.shortfalls
     )
+
+
+def test_guard_nested_in_a_loop_arm_is_placed_inside_that_arm():
+    """``if i > 20 or not allow: raise`` inside ``if x == 6:`` in a loop.
+
+    The loop composer placed the inner guard at the loop-body level after the
+    outer conditional, where ``i > 20`` (computed only inside the arm) does not
+    dominate it: audit ``use-not-dominated`` (``_validate_row``'s ``if item is
+    NEW:`` arm in the bootstrap).  The guard belongs inside its arm.  The C
+    module lane has no validation runtime, so this is checked by the audit.
+    """
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.identity_concordance import CorrelationTable
+
+    source = (
+        "def root(n: int, allow: bool) -> int:\n"
+        "    out = 0\n"
+        "    for i in range(n):\n"
+        "        x = (i * 3) % 7\n"
+        "        if x == 6:\n"
+        "            if i > 20 or not allow:\n"
+        "                raise ValueError('bad')\n"
+        "            out += 100\n"
+        "            continue\n"
+        "        if x > 10:\n"
+        "            raise ValueError('never')\n"
+        "        out += x\n"
+        "    return out\n"
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="corpus_nested_loop_guard",
+        extraction_contract=str(CONTRACT), progress=lambda _message: None,
+    )
+    assert CorrelationTable.build(module).findings(module) == []

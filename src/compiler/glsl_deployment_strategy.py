@@ -812,6 +812,17 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             ),
         ))
 
+    # A guard nested inside a conditional arm of a retained loop's body is
+    # built by the loop composer (which owns its structured predicate) and
+    # handed here, keyed by its raise node, to be placed after the region
+    # that computes its predicate -- inside that arm (see
+    # ``loop_composer``'s ``arm_nested_loop_validations``).
+    blocks.extend(
+        block for _raise_id, block in sorted(dict(
+            graph.graph.get("arm_nested_loop_validations") or {}
+        ).items())
+    )
+
     # Planning a scalar predicate may attach a synthetic callsite shell to the
     # same graph.  Iterate a stable snapshot: validation discovery is allowed
     # to enrich planning metadata, but must not invalidate its own traversal.

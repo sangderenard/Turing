@@ -5115,13 +5115,31 @@ def analyze_shader_loop_reductions(
         # handling), so validating the raise here is enough on its own to
         # make the whole statement compile.
         validations: list[tuple[int, int, bool, tuple[int, ...]]] = []
+        nested_validations: list[tuple[int, int, bool, tuple[int, ...]]] = []
         validated_raise_signatures: set[tuple[Any, ...]] = set()
+        # Only a guard that is a direct statement of THIS loop's body is the
+        # composer's; a guard nested in another ``if`` of the body is placed
+        # inside that arm by the producer-region placement
+        # (``_validation_control_blocks``), never at the body level where
+        # its predicate is not computed.
+        loop_syntax = graph.G.nodes[int(loop.node_id)].get("expr_obj")
+        direct_body_guards = {
+            id(member)
+            for member in (
+                (*loop_syntax.body, *loop_syntax.orelse)
+                if isinstance(loop_syntax, (ast.For, ast.While)) else ()
+            )
+            if isinstance(member, ast.If)
+        }
         for node_id in loop.body_nodes:
             if node_id not in graph.G:
                 continue
             statement = graph.G.nodes[node_id].get("expr_obj")
             if not isinstance(statement, ast.If):
                 continue
+            owned_here = (
+                not direct_body_guards or id(statement) in direct_body_guards
+            )
             # A validation arm may prepare diagnostics before its terminal
             # raise.  Requiring every statement in the arm to be ``Raise``
             # rejects ordinary authored guards such as ``if failed: log();
@@ -5151,6 +5169,22 @@ def analyze_shader_loop_reductions(
                 continue
             raise_node_id = node_for_expression(raise_items[0])
             if raise_node_id is None:
+                continue
+            if not owned_here:
+                # A nested guard is still a validation, not a blocking raise;
+                # its block is built below and placed inside its arm by the
+                # producer-region placement.
+                nested_validations.append((
+                    int(raise_node_id),
+                    int(predicate_id),
+                    not raises_when_true,
+                    validation_diagnostic_value_ids(
+                        raise_items[0], node_for_expression,
+                    ),
+                ))
+                validated_raise_signatures.update(
+                    expression_signature(item) for item in raise_items
+                )
                 continue
             validations.append((
                 int(raise_node_id),
@@ -6062,6 +6096,43 @@ def analyze_shader_loop_reductions(
                     return_site_cell=site_cell,
                 ),
             ))
+        def validation_block(
+            node_id, predicate_value_id, expect_true, diagnostic_value_ids,
+        ):
+            expression = graph.G.nodes[node_id].get("expr_obj")
+            return ValidationBlock(
+                predicate_value_id,
+                error_code=node_id,
+                expect_true=expect_true,
+                predicate_expression=structured_control_expression(
+                    predicate_value_id
+                ),
+                extraction_identity=(
+                    f"builtins.{expression.exc.func.id}"
+                    if isinstance(expression, ast.Raise)
+                    and isinstance(expression.exc, ast.Call)
+                    and isinstance(expression.exc.func, ast.Name)
+                    else None
+                ),
+                diagnostic_value_ids=diagnostic_value_ids,
+            )
+
+        # Program: ``for i in range(n): if i == 6: if i > 20 or not allow:
+        # raise ...`` (``_validate_row``'s ``if item is NEW:`` arm).  Wrong
+        # record: the inner guard was placed at the loop-body level after the
+        # outer conditional, re-evaluating ``i > 20`` where only the arm
+        # computes it (audit ``use-not-dominated``).  Rule: a guard that is a
+        # direct statement of the loop body runs at its lexical position; a
+        # guard nested in another ``if`` of the body is handed, keyed by its
+        # raise node, to the producer-region placement, which puts it after
+        # the region computing its predicate -- inside that arm.
+        if nested_validations:
+            handed = dict(
+                graph.G.graph.get("arm_nested_loop_validations") or {}
+            )
+            for item in nested_validations:
+                handed[int(item[0])] = validation_block(*item)
+            graph.G.graph["arm_nested_loop_validations"] = handed
         body_items.extend(
             (
                 lexical_position[node_id],
