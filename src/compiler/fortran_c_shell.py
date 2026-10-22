@@ -161,6 +161,7 @@ from .resident_sequence_materialization import (
     _source_sequence_snapshots as _source_sequence_snapshots,
     _static_mapping_capacity_bounds as _static_mapping_capacity_bounds,
     _static_sequence_capacity_bounds as _static_sequence_capacity_bounds,
+    _static_sequence_capacity_survey as _static_sequence_capacity_survey,
 )
 from .sequence_storage_binding import (
     _authored_source_sequence_ids as _authored_source_sequence_ids,
@@ -3792,9 +3793,13 @@ def _live_sequence_member_ids(function: Any, sequence_table: Any) -> set[int]:
         ):
             continue
         members.update(anchors)
+        # A DYNAMIC descriptor's heap owner is a member too (f"a@{n}": a
+        # pruned owner was re-added only after the caller's call had been
+        # linked, which then leased a fresh owner for it).
         members.update(int(value_id) for value_id in (
             descriptor.length_address_id, descriptor.capacity_value_id,
             descriptor.status_address_id, descriptor.live_flags_value_id,
+            descriptor.heap_owner_value_id,
         ) if value_id is not None)
     return members
 
@@ -4034,6 +4039,18 @@ def _prune_unused_callee_formals_once(
             callee, (sequence_tables or {}).get(str(callee_name)),
         ))
         protected.update(sequence_member_ids)
+        # A heap cell formal travels with its owner (``_storage_values``).
+        # Program: f"a@{n}" -- the extend helper reads its DYNAMIC source's
+        # cells but never the owner, so pruning the owner left the cells
+        # naming a formal that no longer existed (the heap-context
+        # projection refused the call).  Rule: the owner a live heap cell
+        # formal names is a sequence member and stays.
+        protected.update(
+            int(owner)
+            for formal in callee.args
+            for owner in ((formal.accounting or {}).get("heap_owner_value_id"),)
+            if owner is not None
+        )
         record_parameter_names = set(map(
             str, dict(metadata.get("parameter_record_abi") or {}),
         ))
@@ -11867,9 +11884,11 @@ def _attach_graph_control_expressions(
                     resident=resident,
                 )
             )
+            # ``if serial < 0 or serial > bits: raise`` guards on the
+            # short-circuit merge, exactly as a while predicate does.
             return replace(
                 block,
-                predicate_expression=predicate_expression,
+                predicate_expression=read_merges(predicate_expression),
             )
         if isinstance(block, SequenceBlock):
             children = list(attach(item) for item in block.blocks)
@@ -19647,6 +19666,81 @@ def _adopt_graph_formal(
     return value
 
 
+def _settle_linked_dynamic_sequences(
+    graphs: tuple[Any, ...], edges: tuple[tuple[Any, int, Any, int], ...],
+) -> None:
+    """One storage, one capacity contract, across exact call bindings.
+
+    Program: ``def make(n): out = []; while ...: out.append(...); return
+    out`` called as ``ys = make(n)``, and ``fill(xs, n)`` appending to its
+    parameter.  Wrong record: each function chose its sequence views' capacity
+    alone.  The callee's growth was invisible to the caller's FIXED view of
+    the same arena (and the reverse), so a returned or filled list was
+    refused (its capacity unproven) or, before that refusal, read as empty.
+    Rule: the exact argument/result bindings (``linked_value_edges``) join
+    the views of one storage; a component that grows without a bound in any
+    of its functions -- a local list the survey leaves unbounded, an append
+    inside a loop, or any append to a parameter or call result -- is DYNAMIC
+    in every view, which ``_bind_sequence_storage_members`` already requires.
+    Published per graph as ``linked_dynamic_sequence_ids``; each function's
+    descriptor birth reads it.
+    """
+
+    from .resident_sequence_materialization import (
+        _sequence_append_call_mutations,
+        _static_sequence_capacity_survey,
+    )
+
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+
+    def find(key):
+        parent.setdefault(key, key)
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    for caller_graph, caller_id, callee_graph, callee_id in edges:
+        left = find((id(caller_graph), int(caller_id)))
+        right = find((id(callee_graph), int(callee_id)))
+        if left != right:
+            parent[left] = right
+    linked = set(parent)
+    seeds: set[tuple[int, int]] = set()
+    for graph_obj in graphs:
+        _bounds, unbounded = _static_sequence_capacity_survey(graph_obj)
+        seeds.update((id(graph_obj), int(value_id)) for value_id in unbounded)
+        local_lists = {
+            int(node_id) for node_id, data in graph_obj.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.List)
+        }
+        loops = [
+            data["expr_obj"] for _node_id, data in graph_obj.nodes(data=True)
+            if isinstance(data.get("expr_obj"), (ast.For, ast.While))
+        ]
+        for mutation in _sequence_append_call_mutations(graph_obj):
+            if mutation.operator == "clear":
+                continue
+            sequence_id = int(mutation.sequence_value_id)
+            expression = graph_obj.nodes.get(
+                int(mutation.effect_node_id), {},
+            ).get("expr_obj")
+            line = getattr(expression, "lineno", None)
+            if (
+                sequence_id not in local_lists
+                or mutation.operator != "append"
+                or line is None
+                or any(loop.lineno <= line <= loop.end_lineno for loop in loops)
+            ):
+                seeds.add((id(graph_obj), sequence_id))
+    dynamic_roots = {find(seed) for seed in seeds if seed in linked}
+    for graph_obj in graphs:
+        graph_obj.graph["linked_dynamic_sequence_ids"] = tuple(sorted(
+            value_id for graph_id, value_id in linked
+            if graph_id == id(graph_obj) and find((graph_id, value_id)) in dynamic_roots
+        ))
+
+
 def _class_surface_ssa_program(
     compilation: Any,
     artifact_name: str,
@@ -21843,6 +21937,9 @@ def _class_surface_ssa_program(
                 (callee_graph, int(callee_id), caller_graph, int(caller_id))
                 for callee_id, caller_id in planned_call.result_bindings
             )
+    _settle_linked_dynamic_sequences(
+        tuple(planned_graphs_by_shell.values()), tuple(linked_value_edges),
+    )
     from .glsl_deployment_strategy import (
         _fold_callsite_structural_values,
         _tensor_descriptor,
@@ -22319,6 +22416,49 @@ def _class_surface_ssa_program(
         for caller_graph, caller_id, callee_graph, callee_id in compile_iter(
             linked_value_edges, "abi-edges", label="abi settlement: call edges",
         ):
+            # Program: ``xs = []; fill(xs, n)`` with ``fill(dst: list[int],
+            # ...)``.  Wrong record: contracts crossed an argument edge only
+            # caller -> callee, so the caller's empty list kept no element
+            # type and was stored as doubles while ``fill`` appended int64
+            # into the same arena ("storage types are immutable").  Rule: a
+            # mutable sequence argument is ONE storage on both sides; the
+            # callee formal's declared row contract is the caller actual's
+            # when the actual states none.
+            target_contract = linked_value_abi_by_graph.get(
+                id(callee_graph), {}
+            ).get(int(callee_id)) or {}
+            actual_contracts = linked_value_abi_by_graph.setdefault(
+                id(caller_graph), {}
+            )
+            actual_contract = actual_contracts.get(int(caller_id)) or {}
+            if (
+                target_contract.get("mutable")
+                and str(target_contract.get("storage") or "") in {
+                    "span", "sequence",
+                }
+                and int(target_contract.get("rank") or 0) == 1
+                and str(target_contract.get("dtype") or "") not in {
+                    "", "None", "unknown",
+                }
+                and str(actual_contract.get("python_type") or "")
+                == str(target_contract.get("python_type") or "")
+                and str(actual_contract.get("dtype") or "") in {
+                    "", "None", "unknown",
+                }
+                and actual_contract.get("storage") in {None, "span", "sequence"}
+            ):
+                actual_contracts[int(caller_id)] = {
+                    **dict(actual_contract),
+                    **{
+                        key: target_contract[key]
+                        for key in (
+                            "storage", "dtype", "rank", "mutable",
+                            "aggregate_kind",
+                        )
+                        if key in target_contract
+                    },
+                }
+                changed = True
             source = linked_value_abi_by_graph.get(
                 id(caller_graph), {}
             ).get(int(caller_id))
@@ -26102,6 +26242,88 @@ def _class_surface_ssa_program(
         for value_id in native_constructor_ids:
             constant_values.pop(int(value_id), None)
 
+        # A schema-known record constructor only packages its field
+        # residents. It cannot mutate a keyed/list field while doing so,
+        # so retain the authored literal's exact capacity universe.
+        # Unknown calls remain conservative and invalidate the bound.
+        abi_record_identities = tuple(
+            (str(record_name), str(
+                record.get("identity") or record_name
+            ))
+            for record_name, record in dict(
+                program_abi.get("records") or {}
+            ).items()
+        )
+        nonmutating_record_calls = {
+            int(node_id)
+            for node_id, data in graph_obj.nodes(data=True)
+            for attributes in (dict(data.get("attributes") or {}),)
+            for candidates in (tuple(filter(None, (
+                attributes.get("class_ref"),
+                attributes.get("static_python_reference"),
+            ))),)
+            if str(data.get("type") or data.get("op") or "").casefold()
+            == "call"
+            and any(
+                str(candidate) in {record_name, identity}
+                or identity.endswith("." + str(candidate))
+                for candidate in candidates
+                for record_name, identity in abi_record_identities
+            )
+        }
+        # One capacity survey of this graph serves both the descriptor birth
+        # (an unbounded private local list is born DYNAMIC) and the static
+        # bounds published on the lowered function below.  A list that is a
+        # function output keeps the public fixed-extent contract.
+        sequence_capacity_bounds, unbounded_local_sequences = (
+            _static_sequence_capacity_survey(
+                graph_obj,
+                nonmutating_call_ids=nonmutating_record_calls,
+                control=control,
+            )
+        )
+        output_history_ids = {
+            int(value_id)
+            for name in tuple(graph_obj.graph.get("function_outputs") or ())
+            for value_id in tuple(
+                (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
+            )
+        }
+        # A linked view's capacity contract is settled across its call
+        # bindings (``_settle_linked_dynamic_sequences``); an output with no
+        # caller binding is this function's public result.
+        dynamic_sequence_ids = {
+            *(
+                int(value_id) for value_id in unbounded_local_sequences
+                if int(value_id) not in output_history_ids
+            ),
+            *map(int, graph_obj.graph.get("linked_dynamic_sequence_ids", ())),
+        }
+        # Program: f"a@{n}".  Wrong record: the JoinedStr destination is
+        # cleared and extended from the formatter's token list, which is
+        # DYNAMIC, while the destination stayed FIXED with no bound (C
+        # refused it as dynamic-growth-unavailable).  Rule: a sequence an
+        # ``extend``/``replace`` fills from a DYNAMIC source holds as many
+        # rows as that source, so it is DYNAMIC too.
+        copied_from = tuple(
+            (int(mutation.sequence_value_id), tuple(map(
+                int, mutation.argument_value_ids,
+            )))
+            for mutation in _control_sequence_mutations(control.root)
+            if str(mutation.operator) in {"extend", "replace"}
+        )
+        grown = True
+        while grown:
+            grown = False
+            for destination_id, source_ids in copied_from:
+                if destination_id not in dynamic_sequence_ids and any(
+                    source_id in dynamic_sequence_ids
+                    for source_id in source_ids
+                ):
+                    dynamic_sequence_ids.add(destination_id)
+                    grown = True
+        dynamic_sequence_ids = tuple(sorted(dynamic_sequence_ids))
+
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -26210,7 +26432,51 @@ def _class_surface_ssa_program(
                 field_aliases=field_aliases,
                 sequence_declarations=sequence_declarations,
                 sequence_capacity_sources=sequence_capacity_sources,
+                dynamic_sequence_ids=dynamic_sequence_ids,
                 sequence_column_dtypes={
+                    # Program: f"a@{n}" (the token list returned by
+                    # ``decimal_integer_glyph_tokens``).  Wrong record: the
+                    # caller's view of a returned list was declared with no
+                    # column dtype, so its descriptor stayed FIXED until a
+                    # later writer settled int64; helpers lowered before
+                    # then kept the FIXED view of a DYNAMIC arena.  Rule: a
+                    # single-column sequence's settled linked contract (the
+                    # exact call binding's element dtype) is its declared
+                    # column dtype; an authored contract still wins.
+                    **{
+                        int(value_id): (str(contract["dtype"]),)
+                        for value_id, contract in dict(
+                            graph_obj.graph.get("linked_value_abi") or {}
+                        ).items()
+                        if str(contract.get("storage") or "") in {
+                            "span", "sequence",
+                        }
+                        and int(contract.get("rank") or 0) == 1
+                        and str(contract.get("dtype") or "") not in {
+                            "", "None", "unknown",
+                        }
+                        and any(
+                            int(sequence_id) == int(value_id)
+                            and int(column_count) == 1
+                            for sequence_id, _policy, column_count, _writable
+                            in sequence_declarations
+                        )
+                    },
+                    # A glyph sequence (a JoinedStr recipe, an optional or
+                    # token glyph projection) holds StringTable tokens, the
+                    # same int64 rows its literal pieces are declared with
+                    # (``literal_glyphs=``).  Declaring it at birth makes a
+                    # DYNAMIC recipe destination DYNAMIC before its first
+                    # step's helper is lowered (f"a@{n}").
+                    **{
+                        int(declaration[0]): ("int64",)
+                        for declaration in (
+                            *glyph_sequence_declarations,
+                            *optional_glyph_declarations,
+                            *token_glyph_declarations,
+                        )
+                        if int(declaration[2]) == 1
+                    },
                     **_sequence_column_dtype_contracts(
                         graph_obj, sequence_declarations
                     ),
@@ -26883,41 +27149,8 @@ def _class_surface_ssa_program(
             # may intentionally carry the same SSA value (``return x, x``);
             # de-duplicating identities here destroys result arity and leaves
             # every unpacking caller with an unmaterialized multi-result call.
-            # A schema-known record constructor only packages its field
-            # residents. It cannot mutate a keyed/list field while doing so,
-            # so retain the authored literal's exact capacity universe.
-            # Unknown calls remain conservative and invalidate the bound.
-            abi_record_identities = tuple(
-                (str(record_name), str(
-                    record.get("identity") or record_name
-                ))
-                for record_name, record in dict(
-                    program_abi.get("records") or {}
-                ).items()
-            )
-            nonmutating_record_calls = {
-                int(node_id)
-                for node_id, data in graph_obj.nodes(data=True)
-                for attributes in (dict(data.get("attributes") or {}),)
-                for candidates in (tuple(filter(None, (
-                    attributes.get("class_ref"),
-                    attributes.get("static_python_reference"),
-                ))),)
-                if str(data.get("type") or data.get("op") or "").casefold()
-                == "call"
-                and any(
-                    str(candidate) in {record_name, identity}
-                    or identity.endswith("." + str(candidate))
-                    for candidate in candidates
-                    for record_name, identity in abi_record_identities
-                )
-            }
             module_ir.functions[symbol].metadata["static_mapping_capacity_bounds"] = (
-                _static_sequence_capacity_bounds(
-                    graph_obj,
-                    nonmutating_call_ids=nonmutating_record_calls,
-                    control=control,
-                )
+                dict(sequence_capacity_bounds)
             )
             module_ir.functions[symbol].metadata[
                 "sequence_capacity_sources"
@@ -29760,6 +29993,18 @@ def _class_surface_ssa_program(
             id(argument)
             for argument in function.args
             if int(argument.id) in deferred_record_member_ids
+        )
+        # A live descriptor's members are its storage even when no body
+        # instruction reads them (``_live_sequence_member_ids``); f"a@{n}"'s
+        # token list lost its heap owner here and the caller leased a
+        # different owner for the same arena.
+        live_descriptor_members = _live_sequence_member_ids(
+            function, all_sequence_tables.get(symbol),
+        )
+        used_argument_objects.update(
+            id(argument)
+            for argument in function.args
+            if int(argument.id) in live_descriptor_members
         )
         function.args[:] = [
             argument for argument in function.args
@@ -40799,6 +41044,19 @@ def _class_surface_ssa_program(
                     != tuple(caller_sequence.key_columns)
                 ):
                     continue
+                if (callee_sequence.heap_owner_value_id is None) != (
+                    caller_sequence.heap_owner_value_id is None
+                ):
+                    # One arena, two capacity contracts: the settlement
+                    # (``_settle_linked_dynamic_sequences``) makes both views
+                    # agree; a disagreement here is a lost settlement.
+                    raise ValueError(
+                        "returned sequence views disagree about dynamic "
+                        f"capacity: caller={caller_symbol!r} "
+                        f"sequence={int(caller_sequence.sequence_id)}, "
+                        f"callee={callee_symbol!r} "
+                        f"sequence={int(callee_sequence.sequence_id)}"
+                    )
                 callee_members = (
                     *callee_sequence.column_value_ids,
                     callee_sequence.length_address_id,
@@ -40807,6 +41065,8 @@ def _class_surface_ssa_program(
                       if callee_sequence.status_address_id is not None else ()),
                     *((callee_sequence.live_flags_value_id,)
                       if callee_sequence.live_flags_value_id is not None else ()),
+                    *((callee_sequence.heap_owner_value_id,)
+                      if callee_sequence.heap_owner_value_id is not None else ()),
                 )
                 caller_members = (
                     *caller_sequence.column_value_ids,
@@ -40816,6 +41076,8 @@ def _class_surface_ssa_program(
                       if caller_sequence.status_address_id is not None else ()),
                     *((caller_sequence.live_flags_value_id,)
                       if caller_sequence.live_flags_value_id is not None else ()),
+                    *((caller_sequence.heap_owner_value_id,)
+                      if caller_sequence.heap_owner_value_id is not None else ()),
                 )
                 if len(callee_members) != len(caller_members):
                     continue
@@ -46794,9 +47056,31 @@ def _class_surface_ssa_program(
                             sources=(source_cell,), stage=FRAME_LINK,
                         )
                         result.device = callee_output.device
+                        callee_accounting = dict(callee_output.accounting or {})
+                        callee_owner = callee_accounting.get("heap_owner_value_id")
+                        if callee_owner is not None:
+                            # Program: ``ys = make(n)`` with ``make``'s list
+                            # DYNAMIC.  Wrong record: the callee output's
+                            # accounting was copied raw, so the caller's arena
+                            # cell named the CALLEE's owner id (996) while
+                            # its own descriptor and the call's bound actual
+                            # named the caller's (955).  Rule: an owner id is
+                            # scope-local; it crosses the call only through
+                            # the call's exact storage binding.
+                            bound_owner = result_storage_bindings_by_call.get(
+                                (str(caller_symbol), int(record.callsite_id)), {},
+                            ).get(int(callee_owner))
+                            if bound_owner is None:
+                                raise ValueError(
+                                    "returned heap arena has no bound owner in "
+                                    f"its caller: caller={caller_symbol!r}, "
+                                    f"callsite={int(record.callsite_id)}, "
+                                    f"callee owner={int(callee_owner)}"
+                                )
+                            callee_accounting["heap_owner_value_id"] = int(bound_owner)
                         result.accounting = {
                             **dict(result.accounting or {}),
-                            **dict(callee_output.accounting or {}),
+                            **callee_accounting,
                         }
                     elif returns_bound_aggregate:
                         _callee_result_id, caller_result_id = result_binding
@@ -49252,7 +49536,7 @@ def _class_surface_ssa_program(
                             "reason": child_lowering.shortfalls[0].reason,
                         })
                         continue
-                    helper = child_lowering.functions[0]
+                    helper = child_lowering.entry
                     all_functions[helper.name] = helper
                     ordered_values = [
                         exact_output_values.get(
@@ -49809,7 +50093,7 @@ def _class_surface_ssa_program(
                             "reason": child_lowering.shortfalls[0].reason,
                         })
                         continue
-                    helper = child_lowering.functions[0]
+                    helper = child_lowering.entry
                     all_functions[helper.name] = helper
                     row_values = arguments[int(row_value_offset):]
                     storage_count = len(helper.args) - len(row_values)
@@ -56673,7 +56957,7 @@ def _lower_ast_source_to_ssa_impl(
     from .assignment_normalization import normalize_destructuring_assignments
 
     compile_substage("source normalisation: authored control and record schemas")
-    short_circuit_receipts = _normalize_binary_short_circuit(tree)
+    short_circuit_receipts = list(_normalize_binary_short_circuit(tree))
     if short_circuit_receipts:
         report(
             "ssa-source: normalized "
@@ -57057,6 +57341,20 @@ def _lower_ast_source_to_ssa_impl(
         receipts = normalize_destructuring_assignments(discovered_tree)
         assignment_receipts.extend(receipts)
 
+    def normalize_discovered_short_circuit(discovered_tree: ast.AST) -> None:
+        """Make every pursued ``and``/``or`` binary, as the entry tree is.
+
+        Program: the bootstrap's pursued ``require_heap_owner`` (``a or b
+        or c``).  Wrong record: only the entry module's tree was normalized,
+        so a pursued definition reached control construction with a
+        3-operand BoolOp.  Rule: every ingested tree gets the same
+        short-circuit normalization, first, as the entry tree does.
+        """
+
+        short_circuit_receipts.extend(
+            _normalize_binary_short_circuit(discovered_tree)
+        )
+
     compile_stage("source-closure")
     report("ssa-source: building complete ProcessGraph source closure")
     program_abi_record_identities = tuple(
@@ -57192,6 +57490,7 @@ def _lower_ast_source_to_ssa_impl(
         activation_roots=compile_targets,
         tensor_code_references=source_tensor_references,
         source_ast_normalizers=(
+            normalize_discovered_short_circuit,
             _normalize_none_default_assignments,
             _normalize_direct_tail_recursion,
             normalize_discovered_destructuring,

@@ -251,6 +251,21 @@ _FLOORED_HELPERS = (
     "    return floor(a / b);",
     "}",
 )
+#: Owned heap arenas (``ssa_heap_allocation``): every block is
+#: ``[previous block][elements...]`` linked into its owner cell, so one
+#: release walks the chain and resets the owner to null.  The C spelling of
+#: the LLVM lane's ``turing_heap_release``.
+_HEAP_HELPERS = (
+    "static void turing_heap_release(void *owner) {",
+    "    void *block = *((void **)owner);",
+    "    *((void **)owner) = NULL;",
+    "    while (block != NULL) {",
+    "        void *next = *((void **)block);",
+    "        free(block);",
+    "        block = next;",
+    "    }",
+    "}",
+)
 #: (integer helper, double helper) per opcode.
 _FLOORED = {
     "Mod": ("turing_imod", "turing_fmod"),
@@ -2913,6 +2928,39 @@ def emit_ssa_module_to_c(
                 ))
             return held
 
+        formals_by_id = {int(value.id): value for value in function.args}
+
+        def heap_element(value) -> str | None:
+            """Element layout of a heap arena pointer CELL, else None.
+
+            A generated helper re-creates operand views; its formal with the
+            exact identity owns the cell contract (as in the LLVM lane).
+            """
+
+            for candidate in (value, formals_by_id.get(int(value.id))):
+                if candidate is None:
+                    continue
+                element = (candidate.accounting or {}).get("heap_element_dtype")
+                if element is not None:
+                    return str(element)
+            return None
+
+        heap_allocation_ids: set[int] = set()
+
+        def heap_data(value) -> str | None:
+            """The arena address a heap pointer cell currently holds.
+
+            An owned-heap Alloca result is a C pointer local that already
+            holds the arena address.  Every other heap value is a CELL -- a
+            formal, or a call's output slot (``ys = make(n)``) -- whose
+            storage holds the arena, one load away.
+            """
+
+            if int(value.id) in heap_allocation_ids:
+                return operand(value)
+            cell = address_operand(value)
+            return None if cell is None else f"(*((void **)({cell})))"
+
         def scalar_operand(value) -> str | None:
             """Load one authored scalar from opaque storage when required."""
 
@@ -4322,6 +4370,53 @@ def emit_ssa_module_to_c(
                                 f"(int)({value}), (size_t)({count}));"
                             )
                         continue
+                    heap_abi = instruction.attributes.get("native_heap_abi")
+                    if heap_abi == "copy_elements":
+                        from .ssa_heap_allocation import validate_heap_copy
+                        try:
+                            destination, source, count_value, layout = (
+                                validate_heap_copy(instruction)
+                            )
+                        except (KeyError, ValueError) as error:
+                            shortfalls.append(CEmissionShortfall(op, str(error)))
+                            continue
+                        destination_arena = heap_data(destination)
+                        source_arena = heap_data(source)
+                        count = scalar_operand(count_value)
+                        if None in {destination_arena, source_arena, count}:
+                            continue
+                        maximum = (2**63 - 1 - 8) // layout.byte_size
+                        body.extend((
+                            f"        if ((int64_t)({count}) < 0 || "
+                            f"(int64_t)({count}) > INT64_C({maximum})) abort();",
+                            f"        if ((int64_t)({count}) > 0) (void)memmove("
+                            f"{destination_arena}, {source_arena}, (size_t)"
+                            f"((int64_t)({count}) * {layout.byte_size}));",
+                        ))
+                        continue
+                    if heap_abi == "release_owner":
+                        from .ssa_heap_allocation import (
+                            HEAP_RELEASE_SYMBOL, require_heap_owner,
+                        )
+                        try:
+                            if (
+                                callee != HEAP_RELEASE_SYMBOL
+                                or len(instruction.args) != 1
+                                or instruction.res is not None
+                            ):
+                                raise ValueError(
+                                    "heap release requires one owner and no result"
+                                )
+                            require_heap_owner(instruction.args[0])
+                        except ValueError as error:
+                            shortfalls.append(CEmissionShortfall(op, str(error)))
+                            continue
+                        owner_cell = address_operand(instruction.args[0])
+                        if owner_cell is not None:
+                            body.append(
+                                f"        turing_heap_release({owner_cell});"
+                            )
+                        continue
                     if target is None or callee not in reachable:
                         shortfalls.append(CEmissionShortfall(
                             op,
@@ -4953,6 +5048,49 @@ def emit_ssa_module_to_c(
                     # constructor is dead; emit nothing for it.  Any real use
                     # of it faults loudly as an unavailable operand.
                     continue
+                if op == "Alloca":
+                    # The C spelling of the LLVM lane's owned-heap Alloca:
+                    # checked count, one block ``[previous][elements]``
+                    # linked into the owner cell, the result is the element
+                    # address.  Overflow and allocation failure abort; a
+                    # wrapped size is never a small successful allocation.
+                    from .ssa_heap_allocation import validate_heap_allocation
+                    try:
+                        count_value, owner, layout = validate_heap_allocation(
+                            instruction
+                        )
+                    except (KeyError, ValueError) as error:
+                        shortfalls.append(CEmissionShortfall(op, str(error)))
+                        continue
+                    count = scalar_operand(count_value)
+                    owner_cell = address_operand(owner)
+                    if count is None or owner_cell is None:
+                        continue
+                    result_id = int(instruction.res.id)
+                    maximum = (2**63 - 1 - 8) // layout.byte_size
+                    block = f"heap_block_{result_id}"
+                    body.extend((
+                        f"        if ((int64_t)({count}) < 0 || "
+                        f"(int64_t)({count}) > INT64_C({maximum})) abort();",
+                        f"        void *{block} = malloc((size_t)((int64_t)({count}) "
+                        f"* {layout.byte_size} + 8));",
+                        f"        if ({block} == NULL) abort();",
+                        f"        *((void **){block}) = *((void **)({owner_cell}));",
+                        f"        *((void **)({owner_cell})) = {block};",
+                        f"        double *t{result_id} = (double *)"
+                        f"((char *){block} + 8);",
+                    ))
+                    if instruction.attributes.get("zero_initialize"):
+                        body.append(
+                            f"        (void)memset(t{result_id}, 0, (size_t)"
+                            f"((int64_t)({count}) * {layout.byte_size}));"
+                        )
+                    expressions[result_id] = f"t{result_id}"
+                    addresses[result_id] = f"t{result_id}"
+                    object_expressions[id(instruction.res)] = f"t{result_id}"
+                    object_addresses[id(instruction.res)] = f"t{result_id}"
+                    heap_allocation_ids.add(result_id)
+                    continue
                 args = [scalar_operand(value) for value in instruction.args]
                 if any(value is None for value in args):
                     continue
@@ -4962,7 +5100,28 @@ def emit_ssa_module_to_c(
                 if op in {"GetElementPtr", "getelementptr"} and len(args) >= 2:
                     base = instruction.args[0]
                     pointer_depth = _pointer_value_depth(base)
-                    if pointer_depth >= 2:
+                    heap_layout = heap_element(base)
+                    if heap_layout is not None:
+                        # An owned heap arena is reached through its cell:
+                        # load the arena address, then index elements of the
+                        # declared layout (single flat index, as in LLVM).
+                        if len(args) != 2:
+                            shortfalls.append(CEmissionShortfall(
+                                op, "owned heap arenas require a single flat "
+                                f"element index in {fn}",
+                            ))
+                            continue
+                        from ..transmogrifier.dtype_layout import layout_for
+                        element = _buffer_c_type(layout_for(heap_layout).name)
+                        arena = heap_data(base)
+                        if arena is None:
+                            continue
+                        declared = (
+                            f"{element} *t{result_id} = "
+                            f"(({element} *)({arena})) + (ptrdiff_t)({args[1]});"
+                        )
+                        address_element_types[result_id] = element
+                    elif pointer_depth >= 2:
                         # ptrptr_float64 indexes a table whose elements are
                         # double pointers. The resulting address is therefore
                         # double ** and Load removes exactly one level.
@@ -4972,60 +5131,61 @@ def emit_ssa_module_to_c(
                         element = "double"
                     else:
                         element = buffer_type(base)
-                    base_expression = address_operand(base)
-                    if base_expression is None:
-                        continue
-                    indices = args[1:]
-                    offset = indices[0]
-                    if len(indices) > 1:
-                        requirement = storage_requirements_by_function.get(
-                            fn, {}
-                        ).get(int(base.id))
-                        static_shape = tuple(
-                            requirement.shape if requirement is not None else ()
-                        )
-                        if static_shape and len(static_shape) >= len(indices):
-                            strides = [
-                                math.prod(static_shape[axis + 1:])
-                                for axis in range(len(indices))
-                            ]
-                            offset = " + ".join(
-                                f"(({index}) * {int(stride)})"
-                                for index, stride in zip(indices, strides)
+                    if heap_layout is None:
+                        base_expression = address_operand(base)
+                        if base_expression is None:
+                            continue
+                        indices = args[1:]
+                        offset = indices[0]
+                        if len(indices) > 1:
+                            requirement = storage_requirements_by_function.get(
+                                fn, {}
+                            ).get(int(base.id))
+                            static_shape = tuple(
+                                requirement.shape if requirement is not None else ()
                             )
-                        else:
-                            terms = []
-                            unresolved = False
-                            for axis, index in enumerate(indices):
-                                trailing = []
-                                for trailing_axis in range(
-                                    axis + 1, len(indices)
-                                ):
-                                    slot = extent_slot(
-                                        fn, int(base.id), "dim", trailing_axis
-                                    )
-                                    if slot is None:
-                                        unresolved = True
+                            if static_shape and len(static_shape) >= len(indices):
+                                strides = [
+                                    math.prod(static_shape[axis + 1:])
+                                    for axis in range(len(indices))
+                                ]
+                                offset = " + ".join(
+                                    f"(({index}) * {int(stride)})"
+                                    for index, stride in zip(indices, strides)
+                                )
+                            else:
+                                terms = []
+                                unresolved = False
+                                for axis, index in enumerate(indices):
+                                    trailing = []
+                                    for trailing_axis in range(
+                                        axis + 1, len(indices)
+                                    ):
+                                        slot = extent_slot(
+                                            fn, int(base.id), "dim", trailing_axis
+                                        )
+                                        if slot is None:
+                                            unresolved = True
+                                            break
+                                        trailing.append(f"extents[{slot}]")
+                                    if unresolved:
                                         break
-                                    trailing.append(f"extents[{slot}]")
+                                    stride = " * ".join(trailing) or "1"
+                                    terms.append(f"(({index}) * ({stride}))")
                                 if unresolved:
-                                    break
-                                stride = " * ".join(trailing) or "1"
-                                terms.append(f"(({index}) * ({stride}))")
-                            if unresolved:
-                                shortfalls.append(CEmissionShortfall(
-                                    op,
-                                    f"multi-axis address of %t{base.id} has no "
-                                    f"public extent origin in {fn}",
-                                ))
-                                continue
-                            offset = " + ".join(terms)
-                    declared = (
-                        f"{element} *t{result_id} = "
-                        f"(({element} *)({base_expression})) "
-                        f"+ (ptrdiff_t)({offset});"
-                    )
-                    address_element_types[result_id] = element
+                                    shortfalls.append(CEmissionShortfall(
+                                        op,
+                                        f"multi-axis address of %t{base.id} has no "
+                                        f"public extent origin in {fn}",
+                                    ))
+                                    continue
+                                offset = " + ".join(terms)
+                        declared = (
+                            f"{element} *t{result_id} = "
+                            f"(({element} *)({base_expression})) "
+                            f"+ (ptrdiff_t)({offset});"
+                        )
+                        address_element_types[result_id] = element
                 elif op in {"Load", "load"} and len(args) == 1:
                     addressed_value = instruction.args[0]
                     source_address = address_operand(addressed_value)
@@ -5769,16 +5929,46 @@ def emit_ssa_module_to_c(
     # calloc establishes empty contents, but zero is not the capacity of an
     # allocated arena. Publish the actual column allocation bound before any
     # native append can test it. Caller-owned descriptors retain their input.
+    from ..transmogrifier.ssa import SSASequenceCapacityPolicy
     root_sequences = getattr(module, "sequence_tables", {}).get(function_name)
     allocation_counts = {name: count for _kind, name, count in root_allocations}
+    heap_releases: list[str] = []
     if root_sequences is not None:
         for sequence in root_sequences.sequences.values():
             capacity = owned_storage_names.get(int(sequence.capacity_value_id))
             columns = [owned_storage_names.get(int(value_id))
                        for value_id in sequence.column_value_ids]
-            if capacity is not None and columns and all(
-                column in allocation_counts for column in columns
-            ) and any(
+            owner = (
+                None if sequence.heap_owner_value_id is None
+                else owned_storage_names.get(int(sequence.heap_owner_value_id))
+            )
+            if (
+                sequence.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC
+                and owner is not None and capacity is not None
+            ):
+                # A frame-owned DYNAMIC sequence starts empty: calloc gives
+                # null arena cells, capacity 0 and a null owner (the LLVM
+                # wrapper stores the same three explicitly).  A column that
+                # is a call's output slot (``ys = make(n)``) is never read
+                # before the first append reserves it: capacity 0 makes
+                # that append grow and publish the arena first.  Its arenas
+                # live until the entry call returns; then the owner chain is
+                # released.
+                release = f"    turing_heap_release({owner});"
+                if release not in heap_releases:
+                    heap_releases.append(release)
+                continue
+            # Program: ``ys = make(n)`` where ``make`` appends to its own
+            # list.  The root view's column is the call's output slot, not a
+            # wrapper allocation, so the check below (which required every
+            # column to be one) skipped it: capacity stayed 0 and every
+            # append reported "full" (n=6 returned 0).  A root-owned capacity
+            # cell over any unproven column is the same refusal.
+            if sequence.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
+                # A caller-provided owner (an object context's tables) keeps
+                # its incoming arena, capacity and lifetime.
+                continue
+            if capacity is not None and capacity in allocation_counts and columns and any(
                 storage_requirements.get(int(value_id)) is None
                 or storage_requirements[int(value_id)].element_count is None
                 for value_id in sequence.column_value_ids
@@ -5877,6 +6067,7 @@ def emit_ssa_module_to_c(
     entry_span.take(
         UnitKind.OUTPUT_STORE, args=tuple(int(item) for item in watch),
     )
+    entry_lines.extend(heap_releases)
     wrapper_body_count = len(entry_lines)
     entry_lines = [
         *(
@@ -5937,6 +6128,7 @@ def emit_ssa_module_to_c(
         "#endif",
         "",
         *_FLOORED_HELPERS,
+        *_HEAP_HELPERS,
         "",
         *(_TRACE_HELPERS if trace else ()),
         "",

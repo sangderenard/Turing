@@ -4619,9 +4619,61 @@ def _emit_repository_call_module(
     from .ir_sequence_tables import SSASequenceCapacityPolicy
     root_sequences = getattr(module, "sequence_tables", {}).get(function_name)
     root_arguments = {int(value.id): value for value in root.args}
+    heap_releases: list[str] = []
     if root_sequences is not None:
         for sequence in root_sequences.sequences.values():
             capacity_id = int(sequence.capacity_value_id)
+            owner_id = sequence.heap_owner_value_id
+            if (sequence.capacity_policy == SSASequenceCapacityPolicy.DYNAMIC
+                    and owner_id is not None and int(owner_id) in allocated_counts
+                    and capacity_id in allocated_counts):
+                # Program: ``xs = []; for i in range(n): xs.append(i * i)``.
+                # Wrong record: the frame-owned DYNAMIC arena's pointer
+                # cells, capacity and owner were bare allocas, so the first
+                # append read a garbage capacity and stored through a garbage
+                # arena (n=5 segfaulted).  Rule: a frame-owned dynamic
+                # sequence starts EMPTY -- null arena cells, capacity 0, null
+                # owner -- and its owner is released after the entry call.
+                # A column that is a call's output slot (``ys = make(n)``)
+                # lives in the entry function's frame; capacity 0 makes its
+                # first append reserve and publish the arena before any read.
+                for column in dict.fromkeys(map(int, sequence.column_value_ids)):
+                    if column in allocated_counts:
+                        wrapper.append(f"  store ptr null, ptr {public_pointer[column]}, align 8")
+                capacity = root_arguments[capacity_id]
+                capacity_type = _value_llvm_type(capacity)
+                wrapper.append(f"  store {capacity_type} 0, ptr {public_pointer[capacity_id]}, align {_align(capacity_type)}")
+                wrapper.append(f"  store ptr null, ptr {public_pointer[int(owner_id)]}, align 8")
+                release = f"  call void @turing_heap_release(ptr {public_pointer[int(owner_id)]})"
+                if release not in heap_releases:
+                    heap_releases.append(release)
+                entry_span.take(UnitKind.STATEMENT, args=(capacity, root_arguments[int(owner_id)], *(root_arguments[int(column)]
+                    for column in sequence.column_value_ids if int(column) in root_arguments)), spelling=public_pointer[capacity_id])
+                continue
+            if sequence.capacity_policy == SSASequenceCapacityPolicy.DYNAMIC:
+                # A caller-provided owner (an object context's tables) keeps
+                # its incoming arena, capacity and lifetime.
+                continue
+            if (sequence.capacity_policy == SSASequenceCapacityPolicy.FIXED
+                    and capacity_id in allocated_counts
+                    and any(storage_requirements.get(int(column)) is None
+                            or storage_requirements[int(column)].element_count is None
+                            for column in sequence.column_value_ids)):
+                # Program: ``xs = []; fill(xs, n)`` / ``ys = make(n)``.  Wrong
+                # record: a frame-owned FIXED sequence whose rows nothing
+                # proves got a one-element arena (or a call's output slot)
+                # and capacity 1 or an uninitialized cell; every append past
+                # it reported "full" into a status nobody reads.  Rule: as in
+                # the C wrapper, unproven fixed capacity is the explicit
+                # ``dynamic-growth-unavailable`` refusal, never a guess.
+                shortfalls.append(LLVMEmissionShortfall(
+                    function_name, "sequence",
+                    "dynamic-growth-unavailable: private sequence "
+                    f"{int(sequence.sequence_id)} of {function_name} has no "
+                    "proven capacity; a caller-provided arena or a static "
+                    "producer extent is required",
+                ))
+                continue
             if (sequence.capacity_policy != SSASequenceCapacityPolicy.FIXED
                     or capacity_id not in allocated_counts
                     or not all(int(column) in allocated_counts for column in sequence.column_value_ids)):
@@ -4657,6 +4709,7 @@ def _emit_repository_call_module(
         UnitKind.CALL, args=(*root.args, *root_outputs),
         spelling=internal_symbols[function_name],
     )
+    wrapper.extend(heap_releases)
     wrapper.extend(wrapper_frees)
     wrapper.append("  ret void")
     entry_span.take(UnitKind.RETURN)

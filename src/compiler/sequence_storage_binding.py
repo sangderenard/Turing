@@ -195,10 +195,25 @@ def _bind_sequence_storage_members(
         or caller_sequence is None
         or len(callee_sequence.column_value_ids)
         != len(caller_sequence.column_value_ids)
-        or (getattr(callee_sequence, "heap_owner_value_id", None) is None)
-        != (getattr(caller_sequence, "heap_owner_value_id", None) is None)
     ):
         return False
+    if (getattr(callee_sequence, "heap_owner_value_id", None) is None) != (
+        getattr(caller_sequence, "heap_owner_value_id", None) is None
+    ):
+        # Program: ``xs = []; fill(xs, n)`` before the callee's parameter
+        # view was born DYNAMIC.  Wrong record: the refusal returned False
+        # and the linker gave the callee fresh length/capacity cells, so
+        # ``fill`` appended into storage the caller never read (n=6
+        # returned 0).  Rule: one exact argument binding is one storage;
+        # two capacity contracts for it are a lost settlement
+        # (``_settle_linked_dynamic_sequences``), refused by name.
+        raise ValueError(
+            "bound sequence views disagree about dynamic capacity: "
+            f"callee sequence={int(callee_sequence.sequence_id)} "
+            f"owner={getattr(callee_sequence, 'heap_owner_value_id', None)!r}, "
+            f"caller sequence={int(caller_sequence.sequence_id)} "
+            f"owner={getattr(caller_sequence, 'heap_owner_value_id', None)!r}"
+        )
     if getattr(callee_sequence, "heap_owner_value_id", None) is not None:
         # A ptr-cell ABI alone cannot prove its pointee layout. Otherwise an
         # int64 arena binds to a float64 arena with every LLVM formal still

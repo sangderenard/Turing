@@ -1246,7 +1246,7 @@ def lower_object_context(context: SSAObjectContext, *, prefix: str = 'native_obj
             function.metadata['generated_helper_provenance'] = 'object-context'
             _publish_generated_helper(function)
             module.functions[function.name] = function
-        return lowering.functions[0]
+        return lowering.entry
 
     allocate = [add(lower_sequence_allocate(descriptor,
         function_name=f'{prefix}_{label}_allocate'))

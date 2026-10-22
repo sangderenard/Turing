@@ -53,6 +53,38 @@ class SSASequenceLowering:
     def complete(self) -> bool:
         return not self.shortfalls
 
+    @property
+    def entry(self) -> Function:
+        """The helper the caller calls: the one no other helper here calls.
+
+        A lowering may return its private dependencies alongside the entry
+        (``lookup, append, extend``; a dynamic ``insert`` with its fixed
+        insert and reserve).  Their order is not a contract -- the dynamic
+        lowering listed its entry first while every caller took the last
+        one, so ``xs.append`` called ``__reserve``.  The call edges say
+        which function is the entry.
+        """
+
+        names = {function.name for function in self.functions}
+        called = {
+            str(instruction.attributes.get("callee"))
+            for function in self.functions
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Call"
+            and str(instruction.attributes.get("callee")) in names
+        }
+        roots = [
+            function for function in self.functions
+            if function.name not in called
+        ]
+        if len(roots) != 1:
+            raise ValueError(
+                "sequence lowering has no unique entry helper: "
+                f"{[function.name for function in roots]!r}"
+            )
+        return roots[0]
+
 
 def schedule_joined_sequence_mutations(function: Function) -> int:
     """Place a list-of-bytes dual-view update after its source is complete.
@@ -310,6 +342,18 @@ def _storage_values(
     ]
     if descriptor.live_flags_value_id is not None:
         values.append(SSAValue(descriptor.live_flags_value_id, dtype="bool"))
+    if descriptor.heap_owner_value_id is not None:
+        # The owner travels with its heap cells.  Program: ``s += tokens``
+        # where ``tokens`` is a DYNAMIC list (f"a@{n}").  Wrong record: the
+        # extend helper read the source's heap cells, each naming its owner
+        # (``heap_owner_value_id``), while the owner itself was no formal of
+        # the helper, so the heap-context projection could not bind it.
+        # Rule: a heap descriptor's storage is its cells AND their owner,
+        # last, in every helper built from it.
+        values.append(SSAValue(
+            descriptor.heap_owner_value_id, "ptr", shape=(1,),
+            accounting={"heap_owner": True},
+        ))
     # Alias descriptors can intentionally name the same arena more than once.
     return tuple({value.id: value for value in values}.values())
 
@@ -333,9 +377,8 @@ def lower_sequence_allocate(
         raise ValueError("heap initialization of shaped rows requires checked capacity multiplication")
     storage = _storage_values(descriptor)
     values = {int(value.id): value for value in storage}
-    owner = SSAValue(descriptor.heap_owner_value_id, "ptr", shape=(1,),
-                     accounting={"heap_owner": True})
-    builder = _Builder(_first_fresh_identity(descriptor, values=(*storage, owner)))
+    owner = values[int(descriptor.heap_owner_value_id)]
+    builder = _Builder(_first_fresh_identity(descriptor, values=storage))
     entry = builder.block("entry")
     capacity = values[int(descriptor.capacity_value_id)]
     for index, column_id in enumerate(descriptor.column_value_ids):
@@ -347,7 +390,7 @@ def lower_sequence_allocate(
     builder.emit(entry, "Store", [zero, slot])
     builder.emit(entry, "Ret", [])
     function = Function(function_name or f"ssa_sequence_{descriptor.sequence_id}_allocate",
-                        [*storage, owner], builder.blocks, metadata={
+                        [*storage], builder.blocks, metadata={
         "ssa_sequence_operation": "allocate", "sequence_id": descriptor.sequence_id,
         "sequence_array_argument_ids": tuple(descriptor.column_value_ids) + (descriptor.length_address_id, owner.id),
     })
@@ -412,9 +455,8 @@ def lower_sequence_reserve(
         raise ValueError("reserve requires a dynamic sequence capacity contract")
     storage = _storage_values(descriptor)
     values = {int(value.id): value for value in storage}
-    owner = SSAValue(descriptor.heap_owner_value_id, "ptr", shape=(1,),
-                     accounting={"heap_owner": True})
-    builder = _Builder(_first_fresh_identity(descriptor, values=(*storage, owner)))
+    owner = values[int(descriptor.heap_owner_value_id)]
+    builder = _Builder(_first_fresh_identity(descriptor, values=storage))
     required = builder.fresh("int64")
     capacity = values[int(descriptor.capacity_value_id)]
     entry = builder.block("entry")
@@ -493,7 +535,7 @@ def lower_sequence_reserve(
                  attributes={"incoming_blocks": tuple(block.name for block, _ in outcomes)})
     builder.emit(result, "Ret", [status])
     function = Function(function_name or f"ssa_sequence_{descriptor.sequence_id}_reserve",
-                        [*storage, owner, required], builder.blocks, metadata={
+                        [*storage, required], builder.blocks, metadata={
         "ssa_sequence_operation": "reserve", "sequence_id": descriptor.sequence_id,
         "required_capacity_value_id": required.id,
         "heap_owner_value_id": owner.id,
@@ -517,8 +559,18 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
         return fixed
     insert = fixed.functions[0]
     reserve = lower_sequence_reserve(descriptor, function_name=name + "__reserve").functions[0]
-    values = {value.id: value for value in insert.args}
-    owner = next(value for value in reserve.args if value.id == descriptor.heap_owner_value_id)
+
+    # Each helper owns its formal occurrences.  Registration rewrites a
+    # helper's construction-local ids IN PLACE, scope by scope; an entry that
+    # reused its fixed insert's formal objects had the row value re-keyed
+    # under the entry's scope, leaving the fixed helper's own row without
+    # its physical fields (``ssa-physical-unposted``).
+    def own(value):
+        return SSAValue(value.id, value.dtype, shape=tuple(value.shape or ()),
+                        accounting=dict(value.accounting or {}))
+
+    values = {value.id: own(value) for value in insert.args}
+    owner = values[descriptor.heap_owner_value_id]
     builder = _Builder(_first_fresh_identity(descriptor, values=tuple(values.values())))
     entry, insert_entry, grow, retry, result = (builder.block(block_name)
         for block_name in ("entry", "insert", "grow", "retry", "result"))
@@ -535,8 +587,8 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
     builder.cond(entry, valid, insert_entry, result)
 
     def call_mutation(block, status):
-        builder.emit(block, "Call", list(insert.args), None if is_store else status,
-                     attributes={"callee": insert.name})
+        builder.emit(block, "Call", [values[value.id] for value in insert.args],
+                     None if is_store else status, attributes={"callee": insert.name})
         if is_store:
             slot = builder.fresh("ptr")
             builder.emit(block, "GetElementPtr", [values[descriptor.status_address_id],
@@ -573,7 +625,8 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
             builder.const(result, 0, dtype="int64")], slot)
         builder.emit(result, "Store", [status, slot])
     builder.emit(result, "Ret", [] if is_store else [status])
-    function = Function(name, [*insert.args, owner], builder.blocks, metadata={
+    function = Function(name, [values[value.id] for value in insert.args],
+                        builder.blocks, metadata={
         **insert.metadata, "fixed_capacity": False, "heap_owner_value_id": owner.id,
         "sequence_array_argument_ids": (*insert.metadata["sequence_array_argument_ids"], owner.id),
         "named_outputs": () if is_store else (("status", status.id),),
@@ -3678,10 +3731,7 @@ def lower_sequence_extend(
     all_storage = tuple({value.id: value for value in (
         *destination_storage, *source_storage
     )}.values())
-    insert_function = insert_lowering.functions[0]
-    if destination.heap_owner_value_id is not None:
-        owner = next(value for value in insert_function.args if value.id == destination.heap_owner_value_id)
-        all_storage = (*all_storage, owner)
+    insert_function = insert_lowering.entry
     insert_ids = {
         value.id
         for function in insert_lowering.functions
@@ -3709,8 +3759,12 @@ def lower_sequence_extend(
     complete = builder.block("complete")
     exhausted = builder.block("capacity_exhausted")
     result_block = builder.block("result")
-    source_length = builder.fresh("int")
-    zero = builder.const(entry, 0)
+    # Lengths are int64 cells (``_storage_values``); the walk over them is
+    # int64 too.  An ``int`` index loaded half the length cell and LLVM
+    # refused the index Phi whose latch increment settled i64 (f"a@{n}"'s
+    # glyph extend).
+    source_length = builder.fresh("int64")
+    zero = builder.const(entry, 0, dtype="int64")
     source_length_slot = builder.fresh("ptr")
     builder.emit(
         entry,
@@ -3724,11 +3778,11 @@ def lower_sequence_extend(
         [source_length_slot],
         source_length,
     )
-    one = builder.const(entry, 1)
+    one = builder.const(entry, 1, dtype="int64")
     full_status = builder.const(entry, 2)
     builder.branch(entry, header)
-    index = builder.fresh("int")
-    next_index = builder.fresh("int")
+    index = builder.fresh("int64")
+    next_index = builder.fresh("int64")
     builder.emit(
         header,
         "Phi",

@@ -278,6 +278,135 @@ guarded calls, guards inside loops and value contexts.
   canonical-sequence sweep retypes only the occurrences to float64, later.
   The descriptor column dtype has to reach the arena's row at precompile.
 
+## Unbounded lists, unclaimed row loads and the 9cc6910 regressions
+
+Each repair below names the program, the wrong record and the rule.
+
+- **Unbounded private lists are DYNAMIC at birth.** `xs = []; for i in
+  range(n): xs.append(i * i)` (c50).
+  - Wrong record: the descriptor was FIXED and nothing proved its rows. The
+    frame allocated one element. LLVM's append reported "full" into a
+    status nobody reads (n=5 returned 1, not 35), and C refused the program.
+  - Rule: the shell's one capacity survey
+    (`_static_sequence_capacity_survey`) also returns the local lists no
+    bound covers. Such a list is born with its own heap-owner cell. Its
+    descriptor turns DYNAMIC once its column layouts are known
+    (`_heap_sequence_contract`).
+  - Growth is the existing checked reserve
+    (`_lower_dynamic_sequence_mutation`).
+  - The root wrappers start a frame-owned dynamic sequence empty (null
+    arena cells, capacity 0, null owner) and release the owner after the
+    call.
+- **The C lane spells the heap vocabulary.** The C lane now spells the
+  `ssa_heap_allocation` vocabulary that LLVM already spelled:
+  - the owned-heap `Alloca`;
+  - the `copy_elements` memmove;
+  - `release_owner`;
+  - the cell-indirect GEP;
+  - `turing_heap_release`.
+- **The row concordance at descriptor birth.** The descriptor took column
+  0's dtype from the arena's row (int64), while `sequence_row_dtype` still
+  said `unknown`. The next reuse concorded `unknown` back over int64. The
+  descriptor's column dtypes are now posted to the row concordance at birth.
+- **One entry per lowering.** The dynamic lowering listed its entry first,
+  while callers took the last function, so `xs.append` called
+  `__reserve`. `SSASequenceLowering.entry` is now the helper no other
+  helper in the lowering calls. Every positional pick was replaced.
+- **Helpers own their formals.** The dynamic entry reused its fixed
+  insert's formal objects. Registration re-keys ids in place, scope by
+  scope, so the fixed helper's row lost its physical fields. Each helper
+  now gets its own formal occurrences.
+- **Unclaimed row loads.** `xs[n - 1] if n > 0 else 0` (c52) and
+  `if n > 0: last = xs[n - 1]` (c53).
+  - Wrong record: a row load was scheduled only by a region that owned its
+    `Indexed` instruction or consumed its value. An arm value whose only
+    consumer is the merge had neither, became an unaccounted formal and
+    read 0. Both fail on clean HEAD.
+  - Rule: an unclaimed row load is emitted where its value is first asked
+    for, as the sequence length already is. A result alias asks in its arm.
+    A carried-name arm asks at the arm's exit.
+- **Escaped collections are mutated.** `xs = []; fill(xs, n); return
+  len(xs)`.
+  - Wrong record: the fold treated the empty literal as `xs`'s contents and
+    returned 0.
+  - Rule: a collection passed into a call that may retain or mutate it is
+    mutated. This is the one escape definition the capacity survey uses
+    (`_call_escaped_argument_ids`).
+  - Such a list is now an honest `dynamic-growth-unavailable` refusal
+    (below).
+- **Refusal covers call-result columns.** `ys = make(n)` silently returned
+  0: the root view's column is the call's output slot, so neither wrapper
+  published capacity. Both wrappers now refuse any root-owned capacity
+  over an unproven column.
+- **9cc6910 regressions found by bootstrap snap6:**
+  - units 060/064: pursued definitions were not made binary. Every pursued
+    tree is now normalized first.
+  - units 048/049: `if serial < 0 or serial > bits: raise` placed the
+    guard inside the `or`'s own arm. A guard on a conditional merge now
+    follows that conditional.
+  - unit 072: a comprehension authored in a short-circuit operand had no
+    arm. The BoolOp's guarded operand is its arm. A region-less conditional
+    is never nested past an intervening loop. An inserted loop takes over
+    the region markers it owns.
+  - unit 043: a latch-generation row load was minted with no dtype. It now
+    takes its identity's recorded row dtype.
+
+## Lists across call edges and f-strings
+
+Each repair below names the program, the wrong record and the rule.
+
+- **One capacity contract per storage.** `xs = []; fill(xs, n)` (c55) and
+  `ys = make(n)` (c56). `_settle_linked_dynamic_sequences` joins the views
+  of one storage over the exact `linked_value_edges`.
+  - A component is DYNAMIC in every view when it grows without a bound
+    anywhere: an unbounded local list, an append inside a loop, or any
+    append to a parameter or call result.
+  - Every view publishes `linked_dynamic_sequence_ids`, and descriptor
+    birth reads it.
+  - A parameter view's owner is a parameter member.
+- **The owner is a storage member.** `_storage_values` emits the heap owner
+  last, so every helper built from a heap descriptor takes it. The
+  hand-added owners in allocate, reserve, the dynamic entry and extend are
+  gone.
+  - Pruners keep it: `_live_sequence_member_ids`, callee pruning, and the
+    structural-recovery formal filter.
+  - Before this, f"a@{n}"'s token list lost its owner. The caller then
+    leased a second owner for the same arena.
+- **Binding refuses two contracts.** `_bind_sequence_storage_members` now
+  raises when one bound view is DYNAMIC and the other is not. It used to
+  return False, and the linker gave the callee fresh length/capacity cells:
+  `fill` appended into storage the caller never read.
+- **Returned sequences bind the owner, and owner ids are translated.** The
+  returned-sequence binding includes the owner. The callee output's
+  accounting was copied raw into the caller's result, naming the callee's
+  owner id. An owner id now crosses only through the call's storage
+  binding.
+- **Element type is one fact.**
+  - A mutable sequence argument takes the callee formal's declared row
+    contract when the caller states none (`fill(dst: list[int])`).
+  - A single-column sequence's settled linked contract is its declared
+    column dtype.
+  - A loop target over a call-result list reads the iterable's linked
+    contract, not the domain's provisional float64.
+- **Glyph sequences.** A JoinedStr recipe destination and the glyph
+  projections hold int64 StringTable tokens, declared at birth. Within a
+  function, a sequence `extend`/`replace` fills from a DYNAMIC source is
+  DYNAMIC. Together these make f"a@{n}" DYNAMIC before its first step's
+  helper is lowered.
+- **Helper calls bind the live helper.** Each literal append re-registers
+  the same helper name, so `callee_input_ids` are stamped once the
+  function is complete, from the live helper's formals. This includes
+  calls between helpers.
+- **Extend walks int64.** The loop index and source length now match the
+  int64 length cell. LLVM had refused the i32 index Phi.
+- **Bare returns in procedures.** `if v == 0: dst.append(7); return`
+  (c59). A value-less return produced no control, so "0" was spelled
+  "00". It is now the return edge with zero slots.
+- **Mutable escapes only.** The fold's escape rule counts only mutable
+  collections. Builtins that read or copy a collection (`bytes`, `sorted`,
+  `sum`, ...) do not escape it. Before a call's extraction identity is
+  resolved, its static builtin symbol names it.
+
 ## Open frontier (stated, not worked around)
 
 - Generic `str()`/`!r` of `Any`-typed facts (ten f-string units): needs a
@@ -286,5 +415,13 @@ guarded calls, guards inside loops and value contexts.
   unit 64/254 read that provisional as a sequence column dtype.
 - Native validation runtime is absent from the C module lane (no corpus
   program with a reachable `raise` can be emitted there).
+- Lists across call edges:
+  - A list a callee grows (c125) or returns (c126) refuses honestly. It
+    needs the DYNAMIC contract settled across the exact call bindings
+    (`linked_value_edges`), with the owner as a bound descriptor member.
+  - A constant list literal passed to a reader fails with "aggregate call
+    binding arity 3 != 0" on clean HEAD (c127).
+- `any(generator)` as a short-circuit operand stays a flat region
+  reduction with no element count (c129/c130, also on HEAD).
 - Local class construction from a source-derived schema is
   `constructor_complete=False` by design (c19).

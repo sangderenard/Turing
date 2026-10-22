@@ -61,6 +61,7 @@ from .deployment_fifo import DeploymentFIFO
 from .control_source import (
     AuthoredControlSite,
     CallBlock,
+    ConditionalBlock,
     ControlExpression,
     ControlOverlayScopeError,
     ControlProgram,
@@ -929,10 +930,37 @@ def _place_validation_blocks(
             values.update(expression_value_ids(operand))
         return frozenset(values)
 
+    # Program: ``if serial < 0 or serial > bits: raise`` (id_space.compose).
+    # Wrong record: the guard's predicate was spelled ``or(lt, gt)`` and
+    # placed after the region computing ``gt`` -- inside the short-circuit
+    # conditional's own guarded arm -- so its CondBr read the operator's
+    # merge before the merge existed (use-not-dominated).  Rule: a predicate
+    # a ConditionalBlock merge defines is control-owned; the guard follows
+    # that conditional, and its operand regions do not schedule it.
+    def control_merges(block) -> set[int]:
+        merged: set[int] = set()
+        if isinstance(block, ConditionalBlock):
+            merged.update(int(alias[2]) for alias in block.result_aliases)
+            merged |= control_merges(block.body)
+            if block.orelse is not None:
+                merged |= control_merges(block.orelse)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                merged |= control_merges(child)
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            merged |= control_merges(block.body)
+            if isinstance(block, WhileBlock):
+                merged |= control_merges(block.condition)
+        return merged
+
+    merged_predicates = frozenset(control_merges(control.root))
     required_by_validation = {
         int(block.predicate_value_id): (
             {int(block.predicate_value_id)}
-            | set(expression_value_ids(block.predicate_expression))
+            | (
+                set() if int(block.predicate_value_id) in merged_predicates
+                else set(expression_value_ids(block.predicate_expression))
+            )
         )
         for block in validations
     }
@@ -978,6 +1006,7 @@ def _place_validation_blocks(
             )
     return place_validations_after_region_producers(
         control, validations, predicate_regions=predicate_regions,
+        merged_predicates=merged_predicates,
     )
 
 
@@ -8560,6 +8589,24 @@ def _ordinary_conditional_control_programs(
             if not statements:
                 return None
             terminal = statements[-1]
+            if (
+                isinstance(terminal, ast.Return)
+                and terminal.value is None
+                and not inside_loop
+                and not tuple(graph.G.graph.get("function_outputs") or ())
+            ):
+                # Program: ``if v == 0: dst.append(7); return`` then
+                # ``dst.append(8)`` (``append_decimal_integer_glyphs``'s
+                # zero case).  Wrong record: a value-less return produced no
+                # control, so the statements after the guard also ran ("0"
+                # was spelled "00").  Rule: a bare return in a procedure is
+                # the same return edge to the function exit, carrying the
+                # procedure's zero result slots.
+                return LoopControlBlock(
+                    "return", None, True, None,
+                    source_action="return",
+                    return_value_ids=(),
+                )
             if not isinstance(terminal, ast.Return) or terminal.value is None:
                 return None
             returned = terminal.value
@@ -8989,15 +9036,43 @@ def _nest_region_less_conditionals(
         statements = getattr(expression, arm)
         return statements if isinstance(statements, list) else [statements]
 
+    loop_types = (
+        ast.For, ast.AsyncFor, ast.While,
+        ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp,
+    )
+
     def owning_arm(parent: ast.AST, child: ast.AST):
         child_signature = _ast_source_signature(child)
-        for arm in ("body", "orelse"):
-            if any(
+
+        def contains(node: ast.AST) -> bool:
+            return any(
                 _ast_source_signature(member) == child_signature
-                for statement in arm_statements(parent, arm)
+                for member in ast.walk(node)
+            )
+
+        for arm in ("body", "orelse"):
+            statements = [
+                statement for statement in arm_statements(parent, arm)
+                if contains(statement)
+            ]
+            if not statements:
+                continue
+            # Program: ``A or any((i.x or (None,))[0] in ops for b in bs
+            # for i in b.instrs)`` (native_object_requirement_sources).
+            # Wrong record: the inner region-less ``or`` was nested straight
+            # into the outer ``or``'s arm, skipping the comprehension loop
+            # between them, so the loop's region had two sequential control
+            # owners.  Rule: a conditional owns a child directly only when no
+            # loop lies between them; otherwise that loop owns it.
+            if any(
+                isinstance(member, loop_types)
+                and _ast_source_signature(member) != child_signature
+                and contains(member)
+                for statement in statements
                 for member in ast.walk(statement)
             ):
-                return arm
+                return None
+            return arm
         return None
 
     region_lines: dict[int, int | None] = {}
@@ -20785,6 +20860,31 @@ def _tensor_descriptor_rule(
             # leaves) put in it; when every one of them describes the same
             # scalar, that is the target's descriptor.
             iterable_attributes = graph.G.nodes[iterable].get("attributes") or {}
+            # Program: ``ys = make(n)`` then ``for y in ys``.  Wrong record:
+            # the target took the domain's provisional float64 and the
+            # builder imposed it on the caller's view of ``make``'s int64
+            # arena; the call edge's settled contract already said int64.
+            # Rule: a single-column iterable's linked contract (settled over
+            # the exact call binding) is its row, hence the target's.
+            linked_contract = dict(
+                (graph.G.graph.get("linked_value_abi") or {}).get(
+                    iterable_value
+                ) or {}
+            )
+            if (
+                len(targets) == 1
+                and str(linked_contract.get("storage") or "") in {
+                    "span", "sequence",
+                }
+                and int(linked_contract.get("rank") or 0) == 1
+                and str(linked_contract.get("dtype") or "") not in {
+                    "", "None", "unknown",
+                }
+            ):
+                return {
+                    "shape": (), "dtype": str(linked_contract["dtype"]),
+                    "rank": 0,
+                }
             if (
                 len(targets) == 1
                 and iterable_attributes.get("aggregate_kind") == "list"
@@ -22095,6 +22195,41 @@ def _fold_callsite_structural_values(
             graph.G.graph.get("source_sequence_mutation_records") or {}
         ).values()
     }
+    # Program: ``xs = []; fill(xs, n); return len(xs)``.  Wrong record: the
+    # empty literal was folded as ``xs``'s contents because only direct
+    # mutation records and indexed stores counted; ``fill`` appends to its
+    # argument, and ``len(xs)`` folded to 0.  Rule: a collection passed into
+    # a call that may retain or mutate it is mutated, by the one escape
+    # definition the capacity survey uses.
+    # Only a MUTABLE collection can be changed by the call; a tuple, a
+    # frozenset, bytes or a string passed to a callee keeps its contents
+    # (``test_structural_fold_retains_singleton_aggregate_leaf_identity``).
+    from .resident_sequence_materialization import _call_escaped_argument_ids
+
+    def mutable_collection(node_id: int) -> bool:
+        data = graph.G.nodes.get(int(node_id), {})
+        expression = data.get("expr_obj")
+        if isinstance(expression, (
+            ast.List, ast.Set, ast.Dict,
+            ast.ListComp, ast.SetComp, ast.DictComp,
+        )):
+            return True
+        if isinstance(expression, ast.Constant):
+            return isinstance(expression.value, (list, set, dict, bytearray))
+        literal = (data.get("attributes") or {}).get("value")
+        if isinstance(literal, (list, set, dict, bytearray)):
+            return True
+        return str((data.get("attributes") or {}).get(
+            "extraction_identity"
+        ) or "") in {
+            "builtins.list", "builtins.set", "builtins.dict",
+            "builtins.bytearray",
+        }
+
+    mutated_sequence_ids.update(
+        node_id for node_id in _call_escaped_argument_ids(graph.G)
+        if mutable_collection(node_id)
+    )
     # IndexedStore carries the updated state identity on its base edge. Its
     # initializer must stay resident too: folding it to a literal made each
     # region construct its own [0.0], so the write survived but the later read

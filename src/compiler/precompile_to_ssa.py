@@ -2062,6 +2062,7 @@ class _ControlSSABuilder(TiledObject):
             int, tuple[tuple[int, str, int], ...]
         ] | None = None,
         source_sequence_ids: tuple[int, ...] = (),
+        dynamic_sequence_ids: tuple[int, ...] = (),
         sequence_memberships: tuple[
             tuple[int, int | tuple[int, ...], int, bool], ...
         ] = (),
@@ -2088,6 +2089,7 @@ class _ControlSSABuilder(TiledObject):
         table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
         table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
         table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+        consumer_row_loads: Mapping[int, tuple[Any, ...]] | None = None,
         resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
         native_object_context: Any = None,
         native_object_module: Any = None,
@@ -2354,6 +2356,11 @@ class _ControlSSABuilder(TiledObject):
                 sequence_child_table_layouts or {}
             ).items()
         }
+        # Local sequences whose row count the graph's capacity survey could
+        # not bound (``_static_sequence_capacity_survey``).  Their descriptor
+        # is born DYNAMIC with a heap owner, never FIXED at an unproven size.
+        self.dynamic_sequence_ids = frozenset(map(int, dynamic_sequence_ids))
+        self.sequence_heap_owners: dict[int, SSAValue] = {}
         # Record-typed columns of fixed-width rows: (authored column,
         # identity, physical width) per resident sequence.
         self.sequence_row_record_slots = {
@@ -2531,6 +2538,18 @@ class _ControlSSABuilder(TiledObject):
                         f"first={incumbent!r}, second={exact!r}"
                     )
                 self.sequence_row_load_operations[result_id] = exact
+        # Program: ``xs[n - 1] if n > 0 else 0`` (a resident list).  Wrong
+        # record: a row load is scheduled only by the region that owns its
+        # ``Indexed`` instruction or that consumes its value; an IfExp arm
+        # whose sole consumer is the merge Phi had neither, so the arm value
+        # became an unaccounted formal and read 0.  Rule: a row load no
+        # region schedules is emitted where its value is first asked for --
+        # the arm, for a result alias -- as the sequence length already is.
+        self.consumer_row_loads: dict[int, tuple[Any, ...]] = {
+            int(result_id): tuple(operation)
+            for result_id, operation in (consumer_row_loads or {}).items()
+            if int(result_id) not in self.sequence_row_load_operations
+        }
         self.uniform_values: dict[str, SSAValue] = {}
         # Lexical control names (currently loop induction variables) are SSA
         # values too.  Keeping them here lets a StateMachineTick dispatch on
@@ -5139,6 +5158,10 @@ class _ControlSSABuilder(TiledObject):
                     value_id, incumbent, BindingKind.FIELD_INCUMBENT,
                     self._binding_cell(field_value_id),
                 )
+        consumer_row_load = self.consumer_row_loads.get(value_id)
+        if consumer_row_load is not None and value_id not in self.external_values:
+            del self.consumer_row_loads[value_id]
+            self._emit_sequence_row_load(*consumer_row_load)
         sequence_id = self.sequence_length_values.get(value_id)
         if sequence_id is not None and value_id not in self.external_values:
             if int(sequence_id) in self.native_object_source_ids:
@@ -5369,9 +5392,29 @@ class _ControlSSABuilder(TiledObject):
                 # it replaces kept the incumbent object's dtype): a
                 # redefining producer's own claim (a region view's float64,
                 # tuple_loop_row_handle_contract value 18) does not retype it.
+                # The recorded type is the identity's ``ssa_value`` row:
+                # ``_merge_partitions.resident``'s row load 14 was posted
+                # float64 by region planning while its entry object still
+                # read 'unknown', and a generation copying the object was
+                # minted with no dtype ("unresolved physical transport").
+                recorded = self._book().latest_ref(
+                    SSA_VALUE, (self._scope(), int(value_id)),
+                )
+                recorded_fact = (
+                    None if recorded is None
+                    else self._book().page(SSA_VALUE).cell(
+                        recorded.row, recorded.column,
+                    )
+                )
+                recorded_dtype = (
+                    recorded_fact.dtype
+                    if isinstance(recorded_fact, SSAValueFact)
+                    and recorded_fact.dtype not in {None, "", "unknown"}
+                    else None
+                )
                 previous = value
                 value = self.fresh_value(
-                    dtype=value.dtype or dtype,
+                    dtype=recorded_dtype or value.dtype or dtype,
                     shape=tuple(value.shape),
                     transform=VERSIONED_WRITE,
                     operands=(self._binding_cell(value_id), previous),
@@ -7645,6 +7688,11 @@ class _ControlSSABuilder(TiledObject):
         arm_id = int(arm_id)
         if arm_id == int(initial_id):
             return snapshot, snapshot_cell
+        if arm_id in self.consumer_row_loads:
+            # ``if n > 0: last = xs[n - 1]``: the merge is the row load's
+            # only consumer, and this is the arm's exit -- the place its
+            # value is first asked for (see ``consumer_row_loads``).
+            self.external_value(arm_id)
         value = self.external_values.get(arm_id)
         # The fused pointer-type program first binds store-version 462 in
         # the nested true arm (Phi319), then republishes it as Phi321. It
@@ -10599,9 +10647,9 @@ class _ControlSSABuilder(TiledObject):
                 stage=self._stage(),
             )
             if tuple(existing.column_dtypes) != concorded_column_dtypes:
-                existing = replace(
-                    existing, column_dtypes=concorded_column_dtypes
-                )
+                existing = self._heap_sequence_contract(replace(
+                    existing, column_dtypes=concorded_column_dtypes,
+                ))
                 self.sequence_descriptors[value_id] = existing
                 for value, dtype in zip(
                     self.sequence_storage_values[value_id],
@@ -10874,6 +10922,58 @@ class _ControlSSABuilder(TiledObject):
                 key_columns=tuple(child_key_columns),
                 writable=bool(child_writable),
             )
+        # Program: ``xs = []; for i in range(n): xs.append(i * i)``.  Wrong
+        # record: the descriptor was FIXED while nothing proves its rows, so
+        # the frame allocated one element; LLVM's append reported "full" into
+        # a status nobody reads (n=5 returned 1, not 35) and C refused the
+        # program.  Rule: a private local list the capacity survey leaves
+        # unbounded is born DYNAMIC with its own heap owner cell; growth is
+        # the existing checked reserve and the owner is released with the
+        # frame.  Borrowed (parameter) storage, child pools, live flags and
+        # shaped rows keep their fixed contracts.
+        # Program: ``xs = []; for i in range(n): xs.append(i * i)``.  Wrong
+        # record: the descriptor took column 0 from the data arena's row
+        # (int64) while ``sequence_row_dtype`` still said 'unknown', so the
+        # next reuse concorded 'unknown' back over the descriptor's int64.
+        # Rule: the descriptor's column dtypes are posted to the row
+        # concordance at birth, derived from the arena cells they came from;
+        # the two records state one row layout.
+        born_column_dtypes = (
+            str(data.dtype or "unknown"),
+            *(str(column.dtype or "unknown") for column in extra_columns),
+        )
+        if born_column_dtypes != tuple(concorded_column_dtypes):
+            concord_sequence_row_dtypes(
+                self.function_name,
+                {value_id: born_column_dtypes},
+                source=f"{location}: descriptor arena dtypes",
+                sources=self._cells(
+                    self._sequence_contract_cell(value_id),
+                    data, *extra_columns,
+                ) or (self._function_root(),),
+                stage=self._stage(),
+            )
+        # A parameter's view joins its caller's DYNAMIC storage through the
+        # settled call bindings (``linked_dynamic_sequence_ids``); its owner
+        # cell is then a parameter member like length and capacity, bound
+        # to the caller's owner by ``_bind_sequence_storage_members``.
+        if (
+            value_id in self.dynamic_sequence_ids
+            and child_table_pool is None
+            and live_flags is None
+            and not any(proposed_column_shapes)
+        ):
+            heap_owner = storage_cell("ptr", (1,))
+            heap_owner.accounting = {
+                **dict(heap_owner.accounting or {}),
+                "heap_owner": True,
+                "compiler_frame_storage": str(self.function_name),
+                "compiler_frame_sequence_id": value_id,
+                "transformation_priority": "compiler_storage_identity",
+                "transformation_tie_policy": "incumbent",
+            }
+            self.arguments.append(heap_owner)
+            self.sequence_heap_owners[value_id] = heap_owner
         descriptor = SSASequenceDescriptor(
             sequence_id=value_id,
             column_value_ids=(int(data.id), *(
@@ -10897,6 +10997,7 @@ class _ControlSSABuilder(TiledObject):
             writable=bool(writable),
             child_table_pool=child_table_pool,
         )
+        descriptor = self._heap_sequence_contract(descriptor)
         # NOTE: a key column here is routinely left with the provisional
         # dtype a structural constant carries (float64, or "unknown"), and
         # no column contract reaches this point to correct it -- see
@@ -10911,6 +11012,10 @@ class _ControlSSABuilder(TiledObject):
         self.sequence_storage_values[value_id] = (
             data, *extra_columns, length_address, capacity,
             *((live_flags,) if live_flags is not None else ()),
+            *(
+                (self.sequence_heap_owners[value_id],)
+                if descriptor.heap_owner_value_id is not None else ()
+            ),
         )
         if status_address is not None:
             self.sequence_status_values[value_id] = status_address
@@ -10977,6 +11082,62 @@ class _ControlSSABuilder(TiledObject):
                     "program_abi_rank": _member_fact.rank,
                 }
         return descriptor
+
+    def _heap_sequence_contract(
+        self, descriptor: SSASequenceDescriptor,
+    ) -> SSASequenceDescriptor:
+        """State the DYNAMIC contract once every column layout is known.
+
+        An unbounded local list is usually born empty (``xs = []``), so its
+        element type arrives with its first writer.  Its heap owner cell is
+        claimed at birth; the descriptor becomes DYNAMIC, and its columns
+        heap pointer cells, at the first moment the layouts exist -- the
+        heap contract never guesses an element layout.
+        """
+
+        from ..transmogrifier.dtype_layout import layout_for
+
+        owner = self.sequence_heap_owners.get(int(descriptor.sequence_id))
+        if (
+            owner is None
+            or descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC
+        ):
+            return descriptor
+        try:
+            layouts = tuple(
+                layout_for(str(dtype)) for dtype in descriptor.column_dtypes
+            )
+        except KeyError:
+            return descriptor
+        if len(layouts) != len(descriptor.column_value_ids):
+            return descriptor
+        columns = self.sequence_storage_values.get(
+            int(descriptor.sequence_id), ()
+        )[:len(descriptor.column_value_ids)] or tuple(
+            self.ssa_value_objects[int(value_id)]
+            for value_id in descriptor.column_value_ids
+        )
+        for column, layout in zip(columns, layouts, strict=True):
+            column.accounting = {
+                **dict(column.accounting or {}),
+                "heap_element_dtype": layout.name,
+                "heap_owner_value_id": int(owner.id),
+            }
+        # The owner is a storage member, last (``_storage_values``): every
+        # helper call that passes the sequence's storage passes its owner.
+        sequence_id = int(descriptor.sequence_id)
+        if sequence_id in self.sequence_storage_values and not any(
+            int(value.id) == int(owner.id)
+            for value in self.sequence_storage_values[sequence_id]
+        ):
+            self.sequence_storage_values[sequence_id] = (
+                *self.sequence_storage_values[sequence_id], owner,
+            )
+        return replace(
+            descriptor,
+            capacity_policy=SSASequenceCapacityPolicy.DYNAMIC,
+            heap_owner_value_id=int(owner.id),
+        )
 
     def _sequence_status_address(self, status_arena: SSAValue) -> SSAValue:
         zero = self.constant_value(0, status_arena)
@@ -13896,7 +14057,7 @@ class _ControlSSABuilder(TiledObject):
             }
             call_arguments = tuple(
                 available_arguments[int(formal.id)]
-                for formal in lowering.functions[-1].args
+                for formal in lowering.entry.args
             )
             status = self.fresh_value(
                 dtype="int", transform=REGION_CALL_RESULT,
@@ -13907,7 +14068,7 @@ class _ControlSSABuilder(TiledObject):
                 list(call_arguments),
                 status,
                 attributes={
-                    "callee": lowering.functions[-1].name,
+                    "callee": lowering.entry.name,
                     "source_linked": True,
                     "ssa_sequence_operation": "sort",
                     "sequence_id": int(destination.sequence_id),
@@ -13983,7 +14144,7 @@ class _ControlSSABuilder(TiledObject):
             self.emit(
                 Handler.Call, list(call_arguments), status,
                 attributes={
-                    "callee": lowering.functions[-1].name,
+                    "callee": lowering.entry.name,
                     "source_linked": True,
                     "ssa_sequence_operation": operation,
                     "sequence_id": int(destination.sequence_id),
@@ -14901,7 +15062,7 @@ class _ControlSSABuilder(TiledObject):
                     ],
                     count_status,
                     attributes={
-                        "callee": count_lowering.functions[-1].name,
+                        "callee": count_lowering.entry.name,
                         "source_linked": True,
                         "ssa_sequence_operation": "append_joined_count",
                         "sequence_id": int(destination.sequence_id),
@@ -14930,7 +15091,7 @@ class _ControlSSABuilder(TiledObject):
                     list(joined_call_values.values()),
                     flat_status,
                     attributes={
-                        "callee": flat_lowering.functions[-1].name,
+                        "callee": flat_lowering.entry.name,
                         "source_linked": True,
                         "ssa_sequence_operation": (
                             "append_joined_singleton"
@@ -15547,7 +15708,10 @@ class _ControlSSABuilder(TiledObject):
             )
             return
         self._register_sequence_lowering(lowering)
-        callee = lowering.functions[-1].name
+        callee = lowering.entry.name
+        # A DYNAMIC destination's entry takes its heap owner cell last
+        # (``_lower_dynamic_sequence_mutation``); the owner is the exact
+        # cell the descriptor names, never a positional stand-in.
         status = self.fresh_value(
             dtype="int", transform=REGION_CALL_RESULT,
             operands=tuple(call_arguments),
@@ -20609,6 +20773,7 @@ def lower_control_program_to_ssa(
         int, tuple[tuple[int, str, int], ...]
     ] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
+    dynamic_sequence_ids: tuple[int, ...] = (),
     sequence_memberships: tuple[
         tuple[int, int | tuple[int, ...], int, bool], ...
     ] = (),
@@ -20635,6 +20800,7 @@ def lower_control_program_to_ssa(
     table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
     table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
     table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+    consumer_row_loads: Mapping[int, tuple[Any, ...]] | None = None,
     resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
     native_object_context: Any = None,
     native_object_module: Any = None,
@@ -20674,6 +20840,7 @@ def lower_control_program_to_ssa(
         sequence_child_table_layouts=sequence_child_table_layouts,
         sequence_row_record_slots=sequence_row_record_slots,
         source_sequence_ids=source_sequence_ids,
+        dynamic_sequence_ids=dynamic_sequence_ids,
         sequence_memberships=sequence_memberships,
         table_lookups=table_lookups,
         lexical_table_lookup_result_ids=lexical_table_lookup_result_ids,
@@ -20694,6 +20861,7 @@ def lower_control_program_to_ssa(
         table_region_operations=table_region_operations,
         table_region_post_operations=table_region_post_operations,
         table_epilogue_operations=table_epilogue_operations,
+        consumer_row_loads=consumer_row_loads,
         resolved_sequence_schemas=resolved_sequence_schemas,
         native_object_context=native_object_context,
         native_object_module=native_object_module,
@@ -20717,6 +20885,38 @@ def lower_control_program_to_ssa(
     from .ir_sequence_tables import schedule_joined_sequence_mutations
 
     schedule_joined_sequence_mutations(function)
+    # Program: ``append_decimal_integer_glyphs`` (seven literal appends).
+    # Wrong record: each append re-lowers and re-registers the same helper
+    # name, minting a fresh row formal; the last registration is the live
+    # helper, so identities stamped at each call's emission named formals
+    # that no longer exist and the heap-context projection refused the
+    # call.  Rule: a sequence helper call binds the LIVE helper's formals by
+    # position; once the function is complete, a call into a heap-owning
+    # helper records exactly those formals as its ``callee_input_ids``.
+    helpers = builder.sequence_helper_functions
+    for block in (
+        block
+        for caller in (function, *helpers.values())
+        for block in caller.blocks.values()
+    ):
+        for instruction in block.instrs:
+            if instruction.op != "Call":
+                continue
+            helper = helpers.get(str(instruction.attributes.get("callee")))
+            if helper is None or not any(
+                (formal.accounting or {}).get("heap_owner")
+                for formal in helper.args
+            ):
+                continue
+            if len(helper.args) != len(instruction.args):
+                raise ValueError(
+                    "heap sequence helper call does not bind every live "
+                    f"formal: {helper.name!r} has {len(helper.args)} "
+                    f"formal(s), the call passes {len(instruction.args)}"
+                )
+            instruction.attributes["callee_input_ids"] = tuple(
+                int(formal.id) for formal in helper.args
+            )
     return function, shortfalls
 
 
@@ -23683,6 +23883,7 @@ def lower_control_sections_to_ssa(
     ] | None = None,
     callsite_projection_ids: Mapping[int, tuple[int, ...]] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
+    dynamic_sequence_ids: tuple[int, ...] = (),
     sequence_memberships: tuple[
         tuple[int, int | tuple[int, ...], int, bool], ...
     ] = (),
@@ -26440,6 +26641,7 @@ def lower_control_sections_to_ssa(
         sequence_child_table_layouts=sequence_child_table_layouts,
         sequence_row_record_slots=sequence_row_record_slots,
         source_sequence_ids=source_sequence_ids,
+        dynamic_sequence_ids=dynamic_sequence_ids,
         sequence_memberships=sequence_memberships,
         table_lookups=table_lookups,
         lexical_table_lookup_result_ids=lexical_table_lookup_ids,
@@ -26477,6 +26679,7 @@ def lower_control_sections_to_ssa(
             for region, operations in table_region_post_operations.items()
         },
         table_epilogue_operations=tuple(table_epilogue_operations),
+        consumer_row_loads=row_load_by_result,
         native_object_context=native_object_context,
         native_object_module=native_object_module,
         native_object_value_ids=native_object_value_ids,

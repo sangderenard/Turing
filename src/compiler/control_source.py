@@ -3786,6 +3786,34 @@ def _order_conditional_state_dependencies(block: ControlBlock) -> ControlBlock:
     return replace(block, blocks=tuple(children))
 
 
+def _markers_within(block: "ControlBlock") -> tuple[int, ...]:
+    """Every scheduled region marker a control subtree holds."""
+
+    found: list[int] = []
+
+    def visit(item):
+        if isinstance(item, StatementBlock):
+            marker = _region_marker(item)
+            if marker is not None:
+                found.append(int(marker))
+            return
+        if isinstance(item, SequenceBlock):
+            for child in item.blocks:
+                visit(child)
+        elif isinstance(item, ConditionalBlock):
+            visit(item.body)
+            if item.orelse is not None:
+                visit(item.orelse)
+        elif isinstance(item, WhileBlock):
+            visit(item.condition)
+            visit(item.body)
+        elif isinstance(item, LoopBlock):
+            visit(item.body)
+
+    visit(block)
+    return tuple(found)
+
+
 def overlay_scheduled_control(
     region_indices: Iterable[int],
     controls: Iterable[ControlProgram],
@@ -4261,7 +4289,25 @@ def overlay_scheduled_control(
             for arm in ("body", "orelse"):
                 if not hasattr(block, arm):
                     continue
-                statements = getattr(parent_expression, arm, ())
+                if isinstance(parent_expression, ast.BoolOp):
+                    # Program: ``... or any(... for block in ... for i in
+                    # block.instrs)`` (native_object_requirement_sources).
+                    # Wrong record: a short-circuit conditional's source is
+                    # the BoolOp, which has no ``body``/``orelse`` statements,
+                    # so a loop authored in its guarded operand found no arm.
+                    # Rule: the guarded operand is the conditional's arm --
+                    # ``body`` for ``and``, ``orelse`` for ``or`` (binary
+                    # after source normalization).
+                    guarded = (
+                        "body" if isinstance(parent_expression.op, ast.And)
+                        else "orelse"
+                    )
+                    statements = (
+                        tuple(parent_expression.values[1:])
+                        if arm == guarded else ()
+                    )
+                else:
+                    statements = getattr(parent_expression, arm, ())
                 if isinstance(statements, ast.AST):
                     statements = (statements,)
                 members = tuple(frozenset(map(id, ast.walk(statement)))
@@ -4276,6 +4322,22 @@ def overlay_scheduled_control(
                 raise ValueError("nested loop has ambiguous authored arm")
             arm, (ordinal,), members = slots[0]
             siblings = _flatten_control_sequence(getattr(block, arm))
+            # Program: ``A or any(... for b in bs for i in b.instrs)``.
+            # Wrong record: the short-circuit arm already listed the inner
+            # loop's region marker, and inserting the region-less outer loop
+            # (which holds that loop) left the marker beside it -- one region
+            # with two sequential owners.  Rule: as in marker embedding, a
+            # region the inserted control owns is that control's, so its
+            # marker leaves the arm.
+            owned_regions = set(_markers_within(child_root))
+            siblings = [
+                sibling for sibling in siblings
+                if not (
+                    isinstance(sibling, StatementBlock)
+                    and _region_marker(sibling) is not None
+                    and _region_marker(sibling) in owned_regions
+                )
+            ]
             offset = len(siblings)
             for i, sibling in enumerate(siblings):
                 positions = {j for node in source_ids(sibling)
@@ -4632,6 +4694,7 @@ def place_validations_after_region_producers(
     validations: Iterable[ValidationBlock],
     *,
     predicate_regions: Mapping[int, int],
+    merged_predicates: frozenset[int] = frozenset(),
 ) -> ControlProgram:
     """Place each guard after the region that computes its predicate.
 
@@ -4649,13 +4712,22 @@ def place_validations_after_region_producers(
     """
 
     pending_by_region: dict[int, list[ValidationBlock]] = {}
+    # A predicate that a ConditionalBlock merge defines (a short-circuit
+    # operator's result) is placed directly after that conditional.
+    pending_by_merge: dict[int, list[ValidationBlock]] = {}
     prelude: list[ValidationBlock] = []
     for validation in validations:
+        if int(validation.predicate_value_id) in merged_predicates:
+            pending_by_merge.setdefault(
+                int(validation.predicate_value_id), [],
+            ).append(validation)
+            continue
         region = predicate_regions.get(int(validation.predicate_value_id))
         if region is None:
             prelude.append(validation)
         else:
             pending_by_region.setdefault(int(region), []).append(validation)
+    placed_merges: set[int] = set()
 
     placed: set[int] = set()
 
@@ -4693,7 +4765,16 @@ def place_validations_after_region_producers(
                 return expanded[0]
             return SequenceBlock(tuple(expanded))
         if isinstance(block, SequenceBlock):
-            return replace(block, blocks=tuple(map(visit, block.blocks)))
+            children: list[ControlBlock] = []
+            for child in block.blocks:
+                children.append(visit(child))
+                if isinstance(child, ConditionalBlock):
+                    for alias in child.result_aliases:
+                        merged = int(alias[2])
+                        if merged in pending_by_merge and merged not in placed_merges:
+                            children.extend(pending_by_merge[merged])
+                            placed_merges.add(merged)
+            return replace(block, blocks=tuple(children))
         if isinstance(block, ConditionalBlock):
             return replace(
                 block,
@@ -4721,11 +4802,30 @@ def place_validations_after_region_producers(
         return block
 
     root = visit(program.root)
+    if isinstance(program.root, ConditionalBlock):
+        trailing = [
+            validation
+            for alias in program.root.result_aliases
+            if int(alias[2]) in pending_by_merge
+            and int(alias[2]) not in placed_merges
+            for validation in pending_by_merge[int(alias[2])]
+        ]
+        placed_merges.update(
+            int(alias[2]) for alias in program.root.result_aliases
+        )
+        if trailing:
+            root = SequenceBlock((root, *trailing))
     missing = set(pending_by_region) - placed
     if missing:
         raise ValueError(
             "validation predicate producer regions are absent from the "
             f"scheduled control tree: regions={sorted(missing)!r}"
+        )
+    missing_merges = set(pending_by_merge) - placed_merges
+    if missing_merges:
+        raise ValueError(
+            "validation predicates name conditional merges absent from the "
+            f"control tree's sequences: merges={sorted(missing_merges)!r}"
         )
     if prelude:
         root = SequenceBlock((*prelude, root))

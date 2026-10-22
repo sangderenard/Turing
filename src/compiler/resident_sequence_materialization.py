@@ -1503,12 +1503,75 @@ def _control_sequence_capacity_bounds(control: Any, sequence_ids: Iterable[int])
     return {key: value for key, value in peaks.items() if value is not None}
 
 
+#: Builtins that read (or copy) a collection argument without retaining or
+#: mutating it: the argument's rows after the call are its rows before it.
+_NONESCAPING_COLLECTION_CALLS = frozenset({
+    "builtins.tuple", "builtins.len", "builtins.bool", "builtins.enumerate",
+    "builtins.bytes", "builtins.bytearray", "builtins.list", "builtins.set",
+    "builtins.frozenset", "builtins.dict", "builtins.sorted", "builtins.sum",
+    "builtins.min", "builtins.max", "builtins.any", "builtins.all",
+    "builtins.zip", "builtins.reversed", "builtins.isinstance",
+    "builtins.id", "builtins.str", "builtins.repr",
+})
+
+
+def _call_escaped_argument_ids(graph_obj: Any) -> frozenset[int]:
+    """Values passed as an argument into a call that may retain or mutate it.
+
+    One definition for every reader: the capacity survey (an escaped list's
+    rows are not bounded by its own appends) and the structural fold (an
+    escaped collection's initializer is not its runtime contents).
+    """
+
+    escaped: set[int] = set()
+    for _node_id, data in graph_obj.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not isinstance(expression, ast.Call):
+            continue
+        attributes = data.get("attributes") or {}
+        identity = attributes.get("extraction_identity")
+        reference = attributes.get("static_python_reference")
+        if (
+            identity is None
+            and isinstance(reference, str)
+            and "." not in reference
+        ):
+            # Before extraction resolves the call, its static symbol names
+            # the builtin (``bytes([11])``).
+            identity = f"builtins.{reference}"
+        if identity in _NONESCAPING_COLLECTION_CALLS:
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role).startswith("arg:"):
+                escaped.add(int(parent))
+    return frozenset(escaped)
+
+
 def _static_sequence_capacity_bounds(
     graph_obj: Any,
     *,
     nonmutating_call_ids: Iterable[int] = (),
     control: Any = None,
 ) -> dict[int, int]:
+    return _static_sequence_capacity_survey(
+        graph_obj, nonmutating_call_ids=nonmutating_call_ids, control=control,
+    )[0]
+
+
+def _static_sequence_capacity_survey(
+    graph_obj: Any,
+    *,
+    nonmutating_call_ids: Iterable[int] = (),
+    control: Any = None,
+) -> tuple[dict[int, int], frozenset[int]]:
+    """Proven row bounds, and the local lists no bound covers.
+
+    The second set is the authored local lists (``xs = []``) whose rows the
+    survey cannot bound -- appended inside a loop, or appended by an
+    operator other than ``append`` -- and which never escape into a call.
+    Their storage is the function's own, so their capacity is the dynamic
+    contract (heap owner, checked geometric growth), not a fixed extent.
+    """
     bounds = _static_mapping_capacity_bounds(
         graph_obj,
         nonmutating_call_ids=nonmutating_call_ids,
@@ -1531,17 +1594,10 @@ def _static_sequence_capacity_bounds(
             unknown.add(sequence_id)
         else:
             local_lists[sequence_id] += 1
-    for _node_id, data in graph_obj.nodes(data=True):
-        expression = data.get("expr_obj")
-        if not isinstance(expression, ast.Call):
-            continue
-        identity = (data.get("attributes") or {}).get("extraction_identity")
-        if identity in {"builtins.tuple", "builtins.len", "builtins.bool", "builtins.enumerate"}:
-            continue
-        for parent, role in data.get("parents") or ():
-            if str(role).startswith("arg:") and int(parent) in local_lists:
-                unknown.add(int(parent))
-                escaped.add(int(parent))
+    for parent in _call_escaped_argument_ids(graph_obj):
+        if parent in local_lists:
+            unknown.add(parent)
+            escaped.add(parent)
     bounds.update({key: count for key, count in local_lists.items() if key not in unknown})
     if control is not None:
         bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
@@ -1551,7 +1607,10 @@ def _static_sequence_capacity_bounds(
         source = int(mutation.argument_value_ids[0])
         if source in bounds:
             bounds[int(mutation.sequence_value_id)] = bounds[source]
-    return bounds
+    unbounded = frozenset(
+        key for key in local_lists if key not in bounds and key not in escaped
+    )
+    return bounds, unbounded
 
 
 def _linked_sequence_propagation_kind(
