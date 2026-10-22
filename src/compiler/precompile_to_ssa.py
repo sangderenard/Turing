@@ -10721,7 +10721,20 @@ class _ControlSSABuilder(TiledObject):
         )
         if concorded_column_dtypes:
             first_dtype = concorded_column_dtypes[0]
-        data = self.external_value(value_id, dtype=first_dtype)
+        # Program: ``xs = [5, n, 2]; xs[0] = 7`` (scratch c140).  Wrong
+        # record: with no row type concorded yet, the arena was minted from
+        # the planner's region meta -- its float64 capture guess -- and that
+        # row outlived the int64 the appends concorded ("storage types are
+        # immutable").  Rule: an arena's element type is its row contract;
+        # before any writer states one it is ``unknown``, never the guess.
+        data = self.external_value(
+            value_id,
+            dtype=(
+                first_dtype
+                if first_dtype not in {None, "", "None"}
+                else "unknown"
+            ),
+        )
         # Claim the physical arena at its creation boundary.  Waiting for the
         # final storage-declaration sweep is too late: call/result identity
         # reconciliation may otherwise treat this provisional formal as a
@@ -11176,6 +11189,230 @@ class _ControlSSABuilder(TiledObject):
             capacity_policy=SSASequenceCapacityPolicy.DYNAMIC,
             heap_owner_value_id=int(owner.id),
         )
+
+    def _lower_positional_sequence_operation(
+        self, mutation: ControlSequenceMutation, destination: Any, *,
+        location: str,
+    ) -> None:
+        """``list.pop(i)``, ``list.insert(i, x)`` and ``list.reverse()``.
+
+        Program: ``xs = [5, n, 2]; xs.pop(0)`` / ``xs.insert(0, 8)`` /
+        ``xs.reverse()`` (scratch c141-c143).  Wrong record: these methods had
+        no lowering and were either dropped (results read the unmutated
+        display) or refused.  Rule: each is the repository helper of the same
+        name over the sequence's own storage (``ir_sequence_tables``); an
+        out-of-range ``pop(i)`` raises through the validation runtime as the
+        zero-argument ``pop`` does (Python's IndexError).
+        """
+
+        from .ir_sequence_tables import (
+            lower_sequence_delete_at, lower_sequence_insert_at,
+            lower_sequence_reverse,
+        )
+
+        operation = str(mutation.operator)
+        attributes = {
+            "binding": f"ssa_sequence_{operation}",
+            "sequence_id": int(destination.sequence_id),
+            "source_effect_node_id": int(mutation.effect_node_id),
+        }
+        arguments = tuple(
+            (
+                self.lower_control_expression(expression)
+                if expression is not None
+                else self.external_value(value_id)
+            )
+            for value_id, expression in zip(
+                mutation.argument_value_ids,
+                (
+                    *mutation.argument_expressions,
+                    *(None for _ in range(
+                        len(mutation.argument_value_ids)
+                        - len(mutation.argument_expressions)
+                    )),
+                ),
+            )
+        )
+        columns = len(destination.column_value_ids)
+        if operation == "insert" and len(arguments) == 1 + columns:
+            # The writer of a row proposes the dtypes it stores (the append
+            # rule): ``xs = []`` then ``xs.insert(0, i * 3)`` in a loop
+            # (scratch c161) otherwise left the row unknown, so the private
+            # list never stated its heap contract.
+            stored = tuple(arguments[1:])
+            for value, expression in zip(
+                stored,
+                (*mutation.argument_expressions[1:], *(None,) * columns),
+            ):
+                if (
+                    expression is not None and expression.op == "const"
+                    and str(value.dtype or "unknown") in {"", "unknown", "None"}
+                ):
+                    literal = expression.literal
+                    proposed = (
+                        "bool" if isinstance(literal, bool)
+                        else "int64" if isinstance(literal, int)
+                        else "float64" if isinstance(literal, float)
+                        else None
+                    )
+                    if proposed is not None:
+                        value.dtype = proposed
+                        self._revise_value(value)
+            if any(
+                str(column_dtype) in {"", "unknown", "None"}
+                and str(value.dtype or "unknown") not in {"", "unknown", "None"}
+                for column_dtype, value in zip(destination.column_dtypes, stored)
+            ):
+                refined = self._sequence_descriptor(
+                    mutation.sequence_value_id,
+                    policy=mutation.policy,
+                    writable=True,
+                    location=location,
+                    column_count=columns,
+                    column_dtypes=tuple(
+                        None if str(value.dtype or "unknown")
+                        in {"", "unknown", "None"} else str(value.dtype)
+                        for value in stored
+                    ),
+                    dtype_sources=stored,
+                )
+                if refined is None:
+                    return
+                destination = refined
+        expected = {"reverse": 0, "pop": 1, "insert": 1 + columns}[operation]
+        if len(arguments) != expected:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", operation, location,
+                f"{operation} expects {expected} argument(s) for a "
+                f"{columns}-column row, received {len(arguments)}",
+            ))
+            return
+        storage = self.sequence_storage_values[int(destination.sequence_id)]
+        length_address = storage[columns]
+        helper_operation = {
+            "reverse": "reverse", "pop": "delete_at", "insert": "insert_at",
+        }[operation]
+        lower = {
+            "reverse": lower_sequence_reverse,
+            "delete_at": lower_sequence_delete_at,
+            "insert_at": lower_sequence_insert_at,
+        }[helper_operation]
+        lowering = lower(
+            destination,
+            function_name=self._sequence_helper_name(
+                int(destination.sequence_id), helper_operation,
+            ),
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+        )
+        if not lowering.complete:
+            self.shortfalls.extend(
+                SSALoweringShortfall(
+                    "ssa-sequence", item.code.value, location, item.reason,
+                )
+                for item in lowering.shortfalls
+            )
+            return
+        self._register_sequence_lowering(lowering)
+        extra: tuple[SSAValue, ...] = ()
+        if operation == "pop":
+            # Python's index rule, then the row read, then the removal.
+            index = arguments[0]
+            length = self.fresh_value(
+                dtype="int64", transform=LOAD, operands=(length_address,),
+            )
+            self.emit(Handler.Load, [length_address], length, attributes=attributes)
+            zero = self.constant_value(0, length)
+            negative = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(index,),
+            )
+            self.emit(Handler.Lt, [index, zero], negative, attributes=attributes)
+            wrapped = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(index, length),
+            )
+            self.emit(Handler.Add, [index, length], wrapped, attributes=attributes)
+            normalized = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(negative, wrapped, index),
+            )
+            self.emit(
+                Handler.Select, [negative, wrapped, index], normalized,
+                attributes=attributes,
+            )
+            at_least_zero = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(normalized,),
+            )
+            self.emit(Handler.Ge, [normalized, zero], at_least_zero, attributes=attributes)
+            below_length = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(normalized, length),
+            )
+            self.emit(Handler.Lt, [normalized, length], below_length, attributes=attributes)
+            inside = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(at_least_zero, below_length),
+            )
+            self.emit(Handler.LAnd, [at_least_zero, below_length], inside, attributes=attributes)
+            selected = self.new_block("sequence_pop_selected")
+            outside = self.new_block("sequence_pop_empty")
+            self.conditional_branch(inside, selected, outside)
+            self.current = outside
+            self.emit(
+                Handler.Call, [],
+                attributes={
+                    "callee": "turing_validation_error", "error_code": 71,
+                    **attributes,
+                },
+            )
+            self.branch(selected)
+            self.current = selected
+            if columns == 1:
+                address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS,
+                    operands=(storage[0], normalized),
+                )
+                self.emit(
+                    Handler.GetElementPtr, [storage[0], normalized], address,
+                    attributes=attributes,
+                )
+                result = self.produced_value(
+                    int(mutation.effect_node_id),
+                    dtype=str(destination.column_dtypes[0] or "unknown"),
+                    claim_provisional_definition=True,
+                    cause=(address,),
+                )
+                self.emit(Handler.Load, [address], result, attributes=attributes)
+                self._bind(
+                    int(mutation.effect_node_id), result,
+                    BindingKind.SEQUENCE_RESULT, address,
+                )
+            extra = (normalized,)
+        elif operation == "insert":
+            extra = tuple(arguments)
+        storage_by_id = {int(value.id): value for value in storage}
+        remaining = iter(extra)
+        call_arguments = []
+        for formal in lowering.entry.args:
+            if int(formal.id) in storage_by_id:
+                call_arguments.append(storage_by_id[int(formal.id)])
+            else:
+                call_arguments.append(next(remaining))
+        status = self.fresh_value(
+            dtype="int", transform=REGION_CALL_RESULT, operands=tuple(call_arguments),
+        )
+        self.emit(
+            Handler.Call, call_arguments, status,
+            attributes={
+                "callee": lowering.entry.name, "source_linked": True,
+                "ssa_sequence_operation": helper_operation, **attributes,
+            },
+        )
+        status_arena = self.sequence_status_values.get(int(destination.sequence_id))
+        if status_arena is not None:
+            self.emit(
+                Handler.Store, [status, self._sequence_status_address(status_arena)],
+                attributes={"binding": "ssa_sequence_status"},
+            )
 
     def _sequence_status_address(self, status_arena: SSAValue) -> SSAValue:
         zero = self.constant_value(0, status_arena)
@@ -13852,7 +14089,7 @@ class _ControlSSABuilder(TiledObject):
                 "destination uniqueness policy is unresolved",
             ))
             return
-        if not mutation.argument_value_ids and operation not in {"clear", "pop", "sort"}:
+        if not mutation.argument_value_ids and operation not in {"clear", "pop", "sort", "reverse"}:
             self.shortfalls.append(SSALoweringShortfall(
                 "ssa-sequence",
                 operation,
@@ -14251,16 +14488,17 @@ class _ControlSSABuilder(TiledObject):
             )
             return
 
+        if operation in {"insert", "reverse"} or (
+            operation == "pop" and mutation.argument_value_ids
+            and not mutation.argument_kind.startswith("mapping_")
+        ):
+            self._lower_positional_sequence_operation(
+                mutation, destination, location=location,
+            )
+            return
         if operation == "pop" and not mutation.argument_kind.startswith(
             "mapping_"
         ):
-            if mutation.argument_value_ids:
-                self.shortfalls.append(SSALoweringShortfall(
-                    "ssa-sequence", operation, location,
-                    "resident sequence pop currently supports only the "
-                    "zero-argument last-row operation",
-                ))
-                return
             if len(destination.column_value_ids) != 1:
                 self.shortfalls.append(SSALoweringShortfall(
                     "ssa-sequence", operation, location,
@@ -27490,6 +27728,21 @@ def lower_control_sections_to_ssa(
                             )
                         ) if cell is not None
                     )
+                    # Program: ``xs = [5, n, 2]; xs[0] = 7`` (scratch
+                    # c140).  Wrong record: this revise wrote the formal's
+                    # planner capture guess (float64) into the arena's row,
+                    # which region formals share with the control function,
+                    # overwriting the int64 its appends concorded.  Rule:
+                    # the arena formal's element type is read from the same
+                    # descriptor as its rank.
+                    _column_dtype = str(
+                        (descriptor.column_dtypes or ("unknown",))[0]
+                    )
+                    if (
+                        descriptor.heap_owner_value_id is None
+                        and _column_dtype not in {"", "None", "unknown"}
+                    ):
+                        argument.dtype = _column_dtype
                     _formal_cell = revise_ssa_value(
                         region_function, int(argument.id),
                         dtype=argument.dtype,

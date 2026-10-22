@@ -553,7 +553,9 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
     name = function_name or f"ssa_sequence_{descriptor.sequence_id}_{'store' if is_store else 'insert'}"
     fixed_descriptor = replace(descriptor, capacity_policy=SSASequenceCapacityPolicy.FIXED)
     fixed = (lower_table_store(fixed_descriptor, function_name=name + "__fixed", first_value_id=first_value_id)
-             if is_store else lower_sequence_insert(fixed_descriptor,
+             if is_store else lower_sequence_insert_at(fixed_descriptor,
+                 function_name=name + "__fixed", first_value_id=first_value_id)
+             if operation == "insert_at" else lower_sequence_insert(fixed_descriptor,
                  function_name=name + "__fixed", operation=operation, first_value_id=first_value_id))
     if not fixed.complete:
         return fixed
@@ -2373,6 +2375,318 @@ def lower_sequence_prepend(
                 int(descriptor.column_value_ids[0]),
                 int(descriptor.length_address_id),
             ),
+            "named_outputs": (("status", int(status.id)),),
+        },
+    ),))
+
+
+def _positional_row_columns(
+    descriptor: SSASequenceDescriptor,
+) -> tuple[SSAValue, ...]:
+    """The row columns as element views, as ``lower_sequence_insert`` spells
+    them (a heap column's cell is resolved by its storage formal)."""
+
+    return tuple(
+        SSAValue(int(value_id), dtype=str(dtype))
+        for value_id, dtype in zip(
+            descriptor.column_value_ids,
+            descriptor.column_dtypes
+            or ("unknown",) * len(descriptor.column_value_ids),
+        )
+    )
+
+
+def _positional_unsupported(
+    descriptor: SSASequenceDescriptor, operation: str,
+) -> SSASequenceLowering | None:
+    unsupported = _unsupported_destination(
+        descriptor, operation, allow_dynamic=True,
+    )
+    if unsupported is not None:
+        return unsupported
+    if (
+        descriptor.key_columns
+        or descriptor.live_flags_value_id is not None
+        or descriptor.child_table_pool is not None
+        or any(descriptor.column_shapes or ())
+    ):
+        return SSASequenceLowering(shortfalls=(SSASequenceLoweringShortfall(
+            SSASequenceShortfallCode.DYNAMIC_GROWTH_UNAVAILABLE,
+            descriptor.sequence_id,
+            operation,
+            "positional list operations require dense scalar duplicate-"
+            "policy rows (no keys, live flags, child pools or shaped rows)",
+        ),))
+    return None
+
+
+def _move_row(
+    builder: _Builder, block: BasicBlock, columns: tuple[SSAValue, ...],
+    source_index: SSAValue, destination_index: SSAValue,
+) -> None:
+    for column in columns:
+        source_address = builder.fresh("ptr")
+        destination_address = builder.fresh("ptr")
+        moved = builder.fresh(column.dtype)
+        builder.emit(block, "GetElementPtr", [column, source_index], source_address)
+        builder.emit(block, "Load", [source_address], moved)
+        builder.emit(block, "GetElementPtr", [column, destination_index], destination_address)
+        builder.emit(block, "Store", [moved, destination_address])
+
+
+def lower_sequence_delete_at(
+    descriptor: SSASequenceDescriptor,
+    *,
+    function_name: str | None = None,
+    first_value_id: int | None = None,
+) -> SSASequenceLowering:
+    """Remove row ``index`` by shifting every later row left by one.
+
+    ``list.pop(i)`` reads row ``i`` first and then calls this; ``del xs[i]``
+    is this alone.  ``index`` is already normalized by the caller (Python's
+    negative-index rule).  Status 1 means removed; status 2 means ``index``
+    names no row (Python's IndexError), and nothing is changed.  Removing a
+    row never grows storage, so a DYNAMIC arena uses its cells as they are.
+    """
+
+    unsupported = _positional_unsupported(descriptor, "delete_at")
+    if unsupported is not None:
+        return unsupported
+    storage = _storage_values(descriptor)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=storage, minimum=first_value_id,
+    ))
+    index = builder.fresh("int64")
+    columns = _positional_row_columns(descriptor)
+    length_address = next(
+        value for value in storage if value.id == descriptor.length_address_id
+    )
+    entry = builder.block("entry")
+    header = builder.block("shift_header")
+    body = builder.block("shift_body")
+    done = builder.block("removed")
+    outside = builder.block("index_outside")
+    result = builder.block("result")
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
+    length_slot, length = builder.fresh("ptr"), builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr", [length_address, zero], length_slot)
+    builder.emit(entry, "Load", [length_slot], length)
+    at_least_zero, below_length, inside = (
+        builder.fresh("bool"), builder.fresh("bool"), builder.fresh("bool"),
+    )
+    builder.emit(entry, "Ge", [index, zero], at_least_zero)
+    builder.emit(entry, "Lt", [index, length], below_length)
+    builder.emit(entry, "LAnd", [at_least_zero, below_length], inside)
+    last = builder.fresh("int64")
+    builder.emit(entry, "Sub", [length, one], last)
+    builder.cond(entry, inside, header, outside)
+    position, following = builder.fresh("int64"), builder.fresh("int64")
+    builder.emit(
+        header, "Phi", [index, following], position,
+        attributes={"incoming_blocks": (entry.name, body.name)},
+    )
+    continues = builder.fresh("bool")
+    builder.emit(header, "Lt", [position, last], continues)
+    builder.cond(header, continues, body, done)
+    builder.emit(body, "Add", [position, one], following)
+    _move_row(builder, body, columns, following, position)
+    builder.branch(body, header)
+    builder.emit(done, "Store", [last, length_slot])
+    removed = _status_branch(builder, done, 1, result)
+    rejected = _status_branch(builder, outside, 2, result)
+    status = builder.fresh("int")
+    builder.emit(
+        result, "Phi", [removed, rejected], status,
+        attributes={"incoming_blocks": (done.name, outside.name)},
+    )
+    builder.emit(result, "Ret", [status])
+    name = function_name or f"ssa_sequence_{descriptor.sequence_id}_delete_at"
+    return SSASequenceLowering((Function(
+        name, [*storage, index], builder.blocks,
+        metadata={
+            "ssa_sequence_operation": "delete_at",
+            "sequence_id": descriptor.sequence_id,
+            "sequence_array_argument_ids": tuple(int(value.id) for value in storage),
+            "status_values": {"removed": 1, "index_outside": 2},
+            "named_outputs": (("status", int(status.id)),),
+        },
+    ),))
+
+
+def lower_sequence_insert_at(
+    descriptor: SSASequenceDescriptor,
+    *,
+    function_name: str | None = None,
+    first_value_id: int | None = None,
+) -> SSASequenceLowering:
+    """``list.insert(index, row)``: Python's index rule, then a right shift.
+
+    A negative ``index`` counts from the end, and the result is clamped to
+    ``[0, length]`` (inserting past either end appends or prepends, as
+    Python does).  Status 1 means inserted; status 2 means fixed capacity is
+    exhausted and nothing changed.  A DYNAMIC arena reserves and retries
+    through ``_lower_dynamic_sequence_mutation``.
+    """
+
+    unsupported = _positional_unsupported(descriptor, "insert_at")
+    if unsupported is not None:
+        return unsupported
+    if descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
+        return _lower_dynamic_sequence_mutation(
+            descriptor, function_name=function_name, operation="insert_at",
+            first_value_id=first_value_id,
+        )
+    storage = _storage_values(descriptor)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=storage, minimum=first_value_id,
+    ))
+    columns = _positional_row_columns(descriptor)
+    index = builder.fresh("int64")
+    row_values = tuple(builder.fresh(column.dtype) for column in columns)
+    length_address = next(
+        value for value in storage if value.id == descriptor.length_address_id
+    )
+    capacity = SSAValue(descriptor.capacity_value_id, dtype="int64")
+    entry = builder.block("entry")
+    negative = builder.block("negative_index")
+    nonnegative = builder.block("normalized_low")
+    clamp_high = builder.block("clamp_high")
+    header = builder.block("shift_header")
+    body = builder.block("shift_body")
+    write = builder.block("write")
+    full = builder.block("capacity_exhausted")
+    result = builder.block("result")
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
+    length_slot, length = builder.fresh("ptr"), builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr", [length_address, zero], length_slot)
+    builder.emit(entry, "Load", [length_slot], length)
+    new_length, fits = builder.fresh("int64"), builder.fresh("bool")
+    builder.emit(entry, "Add", [length, one], new_length)
+    builder.emit(entry, "Le", [new_length, capacity], fits)
+    is_negative = builder.fresh("bool")
+    builder.emit(entry, "Lt", [index, zero], is_negative)
+    builder.cond(entry, is_negative, negative, nonnegative)
+    from_end, from_end_clamped = builder.fresh("int64"), builder.fresh("int64")
+    builder.emit(negative, "Add", [index, length], from_end)
+    builder.emit(negative, "Max", [from_end, zero], from_end_clamped)
+    builder.branch(negative, nonnegative)
+    low = builder.fresh("int64")
+    builder.emit(
+        nonnegative, "Phi", [from_end_clamped, index], low,
+        attributes={"incoming_blocks": (negative.name, entry.name)},
+    )
+    builder.branch(nonnegative, clamp_high)
+    target = builder.fresh("int64")
+    builder.emit(clamp_high, "Min", [low, length], target)
+    builder.cond(clamp_high, fits, header, full)
+    position, previous = builder.fresh("int64"), builder.fresh("int64")
+    builder.emit(
+        header, "Phi", [length, previous], position,
+        attributes={"incoming_blocks": (clamp_high.name, body.name)},
+    )
+    continues = builder.fresh("bool")
+    builder.emit(header, "Gt", [position, target], continues)
+    builder.cond(header, continues, body, write)
+    builder.emit(body, "Sub", [position, one], previous)
+    _move_row(builder, body, columns, previous, position)
+    builder.branch(body, header)
+    for column, value in zip(columns, row_values):
+        address = builder.fresh("ptr")
+        builder.emit(write, "GetElementPtr", [column, target], address)
+        builder.emit(write, "Store", [value, address])
+    builder.emit(write, "Store", [new_length, length_slot])
+    inserted = _status_branch(builder, write, 1, result)
+    exhausted = _status_branch(builder, full, 2, result)
+    status = builder.fresh("int")
+    builder.emit(
+        result, "Phi", [inserted, exhausted], status,
+        attributes={"incoming_blocks": (write.name, full.name)},
+    )
+    builder.emit(result, "Ret", [status])
+    name = function_name or f"ssa_sequence_{descriptor.sequence_id}_insert_at"
+    return SSASequenceLowering((Function(
+        name, [*storage, index, *row_values], builder.blocks,
+        metadata={
+            "ssa_sequence_operation": "insert_at",
+            "sequence_id": descriptor.sequence_id,
+            "sequence_array_argument_ids": tuple(int(value.id) for value in storage),
+            "status_values": {"inserted": 1, "capacity_exhausted": 2},
+            "named_outputs": (("status", int(status.id)),),
+        },
+    ),))
+
+
+def lower_sequence_reverse(
+    descriptor: SSASequenceDescriptor,
+    *,
+    function_name: str | None = None,
+    first_value_id: int | None = None,
+) -> SSASequenceLowering:
+    """``list.reverse()``: swap row ``i`` with row ``length - 1 - i``.
+
+    Status 1 always: reversing never changes the length or the storage.
+    """
+
+    unsupported = _positional_unsupported(descriptor, "reverse")
+    if unsupported is not None:
+        return unsupported
+    storage = _storage_values(descriptor)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=storage, minimum=first_value_id,
+    ))
+    columns = _positional_row_columns(descriptor)
+    length_address = next(
+        value for value in storage if value.id == descriptor.length_address_id
+    )
+    entry = builder.block("entry")
+    header = builder.block("swap_header")
+    body = builder.block("swap_body")
+    done = builder.block("reversed")
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
+    length_slot, length = builder.fresh("ptr"), builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr", [length_address, zero], length_slot)
+    builder.emit(entry, "Load", [length_slot], length)
+    last = builder.fresh("int64")
+    builder.emit(entry, "Sub", [length, one], last)
+    builder.branch(entry, header)
+    low, high = builder.fresh("int64"), builder.fresh("int64")
+    next_low, next_high = builder.fresh("int64"), builder.fresh("int64")
+    builder.emit(
+        header, "Phi", [zero, next_low], low,
+        attributes={"incoming_blocks": (entry.name, body.name)},
+    )
+    builder.emit(
+        header, "Phi", [last, next_high], high,
+        attributes={"incoming_blocks": (entry.name, body.name)},
+    )
+    continues = builder.fresh("bool")
+    builder.emit(header, "Lt", [low, high], continues)
+    builder.cond(header, continues, body, done)
+    for column in columns:
+        low_address, high_address = builder.fresh("ptr"), builder.fresh("ptr")
+        low_row, high_row = builder.fresh(column.dtype), builder.fresh(column.dtype)
+        builder.emit(body, "GetElementPtr", [column, low], low_address)
+        builder.emit(body, "GetElementPtr", [column, high], high_address)
+        builder.emit(body, "Load", [low_address], low_row)
+        builder.emit(body, "Load", [high_address], high_row)
+        builder.emit(body, "Store", [high_row, low_address])
+        builder.emit(body, "Store", [low_row, high_address])
+    builder.emit(body, "Add", [low, one], next_low)
+    builder.emit(body, "Sub", [high, one], next_high)
+    builder.branch(body, header)
+    status = builder.const(done, 1)
+    builder.emit(done, "Ret", [status])
+    name = function_name or f"ssa_sequence_{descriptor.sequence_id}_reverse"
+    return SSASequenceLowering((Function(
+        name, list(storage), builder.blocks,
+        metadata={
+            "ssa_sequence_operation": "reverse",
+            "sequence_id": descriptor.sequence_id,
+            "sequence_array_argument_ids": tuple(int(value.id) for value in storage),
+            "status_values": {"reversed": 1},
             "named_outputs": (("status", int(status.id)),),
         },
     ),))

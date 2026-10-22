@@ -10116,6 +10116,62 @@ def _control_partition_keys(
     }
 
 
+def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
+    """Read-after-write order between an in-place sequence effect and the
+    later reads of its receiver.
+
+    Program: ``xs = [0.5, 1.5]; xs.append(n * 0.25)`` then ``return xs[0] +
+    xs[1] * 10.0 + xs[2] * 100.0`` (scratch c164; likewise ``insert``).
+    Wrong record: ``xs`` is mutated in place, so no graph edge leads from
+    the append to the later ``xs[2]``; the region reducer fused the
+    argument's ``n * 0.25`` with the arithmetic over the post-append rows
+    into one region, which then both fed and followed the append (a control
+    order cycle).  Rule: an effect retained on ``source_sequence_mutation_
+    records`` precedes every read of its receiver that starts after the
+    effect ends.  Effects inside a loop are ordered by the loop composer.
+    """
+
+    _retain_source_sequence_mutation_records(graph.G)
+    records = graph.G.graph.get("source_sequence_mutation_records") or {}
+    loops = [
+        (int(expression.lineno), int(getattr(expression, "end_lineno", expression.lineno)))
+        for _node_id, data in graph.G.nodes(data=True)
+        for expression in (data.get("expr_obj"),)
+        if isinstance(expression, (ast.For, ast.AsyncFor, ast.While))
+    ]
+    readers_by_sequence: dict[int, list[tuple[tuple[int, int], int]]] = {}
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        line = getattr(expression, "lineno", None)
+        if line is None:
+            continue
+        for parent, _role in data.get("parents") or ():
+            if parent not in graph.G:
+                continue
+            sequence_id = int(graph.G.nodes[parent].get("value_id", parent))
+            readers_by_sequence.setdefault(sequence_id, []).append((
+                (int(line), int(getattr(expression, "col_offset", 0) or 0)),
+                int(node_id),
+            ))
+    edges: set[tuple[int, int]] = set()
+    for effect_id, record in records.items():
+        expression = record.get("expression")
+        end_line = getattr(expression, "end_lineno", None)
+        if (
+            int(effect_id) not in graph.G
+            or end_line is None
+            or any(start <= int(expression.lineno) <= end for start, end in loops)
+        ):
+            continue
+        end = (int(end_line), int(getattr(expression, "end_col_offset", 0) or 0))
+        for start, reader in readers_by_sequence.get(
+            int(record["sequence_value_id"]), (),
+        ):
+            if start >= end and reader != int(effect_id):
+                edges.add((int(effect_id), reader))
+    return frozenset(edges)
+
+
 def _closure_routing_dependencies(
     graph: Any,
 ) -> tuple[frozenset[tuple[int, int]], frozenset[int]]:
@@ -30525,7 +30581,9 @@ def strategize_shell_deployment(
             executable_nodes,
             max_nodes_per_region=max_nodes_per_dispatch,
             partition_keys=partition_keys,
-            extra_dependency_edges=closure_edges,
+            extra_dependency_edges=(
+                *closure_edges, *_sequence_effect_read_edges(graph),
+            ),
             fusible_node_ids=_shader_fusible_node_ids(
                 graph, executable_nodes,
             ),

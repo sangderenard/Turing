@@ -63,7 +63,8 @@ class LoopStateEffectMode(str, Enum):
 #: spelled out in a message is a copy that drifts, and a message that
 #: lists the wrong vocabulary is worse than one that lists none.
 SEQUENCE_MUTATION_OPERATORS = frozenset({
-    "add", "append", "clear", "extend", "pop", "remove", "sort",
+    "add", "append", "clear", "extend", "insert", "pop", "remove",
+    "reverse", "sort",
 })
 MAPPING_MUTATION_OPERATORS = frozenset({
     "update", "pop", "setdefault",
