@@ -128,6 +128,33 @@ _PREDICATE_OPERATION_SPELLINGS = frozenset(
 )
 
 
+#: Operator result-type rules shared by region typing
+#: (``plan_region_to_ssa_instrs``) and the planner's graph-level scalar
+#: inference: one table, two readers.
+REGION_PREDICATE_OPS = frozenset({
+    "eq", "equal", "ne", "not_equal", "lt", "less", "le",
+    "less_equal", "gt", "greater", "ge", "greater_equal",
+    "land", "logical_and", "lor", "logical_or", "lnot",
+    "logical_not", "is", "is_not", "contains", "not_contains",
+}) | _PREDICATE_OPERATION_SPELLINGS
+REGION_INTEGER_RESULT_OPS = frozenset({
+    "len", "length", "extent", "bitlength", "bit_length",
+})
+#: Python ``int`` is not the backend's C ``int``.  Repository SSA uses the
+#: widest portable signed scalar ABI for authored Python integers; wrappers
+#: retain authored fallback for values outside that domain.
+REGION_SCALAR_CAST_DTYPES = {
+    "float": "float64",
+    "int": "int64",
+    "bool": "bool",
+}
+REGION_DTYPE_PRESERVING_OPS = frozenset({
+    "add", "sub", "mul", "floordiv", "mod", "pow", "neg", "abs",
+    "min", "max", "minimum", "maximum", "bitand", "bitor",
+    "bitxor", "shl", "shr", "invert",
+})
+
+
 def is_predicate_operation(operation: Any) -> bool:
     """Whether an SSA spelling produces truth, independent of casing."""
 
@@ -388,23 +415,9 @@ def plan_region_to_ssa_instrs(
     # produce predicates, and address indices/extents are integers.  Retain
     # these contracts in repository SSA rather than asking a target emitter to
     # reverse-engineer them from syntax.
-    predicate_ops = {
-        "eq", "equal", "ne", "not_equal", "lt", "less", "le",
-        "less_equal", "gt", "greater", "ge", "greater_equal",
-        "land", "logical_and", "lor", "logical_or", "lnot",
-        "logical_not", "is", "is_not", "contains", "not_contains",
-    } | _PREDICATE_OPERATION_SPELLINGS
-    integer_result_ops = {
-        "len", "length", "extent", "bitlength", "bit_length",
-    }
-    scalar_cast_dtypes = {
-        "float": "float64",
-        # Python ``int`` is not the backend's C ``int``.  Repository SSA uses
-        # the widest portable signed scalar ABI for authored Python integers;
-        # wrappers retain authored fallback for values outside that domain.
-        "int": "int64",
-        "bool": "bool",
-    }
+    predicate_ops = REGION_PREDICATE_OPS
+    integer_result_ops = REGION_INTEGER_RESULT_OPS
+    scalar_cast_dtypes = REGION_SCALAR_CAST_DTYPES
 
     # The operation owns its result domain. Commit that fact at the point
     # repository SSA values are born so later region copies and target
@@ -525,11 +538,7 @@ def plan_region_to_ssa_instrs(
     # semantics before constructing any SSAValue.  Iterate because a chain
     # such as int(record[index]) -> min -> shift must carry the corrected
     # integer width through every intermediate, independent of node order.
-    dtype_preserving_ops = {
-        "add", "sub", "mul", "floordiv", "mod", "pow", "neg", "abs",
-        "min", "max", "minimum", "maximum", "bitand", "bitor",
-        "bitxor", "shl", "shr", "invert",
-    }
+    dtype_preserving_ops = REGION_DTYPE_PRESERVING_OPS
     projection_ops = {
         "indexed", "getitem", "get_item", "subscript", "load",
     }

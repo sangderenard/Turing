@@ -24110,6 +24110,19 @@ def _fold_callsite_structural_values(
                         and base_ids[0] not in mutated_sequence_ids
                         and base_attributes.get("producer_kind")
                         in {"aggregate", "aggregate_phi"}
+                        # Program: ``d = {1: 10, 2: 20, 0: 30}; d[1]``
+                        # (scratch c240).  Wrong record: a dict's ledger
+                        # (keys then values) was indexed by position, so
+                        # ``d[1]`` read the second key (2), not 10.  Rule:
+                        # a subscript selects a leaf by position only on a
+                        # positional sequence; a mapping subscript is a key
+                        # lookup and a set has no positions.
+                        and base_attributes.get("aggregate_kind")
+                        not in {"dict", "set", "frozenset"}
+                        and not isinstance(
+                            graph.G.nodes[base_ids[0]].get("expr_obj"),
+                            (ast.Dict, ast.Set, ast.DictComp, ast.SetComp),
+                        )
                         and leaves
                         and all(int(leaf) in graph.G for leaf in leaves)
                         and isinstance(index_value, int)
