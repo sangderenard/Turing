@@ -81,6 +81,10 @@ EXTENDED = [
     (["xs{v} = [{a}, {b}, {c}]"], "int(any([x{v} > n for x{v} in xs{v}])) * 10 + int(all([x{v} > n for x{v} in xs{v}]))"),
     (["xs{v} = [{a}, {b}, {c}]", "ys{v} = [x{v} - n for x{v} in xs{v}]"], "ys{v}[n % 3] * 10 + sum(ys{v})"),
     (["s{v} = {{(x{v} + n) % 3 for x{v} in [{a}, {b}, {c}]}}"], "len(s{v})"),
+    # chained comparisons whose middle is a builtin conversion or measure,
+    # one behind a guarding ``and`` (lanes plan A0)
+    (["f{v} = n * 0.5 + {a}"], "1 if 0 <= int(f{v}) <= {b} + 3 else 2"),
+    (["xs{v} = [{a}, n, {b}]"], "(1 if 1 < len(xs{v}) <= n else 0) + (2 if n != 0 and 0 < abs({a} // n) < 3 else 0)"),
 ]
 EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
@@ -108,6 +112,18 @@ EXTENDED2 = [
     (["k{v} = n", "s{v} = 0", "while k{v} > 0:", "    s{v} += k{v} % 10", "    k{v} //= 10"], "s{v}"),
     (["xs{v} = [{a}, {b}]", "xs{v} += [n]"], "len(xs{v}) * 10 + xs{v}[-1]"),
     (["b{v} = n > {a} or n < -{b}"], "int(b{v}) + (3 if not b{v} else 0)"),
+    # a callee growing its own list and dict (A6, capacity of hoisted storage)
+    (["c{v} = localgrow(n + {a})"], "c{v}"),
+    # a callee returning a list display (A6)
+    (["xs{v} = pairlist(n + {a})"], "len(xs{v}) * 10 + xs{v}[1]"),
+    (["xs{v} = pairlist(n)", "xs{v}.append({b})"], "len(xs{v}) * 10 + xs{v}[2] + xs{v}[0] * 100"),
+    # a list bound to equal-length displays on two branches (c271)
+    (["if n > {a}:", "    t{v} = [n, {b}]", "else:", "    t{v} = [{c}, n]", "t{v}.append({a})"], "len(t{v}) * 100 + t{v}[0] * 10 + t{v}[2]"),
+    (["t{v} = [n, {b}] if n % 2 == 0 else [{c}, {a}]"], "len(t{v}) * 10 + t{v}[1]"),
+    # concatenation of displays then a dict display (p16_29, region order)
+    (["xs{v} = [{a}, -1] + [n, {b}]", "d{v} = {{1: {c}}}"], "xs{v}[2] * 10 + xs{v}[0] + d{v}[1]"),
+    # dict.update from a display stores its rows (A3)
+    (["d{v} = {{1: {a}, 2: n}}", "d{v}.update({{1: n + {b}, 3: {c}}})"], "d{v}[1] * 10 + d{v}[2] + len(d{v}) * 100 + d{v}[3]"),
 ]
 EXTENDED3 = [
     (["xs{v} = [n, {a}]", "setfirst(xs{v}, {b})"], "len(xs{v}) * 100 + xs{v}[0] * 10 + xs{v}[1]"),
@@ -156,6 +172,18 @@ EXT2_HELPERS = """def total(xs: list[int]) -> int:
     for x in xs:
         t += x
     return t
+
+
+def pairlist(x: int) -> list[int]:
+    return [x, x + 1]
+
+
+def localgrow(x: int) -> int:
+    xs = [7, 5]
+    xs.append(x)
+    d = {1: x, 2: 5}
+    d[3] = x * 2
+    return xs[0] + xs[2] * 10 + d[1] * 100 + d[3]
 
 
 """

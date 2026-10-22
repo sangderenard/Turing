@@ -1666,12 +1666,60 @@ def _concord_call_argument_operands(
                 page.concord(argument_row, (role, ordinal))
 
 
+_MUTABLE_RETURN_KINDS = frozenset({"list", "set", "dict", "bytearray"})
+
+
+def _refuse_divergent_collection_returns(child_graph: Any) -> None:
+    """Refuse a function whose return sites return different mutable
+    collections in one slot (see the receipt at its caller)."""
+
+    sites = child_graph.graph.get("return_slot_values") or {}
+    by_slot: dict[int, set[int]] = {}
+    for values in sites.values():
+        for slot, value_id in enumerate(values or ()):
+            by_slot.setdefault(slot, set()).add(int(value_id))
+    for slot, value_ids in by_slot.items():
+        if len(value_ids) < 2:
+            continue
+        kinds = {
+            (child_graph.nodes[value_id].get("attributes") or {}).get(
+                "aggregate_kind"
+            )
+            for value_id in value_ids if value_id in child_graph
+        }
+        if kinds & _MUTABLE_RETURN_KINDS:
+            raise ValueError(
+                f"function {child_graph.graph.get('function_name')!r} returns "
+                f"different collections in return slot {slot} "
+                f"(values {tuple(sorted(value_ids))}); a returned collection "
+                "is one storage and the variadic sequence return is not "
+                "lowered"
+            )
+
+
 def _authored_output_paths(graph, outputs):
-    """Read return leaves by their authored aggregate edges, not flat ABI order."""
+    """Read return leaves by their authored aggregate edges, not flat ABI order.
+
+    Program: ``def pick(n): return [n]`` then ``t = pick(n); len(t) * 10 +
+    t[0]`` (corpus c215).  Wrong record: the returned list display was
+    expanded to its member path ``(0, 0)``, which no caller projection
+    (``t[0]`` is ``(0,)``) matches, so the call bound no result and the
+    caller read its own unborn arena (0; clean audit).  Rule: a returned
+    mutable collection is one storage, exactly as an argument is (rule 3):
+    its path is the output itself, and the caller's reads go through the
+    shared arena.  Tuples keep their structural member paths.
+    """
     paths = {}
 
     def expand(path, value_id):
-        leaves = _authored_aggregate_leaves(graph, int(value_id))
+        attributes = (
+            graph.G.nodes[int(value_id)].get("attributes") or {}
+            if int(value_id) in graph.G else {}
+        )
+        leaves = (
+            () if attributes.get("aggregate_kind") in _MUTABLE_RETURN_KINDS
+            else _authored_aggregate_leaves(graph, int(value_id))
+        )
         if not leaves:
             paths[path] = int(value_id)
             return
@@ -2847,6 +2895,16 @@ def _build_shell_hierarchy_plan(
                 result_bindings = ((int(child_outputs[0]), int(node_id)),)
                 _post_call_result_projections(graph, node_id)
             else:
+                # Program: ``if n > 2: return [n]`` / ``return []`` then
+                # ``t = pick(n); len(t)`` (scratch c971).  Wrong record: the
+                # two return sites return two different lists (two arenas),
+                # but the one output named only the last, so the caller
+                # read the empty list's storage on every path (silent).
+                # Rule: a returned mutable collection is one storage; return
+                # sites that return different collections have no one
+                # result arena, and that is refused by name until the
+                # variadic sequence-return lowering exists (lanes plan A6).
+                _refuse_divergent_collection_returns(child_graph)
                 child_output_paths = _authored_output_paths(
                     child.process_graph, child_outputs,
                 )
@@ -8119,7 +8177,10 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
     ``sort`` keeps its source sort contract.
     """
 
-    from .resident_sequence_materialization import _RECEIVER_READING_METHODS
+    from .resident_sequence_materialization import (
+        _RECEIVER_READING_METHODS,
+        _receiver_collection_kind,
+    )
 
     records = dict(
         graph_obj.graph.get("source_sequence_mutation_records") or {}
@@ -8181,9 +8242,8 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
         ):
             continue
         destination_data = graph_obj.nodes[destination]
-        if (destination_data.get("attributes") or {}).get(
-            "aggregate_kind"
-        ) not in {"list", "set", "bytes", "bytearray"}:
+        destination_kind = _receiver_collection_kind(destination_data)
+        if destination_kind not in {"list", "set", "bytes", "bytearray"}:
             continue
         records[int(node_id)] = {
             "expression": expression,
@@ -8197,10 +8257,7 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
             "operator": str(expression.func.attr),
             "policy": (
                 "unique"
-                if expression.func.attr == "add"
-                or (destination_data.get("attributes") or {}).get(
-                    "aggregate_kind"
-                ) == "set"
+                if expression.func.attr == "add" or destination_kind == "set"
                 else "duplicates"
             ),
         }
@@ -10669,7 +10726,10 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     # placed before the call and the callee's rows were never read.  Rule:
     # every escape of a collection the one mutation definition names
     # (``_mutated_sequence_node_ids``) is an effect of that call on it.
-    from .resident_sequence_materialization import _call_escaped_argument_edges
+    from .resident_sequence_materialization import (
+        _call_escaped_argument_edges,
+        _dict_update_mutations,
+    )
 
     mutated = _mutated_sequence_node_ids(graph.G)
     effects = [
@@ -10684,7 +10744,86 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         })
         for call_id, argument_id in sorted(_call_escaped_argument_edges(graph.G))
         if int(argument_id) in mutated and int(argument_id) in graph.G
+    ] + [
+        # Program: ``d = {1: 1, 2: n}; d.update({1: n + 2})`` then ``return
+        # d[1] * 10 + d[2]`` (fuzzer p13_31).  Wrong record: the update's
+        # stores were no effect here, so the reducer fused ``n + 2`` with
+        # the post-update reads into one region that both fed and followed
+        # the update (a control order cycle).  Rule: a dict update is an
+        # in-place effect on its receiver, as an append is.
+        (int(mutation.effect_node_id), {
+            "expression": graph.G.nodes[int(mutation.effect_node_id)].get("expr_obj"),
+            "sequence_value_id": int(mutation.sequence_value_id),
+        })
+        for mutation in _dict_update_mutations(graph.G)
+        if int(mutation.effect_node_id) in graph.G
     ]
+    # Program: ``xs0 = [2, n]; grow(xs0, n % 3 + 1); xs1 = [n, 4];
+    # push(xs1, 3)`` then ``return len(xs1) * 100 + xs1[-1]`` (fuzzer
+    # p18_11; corpus c270).  Wrong record: each effect was ordered only
+    # before the reads of its own receiver, but effects execute in source
+    # order, so ``push`` followed ``grow``; the reducer fused ``n % 3 + 1``
+    # (which ``grow`` reads) with the arithmetic over ``xs1`` into one
+    # region, which put ``grow``, then ``push``, after the reads of ``xs1``
+    # (``push`` was lost; silent).  The same held for a call with no
+    # effect: ``xs0 = pairlist(n + 4)`` before ``push(xs1, 9)`` (fuzzer
+    # p18_27).  Rule: calls are lowered in source order, so the effects and
+    # the source calls outside loops keep that order; each precedes the
+    # next.  A call completes where it ends, so an inner call precedes the
+    # call that receives its result.
+    sequenced = [
+        (int(effect_id), record.get("expression"))
+        for effect_id, record in effects
+    ] + [
+        (int(node_id), data.get("expr_obj"))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        # A source call, lowered as a call; an intrinsic or a native math
+        # call is an operation inside a region (c22_math).
+        and (data.get("attributes") or {}).get("extraction_action") is None
+    ] + [
+        # Program: ``xs0 = [1] * (n % 4 + 1)`` then ``swap(xs2)`` (fuzzer
+        # p23_32).  A list built by an operator is filled where it is
+        # authored, as a call is, so it keeps its place in this order too.
+        (int(node_id), data.get("expr_obj"))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.BinOp)
+        and (data.get("attributes") or {}).get("aggregate_kind") == "list"
+    ]
+    # Program: ``while k0 > 0: xs0.append(k0); k0 -= 2`` then ``swap(xs2)``
+    # (fuzzer p24_54).  An effect inside a loop is observed when its
+    # outermost enclosing loop completes, so that loop takes its place.
+    def sequenced_at(effect_id, expression):
+        enclosing = [
+            (start, -end, loop_node, loop)
+            for start, end, loop_node, loop in loop_nodes
+            if start <= int(expression.lineno) <= end
+        ]
+        if enclosing:
+            _start, _end, loop_node, loop = min(enclosing)
+            return int(loop_node), loop
+        return int(effect_id), expression
+
+    ordered_effects = sorted({
+        (
+            (
+                int(expression.end_lineno),
+                int(getattr(expression, "end_col_offset", 0) or 0),
+            ),
+            int(effect_id),
+        )
+        for candidate_id, candidate in sequenced
+        if int(candidate_id) in graph.G
+        and getattr(candidate, "lineno", None) is not None
+        for effect_id, expression in (sequenced_at(candidate_id, candidate),)
+        if int(effect_id) in graph.G
+        and getattr(expression, "end_lineno", None) is not None
+    })
+    for (_first_position, first), (_second_position, second) in zip(
+        ordered_effects, ordered_effects[1:],
+    ):
+        if first != second:
+            edges.add((first, second))
     for effect_id, record in effects:
         expression = record.get("expression")
         end_line = getattr(expression, "end_lineno", None)
@@ -22900,6 +23039,7 @@ def _remove_dead_metadata_nodes(
 
 def _mutated_sequence_node_ids(
     graph_obj: Any, *, include_call_escapes: bool = True,
+    include_merge_aliases: bool = True,
 ) -> frozenset[int]:
     """Collections whose contents change after their initializer.
 
@@ -22909,7 +23049,8 @@ def _mutated_sequence_node_ids(
     capture folded to a ``Const`` literal).  ``include_call_escapes=False``
     leaves out escapes into calls: the mutations this graph itself makes,
     for a reader that decides about one call's binding by itself
-    (``_aggregate_binds_by_member``).
+    (``_aggregate_binds_by_member``).  ``include_merge_aliases=False``
+    leaves out arms changed only through a branch merge.
     """
 
     mutated_sequence_ids = {
@@ -22980,6 +23121,29 @@ def _mutated_sequence_node_ids(
             }:
                 pending_bases.extend(int(parent) for parent, role in base.get("parents") or ()
                                      if str(role) == "base")
+    if include_merge_aliases:
+        # Program: ``a = [1, 2]; if n > 2: t = a else: t = [3, 4]`` then
+        # ``t.append(9); return len(a) * 10 + len(t)`` (scratch c961).
+        # Wrong record: ``t`` is ``a`` on one path, but only ``t`` was
+        # changed, so ``len(a)`` folded to 2 (silent).  Rule: a list merged
+        # from branches is one storage with each arm, so a change to the
+        # merge changes its arms.
+        pending = [
+            int(node_id) for node_id in mutated_sequence_ids
+            if int(node_id) in graph_obj
+        ]
+        while pending:
+            merged = graph_obj.nodes[pending.pop()]
+            if (merged.get("attributes") or {}).get("producer_kind") != "aggregate_phi":
+                continue
+            for parent, role in merged.get("parents") or ():
+                if (
+                    str(role) in {"body", "orelse"}
+                    and int(parent) in graph_obj
+                    and int(parent) not in mutated_sequence_ids
+                ):
+                    mutated_sequence_ids.add(int(parent))
+                    pending.append(int(parent))
     return frozenset(mutated_sequence_ids)
 
 

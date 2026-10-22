@@ -34,7 +34,7 @@ branch has used, merged or not.
 | c211-c218 | Lane A: A0, A3 and follow-ups | `claude/project-thread-kbkzp7` | c211, c212, c214-c218 |
 | c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c234 |
 | c240-c249 | Lane C: C1 constant-list comprehensions | `claude/project-thread-2nw77p` | c240-c243 |
-| c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c268 |
+| c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
 | c280-c289 | next free | | |
 
@@ -42,13 +42,11 @@ branch has used, merged or not.
 
 | rank | item | group (doc 34) | claimed functions | branch | status |
 |---|---|---|---|---|---|
-| A0 | Lower a chained comparison whose middle operand is a call. The middle is evaluated once, in place, never hoisted ahead of a guarding `and`. Duplicating it is allowed only for a proven-pure builtin conversion of a pure operand. Every other call still refuses by name. Then hand Albert both whole-program commands. | R0 | `ast_control_normalization._normalize_chained_comparisons`, `ast_control_normalization._pure_operand` | | open: blocks 100% of both targets |
 | A1 | Give tuple displays a birth. Place the predicate region that produces the members before the effects that consume them, then birth tuples as lists are born. | S1 | `resident_sequence_materialization._list_literal_mutations`, `resident_sequence_materialization._static_sequence_capacity_survey`, `identity_concordance.CorrelationTable._unborn_display_findings` (new) | `claude/project-thread-cz18s3` | in review: born and bounded; the predicate-region placement did not reproduce at `main` |
 | A2 | Keep a return surface whole. `emit_outputs` must not fall back to `(output_id,)` when an aggregate layout is absent. The control finish publishes the layout. Accepted-unit accounting must not let one value stand for a tuple/optional. Add the false-acceptance check from doc 34 §1.4 to the bootstrap status tool. | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs` (nested, line ~28034); the control-finish member Phi publisher; accepted-unit result accounting | | open: false acceptance |
-| A3 | Make `dict.update()` a recorded mutation, so `_mutated_sequence_node_ids` sees it. | B4 | `glsl_deployment_strategy._mutated_sequence_node_ids` (read only); the mutation-record writer for dict methods | | open: inferred silent-capable |
 | A4 | Tire: the result-storage lease mints a record span member's `SSA_VALUE` row as a scalar. Revise it from the record storage contract. `_ssa_structure` reads the registered record storage before calling a shape-empty fact a scalar. | T1 | `structural_concordance._ssa_structure`; the result-storage lease writer in `fortran_c_shell` | | blocked on A0 (re-observe first) |
 | A5 | Measure the core-chain cascade. After A0, ask Albert for a full bootstrap. Fill doc 34 §1.2 and re-file units into groups. | B6, B7 | none (measurement) | | blocked on A0 |
-| A6 | Variadic returns: the sequence-lane lowering for `return ()`/`(x,)`/`[]`/`[x]` (units 034, 162, 212). | B2 | reducer VARIADIC consumer in `precompile_to_ssa`; `ir_sequence_tables` | | open |
+| A6 | Variadic returns: the sequence-lane lowering for `return ()`/`(x,)`/`[]`/`[x]` (units 034, 162, 212). | B2 | reducer VARIADIC consumer in `precompile_to_ssa`; `ir_sequence_tables` | `claude/project-thread-kbkzp7` | claimed 2026-10-22; list returns fixed or refused (doc 35), tuple variadic and two-edge list lowering open |
 | A7 | `Any`-typed receivers and generic `str()`/`!r` of facts: runtime type dispatch over the fact classes. | B3 | to be scoped | | open: needs a design note first |
 | A8 | `'|'.join(tokens)` glyph recipe in f-strings (unit 6). | B5 | f-string glyph recipe builder | | open |
 
@@ -72,7 +70,7 @@ silent-capable items first.
 | C9 | Multi-element replication `[a, b] * k` | no operation writes its rows; fill repeats one value | `_sequence_concat_ops` | | open |
 | C10 | Strings as values (`s = "a" if c else "b"`, `len(s)`, `==`, `startswith`) | dispatch metadata; minted as a root input (c114, c217) | to be scoped | | open: large |
 | C11 | Variadic returns | shared with A6; take it in Lane A | | | see A6 |
-| C12 | A comprehension result mutated afterwards: `ys = [x * n for x in xs]; ys.append(n)` then `len(ys)`, `sum(ys)` | the append node was pruned by loop evaporation; the arena and the reduction kept the comprehension's row count (silent WRONG at `main`) | `loop_composer.evaporate_unrolled_loops` (liveness), `resident_sequence_materialization._static_sequence_capacity_survey`, the comprehension rule in `glsl_deployment_strategy._tensor_descriptor_rule` | `claude/project-thread-cz18s3` (PR #788) | done there (doc 35 §5). Still loud: a set comprehension then `add` (no proven capacity) |
+| C12 | A comprehension result mutated afterwards: `ys = [x * n for x in xs]; ys.append(n)` then `len(ys)`, `sum(ys)` | the append node was pruned by loop evaporation; the arena and the reduction kept the comprehension's row count (silent WRONG at `main`) | `loop_composer.evaporate_unrolled_loops` (liveness), `resident_sequence_materialization._static_sequence_capacity_survey`, the comprehension rule in `glsl_deployment_strategy._tensor_descriptor_rule` | `claude/project-thread-cz18s3` (PR #788) | done there (doc 36 §5). Still loud: a set comprehension then `add` (no proven capacity) |
 
 ## Lane D: defaults and fallbacks
 
@@ -91,7 +89,7 @@ committed inventory script and classify every hit.
 
 | rank | item | claimed functions | branch | status |
 |---|---|---|---|---|
-| D1 | Private root storage sized `else 1` in the exported C wrapper (`ssa_c_backend.py`, the `element_count` expression near line 5905): make it a named refusal and run the corpus | the private-root-storage block of the C wrapper emitter | | open |
+| D1 | Private root storage sized `else 1` in the exported C wrapper (`ssa_c_backend.py`, the `element_count` expression near line 5905): make it a named refusal and run the corpus | the private-root-storage block of the C wrapper emitter | `claude/project-thread-h1z2w1` | PR open. **Observed:** the default was reached by 58/159 corpus programs (the lead said none), every one a rank-0, non-dynamic storage requirement whose `element_count` is `None` only because its shape is empty. That is now read as the proof of one cell; anything else is the shortfall `private-root-storage-unproven`. Corpus 159/159 PASS, fuzz seed 11 tier 3 30/30 PASS, gate identical to `main` in all four parts (aa 89, ab 7, ac 26, rec 20). No corpus program reaches the new refusal yet (**unknown** whether one can). |
 | D2 | Planner region inputs default to float64. Count the fallbacks across the corpus again (~3,000 measured once), then supply the proofs. This is also the tire's T2 (`bool` actual vs float64 region formal). | `_planned_scalar_dtypes` (read), region-input typing in `glsl_deployment_strategy` (`or "float64"` sites near lines 21277 to 21917) | | open |
 | D3 | `except Exception: pass` in decision paths. The four that sit in compiler decisions come first: `glsl_deployment_strategy.py:11455` (planned-shell walk), `:18206` (`invalidate_proven_shape`), `fortran_c_shell.py:47416` (`materializing_binding_kind`), `identity_concordance.py:9680` (failure-claim record). The telemetry and `old == fact` comparisons are probably benign; classify them, don't change them. | those four `try` blocks | | open |
 | D4 | `"int"` vs `"int64"` spellings reaching physical checks (rule 7) | to be listed by the inventory | | open |
@@ -99,4 +97,5 @@ committed inventory script and classify every hit.
 
 ## Done
 
-(none yet)
+- A0 (chained comparison with a builtin conversion middle): branch `claude/project-thread-kbkzp7`, receipts in doc 35.
+- A3 (`dict.update()` from a display is a table mutation): branch `claude/project-thread-kbkzp7`, receipts in doc 35.

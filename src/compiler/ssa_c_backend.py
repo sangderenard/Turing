@@ -1623,6 +1623,80 @@ def _trace_text(text: str) -> str:
     return "\"" + "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in escaped) + "\""
 
 
+def _linked_frame_sequences(module: Any, function_name: str) -> tuple[Any, ...]:
+    """Callee sequences whose storage the entry function's frame owns.
+
+    Program: ``def f(n): xs = [7, 5]; xs.append(n); return xs[0] * 10 +
+    xs[2]`` called from ``root`` (corpus c217).  Wrong record: the
+    callee's arena, length and capacity cells are hoisted into the entry
+    function's private storage (``linked_call_frame_storage``), but only
+    the entry function's own sequence table was read when the wrapper
+    published capacities, so the hoisted capacity cell stayed 0 and every
+    append and store reported "full" into a status nobody read (0; clean
+    audit).  Rule: a sequence's capacity cell is published wherever its
+    storage is allocated; the call chain's exact argument-to-formal
+    bindings (``callee_input_ids``) say which entry storage a callee's
+    member is.  Each returned descriptor is respelled in entry-function
+    value ids.
+    """
+
+    from dataclasses import replace as _replace
+
+    functions = getattr(module, "functions", {})
+    tables = getattr(module, "sequence_tables", {})
+    entry = functions.get(function_name)
+    if entry is None:
+        return ()
+    # (function, value id) -> entry value id, through exact call bindings.
+    aliases = {(function_name, int(value.id)): int(value.id) for value in entry.args}
+    pending = [function_name]
+    visited = set()
+    while pending:
+        name = pending.pop()
+        if name in visited or name not in functions:
+            continue
+        visited.add(name)
+        for block in functions[name].blocks.values():
+            for instruction in block.instrs:
+                attributes = getattr(instruction, "attributes", None) or {}
+                callee = attributes.get("callee")
+                inputs = attributes.get("callee_input_ids")
+                if (
+                    getattr(instruction, "op", None) != "Call"
+                    or callee not in functions or inputs is None
+                    or len(inputs) != len(instruction.args)
+                ):
+                    continue
+                for argument, formal in zip(instruction.args, inputs):
+                    entry_id = aliases.get((name, int(argument.id)))
+                    if entry_id is not None:
+                        aliases.setdefault((str(callee), int(formal)), entry_id)
+                pending.append(str(callee))
+    linked = []
+    for name in sorted(visited - {function_name}):
+        table = tables.get(name)
+        if table is None:
+            continue
+        for sequence in table.sequences.values():
+            capacity = aliases.get((name, int(sequence.capacity_value_id)))
+            columns = tuple(
+                aliases.get((name, int(value_id)))
+                for value_id in sequence.column_value_ids
+            )
+            if capacity is None or None in columns:
+                continue
+            owner = sequence.heap_owner_value_id
+            linked.append(_replace(
+                sequence,
+                column_value_ids=columns,
+                capacity_value_id=capacity,
+                heap_owner_value_id=(
+                    None if owner is None else aliases.get((name, int(owner)))
+                ),
+            ))
+    return tuple(linked)
+
+
 def emit_ssa_module_to_c(
     module: IRModule,
     function_name: str,
@@ -5907,7 +5981,15 @@ def emit_ssa_module_to_c(
                     else requirement.element_count
                     if requirement is not None
                     and requirement.element_count is not None
+                    # A rank-0, non-dynamic storage requirement is a proven
+                    # single cell (``element_count`` is ``None`` only
+                    # because the shape is empty).
                     else 1
+                    if requirement is not None
+                    and tuple(requirement.shape) == ()
+                    and not requirement.dynamic
+                    and authored_shape == ()
+                    else None
                 )
                 if value_id in record_parameter_ids:
                     # A record parameter's arena is its cell table: one
@@ -5923,9 +6005,30 @@ def emit_ssa_module_to_c(
                         record_entry = record_descriptor.records.get(value_id)
                         if record_entry is not None:
                             element_count = max(
-                                int(element_count),
+                                int(element_count or 0),
                                 len(record_entry.fields),
                             )
+                if element_count is None:
+                    # Lane D, item D1. Wrong record: a private root arena
+                    # with no storage requirement (or a dynamic or ranked
+                    # one with no element count), no split-source shape and
+                    # no record cell table was sized ``else 1``. One element
+                    # is a default, not a proof; a formal that is really a
+                    # row or a table would overrun it silently. Rule: a
+                    # private root arena's extent comes from its storage
+                    # requirement, the authored shape of its split source,
+                    # or its record cell table; otherwise the artifact is
+                    # refused by name. The one-cell arena below exists only
+                    # so the rest of the wrapper renders; a shortfall makes
+                    # the artifact incomplete, so it is never compiled.
+                    shortfalls.append(CEmissionShortfall(
+                        "storage",
+                        "private-root-storage-unproven: root formal "
+                        f"{value_id} of {function_name} has no storage "
+                        "requirement, split-source shape or record cell "
+                        "table that proves its extent",
+                    ))
+                    element_count = 1
                 owned = activation_array(held, element_count)
                 owned_storage_names[value_id] = owned
                 copied_from = (
@@ -6035,8 +6138,14 @@ def emit_ssa_module_to_c(
     root_sequences = getattr(module, "sequence_tables", {}).get(function_name)
     allocation_counts = {name: count for _kind, name, count in root_allocations}
     heap_releases: list[str] = []
-    if root_sequences is not None:
-        for sequence in root_sequences.sequences.values():
+    if root_sequences is not None or _linked_frame_sequences(
+        module, function_name,
+    ):
+        for sequence in (
+            *(root_sequences.sequences.values()
+              if root_sequences is not None else ()),
+            *_linked_frame_sequences(module, function_name),
+        ):
             capacity = owned_storage_names.get(int(sequence.capacity_value_id))
             columns = [owned_storage_names.get(int(value_id))
                        for value_id in sequence.column_value_ids]

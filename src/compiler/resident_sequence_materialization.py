@@ -1365,9 +1365,32 @@ def _static_mapping_capacity_bounds(
             unknown.add(destination)
             continue
         keys[destination].add(literal_keys[0])
+    # ``d.update(<dict display>)`` stores the display's rows into ``d`` and
+    # only reads the display (corpus c214): the receiver's universe gains
+    # the rows' literal keys, as ``d[k] = v`` does, and neither is
+    # unbounded by the call scan below.
+    display_updates = set()
+    for mutation in _dict_update_mutations(graph_obj):
+        if mutation.argument_kind != "mapping_items":
+            continue
+        display_updates.add(int(mutation.effect_node_id))
+        destination = int(aliases.get(
+            int(mutation.sequence_value_id), int(mutation.sequence_value_id),
+        ))
+        if destination not in keys:
+            continue
+        for key_id in mutation.argument_value_ids[::2]:
+            try:
+                keys[destination].add(ast.literal_eval(
+                    graph_obj.nodes[int(key_id)].get("expr_obj")
+                ))
+            except (KeyError, ValueError, TypeError):
+                unknown.add(destination)
     for _node_id, data in graph_obj.nodes(data=True):
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
         operation = str(data.get("type") or data.get("op") or "").casefold()
+        if int(_node_id) in display_updates:
+            continue
         if operation == "indexedstore":
             destination = int(aliases.get(roles.get("base"), roles.get("base", -1)))
             if destination in keys:
@@ -1676,6 +1699,30 @@ _RECEIVER_READING_METHODS = frozenset({
 _MUTABLE_COLLECTION_KINDS = frozenset({"list", "dict", "set", "bytearray"})
 
 
+def _receiver_collection_kind(data: Any) -> str | None:
+    """A receiver node's builtin collection kind: its ``aggregate_kind``,
+    else the builtin class its call result is declared to be.
+
+    Program: ``t = pick(n); t.append(9)`` with ``pick -> list[int]``
+    (corpus c216).  Wrong record: a call result carries no
+    ``aggregate_kind``, only ``result_class_ref='builtins.list'``, so its
+    in-place methods were no mutation record and the append vanished (the
+    caller read past the length: garbage).  Rule: a call result whose
+    declared class is a builtin collection is that collection.
+    """
+
+    attributes = (data or {}).get("attributes") or {}
+    kind = attributes.get("aggregate_kind")
+    if kind is not None:
+        return str(kind)
+    declared = str(attributes.get("result_class_ref") or "")
+    if declared.startswith("builtins.") and declared[9:] in (
+        _MUTABLE_COLLECTION_KINDS | {"bytes", "tuple", "frozenset"}
+    ):
+        return declared[9:]
+    return None
+
+
 def _method_mutated_receiver_ids(graph_obj: Any) -> frozenset[int]:
     """Mutable collections whose own method call changes their contents.
 
@@ -1700,9 +1747,8 @@ def _method_mutated_receiver_ids(graph_obj: Any) -> frozenset[int]:
             if str(role) != "operand" or parent not in graph_obj:
                 continue
             if (
-                (graph_obj.nodes[parent].get("attributes") or {}).get(
-                    "aggregate_kind"
-                ) in _MUTABLE_COLLECTION_KINDS
+                _receiver_collection_kind(graph_obj.nodes[parent])
+                in _MUTABLE_COLLECTION_KINDS
                 or isinstance(
                     graph_obj.nodes[parent].get("expr_obj"),
                     (ast.List, ast.Set, ast.Dict),
@@ -1761,6 +1807,17 @@ def _static_sequence_capacity_survey(
         for attributes in ((data.get("attributes") or {}),)
         if attributes.get("materialization_kind") == "unrolled_loop"
         and attributes.get("aggregate_kind") == "list"
+    })
+    # A list merged from equal-length arm displays (an ``aggregate_phi``)
+    # is born at the merge from its member Phis (``_list_literal_
+    # mutations``), so it is a local list of that many rows.
+    local_lists.update({
+        int(node_id): len(attributes["aggregate_leaf_value_ids"])
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in (data.get("attributes") or {},)
+        if attributes.get("producer_kind") == "aggregate_phi"
+        and attributes.get("aggregate_kind") == "list"
+        and attributes.get("aggregate_leaf_value_ids")
     })
     unknown = set()
     escaped = set()
@@ -2366,6 +2423,38 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
 
     accepted = set(map(int, sequence_ids))
     aggregate_scope = graph_obj.graph.get("source_aggregate_layout_scope")
+
+    def layout_members_of(layout):
+        return (
+            isinstance(layout, SourceAggregateLayout)
+            and str(layout.aggregate_kind) == "list"
+            and bool(layout.members)
+        )
+
+    def refuse_shared_merge_arms(merged_id, merged):
+        from .glsl_deployment_strategy import _mutated_sequence_node_ids
+
+        changed = _mutated_sequence_node_ids(graph_obj)
+        changed_in_place = _mutated_sequence_node_ids(
+            graph_obj, include_merge_aliases=False,
+        )
+        arms = tuple(
+            int(parent) for parent, role in merged.get("parents") or ()
+            if str(role) in {"body", "orelse"} and int(parent) in graph_obj
+        )
+        for arm in arms:
+            readers = tuple(
+                int(reader) for reader, reader_data in graph_obj.nodes(data=True)
+                if int(reader) != merged_id
+                and any(int(parent) == arm for parent, _role in reader_data.get("parents") or ())
+            )
+            if arm in changed_in_place or (readers and arm in changed):
+                raise ValueError(
+                    f"list {merged_id} merges the list {arm} from a branch, "
+                    "which changes or is shared after its display; a list "
+                    "bound on two branches is born from its arms' members "
+                    "only while each arm is its own unchanged display"
+                )
     aggregate_page = current_identity_book().page(SOURCE_AGGREGATE_LAYOUT)
     mutations = []
     nodes_by_value: dict[int, list[int]] = {}
@@ -2435,13 +2524,35 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             mutations.extend(rows)
             continue
         if (sequence_id not in accepted
-                or attributes.get("producer_kind") != "aggregate"
+                or attributes.get("producer_kind") not in {"aggregate", "aggregate_phi"}
                 or attributes.get("materialization_kind") is not None):
             continue
         layout = (
             aggregate_page.latest((aggregate_scope, sequence_id))
             if aggregate_scope is not None else None
         )
+        if attributes.get("producer_kind") == "aggregate_phi":
+            # Program: ``if n > 2: t = [n, 1] else: t = [5, 6]`` then
+            # ``return len(t) * 10 + t[0]`` (corpus c271).  Wrong record: a
+            # list merged from its arms had member Phis but no birth, so
+            # ``len(t)`` read a never-born arena (0) and appends after the
+            # merge were lost (silent).  Rule: the merged list is its own
+            # storage, born at the merge from its member Phis.  That copy is
+            # the list only while every arm is a display nothing else reads
+            # or changes; otherwise refuse by name.
+            if not layout_members_of(layout):
+                if attributes.get("aggregate_kind") == "list":
+                    # Program: ``def pick(n): if n > 2: r = [n] else: r =
+                    # []; return r`` (scratch c972).  Arms of different
+                    # lengths publish no member layout, and nothing else
+                    # bore the merge, so the caller read an empty list.
+                    raise ValueError(
+                        f"list {int(node_id)} is bound to lists of different "
+                        "shapes on two branches; a list merged from branches "
+                        "is lowered only from equal-length displays"
+                    )
+                continue
+            refuse_shared_merge_arms(int(node_id), data)
         # Program: ``s = {1, 2}; for i in ...: s.add(i * 3); len(s)``
         # (scratch c_s2).  Wrong record: only list displays were born, so a
         # set display's members were never inserted and ``len(s)`` counted
@@ -2675,6 +2786,101 @@ def _joined_list_literal_mutations(
     return tuple(mutations)
 
 
+def _dict_update_mutations(graph_obj: Any) -> tuple[Any, ...]:
+    """``d.update(...)`` on a dict receiver, as table mutations.
+
+    Program: ``d = {1: 10, 2: 20}; d.update({1: 5}); return d[1] + n``
+    (corpus c214).  Wrong record: ``update`` on a dict was no mutation
+    record of any kind, so its rows were never stored and the later lookup
+    read the initializer's 10 (silent; clean audit).  Rule:
+    ``d.update(<dict display>)`` is one keyed store per display row, in
+    order, at the call (the table store ``d[k] = v`` lowers to).  Its rows
+    are the display's own key and value producers, evaluated before the
+    call as Python evaluates the argument.  Any other ``update`` (another
+    mapping, keywords, ``**``) is posted as a ``mapping_source`` update,
+    which the table lowering refuses by name.
+    """
+
+    from .control_source import ControlSequenceMutation
+
+    calls = [
+        (node_id, data)
+        for node_id, data in sorted(graph_obj.nodes(data=True), key=lambda item: int(item[0]))
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "update"
+    ]
+    if not calls:
+        return ()
+    # A display changed after its birth no longer holds its display rows
+    # (``e = {2: n}; e[2] = 9; d.update(e)``): its update is a mapping
+    # source, by the one definition of "changed".
+    from .glsl_deployment_strategy import _mutated_sequence_node_ids
+
+    changed = _mutated_sequence_node_ids(graph_obj)
+    mutations = []
+    for node_id, data in calls:
+        expression = data.get("expr_obj")
+        roles = [
+            (str(role), int(parent)) for parent, role in data.get("parents") or ()
+            if parent in graph_obj
+        ]
+        receiver = next((parent for role, parent in roles if role == "operand"), None)
+        if receiver is None or (
+            graph_obj.nodes[receiver].get("attributes") or {}
+        ).get("aggregate_kind") != "dict":
+            continue
+        sequence_id = int(graph_obj.nodes[receiver].get("value_id", receiver))
+        sources = [parent for role, parent in roles if role.startswith("arg:")]
+        source = graph_obj.nodes[sources[0]] if len(sources) == 1 else {}
+        display = source.get("expr_obj")
+        if not (
+            len(sources) == 1 and len(expression.args) == 1
+            and not expression.keywords
+            and isinstance(display, ast.Dict)
+            and None not in display.keys
+            and (source.get("attributes") or {}).get("aggregate_kind") == "dict"
+            and int(sources[0]) not in changed
+        ):
+            mutations.append(ControlSequenceMutation(
+                sequence_value_id=sequence_id, operator="update",
+                argument_value_ids=tuple(
+                    int(graph_obj.nodes[parent].get("value_id", parent))
+                    for parent in sources
+                ),
+                effect_node_id=int(node_id), policy="unique",
+                argument_kind="mapping_source",
+            ))
+            continue
+        if not display.keys:
+            continue
+        source_parents = tuple(source.get("parents") or ())
+        keys = tuple(
+            int(graph_obj.nodes[parent].get("value_id", parent))
+            for parent, role in source_parents
+            if str(role).startswith("keys") and parent in graph_obj
+        )
+        values = tuple(
+            int(graph_obj.nodes[parent].get("value_id", parent))
+            for parent, role in source_parents
+            if str(role).startswith("values") and parent in graph_obj
+        )
+        if not len(keys) == len(values) == len(display.keys):
+            raise ValueError(
+                f"Dictionary update {node_id} lacks one exact key and value "
+                "producer per display row"
+            )
+        mutations.append(ControlSequenceMutation(
+            sequence_value_id=sequence_id, operator="update",
+            argument_value_ids=tuple(
+                value_id for pair in zip(keys, values) for value_id in pair
+            ),
+            effect_node_id=int(node_id), policy="unique",
+            argument_kind="mapping_items",
+        ))
+    return tuple(mutations)
+
+
 def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
     """Materialize authored dynamic dict rows at the literal's source site.
 
@@ -2818,4 +3024,5 @@ def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
                 argument_kind="mapping_items",
                 argument_expressions=(key_expression_ir, None),
             ))
+    mutations.extend(_dict_update_mutations(graph_obj))
     return tuple(mutations)

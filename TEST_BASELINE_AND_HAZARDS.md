@@ -1,6 +1,6 @@
 2026-10-22 COMPREHENSION OVER A NEGATIVE LITERAL (MEASURED): `[x * n for x in
 [5, -1]]` typed its row float64 (`-1` is a `neg` node). Fixed in
-`literal_row`, doc 35 section 6. Corpus 172/172 at 99c1dfaf. Fuzz seed 24
+`literal_row`, doc 36 section 6. Corpus 172/172 at 99c1dfaf. Fuzz seed 24
 base 40/40. Seed 23 FUZZ_EXT=2: 39 PASS and 1 WRONG (p23_3 = lanes plan
 C15, WRONG at `main`, Lane C). Gate names identical to `main`.
 
@@ -8,7 +8,7 @@ C15, WRONG at `main`, Lane C). Gate names identical to `main`.
 `ys = [x * n for x in xs]; ys.append(n)` (folded `xs`) lost the append:
 loop evaporation pruned its node, the survey did not bound the arena, and
 the comprehension's extent was proven static. New audit finding
-`static-extent-of-grown-sequence`. See docs/compiler_convergence/35
+`static-extent-of-grown-sequence`. See docs/compiler_convergence/36
 section 5. Note: the typed corpus harness cannot feed a root `list[int]`
 parameter (it wraps every input as a one-element array), so probes with
 resident list roots read an empty list or crash; use folded lists.
@@ -21,7 +21,7 @@ names identical to `main` 2532577 in all four parts.
 `for y in [x * n for x in xs]` read an empty iterable: a private copy of
 loop containment installed the comprehension's birth in the loop body.
 Built on Lane C's b1da6a5e (carried unchanged). See
-docs/compiler_convergence/35 section 4.
+docs/compiler_convergence/36 section 4.
 Corpus (this container): 169/169 PASS at the C14 commit. Fuzz seed 18 (base,
 40): 40 PASS. Seed 19 (FUZZ_EXT=1, 40): 39 PASS, 1 LOUD (p19_13, "lacks
 one exact element producer", LOUD at `main` too). Gate: failure names
@@ -30,7 +30,7 @@ identical to `main` 2532577 in all four parts.
 2026-10-22 MIXED INT/FLOAT LIST ROWS (C13) (MEASURED):
 A float row appended to an int64 arena was cast to int64 at the append
 call (silent at `main`). A float-to-integer call input conversion now
-refuses by name. See docs/compiler_convergence/35 section 3.
+refuses by name. See docs/compiler_convergence/36 section 3.
 Corpus (this container) at the C13 commit: 164/164 PASS (c01 re-run alone
 after a parallel cffi build race in the fresh worktree). Fuzz seed 16
 (base, 40) and seed 17 (FUZZ_EXT=1, 40): 80/80 PASS. Gate: failure names
@@ -42,7 +42,7 @@ concat of a concat had no bound (len 2 for 4); a concat's row typed
 float64; a concat placed before its operand's birth (PR #786's rule,
 carried verbatim). An unbounded concat is now DYNAMIC and refuses by name
 (`append_slice` cannot grow yet). Audit: `display-read-before-birth`.
-See docs/compiler_convergence/35 section 2.
+See docs/compiler_convergence/36 section 2.
 Corpus (this container): 164/164 PASS at f7e9b237 (c260-c264 then
 numbered c240-c244; d4adaba8 only renames programs and comments).
 Fuzz seed 15 (base, 40): 40 PASS. Seed 14 (FUZZ_EXT=1, 40): 39 PASS,
@@ -56,7 +56,7 @@ Silent wrong answer found and fixed (clean audit at `main`): `len()` of a
 computed tuple display read an unwritten length cell (0 for 3). Tuples are
 now born like lists and bounded by member count. The audit reports a
 display whose length is read while nothing writes its sequence
-(`display-length-unborn`). See docs/compiler_convergence/35 section 1.
+(`display-length-unborn`). See docs/compiler_convergence/36 section 1.
 Corpus (this container, Linux): 161/161 PASS with c260 and c261 (then numbered c218, c219) at
 01e2613; `main` 2532577 is 159/159 on the same container.
 Fuzz seed 11 (base tier, 40 programs, new tuple snippets): 39 PASS, 1 LOUD
@@ -66,6 +66,68 @@ Gate (this container): aa 96, ab 20, ac 57, rec 39 failed, both at
 parts. Both add the same 70 names to the committed baselines, so those 70
 belong to this container, not to this change. Not green: the gate must
 still be read on the machine that wrote the baselines.
+2026-10-22 LANE A, AUGMENTED SUBSCRIPT STORE CYCLE (MEASURED, cloud):
+`xs[0] += n` was refused with an effect-order cycle (loud on main; 3 of
+240 FUZZ_EXT=3 programs). A region's local Const no longer counts as a
+produced value. At 57052b8d: corpus 170/170 PASS; FUZZ_EXT=3 seeds 25/29
+60/60; gate same names as the parent.
+
+2026-10-22 LANE A, CALL ORDER SECOND STEP (MEASURED, cloud):
+`swap(xs)` after a list fill (`[1] * k`) or after a loop that appends ran
+after the reads of `xs` (silent on main). Fills and loops now join the
+source-order chain. At efa87006: corpus 169/169 PASS; FUZZ_EXT=3 seeds
+23/24 60/60, seed 25 59 PASS + 1 LOUD that is also loud on main (p25_25,
+augmented store cycle); gate same names as the parent.
+
+2026-10-22 LANE A, CALL ORDER AND BRANCH-MERGED LISTS (MEASURED, cloud):
+Silent wrong answers fixed (both wrong on main): a call after another
+source call whose argument fused with later reads was lost (FUZZ_EXT=3
+seed 18); a list bound to displays on two branches read len 0 and lost
+later appends. Shared, changed or unequal arms now refuse by name. At
+c52f8ef9: corpus 168/168 PASS, 0 findings; fuzz FUZZ_EXT=3 seeds 18/19/21
+and FUZZ_EXT=2 seed 20, 60/60 PASS each; gate aa 89 / ab 7 / ac 26 /
+rec 20, same names as the parent. See docs/compiler_convergence/35.
+
+2026-10-22 LANE A FOLLOW-UPS (MEASURED, cloud container):
+Silent wrong answers fixed: a callee's hoisted list or dict had capacity
+0 in the C wrapper; `[1, -1] + [n, 1]` followed by a dict display copied
+the right operand before its birth (fuzz p16_29, wrong on main). An int
+formal's physical arm is now int64 (rule 7). At a4c29be9: corpus 166/166
+PASS, 0 findings; fuzz FUZZ_EXT=2 seeds 16 and 17, 60/60 PASS each; gate
+aa 89 / ab 7 / ac 26 / rec 20, same names as the parent. See
+docs/compiler_convergence/35.
+
+2026-10-22 LANE A ITEM A6, PART (MEASURED, cloud container):
+Silent wrong answers fixed (all observed on main, clean audit):
+- `return [n]` from a callee read as an empty list in the caller;
+- `return [n]` / `return []` on two edges read the last site (now
+  refused by name);
+- a caller's `t.append(...)` on a returned list was dropped, and later
+  reads went past the length (garbage).
+At 12ee174: corpus 164/164 PASS, 0 findings; fuzz FUZZ_EXT=2 seed 15,
+60/60 PASS; gate aa 89 / ab 7 / ac 26 / rec 20, nothing outside the
+parent's failures. See docs/compiler_convergence/35.
+
+2026-10-22 LANE A ITEM A3 (MEASURED, cloud container):
+Silent wrong answer fixed: `d.update({k: v})` on a dict was dropped,
+so later lookups read the initializer. It is now a keyed store per
+display row. Updates from a changed mapping or with keywords are refused
+by name. At 0718f9a: corpus 162/162 PASS, 0 findings; fuzz FUZZ_EXT=2
+seed 12, 40/40 PASS; gate aa 89 / ab 7 / ac 26 / rec 20, nothing outside
+the parent's failures. See docs/compiler_convergence/35.
+
+2026-10-22 LANE A ITEM A0 (MEASURED, cloud container):
+A chained comparison whose middle is int/float/len/abs/ord of a pure
+operand now lowers, the middle spelled in place in both comparisons
+(never hoisted past a guarding `and`). Other call middles still refuse.
+This was the first refusal of both the bootstrap and the managed tire.
+At 0d98ef1: corpus 161/161 PASS, 0 findings; fuzz FUZZ_EXT=1 seed 10,
+30/30 PASS; gate aa 90 / ab 7 / ac 26 / rec 20 vs parent 2532577 aa 89 /
+7 / 26 / 20 in the same container. The extra aa name
+(test_sympy_process_graph_is_registered_before_python_dependency_pursuit)
+fails the same way alone on the parent: order-dependent, not A0.
+Not measured: the bootstrap and the tire themselves (Albert's machine).
+See docs/compiler_convergence/35.
 
 2026-10-22 CALL-BOUNDARY AND SET ROUND (MEASURED):
 Silent wrong answers found and fixed (each with a clean audit):
