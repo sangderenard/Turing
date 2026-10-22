@@ -3798,6 +3798,22 @@ def emit_ssa_module_to_c(
                             # whose shape is unknown is not one element: it
                             # has no static count and is refused below.
                             count = 1
+                    empty_guard = None
+                    if count is None:
+                        # Program: ``xs = [n, 7, -2, n * 2]; max(xs)`` and
+                        # ``sum(collect(n))`` (scratch c104, c116).  Wrong
+                        # record: a resident sequence's reduction was refused
+                        # for want of a static count, though its live length
+                        # is the sequence's own length cell (the formal whose
+                        # ``sequence_length_for`` names it).  Rule: a
+                        # sequence of scalar rows reduces over its live
+                        # length; ``max``/``min`` of no rows raises (Python's
+                        # ValueError) through the validation runtime.
+                        parts = sequence_extent_parts(source)
+                        if parts is not None and not tuple(parts[1]):
+                            count = f"(ptrdiff_t)({parts[0]})"
+                            if op in {"max", "min"}:
+                                empty_guard = count
                     if count is None:
                         shortfalls.append(CEmissionShortfall(
                             op,
@@ -3805,6 +3821,13 @@ def emit_ssa_module_to_c(
                             f"static semantic element count in {fn}",
                         ))
                         continue
+                    if empty_guard is not None:
+                        prototype = (
+                            "void turing_validation_error(uint32_t error_code);"
+                        )
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
                     result_id = int(instruction.res.id)
                     result_type = buffer_type(instruction.res)
                     # ``builtins.sum(iterable, start)``: the start operand
@@ -3829,10 +3852,22 @@ def emit_ssa_module_to_c(
                             f"{rendered};"
                         )
                     else:
-                        source_address = address_operand(source)
+                        # A heap-owned sequence's operand is its pointer
+                        # CELL; the rows are one load away (``heap_data``).
+                        heap_layout = heap_element(source)
+                        source_address = (
+                            heap_data(source) if heap_layout is not None
+                            else address_operand(source)
+                        )
                         if source_address is None:
                             continue
-                        element_type = buffer_type(source)
+                        if heap_layout is not None:
+                            from ..transmogrifier.dtype_layout import layout_for
+                            element_type = _buffer_c_type(
+                                layout_for(heap_layout).name
+                            )
+                        else:
+                            element_type = buffer_type(source)
                         if op in {"max", "min"}:
                             comparison = ">" if op == "max" else "<"
                             # NaN propagates, matching the numpy reference:
@@ -3871,9 +3906,15 @@ def emit_ssa_module_to_c(
                             )
                             initial = "0.0"
                             start = 0
+                        # ``max``/``min`` of no rows records the error and
+                        # never reads a row (an empty arena has none).
                         body.extend((
-                            f"        {result_type} t{result_id};",
-                            "        {",
+                            f"        {result_type} t{result_id} = 0;",
+                            (
+                                f"        if ({empty_guard} <= 0) "
+                                "turing_validation_error(74u); else {"
+                                if empty_guard is not None else "        {"
+                            ),
                             f"        const {element_type} *turing_red_"
                             f"{result_id}_src = (const {element_type} *)"
                             f"({source_address});",

@@ -20757,6 +20757,17 @@ def _post_ssa_block_geometry(book, scope, function):
             )
             if callsite is not None
             for cell in call_bindings.get(int(callsite), ())
+        ) + tuple(
+            # A region call's arity is its region's signature.
+            cell
+            for instruction in block.instrs
+            if instruction.op in {"Call", "call"}
+            and instruction.attributes.get("region_index") is not None
+            for cell in (book.latest_ref(
+                REGION_SIGNATURE,
+                (scope, int(instruction.attributes["region_index"])),
+            ),)
+            if cell is not None
         )
         sources = tuple(dict.fromkeys(cell for cell in (
             book.latest_ref(SSA_BLOCK, (scope, str(function.name), str(label))),
@@ -27743,6 +27754,28 @@ def lower_control_sections_to_ssa(
                         and _column_dtype not in {"", "None", "unknown"}
                     ):
                         argument.dtype = _column_dtype
+                    elif (
+                        descriptor.heap_owner_value_id is not None
+                        and _column_dtype not in {"", "None", "unknown", "ptr"}
+                    ):
+                        # A heap-owned arena enters the region as its pointer
+                        # CELL (``sum(collect(n))``, scratch c116: the region
+                        # read the cell as rows).  The formal carries the
+                        # descriptor's heap element layout.
+                        from ..transmogrifier.dtype_layout import layout_for
+
+                        # The region only reads the rows: it carries the
+                        # element layout, not the owner (which is no value
+                        # of the region; growth stays with the caller).
+                        argument.dtype = "ptr"
+                        accounting = {
+                            key: entry for key, entry in accounting.items()
+                            if key != "heap_owner_value_id"
+                        }
+                        accounting["heap_element_dtype"] = layout_for(
+                            _column_dtype
+                        ).name
+                        argument.accounting = dict(accounting)
                     _formal_cell = revise_ssa_value(
                         region_function, int(argument.id),
                         dtype=argument.dtype,
@@ -27819,6 +27852,61 @@ def lower_control_sections_to_ssa(
                         call_instruction.args.extend(appended)
                         if appended:
                             attributes = dict(call_instruction.attributes)
+                            # Program: ``out = []`` filled by a callee, then
+                            # ``len(xs) * 100 + sum(xs)`` (scratch c116).
+                            # Wrong record: appending the length cell changed
+                            # the calling block's geometry with no new cause,
+                            # and the geometry post was refused.  Rule: the
+                            # region's signature gains the feed, REVISED from
+                            # the sequence contract cells that require it;
+                            # block geometry names that signature.
+                            region_index = attributes.get("region_index")
+                            if region_index is not None:
+                                previous_signature = region_signatures.get(
+                                    int(region_index)
+                                )
+                                if previous_signature is not None:
+                                    revised_feeds = (
+                                        *tuple(previous_signature[0]),
+                                        *(
+                                            int(value.id) for value in appended
+                                            if int(value.id)
+                                            not in previous_signature[0]
+                                        ),
+                                    )
+                                    region_signatures[int(region_index)] = (
+                                        revised_feeds, previous_signature[1],
+                                    )
+                                    signature_sources = tuple(
+                                        cell for cell in (
+                                            _control_book.latest_ref(
+                                                _SEQUENCE_CONTRACT_PAGE,
+                                                (_scope, int(sequence_id)),
+                                            )
+                                            for sequence_id, _length in additions
+                                            for _scope in (
+                                                control_function.name,
+                                                str(tensor_shape_concordance_scope),
+                                            )
+                                        ) if cell is not None
+                                    ) or (_function_root_cell(
+                                        _control_book,
+                                        str(tensor_shape_concordance_scope),
+                                    ),)
+                                    _control_book.post(
+                                        REGION_SIGNATURE,
+                                        (
+                                            str(tensor_shape_concordance_scope),
+                                            int(region_index),
+                                        ),
+                                        RegionSignature(
+                                            tuple(map(int, revised_feeds)),
+                                            tuple(map(int, previous_signature[1])),
+                                        ),
+                                        stage=CONTROL_SSA_REGION,
+                                        provenance=Derived(signature_sources),
+                                        mode=Mode.REVISE,
+                                    )
                             if "feed_ids" in attributes:
                                 attributes["feed_ids"] = (
                                     *tuple(attributes["feed_ids"]),

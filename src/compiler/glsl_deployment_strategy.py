@@ -2742,10 +2742,19 @@ def _build_shell_hierarchy_plan(
             ).values()
         }
         capture_constants = {}
+        mutated_capture_ids = _mutated_sequence_node_ids(graph.G)
         for value_id in region_captures:
             if value_id in carried_initial_boundaries:
                 continue
             if int(value_id) in loop_target_value_ids:
+                continue
+            # Program: ``xs = [0, 0, 0, 0]; for i in range(4): xs[i] = i * n``
+            # (scratch c111).  Wrong record: the stored-into display was
+            # folded into the first store region as a ``Const`` literal, a
+            # second producer of the arena's identity that redefined it after
+            # its appends (dominance findings).  Rule: a mutated collection's
+            # initializer is never its contents (``_mutated_sequence_node_ids``).
+            if int(value_id) in mutated_capture_ids:
                 continue
             known, value = _constant_expression(value_id)
             if known:
@@ -22235,6 +22244,86 @@ def _remove_dead_metadata_nodes(
                 heapq.heappush(pending, node_order[parent])
 
 
+def _mutated_sequence_node_ids(graph_obj: Any) -> frozenset[int]:
+    """Collections whose contents change after their initializer.
+
+    One definition for every reader that would otherwise treat an
+    initializer as the collection's contents: the structural fold (a
+    projection folded to an initializer leaf) and region planning (a
+    capture folded to a ``Const`` literal).
+    """
+
+    mutated_sequence_ids = {
+        int(record["sequence_value_id"])
+        for record in (
+            graph_obj.graph.get("source_sequence_mutation_records") or {}
+        ).values()
+    }
+    # Program: ``xs = []; fill(xs, n); return len(xs)``.  Wrong record: the
+    # empty literal was folded as ``xs``'s contents because only direct
+    # mutation records and indexed stores counted; ``fill`` appends to its
+    # argument, and ``len(xs)`` folded to 0.  Rule: a collection passed into
+    # a call that may retain or mutate it is mutated, by the one escape
+    # definition the capacity survey uses.
+    # Only a MUTABLE collection can be changed by the call; a tuple, a
+    # frozenset, bytes or a string passed to a callee keeps its contents
+    # (``test_structural_fold_retains_singleton_aggregate_leaf_identity``).
+    from .resident_sequence_materialization import _call_escaped_argument_ids
+
+    def mutable_collection(node_id: int) -> bool:
+        data = graph_obj.nodes.get(int(node_id), {})
+        expression = data.get("expr_obj")
+        if isinstance(expression, (
+            ast.List, ast.Set, ast.Dict,
+            ast.ListComp, ast.SetComp, ast.DictComp,
+        )):
+            return True
+        if isinstance(expression, ast.Constant):
+            return isinstance(expression.value, (list, set, dict, bytearray))
+        literal = (data.get("attributes") or {}).get("value")
+        if isinstance(literal, (list, set, dict, bytearray)):
+            return True
+        return str((data.get("attributes") or {}).get(
+            "extraction_identity"
+        ) or "") in {
+            "builtins.list", "builtins.set", "builtins.dict",
+            "builtins.bytearray",
+        }
+
+    mutated_sequence_ids.update(
+        node_id for node_id in _call_escaped_argument_ids(graph_obj)
+        if mutable_collection(node_id)
+    )
+    from .resident_sequence_materialization import (
+        _method_mutated_receiver_ids,
+    )
+    mutated_sequence_ids.update(_method_mutated_receiver_ids(graph_obj))
+    # IndexedStore carries the updated state identity on its base edge. Its
+    # initializer must stay resident too: folding it to a literal made each
+    # region construct its own [0.0], so the write survived but the later read
+    # still observed a different, untouched arena. Follow only exact base
+    # edges through consecutive store versions, never a binding-name match.
+    for _node_id, store in graph_obj.nodes(data=True):
+        if str(store.get("op") or store.get("type") or "").casefold() not in {
+            "indexedstore", "index_set", "setitem",
+        }:
+            continue
+        pending_bases = [int(parent) for parent, role in store.get("parents") or ()
+                         if str(role) == "base"]
+        while pending_bases:
+            base_id = pending_bases.pop()
+            if base_id in mutated_sequence_ids:
+                continue
+            mutated_sequence_ids.add(base_id)
+            base = graph_obj.nodes.get(base_id, {})
+            if str(base.get("op") or base.get("type") or "").casefold() in {
+                "indexedstore", "index_set", "setitem",
+            }:
+                pending_bases.extend(int(parent) for parent, role in base.get("parents") or ()
+                                     if str(role) == "base")
+    return frozenset(mutated_sequence_ids)
+
+
 def _fold_callsite_structural_values(
     graph: Any, *, _progress: Any = None,
 ) -> None:
@@ -22293,74 +22382,7 @@ def _fold_callsite_structural_values(
     unresolved = _UNRESOLVED_STRUCTURAL_VALUE
     known: dict[int, Any] = {}
     topology_changed = False
-    mutated_sequence_ids = {
-        int(record["sequence_value_id"])
-        for record in (
-            graph.G.graph.get("source_sequence_mutation_records") or {}
-        ).values()
-    }
-    # Program: ``xs = []; fill(xs, n); return len(xs)``.  Wrong record: the
-    # empty literal was folded as ``xs``'s contents because only direct
-    # mutation records and indexed stores counted; ``fill`` appends to its
-    # argument, and ``len(xs)`` folded to 0.  Rule: a collection passed into
-    # a call that may retain or mutate it is mutated, by the one escape
-    # definition the capacity survey uses.
-    # Only a MUTABLE collection can be changed by the call; a tuple, a
-    # frozenset, bytes or a string passed to a callee keeps its contents
-    # (``test_structural_fold_retains_singleton_aggregate_leaf_identity``).
-    from .resident_sequence_materialization import _call_escaped_argument_ids
-
-    def mutable_collection(node_id: int) -> bool:
-        data = graph.G.nodes.get(int(node_id), {})
-        expression = data.get("expr_obj")
-        if isinstance(expression, (
-            ast.List, ast.Set, ast.Dict,
-            ast.ListComp, ast.SetComp, ast.DictComp,
-        )):
-            return True
-        if isinstance(expression, ast.Constant):
-            return isinstance(expression.value, (list, set, dict, bytearray))
-        literal = (data.get("attributes") or {}).get("value")
-        if isinstance(literal, (list, set, dict, bytearray)):
-            return True
-        return str((data.get("attributes") or {}).get(
-            "extraction_identity"
-        ) or "") in {
-            "builtins.list", "builtins.set", "builtins.dict",
-            "builtins.bytearray",
-        }
-
-    mutated_sequence_ids.update(
-        node_id for node_id in _call_escaped_argument_ids(graph.G)
-        if mutable_collection(node_id)
-    )
-    from .resident_sequence_materialization import (
-        _method_mutated_receiver_ids,
-    )
-    mutated_sequence_ids.update(_method_mutated_receiver_ids(graph.G))
-    # IndexedStore carries the updated state identity on its base edge. Its
-    # initializer must stay resident too: folding it to a literal made each
-    # region construct its own [0.0], so the write survived but the later read
-    # still observed a different, untouched arena. Follow only exact base
-    # edges through consecutive store versions, never a binding-name match.
-    for _node_id, store in graph.G.nodes(data=True):
-        if str(store.get("op") or store.get("type") or "").casefold() not in {
-            "indexedstore", "index_set", "setitem",
-        }:
-            continue
-        pending_bases = [int(parent) for parent, role in store.get("parents") or ()
-                         if str(role) == "base"]
-        while pending_bases:
-            base_id = pending_bases.pop()
-            if base_id in mutated_sequence_ids:
-                continue
-            mutated_sequence_ids.add(base_id)
-            base = graph.G.nodes.get(base_id, {})
-            if str(base.get("op") or base.get("type") or "").casefold() in {
-                "indexedstore", "index_set", "setitem",
-            }:
-                pending_bases.extend(int(parent) for parent, role in base.get("parents") or ()
-                                     if str(role) == "base")
+    mutated_sequence_ids = set(_mutated_sequence_node_ids(graph.G))
     from .resident_sequence_materialization import (
         _loop_carried_initial_ids,
     )
