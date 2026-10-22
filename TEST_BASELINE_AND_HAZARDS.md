@@ -1,3 +1,33 @@
+2026-10-22 LOOP EXITS, SEQUENCE EFFECTS, DISPLAY IDENTITIES, PLANNED TYPES (MEASURED):
+Native corpus (C lane against the authored Python, with result-type check):
+107 programs, all value-correct with 0 concordance findings at 6300d55.
+Four return a float where Python returns an int (c144, c145, c152, c156).
+New since baa4d9d:
+- for/while-else and loop exits;
+- sorted() and every in-place list method (pop, pop(i), insert, remove,
+  extend, reverse, sort);
+- stores into displays;
+- reductions over runtime-length and returned lists;
+- dict literals and `d[k] += v`;
+- chained comparisons;
+- filtered comprehensions;
+- sets filled in a loop.
+Silent wrong answers fixed:
+- dict subscript of a literal;
+- display members after a sort;
+- pop/remove/extend dropped;
+- a computed member in two displays;
+- `xs[len(xs) - 1]`.
+Gate (gate12 49-file split, --timeout 900): 123 failed, the same set as at
+g16. 0 new across g17 to g21 (686fe50); gate22 (6300d55) is pending.
+Focused rec suite: 20 failed, unchanged.
+`main` was fast-forwarded to 686fe50 at the user's request.
+Open in doc 33's frontier:
+- strings as values;
+- the remaining int-as-float results;
+- c202/c204/c211/c212/c214/c216 (loud refusals).
+See docs/compiler_convergence/33_identity_repairs_and_bootstrap_chain_2026_10_22.md.
+
 2026-10-22 SCOPE-LOCAL IDENTITIES, RETURNED LISTS, HEAP LEASES (MEASURED):
 Native corpus (`tests/native_semantics_corpus`, C lane, run against the
 authored Python): 63/63 pass with 0 concordance findings at baa4d9d. New:

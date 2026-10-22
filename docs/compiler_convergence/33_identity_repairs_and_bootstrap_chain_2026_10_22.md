@@ -469,6 +469,87 @@ at g11 (3 fixed); the 2 new ones are fixed at 9f1643c. Focused suites: 20
 failed versus 22. Units 24, 33 and 35 compile on replay; 34 stops at the
 variadic return lane.
 
+## Loop exits, sequence effects and one identity per display member
+
+Found by core-semantics probe batches (scratch batch1/batch2, run against the
+authored Python with a type-checking harness). Each entry is program -- wrong
+record -- rule; every rule is applied at the pass that lost the record.
+
+- `for ... else` / `while ... else`: normalized into a break flag
+  (`_normalize_loop_else`). The structural fold leaves a post-loop read of a
+  break continuation or carried update unresolved. A `for` target read after
+  the loop is carried (pre-loop value, element). A name assigned this loop's
+  own target is not a descendant-loop induction. The C lane copies the
+  Phis on an edge as one parallel copy (`i = -5; for i in range(10)` returned
+  10 for 9).
+- List display members: an append's identity is (display, ordinal)
+  (`ControlSequenceMutation.display_member`), not the member's producer.
+  The producer key misplaced `[5, n, 2, 9]`'s `n` after the sort that read
+  the list. It also retired `k = n + 1`'s region when `k` sat in two
+  displays, which minted `k` as a root formal. Placement, guards, effect
+  dedupe, installed-effect matching, region retirement, the completeness
+  audit and contract provenance all read the display.
+- `sorted()` of a private list is heap-owned DYNAMIC. Its sort workspaces
+  are the function's own storage, reserved to the row count; they were
+  caller-provided root formals with capacity 0. A copy states the
+  destination's heap contract once its layout is concorded.
+- In-place sequence methods are retained effects.
+  - Before, only `append` and `add` were retained, and `pop`, `extend`,
+    `remove`, `insert`, `reverse` and `pop(i)` vanished silently.
+  - New helpers: `lower_sequence_delete_at`, `lower_sequence_insert_at`
+    (Python's index rule, DYNAMIC reserve-and-retry) and
+    `lower_sequence_reverse`.
+  - The structural fold no longer reads a method-mutated receiver's
+    initializer as its contents (`_method_mutated_receiver_ids`).
+  - `_mutated_sequence_node_ids` is the one definition of a collection
+    whose contents change after its initializer. The fold and region
+    planning both read it; the latter had folded a stored-into display
+    into a region `Const`.
+- A sequence effect outside a loop precedes every later read of its receiver
+  (`_sequence_effect_read_edges` -> region reducer). An append's computed
+  argument was fused with the post-append reads into one region (cycle).
+- A reader of an arena follows the arena's display birth (extend of a
+  display argument). A captured row load is a read of its index and sequence
+  (`xs[len(xs) - 1]` read its index before definition).
+- Types:
+  - A row load revises its `ssa_value` row to the column dtype.
+  - An arena with no concorded row is born `unknown`, not the planner's
+    float64 capture guess.
+  - A region's arena formal reads its element type, or heap layout, from
+    the descriptor.
+  - `_planned_scalar_dtypes` types plan-time values from the source:
+    literals, annotated parameters, `range` targets, the shared region
+    operator rules (`hierarchical_plan.REGION_*`), and a collection's
+    element type joined from its writers.
+  - A DYNAMIC sequence whose element type is proven is declared with it at
+    birth.
+- Reductions (`max`/`min`/`sum`/`any`/`all`) over a sequence use its live
+  length (`sequence_extent_parts`) and read heap arenas through their cell.
+  `max`/`min` of an empty sequence raises through the validation runtime,
+  which the C lane now links (`turing_validation_error`), as do `pop` and
+  `remove` on absent rows.
+- A dict subscript is a key lookup. The fold had aliased `d[1]` to the
+  dict's second ledger leaf, a key (silent).
+- Chained comparisons are the conjunction of their adjacent comparisons
+  (`_normalize_chained_comparisons`). A chain was dispatch metadata and read
+  a minted input (always 0).
+- Smaller fixes:
+  - A minted indexed store states its site's span, so `d[1] += 5` is placed
+    at its statement.
+  - The builder prologue counts post-scheduled table operations as
+    scheduled.
+  - Appending a sequence length feed revises the region signature, so block
+    geometry has its cause.
+  - A loop-grown private sequence is DYNAMIC whoever minted it
+    (comprehension collections).
+
+Measured at 6300d55:
+- Corpus: 107 programs, all value-correct with 0 concordance findings. Four
+  return a float where Python returns an int (c144, c145, c152, c156).
+- Gate (gate12 file split, 49 files): 123 failed, the same set as at g16.
+  No new failure across g17 to g21; gate22 is pending at the time of
+  writing.
+
 ## Open frontier (stated, not worked around)
 
 - **Variadic returns.** `return ()` / `return (x,)` and `return []` /
@@ -490,10 +571,26 @@ variadic return lane.
 
 - Generic `str()`/`!r` of `Any`-typed facts (ten f-string units): needs a
   runtime type dispatch over every fact class.
-- Planner region inputs default to float64 when the graph domain has no type;
-  unit 64/254 read that provisional as a sequence column dtype.
-- Native validation runtime is absent from the C module lane (no corpus
-  program with a reachable `raise` can be emitted there).
+- Planner region inputs default to float64 when neither the graph domain
+  nor `_planned_scalar_dtypes` proves a type. The remaining int-as-float
+  results are values reached through a callee return, a loop-carried
+  `pop`/`insert` result, or a value computed under a chained conjunction in
+  a loop (c144, c145, c152, c156). Unit 64/254 read that provisional type as
+  a sequence column dtype.
+- Strings as values (`s = "abc" if c else "hello"`, `len(s)`, `s == "abc"`,
+  `s.startswith(...)`) are dispatch metadata. Nothing lowers them, so the
+  value is minted as a root input; the concordance reports
+  `unaccounted-formal` (c114, c217). A string-keyed dict refuses (c241).
+- Loud refusals from probe batch 2, each with a named record:
+  - `d.get(k, 0)` in a loop: control order cycle (c202).
+  - Slices of a display: physical-type conflict (c204).
+  - `xs[i % 4] += i` in a loop: a carried read with no lexical binding row
+    (c211).
+  - Nested list stores: no source cell for the control block (c212).
+  - `any()`/`all()` generators over a comprehension (c214): the generator
+    loops' iterable bindings still name the comprehension node after its
+    collection port superseded it.
+  - Early `return` from a loop over a list parameter (c216).
 - Lists across call edges: growing (c55) and returning (c56, c60) now
   pass. A constant list literal passed to a reader still fails with
   "aggregate call binding arity 3 != 0" (c127).
