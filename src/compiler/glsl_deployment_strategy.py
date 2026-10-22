@@ -8045,6 +8045,30 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
             }
         else:
             continue
+        # Program: ``for x in range(6): if x > 0 and x * 2 > n: ...``
+        # (scratch c83).  The reducer unrolled the loop; each iteration's
+        # ``and`` is its own BoolOp node, all at one source location.  Wrong
+        # record: membership fell back to location + signature, so every
+        # iteration's guarded ``x * 2 > n`` belonged to EVERY copy's arm (and
+        # to the unrolled-away original), one region held them all, and five
+        # short-circuit controls claimed it ("maximal control blocks overlap
+        # without containment").  Rule: edges are authoritative -- a BoolOp
+        # owns the guarded nodes that are graph ancestors of its own guarded
+        # operand edges (``value:1`` ...); a BoolOp record with no such edge
+        # (unrolled away, or folded to a constant) owns nothing.
+        boolean_scope = None
+        if isinstance(expression, ast.BoolOp):
+            control_node = graph.G.nodes.get(int(control_id)) or {}
+            guarded_operands = tuple(
+                int(parent)
+                for parent, edge_role in control_node.get("parents") or ()
+                if str(edge_role).startswith("value:")
+                and str(edge_role) != "value:0"
+                and int(parent) in graph.G
+            )
+            boolean_scope = set(guarded_operands)
+            for operand in guarded_operands:
+                boolean_scope.update(nx.ancestors(graph.G, operand))
         for role, statements in branches.items():
             for statement in statements:
                 for member in ast.walk(statement):
@@ -8057,6 +8081,11 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
                             for candidate, candidate_id in location_nodes.get(_ast_source_location(member), ())
                             if signature(candidate) == signature(member)}))
                     )
+                    if boolean_scope is not None:
+                        guarded_nodes = tuple(
+                            node for node in guarded_nodes
+                            if int(node) in boolean_scope
+                        )
                     guarded_nodes = (*guarded_nodes, *effect_span_nodes.get(
                         (member.lineno, member.col_offset,
                          getattr(member, "end_lineno", None), getattr(member, "end_col_offset", None)), ()))

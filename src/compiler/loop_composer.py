@@ -1074,6 +1074,27 @@ def evaporate_unrolled_loops(
             member.loop.control_sites or member.loop.return_controls
             for member in selected_plans
         )
+        # Program: ``for x in range(6): if x * 2 > n: total += x`` (scratch
+        # c86; also with an else arm, c88).  Wrong record: evaporation
+        # emits no control block, but the body's authored ``if`` is a
+        # control-owned merge -- its per-iteration Phi clones all kept
+        # ``source_conditional_id`` of the ONE source If, so the planner
+        # built a single conditional from iteration 0's predicate and
+        # iteration 5's arm, and every other iteration's total became an
+        # unaccounted formal (the C lane returned 0 for 15).  Rule: a loop
+        # whose body holds an authored ``if`` statement keeps its iterative
+        # control; a conditional EXPRESSION (``a if c else b``) is a value
+        # select and still evaporates.
+        blocked_by_control = blocked_by_control or any(
+            isinstance(member_expression, ast.If)
+            for member in selected_plans
+            for loop_expression in (
+                graph.G.nodes.get(int(member.loop.node_id), {}).get("expr_obj"),
+            )
+            if isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While))
+            for statement in loop_expression.body
+            for member_expression in ast.walk(statement)
+        )
         blocked_by_call = any(
             any((graph.G.nodes[node_id].get("attributes") or {}).get(key)
                 is not None for key in ("callee_ref", "method_ref", "constructor_ref"))
