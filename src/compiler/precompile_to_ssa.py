@@ -27074,10 +27074,18 @@ def lower_control_sections_to_ssa(
 
         item_operand_page = current_identity_book().page("item_operand")
     for region_index, instructions in planned_region_instructions.items():
+        # Program: ``xs1 = [4, n]; xs1[0] += n; return xs1[0]`` (fuzzer
+        # p25_25; corpus c273).  Wrong record: the store's region spelled
+        # its index ``0`` as a local ``Const`` of graph id 3, and that local
+        # was counted as produced, so the row load of ``xs1[0]`` (index 3)
+        # depended on the store that consumes its sum: an order cycle
+        # (loud).  Rule: a region's ``Const`` is its own spelling of a
+        # literal, not a value it produces for anyone else.
         produced = tuple(dict.fromkeys(
             int(instruction.res.id)
             for instruction in instructions
             if instruction.res is not None
+            and str(instruction.op) != "Const"
         ))
         produced_set = set(produced)
         consumed = tuple(dict.fromkeys(
