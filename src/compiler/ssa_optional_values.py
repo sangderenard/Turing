@@ -274,8 +274,15 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
     )
     from .identity_concordance import current_identity_book, Derived, Mode
     from .ssa_record_return_state import (
+        accepted_ssa_component,
         mint_ssa_value, function_scope_of, identity_cells, revise_ssa_value,
     )
+    # Program: bootstrap unit 35 (IdentityPage._virtual_fact) composing the
+    # accepted IdentityPage._resolved (unit 33).  Wrong record: this pass
+    # lowered _resolved's record-covered call to _fork_of_scope a second
+    # time; its output_ids were already the interleaved (payload, presence)
+    # pairs, so 4 projections met 2 receipts.  Rule: an accepted component
+    # is an immutable source -- no loop here writes into one.
     from .structural_concordance import (
         aggregate_return_layouts, publish_aggregate_return_layout,
         optional_structure,
@@ -295,6 +302,8 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
         record_descriptor_cell, record_member_cell,
     )
     for function_name, function in functions.items():
+        if accepted_ssa_component(function):
+            continue  # immutable source; its unit lowered it
         table = record_tables.get(function_name)
         if table is None:
             continue
@@ -450,6 +459,8 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
         )
 
     for function_name, function in functions.items():
+        if accepted_ssa_component(function):
+            continue  # immutable source; its unit lowered it
         producers = {
             int(instruction.res.id): instruction
             for block in function.blocks.values()
@@ -769,6 +780,8 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
     while forwarding_changed:
         forwarding_changed = False
         for function_name, function in functions.items():
+            if accepted_ssa_component(function):
+                continue  # immutable source; its unit lowered it
             if str(function_name) in contracts:
                 continue
             producers = {
@@ -859,6 +872,8 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
             forwarding_changed = True
 
     for caller_name, caller in functions.items():
+        if accepted_ssa_component(caller):
+            continue  # immutable source; its unit lowered it
         producers = {
             int(instruction.res.id): instruction
             for block in caller.blocks.values()

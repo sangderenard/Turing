@@ -19877,7 +19877,17 @@ class _ControlSSABuilder(TiledObject):
                     and len(edges) > 1
                     and slot < len(arms_record[1].member_cells)
                 )
-                if len(edges) == 1:
+                # Program: ``r = []; if n < 0: return r; r.append(2 * n);
+                # return r`` (c62).  Wrong record: both return edges carry
+                # sequence 1, yet the exit minted Phi(1, 1) as a NEW sequence
+                # (94029) with its own, never-written length/capacity cells,
+                # and the caller bound that phantom.  Rule: a merge whose
+                # every incoming value is one identity is that identity.
+                single_identity = (
+                    len({int(value.id) for value in incoming_values}) == 1
+                    and not member_phi
+                )
+                if len(edges) == 1 or single_identity:
                     merged = incoming_values[0]
                 elif member_phi:
                     # The join is the record: this slot's merge IS the
@@ -19898,7 +19908,7 @@ class _ControlSSABuilder(TiledObject):
                     merged = self._return_merge_sequence_destination(
                         merged, incoming_values,
                     )
-                if len(edges) != 1:
+                if len(edges) != 1 and not single_identity:
                     self.emit(
                         Handler.Phi,
                         incoming_values,
@@ -22933,6 +22943,20 @@ def _schedule_loop_callsites(
                         producers.setdefault(int(output), []).append(position)
                 dependencies: list[set[int]] = []
                 dependency_reasons: dict[tuple[int, int], list[Any]] = {}
+                # Program: ``r = []; if n < 0: return r; r.append(2 * n)``
+                # (c62).  Wrong record: the append publishes its arena id as
+                # a value, the guarded ``return r`` reads that id, and the
+                # later-producer rule below pulled the append (and its
+                # operand region) ahead of the guard, so ``n < 0`` returned
+                # ``[2n]``.  Rule: an arena is storage born at its
+                # descriptor, never a value a later mutation produces; its
+                # order is the RAW/WAR/WAW accesses (``sequence_accesses``,
+                # where a return reads the arenas it returns).
+                mutated_arenas = {
+                    int(child.mutation.sequence_value_id)
+                    for child in run
+                    if isinstance(child, SequenceMutationBlock)
+                }
 
                 def require(
                     current: int, prerequisite: int, reason: Any,
@@ -22954,7 +22978,7 @@ def _schedule_loop_callsites(
                             dependency_reasons.setdefault(
                                 (int(prerequisite), int(position)), []
                             ).append(("value", int(feed)))
-                        elif later:
+                        elif later and int(feed) not in mutated_arenas:
                             prerequisite = min(later)
                             required.add(prerequisite)
                             dependency_reasons.setdefault(
@@ -23042,6 +23066,15 @@ def _schedule_loop_callsites(
                     elif isinstance(candidate, SequenceQueryBlock):
                         if candidate.producer_loop_node_id is None:
                             reads.add(int(candidate.sequence_value_id))
+                    elif isinstance(candidate, LoopControlBlock):
+                        # A return hands its arenas to the caller as they
+                        # stand at this edge.
+                        reads.update(
+                            int(value_id)
+                            for value_id in candidate.return_value_ids
+                            if value_id is not None
+                            and int(value_id) in mutated_arenas
+                        )
                     for mutation in getattr(candidate, 'sequence_mutations', ()):
                         writes.add(int(mutation.sequence_value_id))
                     for child in getattr(candidate, 'blocks', ()):

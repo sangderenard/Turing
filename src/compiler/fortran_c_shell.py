@@ -19861,6 +19861,25 @@ def _settle_linked_dynamic_sequences(
             data["expr_obj"] for _node_id, data in graph_obj.nodes(data=True)
             if isinstance(data.get("expr_obj"), (ast.For, ast.While))
         ]
+        # Program: ``r = []; if n < 0: return r; r.append(2 * n); return r``
+        # called as ``found = edges(n)`` (c62).  Wrong record: the returned
+        # list was FIXED, sized by the callee alone, while the caller's view
+        # of the same storage had no arena (its column was the call's scalar
+        # result) and a zero capacity cell, so the append reported full and
+        # the caller read an empty list.  Rule: a local list returned to a
+        # caller is the caller's storage whose rows the callee decides; when
+        # a call binds it, the component is DYNAMIC (the c56 contract).
+        output_ids = {
+            int(value_id)
+            for name in tuple(graph_obj.graph.get("function_outputs") or ())
+            for value_id in tuple(
+                (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
+            )
+        }
+        seeds.update(
+            (id(graph_obj), value_id)
+            for value_id in local_lists & output_ids
+        )
         for mutation in _sequence_append_call_mutations(graph_obj):
             if mutation.operator == "clear":
                 continue
@@ -52805,7 +52824,7 @@ def _class_surface_ssa_program(
                         # claim than deciding what the right dtype would
                         # have been.
                         continue
-                    _frame_register_sequence(caller, caller_sequences, map_sequence_descriptor(descriptor, frame_map, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(pool, frame_map)), _frame_table_cell(
+                    _frame_register_sequence(caller, caller_sequences, map_sequence_descriptor(descriptor, frame_map, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(descriptor.child_table_pool, frame_map)), _frame_table_cell(
                         callee_sequences, descriptor.sequence_id,
                         SEQUENCE_DESCRIPTOR,
                     ))
@@ -53721,7 +53740,7 @@ def _class_surface_ssa_program(
                     ):
                         continue
                     if caller_sequences.by_id(mapped_sequence_id) is None:
-                        _frame_register_sequence(caller, caller_sequences, map_sequence_descriptor(descriptor, frame_map, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(pool, frame_map)), _frame_table_cell(
+                        _frame_register_sequence(caller, caller_sequences, map_sequence_descriptor(descriptor, frame_map, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(descriptor.child_table_pool, frame_map)), _frame_table_cell(
                             callee_sequences, descriptor.sequence_id,
                             SEQUENCE_DESCRIPTOR,
                         ))
