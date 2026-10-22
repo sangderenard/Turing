@@ -4450,6 +4450,34 @@ def emit_ssa_module_to_c(
                                 f"        turing_heap_release({owner_cell});"
                             )
                         continue
+                    if callee == "turing_validation_error":
+                        # Program: ``xs = [5, n, 2]; xs.pop()`` (scratch
+                        # c150).  Wrong record: the sequence pop's empty
+                        # check calls the validation runtime the LLVM lane
+                        # links, and the C lane refused it as an unknown
+                        # function.  Rule: the C lane links the same runtime
+                        # (``needs_validation_runtime``); execution takes
+                        # the code after the run and raises on it.
+                        error_code = instruction.attributes.get("error_code")
+                        if (
+                            instruction.args or instruction.res is not None
+                            or not isinstance(error_code, int)
+                        ):
+                            shortfalls.append(CEmissionShortfall(
+                                op, "validation error call takes one literal "
+                                "error code and returns nothing",
+                            ))
+                            continue
+                        prototype = (
+                            "void turing_validation_error(uint32_t error_code);"
+                        )
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        body.append(
+                            f"        turing_validation_error({int(error_code)}u);"
+                        )
+                        continue
                     if target is None or callee not in reachable:
                         shortfalls.append(CEmissionShortfall(
                             op,

@@ -7635,7 +7635,20 @@ def _retain_source_control_records(graph_obj: Any) -> None:
 
 
 def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
-    """Snapshot authored append/add effects before structural reduction."""
+    """Snapshot authored sequence method effects before structural reduction.
+
+    Program: ``xs = [5, n, 2]; xs.pop(); return xs[0] * 10 + xs[1] +
+    len(xs) * 100`` (scratch c150; likewise ``extend``, ``remove``).  Wrong
+    record: only ``append``/``add`` were retained, so every other method of
+    a resident list outside a loop vanished with no effect and no refusal
+    (351, not 251).  Rule: every method of a sequence receiver that changes
+    it (``_RECEIVER_READING_METHODS`` names the ones that only read) is a
+    retained mutation record; its lowering either exists (``extend``,
+    zero-argument ``pop``, ``remove``, ``clear``) or refuses by name.
+    ``sort`` keeps its source sort contract.
+    """
+
+    from .resident_sequence_materialization import _RECEIVER_READING_METHODS
 
     records = dict(
         graph_obj.graph.get("source_sequence_mutation_records") or {}
@@ -7645,7 +7658,8 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
         if not (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Attribute)
-            and expression.func.attr in {"append", "add"}
+            and expression.func.attr not in _RECEIVER_READING_METHODS
+            and expression.func.attr != "sort"
         ):
             continue
         parents = tuple(data.get("parents") or ())
@@ -7657,8 +7671,9 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
             int(parent) for parent, role in parents
             if str(role).startswith("arg:") and int(parent) in graph_obj
         )
-        arity = 1
-        if destination is None or len(arguments) != arity:
+        if destination is None or (
+            expression.func.attr in {"append", "add"} and len(arguments) != 1
+        ):
             continue
         destination_data = graph_obj.nodes[destination]
         if (destination_data.get("attributes") or {}).get(
@@ -7676,7 +7691,11 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
             ),
             "operator": str(expression.func.attr),
             "policy": (
-                "unique" if expression.func.attr == "add"
+                "unique"
+                if expression.func.attr == "add"
+                or (destination_data.get("attributes") or {}).get(
+                    "aggregate_kind"
+                ) == "set"
                 else "duplicates"
             ),
         }
@@ -22259,6 +22278,10 @@ def _fold_callsite_structural_values(
         node_id for node_id in _call_escaped_argument_ids(graph.G)
         if mutable_collection(node_id)
     )
+    from .resident_sequence_materialization import (
+        _method_mutated_receiver_ids,
+    )
+    mutated_sequence_ids.update(_method_mutated_receiver_ids(graph.G))
     # IndexedStore carries the updated state identity on its base edge. Its
     # initializer must stay resident too: folding it to a literal made each
     # region construct its own [0.0], so the write survived but the later read

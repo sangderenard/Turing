@@ -1598,6 +1598,56 @@ def _call_escaped_argument_ids(graph_obj: Any) -> frozenset[int]:
     return frozenset(escaped)
 
 
+#: Methods of a mutable builtin collection that read their receiver without
+#: changing it.  Every other method of a list/dict/set/bytearray receiver
+#: (``pop``, ``sort``, ``reverse``, ``insert``, ``remove``, ``update`` ...,
+#: and any method this table does not name) changes the receiver's contents.
+_RECEIVER_READING_METHODS = frozenset({
+    "count", "index", "copy", "get", "keys", "values", "items",
+    "issubset", "issuperset", "isdisjoint", "union", "intersection",
+    "difference", "symmetric_difference", "fromkeys", "hex", "decode",
+    "startswith", "endswith", "find", "rfind",
+})
+
+_MUTABLE_COLLECTION_KINDS = frozenset({"list", "dict", "set", "bytearray"})
+
+
+def _method_mutated_receiver_ids(graph_obj: Any) -> frozenset[int]:
+    """Mutable collections whose own method call changes their contents.
+
+    Program: ``xs = [5, n, 2]; xs.pop(0); return xs[0] * 10 + xs[1]``
+    (scratch c143).  Wrong record: the structural fold counted only retained
+    mutation records, escaped arguments and indexed stores as mutation, so
+    ``xs[0]`` folded to the display's 5 after ``pop`` removed it (51, not
+    12; likewise ``sort``/``reverse``/``insert``).  Rule: a method call on a
+    mutable builtin collection receiver mutates that receiver unless the
+    method only reads it (``_RECEIVER_READING_METHODS``).
+    """
+
+    mutated: set[int] = set()
+    for _node_id, data in graph_obj.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+        ) or expression.func.attr in _RECEIVER_READING_METHODS:
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role) != "operand" or parent not in graph_obj:
+                continue
+            if (
+                (graph_obj.nodes[parent].get("attributes") or {}).get(
+                    "aggregate_kind"
+                ) in _MUTABLE_COLLECTION_KINDS
+                or isinstance(
+                    graph_obj.nodes[parent].get("expr_obj"),
+                    (ast.List, ast.Set, ast.Dict),
+                )
+            ):
+                mutated.add(int(parent))
+    return frozenset(mutated)
+
+
 def _static_sequence_capacity_bounds(
     graph_obj: Any,
     *,
@@ -1929,11 +1979,20 @@ def _sequence_append_call_mutations(graph_obj: Any):
                 arguments.extend(leaves)
             else:
                 arguments.append(int(value_id))
+        # Program: ``xs = [5, n, 2]; xs.insert(0, 8)`` (scratch c142).
+        # Wrong record: insert's (index, value) arguments were read as a
+        # two-column row, and the shell declared ``xs`` two columns wide.
+        # Rule: only an operator whose arguments ARE the row (append, add,
+        # remove, discard) writes a row; any other operator keeps its kind.
+        row_operator = str(mutation.operator) in {
+            "append", "add", "remove", "discard",
+        }
         expanded_mutations.append(replace(
             mutation,
             argument_value_ids=tuple(arguments),
             argument_kind=(
-                "row" if len(arguments) > 1 and not mutation.argument_kind.startswith((
+                "row" if row_operator and len(arguments) > 1
+                and not mutation.argument_kind.startswith((
                     "mapping_", "sort_key_",
                 ))
                 else mutation.argument_kind
@@ -2195,12 +2254,15 @@ def _joined_list_literal_mutations(
 
     joined = set(map(int, joined_sequence_ids))
     mutations = []
-    emitted: set[tuple[int, int, int]] = set()
+    emitted: set[tuple[int, tuple[int, int]]] = set()
 
     def append_mutation(
         sequence_id: int, effect_node_id: int, value_id: int,
+        display_member: tuple[int, int],
     ) -> None:
-        key = (int(sequence_id), int(effect_node_id), int(value_id))
+        # One append per display member: ``[b, b]`` is two appends of one
+        # value, so the key is the member, not (producer, value).
+        key = (int(sequence_id), tuple(map(int, display_member)))
         if key in emitted:
             return
         emitted.add(key)
@@ -2211,6 +2273,7 @@ def _joined_list_literal_mutations(
             effect_node_id=int(effect_node_id),
             policy="duplicates",
             argument_kind="joined_literal_element",
+            display_member=tuple(map(int, display_member)),
         ))
 
     nodes = tuple(graph_obj.nodes(data=True))
@@ -2269,8 +2332,10 @@ def _joined_list_literal_mutations(
                 else item[0]
             ),
         )
-        for parent, _role, value_id in elements:
-            append_mutation(sequence_id, parent, value_id)
+        for ordinal, (parent, _role, value_id) in enumerate(elements):
+            append_mutation(
+                sequence_id, parent, value_id, (int(node_id), ordinal),
+            )
 
     # The source realizer may specialize an inline dynamic list into an empty
     # structural resident while retaining the authored list only on the Call
@@ -2278,7 +2343,7 @@ def _joined_list_literal_mutations(
     # ordinary ProcessGraph nodes. Correlate those exact AST objects/source
     # spans back to their deterministic value identities and initialize the
     # resident before the consuming call.
-    for _call_node_id, data in sorted(nodes, key=lambda item: int(item[0])):
+    for call_node_id, data in sorted(nodes, key=lambda item: int(item[0])):
         expression = data.get("expr_obj")
         if not isinstance(expression, ast.Call) or not expression.args:
             continue
@@ -2292,12 +2357,20 @@ def _joined_list_literal_mutations(
         ))
         if len(sequence_ids) != 1 or sequence_ids[0] not in joined:
             continue
-        for element in literal.elts:
+        if any(key[0] == sequence_ids[0] for key in emitted):
+            # Already materialized from its own List node above.
+            continue
+        for ordinal, element in enumerate(literal.elts):
             correlated = expression_node(element)
             if correlated is None:
                 continue
             effect_node_id, value_id = correlated
-            append_mutation(sequence_ids[0], effect_node_id, value_id)
+            # The literal has no node of its own here: its members execute
+            # at the consuming call, in member order.
+            append_mutation(
+                sequence_ids[0], effect_node_id, value_id,
+                (int(call_node_id), ordinal),
+            )
     return tuple(mutations)
 
 

@@ -15252,6 +15252,36 @@ class _ControlSSABuilder(TiledObject):
                         projected.dtype = str(column_dtype)
                     indexed_values.append(projected)
                 mutation_values = tuple(indexed_values)
+            # Program: ``xs = [5, n, 2, 9]; xs.sort()`` (scratch c133).
+            # Wrong record: the literal member 5 is lowered as an untyped
+            # Const, so its append proposed no row dtype; ``xs`` called its
+            # FIXED append helper there and the DYNAMIC one from ``n`` on,
+            # under one helper name (refused: the call binds 4 of 5
+            # formals).  Rule: a literal a writer stores proposes its
+            # Python class's dtype, as an SSA value proposes its own.
+            literal_dtypes = tuple(
+                (
+                    "bool" if isinstance(expression.literal, bool)
+                    else "int64" if isinstance(expression.literal, int)
+                    else "float64" if isinstance(expression.literal, float)
+                    else None
+                )
+                if expression is not None and expression.op == "const"
+                else None
+                for expression in (
+                    *mutation.argument_expressions,
+                    *(None for _ in range(
+                        len(mutation_values)
+                        - len(mutation.argument_expressions)
+                    )),
+                )
+            )
+            for value, literal_dtype in zip(mutation_values, literal_dtypes):
+                if literal_dtype is not None and str(
+                    value.dtype or "unknown"
+                ) in {"", "unknown", "None"}:
+                    value.dtype = literal_dtype
+                    self._revise_value(value)
             if (
                 deferred_record_row is None and not deferred_record_slots
                 and indexed_record_row_source is None
@@ -22795,7 +22825,12 @@ def _schedule_loop_callsites(
             return (
                 tuple(sorted(consumed_ids)),
                 (
-                    int(mutation.effect_node_id),
+                    # A display member append publishes its sequence only;
+                    # its ``effect_node_id`` is the member it reads.
+                    *(
+                        (int(mutation.effect_node_id),)
+                        if mutation.display_member is None else ()
+                    ),
                     int(mutation.sequence_value_id),
                 ),
             )
@@ -23012,6 +23047,26 @@ def _schedule_loop_callsites(
                     for child in run
                     if isinstance(child, SequenceMutationBlock)
                 }
+                # Program: ``xs = [5, n]; xs.extend([7, 8])`` (scratch
+                # c151).  Wrong record: placed by start column, the call
+                # preceded the display that is its argument, and the arena
+                # rule above refused the later display as a producer, so
+                # ``extend`` copied an unborn arena.  Rule: a display's clear
+                # and member appends are the arena's BIRTH, not a later
+                # mutation of it; a reader of the arena follows its birth.
+                births: dict[int, list[int]] = {}
+                for position, child in enumerate(run):
+                    if not isinstance(child, SequenceMutationBlock):
+                        continue
+                    mutation = child.mutation
+                    if mutation.display_member is not None or (
+                        str(mutation.operator) == "clear"
+                        and int(mutation.effect_node_id)
+                        == int(mutation.sequence_value_id)
+                    ):
+                        births.setdefault(
+                            int(mutation.sequence_value_id), []
+                        ).append(position)
 
                 def require(
                     current: int, prerequisite: int, reason: Any,
@@ -23039,6 +23094,12 @@ def _schedule_loop_callsites(
                             dependency_reasons.setdefault(
                                 (int(prerequisite), int(position)), []
                             ).append(("value", int(feed)))
+                        for birth in births.get(int(feed), ()):
+                            if birth > position:
+                                required.add(birth)
+                                dependency_reasons.setdefault(
+                                    (int(birth), int(position)), []
+                                ).append(("birth", int(feed)))
                     dependencies.append(required)
                 hierarchy_positions = [
                     hierarchy_statement_position(child) for child in run

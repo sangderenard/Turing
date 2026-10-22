@@ -13318,13 +13318,29 @@ def _install_lexical_sequence_mutations(
             return replaced
         return insert_ordered(block, item_block)
 
+    # Program: ``k = n + 1; xs = [4, k, 2]; ys = [k, 9]`` (scratch c131).
+    # Wrong record: a display member append's ``effect_node_id`` is the
+    # member's producer (``k``, value 2), so ``k``'s numerical region
+    # looked "wholly covered by installed effects" and was retired below;
+    # ``k`` became a minted root formal and ``n`` vanished from the ABI.
+    # Rule: an installed effect is named by its owner (a display member's
+    # display) and matched by its identity (effect id, display member).
     existing_effect_ids: set[int] = set()
+    existing_effect_keys: set[tuple] = set()
+
+    def record_existing(mutation):
+        existing_effect_ids.add(_sequence_mutation_owner_id(mutation))
+        existing_effect_keys.add((
+            int(mutation.effect_node_id),
+            getattr(mutation, "display_member", None),
+        ))
 
     def gather(block):
         if isinstance(block, ScalarFieldWriteBlock):
             existing_effect_ids.add(int(block.effect_node_id))
+            existing_effect_keys.add((int(block.effect_node_id), None))
         elif isinstance(block, SequenceMutationBlock):
-            existing_effect_ids.add(int(block.mutation.effect_node_id))
+            record_existing(block.mutation)
         elif isinstance(block, SequenceBlock):
             for child in block.blocks:
                 gather(child)
@@ -13333,9 +13349,8 @@ def _install_lexical_sequence_mutations(
             if block.orelse is not None:
                 gather(block.orelse)
         elif isinstance(block, (LoopBlock, WhileBlock)):
-            existing_effect_ids.update(
-                int(item.effect_node_id) for item in block.sequence_mutations
-            )
+            for item in block.sequence_mutations:
+                record_existing(item)
             if isinstance(block, WhileBlock):
                 gather(block.condition)
             gather(block.body)
@@ -13345,7 +13360,9 @@ def _install_lexical_sequence_mutations(
     gather(control.root)
     mutations = tuple(
         item for item in mutations
-        if int(item.effect_node_id) not in existing_effect_ids
+        if (
+            int(item.effect_node_id), getattr(item, "display_member", None),
+        ) not in existing_effect_keys
     )
 
     def node_position(node_id: int) -> tuple[int, int, int]:
@@ -13789,7 +13806,12 @@ def _install_lexical_sequence_mutations(
     # calls with zero operands. Retire only regions wholly covered by actual
     # installed effect identities; mixed numerical work remains scheduled.
     installed_effects = existing_effect_ids | {
-        int(mutation.effect_node_id) for mutation in mutations
+        (
+            int(mutation.effect_node_id)
+            if isinstance(mutation, ScalarFieldWriteBlock)
+            else _sequence_mutation_owner_id(mutation)
+        )
+        for mutation in mutations
         if int(mutation.effect_node_id) not in unplaced}
     retired_regions = {index for index, region in enumerate(dispatch_subgraphs)
         if (nodes := set(map(int, region.G.graph.get('deployment_nodes', ()))))
@@ -15899,7 +15921,9 @@ def _record_sequence_projection_bindings(
             )
             if arguments.intersection(target_aliases):
                 derived_sequences[int(mutation.sequence_value_id)] = origin
-                effect_id = int(mutation.effect_node_id)
+                # A display member's effect is its display; its
+                # ``effect_node_id`` is the member, not a materializer.
+                effect_id = _sequence_mutation_owner_id(mutation)
                 if effect_id in graph_obj:
                     # Hierarchical composition namespaces resident storage,
                     # while a later authored loop still names the source
@@ -24972,7 +24996,9 @@ def _class_surface_ssa_program(
                 # token lookup copy) has none and stands on the contract
                 # cells it was made from.
                 sources=(
-                    _frame_graph_cell(graph_obj, int(mutation.effect_node_id)),
+                    _frame_graph_cell(
+                        graph_obj, _sequence_mutation_owner_id(mutation),
+                    ),
                     _frame_graph_cell(graph_obj, sequence_id),
                     mutation.step_cell,
                     mutation.source_contract_cell,
@@ -27462,7 +27488,10 @@ def _class_surface_ssa_program(
                 in control.collection_bindings
             )
             for mutation in control_mutations:
-                effect_id = int(mutation.effect_node_id)
+                # A display member append lowers its display, not the
+                # member's producer (which it only reads): counting the
+                # producer hid ``k``'s retired region (scratch c131).
+                effect_id = _sequence_mutation_owner_id(mutation)
                 lowered_source_value_ids.add(effect_id)
                 effect_data = graph_obj.nodes.get(effect_id, {})
                 lowered_source_value_ids.update(
