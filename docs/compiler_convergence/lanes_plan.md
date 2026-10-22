@@ -34,7 +34,7 @@ branch has used, merged or not.
 | c211-c218 | Lane A: A0, A3 and follow-ups | `claude/project-thread-kbkzp7` | c211, c212, c214-c218 |
 | c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c234 |
 | c240-c249 | Lane C: C1 constant-list comprehensions | `claude/project-thread-2nw77p` | c240-c243 |
-| c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C13, C14 | `claude/project-thread-cz18s3` | c260-c265 |
+| c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c267 |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
 | c280-c289 | next free | | |
 
@@ -72,6 +72,7 @@ silent-capable items first.
 | C9 | Multi-element replication `[a, b] * k` | no operation writes its rows; fill repeats one value | `_sequence_concat_ops` | | open |
 | C10 | Strings as values (`s = "a" if c else "b"`, `len(s)`, `==`, `startswith`) | dispatch metadata; minted as a root input (c114, c217) | to be scoped | | open: large |
 | C11 | Variadic returns | shared with A6; take it in Lane A | | | see A6 |
+| C12 | A comprehension result mutated afterwards: `ys = [x * n for x in xs]; ys.append(n)` then `len(ys)`, `sum(ys)` | the append node was pruned by loop evaporation; the arena and the reduction kept the comprehension's row count (silent WRONG at `main`) | `loop_composer.evaporate_unrolled_loops` (liveness), `resident_sequence_materialization._static_sequence_capacity_survey`, the comprehension rule in `glsl_deployment_strategy._tensor_descriptor_rule` | `claude/project-thread-cz18s3` (PR #788) | done there (doc 35 §5). Still loud: a set comprehension then `add` (no proven capacity) |
 
 ## Lane D: defaults and fallbacks
 

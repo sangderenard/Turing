@@ -1,3 +1,16 @@
+2026-10-22 COMPREHENSION MUTATED AFTERWARDS (C12) (MEASURED):
+`ys = [x * n for x in xs]; ys.append(n)` (folded `xs`) lost the append:
+loop evaporation pruned its node, the survey did not bound the arena, and
+the comprehension's extent was proven static. New audit finding
+`static-extent-of-grown-sequence`. See docs/compiler_convergence/35
+section 5. Note: the typed corpus harness cannot feed a root `list[int]`
+parameter (it wraps every input as a one-element array), so probes with
+resident list roots read an empty list or crash; use folded lists.
+Corpus (this container): 171/171 PASS at c6c42bd4. Fuzz seed 20 (base,
+40): 39 PASS, 1 LOUD (p20_29). Seed 21 (FUZZ_EXT=1, 40): 39 PASS, 1 LOUD
+(p21_14). Both are control-order cycles, LOUD at `main` too. Gate: failure
+names identical to `main` 2532577 in all four parts.
+
 2026-10-22 LOOP OVER INLINE COMPREHENSION (C14) (MEASURED):
 `for y in [x * n for x in xs]` read an empty iterable: a private copy of
 loop containment installed the comprehension's birth in the loop body.
