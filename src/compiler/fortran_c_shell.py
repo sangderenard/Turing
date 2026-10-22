@@ -12605,7 +12605,29 @@ def _member_completion_position(
 
     position = _authored_node_position(graph_obj, int(node_id))
     data = graph_obj.nodes.get(int(node_id)) if int(node_id) in graph_obj else None
-    if data is None or str(data.get("type") or data.get("op") or "").casefold() not in {
+    if data is None:
+        return position
+    # Program: ``xs0 = [1, -1] + [n, 1]; d1 = {1: 6}; return xs0[2] * 10 +
+    # d1[1]`` (fuzzer p16_29; corpus c218).  Wrong record: the ``+``
+    # region completed at its own start, which precedes its right operand
+    # display ``[n, 1]``, whose birth is placed at the display; the fill
+    # copied that operand before it was born (``xs0[2]`` read 0; silent).
+    # Rule: a member reading a display operand completes after that
+    # display ends, where the display's birth has already run.
+    for parent, _role in data.get("parents") or ():
+        if int(parent) not in graph_obj:
+            continue
+        display = graph_obj.nodes[int(parent)].get("expr_obj")
+        if (
+            isinstance(display, (ast.List, ast.Tuple, ast.Set, ast.Dict))
+            and getattr(display, "end_lineno", None) is not None
+        ):
+            position = max(position, (
+                int(display.end_lineno),
+                int(getattr(display, "end_col_offset", 0) or 0),
+                int(node_id),
+            ))
+    if str(data.get("type") or data.get("op") or "").casefold() not in {
         "indexedstore", "setitem", "setattr",
     }:
         return position

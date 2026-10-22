@@ -106,6 +106,8 @@ EXTENDED2 = [
     # a callee returning a list display (A6)
     (["xs{v} = pairlist(n + {a})"], "len(xs{v}) * 10 + xs{v}[1]"),
     (["xs{v} = pairlist(n)", "xs{v}.append({b})"], "len(xs{v}) * 10 + xs{v}[2] + xs{v}[0] * 100"),
+    # concatenation of displays then a dict display (p16_29, region order)
+    (["xs{v} = [{a}, -1] + [n, {b}]", "d{v} = {{1: {c}}}"], "xs{v}[2] * 10 + xs{v}[0] + d{v}[1]"),
     # dict.update from a display stores its rows (A3)
     (["d{v} = {{1: {a}, 2: n}}", "d{v}.update({{1: n + {b}, 3: {c}}})"], "d{v}[1] * 10 + d{v}[2] + len(d{v}) * 100 + d{v}[3]"),
 ]
