@@ -153,3 +153,38 @@ Measured at `a4c29be9` on a clean worktree: corpus 166/166 PASS, 0
 findings; fuzz `FUZZ_EXT=2` seeds 16 and 17, 60/60 PASS each (seed 16
 held the WRONG); gate aa 89 / ab 7 / ac 26 / rec 20, the same failure
 names as the previous measurement, which matched the parent.
+
+## Two more silent families (FUZZ_EXT=3 and a scratch probe)
+
+Both were **observed** wrong on `main` (`2532577`) with a clean audit.
+
+1. **Calls keep source order** (`d6639c0c`, `c52f8ef9`; fuzzer p18_11,
+   p18_27). `xs0 = [2, n]; grow(xs0, n % 3 + 1); xs1 = [n, 4]; push(xs1,
+   3)` then `return len(xs1) * 100 + xs1[-1]` lost the push. Each effect
+   was ordered only before its own receiver's reads, but source calls are
+   lowered in source order, so the reducer fused `n % 3 + 1` with the
+   arithmetic over `xs1` and both calls landed after the reads. **Rule:**
+   in `_sequence_effect_read_edges`, the effects and the source calls
+   outside loops each precede the next, ordered by where each call ends.
+   Native and intrinsic calls (`math.sqrt`, `len`) are operations inside a
+   region. My first version also ordered those, which turned `c22_math`
+   into a refusal; I caught that in the corpus and fixed it in `c52f8ef9`.
+   Corpus c270.
+2. **A list bound on two branches** (`753ea047`). `if n > 2: t = [n, 1]
+   else: t = [5, 6]` then `len(t)` read 0, and appends after the merge
+   were lost. The same happened in elif chains, ternaries and loops. The
+   reducer's `aggregate_phi` had member Phis but no birth. **Rule:** the
+   merge is its own storage, born where the conditional completes from its
+   member Phis (`_list_literal_mutations`, `_authored_node_position`), and
+   it is a local list for capacity. A change to the merge changes its arms
+   (`_mutated_sequence_node_ids`), so `len(a)` of an aliased arm no longer
+   folds. An arm that changes or is shared, or arms of different lengths,
+   are refused by name (`tests/test_list_branch_merge.py`). Corpus c271.
+   Still loud: such a merge inside a loop in a callee (a pointer Const at
+   emission).
+
+Measured at `c52f8ef9` on a clean worktree: corpus 168/168 PASS, 0
+findings; fuzz `FUZZ_EXT=3` seeds 18, 19 and 21 and `FUZZ_EXT=2` seed 20,
+60/60 PASS each (seed 18 held both WRONGs); gate aa 89 / ab 7 / ac 26 /
+rec 20, the same names as the parent. Corpus numbers c270 to c279 belong
+to this lane.

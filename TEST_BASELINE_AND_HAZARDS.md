@@ -1,3 +1,12 @@
+2026-10-22 LANE A, CALL ORDER AND BRANCH-MERGED LISTS (MEASURED, cloud):
+Silent wrong answers fixed (both wrong on main): a call after another
+source call whose argument fused with later reads was lost (FUZZ_EXT=3
+seed 18); a list bound to displays on two branches read len 0 and lost
+later appends. Shared, changed or unequal arms now refuse by name. At
+c52f8ef9: corpus 168/168 PASS, 0 findings; fuzz FUZZ_EXT=3 seeds 18/19/21
+and FUZZ_EXT=2 seed 20, 60/60 PASS each; gate aa 89 / ab 7 / ac 26 /
+rec 20, same names as the parent. See docs/compiler_convergence/35.
+
 2026-10-22 LANE A FOLLOW-UPS (MEASURED, cloud container):
 Silent wrong answers fixed: a callee's hoisted list or dict had capacity
 0 in the C wrapper; `[1, -1] + [n, 1]` followed by a dict display copied
