@@ -8177,7 +8177,10 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
     ``sort`` keeps its source sort contract.
     """
 
-    from .resident_sequence_materialization import _RECEIVER_READING_METHODS
+    from .resident_sequence_materialization import (
+        _RECEIVER_READING_METHODS,
+        _receiver_collection_kind,
+    )
 
     records = dict(
         graph_obj.graph.get("source_sequence_mutation_records") or {}
@@ -8239,9 +8242,8 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
         ):
             continue
         destination_data = graph_obj.nodes[destination]
-        if (destination_data.get("attributes") or {}).get(
-            "aggregate_kind"
-        ) not in {"list", "set", "bytes", "bytearray"}:
+        destination_kind = _receiver_collection_kind(destination_data)
+        if destination_kind not in {"list", "set", "bytes", "bytearray"}:
             continue
         records[int(node_id)] = {
             "expression": expression,
@@ -8255,10 +8257,7 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
             "operator": str(expression.func.attr),
             "policy": (
                 "unique"
-                if expression.func.attr == "add"
-                or (destination_data.get("attributes") or {}).get(
-                    "aggregate_kind"
-                ) == "set"
+                if expression.func.attr == "add" or destination_kind == "set"
                 else "duplicates"
             ),
         }

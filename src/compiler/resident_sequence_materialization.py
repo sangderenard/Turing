@@ -1699,6 +1699,30 @@ _RECEIVER_READING_METHODS = frozenset({
 _MUTABLE_COLLECTION_KINDS = frozenset({"list", "dict", "set", "bytearray"})
 
 
+def _receiver_collection_kind(data: Any) -> str | None:
+    """A receiver node's builtin collection kind: its ``aggregate_kind``,
+    else the builtin class its call result is declared to be.
+
+    Program: ``t = pick(n); t.append(9)`` with ``pick -> list[int]``
+    (corpus c216).  Wrong record: a call result carries no
+    ``aggregate_kind``, only ``result_class_ref='builtins.list'``, so its
+    in-place methods were no mutation record and the append vanished (the
+    caller read past the length: garbage).  Rule: a call result whose
+    declared class is a builtin collection is that collection.
+    """
+
+    attributes = (data or {}).get("attributes") or {}
+    kind = attributes.get("aggregate_kind")
+    if kind is not None:
+        return str(kind)
+    declared = str(attributes.get("result_class_ref") or "")
+    if declared.startswith("builtins.") and declared[9:] in (
+        _MUTABLE_COLLECTION_KINDS | {"bytes", "tuple", "frozenset"}
+    ):
+        return declared[9:]
+    return None
+
+
 def _method_mutated_receiver_ids(graph_obj: Any) -> frozenset[int]:
     """Mutable collections whose own method call changes their contents.
 
@@ -1723,9 +1747,8 @@ def _method_mutated_receiver_ids(graph_obj: Any) -> frozenset[int]:
             if str(role) != "operand" or parent not in graph_obj:
                 continue
             if (
-                (graph_obj.nodes[parent].get("attributes") or {}).get(
-                    "aggregate_kind"
-                ) in _MUTABLE_COLLECTION_KINDS
+                _receiver_collection_kind(graph_obj.nodes[parent])
+                in _MUTABLE_COLLECTION_KINDS
                 or isinstance(
                     graph_obj.nodes[parent].get("expr_obj"),
                     (ast.List, ast.Set, ast.Dict),
