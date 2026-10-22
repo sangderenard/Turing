@@ -1335,6 +1335,26 @@ def _static_mapping_capacity_bounds(
                       isinstance(op, (ast.In, ast.NotIn))
                       for op in data["expr_obj"].ops
                   )
+              )
+              # A dict's own method that cannot insert a key (``clear``
+              # empties it; the readers read it) leaves the constant-key
+              # universe a bound, as ``in`` does.  ``cells.clear()`` had
+              # unbounded ``{1: 10, 2: 20}``.
+              and not (
+                  isinstance(data.get("expr_obj"), ast.Call)
+                  and isinstance(data["expr_obj"].func, ast.Attribute)
+                  and data["expr_obj"].func.attr in {
+                      "clear", "get", "keys", "values", "items", "copy",
+                  }
+                  and not data["expr_obj"].args[1:]
+              )
+              # A builtin that reads or copies its argument (``len(d)``,
+              # the escape rule's ``_NONESCAPING_COLLECTION_CALLS``) never
+              # inserts into it either.
+              and not (
+                  isinstance(data.get("expr_obj"), ast.Call)
+                  and _collection_call_identity(data)
+                  in _NONESCAPING_COLLECTION_CALLS
               )):
             for parent in roles.values():
                 destination = int(aliases.get(parent, parent))
@@ -1520,6 +1540,21 @@ _BUILTIN_COLLECTION_KINDS = frozenset({
 })
 
 
+def _collection_call_identity(data: Mapping[str, Any]) -> Any:
+    """A call node's builtin identity, read as the escape rule reads it."""
+
+    attributes = data.get("attributes") or {}
+    identity = attributes.get("extraction_identity")
+    reference = attributes.get("static_python_reference")
+    if (
+        identity is None
+        and isinstance(reference, str)
+        and "." not in reference
+    ):
+        identity = f"builtins.{reference}"
+    return identity
+
+
 def _call_escaped_argument_ids(graph_obj: Any) -> frozenset[int]:
     """Values passed as an argument into a call that may retain or mutate it.
 
@@ -1533,17 +1568,9 @@ def _call_escaped_argument_ids(graph_obj: Any) -> frozenset[int]:
         expression = data.get("expr_obj")
         if not isinstance(expression, ast.Call):
             continue
-        attributes = data.get("attributes") or {}
-        identity = attributes.get("extraction_identity")
-        reference = attributes.get("static_python_reference")
-        if (
-            identity is None
-            and isinstance(reference, str)
-            and "." not in reference
-        ):
-            # Before extraction resolves the call, its static symbol names
-            # the builtin (``bytes([11])``).
-            identity = f"builtins.{reference}"
+        # Before extraction resolves the call, its static symbol names the
+        # builtin (``bytes([11])``).
+        identity = _collection_call_identity(data)
         if identity in _NONESCAPING_COLLECTION_CALLS:
             continue
         # Program: ``scopes.setdefault(row[0], {}).setdefault(row, None)``
@@ -1818,7 +1845,15 @@ def _sequence_append_call_mutations(graph_obj: Any):
             continue
         destination = graph_obj.nodes[destination_node]
         attributes = destination.get("attributes") or {}
-        if attributes.get("aggregate_kind") not in sequence_kinds:
+        # Program: ``cells = {1: 10, 2: 20}; if n: cells.clear();
+        # return len(cells)``.  Wrong record: a dict's clear was not a
+        # mutation at all (dicts were outside ``sequence_kinds``), so the
+        # table kept its rows.  Rule: clearing a dict is the same resident
+        # clear as a list's, on the dict's unique-keyed table.
+        clears_dict = (
+            operation == "clear" and attributes.get("aggregate_kind") == "dict"
+        )
+        if attributes.get("aggregate_kind") not in sequence_kinds and not clears_dict:
             continue
         argument_kind = "value"
         argument_ids = tuple(
@@ -1836,7 +1871,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
             effect_node_id=int(data.get("value_id", node_id)),
             policy=(
                 "unique"
-                if attributes.get("aggregate_kind") == "set"
+                if attributes.get("aggregate_kind") in {"set", "dict"}
                 else "duplicates"
             ),
             argument_kind=argument_kind,

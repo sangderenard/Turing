@@ -476,12 +476,14 @@ variadic return lane.
   lowering is not built (units 34, 162, 212; scratch c60_vartuple and
   c61_varlist).
 - **`'|'.join(tokens)` in an f-string** has no glyph recipe (unit 6).
-- **Dict `clear()` / `update()` are not mutations.** `cells = {1: 10,
-  2: 20}; if n: cells.clear(); return len(cells)` is refused at HEAD (the
-  dict has no proven capacity). Making unbounded local dicts DYNAMIC (tried,
-  reverted) turns that refusal into a wrong answer, 2 instead of 0, with a
-  clean audit. Neither call is lowered. `identity_spill._replace_cells`
-  (units 45/206) is this shape.
+- **Dict `update()` and loop-filled dicts.** `clear()` on a dict is now
+  the resident clear (corpus c63/c64). A dict's own non-inserting methods
+  and the reading builtins (`len`) keep its constant-key bound, so the
+  literal is no longer refused. `update()` is still not a mutation. A dict
+  filled in a loop has no bound and no dynamic contract. Making it DYNAMIC
+  was tried and reverted: it must wait for `update()`, or the refusal
+  becomes a wrong answer. `identity_spill._replace_cells` (units 45/206)
+  has this shape.
 - `test_forwarded_tuple_field_has_one_sequence_resident`: `ensure`'s arena
   row says `opaque_ref` while its descriptor says float64. `total`'s lease
   copies the row before the canonical sweep retypes the occurrences.
