@@ -1237,6 +1237,25 @@ def _adapt_physical_call_inputs_round(
                             target_dtype = formal.dtype
                         if source_dtype not in numeric or target_dtype not in numeric:
                             continue
+                        # Program: ``ys = [n]; ys.append(n * 0.5); ys[1]``
+                        # (c265).  Wrong record: the append helper's row
+                        # formal was int64 (the arena's first row), so the
+                        # float actual was cast to int64 here and the row
+                        # read 0 for 0.5 (clean audit).  Python never turns a
+                        # float into an int implicitly.  Rule: a call input
+                        # conversion from a floating actual to an integer or
+                        # bool formal is refused by name, never cast.
+                        if (str(source_dtype).startswith('float')
+                                and not str(target_dtype).startswith('float')):
+                            raise ValueError(
+                                'call input conversion would truncate: '
+                                f'{caller.name} passes {source_dtype} value '
+                                f'{int(actual.id)} to {target_dtype} formal '
+                                f'{int(formal.id)} of {callee.name}; Python '
+                                'never converts a float to an integer '
+                                'implicitly (a list mixing int and float rows '
+                                'has no single arena type)'
+                            )
                         # Shape is retained; a span conversion is elementwise.
                         # These six energy-helper conversions used to mint
                         # outside the book. The source value and the exact
