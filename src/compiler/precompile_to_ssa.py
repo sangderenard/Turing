@@ -1929,6 +1929,22 @@ def register_sequence_lowering(
                     if isinstance(_caller_fact, SSAValueFact)
                     and getattr(_caller_fact, name) not in (None, False)
                 }
+                # Program: ``[5] * (n % 4 + 1)`` (scratch c_k1).  Wrong
+                # record: a sequence helper's heap column formal is the
+                # arena's ``ptr`` CELL by construction (``_storage_values``),
+                # but the structural view completed its empty shape from
+                # the owner graph's (1,) extent and the reserve's heap copy
+                # refused the shaped "handle".  Rule: the helper declares
+                # that formal a reference, one address no graph extent
+                # shapes.  The owner's column keeps its span view: a planned
+                # region reduces over its rows through it (corpus c152).
+                if (
+                    str(argument.dtype) == "ptr"
+                    and (argument.accounting or {}).get(
+                        "heap_owner_value_id"
+                    ) is not None
+                ):
+                    _carried["storage"] = "reference"
                 book.post(
                     SSA_VALUE,
                     row,
@@ -11248,14 +11264,11 @@ class _ControlSSABuilder(TiledObject):
                 "heap_element_dtype": layout.name,
                 "heap_owner_value_id": int(owner.id),
             }
-            # The cell is DECLARED a reference: one address, which no graph
-            # extent shapes (``structural_concordance._ssa_structure``).
             self._revise_value(
                 column, self._sequence_contract_cell(
                     int(descriptor.sequence_id)
                 ),
                 stage=self._stage(),
-                physical={"storage": "reference"},
             )
         # The owner is a storage member, last (``_storage_values``): every
         # helper call that passes the sequence's storage passes its owner.

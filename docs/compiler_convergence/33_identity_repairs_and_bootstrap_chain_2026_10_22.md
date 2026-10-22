@@ -711,10 +711,13 @@ Four refusals on the same frontier became lowerings:
   records were wrong:
   1. The row load demanded the heap column at its element dtype, which
      revised the `ptr` cell's row back to int64.
-  2. The structural view then completed the cell's empty shape from the
-     planner's (1,) extent. The heap contract now declares the cell
-     `storage="reference"`, and a declared reference takes no graph
-     extent.
+  2. The structural view then completed the helpers' cell formals' empty
+     shape from the owner graph's (1,) extent. A sequence helper now
+     declares its heap column formal `storage="reference"`, and a
+     declared reference takes no graph extent. The owner's column keeps
+     its span view: a first version declared the owner's column too, and
+     a planned region then summed the cell's address instead of its rows
+     (corpus c152 returned pointer values; caught by the corpus run).
   3. The fixed fill raised code 75 inside the DYNAMIC protocol, whose
      insert step must report "full" so its caller grows and retries
      (`raise_when_full=False`).
