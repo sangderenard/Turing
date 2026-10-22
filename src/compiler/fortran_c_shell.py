@@ -14383,6 +14383,24 @@ def _install_lexical_sequence_queries(
                 for parent, role in sequence_data.get("parents") or ()
                 if str(role) == "generators"
             ), None)
+        elif (
+            expression.func.id == "sum"
+            and isinstance(sequence_data.get("expr_obj"), ast.GeneratorExp)
+        ):
+            # Program: ``sum(i * k for i in range(6))``.  A generator over a
+            # static range is not composed into a collection LoopResult; its
+            # comprehension loop materializes the same resident arena by
+            # appends.  Wrong record: the call fell through to a numerical
+            # region ``sum`` over that arena as if it were a tensor of shape
+            # ``()`` -- the C lane summed one element (``k=0`` gave 10 for
+            # 416).  Rule: a sum over a resident generator arena is the
+            # resident query, placed after the comprehension loop that is
+            # the generator's ``generators`` producer.
+            producer_loop_node_id = next((
+                int(parent)
+                for parent, role in sequence_data.get("parents") or ()
+                if str(role) == "generators"
+            ), None)
         local_list_truth = (
             expression.func.id in {"bool", "len"}
             and len(arguments) == 1
@@ -14484,7 +14502,29 @@ def _install_lexical_sequence_queries(
             )
         )
         if element_literal != 1 or explicit_start not in {None, 0}:
-            unsupported.append(int(node_id))
+            # Program: ``IdentityPage.cell_count``'s ``sum(item.cells for
+            # item in away.values())`` (and ``row_count``, ``CompressedTable.
+            # stats``).  Wrong record: every sum except ``sum(1 for ...)``
+            # was refused as "no safe resident query lowering" although the
+            # generator is materialized as a resident collection exactly as
+            # for ``max(*...)``.  Rule: ``sum(collection[, start])`` is a
+            # resident reduction over the collection's row column; its
+            # lowering admits only rows whose Python sum has one type.
+            if len(arguments) not in {1, 2}:
+                unsupported.append(int(node_id))
+                continue
+            queries.append(SequenceQueryBlock(
+                result_value_id=result_id,
+                sequence_value_id=sequence_id,
+                operation="sum",
+                default_value_id=(
+                    None if len(arguments) == 1 else int(arguments[1])
+                ),
+                source_call_node_id=int(node_id),
+                extraction_identity=identity,
+                result_alias_ids=result_alias_ids,
+                producer_loop_node_id=producer_loop_node_id,
+            ))
             continue
         queries.append(SequenceQueryBlock(
             result_value_id=result_id,
@@ -21736,20 +21776,30 @@ def _class_surface_ssa_program(
             # every authored ``int`` share the same int64 arm regardless of
             # which record field or formal supplied it.  Non-primitive
             # descriptor/record carriers retain their structural identities.
+            # The primitive class is a physical key only where it decides a
+            # value carrier (an int64 scalar, a glyph span).  A primitive
+            # REFERENCE (``tuple``, ``object``) is the same opaque handle as
+            # any class reference: keying it split ``_validate_fact``'s
+            # ``fact: Any`` union (every arm ``reference``/``opaque_ref``)
+            # into a side-by-side layout that refused its class arms.
+            primitive_carrier = bool(
+                primitive_receipt is not None
+                and str(primitive_receipt["storage"]) in {"scalar", "span"}
+            )
             storage_identity = tuple(
                 (key, repr(contract[key]))
                 for key in (
                     "program_abi_field_identity", "program_abi_parameter",
                     "value_record", "key_encoding",
                 )
-                if primitive_receipt is None
+                if not primitive_carrier
                 and contract.get(key) is not None
             ) + (
                 (("program_abi_record", str(declared_record)),)
                 if declared_record is not None else ()
             ) + (
                 (("primitive_class_abi", primitive_class),)
-                if primitive_receipt is not None else ()
+                if primitive_carrier else ()
             )
             if len(identities) > 1 and not storage:
                 subject_nodes = tuple(

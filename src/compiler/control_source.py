@@ -658,7 +658,7 @@ class SequenceQueryBlock(TiledObject):
     def __post_init__(self) -> None:
         if self.operation not in {
             "length", "truth", "first_or_default", "lookup", "membership",
-            "maximum", "any", "first",
+            "maximum", "any", "first", "sum",
         }:
             raise ValueError("unknown resident sequence query")
         if self.operation == "first_or_default" and self.default_value_id is None:
@@ -2027,6 +2027,16 @@ def render_control_block(
                 f"value_{int(block.result_value_id)} = "
                 f"turing_sequence_lookup(value_{int(block.sequence_value_id)}, "
                 f"{keys});",
+            )
+        if block.operation == "sum":
+            start = (
+                "0" if block.default_value_id is None
+                else f"value_{int(block.default_value_id)}"
+            )
+            return (
+                f"value_{int(block.result_value_id)} = "
+                f"turing_sequence_sum(value_{int(block.sequence_value_id)}, "
+                f"{start});",
             )
         if block.operation == "maximum":
             prefix = ", ".join(

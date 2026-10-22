@@ -3677,9 +3677,12 @@ def emit_ssa_module_to_c(
                     # optional observation, not a missing native callee.
                     continue
                 if (
-                    op in {"max", "min", "all", "any"}
+                    op in {"max", "min", "all", "any", "sum"}
                     and instruction.res is not None
-                    and len(instruction.args) == 1
+                    and (
+                        len(instruction.args) == 1
+                        or (op == "sum" and len(instruction.args) == 2)
+                    )
                     and not tuple(instruction.res.shape or ())
                 ):
                     # Flat tensor reduction to a scalar (the dt controller's
@@ -3705,7 +3708,14 @@ def emit_ssa_module_to_c(
                             isinstance(item, int) for item in source_shape
                         ):
                             count = math.prod(source_shape)
-                        elif not source_shape:
+                        elif not source_shape and (
+                            source.accounting or {}
+                        ).get("program_abi_storage") not in {
+                            "span", "sequence",
+                        }:
+                            # A shapeless SCALAR reduces to itself.  A span
+                            # whose shape is unknown is not one element: it
+                            # has no static count and is refused below.
                             count = 1
                     if count is None:
                         shortfalls.append(CEmissionShortfall(
@@ -3716,12 +3726,21 @@ def emit_ssa_module_to_c(
                         continue
                     result_id = int(instruction.res.id)
                     result_type = buffer_type(instruction.res)
+                    # ``builtins.sum(iterable, start)``: the start operand
+                    # is the accumulator's initial value (0 when omitted).
+                    sum_start = "0"
+                    if op == "sum" and len(instruction.args) == 2:
+                        sum_start = scalar_operand(instruction.args[1])
+                        if sum_start is None:
+                            continue
                     if count == 1:
                         scalar = scalar_operand(source)
                         if scalar is None:
                             continue
                         rendered = (
                             scalar if op in {"max", "min"}
+                            else f"(({result_type})({sum_start}) + "
+                            f"({result_type})({scalar}))" if op == "sum"
                             else f"((({scalar}) != 0.0) ? 1.0 : 0.0)"
                         )
                         body.append(
@@ -3748,6 +3767,14 @@ def emit_ssa_module_to_c(
                             )
                             initial = f"turing_red_{result_id}_src[0]"
                             start = 1
+                        elif op == "sum":
+                            # Left to right from ``start``, as Python adds.
+                            step = (
+                                f"turing_red_{result_id} += "
+                                f"({result_type})turing_red_{result_id}_v;"
+                            )
+                            initial = f"({result_type})({sum_start})"
+                            start = 0
                         elif op == "all":
                             # NaN is truthy (NaN != 0), matching Python.
                             step = (

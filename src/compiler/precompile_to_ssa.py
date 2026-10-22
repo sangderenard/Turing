@@ -46,6 +46,7 @@ from .concordance_declarations import (
 )
 from .concordance_declarations import (
     ADDRESS,
+    SEQUENCE_ROW_DTYPE,
     ARM_VERSION_MISSING,
     BINDING_WITHDRAWN,
     CALLSITE_ARGUMENT,
@@ -4293,6 +4294,9 @@ class _ControlSSABuilder(TiledObject):
                     descriptor, column_dtypes=concorded_dtypes,
                 )
                 self.sequence_descriptors[int(sequence_id)] = descriptor
+            row_dtype_cell = self._book().latest_ref(
+                SEQUENCE_ROW_DTYPE, (self.function_name, int(sequence_id)),
+            )
             for value, dtype in zip(
                 self.sequence_storage_values[int(sequence_id)],
                 concorded_dtypes,
@@ -4300,7 +4304,26 @@ class _ControlSSABuilder(TiledObject):
                 if str(value.dtype or "unknown") in {
                     "", "None", "unknown",
                 }:
+                    # Program: ``ssa_heap_allocation.
+                    # validate_heap_context_projection``'s keyed store.
+                    # Wrong record: the column storage (value 111) took the
+                    # concorded int64 here while its ``ssa_value`` row kept
+                    # 'unknown' ("unresolved evidence cannot erase resident
+                    # type").  Rule: as at the other concorded-column
+                    # writers, the resident change is a REVISE of its row
+                    # DERIVED from the row-dtype concordance it was read
+                    # from; a descriptor column is an arena.
                     value.dtype = str(dtype)
+                    self._revise_value(
+                        value, row_dtype_cell,
+                        self._sequence_contract_cell(int(sequence_id)),
+                        stage=self._stage(),
+                        physical=(
+                            {"arena": True}
+                            if int(value.id) in descriptor.column_value_ids
+                            else KEEP_PHYSICAL
+                        ),
+                    )
         from .ir_sequence_tables import lower_table_store
 
         helper_name = self._sequence_helper_name(int(sequence_id), "store")
@@ -11344,6 +11367,130 @@ class _ControlSSABuilder(TiledObject):
                 [accumulator],
                 result,
                 attributes={**attributes, "target_dtype": value_dtype},
+            )
+            self._bind_sequence_query_result(query, result, accumulator)
+            return
+        if query.operation == "sum":
+            # ``sum(collection[, start])`` over the materialized row column.
+            # Python's ``sum`` of an empty float collection is the int 0,
+            # so a float row has no single result type: only integer and
+            # bool rows (whose sum is always an int) with an integer start
+            # are lowered; anything else is a named shortfall.
+            row_dtype = str(storage[0].dtype or "unknown")
+            start = (
+                None if query.default_value_id is None
+                else self.external_value(int(query.default_value_id))
+            )
+            if row_dtype not in {"int64", "int32", "int", "bool"} or (
+                start is not None
+                and str(start.dtype or "unknown") not in {
+                    "int64", "int32", "int", "bool",
+                }
+            ):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", "sum", self.function_name,
+                    f"resident sum over {row_dtype!r} rows with start "
+                    f"{None if start is None else start.dtype!r}: Python's "
+                    "sum has one result type only for integer rows and an "
+                    "integer start",
+                ))
+                return
+            if start is None:
+                start = self.constant_value(0, length)
+            elif str(start.dtype) != "int64":
+                widened = self.fresh_value(
+                    dtype="int64", transform=CONTROL_CAST, operands=(start,),
+                )
+                self.emit(
+                    Handler.Cast, [start], widened,
+                    attributes={**attributes, "target_dtype": "int64"},
+                )
+                start = widened
+            preheader = self.current
+            header = self.new_block("sequence_sum_header")
+            body = self.new_block("sequence_sum_body")
+            exit_block = self.new_block("sequence_sum_exit")
+            zero = self.constant_value(0, length)
+            one = self.constant_value(1, length)
+            next_index = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
+            )
+            next_accumulator = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(start, storage[0]),
+            )
+            self.branch(header)
+
+            self.current = header
+            index = self.fresh_value(
+                dtype="int64", transform=PHI_LOOP_HEADER,
+                operands=(zero, next_index),
+            )
+            self.emit(
+                Handler.Phi, [zero, next_index], index,
+                attributes={
+                    **attributes,
+                    "incoming_blocks": (preheader.name, body.name),
+                    "binding": "ssa_sequence_sum_index",
+                },
+            )
+            accumulator = self.fresh_value(
+                dtype="int64", transform=PHI_LOOP_HEADER,
+                operands=(start, next_accumulator),
+            )
+            self.emit(
+                Handler.Phi, [start, next_accumulator], accumulator,
+                attributes={
+                    **attributes,
+                    "incoming_blocks": (preheader.name, body.name),
+                    "binding": "ssa_sequence_sum_accumulator",
+                },
+            )
+            has_item = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(index, length),
+            )
+            self.emit(Handler.Lt, [index, length], has_item, attributes=attributes)
+            self.conditional_branch(has_item, body, exit_block)
+
+            self.current = body
+            address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS, operands=(storage[0], index),
+            )
+            self.emit(
+                Handler.GetElementPtr, [storage[0], index], address,
+                attributes=attributes,
+            )
+            item = self.fresh_value(
+                dtype=row_dtype, transform=LOAD, operands=(address,),
+            )
+            self.emit(Handler.Load, [address], item, attributes=attributes)
+            if row_dtype != "int64":
+                widened_item = self.fresh_value(
+                    dtype="int64", transform=CONTROL_CAST, operands=(item,),
+                )
+                self.emit(
+                    Handler.Cast, [item], widened_item,
+                    attributes={**attributes, "target_dtype": "int64"},
+                )
+                item = widened_item
+            self.emit(
+                Handler.Add, [accumulator, item], next_accumulator,
+                attributes=attributes,
+            )
+            self.emit(Handler.Add, [index, one], next_index, attributes=attributes)
+            self.branch(header)
+
+            self.current = exit_block
+            result = self.produced_value(
+                int(query.result_value_id),
+                dtype="int64",
+                claim_provisional_definition=True,
+                cause=(accumulator,),
+            )
+            self.emit(
+                Handler.Cast, [accumulator], result,
+                attributes={**attributes, "target_dtype": "int64"},
             )
             self._bind_sequence_query_result(query, result, accumulator)
             return

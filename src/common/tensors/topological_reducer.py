@@ -6926,6 +6926,20 @@ def _normalize_lexical_values(
         annotation_cell = iterator_attributes.get(
             "sequence_element_annotation_cell"
         )
+        if (
+            class_identity is None
+            and iterator_attributes.get("extraction_identity")
+            == "builtins.range"
+        ):
+            # Program: ``sum(i * 3 for i in range(n))``.  Wrong record: the
+            # comprehension target ``i`` had no ``source_value_class`` row,
+            # so ``i * 3`` had none either and the generator's resident row
+            # was committed as the descriptor domain's provisional float64
+            # (the sum then refused a float row).  Rule: ``builtins.range``
+            # yields ``int``; the call's exact extraction identity is the
+            # declaration, its node cell the source.
+            class_identity = "builtins.int"
+            annotation_cell = node_identity_cell(graph, int(iterator_value))
         target_value = loop_target_bindings_by_ast.get(id(target))
         if (
             class_identity is None

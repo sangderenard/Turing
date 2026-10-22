@@ -163,7 +163,18 @@ def module_storage_requirements(
         function = functions.get(function_name)
         if function is None:
             continue
-        for sequence_id, count in function.metadata.get("static_mapping_capacity_bounds", {}).items():
+        # Program: ``sum(i * k for i in range(6))``.  Wrong record: the
+        # control builder publishes each static producer loop's extent as
+        # ``sequence_static_capacity_bounds`` (the generator arena holds at
+        # most 6 rows), but only ``static_mapping_capacity_bounds`` was read,
+        # so the arena had no element count and emission refused it as
+        # dynamic growth.  Rule: both records state an upper bound on the
+        # rows of one resident sequence; each bounds its column storage.
+        static_bounds = (
+            *dict(function.metadata.get("static_mapping_capacity_bounds", {})).items(),
+            *tuple(function.metadata.get("sequence_static_capacity_bounds", ())),
+        )
+        for sequence_id, count in static_bounds:
             descriptor = table.sequences.get(int(sequence_id))
             if descriptor is None:
                 continue

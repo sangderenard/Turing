@@ -19904,6 +19904,34 @@ def _tensor_descriptor_rule(
                 "shape": (), "dtype": _ARITHMETIC_LOOP_TARGET_DTYPE,
                 "rank": 0,
             }
+        # Program: ``sum(i * 3 for i in range(n))``.  A comprehension's
+        # generator carries no ``iterator_kind``, so its ``range`` target fell
+        # through to the descriptor domain's provisional float64 and the
+        # collection row was committed float64.  Rule: the target's
+        # ``source_value_class`` row (posted from the exact
+        # ``builtins.range`` extraction identity) declares the same Python
+        # int the arithmetic-loop rule states.
+        from ..common.tensors.topological_reducer import (
+            _source_numeric_scope as _target_class_scope,
+        )
+        from .concordance_declarations import (
+            SOURCE_VALUE_CLASS as _TARGET_VALUE_CLASS,
+        )
+        from .identity_concordance import (
+            current_identity_book as _target_class_book,
+        )
+
+        target_class = _target_class_book().page(
+            _TARGET_VALUE_CLASS
+        ).latest((_target_class_scope(graph.G), target_value))
+        if (
+            isinstance(target_class, tuple) and target_class
+            and str(target_class[0]) == "builtins.int"
+        ):
+            return {
+                "shape": (), "dtype": _ARITHMETIC_LOOP_TARGET_DTYPE,
+                "rank": 0,
+            }
         for loop_id, loop_data in graph.G.nodes(data=True):
             targets = [
                 int(value) for value in dict(
@@ -19973,6 +20001,40 @@ def _tensor_descriptor_rule(
             # and folded ``distribution is not None`` the wrong way.
             if boundary.get("python_type"):
                 tensor["python_type"] = str(boundary["python_type"])
+        if "shape" not in tensor:
+            # Program: ``sum(i * k for i in range(6))`` with ``k: int``.
+            # Wrong record: an Input with no planner/ProgramABI boundary had
+            # no descriptor, so binary operators described it as the host
+            # scalar default float64 and ``i * k`` became a float row.
+            # Rule: an Input whose ``source_value_class`` row (posted from
+            # its annotation, default or call edge) is a builtin scalar class
+            # is a rank-0 value of that class's dtype.
+            from ..common.tensors.topological_reducer import (
+                _source_numeric_scope as _input_class_scope,
+            )
+            from .concordance_declarations import (
+                SOURCE_VALUE_CLASS as _INPUT_VALUE_CLASS,
+            )
+            from .identity_concordance import (
+                current_identity_book as _input_class_book,
+            )
+
+            input_class = _input_class_book().page(
+                _INPUT_VALUE_CLASS
+            ).latest((
+                _input_class_scope(graph.G),
+                int(data.get("value_id", node_id)),
+            ))
+            scalar_dtype = {
+                "builtins.int": _ARITHMETIC_LOOP_TARGET_DTYPE,
+                "builtins.bool": "bool",
+                "builtins.float": "float64",
+            }.get(
+                str(input_class[0])
+                if isinstance(input_class, tuple) and input_class else ""
+            )
+            if scalar_dtype is not None:
+                return {"shape": (), "dtype": scalar_dtype, "rank": 0}
     if "shape" not in tensor:
         operation = descriptor_operation
         collection_expression = data.get("expr_obj")
@@ -20299,7 +20361,18 @@ def _tensor_descriptor_rule(
                                     node.get("attributes") or {}
                                 ).get("value")
                             if isinstance(literal, (int, float, bool)):
-                                side = {"shape": (), "dtype": "float64"}
+                                # Program: ``i * 3`` with ``i`` a range
+                                # target.  Wrong record: every literal was
+                                # described float64, so an int operand times
+                                # an int literal promoted to float64.  Rule:
+                                # the literal's descriptor is its Python
+                                # type; against a floating tensor it stays a
+                                # weak scalar (``_promoting_sides``).
+                                side = {"shape": (), "dtype": (
+                                    "bool" if isinstance(literal, bool)
+                                    else "int64" if isinstance(literal, int)
+                                    else "float64"
+                                )}
                     sides.append(side)
                 # A HOST SCALAR broadcasts against anything.  ``index >= k``
                 # compares a vector with an ordinary Python ``int`` argument,
@@ -20525,6 +20598,30 @@ def _tensor_descriptor_rule(
                 if str(role).casefold() in operand_roles
                 and int(parent) in graph.G
             ), None)
+            builtin_sum = bool(
+                operation == "sum"
+                and dict(
+                    (data.get("attributes") or {}).get("extraction_contract")
+                    or {}
+                ).get("identity") == "builtins.sum"
+            )
+            builtin_sum_start = None
+            if source_id is None and builtin_sum:
+                # Program: ``sum(i * k for i in range(6))``.  Wrong record:
+                # the builtin's iterable is its ``arg:0`` (not a receiver
+                # role), so the reduction law never read it and the result
+                # took the descriptor domain's float64 for an int vector.
+                # Rule: ``builtins.sum(iterable[, start])`` reduces
+                # ``arg:0``; its Python result type is the promotion of the
+                # element type with ``start`` (``int`` by default).
+                positional = {
+                    str(role).casefold(): int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role).casefold() in {"arg:0", "arg:1"}
+                    and int(parent) in graph.G
+                }
+                source_id = positional.get("arg:0")
+                builtin_sum_start = positional.get("arg:1")
             source = (
                 None if source_id is None
                 else _tensor_descriptor(graph, source_id, seen)
@@ -20621,6 +20718,40 @@ def _tensor_descriptor_rule(
                         dtype = "bool"
                     elif operation in {"argmin", "argmax"}:
                         dtype = "int64"
+                    elif builtin_sum:
+                        start_descriptor = (
+                            {"dtype": "int64"} if builtin_sum_start is None
+                            else _tensor_descriptor(
+                                graph, builtin_sum_start, seen,
+                            )
+                        )
+                        if start_descriptor is None:
+                            node = graph.G.nodes[builtin_sum_start]
+                            literal = node.get("constant")
+                            if literal is None:
+                                literal = (
+                                    node.get("attributes") or {}
+                                ).get("value")
+                            start_descriptor = (
+                                {"dtype": "float64"}
+                                if isinstance(literal, float)
+                                else {"dtype": "int64"}
+                                if isinstance(literal, int)
+                                else None
+                            )
+                        if start_descriptor is None:
+                            reduced = None
+                        else:
+                            element = "int64" if dtype in {
+                                "bool", "int", "int32", "int64",
+                            } else dtype
+                            dtype = str(np.result_type(
+                                np.dtype(element),
+                                np.dtype(str(
+                                    start_descriptor.get("dtype") or "int64"
+                                )),
+                            ))
+                if reduced is not None:
                     return {
                         "shape": tuple(reduced),
                         "dtype": dtype,
