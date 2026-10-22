@@ -8025,6 +8025,14 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
             memberships.setdefault(int(node_id), set()).update(
                 memberships[source_conditional_id]
             )
+        # An optional call's presence comparison (``call is not None``,
+        # synthesized for an optional IfExp arm) runs exactly where the call
+        # runs: it inherits the call's branch membership.
+        presence_of = (data.get("attributes") or {}).get("call_presence_of")
+        if presence_of is not None and int(presence_of) in memberships:
+            memberships.setdefault(int(node_id), set()).update(
+                memberships[int(presence_of)]
+            )
     return {
         node_id: frozenset(roles)
         for node_id, roles in memberships.items()
@@ -16488,7 +16496,35 @@ def _source_fallthrough_predicate_facts(graph: Any, controls, predicate_fact):
     return reached
 
 
-def _publish_conditional_tuple_members(graph: Any) -> bool:
+def _optional_aggregate_call(graph: Any, value_id: int, function_table: Any):
+    """``value_id`` when it is a call whose callee's one output is declared
+    OPTIONAL_AGGREGATE (in-unit ``return_output_arms`` or an accepted
+    header's record), else None."""
+
+    if function_table is None or int(value_id) not in graph.G:
+        return None
+    data = graph.G.nodes[int(value_id)]
+    if str(data.get("type") or data.get("op") or "").casefold() != "call":
+        return None
+    attributes = data.get("attributes") or {}
+    reference = attributes.get("callee_ref")
+    if reference is None:
+        reference = attributes.get("method_ref")
+    try:
+        entry = function_table.entry(int(reference))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    callee = getattr(entry, "graph", None)
+    optional = (
+        _linked_optional_aggregate_record(entry) if callee is None
+        else _callee_optional_aggregate_members(callee)
+    )
+    return None if optional is None else int(value_id)
+
+
+def _publish_conditional_tuple_members(
+    graph: Any, function_table: Any = None,
+) -> bool:
     """Publish position-matched tuple members as control-owned merge values."""
     from ..common.tensors.topological_reducer import (
         node_identity_cell,
@@ -16532,10 +16568,93 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
             present_arm = 1 if absent_arms[0] else 0
             if arms[present_arm].get("aggregate_kind") != "tuple" or not leaves[present_arm]:
                 continue
+            present_id = int(parents[("body", "orelse")[present_arm]])
+            absent_id = int(parents[("body", "orelse")[1 - present_arm]])
+            optional_call = _optional_aggregate_call(
+                graph, present_id, function_table,
+            )
             descriptors = [_tensor_descriptor(graph, leaf) for leaf in leaves[present_arm]]
-            if any(item is None for item in descriptors):
+            if optional_call is None and any(item is None for item in descriptors):
                 continue
-            required = predicate_fact(parents["test"], present_arm == 0)
+            presence_member = None
+            if optional_call is not None:
+                # Program: ``fork = self._fork_of_scope(row[0]) if c else
+                # None`` (IdentityPage._resolved, unit 33): the present arm
+                # is itself an OPTIONAL_AGGREGATE call.  Wrong record: the
+                # optional's presence was the IfExp test alone, so a guard on
+                # ``c`` was taken as proof while the call may return None.
+                # Rule: presence is ``call is not None`` on the present arm
+                # (lowered, as any such comparison, to the callee's presence)
+                # and False on the absent arm, merged by one member Phi that
+                # IS the optional's predicate.
+                comparison = next_process_value_id(graph)
+                graph.G.add_node(
+                    comparison, type="not_equal", op="not_equal",
+                    value_id=comparison, parents=[], children=[],
+                    tensor={"shape": (), "dtype": "bool"},
+                    attributes={"call_presence_of": int(present_id)},
+                )
+                post_derived_node_identity(
+                    graph, comparison,
+                    (
+                        node_identity_cell(graph, present_id),
+                        node_identity_cell(graph, absent_id),
+                    ),
+                    stage=PLANNER_TENSOR_SPECIALIZATION,
+                )
+                _set_operands(graph, comparison, [
+                    (present_id, "lhs"), (absent_id, "rhs"),
+                ], cause=_AGGREGATE_MEMBER)
+                absent_presence = next_process_value_id(graph)
+                graph.G.add_node(
+                    absent_presence, type="Constant", op="const",
+                    value_id=absent_presence, constant=False, parents=[],
+                    children=[], tensor={"shape": (), "dtype": "bool"},
+                    attributes={
+                        "value": False, "conditional_result_of": int(node_id),
+                        "optional_inactive_presence": True,
+                    },
+                )
+                post_derived_node_identity(
+                    graph, absent_presence,
+                    (
+                        node_identity_cell(graph, int(node_id)),
+                        node_identity_cell(graph, absent_id),
+                    ),
+                    stage=PLANNER_TENSOR_SPECIALIZATION,
+                )
+                presence_arms = [None, None]
+                presence_arms[present_arm] = comparison
+                presence_arms[1 - present_arm] = absent_presence
+                presence_member = next_process_value_id(graph)
+                presence_edges = [
+                    (presence_arms[0], "body"), (presence_arms[1], "orelse"),
+                    (parents["test"], "test"),
+                ]
+                graph.G.add_node(
+                    presence_member, type="Phi", op="Phi",
+                    value_id=presence_member, parents=[], children=[],
+                    tensor={"shape": (), "dtype": "bool"},
+                    attributes={
+                        "conditional_result_of": int(node_id),
+                        "optional_presence_member": True,
+                    },
+                )
+                post_derived_node_identity(
+                    graph, presence_member,
+                    tuple(
+                        node_identity_cell(graph, int(source))
+                        for source, _role in presence_edges
+                    ),
+                    stage=PLANNER_TENSOR_SPECIALIZATION,
+                )
+                _set_operands(
+                    graph, presence_member, presence_edges,
+                    cause=_AGGREGATE_MEMBER,
+                )
+                required = (int(presence_member), True)
+            else:
+                required = predicate_fact(parents["test"], present_arm == 0)
             consumers = tuple(graph.G.successors(node_id))
             # Program: ``fork = t if c else None``; ``if fork is None or x:
             # return ...``; ``a, b = fork`` (IdentityPage._resolved, unit 33).
@@ -16625,9 +16744,14 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
                 guarded.append(int(consumer))
             for test_id, tests_absent in presence_tests.items():
                 # The presence test reads the optional's predicate:
-                # absent  <=>  predicate != (present arm is the body).
-                predicate = int(parents["test"])
-                negate = tests_absent == (present_arm == 0)
+                # absent  <=>  predicate != (present arm is the body); with
+                # a presence member, absent  <=>  not member.
+                if presence_member is not None:
+                    predicate = int(presence_member)
+                    negate = tests_absent
+                else:
+                    predicate = int(parents["test"])
+                    negate = tests_absent == (present_arm == 0)
                 test_data = graph.G.nodes[int(test_id)]
                 test_attributes = dict(test_data.get("attributes") or {})
                 test_attributes["optional_presence_test_of"] = int(node_id)
@@ -16656,9 +16780,15 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
                 descriptors, leaves[present_arm],
             ):
                 value_id = next_process_value_id(graph)
+                # An optional call's scalar members carry no tensor fact; the
+                # inactive filler then takes its type from the member Phi's
+                # settlement, as the present member does.
                 graph.G.add_node(value_id, type="Constant", op="const", value_id=value_id,
                                  constant=0, parents=[], children=[],
-                                 tensor={"shape": (), "dtype": "ptr" if descriptor["shape"] else descriptor["dtype"]},
+                                 **({} if descriptor is None else {"tensor": {
+                                     "shape": (),
+                                     "dtype": "ptr" if descriptor["shape"] else descriptor["dtype"],
+                                 }}),
                                  attributes={"value": 0, "conditional_result_of": int(node_id),
                                              "optional_inactive_payload": True})
                 post_derived_node_identity(
@@ -16674,6 +16804,8 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
             leaves[1 - present_arm] = tuple(inactive)
             optional = {"predicate_id": required[0], "present_when": required[1],
                         "guarded_consumers": tuple(guarded), "inactive_value_ids": tuple(inactive)}
+            if presence_member is not None:
+                optional["presence_member_id"] = int(presence_member)
             descriptors = [descriptors, descriptors]
         else:
             if any(arm.get("aggregate_kind") != "tuple" for arm in arms):
@@ -16681,14 +16813,19 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
             descriptors = [[_tensor_descriptor(graph, leaf) for leaf in arm] for arm in leaves]
         if not leaves[0] or len(leaves[0]) != len(leaves[1]):
             continue
-        if descriptors[0] != descriptors[1] or any(item is None for item in descriptors[0]):
+        if descriptors[0] != descriptors[1] or (
+            any(item is None for item in descriptors[0])
+            and not (optional or {}).get("presence_member_id")
+        ):
             continue
         bindings = []
         for left, right, descriptor in zip(*leaves, descriptors[0]):
             member = next_process_value_id(graph)
             edges = [(left, "body"), (right, "orelse"), (parents["test"], "test")]
             graph.G.add_node(member, type="Phi", op="Phi", value_id=member,
-                             parents=[], children=[], tensor=copy.deepcopy(descriptor),
+                             parents=[], children=[],
+                             **({} if descriptor is None
+                                else {"tensor": copy.deepcopy(descriptor)}),
                              attributes={"conditional_result_of": int(node_id)})
             post_derived_node_identity(
                 graph, member,
@@ -16701,11 +16838,24 @@ def _publish_conditional_tuple_members(graph: Any) -> bool:
             _set_operands(graph, member, edges, cause=_AGGREGATE_MEMBER)
             _append_operand(graph, int(node_id), member, "elts")
             bindings.append((int(left), int(right), member))
+        presence_binding = ()
+        if (optional or {}).get("presence_member_id"):
+            # The presence member merges with the payload members (one Phi
+            # per member at the IfExp's continuation) but is not a member of
+            # the tuple's ledger.
+            member_id = int(optional["presence_member_id"])
+            member_roles = {
+                str(role): int(parent)
+                for parent, role in graph.G.nodes[member_id].get("parents") or ()
+            }
+            presence_binding = ((
+                member_roles["body"], member_roles["orelse"], member_id,
+            ),)
         attributes.update({
             "producer_kind": "aggregate", "aggregate_kind": "tuple",
             "aggregate_leaf_value_ids": tuple(item[2] for item in bindings),
             "tensor_output_descriptors": tuple(copy.deepcopy(descriptors[0])),
-            "conditional_member_bindings": tuple(bindings),
+            "conditional_member_bindings": tuple(bindings) + presence_binding,
         })
         if optional is not None:
             attributes["optional_presence"] = optional
@@ -17942,7 +18092,9 @@ def _propagate_callsite_tensor_specializations(
                     })
         candidates: dict[tuple[int, str], list[dict[str, Any]]] = {}
         for caller in graphs:
-            conditional_changed = _publish_conditional_tuple_members(caller)
+            conditional_changed = _publish_conditional_tuple_members(
+                caller, function_table,
+            )
             conditional_changed |= _publish_conditional_call_aggregate_merges(
                 caller, function_table,
             )
