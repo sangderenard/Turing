@@ -3709,8 +3709,15 @@ class _ControlSSABuilder(TiledObject):
                 "lookup" if str(kind) == "lookup_capture" else str(kind),
                 tuple(operation),
             )
+            # Program: ``d[3] = n; d[1] += 5`` then reads (scratch c201).
+            # Wrong record: operations a region schedules AFTER its call
+            # (``table_region_post_operations``) were not counted as
+            # scheduled, so this prologue emitted them a second time before
+            # the table existed (a store read its value before definition).
+            # Rule: an operation any region schedules is scheduled.
             for operations in (
                 *self.table_region_operations.values(),
+                *self.table_region_post_operations.values(),
                 self.table_epilogue_operations,
             )
             for kind, operation in operations

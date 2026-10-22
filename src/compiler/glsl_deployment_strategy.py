@@ -1760,6 +1760,238 @@ def _accepted_semantic_result_bindings(
     )
 
 
+def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
+    """Scalar dtypes the source proves before any region is typed.
+
+    Program: ``xs = [n, 7]; max(xs) * 100``, ``d = {1: 10}; d[1] += 5``
+    (scratch c150, c201).  Wrong record: a value produced in control (an
+    element read, a ``pop``, a reduction) entered its consuming region as a
+    capture typed by the graph domain's float64 default, so int programs
+    computed and returned doubles and int tables refused float stores.
+    Rule: a node's scalar type is what its source proves -- literals,
+    annotated parameters, ``range`` targets, the region operator rules
+    (``hierarchical_plan.REGION_*``), and a collection's element type
+    joined from its writers (members, retained appends/inserts, stores).
+    A join that disagrees proves nothing and stays unknown.
+    """
+
+    from .hierarchical_plan import (
+        REGION_DTYPE_PRESERVING_OPS, REGION_INTEGER_RESULT_OPS,
+        REGION_PREDICATE_OPS, REGION_SCALAR_CAST_DTYPES,
+    )
+
+    G = graph.G
+    classes = {"int": "int64", "float": "float64", "bool": "bool"}
+
+    def operation(data):
+        return str(data.get("op") or data.get("type") or "").casefold()
+
+    def literal_dtype(value):
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return "int64"
+        if isinstance(value, float):
+            return "float64"
+        return None
+
+    scalar: dict[int, str] = {}
+    element: dict[int, str] = {}
+
+    def join(dtypes):
+        known = {dtype for dtype in dtypes if dtype is not None}
+        if not known or None in dtypes:
+            return None
+        if known <= {"int64", "bool"} and len(known) > 1:
+            return "int64"
+        return next(iter(known)) if len(known) == 1 else None
+
+    def promote(dtypes):
+        if not dtypes or any(dtype is None for dtype in dtypes):
+            return None
+        if any(dtype == "float64" for dtype in dtypes):
+            return "float64"
+        if all(dtype in {"int64", "bool"} for dtype in dtypes):
+            return "int64"
+        return None
+
+    def parents(data, *roles):
+        return [
+            int(parent) for parent, role in data.get("parents") or ()
+            if int(parent) in G and (
+                not roles or any(str(role).startswith(r) for r in roles)
+            )
+        ]
+
+    collection_kinds = {"list", "tuple", "set", "dict"}
+
+    def is_collection(node_id):
+        data = G.nodes.get(int(node_id), {})
+        return (
+            isinstance(data.get("expr_obj"), (
+                ast.List, ast.Tuple, ast.Set, ast.Dict,
+            ))
+            or (data.get("attributes") or {}).get("aggregate_kind")
+            in collection_kinds
+        )
+
+    records = G.graph.get("source_sequence_mutation_records") or {}
+    for _round in range(64):
+        changed = False
+
+        def settle(table, node_id, dtype):
+            nonlocal changed
+            if dtype is not None and table.get(node_id) != dtype:
+                if table.get(node_id) is not None:
+                    return  # first proof stands; a disagreement proves nothing
+                table[node_id] = dtype
+                changed = True
+
+        for node_id, data in G.nodes(data=True):
+            node_id = int(node_id)
+            op = operation(data)
+            attributes = data.get("attributes") or {}
+            expression = data.get("expr_obj")
+            if op in {"const", "constant"}:
+                settle(scalar, node_id, literal_dtype(attributes.get(
+                    "value",
+                    getattr(expression, "value", None)
+                    if isinstance(expression, ast.Constant) else None,
+                )))
+                continue
+            if op == "input":
+                kind = attributes.get("binding_kind")
+                if kind == "parameter":
+                    settle(scalar, node_id, classes.get(
+                        str(attributes.get("result_class_ref") or "")
+                    ))
+                continue
+            if op == "for":
+                iterable = parents(data, "iterable")
+                stop = parents(data, "stop", "start", "step")
+                targets = [
+                    int(child) for child in G.successors(node_id)
+                    if operation(G.nodes[child]) == "input"
+                    and (G.nodes[child].get("attributes") or {}).get(
+                        "binding_kind"
+                    ) == "loop"
+                ]
+                loop_expression = expression
+                target_names = set()
+                if isinstance(loop_expression, ast.For) and isinstance(
+                    loop_expression.target, ast.Name
+                ):
+                    target_names.add(loop_expression.target.id)
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.iter, ast.Call)
+                    and isinstance(loop_expression.iter.func, ast.Name)
+                    and loop_expression.iter.func.id == "range"
+                ):
+                    for name in target_names:
+                        for target_id, target in G.nodes(data=True):
+                            if (
+                                operation(target) == "input"
+                                and (target.get("attributes") or {}).get(
+                                    "binding_name"
+                                ) == name
+                                and (target.get("attributes") or {}).get(
+                                    "binding_kind"
+                                ) == "loop"
+                            ):
+                                settle(scalar, int(target_id), "int64")
+                elif iterable and target_names:
+                    held = element.get(iterable[0])
+                    for name in target_names:
+                        for target_id, target in G.nodes(data=True):
+                            if (
+                                operation(target) == "input"
+                                and (target.get("attributes") or {}).get(
+                                    "binding_name"
+                                ) == name
+                                and (target.get("attributes") or {}).get(
+                                    "binding_kind"
+                                ) == "loop"
+                            ):
+                                settle(scalar, int(target_id), held)
+                del targets, stop
+                continue
+            if is_collection(node_id) and not op.startswith("indexed"):
+                members = (
+                    parents(data, "values") if isinstance(expression, ast.Dict)
+                    or attributes.get("aggregate_kind") == "dict"
+                    else parents(data, "elts")
+                )
+                writers = [scalar.get(member) for member in members]
+                for record in records.values():
+                    if int(record.get("sequence_value_id", -1)) == int(
+                        data.get("value_id", node_id)
+                    ) and str(record.get("operator")) in {
+                        "append", "add", "insert",
+                    }:
+                        arguments = tuple(record.get("argument_value_ids") or ())
+                        if arguments:
+                            writers.append(scalar.get(int(arguments[-1])))
+                for child in G.successors(node_id):
+                    child_data = G.nodes[child]
+                    if operation(child_data) in {"indexedstore", "setitem"}:
+                        writers.extend(
+                            scalar.get(value)
+                            for value in parents(child_data, "value")
+                        )
+                if writers:
+                    settle(element, node_id, join(writers))
+                continue
+            if op in {"indexedstore", "setitem"}:
+                base = parents(data, "base")
+                if base:
+                    settle(element, node_id, element.get(base[0]))
+                continue
+            if op in {"indexed", "getitem", "subscript"}:
+                base = parents(data, "base", "value", "object")
+                if base:
+                    settle(scalar, node_id, element.get(base[0]))
+                continue
+            reference = str(attributes.get("static_python_reference") or "")
+            if op in {"max", "min", "pop", "sum"} or reference in {
+                "max", "min", "sum",
+            }:
+                sources = parents(data, "arg:", "operand")
+                if len(sources) == 1 and sources[0] in element:
+                    held = element[sources[0]]
+                    settle(scalar, node_id, (
+                        "int64" if op == "sum" and held == "bool" else held
+                    ))
+                    continue
+            if op in REGION_PREDICATE_OPS or isinstance(expression, ast.Compare):
+                settle(scalar, node_id, "bool")
+                continue
+            if op in REGION_INTEGER_RESULT_OPS or reference == "len":
+                settle(scalar, node_id, "int64")
+                continue
+            if reference in REGION_SCALAR_CAST_DTYPES:
+                settle(scalar, node_id, REGION_SCALAR_CAST_DTYPES[reference])
+                continue
+            if op in {"truediv", "div"}:
+                operands = parents(data, "lhs", "rhs")
+                if operands and all(scalar.get(o) is not None for o in operands):
+                    settle(scalar, node_id, "float64")
+                continue
+            if op in REGION_DTYPE_PRESERVING_OPS:
+                operands = parents(data, "lhs", "rhs", "operand", "arg:")
+                operands = [o for o in operands if o not in element]
+                settle(scalar, node_id, promote([scalar.get(o) for o in operands]))
+                continue
+            if isinstance(expression, ast.IfExp):
+                arms = parents(data, "body", "orelse")
+                settle(scalar, node_id, join([scalar.get(o) for o in arms]))
+        if not changed:
+            break
+    # A collection enters a region as its arena, whose dtype is its element
+    # type.
+    return {**element, **scalar}
+
+
 def _build_shell_hierarchy_plan(
     shell: Any,
     _memo: dict[int, PlanClosure] | None = None,
@@ -1788,6 +2020,15 @@ def _build_shell_hierarchy_plan(
     # query for each value.  Only publication is batched: descriptor answers,
     # path/cycle guards and all shape-provenance writes remain call-scoped.
     abi_published = False
+
+    _scalar_dtype_cache: list[dict[int, str]] = []
+
+    def planned_scalar_dtypes() -> dict[int, str]:
+        """``_planned_scalar_dtypes`` of this plan's graph, computed once."""
+
+        if not _scalar_dtype_cache:
+            _scalar_dtype_cache.append(_planned_scalar_dtypes(graph))
+        return _scalar_dtype_cache[0]
 
     def planned_descriptor(value_id):
         nonlocal abi_published
@@ -2954,6 +3195,7 @@ def _build_shell_hierarchy_plan(
                     or getattr(specialization, "dtype", None)
                     or node.get("dtype")
                     or described_dtype
+                    or planned_scalar_dtypes().get(int(current))
                     or getattr(domain, "dtype", None)
                     or "float64"
                 )
