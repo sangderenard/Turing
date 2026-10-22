@@ -1184,6 +1184,15 @@ def lower_sequence_sort(
     helper neither calls a host sort nor hides an algorithm in a backend.
     """
 
+    if any(
+        sequence.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC
+        for sequence in (descriptor, scratch, order)
+    ):
+        return _lower_dynamic_sequence_sort(
+            descriptor, scratch, order,
+            key_column=key_column, key_mapping=key_mapping, reverse=reverse,
+            function_name=function_name, first_value_id=first_value_id,
+        )
     unsupported = _unsupported_destination(descriptor, "sort")
     if unsupported is not None:
         return unsupported
@@ -1631,6 +1640,99 @@ def lower_sequence_sort(
     return SSASequenceLowering((
         *((key_lookup.functions) if key_lookup is not None else ()), function,
     ))
+
+
+def _lower_dynamic_sequence_sort(
+    descriptor, scratch, order, *, key_column, key_mapping, reverse,
+    function_name, first_value_id,
+):
+    """Reserve DYNAMIC sort workspaces to the rows being sorted, then sort.
+
+    Program: ``xs = [5, n, 2, 9]; ys = sorted(xs)`` (scratch c120).  Wrong
+    record: the result arena and the scratch/order workspaces were
+    caller-provided root formals whose capacities no caller can know; the
+    harness passed 0, the copy failed its capacity check, and the sort's
+    status overwrote the failure.  Rule: a sort over heap-owned storage
+    reserves each DYNAMIC workspace to the destination's length (the
+    existing checked reserve) and runs the fixed sort on the same cells.
+    The destination itself is never grown by a sort.
+    """
+
+    name = function_name or f"ssa_sequence_{descriptor.sequence_id}_sort"
+    sequences = (descriptor, scratch, order)
+    for sequence, label in zip(sequences, ("sort", "sort_scratch", "sort_order")):
+        unsupported = _unsupported_destination(sequence, label, allow_dynamic=True)
+        if unsupported is not None:
+            return unsupported
+    fixed = lower_sequence_sort(
+        *(replace(sequence, capacity_policy=SSASequenceCapacityPolicy.FIXED)
+          for sequence in sequences),
+        key_column=key_column, key_mapping=key_mapping, reverse=reverse,
+        function_name=name + "__fixed", first_value_id=first_value_id,
+    )
+    if not fixed.complete:
+        return fixed
+    sort = fixed.entry
+    reserves = tuple(
+        lower_sequence_reserve(
+            workspace, function_name=f"{name}__reserve_{label}",
+        ).functions[0]
+        for workspace, label in ((scratch, "scratch"), (order, "order"))
+        if workspace.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC
+    )
+
+    def own(value):
+        return SSAValue(value.id, value.dtype, shape=tuple(value.shape or ()),
+                        accounting=dict(value.accounting or {}))
+
+    values = {int(value.id): own(value) for value in sort.args}
+    for reserve in reserves:
+        for value in reserve.args:
+            if int(value.id) != int(reserve.metadata["required_capacity_value_id"]):
+                values.setdefault(int(value.id), own(value))
+    builder = _Builder(_first_fresh_identity(
+        *sequences, values=tuple(values.values()),
+    ))
+    entry = builder.block("entry")
+    result = builder.block("result")
+    zero = builder.const(entry, 0, dtype="int64")
+    length_slot, length = builder.fresh("ptr"), builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr",
+                 [values[int(descriptor.length_address_id)], zero], length_slot)
+    builder.emit(entry, "Load", [length_slot], length)
+    current = entry
+    outcomes = []
+    for reserve in reserves:
+        reserve_values = {
+            **values, int(reserve.metadata["required_capacity_value_id"]): length,
+        }
+        reserve_status = builder.fresh("int")
+        builder.emit(current, "Call",
+                     [reserve_values[int(value.id)] for value in reserve.args],
+                     reserve_status, attributes={"callee": reserve.name})
+        reserved = builder.fresh("bool")
+        builder.emit(current, "Lt", [reserve_status, builder.const(current, 2)], reserved)
+        following = builder.block(f"reserved_{reserve.name.rsplit('_', 1)[-1]}")
+        builder.cond(current, reserved, following, result)
+        outcomes.append((current, reserve_status))
+        current = following
+    sort_status = builder.fresh("int")
+    builder.emit(current, "Call", [values[int(value.id)] for value in sort.args],
+                 sort_status, attributes={"callee": sort.name})
+    builder.branch(current, result)
+    outcomes.append((current, sort_status))
+    status = builder.fresh("int")
+    builder.emit(result, "Phi", [value for _block, value in outcomes], status,
+                 attributes={"incoming_blocks": tuple(block.name for block, _ in outcomes)})
+    builder.emit(result, "Ret", [status])
+    arguments = list(values.values())
+    function = Function(name, arguments, builder.blocks, metadata={
+        **sort.metadata, "fixed_capacity": False,
+        "status_values": {"sorted": 1, "workspace_too_small": 2},
+        "sequence_array_argument_ids": tuple(int(value.id) for value in arguments),
+        "named_outputs": (("status", int(status.id)),),
+    })
+    return SSASequenceLowering((function, *fixed.functions, *reserves))
 
 
 def lower_sequence_fill(

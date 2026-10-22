@@ -207,6 +207,13 @@ class ControlSequenceMutation(TiledObject):
     # projection such as ``lambda row: row[1]`` records its resident column.
     sort_key_column: int | None = None
     sort_reverse: bool = False
+    # ``(display node, ordinal)`` for one member append of an authored list
+    # display, read from its SOURCE_AGGREGATE_LAYOUT birth.  The append is an
+    # effect of the display: it executes at the display, in member order.
+    # ``effect_node_id`` names the member's producer, which is neither unique
+    # (``[k, 9]`` and ``[4, k]`` share ``k``; ``[n, 3, n]`` repeats ``n``)
+    # nor positioned (a parameter has no authored coordinate).
+    display_member: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)

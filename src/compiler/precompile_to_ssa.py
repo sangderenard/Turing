@@ -2975,7 +2975,7 @@ class _ControlSSABuilder(TiledObject):
             """
 
             found: list[ControlSequenceMutation] = []
-            seen_effects: set[int] = set()
+            seen_effects: set[tuple] = set()
 
             def visit(candidate: ControlBlock | None) -> None:
                 if candidate is None:
@@ -2986,7 +2986,13 @@ class _ControlSSABuilder(TiledObject):
                 elif isinstance(candidate, (LoopBlock, WhileBlock)):
                     mutations = tuple(candidate.sequence_mutations)
                 for mutation in mutations:
-                    effect_id = int(mutation.effect_node_id)
+                    # A display member's effect is (display, ordinal); its
+                    # ``effect_node_id`` is the member producer, shared by
+                    # every display that holds that value.
+                    effect_id = (
+                        int(mutation.effect_node_id),
+                        mutation.display_member,
+                    )
                     if effect_id not in seen_effects:
                         seen_effects.add(effect_id)
                         found.append(mutation)
@@ -4436,6 +4442,18 @@ class _ControlSSABuilder(TiledObject):
             # provisional argument rather than mint a second SSA identity.
             claim_provisional_definition=True,
         )
+        # Program: ``xs = []; ...; ys = sorted(xs)`` then ``ys[0] * 100``
+        # (scratch c135).  Wrong record: the planner posted ``ys[0]``'s
+        # ``ssa_value`` row float64 (its capture guess) before control
+        # lowering; this load produced int64 and left that row standing, so
+        # the region-feed occurrence and scalar settlement re-read float64
+        # and typed the heap arena's loads float64 ("storage types are
+        # immutable").  Rule: the row load is the producer; it revises its
+        # row to the column's element type, derived from the column cell.
+        if str(projected_value.dtype or "unknown") not in {
+            "", "None", "unknown", "ptr",
+        }:
+            self._revise_value(projected_value, *self._cells(source))
         # A direct sequence-row load is the same physical projection as a
         # loop-bound row value.  When the concordance declares this logical
         # column heterogeneous, load its parallel tag column at the identical
@@ -13863,11 +13881,15 @@ class _ControlSSABuilder(TiledObject):
                 ))
                 return
             # ``sorted`` owns a distinct result arena.  Its extent follows
-            # the resident source at run time, so the root ABI must expose
-            # that arena just as it exposes the merge-sort scratch arena;
-            # a one-element private frame cannot represent the persisted
-            # result->source capacity edge.
-            for value in self.sequence_storage_values[
+            # the resident source at run time.  A private result is born
+            # DYNAMIC with its own heap owner (the shell's dynamic set): the
+            # copy reserves to the source's length.  Only a result with no
+            # heap owner -- a public output's fixed extent -- is exposed on
+            # the root ABI as caller-provided workspace.
+            heap_owned = (
+                int(destination.sequence_id) in self.sequence_heap_owners
+            )
+            for value in () if heap_owned else self.sequence_storage_values[
                 int(destination.sequence_id)
             ]:
                 value.accounting = {
@@ -13878,7 +13900,7 @@ class _ControlSSABuilder(TiledObject):
             destination_status = self.sequence_status_values.get(
                 int(destination.sequence_id)
             )
-            if destination_status is not None:
+            if destination_status is not None and not heap_owned:
                 destination_status.accounting = {
                     **dict(destination_status.accounting or {}),
                     "caller_provided_workspace": True,
@@ -13960,6 +13982,16 @@ class _ControlSSABuilder(TiledObject):
                     ],
                 ),
             ).id)
+            # A heap-owned destination's workspaces are the function's own
+            # storage, sized to its rows by the sort's reserve; a fixed
+            # destination's remain caller-provided workspace.
+            heap_workspaces = (
+                int(destination.sequence_id) in self.sequence_heap_owners
+            )
+            if heap_workspaces:
+                self.dynamic_sequence_ids = self.dynamic_sequence_ids | {
+                    scratch_id,
+                }
             scratch = self._sequence_descriptor(
                 scratch_id,
                 policy="duplicates",
@@ -13971,7 +14003,7 @@ class _ControlSSABuilder(TiledObject):
             )
             if scratch is None:
                 return
-            for value in self.sequence_storage_values[int(scratch.sequence_id)]:
+            for value in () if heap_workspaces else self.sequence_storage_values[int(scratch.sequence_id)]:
                 value.accounting = {
                     **dict(value.accounting or {}),
                     "caller_provided_workspace": True,
@@ -13980,7 +14012,7 @@ class _ControlSSABuilder(TiledObject):
             scratch_status = self.sequence_status_values.get(
                 int(scratch.sequence_id)
             )
-            if scratch_status is not None:
+            if scratch_status is not None and not heap_workspaces:
                 scratch_status.accounting = {
                     **dict(scratch_status.accounting or {}),
                     "caller_provided_workspace": True,
@@ -14011,6 +14043,10 @@ class _ControlSSABuilder(TiledObject):
                     ],
                 ),
             ).id)
+            if heap_workspaces:
+                self.dynamic_sequence_ids = self.dynamic_sequence_ids | {
+                    order_id,
+                }
             order = self._sequence_descriptor(
                 order_id,
                 policy="duplicates",
@@ -14022,7 +14058,7 @@ class _ControlSSABuilder(TiledObject):
             )
             if order is None:
                 return
-            for value in self.sequence_storage_values[int(order.sequence_id)]:
+            for value in () if heap_workspaces else self.sequence_storage_values[int(order.sequence_id)]:
                 value.accounting = {
                     **dict(value.accounting or {}),
                     "caller_provided_workspace": True,
@@ -14031,7 +14067,7 @@ class _ControlSSABuilder(TiledObject):
             order_status = self.sequence_status_values.get(
                 int(order.sequence_id)
             )
-            if order_status is not None:
+            if order_status is not None and not heap_workspaces:
                 order_status.accounting = {
                     **dict(order_status.accounting or {}),
                     "caller_provided_workspace": True,
@@ -15510,6 +15546,19 @@ class _ControlSSABuilder(TiledObject):
                                 else KEEP_PHYSICAL
                             ),
                         )
+            # Program: ``xs = []; for ...: xs.append(..)`` then
+            # ``ys = sorted(xs)`` (scratch c135).  Wrong record: ys was born
+            # heap-owned with an unknown row, its layout arrived with this
+            # copy's concord, and the descriptor stayed FIXED, so the copy
+            # ran a fixed capacity check (refused by C as unproven).  Rule:
+            # the heap contract is stated the moment the layout exists, as
+            # ``_heap_sequence_contract`` says -- here, for the destination.
+            stated = self._heap_sequence_contract(destination)
+            if stated is not destination:
+                destination = stated
+                self.sequence_descriptors[
+                    int(destination.sequence_id)
+                ] = destination
             destination_tags = self.sequence_native_type_tag_columns(
                 int(destination.sequence_id)
             )
@@ -26422,6 +26471,26 @@ def lower_control_sections_to_ssa(
                     if item is not None
                 ),
             )))
+        # A captured sequence-row load IS a read of its index and of its
+        # sequence: the load is emitted lazily, at the first region that
+        # asks for its result, so it is no block of its own.  Program:
+        # ``xs = []; for ..: xs.append(..)`` then ``return xs[0] * 100 +
+        # xs[len(xs) - 1]`` (scratch c136).  Wrong record: the region
+        # consuming ``xs[17]`` had no dependency on the region producing
+        # index 17 (``len(xs) - 1``), sorted ahead of it by its earlier
+        # source column, and the load read the index before its definition
+        # (the concordance's dominance finding; n=3 returned 0, not 4).
+        consumed = tuple(dict.fromkeys((
+            *consumed,
+            *(
+                int(read_id)
+                for value_id in consumed
+                for operation in (row_load_by_result.get(int(value_id)),)
+                if operation is not None
+                for read_id in (operation[1], operation[2])
+                if read_id is not None
+            ),
+        )))
         region_dependency_signatures[int(region_index)] = (consumed, produced)
 
     def retained_lookup_ids(block):

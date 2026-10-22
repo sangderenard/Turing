@@ -2176,6 +2176,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 argument_value_ids=arguments, effect_node_id=parent,
                 policy="duplicates", argument_kind="row" if len(arguments) > 1 else "value",
                 argument_expressions=expressions,
+                display_member=(int(node_id), int(ordinal)),
             ))
         mutations.append(ControlSequenceMutation(
             sequence_value_id=sequence_id, operator="clear", argument_value_ids=(),

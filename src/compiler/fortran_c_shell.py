@@ -12064,7 +12064,7 @@ def _nest_lexical_conditionals_in_loops(
 
     def block_position(block) -> tuple[int, int, int]:
         if isinstance(block, SequenceMutationBlock):
-            return node_position(int(block.mutation.effect_node_id))
+            return node_position(_sequence_mutation_owner_id(block.mutation))
         if isinstance(block, StatementBlock) and len(block.lines) == 1:
             line = block.lines[0]
             if line.startswith("__scheduled_region_") and line.endswith("__"):
@@ -12289,6 +12289,21 @@ def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[i
     return result
 
 
+def _sequence_mutation_owner_id(mutation) -> int:
+    """The graph node whose authored position places this mutation.
+
+    A list display's member append executes at its display, in member order
+    (``display_member``); program ``xs = [5, n, 2, 9]; ys = sorted(xs)``
+    (scratch c120) placed the ``n`` append by the parameter node, which has
+    no coordinate, after the sort and the reads of ``ys``.
+    """
+
+    member = getattr(mutation, "display_member", None)
+    if member is not None:
+        return int(member[0])
+    return int(mutation.effect_node_id)
+
+
 def _flattened_sequence_children(block) -> tuple:
     """A sequence's children with nested sequences opened up.
 
@@ -12481,7 +12496,7 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
         if isinstance(block, ScalarFieldWriteBlock):
             return node_position(int(block.effect_node_id))
         if isinstance(block, SequenceMutationBlock):
-            return node_position(int(block.mutation.effect_node_id))
+            return node_position(_sequence_mutation_owner_id(block.mutation))
         if isinstance(block, SequenceQueryBlock) and block.source_call_node_id is not None:
             return node_position(int(block.source_call_node_id))
         if isinstance(block, StatementBlock) and len(block.lines) == 1:
@@ -12746,7 +12761,7 @@ def _place_plan_callsites_lexically(
 
     def block_position(block) -> tuple[int, int, int]:
         if isinstance(block, SequenceMutationBlock):
-            return node_position(int(block.mutation.effect_node_id))
+            return node_position(_sequence_mutation_owner_id(block.mutation))
         if isinstance(block, StatementBlock) and len(block.lines) == 1:
             line = block.lines[0]
             if line.startswith("__scheduled_region_") and line.endswith("__"):
@@ -13351,7 +13366,7 @@ def _install_lexical_sequence_mutations(
         if isinstance(block, ScalarFieldWriteBlock):
             return node_position(int(block.effect_node_id))
         if isinstance(block, SequenceMutationBlock):
-            return node_position(int(block.mutation.effect_node_id))
+            return node_position(_sequence_mutation_owner_id(block.mutation))
         if isinstance(block, StatementBlock) and len(block.lines) == 1:
             line = block.lines[0]
             if line.startswith("__scheduled_region_") and line.endswith("__"):
@@ -13545,7 +13560,7 @@ def _install_lexical_sequence_mutations(
             owners = conditional_owner_ids(body)
             kept = []
             for item in block.sequence_mutations:
-                effect_id = int(item.effect_node_id)
+                effect_id = _sequence_mutation_owner_id(item)
                 guards = tuple(
                     (owner, arm)
                     for owner, arm in predicate_memberships(effect_id)
@@ -13616,7 +13631,7 @@ def _install_lexical_sequence_mutations(
                 continue
         guarded = tuple(dict.fromkeys((
             *tuple(
-                predicate_memberships(int(mutation.effect_node_id))
+                predicate_memberships(_sequence_mutation_owner_id(mutation))
             ),
             *tuple(
                 (int(owner), str(arm))
@@ -26534,6 +26549,18 @@ def _class_surface_ssa_program(
             for mutation in _control_sequence_mutations(control.root)
             if str(mutation.operator) in {"extend", "replace"}
         ) + _optional_glyph_payload_copies(control.root)
+        # Program: ``xs = [5, n, 2, 9]; ys = sorted(xs)`` (scratch c120).
+        # Wrong record: the private result was caller-provided workspace
+        # whose capacity no caller knows (0 in the native harness), so the
+        # copy failed and ys read zeros.  Rule: a private ``sorted`` result
+        # holds as many rows as its source at run time -- it is DYNAMIC,
+        # heap-owned, filled by the reserving replace.
+        dynamic_sequence_ids.update(
+            int(mutation.sequence_value_id)
+            for mutation in _control_sequence_mutations(control.root)
+            if str(mutation.operator) == "sorted"
+            and int(mutation.sequence_value_id) not in output_history_ids
+        )
         grown = True
         while grown:
             grown = False
