@@ -5907,7 +5907,15 @@ def emit_ssa_module_to_c(
                     else requirement.element_count
                     if requirement is not None
                     and requirement.element_count is not None
+                    # A rank-0, non-dynamic storage requirement is a proven
+                    # single cell (``element_count`` is ``None`` only
+                    # because the shape is empty).
                     else 1
+                    if requirement is not None
+                    and tuple(requirement.shape) == ()
+                    and not requirement.dynamic
+                    and authored_shape == ()
+                    else None
                 )
                 if value_id in record_parameter_ids:
                     # A record parameter's arena is its cell table: one
@@ -5923,9 +5931,30 @@ def emit_ssa_module_to_c(
                         record_entry = record_descriptor.records.get(value_id)
                         if record_entry is not None:
                             element_count = max(
-                                int(element_count),
+                                int(element_count or 0),
                                 len(record_entry.fields),
                             )
+                if element_count is None:
+                    # Lane D, item D1. Wrong record: a private root arena
+                    # with no storage requirement (or a dynamic or ranked
+                    # one with no element count), no split-source shape and
+                    # no record cell table was sized ``else 1``. One element
+                    # is a default, not a proof; a formal that is really a
+                    # row or a table would overrun it silently. Rule: a
+                    # private root arena's extent comes from its storage
+                    # requirement, the authored shape of its split source,
+                    # or its record cell table; otherwise the artifact is
+                    # refused by name. The one-cell arena below exists only
+                    # so the rest of the wrapper renders; a shortfall makes
+                    # the artifact incomplete, so it is never compiled.
+                    shortfalls.append(CEmissionShortfall(
+                        "storage",
+                        "private-root-storage-unproven: root formal "
+                        f"{value_id} of {function_name} has no storage "
+                        "requirement, split-source shape or record cell "
+                        "table that proves its extent",
+                    ))
+                    element_count = 1
                 owned = activation_array(held, element_count)
                 owned_storage_names[value_id] = owned
                 copied_from = (
