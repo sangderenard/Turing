@@ -1,3 +1,19 @@
+2026-10-22 TUPLE DISPLAY BIRTH (MEASURED):
+Silent wrong answer found and fixed (clean audit at `main`): `len()` of a
+computed tuple display read an unwritten length cell (0 for 3). Tuples are
+now born like lists and bounded by member count. The audit reports a
+display whose length is read while nothing writes its sequence
+(`display-length-unborn`). See docs/compiler_convergence/34 section 6.
+Corpus (this container, Linux): 161/161 PASS with c218 and c219 at
+01e2613; `main` 2532577 is 159/159 on the same container.
+Fuzz seed 11 (base tier, 40 programs, new tuple snippets): 39 PASS, 1 LOUD
+(p11_30, a control-order cycle, loud at `main` too), 0 WRONG, 0 TYPE.
+Gate (this container): aa 96, ab 20, ac 57, rec 39 failed, both at
+01e2613 and at `main` 2532577, with identical failure names in all four
+parts. Both add the same 70 names to the committed baselines, so those 70
+belong to this container, not to this change. Not green: the gate must
+still be read on the machine that wrote the baselines.
+
 2026-10-22 CALL-BOUNDARY AND SET ROUND (MEASURED):
 Silent wrong answers found and fixed (each with a clean audit):
 - a callee storing into, appending to or growing a caller's list
