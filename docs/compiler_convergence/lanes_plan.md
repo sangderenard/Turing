@@ -55,7 +55,7 @@ silent-capable items first.
 | C10 | Strings as values (`s = "a" if c else "b"`, `len(s)`, `==`, `startswith`) | dispatch metadata; minted as a root input (c114, c217) | to be scoped | | open: large |
 | C11 | Variadic returns | shared with A6; take it in Lane A | | | see A6 |
 | C12 | A comprehension result mutated afterwards: `ys = [x * n for x in xs]; ys.append(n)` then `len(ys)`, `sum(ys)` | the append is emitted after the reads (silent WRONG at `main`, resident and folded `xs` alike) | `_sequence_effect_read_edges` (inferred) | | open: silent |
-| C13 | A list whose rows mix int and float: `ys = [1 * n, 2.5 * n]; sum(ys)` | the arena is int64 and the float row is cast (silent WRONG at `main`) | element join for list arenas (to be trapped) | | open: silent |
+| C13 | A list whose rows mix int and float: `ys = [1 * n, 2.5 * n]; sum(ys)` | the arena is int64 and the float row is cast (silent WRONG at `main`) | element join for list arenas (to be trapped) | claimed by the Silent wrong answers lane | `claude/project-thread-cz18s3` (PR #788) | claimed elsewhere: Lane C skips it |
 | C14 | A loop over an inline comprehension of a folded list: `for y in [x * n for x in xs]` | the loop reads an empty sequence (silent WRONG at `main`) | to be trapped | | open: silent |
 | C15 | A loop over a literal list, then an in-place `reverse()`/`sort()` of another list: `for x in [3, -2, 0]: t += x * n` then `xs = [6, 7, n]; xs.reverse(); xs[0] - xs[2]` | the reverse/sort is dropped (reads the display order). Silent WRONG at `main` 2532577, clean audit; also with a comprehension in place of the loop. Found by fuzz tier 1 seed 11 (p11_29, p11_116) | to be trapped (inferred: loop evaporation over a literal) | | open: silent, blocks the C1 PR's fuzz seed |
 
