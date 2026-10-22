@@ -1,3 +1,33 @@
+2026-10-22 SCOPE-LOCAL IDENTITIES, RETURNED LISTS, HEAP LEASES (MEASURED):
+Native corpus (`tests/native_semantics_corpus`, C lane, run against the
+authored Python): 63/63 pass with 0 concordance findings at baa4d9d. New:
+- c60: a list returned on two edges;
+- c61: `any()` over a range generator;
+- c62: an f-string inside a callee;
+- c63/c64: `dict.clear()`.
+At HEAD 9f1643c, c61, c62 and c63 were refused, and c60 did not compile.
+Bootstrap snap7 (9f1643c tree): 369 units; 243 failed, 71 partial,
+55 compiled-unverified; 7 up and 0 down versus snap6. Replays on the later
+tree: unit 8 (accepted call result row), unit 24 (tag formal kept), unit 35
+(accepted body not re-lowered) and unit 43 (yield after its operands) all
+compile with 0 findings. Unit 34 stops at the variadic return lane.
+Gate (49 files, four shards, --timeout 900) at a8ad2b0: 125 failed versus
+128 at g11; the 2 new failures were fixed at 9f1643c. Focused suites:
+20 failed versus 22.
+New audit finding `accounting-foreign-value-id`: a scope-local accounting id
+(type tag, heap owner, optional payload, iterable target, tensor metadata)
+must name a value of the same function.
+Open, observed and recorded in doc 33 (not worked around):
+- the variadic return lane;
+- `'|'.join` in f-strings;
+- reductions over unrolled structural aggregates (silent; the audit flags
+  them);
+- `len()` of a computed tuple display (silent, clean audit);
+- `dict.update()`;
+- calls on Any-typed receivers (the largest partial family);
+- test_forwarded_tuple_field_has_one_sequence_resident.
+See docs/compiler_convergence/33_identity_repairs_and_bootstrap_chain_2026_10_22.md.
+
 2026-10-22 SHORT-CIRCUIT, CARRIED-INDEX AND LITERAL-LIST SEMANTICS (MEASURED):
 Native corpus (`tests/native_semantics_corpus`, C lane, run against the
 authored Python): 48/48 programs pass with 0 concordance findings. c35-c49 are
