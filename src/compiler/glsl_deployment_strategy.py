@@ -1666,12 +1666,60 @@ def _concord_call_argument_operands(
                 page.concord(argument_row, (role, ordinal))
 
 
+_MUTABLE_RETURN_KINDS = frozenset({"list", "set", "dict", "bytearray"})
+
+
+def _refuse_divergent_collection_returns(child_graph: Any) -> None:
+    """Refuse a function whose return sites return different mutable
+    collections in one slot (see the receipt at its caller)."""
+
+    sites = child_graph.graph.get("return_slot_values") or {}
+    by_slot: dict[int, set[int]] = {}
+    for values in sites.values():
+        for slot, value_id in enumerate(values or ()):
+            by_slot.setdefault(slot, set()).add(int(value_id))
+    for slot, value_ids in by_slot.items():
+        if len(value_ids) < 2:
+            continue
+        kinds = {
+            (child_graph.nodes[value_id].get("attributes") or {}).get(
+                "aggregate_kind"
+            )
+            for value_id in value_ids if value_id in child_graph
+        }
+        if kinds & _MUTABLE_RETURN_KINDS:
+            raise ValueError(
+                f"function {child_graph.graph.get('function_name')!r} returns "
+                f"different collections in return slot {slot} "
+                f"(values {tuple(sorted(value_ids))}); a returned collection "
+                "is one storage and the variadic sequence return is not "
+                "lowered"
+            )
+
+
 def _authored_output_paths(graph, outputs):
-    """Read return leaves by their authored aggregate edges, not flat ABI order."""
+    """Read return leaves by their authored aggregate edges, not flat ABI order.
+
+    Program: ``def pick(n): return [n]`` then ``t = pick(n); len(t) * 10 +
+    t[0]`` (corpus c215).  Wrong record: the returned list display was
+    expanded to its member path ``(0, 0)``, which no caller projection
+    (``t[0]`` is ``(0,)``) matches, so the call bound no result and the
+    caller read its own unborn arena (0; clean audit).  Rule: a returned
+    mutable collection is one storage, exactly as an argument is (rule 3):
+    its path is the output itself, and the caller's reads go through the
+    shared arena.  Tuples keep their structural member paths.
+    """
     paths = {}
 
     def expand(path, value_id):
-        leaves = _authored_aggregate_leaves(graph, int(value_id))
+        attributes = (
+            graph.G.nodes[int(value_id)].get("attributes") or {}
+            if int(value_id) in graph.G else {}
+        )
+        leaves = (
+            () if attributes.get("aggregate_kind") in _MUTABLE_RETURN_KINDS
+            else _authored_aggregate_leaves(graph, int(value_id))
+        )
         if not leaves:
             paths[path] = int(value_id)
             return
@@ -2847,6 +2895,16 @@ def _build_shell_hierarchy_plan(
                 result_bindings = ((int(child_outputs[0]), int(node_id)),)
                 _post_call_result_projections(graph, node_id)
             else:
+                # Program: ``if n > 2: return [n]`` / ``return []`` then
+                # ``t = pick(n); len(t)`` (scratch c971).  Wrong record: the
+                # two return sites return two different lists (two arenas),
+                # but the one output named only the last, so the caller
+                # read the empty list's storage on every path (silent).
+                # Rule: a returned mutable collection is one storage; return
+                # sites that return different collections have no one
+                # result arena, and that is refused by name until the
+                # variadic sequence-return lowering exists (lanes plan A6).
+                _refuse_divergent_collection_returns(child_graph)
                 child_output_paths = _authored_output_paths(
                     child.process_graph, child_outputs,
                 )
