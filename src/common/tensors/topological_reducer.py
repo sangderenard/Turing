@@ -12739,6 +12739,17 @@ def _normalize_lexical_values(
                 node_id = new_node(
                     "IndexedStore", "indexed_store", source_cell=site_cell,
                 )
+                # Program: ``d[1] += 5`` (scratch c201).  Wrong record: the
+                # minted store carried its site only as a cell, while
+                # placement reads a node's ``source_span``; the store sorted
+                # after every later read (a control order cycle).  Rule: the
+                # store states the span its site cell was minted from.
+                graph.G.nodes[node_id].setdefault("source_span", {
+                    "line": int(getattr(target, "lineno", 0) or 0),
+                    "column": int(getattr(target, "col_offset", 0) or 0),
+                    "end_line": int(getattr(target, "end_lineno", 0) or 0),
+                    "end_column": int(getattr(target, "end_col_offset", 0) or 0),
+                })
             node_data = graph.G.nodes[node_id]
             node_data["type"] = "IndexedStore"
             node_data["op"] = "IndexedStore"
