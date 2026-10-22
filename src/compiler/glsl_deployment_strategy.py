@@ -8625,6 +8625,9 @@ def _ordinary_conditional_control_programs(
                 .casefold() != "phi"
                 or int(phi_attributes.get("source_conditional_id", -1))
                 != int(control_id)
+                # An optional merge is represented by its member Phis (each
+                # a result merge of this conditional); its handle is none.
+                or phi_attributes.get("optional_presence") is not None
             ):
                 continue
             phi_parents = {
@@ -16546,6 +16549,128 @@ def _publish_conditional_tuple_members(
         return int(value_id), bool(truth)
 
     fallthrough_facts = _source_fallthrough_predicate_facts(graph, controls, predicate_fact)
+
+    def settle_presence(node_id, consumers, required, presence_member,
+                        optional_test, present_arm):
+        """Check every consumer of the optional ``node_id`` against its
+        presence guard and rewrite its presence tests; returns the guarded
+        consumers and whether a presence test was rewritten."""
+
+        # Program: ``fork = t if c else None``; ``if fork is None or x:
+        # return ...``; ``a, b = fork`` (IdentityPage._resolved, unit 33).
+        # Wrong record: ``fork is None`` was itself counted as a consumer
+        # needing a guard, and the fact a guarding ``or`` establishes on
+        # its fallthrough edge was kept whole, so the unpack read no
+        # presence guard although Python proves one.  Rule: a ``None``
+        # comparison of the optional IS its presence test -- it reads the
+        # optional's predicate (``fork is None`` is ``not c`` when the
+        # body is the present arm) -- and a consumer is guarded by the
+        # predicate fact or by that presence test being false.  Facts
+        # close over ``or`` read false, ``and`` read true and ``not``.
+        presence_tests = {}
+        for consumer in consumers:
+            consumer_data = graph.G.nodes[int(consumer)]
+            expression = consumer_data.get("expr_obj")
+            if not (
+                isinstance(expression, ast.Compare)
+                and len(expression.ops) == 1
+                and isinstance(
+                    expression.ops[0], (ast.Is, ast.IsNot, ast.Eq, ast.NotEq),
+                )
+            ):
+                continue
+            operands = tuple(
+                int(parent) for parent, role in consumer_data.get("parents") or ()
+                if str(role) in {"lhs", "rhs"}
+            )
+            others = tuple(item for item in operands if item != int(node_id))
+            if (
+                len(operands) != 2 or len(others) != 1
+                or others[0] not in graph.G
+                or graph.G.nodes[others[0]].get("type")
+                not in {"Constant", "Const", "const"}
+                or _constant_value(graph.G.nodes[others[0]]) is not None
+            ):
+                continue
+            presence_tests[int(consumer)] = isinstance(
+                expression.ops[0], (ast.Is, ast.Eq),
+            )
+
+        def closed(facts):
+            pending = list(facts)
+            result = set()
+            while pending:
+                value_id, truth = pending.pop()
+                if (value_id, truth) in result:
+                    continue
+                result.add((value_id, truth))
+                data_item = graph.G.nodes.get(int(value_id), {})
+                expression = data_item.get("expr_obj")
+                if isinstance(expression, ast.BoolOp) and (
+                    isinstance(expression.op, ast.Or) and not truth
+                    or isinstance(expression.op, ast.And) and truth
+                ):
+                    pending.extend(
+                        predicate_fact(int(parent), truth)
+                        for parent, role in data_item.get("parents") or ()
+                        if str(role).startswith("value:")
+                    )
+                if int(value_id) in presence_tests:
+                    # ``fork is None`` read ``truth``: the optional is
+                    # present exactly when that test reads false.
+                    present = (not truth) if presence_tests[int(value_id)] else truth
+                    if present:
+                        result.add(required)
+            return frozenset(result)
+
+        guarded = []
+        for consumer in consumers:
+            if int(consumer) in presence_tests:
+                continue
+            facts = {
+                predicate_fact(controls[control]["predicate_id"], arm == "body")
+                for control, arm in memberships.get(int(consumer), ())
+                if control in controls and controls[control].get("predicate_id") in graph.G
+                and arm in {"body", "orelse"}
+            }
+            if fallthrough_facts is not None:
+                facts = fallthrough_facts.get(int(consumer), frozenset())
+            if required not in closed(facts):
+                raise ValueError(
+                    f"optional tuple {node_id} consumer {consumer} has no "
+                    "proven presence guard in function "
+                    f"{graph.G.graph.get('function_name')!r}"
+                )
+            guarded.append(int(consumer))
+        for test_id, tests_absent in presence_tests.items():
+            # The presence test reads the optional's predicate:
+            # absent  <=>  predicate != (present arm is the body); with
+            # a presence member, absent  <=>  not member.
+            if presence_member is not None:
+                predicate = int(presence_member)
+                negate = tests_absent
+            else:
+                predicate = int(optional_test)
+                negate = tests_absent == (present_arm == 0)
+            test_data = graph.G.nodes[int(test_id)]
+            test_attributes = dict(test_data.get("attributes") or {})
+            test_attributes["optional_presence_test_of"] = int(node_id)
+            test_data["attributes"] = test_attributes
+            if negate:
+                test_data["type"] = test_data["op"] = "logical_not"
+                _set_operands(
+                    graph, int(test_id), [(predicate, "operand")],
+                    cause=_AGGREGATE_MEMBER,
+                )
+            else:
+                test_data["type"] = test_data["op"] = "Cast"
+                test_attributes["target_dtype"] = "bool"
+                _set_operands(
+                    graph, int(test_id), [(predicate, "operand")],
+                    cause=_AGGREGATE_MEMBER,
+                )
+        return tuple(guarded), bool(presence_tests)
+
     for node_id, data in tuple(graph.G.nodes(data=True)):
         if not isinstance(data.get("expr_obj"), ast.IfExp):
             continue
@@ -16656,120 +16781,11 @@ def _publish_conditional_tuple_members(
             else:
                 required = predicate_fact(parents["test"], present_arm == 0)
             consumers = tuple(graph.G.successors(node_id))
-            # Program: ``fork = t if c else None``; ``if fork is None or x:
-            # return ...``; ``a, b = fork`` (IdentityPage._resolved, unit 33).
-            # Wrong record: ``fork is None`` was itself counted as a consumer
-            # needing a guard, and the fact a guarding ``or`` establishes on
-            # its fallthrough edge was kept whole, so the unpack read no
-            # presence guard although Python proves one.  Rule: a ``None``
-            # comparison of the optional IS its presence test -- it reads the
-            # optional's predicate (``fork is None`` is ``not c`` when the
-            # body is the present arm) -- and a consumer is guarded by the
-            # predicate fact or by that presence test being false.  Facts
-            # close over ``or`` read false, ``and`` read true and ``not``.
-            presence_tests = {}
-            for consumer in consumers:
-                consumer_data = graph.G.nodes[int(consumer)]
-                expression = consumer_data.get("expr_obj")
-                if not (
-                    isinstance(expression, ast.Compare)
-                    and len(expression.ops) == 1
-                    and isinstance(
-                        expression.ops[0], (ast.Is, ast.IsNot, ast.Eq, ast.NotEq),
-                    )
-                ):
-                    continue
-                operands = tuple(
-                    int(parent) for parent, role in consumer_data.get("parents") or ()
-                    if str(role) in {"lhs", "rhs"}
-                )
-                others = tuple(item for item in operands if item != int(node_id))
-                if (
-                    len(operands) != 2 or len(others) != 1
-                    or others[0] not in graph.G
-                    or graph.G.nodes[others[0]].get("type")
-                    not in {"Constant", "Const", "const"}
-                    or _constant_value(graph.G.nodes[others[0]]) is not None
-                ):
-                    continue
-                presence_tests[int(consumer)] = isinstance(
-                    expression.ops[0], (ast.Is, ast.Eq),
-                )
-
-            def closed(facts):
-                pending = list(facts)
-                result = set()
-                while pending:
-                    value_id, truth = pending.pop()
-                    if (value_id, truth) in result:
-                        continue
-                    result.add((value_id, truth))
-                    data_item = graph.G.nodes.get(int(value_id), {})
-                    expression = data_item.get("expr_obj")
-                    if isinstance(expression, ast.BoolOp) and (
-                        isinstance(expression.op, ast.Or) and not truth
-                        or isinstance(expression.op, ast.And) and truth
-                    ):
-                        pending.extend(
-                            predicate_fact(int(parent), truth)
-                            for parent, role in data_item.get("parents") or ()
-                            if str(role).startswith("value:")
-                        )
-                    if int(value_id) in presence_tests:
-                        # ``fork is None`` read ``truth``: the optional is
-                        # present exactly when that test reads false.
-                        present = (not truth) if presence_tests[int(value_id)] else truth
-                        if present:
-                            result.add(required)
-                return frozenset(result)
-
-            guarded = []
-            for consumer in consumers:
-                if int(consumer) in presence_tests:
-                    continue
-                facts = {
-                    predicate_fact(controls[control]["predicate_id"], arm == "body")
-                    for control, arm in memberships.get(int(consumer), ())
-                    if control in controls and controls[control].get("predicate_id") in graph.G
-                    and arm in {"body", "orelse"}
-                }
-                if fallthrough_facts is not None:
-                    facts = fallthrough_facts.get(int(consumer), frozenset())
-                if required not in closed(facts):
-                    raise ValueError(
-                        f"optional tuple {node_id} consumer {consumer} has no "
-                        "proven presence guard in function "
-                        f"{graph.G.graph.get('function_name')!r}"
-                    )
-                guarded.append(int(consumer))
-            for test_id, tests_absent in presence_tests.items():
-                # The presence test reads the optional's predicate:
-                # absent  <=>  predicate != (present arm is the body); with
-                # a presence member, absent  <=>  not member.
-                if presence_member is not None:
-                    predicate = int(presence_member)
-                    negate = tests_absent
-                else:
-                    predicate = int(parents["test"])
-                    negate = tests_absent == (present_arm == 0)
-                test_data = graph.G.nodes[int(test_id)]
-                test_attributes = dict(test_data.get("attributes") or {})
-                test_attributes["optional_presence_test_of"] = int(node_id)
-                test_data["attributes"] = test_attributes
-                if negate:
-                    test_data["type"] = test_data["op"] = "logical_not"
-                    _set_operands(
-                        graph, int(test_id), [(predicate, "operand")],
-                        cause=_AGGREGATE_MEMBER,
-                    )
-                else:
-                    test_data["type"] = test_data["op"] = "Cast"
-                    test_attributes["target_dtype"] = "bool"
-                    _set_operands(
-                        graph, int(test_id), [(predicate, "operand")],
-                        cause=_AGGREGATE_MEMBER,
-                    )
-            if presence_tests:
+            guarded, rewrote_presence = settle_presence(
+                node_id, consumers, required, presence_member,
+                parents["test"], present_arm,
+            )
+            if rewrote_presence:
                 changed = True
             if not consumers or any(node_id in values for values in
                                     (graph.G.graph.get("return_slot_values") or {}).values()):
@@ -16859,6 +16875,168 @@ def _publish_conditional_tuple_members(
         })
         if optional is not None:
             attributes["optional_presence"] = optional
+        data["attributes"] = attributes
+        data.pop("tensor", None)
+        changed = True
+
+    # Program: ``if c: fork = self._fork_of_scope(x) else: fork = None``
+    # (or two optional calls) then ``if fork is None: ...; a, b = fork``.
+    # Wrong record: a statement merge whose arm is an OPTIONAL_AGGREGATE call
+    # or ``None`` stayed a Phi of the call's aggregate handle and None, read
+    # through a region formal no producer defines.  Rule: as for the IfExp
+    # optional, each arm states its presence (``call is not None``, True for
+    # a plain tuple, False for None) and its payload (the call's or tuple's
+    # ledger, inactive fillers for None); one member Phi per payload position
+    # and one presence member, each a result merge of the source conditional,
+    # replace the merged handle; presence tests read the presence member and
+    # every other consumer must be guarded by it.
+    def constant(value, origin, *cells):
+        node = next_process_value_id(graph)
+        graph.G.add_node(
+            node, type="Constant", op="const", value_id=node,
+            constant=value, parents=[], children=[],
+            **({"tensor": {"shape": (), "dtype": "bool"}}
+               if isinstance(value, bool) else {}),
+            attributes={"value": value, "conditional_result_of": int(origin)},
+        )
+        post_derived_node_identity(
+            graph, node, tuple(cell for cell in cells if cell is not None),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+        )
+        return node
+
+    def merge_member(origin, conditional_id, test_id, body_id, orelse_id,
+                     **extra):
+        member = next_process_value_id(graph)
+        graph.G.add_node(
+            member, type="Phi", op="Phi", value_id=member, parents=[],
+            children=[],
+            attributes={
+                "source_conditional_id": int(conditional_id),
+                "conditional_result_of": int(origin), **extra,
+            },
+        )
+        edges = [(int(body_id), "body"), (int(orelse_id), "orelse"),
+                 (int(test_id), "test")]
+        post_derived_node_identity(
+            graph, member,
+            tuple(node_identity_cell(graph, source) for source, _ in edges),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+        )
+        _set_operands(graph, member, edges, cause=_AGGREGATE_MEMBER)
+        return member
+
+    for node_id, data in tuple(graph.G.nodes(data=True)):
+        attributes = dict(data.get("attributes") or {})
+        if (
+            str(data.get("type") or "") != "Phi"
+            or attributes.get("binding_name") is None
+            or attributes.get("conditional_member_bindings")
+            or attributes.get("producer_kind") == "aggregate_phi"
+            or attributes.get("source_conditional_id") is None
+        ):
+            continue
+        roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        if set(roles) != {"test", "body", "orelse"} or not all(
+            item in graph.G for item in roles.values()
+        ):
+            continue
+        arms = []
+        for role in ("body", "orelse"):
+            arm_id = roles[role]
+            arm = graph.G.nodes[arm_id]
+            if (
+                arm.get("type") in {"Constant", "Const", "const"}
+                and _constant_value(arm) is None
+            ):
+                arms.append(("none", arm_id, ()))
+                continue
+            arm_leaves = _authored_aggregate_leaves(graph, arm_id)
+            if not arm_leaves or (arm.get("attributes") or {}).get(
+                "aggregate_kind"
+            ) != "tuple":
+                arms = None
+                break
+            kind = (
+                "optional_call"
+                if _optional_aggregate_call(graph, arm_id, function_table)
+                is not None else "tuple"
+            )
+            arms.append((kind, arm_id, arm_leaves))
+        if arms is None or not any(
+            kind in {"none", "optional_call"} for kind, _a, _l in arms
+        ) or all(kind == "none" for kind, _a, _l in arms):
+            continue
+        widths = {len(arm_leaves) for kind, _a, arm_leaves in arms if kind != "none"}
+        if len(widths) != 1:
+            continue
+        width = widths.pop()
+        conditional_id = int(attributes["source_conditional_id"])
+        test_id = roles["test"]
+        presences = []
+        payloads = []
+        for kind, arm_id, arm_leaves in arms:
+            arm_cell = node_identity_cell(graph, arm_id)
+            if kind == "none":
+                presences.append(constant(False, node_id, arm_cell))
+                payloads.append(tuple(
+                    constant(0, node_id, arm_cell) for _ in range(width)
+                ))
+                continue
+            if kind == "tuple":
+                presences.append(constant(True, node_id, arm_cell))
+            else:
+                comparison = next_process_value_id(graph)
+                none_node = next((
+                    other for other_kind, other, _l in arms if other_kind == "none"
+                ), None)
+                if none_node is None:
+                    none_node = constant(None, node_id, arm_cell)
+                graph.G.add_node(
+                    comparison, type="not_equal", op="not_equal",
+                    value_id=comparison, parents=[], children=[],
+                    tensor={"shape": (), "dtype": "bool"},
+                    attributes={"call_presence_of": int(arm_id)},
+                )
+                post_derived_node_identity(
+                    graph, comparison,
+                    (arm_cell, node_identity_cell(graph, int(none_node))),
+                    stage=PLANNER_TENSOR_SPECIALIZATION,
+                )
+                _set_operands(graph, comparison, [
+                    (int(arm_id), "lhs"), (int(none_node), "rhs"),
+                ], cause=_AGGREGATE_MEMBER)
+                presences.append(comparison)
+            payloads.append(tuple(map(int, arm_leaves)))
+        presence_member = merge_member(
+            node_id, conditional_id, test_id, presences[0], presences[1],
+            optional_presence_member=True,
+        )
+        guarded, _rewrote = settle_presence(
+            node_id, tuple(graph.G.successors(node_id)),
+            (int(presence_member), True), presence_member, test_id, 0,
+        )
+        members = tuple(
+            merge_member(
+                node_id, conditional_id, test_id, left, right,
+                aggregate_parent_value_id=int(node_id),
+                aggregate_index=int(index),
+            )
+            for index, (left, right) in enumerate(zip(*payloads))
+        )
+        attributes.update({
+            "producer_kind": "aggregate_phi", "aggregate_kind": "tuple",
+            "aggregate_leaf_value_ids": members,
+            "conditional_member_bindings": tuple(
+                (left, right, member)
+                for (left, right), member in zip(zip(*payloads), members)
+            ) + ((presences[0], presences[1], int(presence_member)),),
+            "optional_presence": {
+                "predicate_id": int(presence_member), "present_when": True,
+                "guarded_consumers": guarded,
+                "presence_member_id": int(presence_member),
+            },
+        })
         data["attributes"] = attributes
         data.pop("tensor", None)
         changed = True
