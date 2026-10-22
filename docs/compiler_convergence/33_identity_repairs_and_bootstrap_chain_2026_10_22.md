@@ -550,6 +550,79 @@ Measured at 6300d55:
   No new failure across g17 to g21; gate22 is pending at the time of
   writing.
 
+## Differential fuzzing: one storage per value, one position per block
+
+A differential fuzzer now generates programs from composable snippets
+(lists, dicts, sets, tuples, loops, `break`/`else`, short-circuit, helpers;
+an extended set adds `enumerate`, `zip`, membership, `count`/`index`, float
+math, early return, concat, replication, `del`, `while`-grown lists,
+index-loop stores). It compiles each through `lower_ast_source_to_ssa` and C,
+compares the result with Python (value and type), and runs each native call
+in a forked child so a segfault is a result, not a lost run. The harness
+also applies the native-emission product's own refusal
+(`_unexplained_root_argument_ids`), which `emit_ssa_to_c` alone does not
+check. Five seeds, 280 programs. Every failure below was minimized to a
+corpus program, traced to the record that was wrong, and fixed there.
+
+Silent wrong answers found and fixed:
+- `ys = list(xs); ys.append(n)`: the copy was a materialization alias of
+  its source, so `ys` shared `xs`'s storage (`len(xs)` read 4). A recorded
+  snapshot owns its storage (`_sequence_concat_ops`).
+- The same copy took its source's capacity, and its own appends were not
+  counted. A snapshot's bound is the source's plus its own straight-line
+  appends.
+- `[5, 7] + [n, 7]` took the planner's elementwise-add extent (2) as its
+  arena and wrote 4 rows (a native segfault once its fill ran). A concat is
+  bounded by the sum of its operands.
+- `[2] * (n % 4 + 1)` took the literal's one-row extent; its fill reported
+  "full" into a status nobody reads. A fixed fill that exhausts its
+  capacity now raises (validation code 75). A runtime-count replication is
+  unbounded (DYNAMIC). Its fill reserves its count, but C emission still
+  refuses it (the heap cell keeps the planner extent `(1,)`): loud.
+- The fill's count `n % 4 + 1` was consumed only by the replication, which
+  left the region as a table operation; nothing published it. Values read
+  by a region's recorded table operations cross the region boundary.
+- A concat's reset/append_slice claimed to replace its region, so the
+  region's other work (that count, and the fill after it) was skipped. An
+  operation replaces its region only when the region has nothing left to
+  publish.
+- `xs.count(v)` / `xs.index(v)` have no lowering. Their results become root
+  inputs, which the native product refuses; the harness now applies that
+  refusal.
+
+Placement and identity faults found and fixed:
+- Five lexical placement passes each kept a private `block_position`; only
+  one positioned a `SequenceQueryBlock`. `_control_block_position` is now
+  the one rule. A `for` loop is placed where its iterable ends, and its body
+  lines are its span (the `len(xs)` of `range(len(xs))` was placed inside,
+  then after, the loop).
+- Region placement took the first member in four passes and the last
+  (`_dispatch_region_completion_positions`) in one. All five use the
+  completion rule.
+- A birth takes no WAR edge from an earlier reader; the birth rule already
+  orders the reader after it. A birth is a display's clear and member
+  appends, or a region whose recorded operations reset or fill the arena (a
+  concat or replication result).
+- An effect inside a loop is observed after its outermost loop. That loop
+  now precedes later reads of the receiver (`_sequence_effect_read_edges`).
+- Heap columns are `ptr` cells, shapeless, in the owner as in every helper.
+  The repository-SSA transport posted int64/ptr alternately on one shape
+  edge. Readers of the element type read the descriptor or
+  `heap_element_dtype`.
+- `s.add(x)` was classified numerical work because `add` is a tensor op.
+  A recorded sequence mutation is a control effect.
+- Loop growth makes only births DYNAMIC (aggregate, comprehension,
+  `LoopResult`, generator); record fields and mapping values are views. A
+  local dict with no proven key universe is unbounded and DYNAMIC.
+- A loop over a comprehension iterates the result its producer loop
+  records (`LoopIterationOutput`), not the `ListComp` node.
+- A bare `zip(xs, ys)` iterates its argument sequences, bounded by the
+  shortest.
+- A slice is never a row read.
+- `_planned_scalar_dtypes` reads a constant collection's literals, a linked
+  value's posted ABI contract (`linked_value_abi`), `builtins.int`, and a
+  `pop`'s receiver. All four int-as-float corpus results now return ints.
+
 ## Open frontier (stated, not worked around)
 
 - **Variadic returns.** `return ()` / `return (x,)` and `return []` /
@@ -557,40 +630,39 @@ Measured at 6300d55:
   lowering is not built (units 34, 162, 212; scratch c60_vartuple and
   c61_varlist).
 - **`'|'.join(tokens)` in an f-string** has no glyph recipe (unit 6).
-- **Dict `update()` and loop-filled dicts.** `clear()` on a dict is now
-  the resident clear (corpus c63/c64). A dict's own non-inserting methods
-  and the reading builtins (`len`) keep its constant-key bound, so the
-  literal is no longer refused. `update()` is still not a mutation. A dict
-  filled in a loop has no bound and no dynamic contract. Making it DYNAMIC
-  was tried and reverted: it must wait for `update()`, or the refusal
-  becomes a wrong answer. `identity_spill._replace_cells` (units 45/206)
-  has this shape.
+- **Dict `update()`.** `clear()` on a dict is the resident clear (corpus
+  c63/c64), and a local dict filled in a loop is now DYNAMIC (c161).
+  `update()` is still not a mutation. `identity_spill._replace_cells`
+  (units 45/206) has this shape.
 - `test_forwarded_tuple_field_has_one_sequence_resident`: `ensure`'s arena
   row says `opaque_ref` while its descriptor says float64. `total`'s lease
   copies the row before the canonical sweep retypes the occurrences.
 
 - Generic `str()`/`!r` of `Any`-typed facts (ten f-string units): needs a
   runtime type dispatch over every fact class.
-- Planner region inputs default to float64 when neither the graph domain
-  nor `_planned_scalar_dtypes` proves a type. The remaining int-as-float
-  results are values reached through a callee return, a loop-carried
-  `pop`/`insert` result, or a value computed under a chained conjunction in
-  a loop (c144, c145, c152, c156). Unit 64/254 read that provisional type as
-  a sequence column dtype.
+- Planner region inputs still default to float64 when nothing proves a
+  type (measured: about 3,000 fallbacks across the corpus). Later stages
+  re-type every one that reaches a corpus result; all 121 corpus programs
+  return the Python type.
 - Strings as values (`s = "abc" if c else "hello"`, `len(s)`, `s == "abc"`,
   `s.startswith(...)`) are dispatch metadata. Nothing lowers them, so the
   value is minted as a root input; the concordance reports
   `unaccounted-formal` (c114, c217). A string-keyed dict refuses (c241).
-- Loud refusals from probe batch 2, each with a named record:
+- Loud refusals, each with a named record:
   - `d.get(k, 0)` in a loop: control order cycle (c202).
-  - Slices of a display: physical-type conflict (c204).
+  - A standalone slice `ys = xs[1:n]`: no lowering (only `r += xs[a:b]`
+    is recognized); refused at C emission (c204).
   - `xs[i % 4] += i` in a loop: a carried read with no lexical binding row
     (c211).
   - Nested list stores: no source cell for the control block (c212).
-  - `any()`/`all()` generators over a comprehension (c214): the generator
-    loops' iterable bindings still name the comprehension node after its
-    collection port superseded it.
   - Early `return` from a loop over a list parameter (c216).
+  - `n in xs` with `xs` a folded constant list: no membership is produced
+    (the structural recovery only covers fields and dicts).
+  - `xs.count(v)`, `xs.index(v)`, `del xs[i]` on a list: no lowering.
+  - Runtime-count replication `[v] * k`: see above.
+- `xs = [0, 0]; for ...: t += xs[0]; xs = [i + n, i]` (a display re-bound
+  inside a loop) is wrong at 4c70971 and after, with two audit findings
+  (`descriptor-member-shared`, `unaccounted-formal`).
 - Lists across call edges: growing (c55) and returning (c56, c60) now
   pass. A constant list literal passed to a reader still fails with
   "aggregate call binding arity 3 != 0" (c127).

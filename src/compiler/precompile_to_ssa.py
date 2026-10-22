@@ -23365,6 +23365,28 @@ def _schedule_loop_callsites(
                 # mutation of it; a reader of the arena follows its birth.
                 births: dict[int, list[int]] = {}
                 for position, child in enumerate(run):
+                    # Program: ``xs = [4, 1] + [n, 2]`` beside a tuple
+                    # unpack on the return line (fuzzer p5_2).  Wrong
+                    # record: the concat's region resets and refills its
+                    # result -- that arena's birth -- but only display
+                    # blocks counted as births, so WAR ordered the concat
+                    # after the read of ``xs[2]`` that consumes it: a cycle.
+                    # Rule: a region whose recorded operations reset or fill
+                    # an arena is that arena's birth.
+                    recorded_region = (
+                        scheduled_region(child)
+                        if isinstance(child, StatementBlock) else None
+                    )
+                    if recorded_region is not None:
+                        for kind, arguments in _region_table_operations(
+                            recorded_region,
+                            table_region_operations,
+                            table_region_post_operations,
+                        ):
+                            if str(kind) in {"reset", "fill"}:
+                                births.setdefault(
+                                    int(arguments[0]), []
+                                ).append(position)
                     if not isinstance(child, SequenceMutationBlock):
                         continue
                     mutation = child.mutation
