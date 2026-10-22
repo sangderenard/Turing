@@ -1,3 +1,13 @@
+2026-10-22 LOOP OVER INLINE COMPREHENSION (C14) (MEASURED):
+`for y in [x * n for x in xs]` read an empty iterable: a private copy of
+loop containment installed the comprehension's birth in the loop body.
+Built on Lane C's b1da6a5e (carried unchanged). See
+docs/compiler_convergence/35 section 4.
+Corpus (this container): 169/169 PASS at the C14 commit. Fuzz seed 18 (base,
+40): 40 PASS. Seed 19 (FUZZ_EXT=1, 40): 39 PASS, 1 LOUD (p19_13, "lacks
+one exact element producer", LOUD at `main` too). Gate: failure names
+identical to `main` 2532577 in all four parts.
+
 2026-10-22 MIXED INT/FLOAT LIST ROWS (C13) (MEASURED):
 A float row appended to an int64 arena was cast to int64 at the append
 call (silent at `main`). A float-to-integer call input conversion now
