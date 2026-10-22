@@ -128,3 +128,28 @@ conflict, and an undefined CondBr operand). Measured at `12ee174`: corpus
 164/164 PASS, 0 findings; fuzz `FUZZ_EXT=2` seed 15, 60/60 PASS (5
 programs use the new snippets); gate aa 89 / ab 7 / ac 26 / rec 20, nothing
 outside the parent's failures.
+
+## Follow-ups found by the fuzzer and by c986
+
+1. **Capacity of hoisted callee storage** (`4c65f25f`). A callee's own
+   list or dict lives in the entry frame (hoisted), but the C wrapper
+   published capacity only for the entry's root sequences, so the
+   callee's arena had capacity 0. `_linked_frame_sequences` follows the
+   call's `callee_input_ids` and respells the callee's descriptors in
+   entry ids. Corpus c217.
+2. **Rule 7 at the frame ABI** (`265ee20e`). A primitive `int` formal's
+   physical type arm used the class name `int` where the receipt says
+   `int64`. It now reads the receipt dtype. This commit comes after (1)
+   on purpose: alone it turned a loud c986 into a silent capacity-0 read.
+3. **Concatenation before its operand's birth** (`a4c29be9`, fuzzer
+   p16_29, observed wrong on `main`). `xs = [1, -1] + [n, 1]; d = {1: 6};
+   return xs[2] * 10 + d[1]` returned 6. The `+` region completed at its
+   own start, which precedes the right operand display, so the copy ran
+   before `[n, 1]` was born. **Rule:** a region member that reads a
+   display operand completes where that display ends
+   (`_member_completion_position`). Corpus c218, fuzz snippet.
+
+Measured at `a4c29be9` on a clean worktree: corpus 166/166 PASS, 0
+findings; fuzz `FUZZ_EXT=2` seeds 16 and 17, 60/60 PASS each (seed 16
+held the WRONG); gate aa 89 / ab 7 / ac 26 / rec 20, the same failure
+names as the previous measurement, which matched the parent.

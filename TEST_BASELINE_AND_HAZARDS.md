@@ -1,3 +1,12 @@
+2026-10-22 LANE A FOLLOW-UPS (MEASURED, cloud container):
+Silent wrong answers fixed: a callee's hoisted list or dict had capacity
+0 in the C wrapper; `[1, -1] + [n, 1]` followed by a dict display copied
+the right operand before its birth (fuzz p16_29, wrong on main). An int
+formal's physical arm is now int64 (rule 7). At a4c29be9: corpus 166/166
+PASS, 0 findings; fuzz FUZZ_EXT=2 seeds 16 and 17, 60/60 PASS each; gate
+aa 89 / ab 7 / ac 26 / rec 20, same names as the parent. See
+docs/compiler_convergence/35.
+
 2026-10-22 LANE A ITEM A6, PART (MEASURED, cloud container):
 Silent wrong answers fixed (all observed on main, clean audit):
 - `return [n]` from a callee read as an empty list in the caller;
