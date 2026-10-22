@@ -1677,6 +1677,24 @@ def evaporate_unrolled_loops(
                 graph.G.graph.get("source_sequence_mutation_records") or {}
             )
         )
+        # Program: ``ys = [6]; grow(ys, 2)`` beside ``any([x > n for x in
+        # xs])`` with ``xs`` a folded literal (c269, fuzzer p25_42).  Wrong
+        # record: the ``grow`` call returns ``None`` and has no consumer,
+        # so the same pruning deleted the call; ``len(ys)`` read 1 for 3
+        # and ``ys[-1]`` read 6 for 1 (clean audit).  Rule: a call that
+        # receives a mutated collection is an effect on it (the definition
+        # ``_sequence_effect_read_edges`` orders), so it is live.
+        from .glsl_deployment_strategy import _mutated_sequence_node_ids
+        from .resident_sequence_materialization import (
+            _call_escaped_argument_edges,
+        )
+
+        mutated = _mutated_sequence_node_ids(graph.G)
+        live.update(
+            int(call_id)
+            for call_id, argument_id in _call_escaped_argument_edges(graph.G)
+            if int(argument_id) in mutated
+        )
         # Dataflow ancestry alone is insufficient to retain source control:
         # loop nodes own their bodies semantically, and are not necessarily a
         # value predecessor of the function's return roots.  Evaporating an
