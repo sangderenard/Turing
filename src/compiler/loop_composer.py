@@ -5024,6 +5024,42 @@ def analyze_shader_loop_reductions(
                     for position, (_name, target_id)
                     in enumerate(loop.target_bindings)
                 )
+                # Program: ``for p, q in zip(xs, ys): t += p * q`` (fuzzer
+                # p4_49).  Wrong record: the zip call was taken as the row
+                # source, so each target projected a column of a value that
+                # authors no storage and the loop's extent was the extent of
+                # a shapeless call ("axis 0 is outside shape ()").  Rule: as
+                # under ``enumerate`` above, zip's members are projections of
+                # its exact argument sequences, and its cardinality is their
+                # shortest live length.
+                if reference == "zip":
+                    numbered_sources: dict[int, int] = {}
+                    for parent, role in iterable_data.get("parents", ()):
+                        match = re.fullmatch(r"arg(?::)?(\d+)", str(role))
+                        if match is None:
+                            continue
+                        position = int(match.group(1))
+                        if position in numbered_sources:
+                            numbered_sources = {}
+                            break
+                        numbered_sources[position] = int(parent)
+                    if numbered_sources and set(numbered_sources) == set(
+                        range(len(numbered_sources))
+                    ) and len(numbered_sources) == len(loop.target_bindings):
+                        zip_sources = tuple(
+                            numbered_sources[position]
+                            for position in range(len(numbered_sources))
+                        )
+                        projected_iterable_bindings = tuple(
+                            (
+                                int(projected_source), int(target_id),
+                                induction_name, None,
+                            )
+                            for projected_source, (_name, target_id) in zip(
+                                zip_sources, loop.target_bindings, strict=True,
+                            )
+                        )
+                        iterable_extent_ids = tuple(map(int, zip_sources))
         iterable_extent_id = (
             int(enumerated_source_id)
             if enumerated_source_id is not None
