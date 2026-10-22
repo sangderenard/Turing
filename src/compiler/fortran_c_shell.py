@@ -26590,16 +26590,41 @@ def _class_surface_ssa_program(
             elif isinstance(block, _ControlCallBlock):
                 yield from loop_grown(block.callee, inside_loop)
 
+        # Only a sequence BORN here owns its storage: an aggregate producer
+        # (a display, ``set()``), a materialized comprehension, or the
+        # collection a comprehension's loop composes (its ``LoopResult``,
+        # or a minted id with no graph node).  ``self.columns.append(c)`` and
+        # ``d.setdefault(k, []).append(c)`` grow a record field and a mapping
+        # value -- views of storage another record owns; declaring the view
+        # DYNAMIC gave one column two contracts (heap seq 22 over FIXED
+        # seq 10, ``descriptor-member-shared``, test
+        # test_reassigned_keyed_field_rebinds_to_declared_parts_and_dict_predicate).
+        from .resident_sequence_materialization import (
+            _call_escaped_argument_ids,
+        )
+        escaped_sequence_ids = set(map(int, _call_escaped_argument_ids(graph_obj)))
         for mutation in loop_grown(control.root):
             sequence_id = int(mutation.sequence_value_id)
             if (
                 str(mutation.operator) in {"append", "add", "extend", "insert"}
                 and sequence_id not in sequence_capacity_bounds
                 and sequence_id not in output_history_ids
+                and sequence_id not in escaped_sequence_ids
                 and (
                     sequence_id not in graph_obj
-                    or (graph_obj.nodes[sequence_id].get("attributes") or {})
-                    .get("binding_kind") != "parameter"
+                    or (
+                        (
+                            (graph_obj.nodes[sequence_id].get("attributes")
+                             or {}).get("producer_kind")
+                            in {"aggregate", "sequence_materialization"}
+                            or graph_obj.nodes[sequence_id].get("type")
+                            == "LoopResult"
+                        )
+                        and (
+                            graph_obj.nodes[sequence_id].get("attributes")
+                            or {}
+                        ).get("binding_kind") != "parameter"
+                    )
                 )
             ):
                 dynamic_sequence_ids.add(sequence_id)

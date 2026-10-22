@@ -5539,7 +5539,10 @@ class _ControlSSABuilder(TiledObject):
                 linear_index = offset
             result = self.produced_value(
                 result_id,
-                dtype=str(source.dtype or "unknown"),
+                dtype=str(
+                    (source.accounting or {}).get("heap_element_dtype")
+                    or source.dtype or "unknown"
+                ),
                 claim_provisional_definition=claim_provisional_definition,
                 cause=(source, linear_index),
             )
@@ -5570,7 +5573,13 @@ class _ControlSSABuilder(TiledObject):
         # output typed a function's return merge as an aggregate, and the
         # caller's native result contract then returned a handle with no
         # scalar buffer (the managed window's ``dt_next`` read 0).
-        dtype = str(source.dtype or "unknown")
+        # A heap column is its ``ptr`` CELL; the rows it addresses are its
+        # ``heap_element_dtype`` (``heap_allocate``), the one element record
+        # the C and LLVM lanes read too.
+        dtype = str(
+            (source.accounting or {}).get("heap_element_dtype")
+            or source.dtype or "unknown"
+        )
         if dtype == "ssa.aggregate":
             declared = self._value_from_meta(int(result_id))
             dtype = str(declared.dtype or "unknown")
@@ -11176,11 +11185,26 @@ class _ControlSSABuilder(TiledObject):
             for value_id in descriptor.column_value_ids
         )
         for column, layout in zip(columns, layouts, strict=True):
+            # Program: ``xs = []; for i in range(n): xs.append(i * 3)``
+            # lowered with the repository SSA reference.  Wrong record: the
+            # owner kept the column at its element dtype (int64) while every
+            # helper spells the same identity as its pointer CELL (``ptr``,
+            # ``_storage_values``); the metadata transport posted int64->ptr
+            # and ptr->int64 onto one shape edge until the book refused it.
+            # Rule: a heap column is a ``ptr`` cell everywhere -- the element
+            # layout lives in ``heap_element_dtype`` (``heap_allocate``).
+            column.dtype = "ptr"
             column.accounting = {
                 **dict(column.accounting or {}),
                 "heap_element_dtype": layout.name,
                 "heap_owner_value_id": int(owner.id),
             }
+            self._revise_value(
+                column, self._sequence_contract_cell(
+                    int(descriptor.sequence_id)
+                ),
+                stage=self._stage(),
+            )
         # The owner is a storage member, last (``_storage_values``): every
         # helper call that passes the sequence's storage passes its owner.
         sequence_id = int(descriptor.sequence_id)
@@ -11680,7 +11704,7 @@ class _ControlSSABuilder(TiledObject):
             self._bind_sequence_query_result(query, result, accumulator)
             return
         if query.operation == "maximum":
-            value_dtype = str(storage[0].dtype or "unknown")
+            value_dtype = str((descriptor.column_dtypes or ("unknown",))[0])
 
             def ordered_maximum(
                 incumbent: SSAValue,
@@ -11865,7 +11889,7 @@ class _ControlSSABuilder(TiledObject):
             # so a float row has no single result type: only integer and
             # bool rows (whose sum is always an int) with an integer start
             # are lowered; anything else is a named shortfall.
-            row_dtype = str(storage[0].dtype or "unknown")
+            row_dtype = str((descriptor.column_dtypes or ("unknown",))[0])
             start = (
                 None if query.default_value_id is None
                 else self.external_value(int(query.default_value_id))
@@ -12069,7 +12093,7 @@ class _ControlSSABuilder(TiledObject):
                 attributes=attributes,
             )
             selected_value = self.fresh_value(
-                dtype=storage[0].dtype, transform=LOAD,
+                dtype=str((descriptor.column_dtypes or ("unknown",))[0]), transform=LOAD,
                 operands=(address,),
             )
             self.emit(
@@ -12108,7 +12132,7 @@ class _ControlSSABuilder(TiledObject):
             attributes=attributes,
         )
         selected_value = self.fresh_value(
-            dtype=("int" if query.row_handle else storage[0].dtype),
+            dtype=("int" if query.row_handle else str((descriptor.column_dtypes or ("unknown",))[0])),
             transform=LOAD, operands=(address,),
         )
         self.emit(Handler.Load, [address], selected_value, attributes=attributes)
@@ -14580,7 +14604,7 @@ class _ControlSSABuilder(TiledObject):
             )
             result = self.produced_value(
                 int(mutation.effect_node_id),
-                dtype=str(storage[0].dtype or "unknown"),
+                dtype=str((destination.column_dtypes or ("unknown",))[0]),
                 claim_provisional_definition=True,
                 cause=(address,),
             )

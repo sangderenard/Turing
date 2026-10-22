@@ -7299,12 +7299,21 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
         "no_grad",
     }:
         return Rule.COORDINATOR_NODE_TYPE
+    # Program: ``s = set(); for i in range(n): s.add(i % 4)`` (corpus
+    # c160).  Wrong record: ``add`` is also a tensor operation name, so the
+    # method call on the set was classified numerical work and its region
+    # computed ``s + (i % 4)`` as a scalar add of the set's storage.  Rule:
+    # a node the graph records as a source sequence mutation is a control
+    # effect on its receiver, whatever its method is called.
     if (
         isinstance(data.get("expr_obj"), ast.Call)
         and isinstance(data["expr_obj"].func, ast.Attribute)
         and (
             node_type not in abstract_tensor_funcs
             or ungrounded_tensor_method
+            or int(node_id) in (
+                graph.G.graph.get("source_sequence_mutation_records") or {}
+            )
         )
     ):
         return Rule.METHOD_CALL
