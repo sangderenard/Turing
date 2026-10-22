@@ -1,3 +1,12 @@
+2026-10-22 MIXED INT/FLOAT LIST ROWS (C13) (MEASURED):
+A float row appended to an int64 arena was cast to int64 at the append
+call (silent at `main`). A float-to-integer call input conversion now
+refuses by name. See docs/compiler_convergence/35 section 3.
+Corpus (this container) at the C13 commit: 164/164 PASS (c01 re-run alone
+after a parallel cffi build race in the fresh worktree). Fuzz seed 16
+(base, 40) and seed 17 (FUZZ_EXT=1, 40): 80/80 PASS. Gate: failure names
+identical to `main` 2532577 in all four parts.
+
 2026-10-22 CONCATENATION FAMILY (W2) (MEASURED):
 Three silent wrong answers at `main` fixed (clean audit at `main`): a
 concat of a concat had no bound (len 2 for 4); a concat's row typed
