@@ -489,7 +489,13 @@ variadic return lane.
 - Lists across call edges: growing (c55) and returning (c56, c60) now
   pass. A constant list literal passed to a reader still fails with
   "aggregate call binding arity 3 != 0" (c127).
-- `any(generator)` as a short-circuit operand stays a flat region
-  reduction with no element count (c129/c130, also on HEAD).
+- `any(generator)` over a loop generator is now the resident query, as
+  `sum` was (corpus c61). A reduction over a STRUCTURAL aggregate whose
+  members were unrolled at reduction still miscompiles: `any((1 > n,
+  2 > n, 3 > n))`, `any([x > n for x in xs])`, `any(x > n for x in xs)`,
+  `sum(x * n for x in xs)` with `xs` a literal list. The audit flags each
+  (`has no storage` / `neither a formal nor defined`). The region takes
+  the aggregate as an unproduced input, and no layer assembles it from its
+  members.
 - Local class construction from a source-derived schema is
   `constructor_complete=False` by design (c19).

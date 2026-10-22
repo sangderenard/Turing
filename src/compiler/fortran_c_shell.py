@@ -14556,9 +14556,13 @@ def _install_lexical_sequence_queries(
                 if str(role) == "generators"
             ), None)
         elif (
-            expression.func.id == "sum"
+            expression.func.id in {"sum", "any"}
             and isinstance(sequence_data.get("expr_obj"), ast.GeneratorExp)
         ):
+            # ``any(x > n for x in xs)`` (corpus c61/c62) is the same shape:
+            # it fell to a numerical region ``any`` over the generator's
+            # arena, which nothing filled -- the caller's zeroed storage --
+            # so every test read False.
             # Program: ``sum(i * k for i in range(6))``.  A generator over a
             # static range is not composed into a collection LoopResult; its
             # comprehension loop materializes the same resident arena by
