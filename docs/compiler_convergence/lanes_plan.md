@@ -34,7 +34,7 @@ branch has used, merged or not.
 | c211-c218 | Lane A: A0, A3 and follow-ups | `claude/project-thread-kbkzp7` | c211, c212, c214-c218 |
 | c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c234 |
 | c240-c249 | Lane C: C1 constant-list comprehensions | `claude/project-thread-2nw77p` | c240-c243 |
-| c260-c269 | Lane A: S1 tuple birth, W2 concatenations | `claude/project-thread-cz18s3` | c260-c264 |
+| c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C13, C14 | `claude/project-thread-cz18s3` | c260-c265 |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
 | c280-c289 | next free | | |
 

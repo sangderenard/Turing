@@ -13405,8 +13405,14 @@ def _install_lexical_sequence_mutations(
         if source_id is None:
             return None
         expression = graph.G.nodes.get(int(source_id), {}).get("expr_obj")
-        start = getattr(expression, "lineno", None)
-        end = getattr(expression, "end_lineno", None)
+        # Program: ``for y in [x * n for x in xs]: t += y`` (c265).  Wrong
+        # record: this private copy of loop containment used the ``for``
+        # statement's whole span, so the iterable comprehension's birth
+        # (its clear and appends, authored on the ``for`` line) was placed
+        # in the loop body, after the loop had read the empty iterable's
+        # length (0 for 6; clean audit).  Rule: one containment rule, the
+        # loop's per-iteration lines (``_loop_body_line_span``, p3_46).
+        start, end = _loop_body_line_span(expression)
         if start is None or end is None:
             return None
         return int(start), int(end)
