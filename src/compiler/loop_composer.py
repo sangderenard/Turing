@@ -5061,7 +5061,15 @@ def analyze_shader_loop_reductions(
             # Return controls are keyed by Return.value, often a structural
             # Tuple. Its element expressions must run before that key's
             # exit edge, not after it in unreachable_return_control.
-            return_value = return_value or isinstance(node, ast.Return)
+            # A yield publishes its operands the same way.  Program:
+            # identity_spill._merge_partitions.<locals>.resident (bootstrap
+            # unit 43) -- ``yield position, key, fact, stamps[key]`` sorted
+            # before the region computing ``stamps[key]``, so the publish
+            # read a value defined after it (use-not-dominated; unit 50
+            # refused the dependency).  Rule: a yield follows its operands.
+            return_value = return_value or isinstance(
+                node, (ast.Return, ast.Yield, ast.YieldFrom),
+            )
             if not return_value:
                 yield node
             for child in ast.iter_child_nodes(node):
