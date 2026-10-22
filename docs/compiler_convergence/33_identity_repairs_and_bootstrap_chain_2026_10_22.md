@@ -497,5 +497,16 @@ variadic return lane.
   (`has no storage` / `neither a formal nor defined`). The region takes
   the aggregate as an unproduced input, and no layer assembles it from its
   members.
+- `t = (n > 0, n > 2, n > 4); len(t)` returns 0 with a CLEAN audit (also at
+  HEAD). The chain was observed:
+  1. `_list_literal_mutations` births only lists, so the tuple's length
+     cell is the frame's zeroed storage.
+  2. A tuple birth (tried, then reverted) emits the appends. But the
+     members' producer, region 0, is owned by the later conditional as its
+     predicate region (`t[1]`), so the appends read the members as formals.
+  3. The shell's structural recovery then rebuilds `n > k` from `n`, after
+     parameter naming has dropped `n` as declared-only.
+  A fix must place a predicate region before the effects that consume it,
+  then birth tuples like lists.
 - Local class construction from a source-derived schema is
   `constructor_complete=False` by design (c19).
