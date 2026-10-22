@@ -10781,7 +10781,29 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         # A source call, lowered as a call; an intrinsic or a native math
         # call is an operation inside a region (c22_math).
         and (data.get("attributes") or {}).get("extraction_action") is None
+    ] + [
+        # Program: ``xs0 = [1] * (n % 4 + 1)`` then ``swap(xs2)`` (fuzzer
+        # p23_32).  A list built by an operator is filled where it is
+        # authored, as a call is, so it keeps its place in this order too.
+        (int(node_id), data.get("expr_obj"))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.BinOp)
+        and (data.get("attributes") or {}).get("aggregate_kind") == "list"
     ]
+    # Program: ``while k0 > 0: xs0.append(k0); k0 -= 2`` then ``swap(xs2)``
+    # (fuzzer p24_54).  An effect inside a loop is observed when its
+    # outermost enclosing loop completes, so that loop takes its place.
+    def sequenced_at(effect_id, expression):
+        enclosing = [
+            (start, -end, loop_node, loop)
+            for start, end, loop_node, loop in loop_nodes
+            if start <= int(expression.lineno) <= end
+        ]
+        if enclosing:
+            _start, _end, loop_node, loop = min(enclosing)
+            return int(loop_node), loop
+        return int(effect_id), expression
+
     ordered_effects = sorted({
         (
             (
@@ -10790,12 +10812,12 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
             ),
             int(effect_id),
         )
-        for effect_id, expression in sequenced
+        for candidate_id, candidate in sequenced
+        if int(candidate_id) in graph.G
+        and getattr(candidate, "lineno", None) is not None
+        for effect_id, expression in (sequenced_at(candidate_id, candidate),)
         if int(effect_id) in graph.G
         and getattr(expression, "end_lineno", None) is not None
-        and not any(
-            start <= int(expression.lineno) <= end for start, end in loops
-        )
     })
     for (_first_position, first), (_second_position, second) in zip(
         ordered_effects, ordered_effects[1:],
