@@ -22563,6 +22563,18 @@ def _class_surface_ssa_program(
                 or (primitive_receipt or {}).get("dtype")
                 or ""
             )
+            # Program: ``def table(n: int): return {1: n, 2: 5}`` (corpus
+            # c217).  Wrong record: the formal's contract still spelled the
+            # provisional class ``'int'`` while the literal's arm said
+            # ``int64``, so one dict column held two "different" int arms
+            # and was refused.  Rule 7: Python ``int`` is ``int64``; a
+            # primitive scalar carrier's dtype is its class receipt's.
+            if (
+                primitive_receipt is not None
+                and str(primitive_receipt["storage"]) == "scalar"
+                and dtype == primitive_class
+            ):
+                dtype = str(primitive_receipt["dtype"])
             shape = tuple(map(int, contract.get("shape") or ()))
             rank = int(contract.get(
                 "rank",
