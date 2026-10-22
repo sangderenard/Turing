@@ -1,3 +1,9 @@
+2026-10-22 COMPREHENSION OVER A NEGATIVE LITERAL (MEASURED): `[x * n for x in
+[5, -1]]` typed its row float64 (`-1` is a `neg` node). Fixed in
+`literal_row`, doc 35 section 6. Corpus 172/172 at 99c1dfaf. Fuzz seed 24
+base 40/40. Seed 23 FUZZ_EXT=2: 39 PASS and 1 WRONG (p23_3 = lanes plan
+C15, WRONG at `main`, Lane C). Gate names identical to `main`.
+
 2026-10-22 COMPREHENSION MUTATED AFTERWARDS (C12) (MEASURED):
 `ys = [x * n for x in xs]; ys.append(n)` (folded `xs`) lost the append:
 loop evaporation pruned its node, the survey did not bound the arena, and
