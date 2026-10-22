@@ -5024,7 +5024,11 @@ class IdentityPage:
         count = (
             segment.cells if segment is not None else len(self.__dict__["cells"])
         )
-        away = self.__dict__.get("_detached")
+        # ``_detached`` is private dynamic page state; its value-record
+        # contract is stated at the read boundary, as in
+        # ``identity_spill._detached_ordinals``, so ``item`` is a Segment.
+        from .identity_spill import Segment
+        away: dict[str, Segment] | None = self.__dict__.get("_detached")
         if away:
             count += sum(item.cells for item in away.values())
         return count
@@ -5036,7 +5040,8 @@ class IdentityPage:
             segment.rows if segment is not None
             else len(self.__dict__["row_columns"])
         )
-        away = self.__dict__.get("_detached")
+        from .identity_spill import Segment
+        away: dict[str, Segment] | None = self.__dict__.get("_detached")
         if away:
             count += sum(item.rows for item in away.values())
         return count

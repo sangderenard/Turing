@@ -19424,6 +19424,46 @@ def _post_numeral_leaf_width(
     return int(width)
 
 
+# Program: ``ssa_object_operations._result_layout`` (bootstrap unit 81), whose
+# ``function`` parameter is a ``Function`` record with the keyed field
+# ``blocks``.  Wrong record: the mapping handle the authored read
+# ``function.blocks`` names (graph id 6) entered the frame as a bare
+# ``SSAValue`` with no ``ssa_value`` row; the ``keyed`` REVISE that followed
+# found no row to revise and returned None, and the call-result settlement
+# refused "physical structure lacks SSA identity".  Rule: a mapping handle that
+# enters as a formal is the graph id itself, so its row is posted ADOPTED from
+# that graph id's cell and the record declaration, with its declared ``keyed``
+# storage, before any accounting is written from it.
+def _adopt_keyed_mapping_handle(function, graph, value_id, *declaration_cells):
+    from .concordance_declarations import (
+        RECORD_ABI_MATERIALIZATION as _STAGE, SSA_VALUE, SSAValueFact,
+        SSAValueOrigin,
+    )
+    from .identity_concordance import (
+        ConcordanceRefusal, Derived, Mode, current_identity_book,
+    )
+    from ..transmogrifier.ssa import SSAValue
+
+    source = _frame_graph_cell(graph, int(value_id))
+    if source is None:
+        raise ConcordanceRefusal(
+            "keyed mapping handle has no source graph identity: "
+            f"function={function.name!r}, value={int(value_id)}"
+        )
+    mapping = SSAValue(int(value_id))
+    if _frame_value_cell(function, int(value_id)) is None:
+        current_identity_book().post(
+            SSA_VALUE, (_frame_book_scope(function), int(value_id)),
+            SSAValueFact(
+                None, (), SSAValueOrigin.ADOPTED_GRAPH_ID, storage="keyed",
+            ),
+            stage=_STAGE,
+            provenance=Derived(_frame_cells(source, *declaration_cells)),
+            mode=Mode.CONCORD,
+        )
+    return mapping
+
+
 def _class_surface_ssa_program(
     compilation: Any,
     artifact_name: str,
@@ -32815,7 +32855,10 @@ def _class_surface_ssa_program(
                     for value_id in candidates:
                         mapping = values.get(int(value_id))
                         if mapping is None:
-                            mapping = SSAValue(int(value_id))
+                            mapping = _adopt_keyed_mapping_handle(
+                                function, graph, int(value_id),
+                                GLOBAL_MONOTONIC_IDS.declaration,
+                            )
                             function.args.append(mapping)
                             values[int(value_id)] = mapping
                         mapping.accounting = {
@@ -34674,7 +34717,10 @@ def _class_surface_ssa_program(
                             # input: consumers that have not yet been resolved
                             # against the three slots continue to name it, and
                             # it is what carries the slot correlation.
-                            mapping = SSAValue(int(value_id))
+                            mapping = _adopt_keyed_mapping_handle(
+                                function, graph, int(value_id),
+                                GLOBAL_MONOTONIC_IDS.declaration,
+                            )
                             function.args.append(mapping)
                             values[int(value_id)] = mapping
                         # Rule: post first; accounting is a view.  The
