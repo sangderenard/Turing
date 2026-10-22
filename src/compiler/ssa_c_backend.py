@@ -4765,7 +4765,27 @@ def emit_ssa_module_to_c(
                                 )
                                 output_argument = None
                             else:
-                                destination = output_destinations.get(output_id)
+                                # Program: ``v = maybe(row, flag)`` in a root
+                                # whose own output is id 8, calling a
+                                # specialized ``maybe`` whose payload output
+                                # is also id 8.  Wrong record: the callee's
+                                # output id was looked up among the CALLER's
+                                # output buffers, so the call wrote its
+                                # payload straight into the root's result.
+                                # Rule: the caller's own projection values
+                                # name the caller's storage; the callee's
+                                # output ids live in the callee's namespace.
+                                caller_destinations = {
+                                    output_destinations[int(projection.value.id)]
+                                    for projection in projections
+                                    if int(projection.value.id)
+                                    in output_destinations
+                                }
+                                destination = (
+                                    next(iter(caller_destinations))
+                                    if len(caller_destinations) == 1
+                                    else None
+                                )
                             if formal_position is None and destination is not None:
                                 output_argument = destination
                                 projected_expression = (

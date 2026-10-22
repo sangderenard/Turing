@@ -298,3 +298,54 @@ def test_energy_limit_exact_helper_has_closed_optional_and_structural_abi():
     )
     emitted = emit_ssa_to_c(module, root_name)
     assert emitted.complete, emitted.shortfalls
+
+
+_PROGRAM_CONTRACT = str(
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts" / "program_extraction.yaml"
+)
+
+
+def test_unit_returning_a_statement_merged_optional_exports_its_presence():
+    # ``r = row + 1`` / ``r = None`` merge into a ``conditional_result`` Phi
+    # that the unit's Ret returns.  The export is (payload, presence), as for
+    # a ``return_merge``; before, Ret was the payload alone.
+    source = (
+        "def root(row: int, flag: int):\n"
+        "    if flag > 0:\n"
+        "        r = row + 1\n"
+        "    else:\n"
+        "        r = None\n"
+        "    return r\n"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="optional_statement_unit",
+        extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+    )
+    root = module.functions[exports[0]]
+    (ret,) = [
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    ]
+    assert [value.dtype for value in ret.args] == ["int64", "bool"]
+    presence = ret.args[1]
+    assert (presence.accounting or {}).get("ssa_optional_payload_id") == int(
+        ret.args[0].id
+    )
+    assert check_optional_merges(module) == []
+
+
+def test_unit_returning_tuple_or_none_refuses_instead_of_returning_the_none():
+    # The join of a tuple arm and a None arm has no value; the None arm used
+    # to stand for the output and the tuple vanished from Ret.
+    source = (
+        "def root(row: int, flag: int):\n"
+        "    if flag > 0:\n"
+        "        return (row + 1, row * 2)\n"
+        "    return None\n"
+    )
+    with pytest.raises(ValueError, match="join of its conditional arms"):
+        lower_ast_source_to_ssa(
+            source, "root", name="optional_tuple_unit",
+            extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+        )

@@ -491,6 +491,15 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                 presence_id = next(iter(presence_ids))
                 if presence_id in values and values[presence_id].dtype == "bool":
                     presence_by_payload[payload_id] = values[presence_id]
+        from .ssa_reachability import semantic_output_ids_of
+
+        returned_ids = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in _RETURN_OPS
+            for argument in instruction.args
+        }
         lowered_one = True
         while lowered_one:
             lowered_one = False
@@ -593,9 +602,23 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         payload_args.append(payload)
                         presence_args.append(present)
                     else:
+                        # Program: ``if flag > 0: r = row + 1 else: r = None;
+                        # return r`` (and the bootstrap's single-exit guard
+                        # normalization, which writes exactly that).  Wrong
+                        # record: the merge's binding was
+                        # ``conditional_result``, so the Phi was split but the
+                        # Ret kept only the payload -- the export said "int"
+                        # where Python returns None.  Rule: a Phi is a return
+                        # merge when it is this function's semantic output and
+                        # its own Ret returns it, whatever binding built it.
                         is_return = str(instruction.attributes.get(
                             "binding"
-                        ) or "") == "return_merge"
+                        ) or "") == "return_merge" or (
+                            int(instruction.res.id) in returned_ids
+                            and int(instruction.res.id) in map(
+                                int, semantic_output_ids_of(function),
+                            )
+                        )
                         presence = SSAValue(
                             mint_ssa_value(
                                 function, OPTIONAL_PRESENCE,
