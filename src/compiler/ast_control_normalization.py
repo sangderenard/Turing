@@ -539,6 +539,67 @@ def _pure_operand(node: ast.AST) -> bool:
     return False
 
 
+# Builtin conversions and measures.  Over an argument of a builtin type each
+# one is a function of its argument alone with no effect: a second
+# evaluation, right after the first returned, gives the same value and
+# raises nothing new.  (A user ``__int__``/``__len__`` with an effect would
+# break this; the native lanes do not dispatch to one, lanes plan A7.)
+_PURE_CONVERSION_BUILTINS = frozenset({"int", "float", "len", "abs", "ord"})
+
+
+def _rebound_names(tree: ast.AST) -> frozenset[str]:
+    """Every name the module binds anywhere (assignment, deletion, ``def``,
+    ``class``, parameter, import, ``global``/``nonlocal``).  A builtin
+    whose name is here is not proven to be the builtin."""
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(
+            node.ctx, (ast.Store, ast.Del),
+        ):
+            names.add(node.id)
+        elif isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            names.add(node.name)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                names.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchAs) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchStar) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)
+    return frozenset(names)
+
+
+def _reevaluable_operand(node: ast.AST, rebound: frozenset[str]) -> bool:
+    """Whether a chain's middle operand may be spelled twice: a pure read
+    (``_pure_operand``), or one of ``_PURE_CONVERSION_BUILTINS`` (one
+    positional argument, the name not rebound by the module) applied to
+    such an operand."""
+
+    if _pure_operand(node):
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _PURE_CONVERSION_BUILTINS
+        and node.func.id not in rebound
+        and len(node.args) == 1
+        and not node.keywords
+        and not isinstance(node.args[0], ast.Starred)
+        and _reevaluable_operand(node.args[0], rebound)
+    )
+
+
 def _normalize_chained_comparisons(
     tree: ast.Module,
 ) -> tuple[dict[str, Any], ...]:
@@ -551,9 +612,23 @@ def _normalize_chained_comparisons(
     comparisons, each middle operand evaluated once.  A pure middle operand
     reads the same value twice; a chain with an impure middle operand (a
     call) is refused by name rather than evaluated twice.
+
+    Program: ``digits.isdigit() and 0 <= int(digits) <= 9``
+    (``identity_concordance.identity_log_lzma_preset``) and
+    ``eps < float(value) < hi`` (``dt_controller``; corpus c211).  Wrong
+    record: every call was classed as effectful, so both whole-program
+    targets were refused at source normalisation (and 22 more compiler
+    sources hold ``len(x)``/``abs(x)``/``ord(c)`` middles).  Rule: a
+    builtin conversion or measure of a pure operand, under a name the
+    module never rebinds, is re-evaluable, and is spelled in place in both adjacent comparisons.
+    The first occurrence stays where Python evaluates it, so a guarding
+    ``and`` still short-circuits it, and the second runs only after the
+    first returned.  It is never hoisted out of the expression.  Any other
+    call keeps the refusal.
     """
 
     receipts: list[dict[str, Any]] = []
+    rebound = _rebound_names(tree)
 
     class Rewriter(ast.NodeTransformer):
         def visit_Compare(self, node):  # noqa: N802
@@ -562,7 +637,8 @@ def _normalize_chained_comparisons(
                 return node
             middles = node.comparators[:-1]
             impure = next((
-                middle for middle in middles if not _pure_operand(middle)
+                middle for middle in middles
+                if not _reevaluable_operand(middle, rebound)
             ), None)
             if impure is not None:
                 raise ValueError(
@@ -593,6 +669,10 @@ def _normalize_chained_comparisons(
                 "line": int(getattr(node, "lineno", -1)),
                 "column": int(getattr(node, "col_offset", -1)),
                 "comparisons": len(comparisons),
+                "reevaluated_conversions": [
+                    ast.unparse(middle) for middle in middles
+                    if not _pure_operand(middle)
+                ],
             })
             conjunction = ast.BoolOp(op=ast.And(), values=comparisons)
             return ast.copy_location(conjunction, node)
