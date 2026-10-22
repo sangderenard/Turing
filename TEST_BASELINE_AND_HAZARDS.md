@@ -1,3 +1,10 @@
+2026-10-22 LANE A, CALL ORDER SECOND STEP (MEASURED, cloud):
+`swap(xs)` after a list fill (`[1] * k`) or after a loop that appends ran
+after the reads of `xs` (silent on main). Fills and loops now join the
+source-order chain. At efa87006: corpus 169/169 PASS; FUZZ_EXT=3 seeds
+23/24 60/60, seed 25 59 PASS + 1 LOUD that is also loud on main (p25_25,
+augmented store cycle); gate same names as the parent.
+
 2026-10-22 LANE A, CALL ORDER AND BRANCH-MERGED LISTS (MEASURED, cloud):
 Silent wrong answers fixed (both wrong on main): a call after another
 source call whose argument fused with later reads was lost (FUZZ_EXT=3

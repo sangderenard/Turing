@@ -188,3 +188,17 @@ findings; fuzz `FUZZ_EXT=3` seeds 18, 19 and 21 and `FUZZ_EXT=2` seed 20,
 60/60 PASS each (seed 18 held both WRONGs); gate aa 89 / ab 7 / ac 26 /
 rec 20, the same names as the parent. Corpus numbers c270 to c279 belong
 to this lane.
+
+### The call-order chain, second step (`efa87006`)
+
+`FUZZ_EXT=3` seeds 23 and 24 turned up two more instances of the same family,
+both wrong on `main`. In each, `swap(xs2)` ran after the reads of `xs2`: once
+after `xs0 = [1] * (n % 4 + 1)` and once after a `while` loop appending to
+`xs0`. The fill and the loop are lowered where they are authored, but they
+were not in the chain. Now a list built by an operator joins the chain, and an
+effect or call inside a loop is placed by its outermost loop. Corpus c272.
+Measured at `efa87006`: corpus 169/169 PASS, 0 findings; fuzz `FUZZ_EXT=3`
+seeds 23 and 24 60/60, and seed 25 59 PASS with 1 LOUD (p25_25, an
+effect-order cycle around an augmented store, `xs1[0] += n`, which fails the
+same way on `main`). Gate aa 89 / ab 7 / ac 26 / rec 20, same names as the
+parent.
