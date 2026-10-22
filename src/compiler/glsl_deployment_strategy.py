@@ -212,6 +212,7 @@ from .deployment_profiler import (
 from .formal_shape_ledger import (
     _FORMAL_LITERAL_CONFLICT as _FORMAL_LITERAL_CONFLICT,
     _publish_formal_literal as _publish_formal_literal,
+    _publish_formal_dynamic as _publish_formal_dynamic,
     _publish_formal_shape as _publish_formal_shape,
     _proven_formal_shape as _proven_formal_shape,
     _proven_formal_literal as _proven_formal_literal,
@@ -24002,6 +24003,26 @@ def _fold_callsite_structural_values(
             ))
             for node_id in sorted(rejected_nodes, reverse=True):
                 remove_node(node_id)
+            # Program: ``raise ValueError(f"(0..{SERIAL_BITS})")`` with a
+            # module int.  ``append_decimal_integer_glyphs`` specialized on
+            # ``value=1000`` folds ``if value == _INT64_MIN`` to its orelse
+            # and removes the body's twenty append nodes (60, 62, ...), but
+            # ``source_sequence_mutation_records`` -- the pre-fold effect
+            # snapshot -- still listed them.  Control lowering then
+            # installed effects whose nodes no longer exist; with no owner
+            # cell they shared one ``control_block`` row and the second
+            # placement was refused.  Rule: an effect this fold rejects is
+            # retired from the snapshot with its node.  A record whose
+            # effect survives keeps outliving its folded literal argument.
+            mutation_records = graph.G.graph.get(
+                "source_sequence_mutation_records"
+            )
+            if mutation_records:
+                graph.G.graph["source_sequence_mutation_records"] = {
+                    int(effect_id): record
+                    for effect_id, record in mutation_records.items()
+                    if int(effect_id) not in rejected_nodes
+                }
             remove_node(int(control_id))
             identities = graph.G.graph.get("identity_table") or {}
             if selected_return_id is not None:
@@ -24756,6 +24777,13 @@ def _callsite_specialized_shell_type(
                     str(caller.G.graph.get("function_name")),
                     specialization_cells[parameter],
                 )
+        if parameter not in specializations:
+            _publish_formal_dynamic(
+                str(original.G.graph.get("function_name")),
+                parameter,
+                str(caller.G.graph.get("function_name")),
+                _argument_identity_cells(caller, int(parent)),
+            )
         proven_descriptor = tensor_descriptors.get(parameter)
         if proven_descriptor is not None and descriptor_states_a_shape(
             proven_descriptor
@@ -24844,13 +24872,7 @@ def _callsite_specialized_shell_type(
             return repr(value)
         return value
 
-    key = (
-        tuple(policy.items()), generation,
-        id(function_table),
-        # A planned shell's rows were posted on the book of the compile that
-        # built it; a later compile (a new book) must plan again so its own
-        # book holds them (plan 80, R3).
-        id(current_identity_book()),
+    callsite_contract = (
         int(reference),
         tuple(sorted(
             (name, stable(value))
@@ -24869,6 +24891,15 @@ def _callsite_specialized_shell_type(
             for name, value in record_descriptors.items()
         )),
         tuple(sorted(parameter_classes.items())),
+    )
+    key = (
+        tuple(policy.items()), generation,
+        id(function_table),
+        # A planned shell's rows were posted on the book of the compile that
+        # built it; a later compile (a new book) must plan again so its own
+        # book holds them (plan 80, R3).
+        id(current_identity_book()),
+        *callsite_contract,
         # Object identities isolate a live compile, while these concordance
         # scopes make the cache key stable against Python reusing those ids
         # after a completed compatibility compile remains cached.  Anonymous

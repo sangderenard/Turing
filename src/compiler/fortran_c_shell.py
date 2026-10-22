@@ -21681,19 +21681,31 @@ def _class_surface_ssa_program(
             ):
                 storage = "scalar"
             primitive_receipt = None
-            if identity.startswith("builtins.") and storage in {
-                "", "scalar", "span",
-            }:
+            if identity.startswith("builtins."):
                 # A primitive class owns its physical storage: ``int`` is a
                 # scalar int64, ``float`` a scalar float64, ``bool`` a scalar
                 # bool, ``str`` a resident int64 span.  The receipt is the one
                 # the ProgramABI states for an annotation naming that class
                 # (fields and parameters), so a value whose class the
                 # concordance has settled needs no second declaration.
+                #
+                # Program: ``argument_binding_history``'s ``rows = tuple(...)
+                # if rows is None else rows``.  The generator arm had no
+                # storage and took the ``tuple`` receipt (``reference``,
+                # keyed ``primitive_class_abi``); the ``rows`` formal arm
+                # declared ``reference`` itself, skipped the receipt, and
+                # kept no primitive key -- one carrier, two arms, refused as
+                # "changes its physical ABI".  Rule: a declared storage equal
+                # to the class receipt's IS that primitive carrier.
                 primitive_class = identity.rsplit(".", 1)[-1]
-                primitive_receipt = _authored_annotation_field_receipt(
+                receipt = _authored_annotation_field_receipt(
                     ast.Name(id=primitive_class, ctx=ast.Load()),
                 )
+                if receipt is not None and (
+                    storage in {"", "scalar", "span"}
+                    or storage == str(receipt["storage"])
+                ):
+                    primitive_receipt = receipt
                 if not storage and primitive_receipt is not None:
                     storage = str(primitive_receipt["storage"])
             if storage in {"keyed", "table"}:
@@ -22900,6 +22912,7 @@ def _class_surface_ssa_program(
             ("<sequence-schema-survey>", item)
             for item in sequence_schema_shortfalls
         )
+    lowered_symbol_contracts: dict[str, Any] = {}
     for shell_index, shell in compile_iter(
         enumerate(planned_shells, 1), "functions", total=len(planned_shells),
         label="SSA lowering: shells completed",
@@ -23759,6 +23772,31 @@ def _class_surface_ssa_program(
         shell_symbols[id(shell)] = symbol
         if function_reference is not None:
             function_symbols[int(function_reference)] = symbol
+        # Program: ``serial = int(serial); raise ValueError(f"serial
+        # {serial} (0..{flags})")``.  Two ``decimal_integer_glyph_tokens``
+        # copies (their ``value`` descriptors differ) each planned
+        # ``append_decimal_integer_glyphs`` on the same contract
+        # ``{destination: []}``; the planner keeps one shell per caller, the
+        # symbol digest names the contract, so both shells were lowered as
+        # ``..._specialized_1cd15043d8e2`` -- one executable, two Function
+        # records (the second ``loop_scope`` post was refused; the second
+        # Function silently replaced the first in the module).  Rule: a
+        # symbol is lowered once.  The symbol is the digest of
+        # ``specialization_contract``; a later shell with the same symbol
+        # and the same contract calls that executable, and a different
+        # contract under one symbol (a digest collision) is refused.
+        shell_contract = repr(specialization_contract)
+        if symbol in lowered_symbol_contracts:
+            if lowered_symbol_contracts[symbol] != shell_contract:
+                from .identity_concordance import ConcordanceRefusal
+
+                raise ConcordanceRefusal(
+                    f"symbol {symbol!r} names two shells with different "
+                    f"callsite contracts: {lowered_symbol_contracts[symbol]!r}"
+                    f" and {shell_contract!r}"
+                )
+            continue
+        lowered_symbol_contracts[symbol] = shell_contract
         # Instance fields flow through the object's field arena: ``self`` is a
         # slot array, a field read is a load from its slot, a field write a
         # store. In whole-program precompile mode the field-op region is never

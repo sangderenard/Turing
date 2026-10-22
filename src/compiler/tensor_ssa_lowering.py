@@ -314,6 +314,26 @@ _SHAPED_SSA_OPERATIONS = {
 }
 
 
+#: The tensor-contract accounting keys a call edge transports
+#: (``enrich``) and therefore the keys the call-metadata fixed point
+#: snapshots.  Program: ``reindex``'s ``row_columns.setdefault(row,
+#: []).append(column)`` (test_authored_tuple_loop_row_remains_integer_table_
+#: key_handle).  Wrong record: the edge carried ``sequence_row_shape`` onto
+#: the sequence helpers' formals in round 1, but the snapshot listed the
+#: other six keys only, so round 1 equalled round 0 while a pass reported a
+#: change and the fixed point refused as a cycle.  Rule: one key list for
+#: what the edge writes and what the snapshot reads.
+_TENSOR_CONTRACT_KEYS = (
+    "program_abi_storage",
+    "program_abi_rank",
+    "tensor_metadata_state",
+    "tensor_shape_value_id",
+    "tensor_rank_value_id",
+    "tensor_element_count_value_id",
+    "sequence_row_shape",
+)
+
+
 def _elementwise_result_physical(
     owner: Any, operands: Any, *, book: Any,
 ) -> dict[str, Any]:
@@ -1518,15 +1538,7 @@ def propagate_repository_ssa_call_metadata(
         # backend can follow the call edge back to that span.  Previously this
         # fixed point propagated only the display shape/dtype, leaving the
         # formal ``unresolved`` even though the actual was fully accounted.
-        tensor_contract_keys = (
-            "program_abi_storage",
-            "program_abi_rank",
-            "tensor_metadata_state",
-            "tensor_shape_value_id",
-            "tensor_rank_value_id",
-            "tensor_element_count_value_id",
-            "sequence_row_shape",
-        )
+        tensor_contract_keys = _TENSOR_CONTRACT_KEYS
         source_tensor_contract = {
             key: source_accounting[key]
             for key in tensor_contract_keys
@@ -2083,14 +2095,7 @@ def propagate_repository_ssa_call_metadata(
                 ),
                 tuple(
                     (key, (value.accounting or {}).get(key))
-                    for key in (
-                        "program_abi_storage",
-                        "program_abi_rank",
-                        "tensor_metadata_state",
-                        "tensor_shape_value_id",
-                        "tensor_rank_value_id",
-                        "tensor_element_count_value_id",
-                    )
+                    for key in _TENSOR_CONTRACT_KEYS
                 ),
             )
             for function_name, function in module.functions.items()

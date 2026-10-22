@@ -57,6 +57,50 @@ def _publish_formal_literal(
     )
 
 
+def _publish_formal_dynamic(
+    function: str, parameter: str, caller: str, cells: tuple = (),
+) -> None:
+    """Record that a callsite passes a runtime value for one formal.
+
+    Program: ``f"serial {serial} (0..{SERIAL_BITS})"``.  Two callsites of
+    ``decimal_integer_glyph_tokens``: one passes the module literal 1000,
+    one the runtime ``serial``.  Only the literal callsite posted on page
+    ``formal_literal``, so row ``(decimal_integer_glyph_tokens, value)``
+    read ``("proven", 1000, ...)`` as if every callsite agreed; the generic
+    copy planned for ``serial`` read its ``value`` Input as 1000 and called
+    ``append_decimal_integer_glyphs`` specialized on 1000.  Rule: a callsite
+    whose argument is not source-static is an observation too; it revises
+    the row to ``Unresolved(SPECIALIZATION_DYNAMIC_ARGUMENT)`` DERIVED from
+    the incumbent and this callsite's argument cells.  A row already
+    unresolved stays as it is.
+    """
+
+    from .concordance_declarations import (
+        FORMAL_LITERAL, PLANNER_SPECIALIZATION,
+        SPECIALIZATION_DYNAMIC_ARGUMENT,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Unresolved, current_identity_book,
+    )
+
+    book = current_identity_book()
+    row = (str(function), str(parameter))
+    previous = book.latest_ref(FORMAL_LITERAL, row)
+    if previous is not None and isinstance(
+        book.pages[FORMAL_LITERAL.name].latest(row), Unresolved,
+    ):
+        return
+    read = tuple(dict.fromkeys((
+        *((previous,) if previous is not None else ()), *tuple(cells),
+    )))
+    book.post(
+        FORMAL_LITERAL, row,
+        Unresolved(SPECIALIZATION_DYNAMIC_ARGUMENT, read=read),
+        stage=PLANNER_SPECIALIZATION, provenance=Derived(read),
+        mode=Mode.REVISE,
+    )
+
+
 def _publish_formal_shape(
     function: str, parameter: str, descriptor: Any, caller: str,
     cells: tuple = (),

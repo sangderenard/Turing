@@ -178,9 +178,17 @@ def _concord_exact_region_feed_dtypes(
                     # instruction's cut-time ``feed_dtypes`` copy was kept as
                     # the exact feed, so the int64 actual was cast to float64
                     # and the formal row revised back to float64.  Rule: once
-                    # result settlement has run (the non-deferred pass), the
-                    # resident's posted row is the feed's type for every
-                    # numeric resident, not only a producer-backed result.
+                    # result settlement has run (the non-deferred pass), a
+                    # SCALAR resident's posted row is the feed's type, not
+                    # only a producer-backed result's.  A span's feed is its
+                    # buffer's physical type, which the cut recorded (a bool
+                    # mask stored as float64 is fed as float64).
+                    producer_backed = bool(
+                        resident is not None
+                        and (resident.accounting or {}).get(
+                            'ssa_call_result_from'
+                        )
+                    )
                     if (
                         (not defer_unsettled_region_call_results or settled_physical_result)
                         and
@@ -199,7 +207,8 @@ def _concord_exact_region_feed_dtypes(
                         payload = dict(structure.children).get("payload", structure)
                         if payload.dtype is None:
                             raise ConcordanceRefusal("returned region feed has no physical type")
-                        revised_feed_dtypes[position] = str(payload.dtype)
+                        if producer_backed or structure.kind == "scalar":
+                            revised_feed_dtypes[position] = str(payload.dtype)
                     elif (
                         resident is not None
                         and (resident.accounting or {}).get(

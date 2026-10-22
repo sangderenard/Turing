@@ -5175,10 +5175,21 @@ class _ControlSSABuilder(TiledObject):
             # producer's later claim is the revision that resolves it.
             self._bind_unresolved(value_id, NO_PRODUCER_AT_USE, value=value)
             self.arguments.append(value)
-        elif dtype is not None and str(value.dtype or "unknown") != str(dtype):
+        elif (
+            str(dtype or "unknown") not in {"", "unknown"}
+            and str(value.dtype or "unknown") != str(dtype)
+        ):
             # A structural control use can carry a stronger contract than an
             # earlier generic region capture.  Refine the one SSA identity
             # before the Function signature is assembled.
+            #
+            # Program: ``argument_binding_history``'s nested row loop.  The
+            # sequence row load demanded its column's descriptor dtype,
+            # still ``unknown``, of the row base minted ``int64`` by
+            # ``bind_nested_row``; the "refinement" replaced the int64
+            # identity with an unknown one and revised its row back to
+            # unknown ("unresolved evidence cannot erase resident type").
+            # Rule: only a resolved dtype is a contract that refines.
             refined = SSAValue(
                 value.id,
                 dtype=str(dtype),

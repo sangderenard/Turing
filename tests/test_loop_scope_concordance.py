@@ -62,7 +62,13 @@ def test_loop_inner_transition_preserves_declaration_and_publishes_resident():
             cells=(cells[12], cells[99]),
         )
 
-        declarations = loop_scope_declarations(book, "artifact__step")
+        # Rows are keyed by the lowered symbol (``loop_scope_owner``): two
+        # callsite specializations of one authored loop are two lowerings,
+        # each with its own generations.  Keyed by the authored name, the
+        # second specialization's declaration was refused ("already holds
+        # carried ...").
+        owner = "artifact__step__specialized_deadbeef"
+        declarations = loop_scope_declarations(book, owner)
         assert declarations == [{
             "loop_node_id": 7,
             "boundary": ("loop_header", "loop_latch", "loop_exit"),
@@ -75,11 +81,11 @@ def test_loop_inner_transition_preserves_declaration_and_publishes_resident():
         }]
         # The declaration stays the three authored generations, exactly;
         # the resident is published on the transition page, not over it.
-        assert book.page("loop_scope").history(("step", 7, 10)) == (
+        assert book.page("loop_scope").history((owner, 7, 10)) == (
             (0, 10), (1, 11), (2, 12),
         )
         assert book.page("loop_scope_inner_transition").latest(
-            ("step", 7, 12)
+            (owner, 7, 12)
         ) == (99, "complete_loop_latch_carried")
     finally:
         end_identity_book(token)
