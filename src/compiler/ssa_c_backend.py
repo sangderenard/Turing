@@ -3067,7 +3067,7 @@ def emit_ssa_module_to_c(
             ))
             return length, row_shape
 
-        phi_scalar_cells: set[tuple[int, int]] = set()
+        phi_scalar_cells: set[tuple] = set()
 
         def phi_edge_assignments(source_block: str, target_block: str) -> list[str]:
             """The out-of-SSA copies owed on one CFG edge."""
@@ -3076,6 +3076,23 @@ def emit_ssa_module_to_c(
             target = function.blocks.get(target_block)
             if target is None:
                 return assignments
+            # The Phis of one block read their operands simultaneously. An
+            # incoming operand that is itself a Phi of this block, assigned on
+            # this same edge, must be read before any assignment: for
+            # ``i = -5; for i in range(n): ... ; return i`` the exit carry's
+            # latch operand is the header's induction Phi, and copying the
+            # induction first made the carry read the next induction (10
+            # instead of 9). Snapshot such operands into edge cells first.
+            assigned_here = {
+                int(instruction.res.id)
+                for instruction in target.instrs
+                if str(instruction.op) == "Phi" and instruction.res is not None
+                and source_block in {
+                    str(origin) for origin in
+                    instruction.attributes.get("incoming_blocks") or ()
+                }
+            }
+            snapshots: list[str] = []
             for instruction in target.instrs:
                 if str(instruction.op) != "Phi" or instruction.res is None:
                     continue
@@ -3086,6 +3103,22 @@ def emit_ssa_module_to_c(
                     if str(origin) == source_block and position < len(
                         instruction.args
                     ):
+                        source_id = int(instruction.args[position].id)
+                        if (source_id in assigned_here
+                                and source_id != int(instruction.res.id)):
+                            cell = f"phisnap{source_id}"
+                            if ("snap", source_id) not in phi_scalar_cells:
+                                local_tensor_declarations.append(
+                                    f"    {phi_declarations[source_id]} {cell};"
+                                )
+                                phi_scalar_cells.add(("snap", source_id))
+                            line = f"        {cell} = t{source_id};"
+                            if line not in snapshots:
+                                snapshots.append(line)
+                            assignments.append(
+                                f"        t{instruction.res.id} = {cell};"
+                            )
+                            continue
                         if int(instruction.res.id) in span_phi_ids:
                             source = instruction.args[position]
                             address = (operand(source) if _pointer_value_depth(source) > 0
@@ -3126,7 +3159,7 @@ def emit_ssa_module_to_c(
                             assignments.append(
                                 f"        t{instruction.res.id} = {value};"
                             )
-            return assignments
+            return snapshots + assignments
 
         def phi_edge_values(source_block: str, target_block: str) -> tuple:
             """The (Phi result, incoming value) pairs one CFG edge copies,

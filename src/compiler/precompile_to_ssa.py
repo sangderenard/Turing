@@ -17802,6 +17802,12 @@ class _ControlSSABuilder(TiledObject):
         }
         for entry, (updated_id, _initial_id, _initial, updated, _current) in enumerate(carried):
             if int(carried_updates[entry].id) not in produced_results:
+                if int(carried_updates[entry].id) == int(induction.id):
+                    # The loop target carried past the loop (``for i in
+                    # range(10): ... break`` then ``return i``): its value
+                    # this iteration IS the induction, produced by the
+                    # header for every iteration.
+                    continue
                 if updated.accounting.get(
                     "loop_carried_preexisting_update"
                 ):

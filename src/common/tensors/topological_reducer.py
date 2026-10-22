@@ -14563,9 +14563,15 @@ def _normalize_lexical_values(
                         # creates a Phi whose backedge can never have a body
                         # producer (for example pad_cat_'s inner ``i, size``
                         # enumerate target leaking into the outer ``arr``
-                        # loop).
+                        # loop).  This loop's OWN target is not a
+                        # descendant's: ``j = -5; for i in range(10): j = i;
+                        # if i * i > n: break`` then ``return j`` (scratch
+                        # c125) dropped ``j`` and returned -5 on exhaustion.
                         and not (
-                            environment[name] in graph.G
+                            environment[name] not in set(
+                                loop_target_bindings.values()
+                            )
+                            and environment[name] in graph.G
                             and (
                                 graph.G.nodes[environment[name]].get(
                                     "attributes"
@@ -14574,6 +14580,28 @@ def _normalize_lexical_values(
                         )
                     )
                 }
+                # Program: ``i = -5; for i in range(10): if i * i > n:
+                # break`` then ``return i`` (scratch c124).  Wrong record: the
+                # loop's own target was excluded from the carried bindings, so
+                # a post-loop read resolved to the pre-loop -5 (also at the
+                # session base).  Rule: after a ``for`` loop its target holds
+                # the element of the last iteration that ran -- the break
+                # site's on a break, the final one on exhaustion, the
+                # pre-loop value on zero trips.  A target read after the loop
+                # with a pre-loop value is therefore carried: (pre-loop value,
+                # this iteration's element).
+                for name, target_value in dict(loop_target_bindings).items():
+                    if (
+                        name in live_after_loop
+                        and name in before_loop
+                        and isinstance(target_value, int)
+                        and not isinstance(target_value, bool)
+                        and int(before_loop[name]) != int(target_value)
+                        and int(target_value) in graph.G
+                    ):
+                        loop_carried_bindings[name] = (
+                            int(before_loop[name]), int(target_value),
+                        )
                 # A terminal ``continue`` arm does not reach the conditional's
                 # ordinary fallthrough environment, by design.  Its bindings
                 # nevertheless reach the loop latch and are therefore genuine
@@ -14645,7 +14673,10 @@ def _normalize_lexical_values(
                     is_break = site["action"] == "break"
                     site_values: dict[tuple[int, int], int] = {}
                     for name, value in site["bindings"].items():
-                        if name in loop_target_bindings:
+                        if (
+                            name in loop_target_bindings
+                            and name not in loop_carried_bindings
+                        ):
                             continue
                         initial = before_loop.get(name)
                         if (
@@ -14741,10 +14772,17 @@ def _normalize_lexical_values(
                 loop_attributes["loop_target_bindings"] = (
                     loop_target_bindings
                 )
+                # A target's pre-loop value is dead setup (the planner's
+                # ``loop_target_initializer`` rule) only while the loop
+                # overwrites it unread.  A target carried past the loop reads
+                # it as the zero-trip value: scratch c124 ``i = -5`` was
+                # classified dispatch metadata, never lowered, and the header
+                # Phi's entry operand became a minted root formal (value 3).
                 loop_attributes["loop_target_initials"] = {
                     name: before_loop[name]
                     for name in loop_target_bindings
                     if name in before_loop
+                    and name not in loop_carried_bindings
                 }
                 # This pass resolves source/value identities only.  It records
                 # the body value selected by the lexical continuation, but it

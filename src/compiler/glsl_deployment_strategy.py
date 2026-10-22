@@ -23894,6 +23894,50 @@ def _fold_callsite_structural_values(
     #: ``source_control_specialization_concordance``); the round record
     #: derives from them.
     round_cells: list = []
+    # Program: ``broke = False; while i < 8: if ...: broke = True; break``
+    # then ``if not broke: found = 100`` (scratch c122).  Wrong record: the
+    # reducer leaves a post-loop read of a break-only (or carried) binding on
+    # the loop's continuation value -- the break-site ``True`` -- until loop
+    # port materialization rewires it to a LoopResult; this fold ran first,
+    # read ``not True``, and erased the guard, so the zero-break exit kept
+    # ``found = -1``.  Rule: after a loop, a name is the loop's EXIT merge,
+    # not the body value; a read of a loop's continuation or carried update
+    # from outside the loop's source span is unresolved here.
+    loop_exit_values: list[tuple[frozenset[int], int, int]] = []
+    for _loop_id, loop_data in graph.G.nodes(data=True):
+        loop_expression = loop_data.get("expr_obj")
+        if not isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While)):
+            continue
+        loop_attributes = loop_data.get("attributes") or {}
+        exit_values = {
+            int(value)
+            for _name, (_initial, value) in dict(
+                loop_attributes.get("loop_break_bindings") or {}
+            ).items()
+        } | {
+            int(updated)
+            for _name, (initial, updated) in dict(
+                loop_attributes.get("loop_carried_bindings") or {}
+            ).items()
+            if int(updated) != int(initial)
+        }
+        if exit_values:
+            loop_exit_values.append((
+                frozenset(exit_values),
+                int(loop_expression.lineno),
+                int(getattr(loop_expression, "end_lineno", loop_expression.lineno)),
+            ))
+
+    def reads_loop_exit(data: Mapping[str, Any]) -> bool:
+        line = getattr(data.get("expr_obj"), "lineno", None)
+        if line is None or not loop_exit_values:
+            return False
+        parents = {int(parent) for parent, _role in data.get("parents") or ()}
+        return any(
+            parents & values and not (start <= int(line) <= end)
+            for values, start, end in loop_exit_values
+        )
+
     changed = True
     while changed:
         # A projection alias can rewrite topology and restart this sweep.
@@ -24654,6 +24698,8 @@ def _fold_callsite_structural_values(
                     data["attributes"] = attributes
             if str(data.get("type")) in {"Constant", "Const", "const"}:
                 value = constant(data)
+            elif reads_loop_exit(data):
+                value = unresolved
             else:
                 value = evaluate(node_id, data)
             if value is unresolved:

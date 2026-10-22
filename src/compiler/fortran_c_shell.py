@@ -83,6 +83,7 @@ from .declared_piece_signature import (
 )
 from .ast_control_normalization import (
     _normalize_binary_short_circuit as _normalize_binary_short_circuit,
+    _normalize_loop_else as _normalize_loop_else,
     _normalize_direct_tail_recursion as _normalize_direct_tail_recursion,
     _normalize_none_default_assignments as _normalize_none_default_assignments,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
@@ -57059,6 +57060,12 @@ def _lower_ast_source_to_ssa_impl(
 
     compile_substage("source normalisation: authored control and record schemas")
     short_circuit_receipts = list(_normalize_binary_short_circuit(tree))
+    loop_else_receipts = list(_normalize_loop_else(tree))
+    if loop_else_receipts:
+        report(
+            "ssa-source: normalized "
+            f"{len(loop_else_receipts)} loop else arm(s)"
+        )
     if short_circuit_receipts:
         report(
             "ssa-source: normalized "
@@ -57455,6 +57462,7 @@ def _lower_ast_source_to_ssa_impl(
         short_circuit_receipts.extend(
             _normalize_binary_short_circuit(discovered_tree)
         )
+        loop_else_receipts.extend(_normalize_loop_else(discovered_tree))
 
     compile_stage("source-closure")
     report("ssa-source: building complete ProcessGraph source closure")

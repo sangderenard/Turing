@@ -558,3 +558,148 @@ def _normalize_binary_short_circuit(
 
     Rewriter().visit(tree)
     return tuple(receipts)
+
+
+def _normalize_loop_else(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """Lower a loop's ``else`` arm to the conditional Python defines it as.
+
+    Program: ``for i in range(10): if i * i > n: break`` with ``else: return
+    -1`` then ``return i`` (scratch c106).  Wrong record: Control IR has no
+    loop ``else``; the arm was laid after the loop unconditionally, so every
+    exit -- the ``break`` included -- returned -1 (also at the session base,
+    with a clean audit).  Rule: ``for/while ... else E`` runs E exactly when
+    no ``break`` of THAT loop ran.  Each such ``break`` first sets a private
+    flag, and E follows the loop under ``if not flag``.  Breaks of nested
+    loops and nested definitions are their own.  A loop with no break runs
+    E unconditionally.  The synthesized statements carry the source
+    positions of the ``break`` and of E, so lexical ownership reads real
+    extents.
+    """
+
+    receipts: list[dict[str, Any]] = []
+
+    def own_breaks(statements: list[ast.stmt]) -> list[ast.Break]:
+        found: list[ast.Break] = []
+
+        def walk(node: ast.AST) -> None:
+            if isinstance(node, ast.Break):
+                found.append(node)
+                return
+            if isinstance(node, (
+                ast.For, ast.AsyncFor, ast.While,
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                ast.ClassDef,
+            )):
+                return
+            for child in ast.iter_child_nodes(node):
+                walk(child)
+
+        for statement in statements:
+            walk(statement)
+        return found
+
+    def located(node: ast.AST, source: ast.AST, end: ast.AST | None = None):
+        end = end or source
+        node.lineno = source.lineno
+        node.col_offset = source.col_offset
+        node.end_lineno = getattr(end, "end_lineno", source.lineno)
+        node.end_col_offset = getattr(end, "end_col_offset", source.col_offset)
+        return ast.fix_missing_locations(node)
+
+    class Rewriter(ast.NodeTransformer):
+        def rewrite_block(self, statements: list[ast.stmt]) -> list[ast.stmt]:
+            rewritten: list[ast.stmt] = []
+            for statement in statements:
+                statement = self.visit(statement)
+                if (
+                    isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
+                    and statement.orelse
+                ):
+                    rewritten.extend(self.lower(statement))
+                else:
+                    rewritten.append(statement)
+            return rewritten
+
+        def lower(self, loop: ast.stmt) -> list[ast.stmt]:
+            orelse = list(loop.orelse)
+            loop.orelse = []
+            # The loop's extent no longer includes the arm: the arm runs
+            # after the loop, and readers of the loop's exit values there
+            # are post-loop reads.
+            loop.end_lineno = getattr(loop.body[-1], "end_lineno", loop.end_lineno)
+            loop.end_col_offset = getattr(
+                loop.body[-1], "end_col_offset", loop.end_col_offset,
+            )
+            breaks = own_breaks(loop.body)
+            receipts.append({
+                "line": int(loop.lineno),
+                "column": int(loop.col_offset),
+                "breaks": len(breaks),
+            })
+            if not breaks:
+                return [loop, *orelse]
+            flag = f"__turing_loop_broke_{loop.lineno}_{loop.col_offset}"
+            first, last = orelse[0], orelse[-1]
+
+            class BreakFlag(ast.NodeTransformer):
+                def generic_visit(self, node):  # noqa: D401
+                    if isinstance(node, (
+                        ast.For, ast.AsyncFor, ast.While,
+                        ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                        ast.ClassDef,
+                    )) and node is not loop:
+                        return node
+                    for field, value in ast.iter_fields(node):
+                        if isinstance(value, list) and value and all(
+                            isinstance(item, ast.stmt) for item in value
+                        ):
+                            expanded: list[ast.stmt] = []
+                            for item in value:
+                                if isinstance(item, ast.Break) and any(
+                                    item is own for own in breaks
+                                ):
+                                    expanded.append(located(ast.Assign(
+                                        targets=[ast.Name(id=flag, ctx=ast.Store())],
+                                        value=ast.Constant(value=True),
+                                    ), item))
+                                    expanded.append(item)
+                                else:
+                                    expanded.append(self.visit(item))
+                            setattr(node, field, expanded)
+                        elif isinstance(value, ast.AST):
+                            self.visit(value)
+                    return node
+
+            BreakFlag().generic_visit(loop)
+            initial = located(ast.Assign(
+                targets=[ast.Name(id=flag, ctx=ast.Store())],
+                value=ast.Constant(value=False),
+            ), breaks[0])
+            guard = located(ast.If(
+                test=ast.UnaryOp(
+                    op=ast.Not(), operand=ast.Name(id=flag, ctx=ast.Load()),
+                ),
+                body=orelse,
+                orelse=[],
+            ), first, last)
+            return [initial, loop, guard]
+
+        def generic_visit(self, node):  # noqa: D401
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list) and value and all(
+                    isinstance(item, ast.stmt) for item in value
+                ):
+                    setattr(node, field, self.rewrite_block(value))
+                elif isinstance(value, list):
+                    setattr(node, field, [
+                        self.visit(item) if isinstance(item, ast.AST) else item
+                        for item in value
+                    ])
+                elif isinstance(value, ast.AST):
+                    setattr(node, field, self.visit(value))
+            return node
+
+    Rewriter().visit(tree)
+    return tuple(receipts)
