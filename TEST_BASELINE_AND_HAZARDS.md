@@ -1,3 +1,9 @@
+2026-10-22 LANE A, AUGMENTED SUBSCRIPT STORE CYCLE (MEASURED, cloud):
+`xs[0] += n` was refused with an effect-order cycle (loud on main; 3 of
+240 FUZZ_EXT=3 programs). A region's local Const no longer counts as a
+produced value. At 57052b8d: corpus 170/170 PASS; FUZZ_EXT=3 seeds 25/29
+60/60; gate same names as the parent.
+
 2026-10-22 LANE A, CALL ORDER SECOND STEP (MEASURED, cloud):
 `swap(xs)` after a list fill (`[1] * k`) or after a loop that appends ran
 after the reads of `xs` (silent on main). Fills and loops now join the

@@ -202,3 +202,17 @@ seeds 23 and 24 60/60, and seed 25 59 PASS with 1 LOUD (p25_25, an
 effect-order cycle around an augmented store, `xs1[0] += n`, which fails the
 same way on `main`). Gate aa 89 / ab 7 / ac 26 / rec 20, same names as the
 parent.
+
+## An augmented subscript store's order cycle (`57052b8d`, loud on main)
+
+`xs1 = [4, n]; xs1[0] += n; return xs1[0]` was refused with "control effect
+order conflicts with value dependencies". It was 3 of 240 `FUZZ_EXT=3`
+programs (p25_25, p26_45, p28_53). The store's region spelled index `0` as a
+local `Const` that carries the graph id the row load of `xs1[0]` also reads.
+The region signature counted that local as produced, so the load depended on
+the store that consumes its sum. **Rule:** a region's `Const` is its own
+spelling of a literal, not a value it produces for anyone else
+(`region_dependency_signatures` in `precompile_to_ssa`). Corpus c273.
+Measured at `57052b8d`: corpus 170/170 PASS, 0 findings; fuzz `FUZZ_EXT=3`
+seeds 25 and 29 60/60 each (seed 25 held p25_25); gate aa 89 / ab 7 /
+ac 26 / rec 20, same names as the parent.
