@@ -19818,6 +19818,32 @@ class _ControlSSABuilder(TiledObject):
                 # arm assignments rather than a temporal fallthrough. Prefer
                 # the value materialized by control lowering; only use an
                 # owned literal if no arm/join value exists.
+                #
+                # Program: ``if flag > 0: fork = (row + 1, row * 2) else:
+                # fork = None; return fork`` (also the bootstrap's
+                # single-exit rewrite of ``if c: return (a, b)`` /
+                # ``return None``).  Wrong record: neither the join (history
+                # 11) nor the tuple arm (9) had a value, so the owned
+                # ``None`` literal (10) became the output and the tuple arm
+                # vanished from ``Ret``.  Rule: an arm stands for the output only when the
+                # join resolves to it; a missing join is refused by name.
+                def resolves(value_id: int) -> bool:
+                    return (
+                        existing_value(value_id) is not None
+                        or owned_literal(value_id) is not None
+                    )
+
+                if (
+                    len(history) > 1
+                    and not resolves(history[-1])
+                    and any(map(resolves, history[:-1]))
+                ):
+                    raise ValueError(
+                        f"returned name {name!r}: the join of its "
+                        f"conditional arms (value {int(history[-1])}) was "
+                        "not materialized; returning one arm would drop "
+                        "the others"
+                    )
                 value = next((
                     resolved
                     for value_id in reversed(history)
