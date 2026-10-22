@@ -32,6 +32,8 @@ SNIPPETS = [
     (["d{v} = {{}}", "for i{v} in range(n % 4 + 1):", "    d{v}[i{v} % 2] = i{v}"], "len(d{v}) * 10 + d{v}[0]"),
     (["s{v} = set()", "for i{v} in range(n % 5 + 2):", "    s{v}.add(i{v} % 3)"], "len(s{v}) * 10 + (1 if 2 in s{v} else 0)"),
     (["t{v} = (n, {a}, {b})", "q{v}, r{v}, w{v} = t{v}"], "q{v} + r{v} * w{v}"),
+    (["t{v} = (n + {a}, n * {b}, {c})"], "len(t{v}) * 100 + t{v}[1]"),
+    (["t{v} = (n > {a}, n < {b})", "c{v} = 0", "for x{v} in t{v}:", "    if x{v}:", "        c{v} += 1"], "c{v} * 10 + len(t{v})"),
     # control
     (["c{v} = 0", "for i{v} in range(n % 7 + 1):", "    if i{v} % 3 == 0:", "        continue", "    c{v} += i{v}"], "c{v}"),
     (["c{v} = -1", "for i{v} in range(10):", "    if i{v} * {a} > n + 5:", "        c{v} = i{v}", "        break"], "c{v}"),

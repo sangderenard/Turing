@@ -1515,6 +1515,7 @@ class CorrelationTable:
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
+        found.extend(self._unborn_display_findings(module))
         found.extend(self._live_structure_findings(module))
         found.extend(self._ssa_publication_findings(module))
         found.extend(self._value_type_abi_findings(module))
@@ -3604,6 +3605,72 @@ class CorrelationTable:
                     "source-aggregate-layout-disagreement", str(scope),
                     None if value_id is None else int(value_id), problem,
                 ))
+        return found
+
+    @staticmethod
+    def _unborn_display_findings(module: Any) -> list[Finding]:
+        """Report a display whose resident length is read but never written.
+
+        Program: ``t = (n + 1, n + 2, n * 3); len(t)`` (c218).  The
+        SOURCE_AGGREGATE_LAYOUT row said three members; the module read the
+        tuple's length cell, and no instruction anywhere cleared or wrote
+        that sequence, so ``len(t)`` read the frame's zeroed cell and
+        returned 0 with a clean audit.  The two records are the layout's
+        member count and the module's writers of that sequence identity.
+        """
+
+        from .concordance_declarations import (
+            SOURCE_AGGREGATE_LAYOUT,
+            SourceAggregateLayout,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                SOURCE_AGGREGATE_LAYOUT.name
+            )
+        )
+        if page is None:
+            return []
+        layouts: dict[int, SourceAggregateLayout] = {}
+        for row in page.rows():
+            if not (isinstance(row, tuple) and len(row) == 2):
+                continue
+            history = page.history(row)
+            fact = history[-1][1] if history else None
+            if isinstance(fact, SourceAggregateLayout) and fact.members:
+                layouts[int(row[1])] = fact
+        if not layouts:
+            return []
+        written: set[int] = set()
+        reads: list[tuple[str, int]] = []
+        for name, function in module.functions.items():
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    attributes = getattr(instruction, "attributes", {}) or {}
+                    sequence_id = attributes.get("sequence_id")
+                    if sequence_id is not None:
+                        written.add(int(sequence_id))
+                    if (instruction.op == "Load"
+                            and attributes.get("binding") == "ssa_sequence_length"
+                            and attributes.get("sequence_value_id") is not None):
+                        reads.append(
+                            (str(name), int(attributes["sequence_value_id"]))
+                        )
+        found = []
+        for name, sequence_id in dict.fromkeys(reads):
+            layout = layouts.get(sequence_id)
+            if layout is None or sequence_id in written:
+                continue
+            found.append(Finding(
+                "display-length-unborn", name, sequence_id,
+                f"{layout.aggregate_kind} display has {len(layout.members)} "
+                "member(s) in its source layout, but no instruction writes "
+                "its resident sequence before its length is read",
+            ))
         return found
 
     @staticmethod

@@ -1770,6 +1770,18 @@ def _static_sequence_capacity_survey(
             unknown.add(parent)
             escaped.add(parent)
     bounds.update({key: count for key, count in local_lists.items() if key not in unknown})
+    # Program: ``t = (n + 1, n + 2, n * 3); len(t)`` (c218).  Wrong record:
+    # a tuple display had resident storage but no birth and no bound, so
+    # ``len(t)`` read the frame's zeroed length cell (0 for 3; clean audit).
+    # Rule: a tuple display is born like a list display, and nothing grows
+    # a tuple, so its member count bounds it even when it escapes.
+    for node_id, data in graph_obj.nodes(data=True):
+        expression = data.get("expr_obj")
+        if (isinstance(expression, ast.Tuple)
+                and isinstance(expression.ctx, ast.Load)
+                and not any(isinstance(element, ast.Starred)
+                            for element in expression.elts)):
+            bounds.setdefault(int(node_id), len(expression.elts))
     if control is not None:
         bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
             control, local_lists,
@@ -2359,7 +2371,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         layout_members = (
             tuple(int(member.value_id) for member in layout.members)
             if isinstance(layout, SourceAggregateLayout)
-            and str(layout.aggregate_kind) in {"list", "set", "frozenset"}
+            and str(layout.aggregate_kind) in {"list", "tuple", "set", "frozenset"}
             else ()
         )
         # Program: ``xs = [5, 7, 11]; return xs[n]`` (c36_literal_index_param).
@@ -2369,7 +2381,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         # length and every ``xs[n]`` read 0.  Rule: the list birth is the
         # SOURCE_AGGREGATE_LAYOUT record's ordered members; the AST, when it
         # survives, only refines a member's spelling.
-        if isinstance(expression, (ast.List, ast.Set)):
+        if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
             if not expression.elts:
                 continue
             elements = tuple(expression.elts)
