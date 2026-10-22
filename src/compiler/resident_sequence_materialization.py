@@ -1708,8 +1708,25 @@ def _static_sequence_capacity_survey(
         source = int(mutation.argument_value_ids[0])
         if source in bounds:
             bounds[int(mutation.sequence_value_id)] = bounds[source]
+    # Program: ``d = {}; for i in range(n % 4 + 1): d[i % 2] = i`` (fuzzer
+    # p1_27).  Wrong record: a local dict whose key universe the survey
+    # cannot bound was neither bounded nor unbounded, so C refused it as a
+    # private sequence with no capacity contract.  Rule: a dict born here
+    # (a display) with no proven key universe that never escapes is the
+    # function's own storage and takes the dynamic contract, as a list does.
+    local_dicts = {
+        int(node_id) for node_id, data in graph_obj.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Dict)
+    }
+    escaped_dicts = {
+        parent for parent in _call_escaped_argument_ids(graph_obj)
+        if parent in local_dicts
+    }
     unbounded = frozenset(
         key for key in local_lists if key not in bounds and key not in escaped
+    ) | frozenset(
+        key for key in local_dicts
+        if key not in bounds and key not in escaped_dicts
     )
     return bounds, unbounded
 

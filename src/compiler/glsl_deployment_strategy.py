@@ -1836,6 +1836,24 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
         )
 
     records = G.graph.get("source_sequence_mutation_records") or {}
+    # Program: ``xs = collect(n); return sum(xs)`` (corpus c152).  Wrong
+    # record: the call result's element type was unread, so ``sum`` fell to
+    # the float64 domain default though the linked callee's return contract
+    # (``linked_value_abi``) states int64 rows.  Rule: a linked value's
+    # posted ABI contract is evidence -- a rank-1 span's dtype types its
+    # elements, a rank-0 scalar's types the value.
+    for value_id, contract in dict(
+        G.graph.get("linked_value_abi") or {}
+    ).items():
+        dtype = str((contract or {}).get("dtype") or "")
+        if dtype not in {"int64", "float64", "bool"}:
+            continue
+        rank = int((contract or {}).get("rank") or 0)
+        storage = str((contract or {}).get("storage") or "")
+        if rank == 1 and storage in {"span", "sequence"}:
+            element.setdefault(int(value_id), dtype)
+        elif rank == 0 and storage in {"scalar", ""}:
+            scalar.setdefault(int(value_id), dtype)
     for _round in range(64):
         changed = False
 
@@ -1853,17 +1871,30 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
             attributes = data.get("attributes") or {}
             expression = data.get("expr_obj")
             if op in {"const", "constant"}:
-                settle(scalar, node_id, literal_dtype(attributes.get(
+                literal = attributes.get(
                     "value",
                     getattr(expression, "value", None)
                     if isinstance(expression, ast.Constant) else None,
-                )))
+                )
+                settle(scalar, node_id, literal_dtype(literal))
+                # Program: ``for x in [1, 5, 9]: ... r += x`` (corpus c156).
+                # Wrong record: the folded display is a constant whose
+                # element type nobody read, so ``x`` had no proven class and
+                # the result fell to the float64 domain default.  Rule: a
+                # constant collection's element type is the join of its
+                # literal members.
+                if isinstance(literal, (list, tuple, set, frozenset)) and literal:
+                    settle(element, node_id, join([
+                        literal_dtype(member) for member in literal
+                    ]))
                 continue
             if op == "input":
                 kind = attributes.get("binding_kind")
                 if kind == "parameter":
+                    # ``builtins.int`` and ``int`` are one class reference.
                     settle(scalar, node_id, classes.get(
                         str(attributes.get("result_class_ref") or "")
+                        .removeprefix("builtins.")
                     ))
                 continue
             if op == "for":
@@ -1956,7 +1987,10 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
             if op in {"max", "min", "pop", "sum"} or reference in {
                 "max", "min", "sum",
             }:
-                sources = parents(data, "arg:", "operand")
+                # ``xs.pop(i)`` reads its receiver (the operand); the index
+                # argument is not a second source (corpus c145: ``pop(0)``
+                # left ``first`` untyped and the result float64).
+                sources = parents(data, "operand") or parents(data, "arg:")
                 if len(sources) == 1 and sources[0] in element:
                     held = element[sources[0]]
                     settle(scalar, node_id, (

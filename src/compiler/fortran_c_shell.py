@@ -12482,16 +12482,9 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
     def node_position(candidate: int) -> tuple[int, int, int]:
         return _authored_node_position(graph.G, int(candidate))
 
-    region_positions = {
-        int(index): min(
-            (
-                node_position(int(member))
-                for member in subgraph.G.graph.get("deployment_nodes", ())
-            ),
-            default=(1 << 30, 0, int(index)),
-        )
-        for index, subgraph in enumerate(dispatch_subgraphs)
-    }
+    region_positions = _dispatch_region_completion_positions(
+        graph.G, dispatch_subgraphs,
+    )
 
     def block_position(block) -> tuple[int, int, int]:
         if isinstance(block, ScalarFieldWriteBlock):
@@ -12749,16 +12742,14 @@ def _place_plan_callsites_lexically(
     def node_position(node_id: int) -> tuple[int, int, int]:
         return _authored_node_position(graph.G, int(node_id))
 
-    region_positions = {
-        int(index): min(
-            (
-                node_position(int(node_id))
-                for node_id in subgraph.G.graph.get("deployment_nodes", ())
-            ),
-            default=(1 << 30, 0, int(index)),
-        )
-        for index, subgraph in enumerate(dispatch_subgraphs)
-    }
+    # One placement rule for an atomic region: where its last authored
+    # member completes (``_dispatch_region_completion_positions``).
+    # Taking the first member here placed ``c = abs(n - 3)`` fused with
+    # the later ``xs[0]`` read before ``xs.reverse()`` (fuzzer p1_26:
+    # effect-order cycle).
+    region_positions = _dispatch_region_completion_positions(
+        graph.G, dispatch_subgraphs,
+    )
 
     def block_position(block) -> tuple[int, int, int]:
         if isinstance(block, SequenceMutationBlock):
@@ -13369,16 +13360,14 @@ def _install_lexical_sequence_mutations(
     def node_position(node_id: int) -> tuple[int, int, int]:
         return _authored_node_position(graph.G, int(node_id))
 
-    region_positions = {
-        int(index): min(
-            (
-                node_position(int(node_id))
-                for node_id in subgraph.G.graph.get("deployment_nodes", ())
-            ),
-            default=(1 << 30, 0, int(index)),
-        )
-        for index, subgraph in enumerate(dispatch_subgraphs)
-    }
+    # One placement rule for an atomic region: where its last authored
+    # member completes (``_dispatch_region_completion_positions``).
+    # Taking the first member here placed ``c = abs(n - 3)`` fused with
+    # the later ``xs[0]`` read before ``xs.reverse()`` (fuzzer p1_26:
+    # effect-order cycle).
+    region_positions = _dispatch_region_completion_positions(
+        graph.G, dispatch_subgraphs,
+    )
 
     def block_position(block) -> tuple[int, int, int]:
         if isinstance(block, ScalarFieldWriteBlock):
@@ -13915,15 +13904,14 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             node_source_order.get(int(node_id), int(node_id)),
         )
 
-    region_positions = {
-        int(index): min(
-            (node_position(node_id) for node_id in subgraph.G.graph.get(
-                "deployment_nodes", ()
-            )),
-            default=(1 << 30, 0, int(index)),
-        )
-        for index, subgraph in enumerate(dispatch_subgraphs)
-    }
+    # One placement rule for an atomic region: where its last authored
+    # member completes (``_dispatch_region_completion_positions``).
+    # Taking the first member here placed ``c = abs(n - 3)`` fused with
+    # the later ``xs[0]`` read before ``xs.reverse()`` (fuzzer p1_26:
+    # effect-order cycle).
+    region_positions = _dispatch_region_completion_positions(
+        graph.G, dispatch_subgraphs,
+    )
 
     def block_position(block):
         if isinstance(block, ResourceScopeBlock):
@@ -26619,6 +26607,10 @@ def _class_surface_ssa_program(
                             in {"aggregate", "sequence_materialization"}
                             or graph_obj.nodes[sequence_id].get("type")
                             == "LoopResult"
+                            or isinstance(
+                                graph_obj.nodes[sequence_id].get("expr_obj"),
+                                (ast.ListComp, ast.SetComp, ast.GeneratorExp),
+                            )
                         )
                         and (
                             graph_obj.nodes[sequence_id].get("attributes")
