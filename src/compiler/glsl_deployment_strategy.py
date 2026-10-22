@@ -10758,6 +10758,48 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         for mutation in _dict_update_mutations(graph.G)
         if int(mutation.effect_node_id) in graph.G
     ]
+    # Program: ``xs0 = [2, n]; grow(xs0, n % 3 + 1); xs1 = [n, 4];
+    # push(xs1, 3)`` then ``return len(xs1) * 100 + xs1[-1]`` (fuzzer
+    # p18_11; corpus c219).  Wrong record: each effect was ordered only
+    # before the reads of its own receiver, but effects execute in source
+    # order, so ``push`` followed ``grow``; the reducer fused ``n % 3 + 1``
+    # (which ``grow`` reads) with the arithmetic over ``xs1`` into one
+    # region, which put ``grow``, then ``push``, after the reads of ``xs1``
+    # (``push`` was lost; silent).  The same held for a call with no
+    # effect: ``xs0 = pairlist(n + 4)`` before ``push(xs1, 9)`` (fuzzer
+    # p18_27).  Rule: calls are lowered in source order, so the effects and
+    # the source calls outside loops keep that order; each precedes the
+    # next.  A call completes where it ends, so an inner call precedes the
+    # call that receives its result.
+    sequenced = [
+        (int(effect_id), record.get("expression"))
+        for effect_id, record in effects
+    ] + [
+        (int(node_id), data.get("expr_obj"))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and (data.get("attributes") or {}).get("extraction_action") != "intrinsic"
+    ]
+    ordered_effects = sorted({
+        (
+            (
+                int(expression.end_lineno),
+                int(getattr(expression, "end_col_offset", 0) or 0),
+            ),
+            int(effect_id),
+        )
+        for effect_id, expression in sequenced
+        if int(effect_id) in graph.G
+        and getattr(expression, "end_lineno", None) is not None
+        and not any(
+            start <= int(expression.lineno) <= end for start, end in loops
+        )
+    })
+    for (_first_position, first), (_second_position, second) in zip(
+        ordered_effects, ordered_effects[1:],
+    ):
+        if first != second:
+            edges.add((first, second))
     for effect_id, record in effects:
         expression = record.get("expression")
         end_line = getattr(expression, "end_lineno", None)
