@@ -1947,6 +1947,39 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                                 settle(scalar, int(target_id), held)
                 del targets, stop
                 continue
+            # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
+            # p7_2).  Wrong record: a comprehension's target and its
+            # collection had no proven type, so the collection's rows fell
+            # to the float64 default and ``sum`` refused them.  Rule: a
+            # comprehension target is an element of its iterable (a range
+            # gives int64), as a ``for`` target is; the collection a
+            # comprehension loop composes (its LoopResult) holds the type of
+            # the value it appends.
+            if isinstance(expression, ast.comprehension):
+                iterable = parents(data, "iter")
+                held = (
+                    "int64"
+                    if isinstance(expression.iter, ast.Call)
+                    and isinstance(expression.iter.func, ast.Name)
+                    and expression.iter.func.id == "range"
+                    else element.get(iterable[0]) if iterable else None
+                )
+                if isinstance(expression.target, ast.Name):
+                    for target_id, target in G.nodes(data=True):
+                        if (
+                            operation(target) == "input"
+                            and (target.get("attributes") or {}).get(
+                                "binding_name"
+                            ) == expression.target.id
+                            and (target.get("attributes") or {}).get(
+                                "binding_kind"
+                            ) == "loop"
+                        ):
+                            settle(scalar, int(target_id), held)
+                continue
+            if op == "loopresult" and len(parents(data, "value")) == 1:
+                settle(element, node_id, scalar.get(parents(data, "value")[0]))
+                continue
             if is_collection(node_id) and not op.startswith("indexed"):
                 members = (
                     parents(data, "values") if isinstance(expression, ast.Dict)
