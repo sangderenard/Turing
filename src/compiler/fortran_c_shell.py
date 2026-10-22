@@ -3254,10 +3254,36 @@ def _lease_source(formal: Any) -> Any:
     conflicting-storage-claims).
     """
 
-    return replace(formal, accounting={
-        key: value for key, value in dict(formal.accounting or {}).items()
-        if not str(key).startswith("program_abi_")
-    })
+    # Program: ``def g(x: Any): return len(f"v={int(x)}")`` called from
+    # ``root`` (g's f-string arena is DYNAMIC frame storage).  Wrong record:
+    # the lease cloned g's heap cell formal raw -- element dtype int64 (g's
+    # canonical sweep makes it ptr later) and g's owner id 3978 in
+    # ``heap_owner_value_id`` -- so the caller passed an int64 slot naming a
+    # foreign owner, and the heap-context projection refused it.  Rule: a
+    # lease of a heap cell is a pointer cell; the callee's scope-local ids
+    # and heap labels stay in the callee, and
+    # ``project_native_heap_call_contexts`` publishes the caller's through
+    # the call's exact bindings.
+    from .identity_concordance import CorrelationTable
+
+    accounting = dict(formal.accounting or {})
+    heap_cell = bool(
+        accounting.get("heap_owner")
+        or accounting.get("heap_owner_value_id") is not None
+    )
+    dropped = {
+        *CorrelationTable._SCOPE_LOCAL_ACCOUNTING_IDS,
+        "heap_owner", "heap_element_dtype",
+    }
+    return replace(
+        formal,
+        dtype="ptr" if heap_cell else formal.dtype,
+        accounting={
+            key: value for key, value in accounting.items()
+            if not str(key).startswith("program_abi_")
+            and key not in dropped
+        },
+    )
 
 
 def _link_frame_lease(
@@ -41094,6 +41120,14 @@ def _class_surface_ssa_program(
                     if field is not None and field.dtype is not None
                     else source_structure.dtype
                 )
+                # A heap cell's storage is a pointer cell; its element type
+                # is the cell's ``heap_element_dtype`` (``_lease_source``).
+                if _lease_source(source).dtype == "ptr" and (
+                    (source.accounting or {}).get("heap_owner")
+                    or (source.accounting or {}).get("heap_owner_value_id")
+                    is not None
+                ):
+                    storage_dtype = "ptr"
                 invocation_local = recursive_frame_lease(
                     caller_graph, planned_call.callsite_id, source, callee_function,
                 )
