@@ -10778,7 +10778,9 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         (int(node_id), data.get("expr_obj"))
         for node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("expr_obj"), ast.Call)
-        and (data.get("attributes") or {}).get("extraction_action") != "intrinsic"
+        # A source call, lowered as a call; an intrinsic or a native math
+        # call is an operation inside a region (c22_math).
+        and (data.get("attributes") or {}).get("extraction_action") is None
     ]
     ordered_effects = sorted({
         (
