@@ -2270,6 +2270,45 @@ def _planned_scalar_dtypes_from(
                                 ):
                                     settle(scalar, int(target_id),
                                            element.get(argument))
+                # Program: ``for k, x in enumerate(xs): t += k * x`` (c351).
+                # Wrong record: as with ``zip``, the tuple target's names were
+                # never typed, so ``x`` fell to the float64 default; C
+                # multiplied large int rows through float64 (silently wrong)
+                # and LLVM refused the i64/double Phi.  Rule: over
+                # ``enumerate(a[, start])`` the first name is an int64 count
+                # and the second is an element of ``a``.
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and len(loop_expression.target.elts) == 2
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and (zipped.get("attributes") or {}).get(
+                        "extraction_identity") == "builtins.enumerate"
+                ):
+                    counted = [
+                        int(parent)
+                        for parent, role in zipped.get("parents") or ()
+                        if str(role) == "arg:0" and int(parent) in G
+                    ]
+                    if counted:
+                        held_types = (
+                            "int64", element.get(counted[0]),
+                        )
+                        for item, held in zip(
+                            loop_expression.target.elts, held_types,
+                        ):
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
@@ -2301,6 +2340,50 @@ def _planned_scalar_dtypes_from(
                             ) == "loop"
                         ):
                             settle(scalar, int(target_id), held)
+                # Program: ``[k * x for k, x in enumerate(xs)]`` and
+                # ``[p * q for p, q in zip(xs, ys)]``.  Wrong record: a tuple
+                # comprehension target has no single name, so its names fell
+                # to the float64 default and ``sum`` of the result refused
+                # float64 rows.  Rule: as for a ``for`` target, the i-th name
+                # over ``zip`` is an element of the i-th argument, and over
+                # ``enumerate(a)`` the names are an int64 count and an
+                # element of ``a``.
+                call = G.nodes.get(iterable[0], {}) if iterable else {}
+                identity = (call.get("attributes") or {}).get(
+                    "extraction_identity"
+                )
+                if (
+                    isinstance(expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in expression.target.elts)
+                    and identity in {"builtins.zip", "builtins.enumerate"}
+                ):
+                    arguments = sorted(
+                        (int(str(role).split(":", 1)[1]), int(parent))
+                        for parent, role in call.get("parents") or ()
+                        if str(role).startswith("arg:") and int(parent) in G
+                    )
+                    held_types = (
+                        [element.get(argument) for _, argument in arguments]
+                        if identity == "builtins.zip"
+                        else ["int64", element.get(arguments[0][1])]
+                        if arguments and arguments[0][0] == 0 else []
+                    )
+                    if len(held_types) == len(expression.target.elts):
+                        for item, held in zip(
+                            expression.target.elts, held_types,
+                        ):
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
                 continue
             if (
                 op == "loopresult" and len(parents(data, "value")) == 1
@@ -2339,6 +2422,19 @@ def _planned_scalar_dtypes_from(
                     element.get(receiver),
                     scalar.get(parents(data, "arg:1")[0]),
                 ]))
+                continue
+            # Program: ``xs = [n] * 3`` then ``sum(xs) * 10 + xs[1]``.
+            # Wrong record: a replication had no rule, so its rows fell to
+            # the float64 default and the int program returned a float.
+            # Rule: ``[x] * k`` holds the element class of its list operand.
+            if attributes.get("producer_kind") == "sequence_replication":
+                held = [
+                    element.get(operand)
+                    for operand in parents(data, "lhs", "rhs")
+                    if is_collection(operand)
+                ]
+                if len(held) == 1:
+                    settle(element, node_id, held[0])
                 continue
             if is_collection(node_id) and not op.startswith("indexed"):
                 # Program: ``for y in [x * n for x in xs]: t += y``.  Wrong
@@ -3798,6 +3894,19 @@ def _build_shell_hierarchy_plan(
                 ).casefold()
                 if operation in {"const", "constant"}:
                     literal = attributes.get("value", node.get("constant"))
+                    # A list/tuple literal is an array of its own extent; the
+                    # DomainNode pads it to (1, 1, 1), which squeezed to a
+                    # scalar (``sum([1, 1, 1])`` read one element).
+                    if (
+                        isinstance(literal, (list, tuple))
+                        and not tensor_shape_declared
+                        and literal
+                        and all(
+                            isinstance(item, (bool, int, float))
+                            for item in literal
+                        )
+                    ):
+                        logical = (len(literal),)
                     if isinstance(literal, bool):
                         dtype = "bool"
                     elif isinstance(literal, int):
@@ -3924,7 +4033,17 @@ def _build_shell_hierarchy_plan(
                         }
                         and int(parent) in _shape_dtype_cache
                     ), next((p for p in parents[:1]), None))
-                    if posted is not None and posted.get("dtype"):
+                    # Program: ``xs = [n] * 3; return sum(xs) * 10 + xs[1]``.
+                    # Wrong record: the posted descriptor of ``sum`` over a
+                    # source list carried the list's float64 domain default,
+                    # which overrode the int64 the source proves, and the
+                    # int program returned a float.  Rule: a class the
+                    # source proves (``_planned_scalar_dtypes``) stands; the
+                    # descriptor speaks only where the source proves none.
+                    proven = planned_scalar_dtypes().get(int(current))
+                    if proven is not None:
+                        dtype = str(proven)
+                    elif posted is not None and posted.get("dtype"):
                         dtype = str(posted["dtype"])
                     elif value_parent in _shape_dtype_cache:
                         dtype = _shape_dtype_cache[value_parent][1]
@@ -4066,6 +4185,21 @@ def _build_shell_hierarchy_plan(
         value_shapes = tuple(
             _value_shape_dtype(value_id)
             for value_id in (*region_nodes, *region_captures)
+        )
+        # Program: ``xs = [1, 1, 1]; return sum(xs) * 10 + n``.  Wrong
+        # record: the region's ``Const`` line for the list literal had no
+        # value record (it is neither a region node nor a capture), so it
+        # lowered as a scalar and ``sum`` read one element.  Rule: a
+        # materialised constant with a non-scalar extent carries its record.
+        value_shapes += tuple(
+            record
+            for record in (
+                _value_shape_dtype(value_id)
+                for value_id in sorted(materialised)
+                if int(value_id) not in produced
+                and int(value_id) not in captured
+            )
+            if record[1]
         )
         value_ranks = tuple(
             (
@@ -11289,6 +11423,50 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
                 # so a read before a loop keeps its consumer placement.
                 if not any(int(target) == node for *_rest, node, _loop in loop_nodes):
                     read_before_effect.add((int(reader), int(target)))
+    # Program: ``xs = [n, 3, 2]; xs[0], xs[2] = xs[2], xs[0]`` then
+    # ``return xs[0] * 100 + xs[2]``.  Wrong record: a tuple assignment's
+    # targets are authored before its values, so the store ``xs[0] = ..``
+    # started before the read ``xs[0]`` on the right and the rule above
+    # ordered nothing; the read was placed after the store and both cells
+    # held 2 (202 for 200 + n; clean audit).  Python evaluates the whole
+    # right side first, and the graph says so: the read's base is the
+    # version the store consumes.  Rule: outside loops and branches, a
+    # read of the version an indexed store consumes precedes that store.
+    for effect_id, record in stores:
+        if int(effect_id) not in graph.G or str(
+            graph.G.nodes[int(effect_id)].get("type")
+        ) != "IndexedStore":
+            continue
+        expression = record.get("expression")
+        line = getattr(expression, "lineno", None)
+        if line is None or any(
+            block_start <= int(line) <= block_end
+            for block_start, block_end, _node, _block in (*loop_nodes, *branch_nodes)
+        ):
+            continue
+        consumed = [
+            int(parent)
+            for parent, role in graph.G.nodes[int(effect_id)].get("parents") or ()
+            if str(role) == "base" and parent in graph.G
+        ]
+        for base in consumed:
+            for reader in graph.G.successors(base):
+                if (
+                    int(reader) == int(effect_id)
+                    or str(graph.G.nodes[reader].get("type")) == "IndexedStore"
+                    or nx.has_path(graph.G, int(effect_id), int(reader))
+                    or nx.has_path(graph.G, int(reader), int(effect_id))
+                    # An alias (``ys = xs; ys[1] = 9`` then ``xs[1]``, c143)
+                    # shares the consumed version with reads in later
+                    # statements; only a read in the store's own statement
+                    # is evaluated before it.
+                    or getattr(
+                        graph.G.nodes[reader].get("expr_obj"), "lineno", None
+                    ) != int(line)
+                ):
+                    continue
+                edges.add((int(reader), int(effect_id)))
+                read_before_effect.add((int(reader), int(effect_id)))
     edges = _source_order_edges_within_value_order(graph.G, edges)
     graph.G.graph["sequence_read_before_effect_edges"] = tuple(
         sorted(edge for edge in read_before_effect if edge in edges)
@@ -19484,6 +19662,9 @@ def _propagate_callsite_tensor_specializations(
         specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
             descriptors
         )
+        specialized.G.graph["planner_aggregate_descriptors"] = copy.deepcopy(
+            aggregate_descriptors
+        )
         _apply_callsite_tensor_descriptors(specialized, descriptors)
         _apply_callsite_aggregate_descriptors(
             specialized, aggregate_descriptors,
@@ -23606,8 +23787,15 @@ def _mutated_sequence_node_ids(
                 continue
             mutated_sequence_ids.add(base_id)
             base = graph_obj.nodes.get(base_id, {})
+            # Program: ``m = [[n, 3], [2, 5]]; m[1][0] = n`` then ``return
+            # m[0][1] * 10 + m[1][0]``.  Wrong record: the store's base is the
+            # projection ``m[1]``; only that projection was marked, so
+            # ``m[1][0]`` read again through ``m`` folded to the inner
+            # display's initializer leaf and the return folded to 32 (clean
+            # audit).  Rule: a store through a projection changes the
+            # collection projected from.
             if str(base.get("op") or base.get("type") or "").casefold() in {
-                "indexedstore", "index_set", "setitem",
+                "indexedstore", "index_set", "setitem", "indexed",
             }:
                 pending_bases.extend(int(parent) for parent, role in base.get("parents") or ()
                                      if str(role) == "base")
@@ -25048,6 +25236,18 @@ def _fold_callsite_structural_values(
             "attributes": attributes,
             "constant": copy.deepcopy(value), "expr_obj": None,
         })
+        # Program: ``return min([3, 1, 4]) + n``.  Wrong record: the fold
+        # kept the reduction's tensor shape (3,) on the scalar literal 1, so
+        # the region broadcast it into a 3-wide row and returned zeros.
+        # Rule: a folded literal's extent is the literal's own.
+        tensor = data.get("tensor")
+        if isinstance(tensor, Mapping) and "shape" in tensor:
+            if isinstance(value, (bool, int, float)):
+                data["tensor"] = {**tensor, "shape": ()}
+            elif isinstance(value, (list, tuple)) and all(
+                isinstance(item, (bool, int, float)) for item in value
+            ):
+                data["tensor"] = {**tensor, "shape": (len(value),)}
         # A proven literal belongs to the VALUE, not to the graph instance
         # that happened to fold it.  Several planned shells share one function
         # name, each with its own copy, so a fact folded in one is invisible
@@ -27688,6 +27888,11 @@ def _callsite_specialized_shell_type(
     )
     specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
         tensor_descriptors
+    )
+    # A member-bound aggregate formal is a different frame from the same
+    # formal bound whole as storage; the symbol digest reads this record.
+    specialized.G.graph["planner_aggregate_descriptors"] = copy.deepcopy(
+        aggregate_descriptors
     )
     if record_descriptors:
         parameter_records = copy.deepcopy(dict(

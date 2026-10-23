@@ -3517,3 +3517,37 @@ def test_sequential_loop_body_does_not_own_captured_predecessor_values():
         or (graph.G.nodes[node_id].get("source_span") or {}).get("line") == 7
         for node_id in second.loop.body_nodes
     )
+
+
+def test_enumerate_start_offsets_the_counter():
+    # Program: ``for k, x in enumerate(xs, 3)``.  The count was bound to the
+    # loop induction (which starts at 0) and ``start`` was dropped, so C and
+    # LLVM silently counted from 0.  The counter is the induction plus start.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = textwrap.dedent(
+        """
+        def root(n: int) -> int:
+            xs = [5, n, 6]
+            t = 0
+            for k, x in enumerate(xs, 3):
+                t += k * x
+            return t
+        """
+    )
+    root = pathlib.Path(__file__).resolve().parents[1]
+    module, _, _ = lower_ast_source_to_ssa(
+        source, "root", name="enumerate_start",
+        extraction_contract=str(
+            root / "extraction_contracts" / "program_extraction.yaml"
+        ),
+        progress=lambda _: None,
+    )
+    offsets = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "enumerate_start"
+    ]
+    assert [str(instruction.op) for instruction in offsets] == ["Add"]

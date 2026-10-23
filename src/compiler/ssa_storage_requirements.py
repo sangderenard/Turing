@@ -187,6 +187,14 @@ def module_storage_requirements(
                 shapes[function_name].setdefault(int(column_id), set()).add(
                     (max(1, int(count)), *tuple(row_shape))
                 )
+            # Program: ``d = {1: n, 2: 3}; del d[1]; len(d)``.  Wrong
+            # record: the live-flag arena (one flag per row) had no bound,
+            # so it was allocated one element and the second row's flag was
+            # written past it.  Rule: live flags are bounded like a column.
+            if descriptor.live_flags_value_id is not None:
+                shapes[function_name].setdefault(
+                    int(descriptor.live_flags_value_id), set()
+                ).add((max(1, int(count)),))
     for function_name, table in tensor_tables.items():
         function_name = str(function_name)
         if function_name not in functions:
@@ -242,6 +250,14 @@ def module_storage_requirements(
                     column_shapes = shapes[caller_name].setdefault(int(column_id), set())
                     if not bounds.issubset(column_shapes):
                         column_shapes.update(bounds)
+                        changed = True
+                if descriptor.live_flags_value_id is not None:
+                    bounds = {(outer,) for outer in outer_bounds}
+                    flag_shapes = shapes[caller_name].setdefault(
+                        int(descriptor.live_flags_value_id), set()
+                    )
+                    if not bounds.issubset(flag_shapes):
+                        flag_shapes.update(bounds)
                         changed = True
             for block in getattr(caller, "blocks", {}).values():
                 instructions = tuple(getattr(block, "instrs", ()))

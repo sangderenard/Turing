@@ -1,3 +1,17 @@
+2026-10-23 LANE E, E20 (MEASURED, cloud): `enumerate(xs, start)` counts from
+start (ControlProgram.induction_offsets; it was silently 0-based at main
+2806360d and refused since #805). At eeb508be on main 4a0f5452 (262
+programs): C 262/262, LLVM 262/262, Fortran 176 PASS. Gate names identical
+to main 4a0f5452. Fuzz seed 57: 0 WRONG / 0 TYPE.
+
+2026-10-23 LANE E, E18-E19 (MEASURED, cloud): `for k, x in enumerate(xs)` left
+x float64, so C rounded large ints silently at main (c351); now typed.
+`enumerate(xs, start)` silently dropped start in C and LLVM; it now refuses
+by name. A tuple comprehension target over enumerate/zip is typed (c352,
+c353; refused at main). At 09401a20 on main 230369c5 (258 programs): C
+258/258, LLVM 258/258, Fortran 173 PASS. Gate names identical to main
+230369c5. Fuzz seed 56: 0 WRONG / 0 TYPE.
+
 2026-10-23 LANE E, E15-E17 (MEASURED, cloud): Fortran emits a callee that
 returns an optional value (c308), states a populated list literal (c293,
 c309; C is silently wrong on c309 at main 2806360d, fixed earlier in this

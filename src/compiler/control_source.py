@@ -791,6 +791,10 @@ class ControlProgram(TiledObject):
     # dropping it.  Declared last: ControlProgram is built positionally in
     # places, so a new field must never shift the existing ones.
     anchor_region: int | None = None
+    # (counter target value id, start value id) for ``enumerate(a, start)``:
+    # the counter target is the loop induction plus ``start``.  Declared
+    # after ``anchor_region`` for the positional-build reason above.
+    induction_offsets: tuple[tuple[int, int], ...] = ()
 
 
 def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[int]:
@@ -808,6 +812,7 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
         control.collection_bindings,
         control.closure_iterable_bindings,
         control.projected_iterable_bindings,
+        control.induction_offsets,
     ):
         for binding in bindings:
             for value in binding:
@@ -3261,6 +3266,7 @@ def compose_region_code(
         specialized_conditional_node_ids=(
             program.specialized_conditional_node_ids
         ),
+        induction_offsets=program.induction_offsets,
     )
     # Step 9 (plan 100, 2.3): the composed tree is a revision of the planned
     # one; a caller that hands the graph gets the rows posted here.
@@ -3734,6 +3740,7 @@ def project_control_regions(
             if str(binding[2]) in active_inductions
         ),
         program.specialized_conditional_node_ids,
+        induction_offsets=program.induction_offsets,
     )
     # Step 9 (plan 100, 2.3): a collapsed construct's placement is withdrawn
     # by ``Unresolved(COLLAPSED_EMPTY_CONSTRUCT)`` from ``previous``.
@@ -3873,6 +3880,7 @@ def overlay_scheduled_control(
     collection_bindings = []
     closure_iterable_bindings = []
     projected_iterable_bindings = []
+    induction_offsets = []
     recursion_regions = []
     deployment_regions = []
     specialized_conditional_node_ids = []
@@ -4536,6 +4544,7 @@ def overlay_scheduled_control(
         projected_iterable_bindings.extend(
             control.projected_iterable_bindings
         )
+        induction_offsets.extend(control.induction_offsets)
         recursion_regions.extend(control.recursion_regions)
         deployment_base = len(deployment_regions)
         deployment_regions.extend(
@@ -4690,6 +4699,7 @@ def overlay_scheduled_control(
         projected_iterable_bindings=tuple(
             dict.fromkeys(projected_iterable_bindings)
         ),
+        induction_offsets=tuple(dict.fromkeys(induction_offsets)),
         specialized_conditional_node_ids=tuple(dict.fromkeys(
             int(node_id) for node_id in specialized_conditional_node_ids
         )),

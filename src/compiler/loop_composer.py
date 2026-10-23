@@ -1802,6 +1802,26 @@ def evaporate_unrolled_loops(
         live.update(
             int(call_id) for call_id, _receiver in _method_mutation_edges(graph.G)
         )
+        # Program: ``for y in [x * n for x in [6, 3]]: t += y`` beside ``m =
+        # [[n, 5], [5, 5]]; m[1][0] = n`` then ``t + m[1][0]`` (fuzzer
+        # p85_45).  Wrong record: a store through the projection ``m[1]``
+        # publishes a version nothing reads (the later read projects ``m``
+        # again), so this pruning deleted the store; the structural fold then
+        # read the inner display's initializer (5 for n; clean audit).  Rule:
+        # an indexed store outside the evaporated loops is an effect, so it is
+        # live.
+        evaporated_body_ids = {
+            int(node_id)
+            for plan in plans
+            if int(plan.loop.node_id) in handled_loop_ids
+            for node_id in plan.loop.body_nodes
+        }
+        live.update(
+            int(node_id)
+            for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("type")) == "IndexedStore"
+            and int(node_id) not in evaporated_body_ids
+        )
         # Dataflow ancestry alone is insufficient to retain source control:
         # loop nodes own their bodies semantically, and are not necessarily a
         # value predecessor of the function's return roots.  Evaporating an
@@ -5085,6 +5105,7 @@ def analyze_shader_loop_reductions(
                 )
             )
         enumerated_source_id = None
+        induction_offsets: tuple[tuple[int, int], ...] = ()
         iterable_extent_ids: tuple[int, ...] = ()
         if (
             loop.stop is None
@@ -5100,6 +5121,35 @@ def analyze_shader_loop_reductions(
                 "static_python_reference"
             )
             if reference == "enumerate":
+                # Program: ``for k, x in enumerate(xs, 3)``.  Wrong
+                # record: the count was bound to the loop induction, which
+                # starts at 0, and the ``start`` argument was dropped, so C
+                # and LLVM silently counted from 0.  Rule: the counter target
+                # is the induction plus ``start``, recorded as an induction
+                # offset (``ControlProgram.induction_offsets``).  Any other
+                # extra argument still refuses by name.
+                started = [
+                    (int(parent), str(role))
+                    for parent, role in iterable_data.get("parents", ())
+                    if str(role) not in {"arg", "args", "arg:0", "arg0", "callee"}
+                ]
+                if [role for _parent, role in started] in (
+                    ["arg:1"], ["kw:start"],
+                ) and len(
+                    loop.target_bindings
+                ) >= 2:
+                    start_node = started[0][0]
+                    induction_offsets = ((
+                        int(loop.target_bindings[0][1]),
+                        int(graph.G.nodes[start_node].get(
+                            "value_id", start_node,
+                        )),
+                    ),)
+                elif started:
+                    raise ValueError(
+                        "enumerate with a start argument has no loop "
+                        f"lowering; iterable={iterable_id}, roles={started!r}"
+                    )
                 source_id = next(
                     (
                         int(parent)
@@ -6818,6 +6868,7 @@ def analyze_shader_loop_reductions(
                     projected_iterable_bindings=(
                         projected_iterable_bindings
                     ),
+                    induction_offsets=induction_offsets,
                     specialized_conditional_node_ids=(
                         specialized_conditional_node_ids
                     ),

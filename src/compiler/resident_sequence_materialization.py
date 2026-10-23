@@ -2700,6 +2700,42 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         # like a display -- one lexical clear, then one append (``add``)
         # per materialized row, in iteration order -- as the unrolled dict
         # comprehension already is.
+        # Program: ``xs = [1, n] * 3`` then ``xs[3]`` (corpus c249, lanes
+        # plan C9); also ``[n] * 3``.  Wrong record: only a replication of
+        # one literal member has a birth (the ``fill`` initialization in
+        # ``fortran_c_shell``); any other row had none, so the product
+        # lowered as a numerical ``Mul`` of the row's handle and its reads
+        # went past it (silently; clean audit).  A birth by repeated member
+        # appends would give one member producer several control blocks,
+        # which the control book cannot own (as ``[n, n]`` is refused
+        # below).  Rule: refuse such a replication by name.
+        if attributes.get("producer_kind") == "sequence_replication":
+            operands = [
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) in {"lhs", "rhs"} and int(parent) in graph_obj
+            ]
+            row_ids = [
+                operand for operand in operands
+                if (graph_obj.nodes[operand].get("attributes") or {}).get(
+                    "aggregate_kind") in {"list", "tuple"}
+            ]
+            leaves = tuple(
+                int(leaf)
+                for row_id in row_ids
+                for leaf in (graph_obj.nodes[row_id].get("attributes")
+                             or {}).get("aggregate_leaf_value_ids", ())
+            )
+            # One member, literal or runtime, is born by the fill (``[n] *
+            # 3``, corpus c334/c335: the fill reads the member's value).
+            # Only a wider row has no birth.
+            if len(row_ids) != 1 or len(leaves) != 1 or len(
+                nodes_by_value.get(leaves[0], ())
+            ) != 1:
+                raise ValueError(
+                    f"list {sequence_id} replicates a row other than one "
+                    "member; a replication is lowered only as the fill of "
+                    "one member"
+                )
         if (sequence_id in accepted
                 and attributes.get("materialization_kind") == "unrolled_loop"
                 and attributes.get("aggregate_kind") in {"list", "set"}):
