@@ -4,7 +4,11 @@ Fortran as well as C. LLVM went from 132 pass / 5 WRONG / 1 crash / 33
 refused to 157 / 0 / 0 / 19 (static tuples, root frame cells, owned frame
 storage, loop literals, flat reductions; doc 37). At ddcf059f: corpus C
 176/176; FUZZ_EXT=3 FUZZ_BACKENDS=llvm seed 40 0 WRONG; gate same names
-as the parent.
+as the parent. At 3884c95b (195 programs): C 195/195, LLVM 171 PASS / 0
+WRONG / 24 refused, Fortran (gfortran) 103 PASS / 1 WRONG (c22, LUT sin by
+design). Gate names identical to main 4567cb65. Fuzz seed 42 FUZZ_EXT=3
+llvm: 0 LLVM WRONG; 1 C WRONG p42_33 (callee swap lost), also WRONG at
+main d8d41cb6, handed to the silent lane (doc 37).
 
 2026-10-23 MERGED MAIN cc6e6f36 INTO THE SILENT LANE (MEASURED): corpus
 184/184 PASS at 10fe5dd1. Fuzz seed 27 base 40/40. Seed 25 FUZZ_EXT=3: 57

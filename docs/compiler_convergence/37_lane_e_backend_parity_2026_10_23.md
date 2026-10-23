@@ -145,3 +145,34 @@ emitted. The items below were fixed in the Fortran writer:
     Fortran emission yet.
   - 21 COMPILE-FAIL, mostly rank mismatches in reductions and pops.
   - 2 EMIT-FAIL.
+
+After `ba464c22`, the LLVM `Abs` on i64 (commit `3884c95b`) moved c163
+and c212 from refused to PASS, so LLVM is 171 PASS and 24 refused.
+
+## Gate receipts (at `3884c95b`, on a clean worktree)
+
+- Gate: aa 89 / ab 7 / ac 26 / rec 20. The failure names in each part
+  match main `4567cb65` exactly, both run in this container.
+- Fuzz: `FUZZ_EXT=3 FUZZ_BACKENDS=llvm` seed 42 ran 40 programs. 26
+  passed, 10 were LLVM-LOUD (refusal families above), 3 were LOUD in C,
+  and 0 were TYPE.
+- **1 WRONG, in C, already on main:** p42_33. It is not from this branch.
+  It reproduces on main `d8d41cb6`. Reduced:
+
+  ```python
+  def swap(xs: list[int]) -> None:
+      t = xs[0]
+      xs[0] = xs[1]
+      xs[1] = t
+
+  def root(n: int) -> int:
+      xs0 = [i0 * 4 for i0 in range(n % 5 + 1) if i0 % 2 == 0]
+      xs1 = [n, 5]
+      swap(xs1)
+      c2 = sum(i2 * n for i2 in range(4))
+      return (len(xs0) * 100 + sum(xs0)) + (xs1[0] * 10 + xs1[1]) + (c2)
+  ```
+
+  C returns the list unswapped (n=0 gives 105, want 150). Without the
+  comprehension, or without the `sum`, it passes. It was handed to the
+  silent wrong answers lane.
