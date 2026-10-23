@@ -4,8 +4,9 @@ C and compared with Python; failures clustered by signature.
 usage: python tools/differential_fuzz.py OUTDIR SEED COUNT
 (FUZZ_EXT=1/2/3 widen the grammar: extended builtins, then more control
 and sequences, then helpers that mutate and read a caller's list.
-FUZZ_BACKENDS=llvm also runs each program through LLVM: a wrong LLVM value
-is WRONG, and an LLVM refusal of a program C ran is LLVM-LOUD.)
+FUZZ_BACKENDS=llvm,fortran also runs each program through LLVM and/or
+Fortran: a wrong value is WRONG, and a refusal of a program C ran is
+LLVM-LOUD or FORTRAN-LOUD.)
 Writes OUTDIR/<id>.py for every program and OUTDIR/results.jsonl.
 """
 import sys, os, random, json, re, warnings, pathlib, tempfile, traceback
@@ -320,6 +321,35 @@ def run_one(text):
             value = np.asarray(ex.buffers[outs[0].id]).reshape(-1)[0]
             if float(value) != float(want):
                 wrong.append(f"llvm n={n} got {value} want {want}")
+    if not wrong and "fortran" in os.environ.get("FUZZ_BACKENDS", ""):
+        from src.compiler.ssa_fortran_backend import FortranCoreNative, emit_module
+        from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
+        try:
+            fortran = emit_module(module, progress=lambda _: None)
+        except Exception as error:  # noqa: BLE001
+            return "FORTRAN-LOUD", signature(f"fortran {type(error).__name__}: {error}")
+        if not fortran.complete:
+            return "FORTRAN-LOUD", signature(f"fortran {fortran.shortfalls[0].format()}")
+        try:
+            built = compile_fortran_module_c_shell(
+                fortran, {}, pathlib.Path(tempfile.mkdtemp()), library=True,
+                entrypoint=exports[0], name=exports[0][:48],
+            )
+            record = next(e for e in fortran.api.entry_points if str(e.name) == exports[0])
+            native = FortranCoreNative(built.executable_path, record, fortran.api)
+        except Exception as error:  # noqa: BLE001
+            return "FORTRAN-LOUD", signature(f"fortran compile {type(error).__name__}: {error}")
+        for n in inputs:
+            want = expected[n]
+            if isinstance(want, tuple):
+                continue
+            try:
+                ex = native.prepare_execution({params["n"]: np.array([n])} if "n" in params else {}).run()
+            except Exception as error:  # noqa: BLE001
+                return "FORTRAN-LOUD", signature(f"fortran run {type(error).__name__}: {error}")
+            value = np.asarray(ex.buffers[outs[0].id]).reshape(-1)[0]
+            if float(value) != float(want):
+                wrong.append(f"fortran n={n} got {value} want {want}")
     if wrong:
         return "WRONG", "; ".join(wrong[:2]) + f" | findings={finding_count}"
     if finding_count:
