@@ -238,3 +238,5 @@ slice snippets and a sum of a folded list.
 - Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm`, seed 43 (40 programs, with the
   new slice snippets): 30 PASS, 6 LLVM-LOUD, 4 LOUD, 0 WRONG and 0 TYPE.
   All four LOUD programs are also LOUD on main.
+- Census at the rebased head `3668d968` (210 programs): C 210/210, LLVM
+  196 PASS, 0 WRONG, 0 crashes and 14 refused.
