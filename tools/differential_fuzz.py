@@ -236,6 +236,8 @@ EXTENDED3 = [
     (["c{v} = branchpair(n - {a})"], "c{v}"),
     # enumerate over a list holding a large int (lane E)
     (["xs{v} = [{a}, n + 36028797018963969, {b}]", "t{v} = 0", "for k{v}, x{v} in enumerate(xs{v}):", "    t{v} += k{v} * x{v}"], "t{v}"),
+    # tuple comprehension targets over enumerate and zip (lane E)
+    (["xs{v} = [{a}, n, {b}]", "ys{v} = [k{v} * x{v} for k{v}, x{v} in enumerate(xs{v})]", "zs{v} = [p{v} * q{v} for p{v}, q{v} in zip(xs{v}, ys{v})]"], "sum(ys{v}) + sum(zs{v})"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
