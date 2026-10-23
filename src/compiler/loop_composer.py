@@ -5085,6 +5085,7 @@ def analyze_shader_loop_reductions(
                 )
             )
         enumerated_source_id = None
+        induction_offsets: tuple[tuple[int, int], ...] = ()
         iterable_extent_ids: tuple[int, ...] = ()
         if (
             loop.stop is None
@@ -5103,14 +5104,28 @@ def analyze_shader_loop_reductions(
                 # Program: ``for k, x in enumerate(xs, 3)``.  Wrong
                 # record: the count was bound to the loop induction, which
                 # starts at 0, and the ``start`` argument was dropped, so C
-                # and LLVM silently counted from 0.  Rule: a ``start`` has no
-                # lowering here, so it refuses by name rather than being
-                # ignored.
+                # and LLVM silently counted from 0.  Rule: the counter target
+                # is the induction plus ``start``, recorded as an induction
+                # offset (``ControlProgram.induction_offsets``).  Any other
+                # extra argument still refuses by name.
                 started = [
-                    role for _parent, role in iterable_data.get("parents", ())
+                    (int(parent), str(role))
+                    for parent, role in iterable_data.get("parents", ())
                     if str(role) not in {"arg", "args", "arg:0", "arg0", "callee"}
                 ]
-                if started:
+                if [role for _parent, role in started] in (
+                    ["arg:1"], ["kw:start"],
+                ) and len(
+                    loop.target_bindings
+                ) >= 2:
+                    start_node = started[0][0]
+                    induction_offsets = ((
+                        int(loop.target_bindings[0][1]),
+                        int(graph.G.nodes[start_node].get(
+                            "value_id", start_node,
+                        )),
+                    ),)
+                elif started:
                     raise ValueError(
                         "enumerate with a start argument has no loop "
                         f"lowering; iterable={iterable_id}, roles={started!r}"
@@ -6833,6 +6848,7 @@ def analyze_shader_loop_reductions(
                     projected_iterable_bindings=(
                         projected_iterable_bindings
                     ),
+                    induction_offsets=induction_offsets,
                     specialized_conditional_node_ids=(
                         specialized_conditional_node_ids
                     ),

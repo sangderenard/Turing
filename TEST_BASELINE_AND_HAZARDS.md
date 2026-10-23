@@ -1,3 +1,9 @@
+2026-10-23 LANE E, E20 (MEASURED, cloud): `enumerate(xs, start)` counts from
+start (ControlProgram.induction_offsets; it was silently 0-based at main
+2806360d and refused since #805). At eeb508be on main 4a0f5452 (262
+programs): C 262/262, LLVM 262/262, Fortran 176 PASS. Gate names identical
+to main 4a0f5452. Fuzz seed 57: 0 WRONG / 0 TYPE.
+
 2026-10-23 LANE E, E18-E19 (MEASURED, cloud): `for k, x in enumerate(xs)` left
 x float64, so C rounded large ints silently at main (c351); now typed.
 `enumerate(xs, start)` silently dropped start in C and LLVM; it now refuses
