@@ -57,8 +57,9 @@ branch has used, merged or not.
 | c240-c249 | Lane C: C1 constant-list comprehensions, C15, C2 | `claude/project-thread-2nw77p` | c240-c245 |
 | c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
-| c280-c289 | Silent lane follow-ups (indexed stores and concatenations in the call order) | `claude/project-thread-cz18s3` | c280-c282 |
-| c290-c299 | next free | | |
+| c280-c289 | Silent lane follow-ups (indexed stores and concatenations in the call order; comprehension births; grown sets) | `claude/project-thread-cz18s3` | c280-c289 (full) |
+| c290-c299 | Silent lane: reads before later effects on the same list, returned reads | `claude/project-thread-cz18s3` | c290-c299 (full) |
+| c300-c309 | next free | | |
 
 ## Lane A: bootstrap families (and the tire, where it shares a group)
 
