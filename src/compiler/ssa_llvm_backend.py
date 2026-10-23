@@ -4365,6 +4365,230 @@ def _emit_repository_call_module(
                     block_exit_label[active_block] = done
                 continue
 
+            if (
+                operation in {"max", "min", "all", "any", "sum"}
+                and result is not None
+                and (
+                    len(instruction.args) == 1
+                    or (operation == "sum" and len(instruction.args) == 2)
+                )
+                and not tuple(result.shape or ())
+                and (
+                    tuple(instruction.args[0].shape or ())
+                    or (instruction.args[0].accounting or {}).get(
+                        "program_abi_storage"
+                    ) in {"span", "sequence"}
+                    or (instruction.args[0].accounting or {}).get(
+                        "heap_element_dtype"
+                    ) is not None
+                )
+            ):
+                # Program: ``xs = [6, 3, 6, n]; sum(xs)`` and ``max(xs)``
+                # (c278, c150-c154; lane E).  Wrong record: a flat reduction
+                # of a sequence to a scalar had no LLVM emission (``sum``) or
+                # died in a binary template (``max``), so the C lane's rule
+                # stood alone.  Rule, as in C: reduce over the static extent
+                # or the sequence's own live length cell, left to right;
+                # ``max``/``min`` of no rows raises error 74.
+                source = instruction.args[0]
+                accounting = dict(source.accounting or {})
+                heap_layout = accounting.get("heap_element_dtype")
+                if heap_layout is not None:
+                    from ..transmogrifier.dtype_layout import layout_for
+                    element_type = layout_for(heap_layout).llvm_type
+                    base_pointer = load_as(source, "ptr", f"red.base.{tag}")
+                else:
+                    element_type = aggregate_constant_types.get(
+                        int(source.id), _value_llvm_type(source),
+                    )
+                    base_pointer = pointer(source)
+                if element_type == "ptr":
+                    element_type = "i64"
+                static_shape = tuple(source.shape or ())
+                count = None
+                if accounting.get("sequence_static_length") is not None:
+                    count = str(int(accounting["sequence_static_length"]))
+                elif static_shape and all(
+                    isinstance(item, int) for item in static_shape
+                ) and accounting.get("program_abi_storage") not in {
+                    "span", "sequence",
+                }:
+                    count = str(_math.prod(static_shape))
+                else:
+                    sequence_ids = {
+                        int(candidate)
+                        for candidate in (
+                            accounting.get("sequence_id"),
+                            accounting.get("compiler_frame_sequence_id"),
+                            int(source.id),
+                        )
+                        if candidate is not None
+                    }
+                    lengths = tuple(
+                        formal for formal in function.args
+                        if (formal.accounting or {}).get("sequence_length_for")
+                        is not None
+                        and int(formal.accounting["sequence_length_for"])
+                        in sequence_ids
+                    )
+                    direct = accounting.get("sequence_length_value_id")
+                    if direct is not None:
+                        lengths = tuple(
+                            formal for formal in function.args
+                            if int(formal.id) == int(direct)
+                        ) or lengths
+                    if len(lengths) == 1:
+                        count = load_as(lengths[0], "i64", f"red.n.{tag}")
+                if count is None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"flat {operation} reduction over %t{int(source.id)} "
+                        "has no static extent or live length cell",
+                    ))
+                    continue
+                result_type = _value_llvm_type(result)
+                accumulator_type = (
+                    "i1" if operation in {"any", "all"} else result_type
+                )
+                if accumulator_type not in {"i1", "i32", "i64", "double"}:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"flat {operation} reduction into {accumulator_type}",
+                    ))
+                    continue
+                floating = accumulator_type == "double"
+                entry_label = block_exit_label.get(
+                    active_block or "", active_block or "entry",
+                )
+                fail = f"red.fail.{tag}"
+                init = f"red.init.{tag}"
+                head = f"red.head.{tag}"
+                loop_body = f"red.body.{tag}"
+                done = f"red.done.{tag}"
+                index = f"%red.i.{tag}"
+                nxt = f"%red.next.{tag}"
+                acc = f"%red.acc.{tag}"
+                acc_next = f"%red.acc.next.{tag}"
+                ordered = operation in {"max", "min"}
+
+                def element(at: str, label: str) -> str:
+                    body.append(
+                        f"  %red.addr.{label}.{tag} = getelementptr "
+                        f"{element_type}, ptr {base_pointer}, i64 {at}"
+                    )
+                    body.append(
+                        f"  %red.v.{label}.{tag} = load {element_type}, "
+                        f"ptr %red.addr.{label}.{tag}, align {_align(element_type)}"
+                    )
+                    loaded = f"%red.v.{label}.{tag}"
+                    if operation in {"any", "all"}:
+                        truth = f"%red.t.{label}.{tag}"
+                        if element_type in {"double", "float"}:
+                            # NaN is truthy, as in Python.
+                            body.append(
+                                f"  {truth} = fcmp une {element_type} {loaded}, 0.0"
+                            )
+                        else:
+                            body.append(
+                                f"  {truth} = icmp ne {element_type} {loaded}, 0"
+                            )
+                        return truth
+                    return convert_loaded(
+                        loaded, element_type, accumulator_type,
+                        f"red.{label}.{tag}",
+                    )
+
+                if ordered:
+                    body.append(f"  %red.empty.{tag} = icmp sle i64 {count}, 0")
+                    body.append(
+                        f"  br i1 %red.empty.{tag}, label %{fail}, label %{init}"
+                    )
+                    body.append(f"{fail}:")
+                    body.append("  call void @turing_validation_error(i32 74)")
+                    body.append(f"  br label %{done}")
+                else:
+                    body.append(f"  br label %{init}")
+                body.append(f"{init}:")
+                if ordered:
+                    initial = element("0", "first")
+                    first_index = "1"
+                elif operation == "sum":
+                    initial = (
+                        load_as(instruction.args[1], accumulator_type, f"red.start.{tag}")
+                        if len(instruction.args) == 2
+                        else literal(0, accumulator_type)
+                    )
+                    first_index = "0"
+                else:
+                    initial = "true" if operation == "all" else "false"
+                    first_index = "0"
+                body.append(f"  br label %{head}")
+                body.append(f"{head}:")
+                body.append(
+                    f"  {index} = phi i64 [ {first_index}, %{init} ], "
+                    f"[ {nxt}, %{loop_body} ]"
+                )
+                body.append(
+                    f"  {acc} = phi {accumulator_type} [ {initial}, %{init} ], "
+                    f"[ {acc_next}, %{loop_body} ]"
+                )
+                body.append(f"  %red.more.{tag} = icmp slt i64 {index}, {count}")
+                body.append(
+                    f"  br i1 %red.more.{tag}, label %{loop_body}, label %{done}"
+                )
+                body.append(f"{loop_body}:")
+                item = element(index, "row")
+                if operation == "sum":
+                    body.append(
+                        f"  {acc_next} = {'fadd' if floating else 'add'} "
+                        f"{accumulator_type} {acc}, {item}"
+                    )
+                elif operation == "any":
+                    body.append(f"  {acc_next} = or i1 {acc}, {item}")
+                elif operation == "all":
+                    body.append(f"  {acc_next} = and i1 {acc}, {item}")
+                else:
+                    keep = f"%red.take.{tag}"
+                    if floating:
+                        # NaN propagates, as in the C lane: once NaN no
+                        # comparison displaces it, and a NaN row enters.
+                        body.append(
+                            f"  {keep}.cmp = fcmp {'ogt' if operation == 'max' else 'olt'} "
+                            f"double {item}, {acc}"
+                        )
+                        body.append(f"  {keep}.nan = fcmp uno double {item}, {item}")
+                        body.append(f"  {keep} = or i1 {keep}.cmp, {keep}.nan")
+                    else:
+                        body.append(
+                            f"  {keep} = icmp {'sgt' if operation == 'max' else 'slt'} "
+                            f"{accumulator_type} {item}, {acc}"
+                        )
+                    body.append(
+                        f"  {acc_next} = select i1 {keep}, "
+                        f"{accumulator_type} {item}, {accumulator_type} {acc}"
+                    )
+                body.append(f"  {nxt} = add i64 {index}, 1")
+                body.append(f"  br label %{head}")
+                body.append(f"{done}:")
+                reduced = f"%red.out.{tag}"
+                incoming = [f"[ {acc}, %{head} ]"]
+                if ordered:
+                    incoming.insert(0, f"[ {literal(0, accumulator_type)}, %{fail} ]")
+                body.append(
+                    f"  {reduced} = phi {accumulator_type} " + ", ".join(incoming)
+                )
+                stored = convert_loaded(
+                    reduced, accumulator_type, result_type, f"red.store.{tag}",
+                )
+                body.append(
+                    f"  store {result_type} {stored}, ptr {pointer(result)}, "
+                    f"align {_align(result_type)}"
+                )
+                if active_block is not None:
+                    block_exit_label[active_block] = done
+                register_cache.clear()
+                continue
+
             if template is not None and result is not None:
                 result_type = _value_llvm_type(result)
                 operand_argument_types = [
