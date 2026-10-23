@@ -176,3 +176,52 @@ and c212 from refused to PASS, so LLVM is 171 PASS and 24 refused.
   C returns the list unswapped (n=0 gives 105, want 150). Without the
   comprehension, or without the `sum`, it passes. It was handed to the
   silent wrong answers lane.
+
+## E4 in part: slice concatenation is int64 (LLVM)
+
+- **Program:** `xs = [1, 2] + [n, 8]; return xs[2]` (c264), and nine
+  other concatenations (c166, c173, c210, c218, c262, c263, c273, c281,
+  c282).
+- **Wrong record:** `lower_sequence_append_slice` minted its bounds,
+  lengths and indices as `int`. Scalar settlement widened each `Add` to
+  int64 and left the Phis at `int`, so LLVM refused an i32 Phi with i64
+  incoming. The helper also loaded the int64 length cells as `int`.
+- **Rule:** slice arithmetic has the width of the length cell, int64, like
+  `insert_at`. Its status stays `int`. The caller's bounds and its
+  absent-bound constants are int64 too.
+
+## E5: list slices (C, silent on main)
+
+These were found while writing a corpus program for the item above. On
+main `d8d41cb6`, each of c290-c294 gives a wrong answer in C, with no
+refusal.
+
+1. **Folded slice.**
+   - Program: `xs = [3, 1, 4, 1, 5]; ys = xs[:3]; return ys[n % 3]`.
+   - Wrong record: structural specialization folded `xs[:3]` to the
+     Constant `[3, 1, 4]`, with no parents and no leaves. Nothing wrote its
+     arena, so the reset left length 0 and every row read gave 0.
+     `xs[-4:-1] + [n, 9]` copied zero rows from it.
+   - Rule: a folded slice's rows are its literal. It is initialized like a
+     compile-time table (`literal_rows=`, under the duplicates policy).
+2. **Runtime slice.**
+   - Program: `xs = [3, n, 4]; ys = xs[:2]; return ys[1]`.
+   - Wrong record: the slice declared its own arena, but no operation
+     filled it (0.0 for n).
+   - Rule: `dst = src[lower:upper]` is the sequence mutation `slice`.
+     It resets `dst`, then appends the clipped rows of `src` with the
+     existing `append_slice` helper. Its capacity is the snapshot bound:
+     the source's bound plus its own straight-line appends. A stepped slice
+     is not admitted, and stays on its old path.
+3. **`sum` of a folded list.**
+   - Program: `xs = [3, 1, 4, 7]; return sum(xs) + n`.
+   - Wrong record: the list's Const result settled to int64 `(4,)`. The
+     `sum` operand is another occurrence of the same identity, and it kept
+     the provisional `()`, so C reduced one element (7 for 19). The
+     concordance audit reported it as a finding.
+   - Rule: a published type belongs to the identity. Every occurrence in
+     the function that carried the previous type takes the new one
+     (`publish_ssa_value_type`).
+
+The corpus adds c290 to c294. The fuzzer's EXTENDED3 pool adds four
+slice snippets and a sum of a folded list.

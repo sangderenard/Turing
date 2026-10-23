@@ -176,6 +176,12 @@ EXTENDED3 = [
     (["xs{v} = [{a}, n, {a}, {b}]"], "sum(xs{v}) * 100 + xs{v}.count({a}) * 10 + xs{v}.index(n)"),
     (["xs{v} = [{a}, n, {b}]", "xs{v}.remove(n)"], "len(xs{v}) * 10 + xs{v}[1]"),
     (["c{v} = label(n + {a})"], "c{v}"),
+    # list slices (lane E): a folded slice, a slice of a display holding a
+    # parameter, a slice with a runtime lower bound, a sum of a folded list
+    (["xs{v} = [{a}, {b}, {c}, {a}]", "ys{v} = xs{v}[1:3] + [n]"], "len(ys{v}) * 100 + ys{v}[0] * 10 + ys{v}[2]"),
+    (["xs{v} = [{a}, n, {b}]", "ys{v} = xs{v}[-2:]"], "ys{v}[0] * 10 + len(ys{v})"),
+    (["xs{v} = [{a}, n, {b}, {c}]", "ys{v} = xs{v}[n % 3:]"], "len(ys{v}) * 10 + ys{v}[0]"),
+    (["xs{v} = [{a}, {b}, {c}]"], "sum(xs{v}) + n"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v

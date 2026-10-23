@@ -9884,6 +9884,30 @@ def _field_slot_ops(
                 f"literal_table={encoded_rows!r}",
                 2,
             ))
+        # Program: ``xs = [3, 1, 4, 1, 5]; ys = xs[:3]; return ys[n % 3]``.
+        # Wrong record: structural specialization folded the slice to the
+        # Constant ``[3, 1, 4]`` with no parents and no leaves, so nothing
+        # wrote its arena: the reset stored length 0 and every row read
+        # returned 0 (and ``xs[:3] + [n, 9]`` copied zero rows).  Rule: a
+        # folded slice's rows are its literal; initialize them like a
+        # compile-time table, under the list's duplicates policy.
+        folded_slice = attributes.get("value")
+        if (
+            aggregate_kind == "list"
+            and attributes.get("producer_kind") == "sequence_slice"
+            and attributes.get("structural_specialization")
+            and not leaf_ids
+            and isinstance(folded_slice, (list, tuple))
+            and folded_slice
+            and all(
+                isinstance(item, (bool, int, float)) for item in folded_slice
+            )
+        ):
+            sequence_initializations.append((
+                sequence_id,
+                f"literal_rows={tuple((item,) for item in folded_slice)!r}",
+                1,
+            ))
         sequence_items = attributes.get("compile_time_sequence_items")
         if (
             aggregate_kind in {"set", "frozenset"}

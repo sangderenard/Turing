@@ -336,7 +336,31 @@ def publish_ssa_value_type(function, value, *, dtype, shape, sources, stage, boo
         raise ConcordanceRefusal(
             f"SSA type change was not published: {function.name!r}/{value.id}"
         )
+    previous = (value.dtype, tuple(value.shape or ()))
     value.dtype, value.shape = fact.dtype, fact.shape
+    if previous != (fact.dtype, tuple(fact.shape)):
+        # Program: ``xs = [3, 1, 4, 7]; return sum(xs) + n``.  Wrong record:
+        # the folded list's Const result settled to int64 (4,) but the
+        # ``sum`` operand, another occurrence of the same identity, kept the
+        # provisional () and C reduced one element (7 for 19).  Rule: a
+        # published type is the identity's, so every occurrence in the
+        # function that carried the previous type carries the new one.
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for occurrence in (*instruction.args, instruction.res):
+                    if (
+                        occurrence is not None and occurrence is not value
+                        and int(occurrence.id) == int(value.id)
+                        and (occurrence.dtype, tuple(occurrence.shape or ()))
+                        == previous
+                    ):
+                        occurrence.dtype, occurrence.shape = fact.dtype, fact.shape
+        for occurrence in function.args:
+            if (
+                occurrence is not value and int(occurrence.id) == int(value.id)
+                and (occurrence.dtype, tuple(occurrence.shape or ())) == previous
+            ):
+                occurrence.dtype, occurrence.shape = fact.dtype, fact.shape
     return cell
 
 
