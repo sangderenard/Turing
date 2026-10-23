@@ -22736,16 +22736,27 @@ def _class_surface_ssa_program(
                 # carried no contract, so the callee's return and the
                 # caller's call result had no class and the sum's region fell
                 # to float64 (-4 came back as 1.8e19).  Rule: a statement
-                # name merge of a source conditional settles from its arms
-                # exactly as an IfExp and a member merge do.
+                # name merge of a source conditional with a ``None`` arm (an
+                # optional) settles from its arms exactly as an IfExp and a
+                # member merge do.  Other name merges (``t = pair(row)`` /
+                # ``t = (7, 8)``, corpus c29) keep their own settlement.
                 member_merge = (
                     str(data.get("type") or "") == "Phi"
                     and (
                         member_attributes.get("conditional_result_of") is not None
                         or member_attributes.get("aggregate_parent_value_id")
                         is not None
-                        or member_attributes.get("source_conditional_id")
-                        is not None
+                        or (
+                            member_attributes.get("source_conditional_id")
+                            is not None
+                            and any(
+                                (contracts.get(int(parent)) or {}).get(
+                                    "python_type"
+                                ) == "builtins.NoneType"
+                                for parent, role in data.get("parents") or ()
+                                if str(role) in {"body", "orelse"}
+                            )
+                        )
                     )
                 )
                 if not (
