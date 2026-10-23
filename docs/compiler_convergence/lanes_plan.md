@@ -53,7 +53,7 @@ branch has used, merged or not.
 | range | lane / item | branch | used |
 |---|---|---|---|
 | c211-c218 | Lane A: A0, A3 and follow-ups | `claude/project-thread-kbkzp7` | c211, c212, c214-c218 |
-| c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c234 |
+| c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c239 (used up) |
 | c240-c249 | Lane C: C1 constant-list comprehensions, C15, C2 | `claude/project-thread-2nw77p` | c240-c245 |
 | c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
@@ -64,14 +64,15 @@ branch has used, merged or not.
 
 | rank | item | group (doc 34) | claimed functions | branch | status |
 |---|---|---|---|---|---|
-| A2 | Keep a return surface whole: the remaining pieces. `emit_outputs` must not fall back to `(output_id,)` when no `Ret` exists; accepted-unit accounting must not let one value stand for a tuple/optional (`project_compilation_product`, `len(paths) == 1 and len(published_ids) == 1`); add the doc 34 §1.4 false-acceptance check to the bootstrap status tool. The optional-return part is done (doc 34 §6, §7). | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs`; accepted-unit result accounting | `claude/project-thread-h4aybe` | claimed 2026-10-22; the optional-return part and W1 are done on the branch; next: re-merge `main` (#792 is in) and open the PR |
+| A2 | Keep a return surface whole: the remaining pieces. `emit_outputs` must not fall back to `(output_id,)` when no `Ret` exists; accepted-unit accounting must not let one value stand for a tuple/optional (`project_compilation_product`, `len(paths) == 1 and len(published_ids) == 1`); add the doc 34 §1.4 false-acceptance check to the bootstrap status tool. The optional-return part is done (doc 34 §6, §7). | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs`; accepted-unit result accounting | `claude/project-thread-h4aybe` | claimed 2026-10-22; the optional-return part and W1 are done on the branch; W3 also done; `main` re-merged after #792, PR next |
 | A2b | Lower a returned tuple-or-`None` (`if c: return (a, b)` / `return None` in a bootstrap unit; `fork = (a, b)` / `fork = None; return fork` anywhere). It refuses by name now (`its newest binding ... was not materialized`), was silent before. Observed by the silent-wrong-answers thread: the planner builds the aggregate Phi (presence member 15, member Phis 16, 17), but the root's return reads the handle (10) instead of that layout, and the tuple's region is then pruned as dead. | B1 | the control finish's output resolution in `precompile_to_ssa`; find the pruner with a trap | | open: loud |
 | A4 | Tire: the result-storage lease mints a record span member's `SSA_VALUE` row as a scalar. Revise it from the record storage contract. `_ssa_structure` reads the registered record storage before calling a shape-empty fact a scalar. Repro idea: lift `Metrics` with its `error_present` span (15,) into a scratch program that returns the record through one call edge. Suspected pass (**inferred**): the lease writer, which reads the fact's empty shape before the record storage. | T1 | `structural_concordance._ssa_structure`; the result-storage lease writer in `fortran_c_shell` | | open: A0 merged; re-observe at `main` first (needs a tire run, see A5) |
 | A5 | Measure the core-chain cascade at `main`: one full bootstrap and one managed tire run. Fill doc 34 §1.2 and re-file units into groups. Many silent-wrong fixes and the S1 birth have landed since the 23/330 measurement, so the triage groups are stale (**inferred**). | B6, B7, T1 | none (measurement) | | open: asked Albert 2026-10-23 |
 | A6 | Variadic returns: the sequence-lane lowering for `return ()`/`(x,)`/`[]`/`[x]` (units 034, 162, 212). | B2 | reducer VARIADIC consumer in `precompile_to_ssa`; `ir_sequence_tables` | `claude/project-thread-kbkzp7` | claimed 2026-10-22; list returns fixed or refused (doc 35), tuple variadic and two-edge list lowering open |
 | A7 | `Any`-typed receivers and generic `str()`/`!r` of facts: runtime type dispatch over the fact classes. | B3 | to be scoped | | open: needs a design note first |
 | A8 | `'|'.join(tokens)` glyph recipe in f-strings (unit 6). | B5 | f-string glyph recipe builder | | open |
-| W3 | A caller's `is None` test on a callee returning `x if c else None` (a conditional value union) does not compile: the call escapes whole as a `double *` table over `int64_t` slots. Loud (C compile error) on `main`. Doc 34 §7. | the union-call consumer in `ssa_c_backend` / the optional-call rewrite in `ssa_optional_values` (find which owns it with a trap) | | | open |
+| W3 | A caller's `is None` test on a callee returning `x if c else None` (a conditional value union) did not compile. Two lost records: the linker rebound the call's placeholder (the scalar `v`) to the (payload, tag) container, and `v is None` lowered to `Eq(payload, None)`. Doc 34 §8; corpus c237-c239. | silent behind loud | `fortran_c_shell` linker placeholder rebind; `precompile_to_ssa.lower_control_expression` | `claude/project-thread-h4aybe` | done on the branch |
+| W3b | A wrapper that forwards a value-union result (`def wrap(...): return maybe(...)`) is refused: `shared heterogeneous sequence payload changes its physical ABI: value=2, payload=(None, ())`. Loud on `main` too. Doc 34 §8. | loud | forwarding of `native_value_union_return_layouts` through an exact wrapper | | open |
 
 ## Lane C: language frontier
 
@@ -118,6 +119,7 @@ committed inventory script and classify every hit.
 
 ## Done
 
+- A2, optional return surfaces, W1 (an optional helper's merge has no class) and W3 (a value-union call's `is None`): branch `claude/project-thread-h4aybe`, receipts in doc 34 §6 to §8. Corpus block c230 to c239 belongs to this thread (used up).
 - A1 / S1 (tuple displays are born and bounded), W2, C12, C13, C14: PR #788, merge `ca9668a4`, receipts in doc 36.
 - D1 (private root storage proven or refused): PR #787, merge `cc6e6f36`.
 - D3 (no silent except around the binding-kind lookup or the planned-shell walk): PR #790, merge `3ffb64d6`. D3a stays open.
