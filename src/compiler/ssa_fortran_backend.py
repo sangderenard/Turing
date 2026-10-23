@@ -466,6 +466,26 @@ def _declaration(value: SSAValue, *, elemental: bool) -> str:
     return kind if elemental else kind
 
 
+def _span_formal_is_array(value: SSAValue) -> bool:
+    """Whether a ``program_abi_storage: span`` formal is an array.
+
+    Program: ``a = outer(xs)`` where ``outer`` returns ``xs[0]`` (corpus
+    c185).  Wrong record: the call result reaches a planned region as a
+    span formal whose accounting states ``program_abi_rank: 0``, and the
+    span storage alone made it an assumed-size array here, so the caller
+    declared ``t3(extent)`` beside a callee writing a scalar ``t3`` (gfortran:
+    rank mismatch).  Rule: a span with an explicit rank of zero is one cell,
+    as the LLVM and C emitters already read it (``_declared_span_rank``); a
+    span whose rank is unstated keeps the array reading.
+    """
+
+    accounting = value.accounting or {}
+    if str(accounting.get("program_abi_storage")) != "span":
+        return False
+    rank = accounting.get("program_abi_rank")
+    return rank is None or int(rank) > 0 or tuple(value.shape or ()) != ()
+
+
 def _name(value: SSAValue) -> str:
     return f"t{value.id}"
 
@@ -828,8 +848,7 @@ class _FunctionEmitter:
             int(argument.id)
             for argument in self.function.args
             if (
-                str((argument.accounting or {}).get("program_abi_storage"))
-                == "span"
+                _span_formal_is_array(argument)
                 or int((argument.accounting or {}).get(
                     "program_abi_rank", 0
                 )) > 0
@@ -1405,7 +1424,32 @@ class _FunctionEmitter:
             return False
         if uses[0][0] != block.name:
             return False
+        if instr.op in ("Load", "load") and self._written_between(
+            instr, block, uses[0][1],
+        ):
+            # Program: ``t = xs[0]; xs[0] = xs[1]; xs[1] = t`` in a callee
+            # (corpus c187).  Wrong record: the read of ``xs[0]`` was folded
+            # into its consumer, a call placed after the call that writes
+            # ``xs[0]``, so it read the new row.  Rule: a load is not moved
+            # past a store or a call.
+            return False
         return not self._is_subscripted_by(result, uses[0])
+
+    def _written_between(
+        self, instr: Instr, block: BasicBlock, use_position: int,
+    ) -> bool:
+        """Whether memory may be written between ``instr`` and its use."""
+
+        positions = [
+            position for position, candidate in enumerate(block.instrs)
+            if candidate is instr
+        ]
+        if len(positions) != 1:
+            return True
+        return any(
+            candidate.op in ("Store", "store", "Call", "call")
+            for candidate in block.instrs[positions[0] + 1:use_position]
+        )
 
     def _is_subscripted_by(
         self, value: SSAValue, use: tuple[str, int]
@@ -5283,6 +5327,7 @@ def emit_module(
         function_name: set(value_ids)
         for function_name, value_ids in call_array_argument_ids(
             functions, call_is_semantic_edge=lambda instruction: not _static_span_assignment(instruction),
+            span_formal_is_array=_span_formal_is_array,
         ).items()
     }
     method_mutated_bases: dict[str, set[int]] = {}
@@ -5295,8 +5340,7 @@ def emit_module(
             int(argument.id)
             for argument in function.args
             if (
-                str((argument.accounting or {}).get("program_abi_storage"))
-                == "span"
+                _span_formal_is_array(argument)
                 or int((argument.accounting or {}).get(
                     "program_abi_rank", 0
                 )) > 0

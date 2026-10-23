@@ -189,6 +189,8 @@ EXTENDED3 = [
     # length (lane E)
     (["xs{v} = [n, {a}, n * {b}]", "xs{v}.append({c} - n)"], "max(xs{v}) * 1000 + min(xs{v}) * 10 + sum(xs{v}, n)"),
     (["xs{v} = [n, {a}]", "xs{v}.append(n - {b})"], "int(any(xs{v})) * 10 + int(all(xs{v}))"),
+    # a callee's scalar result beside a callee swap, Fortran (lane E)
+    (["xs{v} = [n, {a}]", "h{v} = head(xs{v})", "swap(xs{v})", "swap(xs{v})", "swap(xs{v})"], "h{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
