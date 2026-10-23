@@ -5574,13 +5574,21 @@ class _ControlSSABuilder(TiledObject):
                 )
         return None
 
-    def constant_value(self, literal: int, *operands: Any) -> SSAValue:
+    def constant_value(
+        self, literal: int, *operands: Any, dtype: str = "int",
+    ) -> SSAValue:
         """An int literal the builder needs: CONTROL_CONST from ``operands``
         (the cells of what the literal indexes or bounds; a bare literal has
-        no identity cell of its own and names the function root)."""
+        no identity cell of its own and names the function root).
+
+        A literal that enters a loop Phi takes the Phi's dtype: an ``int``
+        zero entering an ``int64`` index Phi (or an ``int`` False entering a
+        ``bool`` accumulator) is a representation change no Phi can make,
+        and the LLVM lane refused every resident ``sum``/``any``/``count``
+        loop on it (lane E)."""
 
         value = self.fresh_value(
-            dtype="int", transform=CONTROL_CONST, operands=operands,
+            dtype=dtype, transform=CONTROL_CONST, operands=operands,
         )
         self.emit(
             Handler.Const,
@@ -9779,6 +9787,43 @@ class _ControlSSABuilder(TiledObject):
                 },
             )
             return result
+        none_test = self._union_none_identity_subject(expression)
+        if none_test is not None:
+            # Program: ``v = maybe(row, flag); if v is None: ...`` where
+            # ``maybe`` returns ``row + 1 if flag > 0 else None``.  Wrong
+            # record: the identity test lowered to ``Eq(payload, None)``,
+            # which reads only the int arm's storage and is never true.  Rule:
+            # ``is None`` on a value whose type ABI is a union with NoneType
+            # is an exact type-identity test of that union's tag.
+            is_none = self._native_value_type_predicate(
+                none_test, ("builtins.NoneType",),
+                result_override=(
+                    result_override if expression.op == "eq" else None
+                ),
+                subtype=False,
+                receipt={
+                    "control_expression": f"none_identity_{expression.op}",
+                    "subject_value_id": int(none_test),
+                    "accepted_types": ("builtins.NoneType",),
+                },
+            )
+            if expression.op == "eq":
+                result = is_none
+            else:
+                result = result_override or self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(is_none,),
+                )
+                self.emit(Handler.LNot, [is_none], result, attributes={
+                    "binding": "control_expression",
+                    "source_value_id": expression.value_id,
+                })
+            if expression.value_id is not None:
+                self._bind(
+                    int(expression.value_id), result,
+                    BindingKind.CONTROL_EXPRESSION, is_none,
+                )
+            return result
         operand_values = [
             self.lower_control_expression(operand)
             for operand in expression.operands
@@ -9861,6 +9906,34 @@ class _ControlSSABuilder(TiledObject):
                 BindingKind.CONTROL_EXPRESSION, *operand_values,
             )
         return result
+
+    def _union_none_identity_subject(self, expression) -> int | None:
+        """The subject id of ``subject is None`` when its type ABI is a union
+        that admits NoneType; otherwise None (an ordinary comparison)."""
+
+        if expression.op not in {"eq", "ne"} or len(expression.operands) != 2:
+            return None
+        values = tuple(
+            operand for operand in expression.operands
+            if operand.op == "value" and operand.value_id is not None
+        )
+        nones = tuple(
+            operand for operand in expression.operands
+            if operand.op == "const" and operand.literal is None
+            and not operand.operands
+        )
+        if len(values) != 1 or len(nones) != 1:
+            return None
+        subject_id = int(values[0].value_id)
+        fact = self.native_value_type_abi.get(subject_id)
+        alternatives = tuple(map(str,
+            fact.get("alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "alternatives", ())
+        ))
+        if len(alternatives) <= 1 or "builtins.NoneType" not in alternatives:
+            return None
+        return subject_id
 
     def _post_scalar_item_merge(self, item_id: int, source: SSAValue) -> Ref:
         """``scalar_item_merge`` row ``(function scope, item)`` -> the
@@ -11706,9 +11779,9 @@ class _ControlSSABuilder(TiledObject):
             body = self.new_block("sequence_any_body")
             latch = self.new_block("sequence_any_latch")
             exit_block = self.new_block("sequence_any_exit")
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
-            false = self.constant_value(False, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
+            false = self.constant_value(False, length, dtype="bool")
             next_index = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION,
                 operands=(length,),
@@ -11858,8 +11931,8 @@ class _ControlSSABuilder(TiledObject):
             retained = self.new_block("sequence_maximum_loop_retained")
             latch = self.new_block("sequence_maximum_latch")
             exit_block = self.new_block("sequence_maximum_exit")
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
             next_index = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
             )
@@ -12001,7 +12074,7 @@ class _ControlSSABuilder(TiledObject):
                 ))
                 return
             if start is None:
-                start = self.constant_value(0, length)
+                start = self.constant_value(0, length, dtype="int64")
             elif str(start.dtype) != "int64":
                 widened = self.fresh_value(
                     dtype="int64", transform=CONTROL_CAST, operands=(start,),
@@ -12015,8 +12088,8 @@ class _ControlSSABuilder(TiledObject):
             header = self.new_block("sequence_sum_header")
             body = self.new_block("sequence_sum_body")
             exit_block = self.new_block("sequence_sum_exit")
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
             next_index = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
             )
@@ -12125,8 +12198,8 @@ class _ControlSSABuilder(TiledObject):
             exit_block = self.new_block(f"sequence_{query.operation}_exit")
             found = None if counting else self.new_block("sequence_index_found")
             missing = None if counting else self.new_block("sequence_index_missing")
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
             next_index = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
             )
@@ -12217,7 +12290,7 @@ class _ControlSSABuilder(TiledObject):
                         **attributes,
                     },
                 )
-                absent = self.constant_value(-1, length)
+                absent = self.constant_value(-1, length, dtype="int64")
                 self.branch(exit_block)
                 self.current = found
                 self.branch(exit_block)
@@ -14904,8 +14977,8 @@ class _ControlSSABuilder(TiledObject):
                 dtype="int64", transform=LOAD, operands=(length_address,),
             )
             self.emit(Handler.Load, [length_address], length, attributes=attributes)
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
             scan_header = self.new_block("sequence_remove_scan")
             scan_body = self.new_block("sequence_remove_compare")
             scan_latch = self.new_block("sequence_remove_next")
@@ -14987,8 +15060,6 @@ class _ControlSSABuilder(TiledObject):
                 operands=(length, one),
             )
             self.current = shift_header
-            self.emit(Handler.Sub, [length, one], new_length,
-                      attributes=attributes)
             next_shift = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION,
                 operands=(scan_index, one),
@@ -14997,6 +15068,8 @@ class _ControlSSABuilder(TiledObject):
                 dtype="int64", transform=PHI_LOOP_HEADER,
                 operands=(scan_index, next_shift),
             )
+            # The header's Phi leads its block: LLVM rejects a Phi after the
+            # ``length - 1`` it once followed (c137, lane E).
             self.emit(
                 Handler.Phi, [scan_index, next_shift], shift_index,
                 attributes={
@@ -15004,6 +15077,8 @@ class _ControlSSABuilder(TiledObject):
                     "incoming_blocks": (scan_body.name, shift_latch.name),
                 },
             )
+            self.emit(Handler.Sub, [length, one], new_length,
+                      attributes=attributes)
             shifting = self.fresh_value(
                 dtype="bool", transform=CONTROL_PREDICATE,
                 operands=(shift_index, new_length),
@@ -19858,6 +19933,32 @@ class _ControlSSABuilder(TiledObject):
                     if resolved is not None
                 ), None)
                 if value is None:
+                    # Program: ``if flag > 0: fork = (row + 1, row * 2)
+                    # else: fork = None; return fork`` (also the bootstrap's
+                    # single-exit rewrite of ``if c: return (a, b)`` /
+                    # ``return None``).  Wrong record: history (9, 10, 11)
+                    # had no materialized value -- not the tuple arm (9), not
+                    # the join (11) -- so the owned ``None`` literal (10)
+                    # became the output and the tuple vanished from ``Ret``.
+                    # Rule: an owned literal stands for the output only when
+                    # it is the name's newest binding; a newer binding that
+                    # nothing materialized is refused by name.
+                    literal_position = next((
+                        position
+                        for position in reversed(range(len(history)))
+                        if owned_literal(history[position]) is not None
+                    ), None)
+                    if (
+                        literal_position is not None
+                        and literal_position != len(history) - 1
+                    ):
+                        raise ValueError(
+                            f"returned name {name!r}: its newest binding "
+                            f"(value {int(history[-1])}) was not "
+                            "materialized; returning the older literal "
+                            f"(value {int(history[literal_position])}) "
+                            "would drop it"
+                        )
                     value = next((
                         resolved
                         for value_id in reversed(history)

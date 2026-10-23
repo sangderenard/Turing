@@ -18453,6 +18453,28 @@ def _propagate_native_type_tag_results(
                                         tag if argument is prior_tag else argument
                                         for argument in consumer.args
                                     ]
+                                    # Program: ``if v is not None: t = v * 3``
+                                    # on a value-union call result.  Wrong
+                                    # record: the region feed's view of ``v``
+                                    # kept the provisional tag id after the
+                                    # tag itself was replaced.  Rule: every
+                                    # occurrence of the payload names the
+                                    # linked tag.
+                                    for argument in consumer.args:
+                                        accounting = argument.accounting or {}
+                                        if (
+                                            int(argument.id)
+                                            == int(first_payload.id)
+                                            and accounting.get(
+                                                "native_type_tag_value_id"
+                                            ) == int(prior_tag_id)
+                                        ):
+                                            argument.accounting = {
+                                                **dict(accounting),
+                                                "native_type_tag_value_id": int(
+                                                    tag.id
+                                                ),
+                                            }
                             caller.args = [
                                 argument for argument in caller.args
                                 if argument is not prior_tag
@@ -22762,6 +22784,50 @@ def _class_surface_ssa_program(
                 # does; an arm that is an inactive optional filler is not a
                 # value of the merge (it is never read) and contributes none.
                 member_attributes = data.get("attributes") or {}
+                # Program: ``if x > y: r = x + y else: r = None; return r``
+                # called as ``o = maybe_inc(n, 2)``, then ``(-1 if o is None
+                # else o) + n`` (doc 34 W1).  Wrong record: the name merge of
+                # ``r`` carried no contract, so neither the callee's return
+                # nor the caller's call had a class and the sum's region fell
+                # to float64 (-4 came back as 1.8e19).  Rule: a statement
+                # name merge of an optional (one arm the ``None`` literal)
+                # carries its payload arm's class, as a guard-form optional
+                # return (``if x < y: return None``) already does; its
+                # presence is lowered separately (``ssa_optional_values``),
+                # so it is not a tagged union.
+                if (
+                    str(data.get("type") or "") == "Phi"
+                    and member_attributes.get("source_conditional_id")
+                    is not None
+                    and member_attributes.get("conditional_result_of") is None
+                    and member_attributes.get("aggregate_parent_value_id")
+                    is None
+                ):
+                    merge_id = int(data.get("value_id", node_id))
+                    arm_classes = [
+                        (contracts.get(int(parent)) or {}).get("python_type")
+                        for parent, role in data.get("parents") or ()
+                        if str(role) in {"body", "orelse"}
+                    ]
+                    payload_classes = {
+                        str(identity) for identity in arm_classes
+                        if identity is not None
+                        and str(identity) != "builtins.NoneType"
+                    }
+                    incumbent = contracts.get(merge_id) or {}
+                    if (
+                        len(arm_classes) == 2
+                        and "builtins.NoneType" in arm_classes
+                        and None not in arm_classes
+                        and len(payload_classes) == 1
+                        and not incumbent.get("python_types")
+                        and incumbent.get("python_type") is None
+                    ):
+                        contracts.setdefault(merge_id, {})["python_type"] = (
+                            next(iter(payload_classes))
+                        )
+                        conditional_changed = True
+                    continue
                 member_merge = (
                     str(data.get("type") or "") == "Phi"
                     and (
@@ -48478,13 +48544,29 @@ def _class_surface_ssa_program(
                         # Rebind the exact placeholder object, never every
                         # numerically equal id: independent numbering domains
                         # can legitimately collide.
+                        # Program: ``v = maybe(row, flag)`` where ``maybe``
+                        # returns ``row + 1 if flag > 0 else None``.  Wrong
+                        # record: the placeholder is the authored scalar ``v``
+                        # of a value-union result, not an aggregate feed, so
+                        # ``v is None`` and ``return v`` read the (payload,
+                        # tag) container.  Rule: a union result's semantic
+                        # value is its payload projection (the unpack's Load
+                        # already defines the placeholder object itself).
+                        union_payload = next((
+                            values.get(int(caller_id))
+                            for callee_id, caller_id in record.result_bindings
+                            if union_return_layouts.get(int(callee_id))
+                        ), None)
+                        rebound = (
+                            result if union_payload is None else union_payload
+                        )
                         for caller_block in caller.blocks.values():
                             for caller_instruction in caller_block.instrs:
                                 caller_instruction.args = [
                                     _rebind_linked_storage_alias(
                                         argument,
                                         aggregate_placeholder,
-                                        result,
+                                        rebound,
                                     )
                                     for argument in caller_instruction.args
                                 ]
@@ -48492,7 +48574,7 @@ def _class_surface_ssa_program(
                             argument for argument in caller.args
                             if argument is not aggregate_placeholder
                         ]
-                        values[int(record.callsite_id)] = result
+                        values[int(record.callsite_id)] = rebound
                     if returns_physical_result:
                         consumed_result_ids = (
                             {
