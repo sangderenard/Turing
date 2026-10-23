@@ -3951,6 +3951,30 @@ class _FunctionEmitter:
                         tuple(typed.shape),
                         dtype=typed.dtype,
                     )
+                if (
+                    isinstance(payload, (list, tuple))
+                    and payload
+                    and instr.res is not None
+                    and not any(
+                        isinstance(item, (list, tuple, str, bytes))
+                        for item in payload
+                    )
+                    and tuple(self._typed(instr.res).shape or ())
+                    == (len(payload),)
+                ):
+                    # A populated list literal whose declared shape is its
+                    # own length (``[4, 6, 1]`` feeding ``sum``) is a rank-1
+                    # array constant, stated element for element in the
+                    # declared kind.  Any other shape still refuses below.
+                    typed = self._typed(instr.res)
+                    return _array_literal(
+                        [
+                            float(item) if typed.dtype == "float64" else item
+                            for item in payload
+                        ],
+                        tuple(typed.shape),
+                        dtype=typed.dtype or self.dtype,
+                    )
                 try:
                     return _literal(
                         payload,

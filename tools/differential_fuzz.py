@@ -203,6 +203,8 @@ EXTENDED3 = [
     (["f{v} = maybe_pair(n, {a}) if n != {b} else None", "r{v} = -1", "if f{v} is not None:", "    p{v}, q{v} = f{v}", "    r{v} = p{v} * 10 + q{v}"], "r{v}"),
     # a callee that returns an optional scalar, read after a None test (lane E)
     (["o{v} = maybe_twice(n, {a})", "t{v} = {b}", "if o{v} is not None:", "    t{v} = o{v} - {c}"], "t{v} * 10 + n"),
+    # reductions over a populated list literal (lane E)
+    ([], "sum([{a}, {b}, n]) * 10 + min([{c}, n, {a}])"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
