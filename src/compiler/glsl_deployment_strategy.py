@@ -2252,6 +2252,45 @@ def _planned_scalar_dtypes_from(
                                 ):
                                     settle(scalar, int(target_id),
                                            element.get(argument))
+                # Program: ``for k, x in enumerate(xs): t += k * x`` (c351).
+                # Wrong record: as with ``zip``, the tuple target's names were
+                # never typed, so ``x`` fell to the float64 default; C
+                # multiplied large int rows through float64 (silently wrong)
+                # and LLVM refused the i64/double Phi.  Rule: over
+                # ``enumerate(a[, start])`` the first name is an int64 count
+                # and the second is an element of ``a``.
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and len(loop_expression.target.elts) == 2
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and (zipped.get("attributes") or {}).get(
+                        "extraction_identity") == "builtins.enumerate"
+                ):
+                    counted = [
+                        int(parent)
+                        for parent, role in zipped.get("parents") or ()
+                        if str(role) == "arg:0" and int(parent) in G
+                    ]
+                    if counted:
+                        held_types = (
+                            "int64", element.get(counted[0]),
+                        )
+                        for item, held in zip(
+                            loop_expression.target.elts, held_types,
+                        ):
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
@@ -2283,6 +2322,50 @@ def _planned_scalar_dtypes_from(
                             ) == "loop"
                         ):
                             settle(scalar, int(target_id), held)
+                # Program: ``[k * x for k, x in enumerate(xs)]`` and
+                # ``[p * q for p, q in zip(xs, ys)]``.  Wrong record: a tuple
+                # comprehension target has no single name, so its names fell
+                # to the float64 default and ``sum`` of the result refused
+                # float64 rows.  Rule: as for a ``for`` target, the i-th name
+                # over ``zip`` is an element of the i-th argument, and over
+                # ``enumerate(a)`` the names are an int64 count and an
+                # element of ``a``.
+                call = G.nodes.get(iterable[0], {}) if iterable else {}
+                identity = (call.get("attributes") or {}).get(
+                    "extraction_identity"
+                )
+                if (
+                    isinstance(expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in expression.target.elts)
+                    and identity in {"builtins.zip", "builtins.enumerate"}
+                ):
+                    arguments = sorted(
+                        (int(str(role).split(":", 1)[1]), int(parent))
+                        for parent, role in call.get("parents") or ()
+                        if str(role).startswith("arg:") and int(parent) in G
+                    )
+                    held_types = (
+                        [element.get(argument) for _, argument in arguments]
+                        if identity == "builtins.zip"
+                        else ["int64", element.get(arguments[0][1])]
+                        if arguments and arguments[0][0] == 0 else []
+                    )
+                    if len(held_types) == len(expression.target.elts):
+                        for item, held in zip(
+                            expression.target.elts, held_types,
+                        ):
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
                 continue
             if (
                 op == "loopresult" and len(parents(data, "value")) == 1

@@ -3517,3 +3517,31 @@ def test_sequential_loop_body_does_not_own_captured_predecessor_values():
         or (graph.G.nodes[node_id].get("source_span") or {}).get("line") == 7
         for node_id in second.loop.body_nodes
     )
+
+
+def test_enumerate_start_refuses_rather_than_counting_from_zero():
+    # Program: ``for k, x in enumerate(xs, 3)``.  The count was bound to the
+    # loop induction (which starts at 0) and ``start`` was dropped, so C and
+    # LLVM silently counted from 0.  A start has no loop lowering: it
+    # refuses by name.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = textwrap.dedent(
+        """
+        def root(n: int) -> int:
+            xs = [5, n, 6]
+            t = 0
+            for k, x in enumerate(xs, 3):
+                t += k * x
+            return t
+        """
+    )
+    root = pathlib.Path(__file__).resolve().parents[1]
+    with pytest.raises(ValueError, match="enumerate with a start argument"):
+        lower_ast_source_to_ssa(
+            source, "root", name="enumerate_start",
+            extraction_contract=str(
+                root / "extraction_contracts" / "program_extraction.yaml"
+            ),
+            progress=lambda _: None,
+        )
