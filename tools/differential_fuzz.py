@@ -353,6 +353,7 @@ def build(m: int) -> list[int]:
 # c333-c338.
 EXTENDED4 = [
     (["xs{v} = [n, {a}, {b}, {c}]", "s{v} = 0", "while xs{v}:", "    s{v} = s{v} * 3 + xs{v}.pop()"], "s{v}"),
+    (["s{v} = 0", "t{v} = (n, {a}, n + {b})", "for x{v} in t{v}:", "    if x{v} % 2 == 0:", "        continue", "    s{v} = s{v} * 3 + x{v}"], "s{v} * 10 + t{v}[1]"),
     (["d{v} = {{1: n, 2: {a}}}", "s{v} = 0", "for k{v} in d{v}:", "    s{v} += k{v} * d{v}[k{v}]"], "s{v}"),
     (["d{v} = {{1: n, 3: {a}}}", "s{v} = 0", "for k{v}, w{v} in d{v}.items():", "    s{v} += k{v} * 10 + w{v}"], "s{v}"),
     (["p{v}, q{v} = n, {a}", "p{v}, q{v} = q{v}, p{v} + q{v}"], "p{v} * 100 + q{v}"),
