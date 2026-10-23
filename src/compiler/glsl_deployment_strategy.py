@@ -2017,6 +2017,32 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
         G.graph.get("linked_value_abi") or {}
     ).items():
         dtype = str((contract or {}).get("dtype") or "")
+        # Program: ``o = maybe(n, 3); return (-1 if o is None else o) + n``
+        # with ``maybe`` returning ``x - y`` or ``None``.  Wrong record: the
+        # call's contract spells its class ``'int'`` and the IfExp's names
+        # only ``python_type``, so neither was read, the sum's region fell to
+        # the float64 default, and -4 came back as 1.8e19.  Rule: an absent
+        # or provisional ``'int'`` dtype is the contract's Python class.
+        #
+        # Program: the same sum over ``maybe_inc``, whose ``r`` merges an int
+        # arm with a ``None`` arm (doc 34 W1).  The call's contract is the
+        # union ``(NoneType, int)``.  Rule: an optional scalar's payload --
+        # the only value a region reads, and only when present (its
+        # presence is a separate value after optional lowering) -- has the
+        # class of the union's one non-None arm.
+        python_types = tuple(
+            (contract or {}).get("python_types")
+            or (((contract or {}).get("python_type"),)
+                if (contract or {}).get("python_type") is not None else ())
+        )
+        payload_types = tuple(
+            str(identity) for identity in python_types
+            if str(identity) != "builtins.NoneType"
+        )
+        if dtype in {"", "int"} and len(payload_types) == 1:
+            dtype = classes.get(
+                payload_types[0].removeprefix("builtins."), dtype,
+            )
         if dtype not in {"int64", "float64", "bool"}:
             continue
         rank = int((contract or {}).get("rank") or 0)

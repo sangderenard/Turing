@@ -298,3 +298,112 @@ def test_energy_limit_exact_helper_has_closed_optional_and_structural_abi():
     )
     emitted = emit_ssa_to_c(module, root_name)
     assert emitted.complete, emitted.shortfalls
+
+
+_PROGRAM_CONTRACT = str(
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts" / "program_extraction.yaml"
+)
+
+
+def test_unit_returning_a_statement_merged_optional_exports_its_presence():
+    # ``r = row + 1`` / ``r = None`` merge into a ``conditional_result`` Phi
+    # that the unit's Ret returns.  The export is the output's whole
+    # published surface -- payload and the member that says which arm ran --
+    # exactly as for ``return row + 1 if flag > 0 else None``; before, Ret
+    # was the payload alone.
+    for body in (
+        "    if flag > 0:\n"
+        "        r = row + 1\n"
+        "    else:\n"
+        "        r = None\n"
+        "    return r\n",
+        "    return row + 1 if flag > 0 else None\n",
+    ):
+        module, _outputs, exports = lower_ast_source_to_ssa(
+            "def root(row: int, flag: int):\n" + body,
+            "root", name="optional_statement_unit",
+            extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+        )
+        root = module.functions[exports[0]]
+        (ret,) = [
+            instruction for block in root.blocks.values()
+            for instruction in block.instrs if instruction.op == "Ret"
+        ]
+        layouts = dict(root.metadata["aggregate_return_layouts"])
+        assert len(ret.args) == 2
+        assert layouts == {
+            int(ret.args[0].id): tuple(int(value.id) for value in ret.args)
+        }
+        assert ret.args[0].dtype == "int64"
+        assert check_optional_merges(module) == []
+
+
+def test_unit_returning_tuple_or_none_refuses_instead_of_returning_the_none():
+    # The join of a tuple arm and a None arm has no value; the None arm used
+    # to stand for the output and the tuple vanished from Ret.
+    source = (
+        "def root(row: int, flag: int):\n"
+        "    if flag > 0:\n"
+        "        return (row + 1, row * 2)\n"
+        "    return None\n"
+    )
+    with pytest.raises(ValueError, match="newest binding .* was not materialized"):
+        lower_ast_source_to_ssa(
+            source, "root", name="optional_tuple_unit",
+            extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+        )
+
+
+def test_is_none_on_an_ifexp_union_call_result_reads_its_tag():
+    # ``maybe`` returns ``row + 1 if flag > 0 else None``: a value union whose
+    # call result is (payload, tag).  ``v is None`` used to compare the int
+    # payload (or the call's container) with None; consumers of ``v`` read
+    # the container.  The test reads the tag; every other use reads payload.
+    source = (
+        "def maybe(row: int, flag: int):\n"
+        "    return row + 1 if flag > 0 else None\n"
+        "def root(row: int, flag: int) -> int:\n"
+        "    v = maybe(row, flag)\n"
+        "    if v is None:\n"
+        "        return -1\n"
+        "    return v\n"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="optional_ifexp_callee",
+        extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+    )
+    root = module.functions[exports[0]]
+    instructions = [
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs
+    ]
+    (call,) = [instruction for instruction in instructions if instruction.op == "Call"]
+    handle = int(call.res.id)
+    assert all(
+        instruction.op == "GetElementPtr"
+        for instruction in instructions
+        if any(int(argument.id) == handle for argument in instruction.args)
+    )
+    tags = dict(root.metadata["native_value_type_tags"])
+    (payload_id, tag_id), = tags.items()
+    none_operands = {
+        int(instruction.res.id)
+        for instruction in instructions
+        if instruction.op == "NoneValue"
+    }
+    assert not [
+        instruction for instruction in instructions
+        if instruction.op in {"Eq", "Ne"}
+        and any(int(argument.id) in none_operands for argument in instruction.args)
+    ]
+    assert any(
+        instruction.op == "Eq"
+        and int(instruction.args[0].id) == int(tag_id)
+        for instruction in instructions
+    )
+    (merge,) = [
+        instruction for instruction in instructions
+        if instruction.op == "Phi"
+    ]
+    assert int(payload_id) in {int(argument.id) for argument in merge.args}

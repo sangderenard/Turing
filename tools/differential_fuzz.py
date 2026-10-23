@@ -3,7 +3,10 @@ C and compared with Python; failures clustered by signature.
 
 usage: python tools/differential_fuzz.py OUTDIR SEED COUNT
 (FUZZ_EXT=1/2/3 widen the grammar: extended builtins, then more control
-and sequences, then helpers that mutate and read a caller's list.)
+and sequences, then helpers that mutate and read a caller's list.
+FUZZ_BACKENDS=llvm,fortran also runs each program through LLVM and/or
+Fortran: a wrong value is WRONG, and a refusal of a program C ran is
+LLVM-LOUD or FORTRAN-LOUD.)
 Writes OUTDIR/<id>.py for every program and OUTDIR/results.jsonl.
 """
 import sys, os, random, json, re, warnings, pathlib, tempfile, traceback
@@ -97,9 +100,33 @@ EXTENDED = [
     # one behind a guarding ``and`` (lanes plan A0)
     (["f{v} = n * 0.5 + {a}"], "1 if 0 <= int(f{v}) <= {b} + 3 else 2"),
     (["xs{v} = [{a}, n, {b}]"], "(1 if 1 < len(xs{v}) <= n else 0) + (2 if n != 0 and 0 < abs({a} // n) < 3 else 0)"),
+    # Optional scalar returns: a statement merge with a None arm, and an
+    # early ``return None`` guard, each tested for presence by the caller.
+    (["o{v} = maybe_inc(n, {a})"], "(-1 if o{v} is None else o{v})"),
+    (["o{v} = maybe_guard(n, {a})", "t{v} = 0", "if o{v} is not None:", "    t{v} = o{v} * 3"], "t{v}"),
+    # A value-union return (``x if c else None``) tested by identity.
+    (["o{v} = maybe_pick(n, {a})", "t{v} = 5", "if o{v} is not None:", "    t{v} = o{v} - 2"], "t{v}"),
 ]
 EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
+
+
+def maybe_inc(x: int, y: int):
+    if x > y:
+        r = x + y
+    else:
+        r = None
+    return r
+
+
+def maybe_guard(x: int, y: int):
+    if x < y:
+        return None
+    return x - y
+
+
+def maybe_pick(x: int, y: int):
+    return x * 2 if x != y else None
 
 
 def first_over(x: int, y: int) -> int:
@@ -150,6 +177,14 @@ EXTENDED3 = [
     (["xs{v} = [n, {a}, {b}]"], "pick(xs{v}, n % 3) * 10 + width(xs{v})"),
     # a set grown by a helper (corpus c288, c289)
     (["s{v} = {{n, {a}}}", "addto(s{v}, {b})", "addto(s{v}, n)"], "len(s{v}) * 100 + sum(s{v})"),
+    # backend parity (lane E): a static int and bool tuple read in a loop
+    # under a condition, a resident sum/count/index/any, a sort of a
+    # display with a parameter, an f-string measured in a callee
+    (["r{v} = 0", "for x{v} in ({a}, {b}, {c}):", "    if x{v} <= n:", "        r{v} += x{v}"], "r{v}"),
+    (["r{v} = 0", "for f{v} in (True, False, n > {a}):", "    if f{v}:", "        r{v} += 1"], "r{v}"),
+    (["xs{v} = [{a}, n, {a}, {b}]"], "sum(xs{v}) * 100 + xs{v}.count({a}) * 10 + xs{v}.index(n)"),
+    (["xs{v} = [{a}, n, {b}]", "xs{v}.remove(n)"], "len(xs{v}) * 10 + xs{v}[1]"),
+    (["c{v} = label(n + {a})"], "c{v}"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
@@ -184,6 +219,10 @@ def pick(xs: list[int], i: int) -> int:
 
 def addto(s: set[int], v: int) -> None:
     s.add(v)
+
+
+def label(x: int) -> int:
+    return len(f"value={int(x)}")
 
 
 """
@@ -300,6 +339,54 @@ def run_one(text):
             wrong.append(f"n={n} got {value} want {want}")
         elif got[0].dtype.kind not in "iub":
             typed.append(n)
+    if not wrong and "llvm" in os.environ.get("FUZZ_BACKENDS", ""):
+        from src.compiler.ssa_llvm_backend import (
+            compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
+        )
+        llvm = emit_ssa_function_to_llvm(module, exports[0])
+        if not llvm.complete:
+            return "LLVM-LOUD", signature(f"llvm {llvm.shortfalls[0].operation}: {llvm.shortfalls[0].reason}")
+        try:
+            llvm = compile_artifact(llvm)
+        except Exception as error:  # noqa: BLE001
+            return "LLVM-LOUD", signature(f"llvm compile {type(error).__name__}: {error}")
+        for n in inputs:
+            want = expected[n]
+            if isinstance(want, tuple):
+                continue
+            ex = prepare_artifact_execution(llvm, {params["n"]: np.array([n])} if "n" in params else {}).run()
+            value = np.asarray(ex.buffers[outs[0].id]).reshape(-1)[0]
+            if float(value) != float(want):
+                wrong.append(f"llvm n={n} got {value} want {want}")
+    if not wrong and "fortran" in os.environ.get("FUZZ_BACKENDS", ""):
+        from src.compiler.ssa_fortran_backend import FortranCoreNative, emit_module
+        from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
+        try:
+            fortran = emit_module(module, progress=lambda _: None)
+        except Exception as error:  # noqa: BLE001
+            return "FORTRAN-LOUD", signature(f"fortran {type(error).__name__}: {error}")
+        if not fortran.complete:
+            return "FORTRAN-LOUD", signature(f"fortran {fortran.shortfalls[0].format()}")
+        try:
+            built = compile_fortran_module_c_shell(
+                fortran, {}, pathlib.Path(tempfile.mkdtemp()), library=True,
+                entrypoint=exports[0], name=exports[0][:48],
+            )
+            record = next(e for e in fortran.api.entry_points if str(e.name) == exports[0])
+            native = FortranCoreNative(built.executable_path, record, fortran.api)
+        except Exception as error:  # noqa: BLE001
+            return "FORTRAN-LOUD", signature(f"fortran compile {type(error).__name__}: {error}")
+        for n in inputs:
+            want = expected[n]
+            if isinstance(want, tuple):
+                continue
+            try:
+                ex = native.prepare_execution({params["n"]: np.array([n])} if "n" in params else {}).run()
+            except Exception as error:  # noqa: BLE001
+                return "FORTRAN-LOUD", signature(f"fortran run {type(error).__name__}: {error}")
+            value = np.asarray(ex.buffers[outs[0].id]).reshape(-1)[0]
+            if float(value) != float(want):
+                wrong.append(f"fortran n={n} got {value} want {want}")
     if wrong:
         return "WRONG", "; ".join(wrong[:2]) + f" | findings={finding_count}"
     if finding_count:

@@ -1686,10 +1686,23 @@ def _linked_frame_sequences(module: Any, function_name: str) -> tuple[Any, ...]:
             if capacity is None or None in columns:
                 continue
             owner = sequence.heap_owner_value_id
+            # Length and status cells travel the same exact bindings; the
+            # Fortran runtime binding names all of them (lane E, c217).
+            length = aliases.get((name, int(sequence.length_address_id)))
+            status = (
+                None if sequence.status_address_id is None
+                else aliases.get((name, int(sequence.status_address_id)))
+            )
             linked.append(_replace(
                 sequence,
                 column_value_ids=columns,
                 capacity_value_id=capacity,
+                length_address_id=(
+                    sequence.length_address_id if length is None else length
+                ),
+                status_address_id=(
+                    sequence.status_address_id if status is None else status
+                ),
                 heap_owner_value_id=(
                     None if owner is None else aliases.get((name, int(owner)))
                 ),
@@ -4765,7 +4778,27 @@ def emit_ssa_module_to_c(
                                 )
                                 output_argument = None
                             else:
-                                destination = output_destinations.get(output_id)
+                                # Program: ``v = maybe(row, flag)`` in a root
+                                # whose own output is id 8, calling a
+                                # specialized ``maybe`` whose payload output
+                                # is also id 8.  Wrong record: the callee's
+                                # output id was looked up among the CALLER's
+                                # output buffers, so the call wrote its
+                                # payload straight into the root's result.
+                                # Rule: the caller's own projection values
+                                # name the caller's storage; the callee's
+                                # output ids live in the callee's namespace.
+                                caller_destinations = {
+                                    output_destinations[int(projection.value.id)]
+                                    for projection in projections
+                                    if int(projection.value.id)
+                                    in output_destinations
+                                }
+                                destination = (
+                                    next(iter(caller_destinations))
+                                    if len(caller_destinations) == 1
+                                    else None
+                                )
                             if formal_position is None and destination is not None:
                                 output_argument = destination
                                 projected_expression = (

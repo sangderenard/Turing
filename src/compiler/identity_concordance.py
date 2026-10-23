@@ -1775,6 +1775,19 @@ class CorrelationTable:
                         in abi_by_value.get(int(value_id), ())
                         if tuple(abi.alternatives) == tuple(fact.alternatives)
                     ]
+                    # Program: ``o = maybe_inc(n, 1)`` beside an unrelated
+                    # caller value numbered 6, both ``None | int`` (fuzzer
+                    # p0_140).  Wrong record: the candidates were keyed by
+                    # value id alone, so the caller's value 6 and the
+                    # callee's value 6 were two candidates for one state.
+                    # Rule: value ids are scope-local; among equal-arm
+                    # candidates the state's own ABI is the one it derives
+                    # from.
+                    if len(candidates) > 1:
+                        candidates = [
+                            (abi, ref) for abi, ref in candidates
+                            if ref.key in sources
+                        ]
                     if len(candidates) != 1:
                         problem = (
                             "union alternative state has no unique exact "

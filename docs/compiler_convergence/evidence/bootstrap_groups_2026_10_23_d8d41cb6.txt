@@ -1,0 +1,73 @@
+Counter({'failed': 246, 'partial': 69, 'compiled-unverified': 55})
+196 source enclosure lacks a complete dependency product; authored expansion forbidden
+    [(9, 'src.compiler.id_space.label', 'source-normalisation'), (10, 'render_row', 'source-normalisation'), (11, 'CellNeighborhood.lines', 'source-normalisation'), (14, 'Claim.__setstate__', 'source-normalisation')]
+69 <no error; status=partial>
+    [(12, 'CellNeighborhood.lines.<locals>.<lambda:9744:43>', 'compiler-finalization'), (17, 'argument_binding_history', 'compiler-finalization'), (23, 'CorrelationTable._callable_identity_findings', 'compiler-finalization'), (55, 'CorrelationTable._is_authored', 'compiler-finalization')]
+12 formatted glyph component has no resident producer: value=N projection='X'
+    [(6, 'src.compiler.id_space.describe', 'ssa-lowering'), (16, 'CorrelationTable._abi_or_member_key', 'ssa-lowering'), (19, 'CorrelationTable._build_function.<locals>.claim_layout_type', 'ssa-lowering'), (86, 'CorrelationTable._graph_work_publication_findings', 'ssa-lowering')]
+3 native interface argument role is not declared: value
+    [(219, 'IdentityPage.__setstate__', 'deployment-instantiate'), (224, 'IdentityPage.holds', 'deployment-instantiate'), (225, 'IdentityPage.is_virtual', 'deployment-instantiate')]
+2 native union parameter record arm lacks its descriptor-backed side-by-side frame: 'X' arm 'X'
+    [(13, 'IdentityPage.__setattr__', 'ssa-lowering'), (60, 'src.compiler.ssa_heap_allocation.require_heap_owner', 'ssa-lowering')]
+2 SSA dependency lacks complete provenance: [Finding(kind='X', function='X', value
+    [(50, 'IdentityBook._ensure_owner_whole', 'source-normalisation'), (207, 'src.compiler.identity_spill._drop_owners', 'source-normalisation')]
+2 native union result aggregate/reference arm requires its exact descriptor-backed frame: value=N, arm='X'
+    [(286, '_shape_key', 'ssa-lowering'), (287, '_shape_owner_metadata', 'ssa-lowering')]
+1 whole-object SSA lowering is incomplete: CorrelationTable_row__row::root.sequence[N].body::carried-field-arm-missing (a field-carried conditional arm names a fi
+    [(20, 'CorrelationTable.row', 'ssa-lowering')]
+1 whole-object SSA lowering is incomplete: IdentityBook__virtual_edges_into___virtual_edges_into::IdentityBook__virtual_edges_into___virtual_edges_into.return_slo
+    [(34, 'IdentityBook._virtual_edges_into', 'ssa-lowering')]
+1 whole-object SSA lowering is incomplete: IdentityPage_history__history::IdentityPage_history__history.return_slot[N]::return (a return statement's slot value co
+    [(36, 'IdentityPage.history', 'ssa-lowering')]
+1 region N has multiple sequential control owners; function='X'; controls=[{'X': N, 'X': (N, N), 'X': (N,), 's
+    [(64, 'src.compiler.ssa_heap_allocation.validate_heap_context_projection', 'graph-planning')]
+1 authored heterogeneous table value has no exact native type evidence: sequence=N, value=N
+    [(69, 'src.transmogrifier.ssa.SSASequenceDescriptor.to_mapping', 'ssa-lowering')]
+1 control effect order conflicts with value dependencies: cycle=[(N, ('X', None, N, None, None, None), [N], ((N,), (N,))), (N, ('X', None
+    [(72, 'src.compiler.ssa_object_context.native_object_requirement_sources', 'ssa-lowering')]
+1 SSA dependency lacks complete provenance: [Finding(kind='X', function='X', value_id=N, detail=
+    [(85, 'CorrelationTable._function_findings', 'source-normalisation')]
+1 whole-object SSA lowering is incomplete: src_common_tensors_topological_reducer__return_slot_receipt___return_slot_receipt::root.sequence[N].sorted_order.sequen
+    [(106, 'src.common.tensors.topological_reducer._return_slot_receipt', 'ssa-lowering')]
+1 region N has multiple sequential control owners; function='X'; controls=[{'X': N, 'X': (N, N, N, N, N, N, N, N, N, N, 
+    [(117, 'CorrelationTable._source_page_declaration_findings', 'graph-planning')]
+1 sequence contract concordance disagreement for 'X' value N: shell sequence declaration committed unique/N, shell sequence declaration says unique/N
+    [(124, 'CorrelationTable._ssa_publication_findings.<locals>.observe', 'ssa-lowering')]
+1 whole-object SSA lowering is incomplete: src_compiler_identity_spill__dispatch_table__uNc_locals_uNe__reducer__uNc_locals_uNe__reduce__reduce::src_compiler_iden
+    [(164, 'src.compiler.identity_spill._dispatch_table.<locals>.reducer.<locals>.reduce', 'ssa-lowering')]
+1 List N aggregate layout has N member(s), source has N
+    [(167, 'src.compiler.shell_telemetry._windows_rss_binding', 'ssa-lowering')]
+1 whole-object SSA lowering is incomplete: src_compiler_work_contract__named___named::root.sequence[N].body.sequence[N].sequence_mutation[N]::resolved-schema-mism
+    [(170, 'src.compiler.work_contract._named', 'ssa-lowering')]
+1 native union alternative has no exact ProgramABI storage: function='X' value N arm 'X' contract={'X': ('X'
+    [(176, 'src.compiler.identity_spill.BookSpill.read', 'ssa-lowering')]
+1 whole-object SSA lowering is incomplete: IdentityPage_scope_rows__scope_rows::root.sequence[N].body.sequence_mutation[N]::update (mapping update requires determ
+    [(186, 'IdentityPage.scope_rows', 'ssa-lowering')]
+1 SSA dependency lacks complete provenance: [Finding(kind='X', function='X', value_id=N, 
+    [(208, 'src.compiler.identity_spill._extract', 'source-normalisation')]
+1 whole-object SSA lowering is incomplete: IdentityBook_unsourced_rows__unsourced_rows::IdentityBook_unsourced_rows__unsourced_rows.return_slot[N]::return (a retu
+    [(214, 'IdentityBook.unsourced_rows', 'ssa-lowering')]
+1 native interface has no exact record binding for page
+    [(228, 'IdentityPage.mapping', 'deployment-instantiate')]
+1 semantic_output page, row (("lexical_reads:('X', 'X')|fork", N), N): the reducer's row holds None but struc
+    [(245, 'PageMapping.__reduce__', 'ssa-lowering')]
+1 heterogeneous resident sequence arm requires an exact nested descriptor-backed payload column: sequence=N, projection=N, arm='X', storage='X'
+    [(249, 'Ref.__getstate__', 'ssa-lowering')]
+1 sequence row dtype concordance disagreement for 'X' value N: recorded=('X', 'X'), Registry_declare_page__declare_page: t
+    [(256, 'Registry.declare_page', 'ssa-lowering')]
+1 whole-object SSA lowering is incomplete: _ConcurrentIdentityBook__page___page::root.sequence[N].body::carried-name-arm-missing (a name-carried conditional arm n
+    [(261, '_ConcurrentIdentityBook._page', 'ssa-lowering')]
+1 sequence sort scratch must match the row layout
+    [(278, 'src.compiler.id_space.group_by_prefix', 'ssa-lowering')]
+1 shared heterogeneous sequence payload changes its physical ABI: value=N, payload=(None, ()), declared=('X', (-N,))
+    [(327, 'publish_program_abi_graph_identities.<locals>.schema_named', 'ssa-lowering')]
+1 sequence row dtype concordance disagreement for 'X' value N: recorde
+    [(336, 'src.compiler.frame_identity_book._frame_accounting_from_posted', 'ssa-lowering')]
+1 control effect order conflicts with value dependencies: cycle=[(N, ('X', None, None, None, None, None), [N, N], ((N, N, N, N, N, N, N), (N, N, N, N, N))
+    [(351, 'scope_local_accounting_ids', 'ssa-lowering')]
+1 record constructor requires a complete physical schema, but only an exact projection view is available: record='X', fields=('X', 'X',
+    [(358, 'src.compiler.compressed_tiles.CompressedTile.encode', 'ssa-lowering')]
+1 whole-object SSA lowering is incomplete: src_compiler_compressed_tiles_CompressedTable_stats__stats::src_compiler_compressed_tiles_CompressedTable_stats__stats:
+    [(362, 'src.compiler.compressed_tiles.CompressedTable.stats', 'ssa-lowering')]
+1 native union Phi has an incoming value without exact type evidence: result=N, incoming=(N, N), binding='X'
+    [(365, 'src.compiler.identity_spill.BookSpill.__init__', 'ssa-lowering')]
