@@ -403,3 +403,41 @@ unchanged (static, which is what Windows uses).
   which pins the exact runtime-binding mapping. A binding now carries
   `column_shapes` (E10), so the expectation adds `"column_shapes": [[]]`.
   With that, the test passes; every other name matches main.
+
+## E11: a dict that accumulates into itself through `get` (C silent on main, LLVM refused)
+
+- **Program:** `d = {}; for i in range(n): d[i % 3] = d.get(i % 3, 0) +
+  36028797018963969`, then a membership loop sums `d[k]` (c304, c178).
+- **Wrong record:** the planner's scalar proof table types a collection's
+  rows as the join of its writers. Here the writer reads `d.get`, and
+  `d.get` reads the rows: a cycle that the pessimistic fixpoint never
+  closes. So the rows fell to the float64 default, C added 2**55 + 1
+  through float64 (c304 returns ...968 for ...969), and LLVM refused the
+  i64/double Phi (c178). `get` had no rule at all, and a loop that carries
+  a store yielded no element type.
+- **Rule:**
+  - `d.get(k, default)` is the join of `d`'s rows and the default.
+  - A loop whose carried value is a store yields the stored collection's
+    rows.
+  - For a dict whose rows are unproven and that is read by `get` with a
+    typed default, the planner assumes the default's type. It accepts the
+    assumption only if, under it, the dict's writers join to exactly that
+    type (a consistent typing of the cycle). Otherwise it assumes nothing.
+- c304 is WRONG in C at main `08ba0171` and passes in C and LLVM here.
+  c178 moves from LLVM refused to PASS.
+- **Found beside it, not fixed here (handed to the silent lane):**
+  `d[i % 2] = d.get(i % 2, 0) + 5` in a loop, then `return d[0] + len(d)`,
+  returns 7 for 12 at n = 3, on main too. The audit reports that the
+  post-loop `d[0]` read takes a value defined in the loop body.
+
+### Receipts for E11
+
+- Census at `b40bcf78` (220 programs, dynamic Fortran runtime): C
+  220/220. LLVM 210 PASS, 0 WRONG, 10 refused. Fortran 135 PASS, 1 WRONG
+  (c22), 3 RUN-FAIL, 0 COMPILE-FAIL.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 48 (with the accumulating-dict snippet): 19 PASS, 15 FORTRAN-LOUD,
+  3 LLVM-LOUD, 3 LOUD, 0 WRONG and 0 TYPE.
+- Gate at `b40bcf78` (covers E5-E11), on a clean worktree: aa 89 / ab 7 /
+  ac 26 / rec 20. The failure names in every part are the same as main
+  `08ba0171`'s.

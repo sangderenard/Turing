@@ -1,3 +1,10 @@
+2026-10-23 LANE E, E11 (MEASURED, cloud): a dict accumulating into itself
+through get (d[k] = d.get(k, 0) + x) had float64 rows; C rounded large
+ints silently on main (c304). The planner now accepts a consistent typing
+of that cycle. At b40bcf78 (220 programs): C 220/220, LLVM 210 / 0 WRONG /
+10 refused, Fortran 135 PASS. Gate names identical to main 08ba0171. Fuzz
+seed 48 llvm,fortran: 0 WRONG / 0 TYPE.
+
 2026-10-23 LANE E, E8-E10 (MEASURED, cloud): Fortran rank-0 span formals
 are cells, a load is not folded past a write (callee swap), a callee list
 whose sequence id collides with root's gets its capacity (c303, Fortran
