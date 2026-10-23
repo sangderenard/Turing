@@ -36,7 +36,8 @@ branch has used, merged or not.
 | c240-c249 | Lane C: C1 constant-list comprehensions | `claude/project-thread-2nw77p` | c240-c243 |
 | c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
-| c280-c289 | next free | | |
+| c280-c289 | Silent lane follow-ups (indexed stores in the call order) | `claude/project-thread-cz18s3` | c280 |
+| c290-c299 | next free | | |
 
 ## Lane A: bootstrap families (and the tire, where it shares a group)
 

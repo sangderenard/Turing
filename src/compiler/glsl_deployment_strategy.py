@@ -10789,6 +10789,30 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         for node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("expr_obj"), ast.BinOp)
         and (data.get("attributes") or {}).get("aggregate_kind") == "list"
+    ] + [
+        # Program: ``xs0 = [5, n, 0]; xs0[1] = 8; xs0[0] += n; xs1 = [7,
+        # 7]; push(xs1, n); push(xs1, 2)`` then reads of both (fuzzer
+        # p28_37; corpus c280).  Wrong record: an indexed store was no
+        # member of this order, so the reducer fused the augmented store's
+        # ``xs0[0] + n`` with the reads of ``xs1`` after both pushes; the
+        # store placed that region before the calls, and the reads saw
+        # neither push (1220 for 409; with ``xs1 = []`` a null read).  Rule:
+        # an indexed store is an in-place effect lowered where it is
+        # authored, so it keeps its place in this order too.  The store an
+        # augmented assignment writes has no location of its own; it
+        # completes where its value does.
+        (int(node_id), store_expression)
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) == "IndexedStore"
+        for store_expression in ((
+            data.get("expr_obj")
+            if getattr(data.get("expr_obj"), "lineno", None) is not None
+            else next((
+                graph.G.nodes[int(parent)].get("expr_obj")
+                for parent, role in data.get("parents") or ()
+                if str(role) == "value" and int(parent) in graph.G
+            ), None)
+        ),)
     ]
     # Program: ``while k0 > 0: xs0.append(k0); k0 -= 2`` then ``swap(xs2)``
     # (fuzzer p24_54).  An effect inside a loop is observed when its
