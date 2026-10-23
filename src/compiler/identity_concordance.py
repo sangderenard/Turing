@@ -1515,6 +1515,7 @@ class CorrelationTable:
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
+        found.extend(self._unborn_display_findings(module))
         found.extend(self._live_structure_findings(module))
         found.extend(self._ssa_publication_findings(module))
         found.extend(self._value_type_abi_findings(module))
@@ -3617,6 +3618,130 @@ class CorrelationTable:
                     "source-aggregate-layout-disagreement", str(scope),
                     None if value_id is None else int(value_id), problem,
                 ))
+        return found
+
+    @staticmethod
+    def _unborn_display_findings(module: Any) -> list[Finding]:
+        """Report a display whose resident length is read but never written.
+
+        Program: ``t = (n + 1, n + 2, n * 3); len(t)`` (c260).  The
+        SOURCE_AGGREGATE_LAYOUT row said three members; the module read the
+        tuple's length cell, and no instruction anywhere cleared or wrote
+        that sequence, so ``len(t)`` read the frame's zeroed cell and
+        returned 0 with a clean audit.  The two records are the layout's
+        member count and the module's writers of that sequence identity.
+        """
+
+        from .concordance_declarations import (
+            SOURCE_AGGREGATE_LAYOUT,
+            SourceAggregateLayout,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        page = (
+            None if book is None else
+            (getattr(book, "pages", {}) or {}).get(
+                SOURCE_AGGREGATE_LAYOUT.name
+            )
+        )
+        if page is None:
+            return []
+        layouts: dict[int, SourceAggregateLayout] = {}
+        for row in page.rows():
+            if not (isinstance(row, tuple) and len(row) == 2):
+                continue
+            history = page.history(row)
+            fact = history[-1][1] if history else None
+            if isinstance(fact, SourceAggregateLayout) and fact.members:
+                layouts[int(row[1])] = fact
+        if not layouts:
+            return []
+        written: set[int] = set()
+        reads: list[tuple[str, int]] = []
+        for name, function in module.functions.items():
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    attributes = getattr(instruction, "attributes", {}) or {}
+                    sequence_id = attributes.get("sequence_id")
+                    if sequence_id is not None:
+                        written.add(int(sequence_id))
+                    if (instruction.op == "Load"
+                            and attributes.get("binding") == "ssa_sequence_length"
+                            and attributes.get("sequence_value_id") is not None):
+                        reads.append(
+                            (str(name), int(attributes["sequence_value_id"]))
+                        )
+        found = []
+        # Program: ``d[3] = n; xs = [1, 2] + [n, 8]; xs[2]`` (c262).  The
+        # concatenation copied ``[n, 8]`` before that display's birth cleared
+        # and wrote it, in one straight-line block.  The two records are the
+        # birth (the display's ``ssa_sequence_clear``) and the copy that
+        # names it as its source.
+        for name, function in module.functions.items():
+            for block in function.blocks.values():
+                copied: dict[int, int] = {}
+                for position, instruction in enumerate(block.instrs):
+                    attributes = getattr(instruction, "attributes", {}) or {}
+                    source = attributes.get("source_sequence_id")
+                    if (attributes.get("ssa_sequence_operation") == "append_slice"
+                            and source is not None):
+                        copied.setdefault(int(source), position)
+                    if (attributes.get("binding") == "ssa_sequence_clear"
+                            and attributes.get("sequence_id") is not None
+                            and int(attributes["sequence_id"]) in copied
+                            and int(attributes["sequence_id"]) in layouts):
+                        found.append(Finding(
+                            "display-read-before-birth", str(name),
+                            int(attributes["sequence_id"]),
+                            "a slice copy reads this display before its "
+                            "birth clears and writes it in the same block",
+                        ))
+        # Program: ``ys = [x * n for x in xs]; ys.append(n); sum(ys)``
+        # (c266).  The reduction counted the comprehension's three rows (a
+        # static extent) while four appends wrote the sequence.  The two
+        # records are the reduced value's static extent and the module's
+        # appends to that sequence identity.
+        appends: dict[int, int] = {}
+        reductions: list[tuple[str, int, int]] = []
+        for name, function in module.functions.items():
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    attributes = getattr(instruction, "attributes", {}) or {}
+                    if (attributes.get("ssa_sequence_operation") == "append"
+                            and attributes.get("sequence_id") is not None):
+                        sequence_id = int(attributes["sequence_id"])
+                        appends[sequence_id] = appends.get(sequence_id, 0) + 1
+                    if instruction.op not in {"sum", "max", "min", "any", "all"}:
+                        continue
+                    source = instruction.args[0] if instruction.args else None
+                    accounting = getattr(source, "accounting", None) or {}
+                    shape = tuple(getattr(source, "shape", None) or ())
+                    if (accounting.get("sequence_id") is not None
+                            and len(shape) == 1
+                            and isinstance(shape[0], int)):
+                        reductions.append((
+                            str(name), int(accounting["sequence_id"]),
+                            int(shape[0]),
+                        ))
+        for name, sequence_id, extent in dict.fromkeys(reductions):
+            if appends.get(sequence_id, 0) > extent:
+                found.append(Finding(
+                    "static-extent-of-grown-sequence", name, sequence_id,
+                    f"a reduction reads {extent} row(s) as a static extent, "
+                    f"but {appends[sequence_id]} appends write this sequence",
+                ))
+        for name, sequence_id in dict.fromkeys(reads):
+            layout = layouts.get(sequence_id)
+            if layout is None or sequence_id in written:
+                continue
+            found.append(Finding(
+                "display-length-unborn", name, sequence_id,
+                f"{layout.aggregate_kind} display has {len(layout.members)} "
+                "member(s) in its source layout, but no instruction writes "
+                "its resident sequence before its length is read",
+            ))
         return found
 
     @staticmethod

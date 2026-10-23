@@ -32,6 +32,8 @@ SNIPPETS = [
     (["d{v} = {{}}", "for i{v} in range(n % 4 + 1):", "    d{v}[i{v} % 2] = i{v}"], "len(d{v}) * 10 + d{v}[0]"),
     (["s{v} = set()", "for i{v} in range(n % 5 + 2):", "    s{v}.add(i{v} % 3)"], "len(s{v}) * 10 + (1 if 2 in s{v} else 0)"),
     (["t{v} = (n, {a}, {b})", "q{v}, r{v}, w{v} = t{v}"], "q{v} + r{v} * w{v}"),
+    (["t{v} = (n + {a}, n * {b}, {c})"], "len(t{v}) * 100 + t{v}[1]"),
+    (["t{v} = (n > {a}, n < {b})", "c{v} = 0", "for x{v} in t{v}:", "    if x{v}:", "        c{v} += 1"], "c{v} * 10 + len(t{v})"),
     # control
     (["c{v} = 0", "for i{v} in range(n % 7 + 1):", "    if i{v} % 3 == 0:", "        continue", "    c{v} += i{v}"], "c{v}"),
     (["c{v} = -1", "for i{v} in range(10):", "    if i{v} * {a} > n + 5:", "        c{v} = i{v}", "        break"], "c{v}"),
@@ -60,6 +62,10 @@ EXTENDED = [
     (["xs{v} = [{a}, {b}, {a}, n]"], "xs{v}.count({a}) * 10 + xs{v}.index({b})"),
     (["f{v} = n * 0.5 + {a}", "g{v} = f{v} * 2.0"], "int(g{v})"),
     (["xs{v} = [{a}, {b}] + [n, {c}]"], "len(xs{v}) * 10 + xs{v}[2]"),
+    (["d{v} = {{1: {a}}}", "d{v}[2] = n", "xs{v} = [{b}] + [n, {c}]"], "xs{v}[1] * 10 + len(xs{v}) + d{v}[2]"),
+    (["xs{v} = [n] + [{a}, {b}] + [n * {c}]"], "len(xs{v}) * 10 + xs{v}[3]"),
+    (["t{v} = 0", "for y{v} in [x{v} * n for x{v} in [{a}, {b}, {c}]]:", "    t{v} += y{v}"], "t{v}"),
+    (["ys{v} = [x{v} * n for x{v} in [{a}, {b}]]", "ys{v}.append(n + {c})"], "len(ys{v}) * 100 + sum(ys{v}) + ys{v}[2] * 1000"),
     (["xs{v} = [{a}] * (n % 4 + 1)"], "len(xs{v}) * 10 + xs{v}[0]"),
     (["xs{v} = [{a}, n, {b}, {c}]", "del xs{v}[1]"], "len(xs{v}) * 10 + xs{v}[1]"),
     (["q{v}, r{v} = pair(n, {a})"], "q{v} * 10 + r{v}"),
@@ -70,6 +76,11 @@ EXTENDED = [
     (["bs{v} = [n > {a}, n < {b}, True]"], "sum(1 for b{v} in bs{v} if b{v})"),
     (["xs{v} = [{a}, n, {b}]", "ys{v} = list(xs{v})", "ys{v}.append(n)"], "len(xs{v}) * 10 + len(ys{v})"),
     (["xs{v} = [{a}, n, {b}, {c}]"], "xs{v}[-1] * 10 + xs{v}[-2]"),
+    # comprehensions over an all-constant (folded) list (corpus c240-c243)
+    (["xs{v} = [{a}, {b}, {c}]", "ys{v} = [x{v} * n for x{v} in xs{v}]"], "sum(ys{v}) * 10 + len(ys{v})"),
+    (["xs{v} = [{a}, {b}, {c}]"], "int(any([x{v} > n for x{v} in xs{v}])) * 10 + int(all([x{v} > n for x{v} in xs{v}]))"),
+    (["xs{v} = [{a}, {b}, {c}]", "ys{v} = [x{v} - n for x{v} in xs{v}]"], "ys{v}[n % 3] * 10 + sum(ys{v})"),
+    (["s{v} = {{(x{v} + n) % 3 for x{v} in [{a}, {b}, {c}]}}"], "len(s{v})"),
     # chained comparisons whose middle is a builtin conversion or measure,
     # one behind a guarding ``and`` (lanes plan A0)
     (["f{v} = n * 0.5 + {a}"], "1 if 0 <= int(f{v}) <= {b} + 3 else 2"),

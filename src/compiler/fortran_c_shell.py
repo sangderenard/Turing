@@ -13424,8 +13424,14 @@ def _install_lexical_sequence_mutations(
         if source_id is None:
             return None
         expression = graph.G.nodes.get(int(source_id), {}).get("expr_obj")
-        start = getattr(expression, "lineno", None)
-        end = getattr(expression, "end_lineno", None)
+        # Program: ``for y in [x * n for x in xs]: t += y`` (c265).  Wrong
+        # record: this private copy of loop containment used the ``for``
+        # statement's whole span, so the iterable comprehension's birth
+        # (its clear and appends, authored on the ``for`` line) was placed
+        # in the loop body, after the loop had read the empty iterable's
+        # length (0 for 6; clean audit).  Rule: one containment rule, the
+        # loop's per-iteration lines (``_loop_body_line_span``, p3_46).
+        start, end = _loop_body_line_span(expression)
         if start is None or end is None:
             return None
         return int(start), int(end)
@@ -26994,6 +27000,18 @@ def _class_surface_ssa_program(
             for mutation in _control_sequence_mutations(control.root)
             if str(mutation.operator) == "sorted"
             and int(mutation.sequence_value_id) not in output_history_ids
+        )
+        # Program: ``xs = []; for i in range(n): xs.append(i); ys = [7] + xs;
+        # len(ys)`` (c263).  Wrong record: a concatenation no bound covers
+        # was neither bounded nor DYNAMIC, so its arena took the planner's
+        # elementwise extent and the slice copy stopped there (``len(ys)``
+        # 1 for 4; clean audit).  Rule: a concatenation is born here and
+        # holds its operands' rows; with no proven bound it is DYNAMIC.
+        dynamic_sequence_ids.update(
+            int(result_id)
+            for result_id, *_operands in sequence_concats
+            if int(result_id) not in sequence_capacity_bounds
+            and int(result_id) not in output_history_ids
         )
         grown = True
         while grown:
@@ -47506,7 +47524,21 @@ def _class_surface_ssa_program(
                         # private map.  Ask the shared page which kind can
                         # actually materialize it; otherwise one callsite
                         # restores the slot and another refuses the call.
-                        try:
+                        #
+                        # Lane D, item D3. Wrong record: this call sat in an
+                        # ``except Exception: pass``.  A literal binding
+                        # (``default_literal``, ``caller_literal``) carries
+                        # its value as its source -- ``[1, 2]``, ``'v='``,
+                        # or an int -- so ``int(source)`` raised for lists
+                        # and strings (c62, c271, c272), and an int literal
+                        # would have been looked up as a caller value id.
+                        # Rule: only a binding that names a caller slot asks
+                        # the page which kind materializes it; a literal is
+                        # never a slot, and the lookup itself is not
+                        # allowed to fail silently.
+                        if kind in {
+                            "caller_value", "caller_alias", "caller_storage"
+                        }:
                             from .identity_concordance import (
                                 current_identity_book,
                                 materializing_binding_kind,
@@ -47517,8 +47549,6 @@ def _class_surface_ssa_program(
                                 record.callee_symbol or callee.name,
                                 int(argument.id), int(source), kind,
                             )
-                        except Exception:
-                            pass
                         if kind in {
                             "caller_value", "caller_alias", "caller_storage"
                         }:

@@ -20,11 +20,29 @@ Every item ends with: a corpus program (`tests/native_semantics_corpus/`),
 the full typed corpus check (0 non-PASS), a fuzz seed in the lane's tier
 (0 WRONG, 0 TYPE), and the gate (no new names in all four parts).
 
+## Corpus number reservations
+
+Corpus programs are `tests/native_semantics_corpus/cNNN_<name>.py`. Two
+lanes adding programs at once collided on c218 and c240 to c243 on
+2026-10-22. Before adding a program, claim a range here (on your branch, in
+the same commit as the claim of your item) and number inside it. Take the
+next free block of 10 above the highest row; never reuse a number another
+branch has used, merged or not.
+
+| range | lane / item | branch | used |
+|---|---|---|---|
+| c211-c218 | Lane A: A0, A3 and follow-ups | `claude/project-thread-kbkzp7` | c211, c212, c214-c218 |
+| c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c234 |
+| c240-c249 | Lane C: C1 constant-list comprehensions | `claude/project-thread-2nw77p` | c240-c243 |
+| c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
+| c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
+| c280-c289 | next free | | |
+
 ## Lane A: bootstrap families (and the tire, where it shares a group)
 
 | rank | item | group (doc 34) | claimed functions | branch | status |
 |---|---|---|---|---|---|
-| A1 | Give tuple displays a birth. Place the predicate region that produces the members before the effects that consume them, then birth tuples as lists are born. | S1 | `resident_sequence_materialization._list_literal_mutations`; the region-ownership rule that assigns the members' region to the later conditional (find it with a trap first) | | open: silent on `main` with a clean audit |
+| A1 | Give tuple displays a birth. Place the predicate region that produces the members before the effects that consume them, then birth tuples as lists are born. | S1 | `resident_sequence_materialization._list_literal_mutations`, `resident_sequence_materialization._static_sequence_capacity_survey`, `identity_concordance.CorrelationTable._unborn_display_findings` (new) | `claude/project-thread-cz18s3` | in review: born and bounded; the predicate-region placement did not reproduce at `main` |
 | A2 | Keep a return surface whole: the remaining pieces. `emit_outputs` must not fall back to `(output_id,)` when no `Ret` exists; accepted-unit accounting must not let one value stand for a tuple/optional (`project_compilation_product`, `len(paths) == 1 and len(published_ids) == 1`); add the doc 34 §1.4 false-acceptance check to the bootstrap status tool. The optional-return part is done (doc 34 §6, §7). | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs`; accepted-unit result accounting | `claude/project-thread-h4aybe` | claimed 2026-10-22 |
 | A2b | Lower a returned tuple-or-`None` (`if c: return (a, b)` / `return None` in a bootstrap unit; `fork = (a, b)` / `fork = None; return fork` anywhere). It refuses by name now (`its newest binding ... was not materialized`), was silent before. Observed by the silent-wrong-answers thread: the planner builds the aggregate Phi (presence member 15, member Phis 16, 17), but the root's return reads the handle (10) instead of that layout, and the tuple's region is then pruned as dead. | B1 | the control finish's output resolution in `precompile_to_ssa`; find the pruner with a trap | | open: loud |
 | A4 | Tire: the result-storage lease mints a record span member's `SSA_VALUE` row as a scalar. Revise it from the record storage contract. `_ssa_structure` reads the registered record storage before calling a shape-empty fact a scalar. | T1 | `structural_concordance._ssa_structure`; the result-storage lease writer in `fortran_c_shell` | | blocked on A0 (re-observe first) |
@@ -54,6 +72,7 @@ silent-capable items first.
 | C9 | Multi-element replication `[a, b] * k` | no operation writes its rows; fill repeats one value | `_sequence_concat_ops` | | open |
 | C10 | Strings as values (`s = "a" if c else "b"`, `len(s)`, `==`, `startswith`) | dispatch metadata; minted as a root input (c114, c217) | to be scoped | | open: large |
 | C11 | Variadic returns | shared with A6; take it in Lane A | | | see A6 |
+| C12 | A comprehension result mutated afterwards: `ys = [x * n for x in xs]; ys.append(n)` then `len(ys)`, `sum(ys)` | the append node was pruned by loop evaporation; the arena and the reduction kept the comprehension's row count (silent WRONG at `main`) | `loop_composer.evaporate_unrolled_loops` (liveness), `resident_sequence_materialization._static_sequence_capacity_survey`, the comprehension rule in `glsl_deployment_strategy._tensor_descriptor_rule` | `claude/project-thread-cz18s3` (PR #788) | done there (doc 36 §5). Still loud: a set comprehension then `add` (no proven capacity) |
 
 ## Lane D: defaults and fallbacks
 
@@ -74,7 +93,8 @@ committed inventory script and classify every hit.
 |---|---|---|---|---|
 | D1 | Private root storage sized `else 1` in the exported C wrapper (`ssa_c_backend.py`, the `element_count` expression near line 5905): make it a named refusal and run the corpus | the private-root-storage block of the C wrapper emitter | `claude/project-thread-h1z2w1` | PR open. **Observed:** the default was reached by 58/159 corpus programs (the lead said none), every one a rank-0, non-dynamic storage requirement whose `element_count` is `None` only because its shape is empty. That is now read as the proof of one cell; anything else is the shortfall `private-root-storage-unproven`. Corpus 159/159 PASS, fuzz seed 11 tier 3 30/30 PASS, gate identical to `main` in all four parts (aa 89, ab 7, ac 26, rec 20). No corpus program reaches the new refusal yet (**unknown** whether one can). |
 | D2 | Planner region inputs default to float64. Count the fallbacks across the corpus again (~3,000 measured once), then supply the proofs. This is also the tire's T2 (`bool` actual vs float64 region formal). | `_planned_scalar_dtypes` (read), region-input typing in `glsl_deployment_strategy` (`or "float64"` sites near lines 21277 to 21917) | | open |
-| D3 | `except Exception: pass` in decision paths. The four that sit in compiler decisions come first: `glsl_deployment_strategy.py:11455` (planned-shell walk), `:18206` (`invalidate_proven_shape`), `fortran_c_shell.py:47416` (`materializing_binding_kind`), `identity_concordance.py:9680` (failure-claim record). The telemetry and `old == fact` comparisons are probably benign; classify them, don't change them. | those four `try` blocks | | open |
+| D3 | `except Exception: pass` in decision paths. **Observed** with an instrumented full corpus at `cc6e6f3` (170/170 PASS): 18 swallowed errors in 7 programs. (a) `fortran_c_shell` binding-kind lookup (`materializing_binding_kind`): 5 hits in c62, c271, c272, because a literal binding's source is its value (`[1, 2]`, `'v='`), not a slot. Fixed: only `caller_value`/`caller_alias`/`caller_storage` ask the page, with no try. (b) `_resolve_binding_name` planned-shell walk: 0 hits, made loud. (c) `invalidate_proven_shape` site in `glsl_deployment_strategy`: 13 hits, see D3a. (d) `identity_concordance._attach_failure_claim`: 0 hits; it decorates an error already being raised, so it is diagnostic. Classified benign and left as is. | `fortran_c_shell` binding-kind lookup in the call-argument loop; `_resolve_binding_name` | `claude/project-thread-h1z2w1` | PR open |
+| D3a | A shape withdrawal the book refuses, swallowed. In c02, c57, c58 and c62, `invalidate_shape_transformation` posts `shape_transformation_state` for the f-string glyph helpers (`append_decimal_integer_glyphs`, `hyp`). The book refuses it: "REVISE without a changed source; every Derived cell is stamped at or before the row's". Because the refusal is raised before the `proven_shape` invalidation, the stale proven shape stays on the book (**observed**). Whether any reader then uses it is **unknown**; it is **inferred** silent-capable. Next step: trap the post, find why the cause cell is not newer than the row, and supply that record. Then remove the try at the `invalidate_proven_shape` call. | the `invalidate_proven_shape` call site in `glsl_deployment_strategy` (descriptor invalidation cone); `identity_concordance.invalidate_shape_transformation` | | open |
 | D4 | `"int"` vs `"int64"` spellings reaching physical checks (rule 7) | to be listed by the inventory | | open |
 | D5 | Name, suffix and position matching (`.endswith(`, `[0]` on argument lists) in decision paths | to be listed by the inventory | | open: inventory first |
 
