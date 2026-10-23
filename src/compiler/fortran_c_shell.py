@@ -5001,6 +5001,7 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
             if (str(parameter), str(field_name)) in completed_fields:
                 continue
             comparisons: list[tuple[Any, bool]] = []
+            payload_reads: list[Any] = []
             for getter_id, getter in tuple(graph.nodes(data=True)):
                 field_read = _record_field_read(
                     graph, getter_id, getter
@@ -5016,6 +5017,7 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
                     or owner_origin not in owner_ids
                 ):
                     continue
+                payload_reads.append(getter_id)
                 for compare_id in tuple(graph.successors(getter_id)):
                     compare = graph.nodes[compare_id]
                     expression = compare.get("expr_obj")
@@ -5134,6 +5136,22 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
                 children = positive_data.setdefault("children", [])
                 if (compare_id, "operand") not in children:
                     children.append((compare_id, "operand"))
+            # Program: ``return {"n": self.n, "s": self.s}`` with ``s:
+            # int | None`` (bootstrap unit 069, ``SSASequenceDescriptor.
+            # to_mapping``).  Wrong record: only an ``is None`` test linked a
+            # read of the field to this presence Input, so a bare read stored
+            # into a heterogeneous table had a ``None | int`` class and no
+            # tag ("authored heterogeneous table value has no exact native
+            # type evidence").  Rule: every read of the optional field names
+            # the one presence identity of its field; the reader's tag is
+            # derived from that presence, never from the payload filler.
+            for getter_id in dict.fromkeys(payload_reads):
+                graph.nodes[getter_id]["attributes"] = {
+                    **dict(graph.nodes[getter_id].get("attributes") or {}),
+                    "program_abi_optional_presence_value_id": value_id(
+                        positive
+                    ),
+                }
             receipts.append({
                 "parameter": str(parameter),
                 "field": str(field_name),
@@ -5699,6 +5717,121 @@ def _merge_conditional_value_type_abi_arm(
             *incoming.source_cells,
         ))),
         *incoming_physical[6:],
+    )
+
+
+def _none_guarded_operator_arm_contract(
+    planned_graph: Any,
+    data: Mapping[str, Any],
+    contracts: Mapping[int, Mapping[str, Any]],
+) -> tuple[int, str, tuple[int, ...]] | None:
+    """The class of an IfExp's ``None``-guarded operator arm, or None.
+
+    Program: ``s = None if flag > 0 else b; m = {"a": a, "c": None if s is
+    None else s + 1}`` (the ``child_table_pool`` entry of bootstrap unit 069
+    has this shape).  Wrong record: ``s + 1`` reads ``s: None | int``, so the
+    reducer's operator rule (exact builtin operand classes only) gave it no
+    class; the IfExp's union join skipped it, the IfExp had no
+    VALUE_TYPE_ABI, and a table holding it either refused ("authored
+    heterogeneous table value has no exact native type evidence") or, with
+    no other union member, stored the ``None`` arm as the payload filler 0.
+    Rule: in ``None if x is None else E`` (or ``E if x is not None else
+    None``) the guarded arm E runs only when ``x`` holds its one non-None
+    class; an operator arm over ``x`` has the class Python defines for that
+    narrowed operand.  Anything else (no exact guard, two material classes,
+    an operator whose class the operands do not decide) gets no contract.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _builtin_scalar_operator_class,
+    )
+
+    def node_value_id(node_id: Any) -> int:
+        return int(planned_graph.nodes[node_id].get("value_id", node_id))
+
+    def is_none_literal(node_id: Any) -> bool:
+        node = planned_graph.nodes.get(node_id, {})
+        attributes = node.get("attributes") or {}
+        return (
+            str(node.get("type") or node.get("op") or "").casefold()
+            in {"constant", "const", "none", "nonevalue"}
+            and attributes.get("value", node.get("constant")) is None
+        )
+
+    expression = data.get("expr_obj")
+    roles = {
+        str(role): parent for parent, role in data.get("parents") or ()
+        if parent in planned_graph
+    }
+    if not isinstance(expression, ast.IfExp) or set(roles) != {
+        "test", "body", "orelse",
+    }:
+        return None
+    test = planned_graph.nodes[roles["test"]]
+    comparison = test.get("expr_obj")
+    if not (
+        isinstance(comparison, ast.Compare)
+        and len(comparison.ops) == 1
+        and isinstance(comparison.ops[0], (ast.Is, ast.IsNot))
+    ):
+        return None
+    operands = tuple(parent for parent, _role in test.get("parents") or ())
+    subjects = tuple(
+        parent for parent in operands if not is_none_literal(parent)
+    )
+    if len(operands) != 2 or len(subjects) != 1:
+        return None
+    subject_id = node_value_id(subjects[0])
+    subject_classes = tuple(
+        (contracts.get(subject_id) or {}).get("python_types") or ()
+    )
+    material = tuple(
+        identity for identity in subject_classes
+        if str(identity) != "builtins.NoneType"
+    )
+    if "builtins.NoneType" not in subject_classes or len(material) != 1:
+        return None
+    guarded_role, absent_role = (
+        ("orelse", "body") if isinstance(comparison.ops[0], ast.Is)
+        else ("body", "orelse")
+    )
+    if not is_none_literal(roles[absent_role]):
+        return None
+    arm = planned_graph.nodes[roles[guarded_role]]
+    arm_id = node_value_id(roles[guarded_role])
+    if contracts.get(arm_id) is not None:
+        return None
+    arm_expression = arm.get("expr_obj")
+    operand_roles = (
+        ("lhs", "rhs") if isinstance(arm_expression, ast.BinOp)
+        else ("operand",) if isinstance(arm_expression, ast.UnaryOp)
+        else None
+    )
+    if operand_roles is None:
+        return None
+    arm_operands = {
+        str(role): parent for parent, role in arm.get("parents") or ()
+        if parent in planned_graph
+    }
+    if set(arm_operands) != set(operand_roles):
+        return None
+    operand_classes = []
+    for role in operand_roles:
+        operand_id = node_value_id(arm_operands[role])
+        if operand_id == subject_id:
+            operand_classes.append(str(material[0]))
+            continue
+        operand_class = (contracts.get(operand_id) or {}).get("python_type")
+        if operand_class is None:
+            return None
+        operand_classes.append(str(operand_class))
+    result_class = _builtin_scalar_operator_class(
+        arm_expression, tuple(operand_classes),
+    )
+    if result_class is None:
+        return None
+    return arm_id, result_class, (
+        node_value_id(roles["test"]), subject_id,
     )
 
 
@@ -18280,6 +18413,24 @@ def _propagate_native_type_tag_results(
                         "callee_output_ids", ()
                     )
                 ))
+                # Program: ``m = d.to_mapping()`` where ``to_mapping``
+                # returns ``{"n": self.n, "s": self.s}`` with ``s: int |
+                # None``.  The callee writes the mapping into the caller's
+                # table (``result_aliases_frame``) and its union member's tag
+                # into that table's tag column; its Ret also lists the
+                # display's leaves, so a union layout was published for leaf
+                # ``self.s``.  This call binds none of the callee's Ret slots:
+                # the caller reads every member, tag included, from its own
+                # table.  Rule: a frame-aliased call with no bound outputs has
+                # no result slot for a return layout to rebind.  A call that
+                # binds any output is still held to every layout below.
+                if (
+                    not output_ids
+                    and instruction.attributes.get("result_aliases_frame")
+                    and instruction.attributes.get("ssa_output_argument")
+                    is not None
+                ):
+                    continue
                 bindings = dict((
                     map(int, pair) for pair in instruction.attributes.get(
                         "physical_result_bindings", ()
@@ -21986,12 +22137,24 @@ def _class_surface_ssa_program(
                 # the contract carries it (one ``python_type``) and the row's
                 # cell as the source, so the one VALUE_TYPE_ABI post below the
                 # linker settles it.  No row, no identity: nothing is posted.
+                #
+                # Program: ``SSASequenceDescriptor.to_mapping`` (bootstrap
+                # unit 069) reads ``self.status_address_id`` declared ``int
+                # | None``.  Wrong record: a record WITH a
+                # ``source_record_view_schema`` row attached the field's
+                # declaration cell above but never read its annotation, and
+                # an optional field's ProgramABI row has no ``python_type``;
+                # the read had no class, so its dict column had no type
+                # evidence for it.  Rule: whichever declaration cell names
+                # the field, its annotation is the declared class.
                 if (
                     contract.get("python_type") is None
-                    and contract.get(
-                        "program_abi_field_declaration_cell"
-                    ) is None
-                    and "." in record_identity
+                    and not contract.get("python_types")
+                    and (
+                        contract.get("program_abi_field_declaration_cell")
+                        is not None
+                        or "." in record_identity
+                    )
                 ):
                     from .concordance_declarations import (
                         CLASS_FIELD_DECLARATION as _ABI_RECORD_FIELD_PAGE,
@@ -22000,7 +22163,9 @@ def _class_surface_ssa_program(
                     _record_module, _, _record_class = (
                         record_identity.rpartition(".")
                     )
-                    _declared_field_cell = shape_identity_book.latest_ref(
+                    _declared_field_cell = contract.get(
+                        "program_abi_field_declaration_cell"
+                    ) or shape_identity_book.latest_ref(
                         _ABI_RECORD_FIELD_PAGE,
                         (_record_module, _record_class, str(field_name)),
                     )
@@ -22939,180 +23104,215 @@ def _class_surface_ssa_program(
     # VALUE_TYPE_ABI publication.  Per-arm physical receipts are retained
     # independently, so ``None | dict`` is represented by a payload-free arm
     # and a descriptor-handle arm rather than by coercing both to one dtype.
-    conditional_changed = True
-    while conditional_changed:
-        conditional_changed = False
-        for planned_graph in planned_graphs_by_shell.values():
-            contracts = linked_value_abi_by_graph.setdefault(
-                id(planned_graph), {}
-            )
-            for node_id, data in planned_graph.nodes(data=True):
-                # Program: ``origin, stamp = fork`` where ``fork`` is an
-                # optional tuple merge, then ``asof = stamp if ... else asof``
-                # (IdentityPage._resolved).  Wrong record: the member Phi of
-                # a merged aggregate carried no contract, so the union join
-                # on ``asof`` found no exact type for ``stamp`` although the
-                # present arm's call projection is declared ``int``.  Rule: a
-                # member merge settles from its arms exactly as an IfExp
-                # does; an arm that is an inactive optional filler is not a
-                # value of the merge (it is never read) and contributes none.
-                member_attributes = data.get("attributes") or {}
-                # Program: ``if x > y: r = x + y else: r = None; return r``
-                # called as ``o = maybe_inc(n, 2)``, then ``(-1 if o is None
-                # else o) + n`` (doc 34 W1).  Wrong record: the name merge of
-                # ``r`` carried no contract, so neither the callee's return
-                # nor the caller's call had a class and the sum's region fell
-                # to float64 (-4 came back as 1.8e19).  Rule: a statement
-                # name merge of an optional (one arm the ``None`` literal)
-                # carries its payload arm's class, as a guard-form optional
-                # return (``if x < y: return None``) already does; its
-                # presence is lowered separately (``ssa_optional_values``),
-                # so it is not a tagged union.
-                if (
-                    str(data.get("type") or "") == "Phi"
-                    and member_attributes.get("source_conditional_id")
-                    is not None
-                    and member_attributes.get("conditional_result_of") is None
-                    and member_attributes.get("aggregate_parent_value_id")
-                    is None
-                ):
-                    merge_id = int(data.get("value_id", node_id))
-                    arm_classes = [
-                        (contracts.get(int(parent)) or {}).get("python_type")
-                        for parent, role in data.get("parents") or ()
-                        if str(role) in {"body", "orelse"}
-                    ]
-                    payload_classes = {
-                        str(identity) for identity in arm_classes
-                        if identity is not None
-                        and str(identity) != "builtins.NoneType"
-                    }
-                    incumbent = contracts.get(merge_id) or {}
-                    if (
-                        len(arm_classes) == 2
-                        and "builtins.NoneType" in arm_classes
-                        and None not in arm_classes
-                        and len(payload_classes) == 1
-                        and not incumbent.get("python_types")
-                        and incumbent.get("python_type") is None
-                    ):
-                        contracts.setdefault(merge_id, {})["python_type"] = (
-                            next(iter(payload_classes))
-                        )
-                        conditional_changed = True
-                    continue
-                member_merge = (
-                    str(data.get("type") or "") == "Phi"
-                    and (
-                        member_attributes.get("conditional_result_of") is not None
-                        or member_attributes.get("aggregate_parent_value_id")
-                        is not None
-                    )
+    def settle_conditional_unions() -> bool:
+        """Join every conditional's arm contracts; True if any changed."""
+
+        settled_any = False
+        conditional_changed = True
+        while conditional_changed:
+            conditional_changed = False
+            for planned_graph in planned_graphs_by_shell.values():
+                contracts = linked_value_abi_by_graph.setdefault(
+                    id(planned_graph), {}
                 )
-                if not (
-                    isinstance(data.get("expr_obj"), ast.IfExp) or member_merge
-                ):
-                    continue
-                arms_by_role = {
-                    str(role): int(parent)
-                    for parent, role in data.get("parents") or ()
-                    if str(role) in {"body", "orelse"}
-                }
-                if set(arms_by_role) != {"body", "orelse"}:
-                    continue
-                active_arms = tuple(
-                    arm_id
-                    for arm_id in (
-                        arms_by_role["body"], arms_by_role["orelse"],
+                for node_id, data in planned_graph.nodes(data=True):
+                    # Program: ``origin, stamp = fork`` where ``fork`` is an
+                    # optional tuple merge, then ``asof = stamp if ... else asof``
+                    # (IdentityPage._resolved).  Wrong record: the member Phi of
+                    # a merged aggregate carried no contract, so the union join
+                    # on ``asof`` found no exact type for ``stamp`` although the
+                    # present arm's call projection is declared ``int``.  Rule: a
+                    # member merge settles from its arms exactly as an IfExp
+                    # does; an arm that is an inactive optional filler is not a
+                    # value of the merge (it is never read) and contributes none.
+                    member_attributes = data.get("attributes") or {}
+                    # Program: ``if x > y: r = x + y else: r = None; return r``
+                    # called as ``o = maybe_inc(n, 2)``, then ``(-1 if o is None
+                    # else o) + n`` (doc 34 W1).  Wrong record: the name merge of
+                    # ``r`` carried no contract, so neither the callee's return
+                    # nor the caller's call had a class and the sum's region fell
+                    # to float64 (-4 came back as 1.8e19).  Rule: a statement
+                    # name merge of an optional (one arm the ``None`` literal)
+                    # carries its payload arm's class, as a guard-form optional
+                    # return (``if x < y: return None``) already does; its
+                    # presence is lowered separately (``ssa_optional_values``),
+                    # so it is not a tagged union.
+                    if (
+                        str(data.get("type") or "") == "Phi"
+                        and member_attributes.get("source_conditional_id")
+                        is not None
+                        and member_attributes.get("conditional_result_of") is None
+                        and member_attributes.get("aggregate_parent_value_id")
+                        is None
+                    ):
+                        merge_id = int(data.get("value_id", node_id))
+                        arm_classes = [
+                            (contracts.get(int(parent)) or {}).get("python_type")
+                            for parent, role in data.get("parents") or ()
+                            if str(role) in {"body", "orelse"}
+                        ]
+                        payload_classes = {
+                            str(identity) for identity in arm_classes
+                            if identity is not None
+                            and str(identity) != "builtins.NoneType"
+                        }
+                        incumbent = contracts.get(merge_id) or {}
+                        if (
+                            len(arm_classes) == 2
+                            and "builtins.NoneType" in arm_classes
+                            and None not in arm_classes
+                            and len(payload_classes) == 1
+                            and not incumbent.get("python_types")
+                            and incumbent.get("python_type") is None
+                        ):
+                            contracts.setdefault(merge_id, {})["python_type"] = (
+                                next(iter(payload_classes))
+                            )
+                            conditional_changed = True
+                        continue
+                    member_merge = (
+                        str(data.get("type") or "") == "Phi"
+                        and (
+                            member_attributes.get("conditional_result_of") is not None
+                            or member_attributes.get("aggregate_parent_value_id")
+                            is not None
+                        )
                     )
                     if not (
-                        (planned_graph.nodes.get(int(arm_id), {}).get(
-                            "attributes"
-                        ) or {}).get("optional_inactive_payload")
-                    )
-                )
-                if not active_arms:
-                    continue
-                arm_contracts = tuple(
-                    (
-                        arm_id,
-                        contracts.get(int(arm_id)),
-                    )
-                    for arm_id in active_arms
-                )
-                if any(contract is None for _arm_id, contract in arm_contracts):
-                    continue
-                established: dict[str, Any] = {}
-                identities: set[str] = set()
-                source_cells = []
-                for arm_id, arm_contract in arm_contracts:
-                    arm_identities = tuple(sorted(set(
-                        _canonical_program_abi_type_identity(
-                            identity, program_abi,
+                        isinstance(data.get("expr_obj"), ast.IfExp) or member_merge
+                    ):
+                        continue
+                    arms_by_role = {
+                        str(role): int(parent)
+                        for parent, role in data.get("parents") or ()
+                        if str(role) in {"body", "orelse"}
+                    }
+                    if set(arms_by_role) != {"body", "orelse"}:
+                        continue
+                    active_arms = tuple(
+                        arm_id
+                        for arm_id in (
+                            arms_by_role["body"], arms_by_role["orelse"],
                         )
-                        for identity in (
-                        arm_contract.get("python_types")
-                        or ((arm_contract["python_type"],)
-                            if arm_contract.get("python_type") is not None
-                            else ())
+                        if not (
+                            (planned_graph.nodes.get(int(arm_id), {}).get(
+                                "attributes"
+                            ) or {}).get("optional_inactive_payload")
                         )
-                    )))
-                    if not arm_identities:
-                        established.clear()
-                        break
-                    arm_abis = _physical_type_arms(
-                        planned_graph, int(arm_id), arm_contract,
                     )
-                    if tuple(arm.identity for arm in arm_abis) != arm_identities:
-                        established.clear()
-                        break
-                    identities.update(arm_identities)
-                    source_cells.extend(
-                        linked_value_type_source_cells_by_graph.get(
-                            id(planned_graph), {}
-                        ).get(int(arm_id), ())
+                    if not active_arms:
+                        continue
+                    if isinstance(data.get("expr_obj"), ast.IfExp):
+                        narrowed = _none_guarded_operator_arm_contract(
+                            planned_graph, data, contracts,
+                        )
+                        if narrowed is not None:
+                            guarded_arm, guarded_class, guard_ids = narrowed
+                            contracts[guarded_arm] = {"python_type": guarded_class}
+                            linked_value_type_source_cells_by_graph.setdefault(
+                                id(planned_graph), {}
+                            )[guarded_arm] = tuple(dict.fromkeys(
+                                cell for cell in (
+                                    *(
+                                        _identity_cell(planned_graph, guard_id)
+                                        for guard_id in guard_ids
+                                    ),
+                                    _identity_cell(planned_graph, guarded_arm),
+                                ) if cell is not None
+                            ))
+                            conditional_changed = True
+                    arm_contracts = tuple(
+                        (
+                            arm_id,
+                            contracts.get(int(arm_id)),
+                        )
+                        for arm_id in active_arms
                     )
-                    source_cells.append(_identity_cell(planned_graph, int(arm_id)))
-                    for arm in arm_abis:
-                        incumbent = established.get(arm.identity)
-                        if incumbent is not None:
-                            # The call-return arm and the literal else arm of
-                            # ``optional_call() if guard else None`` prove the
-                            # same payload-free None ABI from different exact
-                            # source cells.  Provenance is accumulated; it is
-                            # not part of the physical-layout comparison.
-                            arm = _merge_conditional_value_type_abi_arm(
-                                incumbent, arm,
-                                value_id=int(data.get("value_id", node_id)),
+                    if any(contract is None for _arm_id, contract in arm_contracts):
+                        continue
+                    established: dict[str, Any] = {}
+                    identities: set[str] = set()
+                    source_cells = []
+                    for arm_id, arm_contract in arm_contracts:
+                        arm_identities = tuple(sorted(set(
+                            _canonical_program_abi_type_identity(
+                                identity, program_abi,
                             )
-                        established[arm.identity] = arm
-                if not established or set(established) != identities:
-                    continue
-                value_id = int(data.get("value_id", node_id))
-                result_contract = contracts.setdefault(value_id, {})
-                prior = (
-                    tuple(result_contract.get("python_types") or ()),
-                    result_contract.get("python_type"),
-                    tuple(result_contract.get("python_type_abis") or ()),
-                )
-                _admit_contract_types(result_contract, tuple(identities))
-                result_contract["python_type_abis"] = tuple(sorted(
-                    established.items(), key=lambda item: item[0],
-                ))
-                linked_value_type_source_cells_by_graph.setdefault(
-                    id(planned_graph), {}
-                )[value_id] = tuple(dict.fromkeys(
-                    cell for cell in (
-                        *source_cells,
-                        _identity_cell(planned_graph, value_id),
-                    ) if cell is not None
-                ))
-                current = (
-                    tuple(result_contract.get("python_types") or ()),
-                    result_contract.get("python_type"),
-                    tuple(result_contract.get("python_type_abis") or ()),
-                )
-                conditional_changed = conditional_changed or current != prior
+                            for identity in (
+                            arm_contract.get("python_types")
+                            or ((arm_contract["python_type"],)
+                                if arm_contract.get("python_type") is not None
+                                else ())
+                            )
+                        )))
+                        if not arm_identities:
+                            established.clear()
+                            break
+                        arm_abis = _physical_type_arms(
+                            planned_graph, int(arm_id), arm_contract,
+                        )
+                        if tuple(arm.identity for arm in arm_abis) != arm_identities:
+                            established.clear()
+                            break
+                        identities.update(arm_identities)
+                        source_cells.extend(
+                            linked_value_type_source_cells_by_graph.get(
+                                id(planned_graph), {}
+                            ).get(int(arm_id), ())
+                        )
+                        source_cells.append(_identity_cell(planned_graph, int(arm_id)))
+                        for arm in arm_abis:
+                            incumbent = established.get(arm.identity)
+                            if incumbent is not None:
+                                # The call-return arm and the literal else arm of
+                                # ``optional_call() if guard else None`` prove the
+                                # same payload-free None ABI from different exact
+                                # source cells.  Provenance is accumulated; it is
+                                # not part of the physical-layout comparison.
+                                arm = _merge_conditional_value_type_abi_arm(
+                                    incumbent, arm,
+                                    value_id=int(data.get("value_id", node_id)),
+                                )
+                            established[arm.identity] = arm
+                    if not established or set(established) != identities:
+                        continue
+                    value_id = int(data.get("value_id", node_id))
+                    result_contract = contracts.setdefault(value_id, {})
+                    prior = (
+                        tuple(result_contract.get("python_types") or ()),
+                        result_contract.get("python_type"),
+                        tuple(result_contract.get("python_type_abis") or ()),
+                    )
+                    _admit_contract_types(result_contract, tuple(identities))
+                    result_contract["python_type_abis"] = tuple(sorted(
+                        established.items(), key=lambda item: item[0],
+                    ))
+                    linked_value_type_source_cells_by_graph.setdefault(
+                        id(planned_graph), {}
+                    )[value_id] = tuple(dict.fromkeys(
+                        cell for cell in (
+                            *source_cells,
+                            _identity_cell(planned_graph, value_id),
+                        ) if cell is not None
+                    ))
+                    current = (
+                        tuple(result_contract.get("python_types") or ()),
+                        result_contract.get("python_type"),
+                        tuple(result_contract.get("python_type_abis") or ()),
+                    )
+                    conditional_changed = conditional_changed or current != prior
+
+            settled_any = settled_any or conditional_changed
+        return settled_any
+
+    # Program: ``bump(x, y)`` returns ``None if s is None else s + 1`` where
+    # ``s = maybe_pick(x, y)`` (fuzz seed 0, ``bump_pick``).  Wrong record:
+    # these joins ran once, before call-edge settlement gave the call result
+    # ``s`` its ``None | int`` class, so the guarded arm and the IfExp never
+    # got a class and ``7 + (-4 if o is None else o)`` fell to float64
+    # (``1.8e19`` for -24).  Rule: the joins are part of the settlement
+    # fixed point, repeated in every round until nothing changes.
+    settle_conditional_unions()
 
     abi_guard = BoundedFixedPoint(
         "abi-settlement",
@@ -23616,6 +23816,8 @@ def _class_surface_ssa_program(
                     if marker not in polymorphic_formals:
                         polymorphic_formals.add(marker)
                         changed = True
+        if settle_conditional_unions():
+            changed = True
         abi_guard.round(changed)
 
     # Finish native type expectations whose direct-parameter ABI could only
@@ -27363,6 +27565,15 @@ def _class_surface_ssa_program(
                         } if (data.get("attributes") or {}).get(
                             "aggregate_leaf_value_ids"
                         ) else {}),
+                        **({
+                            "optional_presence_value_id": int(
+                                (data.get("attributes") or {})[
+                                    "program_abi_optional_presence_value_id"
+                                ]
+                            ),
+                        } if (data.get("attributes") or {}).get(
+                            "program_abi_optional_presence_value_id"
+                        ) is not None else {}),
                     }
                     for node_id, data in graph_obj.nodes(data=True)
                     for expression in (data.get("expr_obj"),)

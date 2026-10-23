@@ -445,3 +445,100 @@ def test_a_wrapper_forwarding_a_union_result_exports_the_linked_tag():
         for instruction in block.instrs if instruction.op == "Call"
     ]
     assert tuple(map(int, call.attributes["callee_output_ids"])) == ret_ids
+
+
+def test_a_bare_optional_field_read_stored_in_a_mapping_reads_its_presence(tmp_path):
+    # Bootstrap unit 069 (``SSASequenceDescriptor.to_mapping``) puts the
+    # ``int | None`` field ``self.s`` into a dict display with no ``is None``
+    # test.  Only such a test used to link the read to the field's presence
+    # slot, so the heterogeneous table store had no tag and refused.  The
+    # read's tag is now selected from that presence slot.
+    import numpy as np
+
+    source = (
+        "from dataclasses import dataclass\n"
+        "from typing import Optional\n"
+        "@dataclass(frozen=True)\n"
+        "class Desc:\n"
+        "    n: int\n"
+        "    s: Optional[int] = None\n"
+        "    def get(self) -> int:\n"
+        "        m = {'n': self.n, 's': self.s}\n"
+        "        p = m['s']\n"
+        "        if p is None:\n"
+        "            return -1\n"
+        "        return p + m['n']\n"
+        "def root(n: int, flag: int) -> int:\n"
+        "    d = Desc(n, n + flag)\n"
+        "    return d.get()\n"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="optional_field_in_mapping",
+        extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+    )
+    (get,) = [
+        function for name, function in module.functions.items()
+        if "__get__" in name and "planned_region" not in name
+        and "ssa_sequence" not in name
+    ]
+    presence_formals = {
+        int(argument.id) for argument in get.args
+        if (argument.accounting or {}).get("program_abi_optional_presence")
+    }
+    (select,) = [
+        instruction for block in get.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding")
+        == "program_abi_optional_scalar_type_tag"
+    ]
+    assert int(select.args[0].id) in presence_formals
+    root = module.functions[exports[0]]
+    params = dict(root.metadata["parameter_names"])
+    (ret,) = [
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    ]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native")
+    for n, flag in ((3, 1), (3, 0)):
+        execution = artifact.prepare_execution({
+            params["n"]: np.array([n]), params["flag"]: np.array([flag]),
+        }).run()
+        got = execution.buffers[ret.args[0].id].reshape(-1).tolist()
+        assert got == [n + flag + n]
+
+
+def test_a_none_guarded_operator_arm_keeps_its_ifexp_union():
+    # ``None if s is None else s + 1`` with ``s: None | int``: ``s + 1`` had
+    # no class (its operand is a union), so the IfExp got no type ABI.  In a
+    # dict beside another union it refused; alone, its None arm was stored
+    # as the payload filler 0.  The guarded arm reads ``s`` as ``int``.
+    source = (
+        "def root(a: int, b: int, flag: int) -> int:\n"
+        "    s = None if flag > 0 else b\n"
+        "    m = {'a': a, 'c': (None if s is None else s + 1)}\n"
+        "    v = m['c']\n"
+        "    if v is None:\n"
+        "        return -1\n"
+        "    return v\n"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="none_guarded_operator_arm",
+        extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+    )
+    root = module.functions[exports[0]]
+    unions = {
+        int(value_id) for value_id, fact in dict(
+            root.metadata["native_value_type_abi"]
+        ).items()
+        if tuple(fact.alternatives) == ("builtins.NoneType", "builtins.int")
+    }
+    tagged = {
+        int(instruction.attributes["payload_value_id"])
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding")
+        == "conditional_native_type_tag"
+    }
+    assert len(unions & tagged) == 2

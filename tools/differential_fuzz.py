@@ -116,6 +116,10 @@ EXTENDED = [
     (["o{v} = maybe_pick(n, {a})", "t{v} = 5", "if o{v} is not None:", "    t{v} = o{v} - 2"], "t{v}"),
     # The same union forwarded unchanged by a wrapper.
     (["o{v} = wrap_pick(n, {a})"], "(-3 if o{v} is None else o{v} + 1)"),
+    # An IfExp whose arm is an operator over a union narrowed by the test
+    # (corpus c364-c367, doc 34 U1).
+    (["o{v} = maybe_pick(n, {a})", "q{v} = None if o{v} is None else o{v} * 3 - {b}"], "(-9 if q{v} is None else q{v})"),
+    (["o{v} = bump_pick(n, {a})"], "(-4 if o{v} is None else o{v})"),
 ]
 EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
@@ -141,6 +145,11 @@ def maybe_pick(x: int, y: int):
 
 def wrap_pick(x: int, y: int):
     return maybe_pick(x + 1, y)
+
+
+def bump_pick(x: int, y: int):
+    s = maybe_pick(x, y)
+    return None if s is None else s + 1
 
 
 def first_over(x: int, y: int) -> int:

@@ -13061,6 +13061,14 @@ class _ControlSSABuilder(TiledObject):
             presence = self.optional_scalar_presence_by_payload.get(
                 int(value_id)
             )
+            presence_id = self.source_value_descriptions.get(
+                int(value_id), {}
+            ).get("optional_presence_value_id")
+            if presence is None and presence_id is not None:
+                presence = self.external_value(int(presence_id), dtype="bool")
+                self.optional_scalar_presence_by_payload[int(value_id)] = (
+                    presence
+                )
             material_source = tuple(
                 identity for identity in source_alternatives
                 if identity != "builtins.NoneType"
