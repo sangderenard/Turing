@@ -6725,6 +6725,74 @@ def compile_project_call(
     return receipt
 
 
+def _authored_effect_statements(source_graph: Any) -> tuple[str, ...]:
+    """The source's effect nodes: stores, deletes and discarded calls.
+
+    A store is an ``IndexedStore``/``SetAttr``/``DelItem`` node; a call is
+    an effect when no node consumes its result (``xs.append(3)`` as a
+    statement), read from the graph's own parent edges.
+    """
+
+    import ast
+
+    # A branch or loop lists its statements as ``body``/``orelse``
+    # parents; that holds the statement, it does not read its value.
+    consumed = {
+        int(parent)
+        for _node_id, data in source_graph.nodes(data=True)
+        for parent, role in data.get("parents") or ()
+        if str(role) not in {"body", "orelse"}
+    }
+    found = []
+    for node_id, data in source_graph.nodes(data=True):
+        expression = data.get("expr_obj")
+        kind = str(data.get("type") or "")
+        if kind in {"IndexedStore", "SetAttr", "DelItem", "DelAttr"} or (
+            isinstance(expression, ast.Call) and int(node_id) not in consumed
+        ):
+            found.append(
+                f"{getattr(expression, 'lineno', '?')}: "
+                + (ast.unparse(expression)[:80] if isinstance(expression, ast.AST) else kind)
+            )
+    return tuple(dict.fromkeys(found))
+
+
+def _one_value_aggregate_return(source: Any) -> str | None:
+    """Why the source's return is not one plain value, else None.
+
+    Read from the reducer's return-site receipts: a site returning a tuple,
+    sites of different arity, or a ``None`` site beside a value site.
+    """
+
+    kinds = tuple(
+        (source.G.graph.get("return_container_kinds") or {}).values()
+    )
+    if any(kind not in {None, "value"} for kind in kinds):
+        return f"return site kinds {sorted(map(str, set(kinds)))}"
+    sites = tuple(
+        tuple(site or ())
+        for site in (source.G.graph.get("return_slot_values") or {}).values()
+    )
+    if len({len(site) for site in sites}) > 1:
+        return "return sites of different arity"
+
+    def returns_none(site: tuple) -> bool:
+        if len(site) != 1 or site[0] is None or int(site[0]) not in source.G:
+            return False
+        node = source.G.nodes[int(site[0])]
+        attributes = node.get("attributes") or {}
+        return str(node.get("type")) in {"Constant", "Const", "const"} and (
+            ("value" in attributes and attributes["value"] is None)
+            or ("value" not in attributes and "constant" in node
+                and node["constant"] is None)
+        )
+
+    none_sites = sum(1 for site in sites if returns_none(site))
+    if 0 < none_sites < len(sites):
+        return "a None return site beside a value site"
+    return None
+
+
 def _accepted_physical_output_paths(
     paths: Mapping[tuple[int, ...], int],
     published_ids: set[int],
@@ -7228,6 +7296,25 @@ def _compile_resolved_process_graph_unit_impl(
                     "kind": "concordance-consumer-refusal",
                     "details": list(refusals),
                 })
+        # Program: unit 031 ``thaw_page`` (effects on ``page.__dict__``) and
+        # ``shell_telemetry.compile_count`` (``layer.count(...)``).  Wrong
+        # record: every authored effect was pruned, the export was a lone
+        # ``Ret`` with no outputs, and the unit was admitted.  Rule: an
+        # export with no outputs and no lowered instruction besides control
+        # flow and constants is refused while its source holds an effect
+        # statement (a discarded call, an attribute or item store, a delete).
+        if not published_outputs and correlated:
+            lowered_ops = {
+                str(instruction.op)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+            }
+            authored_effects = _authored_effect_statements(source_graph)
+            if lowered_ops <= {"Ret", "ret", "Br", "br", "Const", "const"} and authored_effects:
+                shortfalls.append({
+                    "kind": "authored-effects-without-lowering",
+                    "statements": list(authored_effects[:8]),
+                })
         if unresolved_calls:
             shortfalls.append({
                 "kind": "unresolved-authored-calls",
@@ -7330,6 +7417,38 @@ def _compile_resolved_process_graph_unit_impl(
                 if len(paths) == 1 and len(published_ids) == 1 and kind not in {"tuple", "list"}:
                     # A scalar Return/Phi is the one published value, even
                     # when several authored return sites feed that Phi.
+                    # Program: unit 027 ``_fork_of_scope`` (``return row,
+                    # column`` or ``return None``; doc 32).  Wrong record: the
+                    # sites' kinds disagree, so ``kind`` was None and one
+                    # published payload was accepted for an optional pair.
+                    # Rule: the scalar reading needs every return site to be
+                    # one plain value of one arity, and no site to return
+                    # ``None`` beside a value; otherwise one value would stand
+                    # for a tuple or an optional, and the layout is refused.
+                    aggregate_reason = _one_value_aggregate_return(source)
+                    if aggregate_reason is not None:
+                        accounting = next((
+                            record for record in unit_accounting
+                            if str(record.get("ssa_function") or "")
+                            == str(export_name)
+                        ), None)
+                        if accounting is None:
+                            raise ValueError(
+                                "one-value aggregate return has no unit "
+                                f"accounting row: {export_name}"
+                            )
+                        accounting["shortfalls"].append({
+                            "kind": "one-value-aggregate-return",
+                            "reason": aggregate_reason,
+                            "authored_paths": [
+                                [list(path), int(value_id)]
+                                for path, value_id in paths.items()
+                            ],
+                            "published_output_ids": sorted(published_ids),
+                        })
+                        accounting["complete"] = False
+                        compiled_complete = False
+                        continue
                     paths = {(0,): int(outputs[str(export_name)][0].id)}
             else:
                 raise ValueError("native result layout has no authoritative source reference")

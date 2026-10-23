@@ -9952,12 +9952,31 @@ def _field_slot_ops(
         )),)
         if len(leaf_ids) == 1
     }
+    # Program: ``for f in (1, n): r += f`` (fuzz p89_3).  Wrong record: the
+    # tuple display stayed a record, so the loop's indexed reads had no
+    # arena and the display became an unexplained root input (loud).  Rule:
+    # a tuple display that a loop iterates is born as a local sequence of
+    # its members, like a list display; a record read of it (``t[1]``)
+    # reads the same rows.
+    iterated_ids = {
+        int(parent)
+        for _loop_id, loop in graph_obj.nodes(data=True)
+        if str(loop.get("type")) == "For"
+        for parent, role in loop.get("parents") or ()
+        if str(role) == "iterable"
+    }
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         attributes = data.get("attributes") or {}
         aggregate_kind = attributes.get("aggregate_kind")
-        snapshot = (aggregate_kind == "tuple" and
-                    attributes.get("producer_kind") == "aggregate_materialization")
+        snapshot = (aggregate_kind == "tuple" and (
+            attributes.get("producer_kind") == "aggregate_materialization"
+            or (
+                attributes.get("producer_kind") == "aggregate"
+                and isinstance(data.get("expr_obj"), ast.Tuple)
+                and int(node_id) in iterated_ids
+            )
+        ))
         if not snapshot and aggregate_kind not in {
             "list", "set", "frozenset", "dict", "bytes", "bytearray"
         }:
