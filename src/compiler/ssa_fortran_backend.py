@@ -6258,10 +6258,40 @@ def emit_module(
         for function_name, function in functions.items()
     }
     entry_by_name = {entry.name: entry for entry in entry_points}
-    for function_name, table in module_sequence_tables.items():
-        described = entry_by_name.get(function_name)
-        if described is None:
+    # Program: c217 (``with_list(n)`` and ``with_dict(n)`` called from
+    # ``root``; lane E).  Wrong record: only an entry's OWN sequence table
+    # was published, so a callee's hoisted capacity cell stayed 0, every
+    # append and store reported "full", and the root returned 0 -- the C
+    # wrapper's record before c217.  Rule: the same linked descriptors the
+    # C and LLVM wrappers publish (``_linked_frame_sequences``), in entry
+    # ids.
+    from .ssa_c_backend import _linked_frame_sequences
+
+    linked_sequence_descriptors: dict[str, tuple[Any, ...]] = {}
+    for function_name in entry_by_name:
+        own = module_sequence_tables.get(function_name)
+        own_ids = set() if own is None else {
+            int(descriptor.sequence_id) for descriptor in own.sequences.values()
+        }
+        linked = tuple(
+            descriptor
+            for descriptor in (
+                _linked_frame_sequences(module, function_name)
+                if isinstance(module, IRModule) else ()
+            )
+            # A callee's sequence id that collides with one of the entry's
+            # own cannot be published under it; that sequence stays
+            # unpublished (capacity 0, loud "full" status), as before.
+            if int(descriptor.sequence_id) not in own_ids
+        )
+        if linked:
+            linked_sequence_descriptors[function_name] = linked
+        if own is None and not linked:
             continue
+        described = entry_by_name[function_name]
+        published_sequences = (
+            *(() if own is None else own.sequences.values()), *linked,
+        )
         parameter_names = {parameter.name for parameter in described.parameters}
         extent_parameters = tuple(
             parameter.name
@@ -6306,7 +6336,7 @@ def emit_module(
                         f"source_length:{parameter.source_name}"
                     )
         bindings = []
-        for descriptor in table.sequences.values():
+        for descriptor in published_sequences:
             required_ids = (
                 int(descriptor.length_address_id),
                 int(descriptor.capacity_value_id),
@@ -6484,9 +6514,22 @@ def emit_module(
                         ) else {}),
                     }
                     for descriptor in table.sequences.values()
+                ] + [
+                    descriptor.to_mapping()
+                    for descriptor in linked_sequence_descriptors.get(function_name, ())
                 ]
                 for function_name, table in module_sequence_tables.items()
                 if function_name in functions and table.sequences
+            } | {
+                function_name: [
+                    descriptor.to_mapping() for descriptor in linked
+                ]
+                for function_name, linked in linked_sequence_descriptors.items()
+                if function_name in functions
+                and not (
+                    function_name in module_sequence_tables
+                    and module_sequence_tables[function_name].sequences
+                )
             },
             # A sequence arena can be both an ABI input/inout and the authored
             # return value.  Ordinary scalar output accounting intentionally

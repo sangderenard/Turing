@@ -1686,10 +1686,23 @@ def _linked_frame_sequences(module: Any, function_name: str) -> tuple[Any, ...]:
             if capacity is None or None in columns:
                 continue
             owner = sequence.heap_owner_value_id
+            # Length and status cells travel the same exact bindings; the
+            # Fortran runtime binding names all of them (lane E, c217).
+            length = aliases.get((name, int(sequence.length_address_id)))
+            status = (
+                None if sequence.status_address_id is None
+                else aliases.get((name, int(sequence.status_address_id)))
+            )
             linked.append(_replace(
                 sequence,
                 column_value_ids=columns,
                 capacity_value_id=capacity,
+                length_address_id=(
+                    sequence.length_address_id if length is None else length
+                ),
+                status_address_id=(
+                    sequence.status_address_id if status is None else status
+                ),
                 heap_owner_value_id=(
                     None if owner is None else aliases.get((name, int(owner)))
                 ),
