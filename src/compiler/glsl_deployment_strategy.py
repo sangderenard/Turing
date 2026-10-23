@@ -10704,11 +10704,17 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     ]
     loops = [(start, end) for start, end, _node, _expression in loop_nodes]
     readers_by_sequence: dict[int, list[tuple[tuple[int, int], int]]] = {}
+    reader_ends: dict[int, tuple[int, int]] = {}
     for node_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
         line = getattr(expression, "lineno", None)
         if line is None:
             continue
+        if getattr(expression, "end_lineno", None) is not None:
+            reader_ends[int(node_id)] = (
+                int(expression.end_lineno),
+                int(getattr(expression, "end_col_offset", 0) or 0),
+            )
         for parent, _role in data.get("parents") or ():
             if parent not in graph.G:
                 continue
@@ -10919,6 +10925,78 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         ):
             if start >= end and reader != int(effect_id):
                 edges.add((int(effect_id), reader))
+    # Program: ``xs = [3, n]; xs.append(2); a = xs[1]; xs[1] = 9`` then
+    # ``return a + 0`` (scratch lp/c_t; ``xs.pop(1)`` likewise).  Wrong
+    # record: an effect was ordered only before the reads after it, so
+    # nothing kept an earlier read before it; the read was placed after
+    # the store and returned 9 for n.  Rule: a read of the receiver that
+    # ends before an effect starts precedes that effect (the effect's
+    # outermost enclosing loop, if any).  An indexed store is such an
+    # effect on its base, and an in-place ``sort`` on its receiver.  The
+    # lowering reads these edges too
+    # (``sequence_read_before_effect_edges``): a row read no region owns is
+    # loaded where it is first consumed, so it must be loaded before the
+    # effect instead.
+    stores = [
+        (int(node_id), {
+            "expression": expression,
+            "sequence_value_id": int(
+                graph.G.nodes[int(base)].get("value_id", base)
+            ),
+        })
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) in {"IndexedStore", "sort"}
+        for expression in (data.get("expr_obj"),)
+        for base in (
+            parent for parent, role in data.get("parents") or ()
+            if str(role) in {"base", "operand"} and parent in graph.G
+        )
+    ]
+    read_before_effect: set[tuple[int, int]] = set()
+    branch_nodes = [
+        (int(expression.lineno), int(getattr(expression, "end_lineno", expression.lineno)),
+         int(node_id), expression)
+        for node_id, data in graph.G.nodes(data=True)
+        for expression in (data.get("expr_obj"),)
+        if isinstance(expression, ast.If)
+    ]
+    for effect_id, record in (*effects, *stores):
+        expression = record.get("expression")
+        if int(effect_id) not in graph.G or getattr(
+            expression, "lineno", None
+        ) is None:
+            continue
+        target, start = int(effect_id), (
+            int(expression.lineno),
+            int(getattr(expression, "col_offset", 0) or 0),
+        )
+        # Program: ``a = xs[1]; if n > 0: xs[1] = 7`` (scratch lp3/c_b).
+        # An effect inside a branch is ordered at its outermost enclosing
+        # statement, which the lowering enters before either arm.
+        enclosing = [
+            (block_start, -block_end, node, block)
+            for block_start, block_end, node, block in (*loop_nodes, *branch_nodes)
+            if block_start <= int(expression.lineno) <= block_end
+        ]
+        if enclosing:
+            _start, _end, target, block = min(enclosing)
+            start = (
+                int(block.lineno), int(getattr(block, "col_offset", 0) or 0),
+            )
+        for _reader_start, reader in readers_by_sequence.get(
+            int(record["sequence_value_id"]), (),
+        ):
+            reader_end = reader_ends.get(int(reader))
+            if (reader_end is not None and reader_end <= start
+                    and int(reader) != int(target)):
+                edges.add((int(reader), int(target)))
+                # A loop block names no graph node the lowering enters,
+                # so a read before a loop keeps its consumer placement.
+                if not any(int(target) == node for *_rest, node, _loop in loop_nodes):
+                    read_before_effect.add((int(reader), int(target)))
+    graph.G.graph["sequence_read_before_effect_edges"] = tuple(
+        sorted(read_before_effect)
+    )
     return frozenset(edges)
 
 

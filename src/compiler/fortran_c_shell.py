@@ -27230,6 +27230,10 @@ def _class_surface_ssa_program(
                 sequence_row_operations=_sequence_row_operations(
                     graph_obj, sequence_declarations
                 ),
+                sequence_read_before_effects=tuple(
+                    graph_obj.graph.get("sequence_read_before_effect_edges")
+                    or ()
+                ),
                 nested_row_projections=_nested_row_projection_ops(
                     graph_obj, control
                 ),
