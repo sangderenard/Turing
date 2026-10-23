@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import os
 import sys
 from dataclasses import replace
@@ -849,7 +850,8 @@ def _promote_conditional_sequence_aliases(
     """
 
     from .control_source import (
-        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock, WhileBlock,
+        CallBlock, ConditionalBlock, ControlSequenceMutation, LoopBlock,
+        SequenceBlock, SequenceQueryBlock, WhileBlock,
     )
 
     copyable_sequence_kinds = {"list", "bytes", "bytearray"}
@@ -930,6 +932,7 @@ def _promote_conditional_sequence_aliases(
 
     promoted_aliases: dict[int, tuple[int, str]] = {}
     destination_ids: set[int] = set()
+    rebirth_ports: dict[int, int] = {}
 
     def promote(block):
         if isinstance(block, ConditionalBlock):
@@ -1005,11 +1008,81 @@ def _promote_conditional_sequence_aliases(
             promoted_body = promote(block.body)
             scalar_carries = []
             sequence_updates: set[tuple[int, int]] = set()
+            rebirths = []
+            port_by_carry = {
+                (int(updated), int(initial)): int(port)
+                for port, initial, updated in block.result_ports
+            }
+            loop_node = (
+                graph_obj.nodes.get(int(block.source_loop_node_id), {})
+                if block.source_loop_node_id is not None else {}
+            )
+            carried_names = {
+                (int(updated), int(initial)): str(name)
+                for name, (initial, updated) in dict(
+                    (loop_node.get("attributes") or {}).get(
+                        "loop_carried_bindings"
+                    ) or {}
+                ).items()
+            }
+            identities = dict(graph_obj.graph.get("identity_table") or {})
             for updated_id, initial_id in block.carried_aliases:
                 updated_id = int(updated_id)
                 initial_id = int(initial_id)
                 updated_resident = resident_by_value.get(updated_id)
                 initial_resident = resident_by_value.get(initial_id)
+                # Program: ``xs = [0, 0]; for i in range(4): t += xs[0];
+                # xs = [i + n, i]`` then ``len(xs)`` (corpus c246).  Wrong
+                # record: the rebound list kept a scalar carry, so only its
+                # handle went through the loop Phi and the exit list's length
+                # was never written (``len`` read 0, silently).  Rule: a list
+                # the body rebinds to another list is carried like a branch
+                # rebinding -- the body's list is copied into the initial
+                # arena at the end of each iteration (one ``replace``).
+                if (
+                    updated_resident is not None
+                    and initial_resident is not None
+                    and updated_resident != initial_resident
+                    and kind_by_value.get(updated_id) in copyable_sequence_kinds
+                    and kind_by_value.get(initial_id)
+                    == kind_by_value.get(updated_id)
+                    and (updated_id, initial_id) in carried_names
+                    and (updated_id, initial_id) in port_by_carry
+                ):
+                    # The copy overwrites the initial list.  That is the
+                    # binding's own storage only while no other name or
+                    # container holds either list: ``ys = xs`` before the
+                    # loop must still read ``[7, 8]`` afterwards.
+                    name = carried_names[(updated_id, initial_id)]
+                    holders = sorted(
+                        str(other)
+                        for other, history in identities.items()
+                        if str(other) != name
+                        and {initial_id, updated_id} & set(map(int, history))
+                    ) + sorted(
+                        f"node {int(reader)}"
+                        for reader, reader_data in graph_obj.nodes(data=True)
+                        for parent, role in reader_data.get("parents") or ()
+                        if int(parent) in {initial_id, updated_id}
+                        and str(role).startswith("elts")
+                    )
+                    if holders:
+                        raise ValueError(
+                            f"list {name!r} is rebound inside a retained "
+                            f"loop while {', '.join(holders)} also holds "
+                            "it; a rebound loop list is carried by copying "
+                            "into its initial storage, which only one name "
+                            "may own"
+                        )
+                    rebirths.append(ControlSequenceMutation(
+                        int(initial_resident), "replace",
+                        (int(updated_resident),),
+                        port_by_carry[(updated_id, initial_id)],
+                        policy="duplicates",
+                    ))
+                    sequence_updates.add((updated_id, initial_id))
+                    destination_ids.add(int(initial_resident))
+                    continue
                 if (
                     updated_resident is None
                     or initial_resident is None
@@ -1038,11 +1111,17 @@ def _promote_conditional_sequence_aliases(
                 resident_by_value[int(port_id)] = resident_id
                 kind_by_value[int(port_id)] = kind
                 promoted_aliases[int(port_id)] = (resident_id, kind)
+                if any(
+                    int(mutation.effect_node_id) == int(port_id)
+                    for mutation in rebirths
+                ):
+                    rebirth_ports[int(port_id)] = resident_id
             return replace(
                 block,
                 body=promoted_body,
                 carried_aliases=tuple(scalar_carries),
                 result_ports=tuple(scalar_ports),
+                sequence_mutations=(*block.sequence_mutations, *rebirths),
             )
         if isinstance(block, WhileBlock):
             return replace(
@@ -1055,6 +1134,34 @@ def _promote_conditional_sequence_aliases(
         return block
 
     promoted = replace(control, root=promote(control.root))
+    if rebirth_ports:
+        # A query of a rebound loop list's exit port (``len(xs)`` after the
+        # loop) reads the initial arena the body's list was copied into;
+        # the port has no storage of its own.
+        def retarget(item):
+            if isinstance(item, SequenceQueryBlock):
+                resident = rebirth_ports.get(int(item.sequence_value_id))
+                return item if resident is None else replace(
+                    item, sequence_value_id=int(resident),
+                )
+            if isinstance(item, tuple):
+                entries = tuple(retarget(entry) for entry in item)
+                return item if all(
+                    new is old for new, old in zip(entries, item)
+                ) else entries
+            if (dataclasses.is_dataclass(item) and not isinstance(item, type)
+                    and type(item).__module__ == ConditionalBlock.__module__):
+                changes = {}
+                for field in dataclasses.fields(item):
+                    value = getattr(item, field.name)
+                    if isinstance(value, tuple) or dataclasses.is_dataclass(value):
+                        retargeted = retarget(value)
+                        if retargeted is not value:
+                            changes[field.name] = retargeted
+                return replace(item, **changes) if changes else item
+            return item
+
+        promoted = replace(promoted, root=retarget(promoted.root))
     return promoted, promoted_aliases, tuple(sorted(destination_ids))
 
 
