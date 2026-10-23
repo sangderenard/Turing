@@ -18378,24 +18378,26 @@ def _invalidate_tensor_descriptor_dependents(
         )
         affected.add(node_id)
         data.pop("tensor", None)
-        try:
-            from .identity_concordance import invalidate_proven_shape, shape_scope_of
-            from ..common.tensors.topological_reducer import node_identity_cell
+        # Lane D, D3a: this withdrawal used to sit in ``except Exception:
+        # pass``.  The only errors it ever raised in the corpus were the
+        # book refusing a second withdrawal of an already withdrawn row,
+        # which ``invalidate_shape_transformation`` now answers itself; any
+        # other failure here is a lost withdrawal and is reported.
+        from .identity_concordance import invalidate_proven_shape, shape_scope_of
+        from ..common.tensors.topological_reducer import node_identity_cell
 
-            arguments = (
-                shape_scope_of(graph), int(data.get("value_id", node_id)),
-                int(causes[0]), str(reason),
-            )
-            # The withdrawal stands on the cells the caller changed, else
-            # on the identity cell of the operand whose descriptor changed
-            # (the cause): that node is where the change came from.
-            cells = tuple(source_cells) or tuple(
-                cell for cell in (node_identity_cell(graph, int(causes[0])),)
-                if cell is not None
-            )
-            invalidate_proven_shape(*arguments, source_cells=cells)
-        except Exception:
-            pass
+        arguments = (
+            shape_scope_of(graph), int(data.get("value_id", node_id)),
+            int(causes[0]), str(reason),
+        )
+        # The withdrawal stands on the cells the caller changed, else
+        # on the identity cell of the operand whose descriptor changed
+        # (the cause): that node is where the change came from.
+        cells = tuple(source_cells) or tuple(
+            cell for cell in (node_identity_cell(graph, int(causes[0])),)
+            if cell is not None
+        )
+        invalidate_proven_shape(*arguments, source_cells=cells)
 
 
 def _publish_callsite_return_members(
