@@ -197,6 +197,8 @@ EXTENDED3 = [
     (["xs{v} = [n, {a}]", "for i{v} in range(n % 3 + 1):", "    xs{v}.append(i{v} + {b})"], "width(xs{v}) * 100 + head(xs{v})"),
     # a dict that accumulates into itself through get (lane E)
     (["d{v} = {{}}", "for i{v} in range(n % 4 + 1):", "    d{v}[i{v} % 2] = d{v}.get(i{v} % 2, {a}) + 36028797018963969", "t{v} = 0", "for k{v} in range(3):", "    if k{v} in d{v}:", "        t{v} = t{v} + d{v}[k{v}]"], "t{v}"),
+    # an optional tuple result unpacked after a None test (lane E)
+    (["f{v} = maybe_pair(n, {a}) if n != {b} else None", "r{v} = -1", "if f{v} is not None:", "    p{v}, q{v} = f{v}", "    r{v} = p{v} * 10 + q{v}"], "r{v}"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
@@ -231,6 +233,12 @@ def pick(xs: list[int], i: int) -> int:
 
 def label(x: int) -> int:
     return len(f"value={int(x)}")
+
+
+def maybe_pair(x: int, y: int) -> tuple[int, int] | None:
+    if x > y:
+        return None
+    return (x + 1, y * 2)
 
 
 """
