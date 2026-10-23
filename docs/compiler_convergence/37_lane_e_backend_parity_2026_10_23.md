@@ -578,3 +578,72 @@ unchanged (static, which is what Windows uses).
 - Gate at `86b8314d` (covers E5-E17), on a clean worktree: aa 89 / ab 7 /
   ac 26 / rec 20. The failure names in every part are the same as main
   `08ba0171`'s (main has since moved to `2806360d`, a docs-only change).
+
+## E18: enumerate loops (C silently wrong; LLVM refused)
+
+- **Program:** `xs = [5, n + 36028797018963969, 6]; for k, x in
+  enumerate(xs): t += k * x` (c351). No corpus program used `enumerate`
+  before this one.
+- **Wrong record:** as with `zip` (E6), the tuple target's names were never
+  typed by the planner's scalar proof table, so `x` fell to the float64
+  default. At main `2806360d`, C multiplies the large int row through
+  float64 and returns 36028797018963984 for 36028797018963983. LLVM refused
+  the i64/double Phi (fuzz p53_17).
+- **Rule:** over `enumerate(a[, start])` the first name is an int64 count
+  and the second is an element of `a`
+  (`glsl_deployment_strategy._planned_scalar_dtypes_from`).
+- **Second wrong record, same loop:** `enumerate(xs, 3)` bound the count to
+  the loop induction, which starts at 0, and dropped `start`. C and LLVM
+  both counted from 0 silently. A start has no loop lowering, so
+  `loop_composer` now **refuses it by name** ("enumerate with a start
+  argument has no loop lowering"). Test:
+  `test_loop_composer.py::test_enumerate_start_refuses_rather_than_counting_from_zero`.
+  Lowering the offset is open work.
+- `[k * x for k, x in enumerate(xs)]` was refused (a resident `sum` over
+  float64 rows); E19 fixes it.
+
+### Receipts for E18 (before the rebase onto main `230369c5`)
+
+- Census at `892bdcce` (227 programs): C 227/227, LLVM 227/227, Fortran 157
+  PASS, 1 WRONG (c22), 1 RUN-FAIL (c197), 68 EMIT-INCOMPLETE.
+- Fuzz seed 54 (`llvm,fortran`, with the enumerate snippet): 24 PASS, 15
+  FORTRAN-LOUD, 1 LOUD, 0 LLVM-LOUD, 0 WRONG and 0 TYPE.
+- Gate at `892bdcce`, on a clean worktree: aa 89 / ab 7 / ac 26 / rec 20
+  (ac and rec each gained the new passing test). Failure names in every
+  part are the same as main `08ba0171`'s.
+
+## E19: a tuple comprehension target over enumerate or zip (refused)
+
+- **Program:** `sum([k * x for k, x in enumerate(xs)])` (c352) and
+  `sum([p * q for p, q in zip(xs, ys)])` (c353), with a large int row.
+- **Wrong record:** the comprehension rule typed only a single-name target,
+  so a tuple target's names fell to the float64 default and the resident
+  `sum` refused float64 rows ("Python's sum has one result type only for
+  integer rows"). Loud at main `2806360d`.
+- **Rule:** a tuple comprehension target takes the `for` rule: over `zip`,
+  the i-th name is an element of the i-th argument; over `enumerate(a)`,
+  an int64 count and an element of `a`.
+- c352 and c353 pass in C and LLVM. Fortran refuses both on `Alloca` (the
+  comprehension's result grows on the heap).
+
+### Receipts for E19 (before the rebase onto main `230369c5`)
+
+- Census at `3e664c6a` (229 programs): C 229/229, LLVM 229/229, Fortran 157
+  PASS, 1 WRONG (c22), 1 RUN-FAIL (c197), 70 EMIT-INCOMPLETE.
+- Fuzz seed 55 (`llvm,fortran`): 22 PASS, 15 FORTRAN-LOUD, 2 LOUD, 1 SEGV,
+  0 WRONG and 0 TYPE. The SEGV (p55_15) is in C and reproduced at main `2806360d`: `len(xs)` was read before
+  callee pushes beside a comprehension loop. The silent lane has since
+  fixed it on main (its c332).
+- Gate at `3e664c6a`, on a clean worktree: aa 89 / ab 7 / ac 26 / rec 20,
+  the same failure names as main `08ba0171` in every part.
+
+### Receipts for E18 and E19 on main `230369c5`
+
+- Census at `09401a20` (258 programs, dynamic Fortran runtime): C 258/258,
+  LLVM 258/258, Fortran 173 PASS, 1 WRONG (c22), 1 RUN-FAIL (c197), 83
+  EMIT-INCOMPLETE (heap growth).
+- Fuzz seed 56 (`FUZZ_EXT=3`, `llvm,fortran`, 30 programs): 13 PASS, 16
+  FORTRAN-LOUD, 1 LOUD, 0 LLVM-LOUD, 0 WRONG and 0 TYPE.
+- Gate at `09401a20` and at main `230369c5`, each on a clean worktree:
+  aa 89 / ab 8 / ac 26 / rec 21 on both. The failure names in every part
+  are the same; ac and rec each gain the new passing test.
