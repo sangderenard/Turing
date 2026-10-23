@@ -1695,6 +1695,22 @@ def evaporate_unrolled_loops(
             for call_id, argument_id in _call_escaped_argument_edges(graph.G)
             if int(argument_id) in mutated
         )
+        # Program: ``for x in [3, -2, 0]: t += x * n`` beside ``xs = [6, 7,
+        # n]; xs.sort()`` then ``xs[0] - xs[2]`` (corpus c244, fuzzer
+        # p11_29/p11_116; lanes plan C15).  Wrong record: ``sort`` keeps no
+        # retained mutation record and returns ``None`` with no consumer, so
+        # this pruning deleted the call; the structural fold then read the
+        # display's order (9 for -10; clean audit).  Rule: a method call that
+        # mutates its receiver (the receivers ``_mutated_sequence_node_ids``
+        # names through ``_method_mutated_receiver_ids``) is an effect on it,
+        # so it is live.
+        from .resident_sequence_materialization import (
+            _method_mutation_edges,
+        )
+
+        live.update(
+            int(call_id) for call_id, _receiver in _method_mutation_edges(graph.G)
+        )
         # Dataflow ancestry alone is insufficient to retain source control:
         # loop nodes own their bodies semantically, and are not necessarily a
         # value predecessor of the function's return roots.  Evaporating an
