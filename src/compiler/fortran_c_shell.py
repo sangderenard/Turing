@@ -10651,6 +10651,15 @@ def _field_slot_ops(
         )
         if literal is not None and not isinstance(literal, (bool, int, float)):
             continue
+        # Program: ``xs = [n] * 3`` then ``return sum(xs) * 10 + xs[1]``.
+        # Wrong record: the member ``n`` is no literal, so its "literal"
+        # read as None and the fill wrote a None payload: every row was 0
+        # (0.0 for -93; clean audit).  Rule: a member that is not a
+        # constant is the fill's runtime value, named by its value id.
+        if str(fill_data.get("type") or fill_data.get("op") or "").casefold() not in {
+            "constant", "const",
+        }:
+            literal = ("value_id", int(fill_data.get("value_id", fill_ids[0])))
         result_id = int(data.get("value_id", node_id))
         sequence_initializations.append((
             result_id,

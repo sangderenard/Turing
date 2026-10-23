@@ -3357,6 +3357,18 @@ class _ControlSSABuilder(TiledObject):
                     else "int64" if fill_literal is None
                     else None
                 )
+                if isinstance(fill_literal, tuple):
+                    # Program: ``xs = [n] * 3; xs[1] = 3``.  Wrong record:
+                    # a runtime member left the rows unclassed, so the
+                    # control function stored them float64 while every
+                    # region read them int64.  Rule: the rows hold the class
+                    # the regions prove for the sequence, else the member's.
+                    proven = (
+                        self.region_value_meta.get(int(sequence_id))
+                        or self.region_value_meta.get(int(fill_literal[1]))
+                    )
+                    if proven is not None:
+                        element_dtype = str(proven.dtype)
             elif str(policy).startswith("literal_bytes="):
                 element_dtype = "int"
             elif str(policy).startswith("literal_glyphs="):
@@ -4736,11 +4748,17 @@ class _ControlSSABuilder(TiledObject):
         )
         self._register_sequence_lowering(lowering)
         contract_cell = self._sequence_contract_cell(int(sequence_id))
-        value = self.fresh_value(
-            dtype=str(descriptor.column_dtypes[0]), transform=CONTROL_CONST,
-            operands=(contract_cell,),
-        )
-        self.emit(Handler.Const, [], value, attributes={"value": literal})
+        if isinstance(literal, tuple):
+            # ``[n] * k``: the member is a runtime value (its value id).
+            value = self.external_value(
+                int(literal[1]), dtype=str(descriptor.column_dtypes[0]),
+            )
+        else:
+            value = self.fresh_value(
+                dtype=str(descriptor.column_dtypes[0]), transform=CONTROL_CONST,
+                operands=(contract_cell,),
+            )
+            self.emit(Handler.Const, [], value, attributes={"value": literal})
         status = self.fresh_value(
             dtype="int", transform=REGION_CALL_RESULT,
             operands=(contract_cell, value),
@@ -5309,13 +5327,41 @@ class _ControlSSABuilder(TiledObject):
                     len(descriptor.column_value_ids)
                 ]
                 value = SSAValue(value_id, dtype="int64")
-                self.emit(
-                    Handler.Load, [length_cell], value,
-                    attributes={
-                        "binding": "ssa_sequence_length_value",
-                        "sequence_id": int(sequence_id),
-                    },
-                )
+                if descriptor.live_flags_value_id is not None:
+                    # Program: ``d = {1: n, 2: 3}; del d[1]; len(d)``.
+                    # Wrong record: ``len`` loaded the length cell, which
+                    # still counts the tombstoned row, and returned 2.
+                    # Rule: a table that retains deleted rows has the
+                    # length of its live rows.
+                    from .ir_sequence_tables import lower_sequence_live_length
+
+                    helper_name = self._sequence_helper_name(
+                        int(sequence_id), "live_length",
+                    )
+                    self._register_sequence_lowering(lower_sequence_live_length(
+                        descriptor,
+                        function_name=helper_name,
+                        first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+                    ))
+                    self.emit(
+                        Handler.Call,
+                        list(self.sequence_storage_values[int(sequence_id)]),
+                        value,
+                        attributes={
+                            "callee": helper_name,
+                            "source_linked": True,
+                            "ssa_sequence_operation": "live_length",
+                            "sequence_id": int(sequence_id),
+                        },
+                    )
+                else:
+                    self.emit(
+                        Handler.Load, [length_cell], value,
+                        attributes={
+                            "binding": "ssa_sequence_length_value",
+                            "sequence_id": int(sequence_id),
+                        },
+                    )
                 # SEQUENCE_LENGTH: the sequence's contract cell is the cause.
                 self._bind(
                     value_id, value, BindingKind.SEQUENCE_LENGTH,
@@ -24011,6 +24057,63 @@ def _schedule_loop_callsites(
                             writes |= child_writes
                     return reads, writes
 
+                # Program: ``d = {1: n, 2: 4}; del d[1]`` beside list work,
+                # then ``int(1 in d)`` (fuzzer p81_13).  Wrong record: the
+                # deletion rides as a pre-operation of the region after it
+                # in value order, and the membership query that follows it
+                # in source was placed before that region (WAR by run
+                # position), so the query found the deleted key (1397 for
+                # 397; clean audit).  Rule: a query of a table whose result
+                # follows a deletion of that table reads after the region
+                # that carries the deletion.  Where the region also needs
+                # the query, the order is a cycle and lowering refuses.
+                # Program: ``d = {}; for i in range(4): d[i % 2] =
+                # d.get(i % 2, 0) + n`` (the plan's C4; the loop unrolls).
+                # Wrong record: the same for a keyed store: all four
+                # ``get``s ran before the first store (-33 for -66; clean
+                # audit).  Rule: a keyed store is such a write too.
+                # The run position of such a query says nothing about it, so
+                # it takes no write-after-read edge to that carrier either.
+                follows: set[tuple[int, int]] = set()
+                deletions_by_position: dict[int, list[tuple[int, int]]] = {}
+                for position, child in enumerate(run):
+                    if not isinstance(child, StatementBlock):
+                        continue
+                    recorded_region = scheduled_region(child)
+                    if recorded_region is None:
+                        continue
+                    for kind, arguments in _region_table_operations(
+                        recorded_region,
+                        table_region_operations,
+                        table_region_post_operations,
+                    ):
+                        if kind not in {"store", "delete"}:
+                            continue
+                        _operation_reads, operation_writes = (
+                            _table_operation_sequence_accesses(kind, arguments)
+                        )
+                        deletions_by_position.setdefault(position, []).extend(
+                            (int(arguments[0]), int(sequence_id))
+                            for sequence_id in operation_writes
+                        )
+                for position, child in enumerate(run):
+                    if not (
+                        isinstance(child, SequenceQueryBlock)
+                        and child.producer_loop_node_id is None
+                    ):
+                        continue
+                    for carrier, deletions in deletions_by_position.items():
+                        if carrier != position and any(
+                            sequence_id == int(child.sequence_value_id)
+                            and effect_id < int(child.result_value_id)
+                            for effect_id, sequence_id in deletions
+                        ):
+                            follows.add((position, carrier))
+                            require(position, carrier, (
+                                "sequence_delete_raw",
+                                int(child.sequence_value_id),
+                            ))
+
                 # Three of the four dependence kinds, and not the fourth:
                 #   RAW  a read after a write   -- last_write
                 #   WAR  a write after a read   -- last_access
@@ -24018,10 +24121,29 @@ def _schedule_loop_callsites(
                 #   RAR  a read after a read    -- NONE, reads commute
                 last_access: dict[int, int] = {}
                 last_write: dict[int, int] = {}
+                reads_since_write: dict[int, list[int]] = {}
                 last_terminal = None
                 terminal_guard_candidates: list[tuple[int, int]] = []
                 for position, child in enumerate(run):
                     reads, writes = sequence_accesses(child)
+                    # Program: ``if n > 6: t = [n, 3] else: t = [8, n]``,
+                    # ``t.append(6)``, then a comprehension (fuzz p85_1).
+                    # Wrong record: the join's birth (clear, then one
+                    # append per member) sat after the append in the run,
+                    # and the write-after-write rule ordered the birth after
+                    # it, so the clear erased the append (len 2 for 3;
+                    # clean audit).  Rule: an access of an arena follows its
+                    # birth wherever the birth sits in the run, and a birth
+                    # takes no write-after-access edge from an access it
+                    # precedes.
+                    for arena in reads | writes:
+                        if position in births.get(int(arena), ()):
+                            continue
+                        for birth in births.get(int(arena), ()):
+                            if birth > position:
+                                require(position, birth, (
+                                    "sequence_birth", int(arena)
+                                ))
                     for arena in reads:
                         if arena in last_write:
                             require(position, last_write[arena], (
@@ -24049,13 +24171,33 @@ def _schedule_loop_callsites(
                                 and position in births.get(int(arena), ())
                             ):
                                 continue
-                            require(position, last_access[arena], (
+                            prior = last_access[arena]
+                            if (
+                                position in births.get(int(arena), ())
+                                and prior not in births.get(int(arena), ())
+                            ):
+                                continue
+                            if (prior, position) in follows:
+                                # The latest reader follows this write; the
+                                # latest reader that does not, else the last
+                                # write, precedes it.
+                                prior = max((
+                                    reader
+                                    for reader in reads_since_write.get(arena, ())
+                                    if (reader, position) not in follows
+                                ), default=last_write.get(arena))
+                                if prior is None:
+                                    continue
+                            require(position, prior, (
                                 access_kind, int(arena)
                             ))
                     for arena in reads | writes:
                         last_access[arena] = position
+                    for arena in reads - writes:
+                        reads_since_write.setdefault(arena, []).append(position)
                     for arena in writes:
                         last_write[arena] = position
+                        reads_since_write[arena] = []
                     # A source-placed call following a guarded continue/return
                     # must not execute on that terminal edge while waiting for
                     # the guard's numerical producer.
@@ -25235,6 +25377,13 @@ def lower_control_sections_to_ssa(
     # element and requested extent must agree in every numerical region and in
     # the control/helper function that surrounds those regions.
     for sequence_id, literal, count_id in sequence_fills.values():
+        region_value_meta[int(count_id)] = Meta((), "int")
+        if isinstance(literal, tuple):
+            # A runtime member: the rows hold its class.
+            member = region_value_meta.get(int(literal[1]))
+            if member is not None:
+                region_value_meta[int(sequence_id)] = Meta((), member.dtype)
+            continue
         element_dtype = (
             "bool" if isinstance(literal, bool)
             else "int" if isinstance(literal, int)
@@ -25243,7 +25392,6 @@ def lower_control_sections_to_ssa(
             else "unknown"
         )
         region_value_meta[int(sequence_id)] = Meta((), element_dtype)
-        region_value_meta[int(count_id)] = Meta((), "int")
     for _iterable_id, target_id, _induction_name, projection in (
         control.projected_iterable_bindings
     ):
