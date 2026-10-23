@@ -18084,6 +18084,32 @@ class _ControlSSABuilder(TiledObject):
             value = self._emit_native_object_operation('get', pair_receipt['source_iterable_value_id'], (key,), value_id)
             self.current.instrs[-1].attributes['native_pair_projection'] = {'contract_cell': pair_receipt['contract_cell']}
             bound_loop_target_ids.update((key_id, value_id))
+        # Program: ``d = {1: 10, 2: 20, 3: 30}; del d[2]; for k in d: ...``.
+        # Wrong record: the loop ran over the physical rows, and a keyed
+        # delete only clears the row's live flag, so the deleted key was
+        # still visited (57 for 37).  Nothing here skips a cleared row.
+        # Rule: iterating a table that carries live flags is refused.
+        for iterable_id, _target_id, induction_name, *_projection in (
+            *self.program.iterable_bindings,
+            *self.program.projected_iterable_bindings,
+        ):
+            if induction_name != loop.induction:
+                continue
+            sequence_id, seen = int(iterable_id), set()
+            while sequence_id in self.value_aliases and sequence_id not in seen:
+                seen.add(sequence_id)
+                sequence_id = int(self.value_aliases[sequence_id])
+            descriptor = self.sequence_descriptors.get(sequence_id)
+            if (
+                descriptor is not None
+                and descriptor.live_flags_value_id is not None
+            ):
+                raise ValueError(
+                    f"{path}: loop {loop.induction} iterates table "
+                    f"{sequence_id}, whose deleted rows stay resident behind "
+                    "cleared live flags; iteration over a table with "
+                    "deletions is not lowered"
+                )
         for iterable_id, target_id, induction_name in (
             self.program.iterable_bindings
         ):

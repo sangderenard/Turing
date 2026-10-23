@@ -1807,9 +1807,12 @@ def evaporate_unrolled_loops(
         # p85_45).  Wrong record: a store through the projection ``m[1]``
         # publishes a version nothing reads (the later read projects ``m``
         # again), so this pruning deleted the store; the structural fold then
-        # read the inner display's initializer (5 for n; clean audit).  Rule:
-        # an indexed store outside the evaporated loops is an effect, so it is
-        # live.
+        # read the inner display's initializer (5 for n; clean audit).
+        # Likewise ``for i in range(5): d[i] = i * n`` then ``del d[1];
+        # len(d)`` (lanes plan C3): ``del`` produces no value, so the pruning
+        # deleted it and ``len`` counted the deleted key (500 for 400).
+        # Rule: an indexed store or ``del`` outside the evaporated loops is an
+        # effect, so it is live.
         evaporated_body_ids = {
             int(node_id)
             for plan in plans
@@ -1819,7 +1822,7 @@ def evaporate_unrolled_loops(
         live.update(
             int(node_id)
             for node_id, data in graph.G.nodes(data=True)
-            if str(data.get("type")) == "IndexedStore"
+            if str(data.get("type")) in {"IndexedStore", "DelItem"}
             and int(node_id) not in evaporated_body_ids
         )
         # Dataflow ancestry alone is insufficient to retain source control:

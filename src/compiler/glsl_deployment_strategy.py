@@ -11131,6 +11131,30 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         })
         for mutation in _dict_update_mutations(graph.G)
         if int(mutation.effect_node_id) in graph.G
+    ] + [
+        # Program: ``e = {}; for i in range(5): e[i] = i * n`` then ``del
+        # e[1]`` beside ``d = {1: 10, 2: 20, 3: n}`` (corpus c370, lanes
+        # plan C3).  Wrong record: a keyed delete clears a live flag in
+        # place and produces no value, so it was no member of this order;
+        # the reducer fused the unrolled ``i * n`` with ``len(d) * 100``
+        # into one region that both fed the stores and followed the delete
+        # (a control order cycle).  Rule: a keyed ``del`` is an in-place
+        # effect on its table, as an update is.  A list ``del`` is already
+        # a retained ``pop`` record.
+        (int(node_id), {
+            "expression": data.get("expr_obj"),
+            "sequence_value_id": int(
+                graph.G.nodes[base].get("value_id", base)
+            ),
+        })
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type") or "") == "DelItem"
+        and int(node_id) not in records
+        for base in (next((
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role) == "base" and int(parent) in graph.G
+        ), None),)
+        if base is not None
     ]
     # Program: ``xs0 = [2, n]; grow(xs0, n % 3 + 1); xs1 = [n, 4];
     # push(xs1, 3)`` then ``return len(xs1) * 100 + xs1[-1]`` (fuzzer
