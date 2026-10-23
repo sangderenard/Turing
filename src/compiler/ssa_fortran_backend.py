@@ -912,6 +912,46 @@ class _FunctionEmitter:
                 current.device,
                 dict(current.accounting or {}),
             )
+        # Program: ``for x in (1, 5, 9): if x <= n: r += x`` (c275, c156,
+        # c27; lane E).  Wrong record: a static aggregate constant (dtype
+        # ``ssa.aggregate``, shape ``()``) read through element addresses had
+        # no Fortran spelling and refused the whole module.  Rule, as in the
+        # LLVM lane: when every use is an element address, the constant is a
+        # rank-1 array of its payload's own kind and length.
+        uses: dict[int, set[tuple[str, int]]] = {}
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                for position, argument in enumerate(instr.args):
+                    uses.setdefault(int(argument.id), set()).add(
+                        (str(instr.op), position)
+                    )
+        self._static_aggregate_constants: dict[int, tuple[Any, ...]] = {}
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                if instr.op not in ("Const", "const") or instr.res is None:
+                    continue
+                payload = instr.attributes.get("constant")
+                if payload is None:
+                    payload = instr.attributes.get("value")
+                if not isinstance(payload, (list, tuple)) or not payload:
+                    continue
+                if any(isinstance(item, (list, tuple, str, bytes)) for item in payload):
+                    continue
+                if tuple(instr.res.shape or ()) or not uses.get(int(instr.res.id)) or any(
+                    op not in {"GetElementPtr", "getelementptr"} or position != 0
+                    for op, position in uses[int(instr.res.id)]
+                ):
+                    continue
+                kind = (
+                    "bool" if all(isinstance(item, bool) for item in payload)
+                    else "int64" if all(isinstance(item, int) for item in payload)
+                    else "float64"
+                )
+                self._static_aggregate_constants[int(instr.res.id)] = tuple(payload)
+                self._value_types[int(instr.res.id)] = SSAValue(
+                    instr.res.id, kind, (len(payload),), instr.res.device,
+                    dict(instr.res.accounting or {}),
+                )
         self.outputs = tuple(self._typed(value) for value in self.outputs)
         self.dynamic_array_extents = {
             int(instr.args[0].id): (
@@ -3698,6 +3738,19 @@ class _FunctionEmitter:
                     return _literal(
                         0,
                         self._typed(instr.res).dtype or self.dtype,
+                    )
+                static_items = self._static_aggregate_constants.get(
+                    int(instr.res.id)
+                ) if instr.res is not None else None
+                if static_items is not None:
+                    typed = self._typed(instr.res)
+                    return _array_literal(
+                        [
+                            float(item) if typed.dtype == "float64" else item
+                            for item in static_items
+                        ],
+                        tuple(typed.shape),
+                        dtype=typed.dtype,
                     )
                 try:
                     return _literal(
