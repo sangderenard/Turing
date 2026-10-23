@@ -264,3 +264,67 @@ slice snippets and a sum of a folded list.
   i-th argument.
 - c295 and c296 are WRONG at main `08ba0171` and pass in C and LLVM here.
   c265, c171 and c172 move from LLVM refused to PASS.
+
+### Receipts for E6
+
+- Census at `ca7c606c` (212 programs): C 212/212. LLVM 201 PASS, 0 WRONG,
+  11 refused. Fortran (static runtime link) 111 PASS, 1 WRONG (c22).
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm`, seed 44 (40 programs, with the
+  comprehension and `zip` snippets): 33 PASS, 3 LLVM-LOUD, 3 LOUD,
+  1 CRASH, 0 WRONG and 0 TYPE. p44_13 (CRASH, an LLVM emission-artifact
+  cell) and the LOUD and LLVM-LOUD programs behave the same on main, except
+  p44_30: it is a C WRONG on main (305 for 302) and an LLVM refusal here.
+- The gate for E6 is the E7 gate below (`d43227df` contains E6).
+
+## E7: Fortran reductions over a resident list (COMPILE-FAIL on main)
+
+- **Program:** `xs = [n, 7, -2, n * 2]; max(xs) * 100 + min(xs)` (c150),
+  float `sum`/`max`/`min` (c154), `sum(xs, n)` after an append (c297,
+  c298), `any(xs)`/`all(xs)` (c299), and `any([x > n for x in xs])`
+  (c240).
+- **Wrong record:**
+  - The arena operand of a reduction over a resident sequence has a
+    shapeless SSA occurrence. The Fortran emitter took the
+    scalar-identity path and wrote `t9 = t6`, which gfortran refuses
+    (ranks 0 and 1).
+  - `any`/`all` with a float64 result passed the mask through `_numeric`,
+    so ANY/ALL got a REAL argument, which gfortran refuses.
+- **Rule:** `max`/`min`/`sum`/`any`/`all` over a resident sequence of
+  scalar rows reduce over its live length, read from the length cell
+  (the formal whose `sequence_length_for` names the arena), left to right
+  as Python and the C emitter do. `max`/`min` of no rows stop with error
+  74 (the C runtime's code) and never read a row. A NaN row propagates.
+  `any`/`all` take a mask (a number's truth is `/= 0`), and their LOGICAL
+  result is converted where it is assigned.
+- Every one of these was loud on main (COMPILE-FAIL or EMIT-INCOMPLETE),
+  never wrong.
+
+### Linking the Fortran runtime in a Linux container
+
+The Fortran artifact links libgfortran statically by default. A Linux
+libgfortran.a is not position independent, so a library that needs the
+runtime (any `error stop`) cannot be linked into a shared object here. That
+showed up as COMPILE-FAIL for list programs that are otherwise right (c135,
+c137, c138, c176, c266, c267, c268, c278, c279). The typed check now takes
+`TYPED_CHECK_FORTRAN_STANDALONE=0` and the fuzzer `FUZZ_FORTRAN_STANDALONE=0`
+to link it dynamically. The emitted program is the same, and the default is
+unchanged (static, which is what Windows uses).
+
+### Receipts for E7
+
+- Census at `d43227df` (215 programs, `TYPED_CHECK_FORTRAN_STANDALONE=0`):
+  C 215/215. LLVM 204 PASS, 0 WRONG, 11 refused. Fortran 126 PASS,
+  1 WRONG (c22, the sine table), 4 RUN-FAIL (c142, c177, c188, c197: a
+  dynamic extent of an internal array is asked of the caller), 5
+  COMPILE-FAIL (c185, c187, c191, c192: a callee's list formal is passed
+  as a scalar or assigned rank 0; c64: a dict value passed REAL to
+  INTEGER), 3 EMIT-FAIL and 76 EMIT-INCOMPLETE.
+- c297-c299 pass in C, LLVM and Fortran here. On main `08ba0171` c297 is
+  EMIT-INCOMPLETE, c298 and c299 COMPILE-FAIL in Fortran.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 45 (40 programs, with the reduction snippets): 15 PASS,
+  20 FORTRAN-LOUD (18 `Alloca`, heap growth has no Fortran emission;
+  2 `NoneValue`), 2 LLVM-LOUD, 3 LOUD, 0 WRONG and 0 TYPE.
+- Gate at `d43227df` (covers E6 and E7), on a clean worktree: aa 89 /
+  ab 7 / ac 26 / rec 20. The failure names in every part are the same as
+  main `08ba0171`'s, with both run in this container.

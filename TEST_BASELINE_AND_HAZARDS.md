@@ -1,3 +1,16 @@
+2026-10-23 LANE E, LOOP TARGETS AND FORTRAN LIST REDUCTIONS (MEASURED,
+cloud): E6, loop targets over an unrolled comprehension or zip were typed
+float64 (C silently rounded big ints, c295-c296); the typed check now
+compares integer answers exactly. E7, Fortran max/min/sum/any/all over a
+resident list reduce over its live length (were COMPILE-FAIL, c297-c299).
+HAZARD: a Linux libgfortran.a is not PIC, so any Fortran library with
+`error stop` fails to link in the cloud container with the default static
+runtime; use TYPED_CHECK_FORTRAN_STANDALONE=0 / FUZZ_FORTRAN_STANDALONE=0.
+At d43227df (215 programs): C 215/215, LLVM 204 PASS / 0 WRONG / 11
+refused, Fortran 126 PASS / 1 WRONG (c22). Gate names identical to main 08ba0171.
+Fuzz seeds 44 (llvm) and 45 (llvm,fortran) FUZZ_EXT=3: 0 WRONG / 0 TYPE.
+Doc 37 E6/E7.
+
 2026-10-23 LANE E, LIST SLICES (MEASURED, cloud): on main, list slices were
 silently wrong in C (a folded slice had no row writer; a runtime slice had
 no lowering), and sum of a folded list reduced one element (an operand
