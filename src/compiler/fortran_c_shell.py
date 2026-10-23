@@ -11079,6 +11079,15 @@ def _sequence_concat_ops(
         resident_by_value.setdefault(int(resident_id), int(resident_id))
         kind_by_value[int(value_id)] = str(kind)
         kind_by_value.setdefault(int(resident_id), str(kind))
+    # A structural alias is the recorded arena of its value.  The exit port
+    # of a loop that rebinds a list (corpus c246) has the body's display as
+    # its one parent, but its arena is the initial list the body's list is
+    # copied into; the single-parent rule below must not re-derive it.
+    recorded_residents = {
+        int(value_id) for value_id, (_resident, kind)
+        in dict(structural_aliases or {}).items()
+        if str(kind) in sequence_kinds
+    }
     # IndexedStore and its loop-result versions are deterministic names for
     # the same resident arena.  Retain that correlation while recognizing
     # structural concatenations across control-versioned sequence names.
@@ -11101,6 +11110,8 @@ def _sequence_concat_ops(
             }:
                 continue
             value_id = int(data.get("value_id", node_id))
+            if value_id in recorded_residents:
+                continue
             resolved_parents = {
                 (
                     int(resident_by_value[parent_value]),
@@ -25180,6 +25191,23 @@ def _class_surface_ssa_program(
                     expression.ctx, ast.Load
                 ):
                     singleton_name_aliases[int(value_id)] = source_id
+        # The exit port of a loop that rebinds a list (corpus c246) copies
+        # the body list's aggregate attributes, but its arena is the initial
+        # list the promotion carried it into: it names that storage and is
+        # not a list of its own.
+        promoted_loop_ports = {
+            int(value_id)
+            for value_id, (resident_id, _kind)
+            in conditional_sequence_aliases.items()
+            if int(value_id) != int(resident_id)
+            and str(graph_node_by_value.get(int(value_id), {}).get("type"))
+            == "LoopResult"
+        }
+        if promoted_loop_ports:
+            sequence_declarations = tuple(
+                declaration for declaration in sequence_declarations
+                if int(declaration[0]) not in promoted_loop_ports
+            )
         if conditional_sequence_destinations:
             sequence_declarations = tuple(
                 (
