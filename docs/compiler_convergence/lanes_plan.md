@@ -112,7 +112,7 @@ branch has used, merged or not.
 | c300-c309 | Lane E: Fortran span cells, callee swaps, dict.get defaults, colliding callee lists | `claude/project-thread-kbkzp7` | c300-c303 |
 | c310-c319 | Silent lane: reads before later effects on the same list, returned reads (renumbered from c290-c299, which Lane E used first) | `claude/project-thread-cz18s3` | c310-c319 (full) |
 | c320-c329 | Silent lane: comprehension loops and conditional expressions in the source-call order | `claude/project-thread-cz18s3` | c320, c321 |
-| c330-c339 | Silent lane: fixed-capacity full is loud, dict `get` in a loop, callee branch displays | `claude/project-thread-cz18s3` | c330, c331 |
+| c330-c339 | Silent lane: fixed-capacity full is loud, dict `get` in a loop, callee branch displays | `claude/project-thread-cz18s3` | c330, c331, c332 |
 | c340-c349 | next free | | |
 
 ## Lane A: bootstrap families (and the tire, where it shares a group)
