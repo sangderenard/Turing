@@ -1,3 +1,9 @@
+2026-10-23 MERGED MAIN cc6e6f36 INTO THE SILENT LANE (MEASURED): corpus
+184/184 PASS at 10fe5dd1. Fuzz seed 27 base 40/40. Seed 25 FUZZ_EXT=3: 57
+PASS and 3 LOUD, LOUD at `main` too. Gate failure names identical to a
+fresh `main` cc6e6f36 gate. Also covers c269 (a mutating call beside an
+unrolled comprehension, doc 36 section 7).
+
 2026-10-22 COMPREHENSION OVER A NEGATIVE LITERAL (MEASURED): `[x * n for x in
 [5, -1]]` typed its row float64 (`-1` is a `neg` node). Fixed in
 `literal_row`, doc 36 section 6. Corpus 172/172 at 99c1dfaf. Fuzz seed 24
