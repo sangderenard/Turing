@@ -4,7 +4,7 @@ Ranked work queues for lanes A (bootstrap families), C (language frontier)
 and D (defaults and fallbacks). Source: `34_2026_10_22_triage.md`. Rules:
 `00_COMPILER_TAKEOVER_PROMPT.md` sections 6 to 10.
 
-Updated 2026-10-23 at `main` `3ffb64d6` (planner run 2). The daily planner
+Updated 2026-10-23 at `main` `c0614a20` (planner run 2). The daily planner
 routine rewrites this file. A worker takes the top unclaimed item of its
 lane, writes its branch beside the claim, and does one item per run.
 
@@ -13,24 +13,21 @@ lane, writes its branch beside the claim, and does one item per run.
 Rank is blast radius x depth x whether the group can answer wrongly with a
 clean audit. Silent-capable groups come first whatever their size. Merged
 since run 1: #786 (A0, A3, list returns, call order, branch-merged lists),
-#787 (D1), #788 (S1 = A1, W2, C12, C13, C14), #790 (D3).
+#787 (D1), #788 (S1 = A1, W2, C12, C13, C14), #789 (a set merged from
+branch displays), #790 (D3), #791 (indexed stores and concatenations in the
+call order, D2-W), #792 (C15, which is also the A2 thread's W4, and the
+unrolled form of C2), #794 (D2 step 1). No lane PR is open.
 
 | order | item | lane | silent? | why here |
 |---|---|---|---|---|
-| 1 | #791 indexed stores in the call order (c280) | silent lane | yes, **observed** WRONG and SEGV on `main` | PR open; waits on Albert's local gate |
-| 2 | #792 = C15 = W4, `sort()` pruned beside an unrolled loop (c244) | C | yes, **observed** WRONG on `main` (fuzz tier 1 seeds 0 and 11, tier 3 seed 28) | PR open; it is the only thing between the A2 branch and a clean seed 0 |
-| 3 | A2 optional return surfaces + W1 (branch `h4aybe`, no PR yet) | A | yes, **observed** (seven silent wrongs fixed on the branch) | waits on Albert's answer on the coverage-march card; unblocked once #792 merges |
-| 4 | D3a stale `proven_shape` after a refused withdrawal | D | **inferred** yes | 4 corpus programs reach it; nobody has shown a reader of the stale shape |
-| 5 | A2 remainder: false acceptance in accepted-unit accounting | A | yes, **observed** once (unit 027) | blast radius is every bootstrap unit with a tuple or optional result |
-| 6 | D2 float64 region-input defaults (tire T2) | D | **inferred** yes (a wrong dtype is a TYPE result) | unblocked: #788 merged; depth is the planner, so it is early |
-| 7 | A2b tuple-or-`None` returns | A | no: loud by name since the A2 branch | bootstrap units with `fork = None` patterns |
-| 8 | A5 bootstrap measurement | A | measurement | A0 merged; the ask is Albert's (see A5) |
-| 9 | C16, C1 remainder, W3, then the rest of C | C, A | no, loud | fuzz frequency: C16 is 4/120 at tier 1 seed 11 |
-
-#789 (Lane A, a set merged from branch displays, c274) is loud-to-answer
-and measured clean; it holds `_list_literal_mutations`, so C16 waits for
-it. Lane E work (LLVM parity, thread `kbkzp7`) is committed on that branch
-behind #789 and claims no function in this file's lanes.
+| 1 | A2 optional return surfaces + W1 (branch `h4aybe`, seven silent wrongs fixed, no PR yet) | A | yes, **observed** | #792 merged, so the branch can re-merge `main` and fuzz seed 0 should be clean; open the PR |
+| 2 | C2 retained form: a display rebound inside a retained loop reads `len(xs)` as 0 | C | yes, **observed** at `3ffb64d6` | silent with a `descriptor-member-shared` finding; any loop that rebinds a list |
+| 3 | D3a stale `proven_shape` after a refused withdrawal | D | **inferred** yes | 4 corpus programs reach it; nobody has shown a reader of the stale shape |
+| 4 | A2 remainder: false acceptance in accepted-unit accounting | A | yes, **observed** once (unit 027) | blast radius is every bootstrap unit with a tuple or optional result |
+| 5 | D2 next sources (`range` constants, generator elements, `dict.get`, `StaticReference`) | D | **inferred** yes (a wrong dtype is a TYPE result) | 8,056 fallbacks left in 80 programs; depth is the planner |
+| 6 | A2b tuple-or-`None` returns | A | no: loud by name on the A2 branch | bootstrap units with `fork = None` patterns |
+| 7 | A5 bootstrap and tire measurement | A | measurement | A0 merged and every open silent fix has landed; the run is Albert's call |
+| 8 | C16 (with C2's constant-member form), C1 remainder, W3, then the rest of C | C, A | no, loud | C16 is 4/120 at tier 1 seed 11 |
 
 ## How claims work
 
@@ -57,20 +54,20 @@ branch has used, merged or not.
 |---|---|---|---|
 | c211-c218 | Lane A: A0, A3 and follow-ups | `claude/project-thread-kbkzp7` | c211, c212, c214-c218 |
 | c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c234 |
-| c240-c249 | Lane C: C1 constant-list comprehensions, C15 | `claude/project-thread-2nw77p` | c240-c244 |
+| c240-c249 | Lane C: C1 constant-list comprehensions, C15, C2 | `claude/project-thread-2nw77p` | c240-c245 |
 | c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
-| c280-c289 | Silent lane follow-ups (indexed stores in the call order) | `claude/project-thread-cz18s3` | c280 |
+| c280-c289 | Silent lane follow-ups (indexed stores and concatenations in the call order) | `claude/project-thread-cz18s3` | c280-c282 |
 | c290-c299 | next free | | |
 
 ## Lane A: bootstrap families (and the tire, where it shares a group)
 
 | rank | item | group (doc 34) | claimed functions | branch | status |
 |---|---|---|---|---|---|
-| A2 | Keep a return surface whole: the remaining pieces. `emit_outputs` must not fall back to `(output_id,)` when no `Ret` exists; accepted-unit accounting must not let one value stand for a tuple/optional (`project_compilation_product`, `len(paths) == 1 and len(published_ids) == 1`); add the doc 34 §1.4 false-acceptance check to the bootstrap status tool. The optional-return part is done (doc 34 §6, §7). | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs`; accepted-unit result accounting | `claude/project-thread-h4aybe` | claimed 2026-10-22; the optional-return part and W1 are done on the branch (no PR yet: waits on #792 and Albert's card) |
+| A2 | Keep a return surface whole: the remaining pieces. `emit_outputs` must not fall back to `(output_id,)` when no `Ret` exists; accepted-unit accounting must not let one value stand for a tuple/optional (`project_compilation_product`, `len(paths) == 1 and len(published_ids) == 1`); add the doc 34 §1.4 false-acceptance check to the bootstrap status tool. The optional-return part is done (doc 34 §6, §7). | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs`; accepted-unit result accounting | `claude/project-thread-h4aybe` | claimed 2026-10-22; the optional-return part and W1 are done on the branch; next: re-merge `main` (#792 is in) and open the PR |
 | A2b | Lower a returned tuple-or-`None` (`if c: return (a, b)` / `return None` in a bootstrap unit; `fork = (a, b)` / `fork = None; return fork` anywhere). It refuses by name now (`its newest binding ... was not materialized`), was silent before. Observed by the silent-wrong-answers thread: the planner builds the aggregate Phi (presence member 15, member Phis 16, 17), but the root's return reads the handle (10) instead of that layout, and the tuple's region is then pruned as dead. | B1 | the control finish's output resolution in `precompile_to_ssa`; find the pruner with a trap | | open: loud |
-| A4 | Tire: the result-storage lease mints a record span member's `SSA_VALUE` row as a scalar. Revise it from the record storage contract. `_ssa_structure` reads the registered record storage before calling a shape-empty fact a scalar. Repro idea: lift `Metrics` with its `error_present` span (15,) into a scratch program that returns the record through one call edge. Suspected pass (**inferred**): the lease writer, which reads the fact's empty shape before the record storage. | T1 | `structural_concordance._ssa_structure`; the result-storage lease writer in `fortran_c_shell` | | open: A0 merged, re-observe at `main` first (needs a tire run, see A5) |
-| A5 | Measure the core-chain cascade at `main` after #791 and #792: one full bootstrap and one managed tire run. Fill doc 34 §1.2 and re-file units into groups. Seven silent-wrong fixes and the S1 birth have landed since the 23/330 measurement, so the triage groups are stale (**inferred**). | B6, B7, T1 | none (measurement) | | open: asked Albert 2026-10-23 |
+| A4 | Tire: the result-storage lease mints a record span member's `SSA_VALUE` row as a scalar. Revise it from the record storage contract. `_ssa_structure` reads the registered record storage before calling a shape-empty fact a scalar. Repro idea: lift `Metrics` with its `error_present` span (15,) into a scratch program that returns the record through one call edge. Suspected pass (**inferred**): the lease writer, which reads the fact's empty shape before the record storage. | T1 | `structural_concordance._ssa_structure`; the result-storage lease writer in `fortran_c_shell` | | open: A0 merged; re-observe at `main` first (needs a tire run, see A5) |
+| A5 | Measure the core-chain cascade at `main`: one full bootstrap and one managed tire run. Fill doc 34 §1.2 and re-file units into groups. Many silent-wrong fixes and the S1 birth have landed since the 23/330 measurement, so the triage groups are stale (**inferred**). | B6, B7, T1 | none (measurement) | | open: asked Albert 2026-10-23 |
 | A6 | Variadic returns: the sequence-lane lowering for `return ()`/`(x,)`/`[]`/`[x]` (units 034, 162, 212). | B2 | reducer VARIADIC consumer in `precompile_to_ssa`; `ir_sequence_tables` | `claude/project-thread-kbkzp7` | claimed 2026-10-22; list returns fixed or refused (doc 35), tuple variadic and two-edge list lowering open |
 | A7 | `Any`-typed receivers and generic `str()`/`!r` of facts: runtime type dispatch over the fact classes. | B3 | to be scoped | | open: needs a design note first |
 | A8 | `'|'.join(tokens)` glyph recipe in f-strings (unit 6). | B5 | f-string glyph recipe builder | | open |
@@ -86,7 +83,7 @@ silent-capable items first.
 | rank | item | where the record is missing (doc 33) | claimed functions | branch | status |
 |---|---|---|---|---|---|
 | C1 | Reductions over a structural aggregate: `any((1 > n, 2 > n))`, `sum(x * n for x in xs)` with `xs` literal | the region takes the aggregate as an unproduced input, and no layer assembles it from its unrolled members | `resident_sequence_materialization._list_literal_mutations`; `glsl_deployment_strategy._tensor_descriptor_rule` (loop-target branch) | `claude/project-thread-2nw77p` | list/set comprehension part done (e7f4a46d, landed with PR #788; c240-c243). Still loud by name: generator over a folded list (`any(x > n for x in xs)`: the GeneratorExp materializer is not a declared sequence) and tuple displays |
-| C2 | A display rebound inside a loop: `xs = [i + n, i]` | `descriptor-member-shared`; unaccounted formal (loud in the product at `main`) | descriptor birth in `precompile_to_ssa` | | open |
+| C2 | A display rebound inside a loop: `xs = [i + n, i]` | UNROLLED loop (fixed on the branch, c245): the cloned display had no SOURCE_AGGREGATE_LAYOUT row, so its birth refused (`List # lacks one exact element producer`), and a post-loop `xs[0]` folded to a body node that evaporation never remapped. RETAINED loop (still open, **silent**): `xs = [0, 0]; for i in range(4): t += xs[0]; xs = [i + n, i]` then `len(xs)` reads 0 at `main` 3ffb64d6 (audit: `descriptor-member-shared`); the rebound display has no birth into the carried storage. Also loud: a cloned display with a constant member (`ys = [j * 2, j]` in a second loop; `xs = [i + n, 6, i]`, fuzz p11_77): a constant member the cloned layout names is gone by birth time | `loop_composer.evaporate_unrolled_loops` (cloned layouts, last-iteration reads) | `claude/project-thread-2nw77p` | unrolled form done (PR #792, c245); retained form open and next for Lane C. Repro idea: the four-line retained loop above. Suspected (**inferred**): the carried storage's birth, which writes the first display only |
 | C3 | Dict `del d[k]` / `d.pop(k)` | placed by graph-id order into a neighbouring region (a cycle); `pop` has no lowering. It should be one lexical mapping effect. | `_control_block_position` (read only); mapping effect lowering | | open |
 | C4 | `d.get(k, 0)` in a loop | control order cycle (c202) | `_sequence_effect_read_edges` | | open |
 | C5 | Standalone slice `ys = xs[1:n]` | no lowering; only `r += xs[a:b]` is recognized | slice recognizer; `ir_sequence_tables` | | open |
@@ -95,8 +92,7 @@ silent-capable items first.
 | C8 | Membership in a folded literal inside a loop (`i in ts`) | structural recovery builds at entry, where the loop target does not exist; the folded literal has no resident sequence | membership survey | | open |
 | C9 | Multi-element replication `[a, b] * k` | no operation writes its rows; fill repeats one value | `_sequence_concat_ops` | | open |
 | C10 | Strings as values (`s = "a" if c else "b"`, `len(s)`, `==`, `startswith`) | dispatch metadata; minted as a root input (c114, c217) | to be scoped | | open: large |
-| C15 | An in-place `sort()` beside an unrolled literal loop or comprehension: `for x in [3, -2, 0]: t += x * n` then `xs = [6, 7, n]; xs.sort(); xs[0] - xs[2]` | loop evaporation's ancestry pruning deleted the `sort` call (no retained record, no consumer); the fold read the display order (silent WRONG at `main` 3ffb64d6; fuzzer p11_29, p11_116, p23_3) | `loop_composer.evaporate_unrolled_loops` (liveness); `resident_sequence_materialization._method_mutation_edges` (new, the edges behind `_method_mutated_receiver_ids`) | `claude/project-thread-2nw77p` (PR #792) | fixed on the branch (c244). Also W4 from the A2 thread (p0_58, p0_85, p0_176 pass on this branch, observed by that thread) |
-| C16 | A comprehension over a folded list beside membership in another folded list: `ys = [x - n for x in [4, 4, 8]]` with `n in [5, 0, 2]` | loud at `main` 3ffb64d6: `List # lacks one exact element producer` (from the list birth in `_list_literal_mutations`); fuzzer tier 1 seed 11 p11_0, p11_24, p11_78, p11_104. Repro idea: the two lines above in one function of `n`. Suspected (**inferred**): the repeated member `4, 4` gives two members one producer, as `[m, m, 9]` does (doc 36 §1), so the birth refuses; the fix is a per-member birth, not a dedupe | `resident_sequence_materialization._list_literal_mutations` (after #789 merges; #789 edits it) | | next for Lane C |
+| C16 | A comprehension over a folded list beside membership in another folded list: `ys = [x - n for x in [4, 4, 8]]` with `n in [5, 0, 2]` | loud at `main` 3ffb64d6: `List # lacks one exact element producer` (from the list birth in `_list_literal_mutations`); fuzzer tier 1 seed 11 p11_0, p11_24, p11_78, p11_104 (and, with the C2 snippet in the pool, p11_0, p11_23, p11_76, p11_102; all loud at `main` too) | to be trapped; *inferred* to share C2's lost constant member | | open: loud, after C2 (same function) |
 
 ## Lane D: defaults and fallbacks
 
@@ -116,8 +112,8 @@ committed inventory script and classify every hit.
 | rank | item | claimed functions | branch | status |
 |---|---|---|---|---|
 | D3a | A shape withdrawal the book refuses, swallowed. In c02, c57, c58 and c62, `invalidate_shape_transformation` posts `shape_transformation_state` for the f-string glyph helpers (`append_decimal_integer_glyphs`, `hyp`). The book refuses it: "REVISE without a changed source; every Derived cell is stamped at or before the row's". Because the refusal is raised before the `proven_shape` invalidation, the stale proven shape stays on the book (**observed**). Whether any reader then uses it is **unknown**; it is **inferred** silent-capable. Next step: trap the post, find why the cause cell is not newer than the row, and supply that record. Then remove the try at the `invalidate_proven_shape` call. Repro idea: c02 alone, with a book-post trap on `shape_transformation_state` for `append_decimal_integer_glyphs`, printing the cause cell's stamp and the row's. | the `invalidate_proven_shape` call site in `glsl_deployment_strategy` (descriptor invalidation cone); `identity_concordance.invalidate_shape_transformation` | | next for Lane D |
-| D2 | Planner region inputs default to float64. Count the fallbacks across the corpus again (~3,000 measured once), then supply the proofs. This is also the tire's T2 (`bool` actual vs float64 region formal). | `_planned_scalar_dtypes` (read), region-input typing in `glsl_deployment_strategy` (`or "float64"` sites near lines 21277 to 21917) | | open, after D3a. Repro idea: count with a one-function hook on the `or "float64"` sites over c01-c62 first (not the full corpus); pick the site with most hits that reach a result. Suspected (**inferred**): inputs whose producer is a call result with a settled linked-ABI class that the region typing does not read |
-| D4 | `"int"` vs `"int64"` spellings reaching physical checks (rule 7). First job: a committed inventory script (`tools/` scratch is not enough) that lists each of the 26 sites and whether a physical check reads it. Suspected writers (**inferred**): provisional class spellings published before `_planned_scalar_dtypes` settles them | the inventory script only (new file); no compiler function until it lands | | open, after D2 |
+| D2 | Planner region inputs default to float64. **Observed** with an instrumented full corpus at `3ffb64d` (184/184 PASS): 9,547 fallbacks over the 14 `or "float64"` sites in `glsl_deployment_strategy`. `_value_shape_dtype` (the last resort after tensor, specialization, node, descriptor, `_planned_scalar_dtypes` and domain) takes 9,521 of them, in 92 programs. `_tensor_descriptor`'s generic tensor descriptor takes 26, in 18 programs. The other 12 sites take none. The 4 `else "float64"` sites are literal-type mappings and legitimate. On a sample, the unproven nodes were branch-join `Phi`s, then `GeneratorExp`/`comprehension`/`sum` over them, `range(...)` constants, `dict.get`, `StaticReference`s, and arithmetic over any of these. Step 1 (this PR): a `Phi` is typed from its `body`/`orelse` arms, as `IfExp` already was. Result: 8,056 left, in 80 programs (-1,491, and 12 programs now have none). Next steps, one source each: `range` constants (element int64), generator and comprehension elements, `dict.get` (the dict's value join), `StaticReference`. | `_planned_scalar_dtypes` (Phi rule); later sources in the same function | `claude/project-thread-h1z2w1` | step 1 done (PR #794); next sources open, after D3a |
+| D4 | `"int"` vs `"int64"` spellings reaching physical checks (rule 7) | to be listed by the inventory | | open |
 | D5 | Name, suffix and position matching (`.endswith(`, `[0]` on argument lists) in decision paths | to be listed by the inventory | | open: inventory first |
 
 ## Done
@@ -125,5 +121,9 @@ committed inventory script and classify every hit.
 - A1 / S1 (tuple displays are born and bounded), W2, C12, C13, C14: PR #788, merge `ca9668a4`, receipts in doc 36.
 - D1 (private root storage proven or refused): PR #787, merge `cc6e6f36`.
 - D3 (no silent except around the binding-kind lookup or the planned-shell walk): PR #790, merge `3ffb64d6`. D3a stays open.
+- Indexed stores and list concatenations in the source-call order (fuzz p28_37; D2-W, fuzz p13_5): PR #791, merge `6e621cd5`, doc 36 §8, §9.
+- C15 (`sort()` kept beside an unrolled loop; also W4) and C2's unrolled form: PR #792, merge `bbf81da8`.
+- A set merged from branch displays (c274): PR #789, merge `4567cb65`.
+- D2 step 1 (a branch join's scalar class is the join of its arms): PR #794, merge `c0614a20`.
 - A0 (chained comparison with a builtin conversion middle): PR #786, merge `57709b54`, receipts in doc 35.
 - A3 (`dict.update()` from a display is a table mutation): PR #786, merge `57709b54`, receipts in doc 35.

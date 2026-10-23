@@ -2232,7 +2232,17 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                 operands = [o for o in operands if o not in element]
                 settle(scalar, node_id, promote([scalar.get(o) for o in operands]))
                 continue
-            if isinstance(expression, ast.IfExp):
+            # Program: ``if a > b: r = a - b ... else: r = (b - a) * 2;
+            # return r + 1`` (corpus c01).  Wrong record: the statement
+            # join (a ``Phi`` with ``test``/``body``/``orelse`` parents, the
+            # same shape as ``IfExp``) had no rule, so ``r`` and everything
+            # computed from it took the float64 domain default in
+            # ``_value_shape_dtype`` (Lane D, D2: that site takes 9,521 of
+            # the planner's 9,547 float64 fallbacks across the 184 corpus
+            # programs at 3ffb64d; branch joins are one of its sources).
+            # Rule: a branch join's class is the join of its arms, exactly
+            # as for a conditional expression.
+            if isinstance(expression, ast.IfExp) or op == "phi":
                 arms = parents(data, "body", "orelse")
                 settle(scalar, node_id, join([scalar.get(o) for o in arms]))
         if not changed:
@@ -10771,6 +10781,12 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     # the source calls outside loops keep that order; each precedes the
     # next.  A call completes where it ends, so an inner call precedes the
     # call that receives its result.
+    from .fortran_c_shell import _sequence_concat_ops
+
+    concatenation_ids = {
+        int(operation[0])
+        for operation in _sequence_concat_ops(graph.G)[0]
+    }
     sequenced = [
         (int(effect_id), record.get("expression"))
         for effect_id, record in effects
@@ -10785,10 +10801,45 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         # Program: ``xs0 = [1] * (n % 4 + 1)`` then ``swap(xs2)`` (fuzzer
         # p23_32).  A list built by an operator is filled where it is
         # authored, as a call is, so it keeps its place in this order too.
+        # Program: ``xs0 = [n] + [3, 6] + [n * 4]`` then ``push(xs1, n)``
+        # twice and ``len(xs1)`` (fuzzer p13_5; corpus c281).  Wrong
+        # record: a concatenation carries no ``aggregate_kind``, so it was
+        # no member of this order; the reducer fused ``n * 4`` with
+        # ``len(xs1) * 100``, and the concatenation that reads ``n * 4``
+        # placed that region before the pushes (``len(xs1)`` read 0;
+        # clean audit).  Rule: a concatenation is the list operator its
+        # lowering recognizes (``_sequence_concat_ops``).
         (int(node_id), data.get("expr_obj"))
         for node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("expr_obj"), ast.BinOp)
-        and (data.get("attributes") or {}).get("aggregate_kind") == "list"
+        and (
+            (data.get("attributes") or {}).get("aggregate_kind") == "list"
+            or int(data.get("value_id", node_id)) in concatenation_ids
+        )
+    ] + [
+        # Program: ``xs0 = [5, n, 0]; xs0[1] = 8; xs0[0] += n; xs1 = [7,
+        # 7]; push(xs1, n); push(xs1, 2)`` then reads of both (fuzzer
+        # p28_37; corpus c280).  Wrong record: an indexed store was no
+        # member of this order, so the reducer fused the augmented store's
+        # ``xs0[0] + n`` with the reads of ``xs1`` after both pushes; the
+        # store placed that region before the calls, and the reads saw
+        # neither push (1220 for 409; with ``xs1 = []`` a null read).  Rule:
+        # an indexed store is an in-place effect lowered where it is
+        # authored, so it keeps its place in this order too.  The store an
+        # augmented assignment writes has no location of its own; it
+        # completes where its value does.
+        (int(node_id), store_expression)
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) == "IndexedStore"
+        for store_expression in ((
+            data.get("expr_obj")
+            if getattr(data.get("expr_obj"), "lineno", None) is not None
+            else next((
+                graph.G.nodes[int(parent)].get("expr_obj")
+                for parent, role in data.get("parents") or ()
+                if str(role) == "value" and int(parent) in graph.G
+            ), None)
+        ),)
     ]
     # Program: ``while k0 > 0: xs0.append(k0); k0 -= 2`` then ``swap(xs2)``
     # (fuzzer p24_54).  An effect inside a loop is observed when its
