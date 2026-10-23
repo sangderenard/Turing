@@ -1,7 +1,7 @@
 # 37. Lane E: backend parity (2026-10-23)
 
 The typed corpus check now runs each program through LLVM (compiled and
-executed) and Fortran (emitted; this container has no Fortran compiler)
+executed) and Fortran (compiled and executed when a Fortran compiler is present; `apt-get install gfortran` in the cloud container, otherwise emitted only)
 beside C:
 
 ```
@@ -87,3 +87,61 @@ These are loud, and are not wrong:
   cell" in a fork copy, the same family as p34_21, which is loud on main.
 - Gate: aa 89 / ab 7 / ac 26 / rec 20. These are the same names as the
   parent `74d79ec7`, both run in this container.
+
+## Fortran, executed (2026-10-23, gfortran 14 in this container)
+
+The first run that actually executed Fortran gave 69 PASS, 20 WRONG and
+87 refusals out of 176. Every Fortran program before that had only been
+emitted. The items below were fixed in the Fortran writer:
+
+6. **Region outputs named by the caller** (c18, c03, c06, c37, c38, c42,
+   c121-c123). Program: `while b != 0: a, b = b, a % b` returned `a`
+   unchanged. Wrong record: a planned region with no return metadata
+   took its output names from its callers' projection loads. The last
+   call site won, so the region's body computed `t3` while publishing
+   `t955`, and the output was never written. Rule: a function's own single
+   `Ret` is its output list. The caller catalogue is used only when the
+   function has no single `Ret`.
+7. **Floor division** (c04, c15, c24). Fortran's integer `/` truncates
+   toward zero. Rule: compute `(a - modulo(a, b)) / b`. This is exact,
+   and `modulo` takes the sign of b, as Python's `%` does.
+8. **Sequential Phi copies** (c124-c126). Program: `for i in range(10):
+   if i * i > n: break` then `return i` returned 10 instead of 9. Wrong
+   record: the copies on one edge ran in declaration order, so a later copy
+   read a value an earlier copy had already advanced. Rule: the copies on
+   an edge are parallel. Each target is written only after every copy that
+   reads it, and a copy cycle is refused by name.
+9. **Callee sequences not published** (c217). This is the same record as
+   C before c217 and LLVM before c271: the runtime bindings and sequence
+   tables named only the entry's own sequences. Rule: publish the linked
+   descriptors as well. `_linked_frame_sequences` now also respells their
+   length and status cells in entry ids.
+10. **Static tuples** (c275, c156). Rule, as in LLVM: when every use is an
+    element address, the tuple is a rank-1 array of its payload's own
+    kind.
+11. **Concat arena sized from an operand** (c264, c166, c173, c210, c218,
+    c262, c263, c273). This only became visible after #788 typed concat
+    rows. Program: `xs = [1, 2] + [n, 8]; xs[2]`. Wrong record: the concat
+    column kept the static shape (2,) of its operand. The second
+    `append_slice` then reported exhausted into a status nothing read, and
+    the read went past the arena. Rule: a sequence column takes the larger
+    shape from the storage requirement.
+
+## Census at the PR head `ba464c22` (195 programs)
+
+| | pass | wrong | crash | refused |
+|---|---|---|---|---|
+| C | 195 | 0 | 0 | 0 |
+| LLVM | 169 | 0 | 0 | 26 |
+| Fortran | 103 | 1 (c22) | 0 | 89 + 2 harness |
+
+- **c22:** Fortran's `sin` and `cos` use the lane's lookup-table
+  approximation (`trig_solver="lut"`), with an error of about 5e-8. The
+  check reports this. It does not tolerate it.
+- **c188, c197:** the Fortran harness stops with a dynamic extent of an
+  internal array that it cannot resolve (RUN-FAIL, loud).
+- **Fortran refusals:**
+  - 66 EMIT-INCOMPLETE. Most of these are `Alloca`: heap growth has no
+    Fortran emission yet.
+  - 21 COMPILE-FAIL, mostly rank mismatches in reductions and pops.
+  - 2 EMIT-FAIL.

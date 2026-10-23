@@ -808,6 +808,15 @@ def integer_scalar_lines(
     if operation == "Neg" and len(operands) == 1:
         return ([f"{register} = sub {operand_type} 0, {operands[0]}"],
                 operand_type)
+    if operation in {"Abs", "abs"} and len(operands) == 1:
+        # ``abs(n - 3)`` on an int stayed loud in LLVM (lane E fuzz, 3 of
+        # 30 programs).  Integer magnitude, no round trip through double.
+        return ([
+            f"{register}.neg = sub {operand_type} 0, {operands[0]}",
+            f"{register}.below = icmp slt {operand_type} {operands[0]}, 0",
+            f"{register} = select i1 {register}.below, "
+            f"{operand_type} {register}.neg, {operand_type} {operands[0]}",
+        ], operand_type)
     if operation == "Invert" and len(operands) == 1:
         # The canonical authored ``~mask`` opcode preserves its integer
         # domain. The old double fallback rejected it, despite an i64
