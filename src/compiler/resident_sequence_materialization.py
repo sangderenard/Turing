@@ -1828,7 +1828,7 @@ def _static_sequence_capacity_survey(
         for node_id, data in graph_obj.nodes(data=True)
         for attributes in (data.get("attributes") or {},)
         if attributes.get("producer_kind") == "aggregate_phi"
-        and attributes.get("aggregate_kind") == "list"
+        and attributes.get("aggregate_kind") in {"list", "set"}
         and attributes.get("aggregate_leaf_value_ids")
     })
     unknown = set()
@@ -2439,7 +2439,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
     def layout_members_of(layout):
         return (
             isinstance(layout, SourceAggregateLayout)
-            and str(layout.aggregate_kind) == "list"
+            and str(layout.aggregate_kind) in {"list", "set"}
             and bool(layout.members)
         )
 
@@ -2462,10 +2462,11 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             )
             if arm in changed_in_place or (readers and arm in changed):
                 raise ValueError(
-                    f"list {merged_id} merges the list {arm} from a branch, "
-                    "which changes or is shared after its display; a list "
-                    "bound on two branches is born from its arms' members "
-                    "only while each arm is its own unchanged display"
+                    f"collection {merged_id} merges the collection {arm} "
+                    "from a branch, which changes or is shared after its "
+                    "display; a list or set bound on two branches is born "
+                    "from its arms' members only while each arm is its own "
+                    "unchanged display"
                 )
     aggregate_page = current_identity_book().page(SOURCE_AGGREGATE_LAYOUT)
     mutations = []
@@ -2551,7 +2552,10 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             # merge were lost (silent).  Rule: the merged list is its own
             # storage, born at the merge from its member Phis.  That copy is
             # the list only while every arm is a display nothing else reads
-            # or changes; otherwise refuse by name.
+            # or changes; otherwise refuse by name.  A set merged the same
+            # way (``s = {1, n} if n > 0 else {2, 3}``, corpus c274) had no
+            # capacity and was refused at emission; its birth is the same,
+            # under the unique ``add`` policy.
             if not layout_members_of(layout):
                 if attributes.get("aggregate_kind") == "list":
                     # Program: ``def pick(n): if n > 2: r = [n] else: r =
