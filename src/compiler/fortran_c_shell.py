@@ -22729,11 +22729,22 @@ def _class_surface_ssa_program(
                 # does; an arm that is an inactive optional filler is not a
                 # value of the merge (it is never read) and contributes none.
                 member_attributes = data.get("attributes") or {}
+                # Program: ``if x > y: r = x + y else: r = None; return r``
+                # called as ``o = maybe_inc(n, 2)``, then ``(-1 if o is None
+                # else o) + n`` (doc 34 W1).  Wrong record: the name merge of
+                # ``r`` (a Phi of its conditional's ``body``/``orelse`` arms)
+                # carried no contract, so the callee's return and the
+                # caller's call result had no class and the sum's region fell
+                # to float64 (-4 came back as 1.8e19).  Rule: a statement
+                # name merge of a source conditional settles from its arms
+                # exactly as an IfExp and a member merge do.
                 member_merge = (
                     str(data.get("type") or "") == "Phi"
                     and (
                         member_attributes.get("conditional_result_of") is not None
                         or member_attributes.get("aggregate_parent_value_id")
+                        is not None
+                        or member_attributes.get("source_conditional_id")
                         is not None
                     )
                 )
