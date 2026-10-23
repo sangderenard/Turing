@@ -1,3 +1,36 @@
+2026-10-23 SILENT LANE: FULL IS LOUD, DICT GET (MEASURED): doc 36 sections
+15-16. A FIXED append/add/insert/slice/prepend/pack that finds no room now
+raises validation error 75 (only the DYNAMIC insert step still reports
+"full", and grows). That exposed c271/c272: a callee's branch display
+`[5, 6]` was bound as a caller literal and its arena got capacity 0 (dead
+arena, so the answers were right). WRONG at `main`: `d[k] = d.get(k, 0) +
+5` in a loop, read after it (7.0 for 12): the get was hoisted to entry
+and typed float64. Measured: corpus 226/226; fuzz 0 WRONG (seeds 45, 46,
+48); gate names identical to `main` 2806360d.
+
+2026-10-23 SILENT LANE ROUND 3 AND R1 (MEASURED): doc 36 sections 10-14.
+These were WRONG at `main` with a clean audit:
+- a comprehension birth, a comprehension loop, or a conditional expression
+  beside a mutating call (p32_55, p42_33, p42_6);
+- a bare returned read of a grown list, which returned nothing;
+- a list read before a later store, pop, insert, sort or mutating call.
+
+These were LOUD at `main`:
+- a set comprehension grown by add;
+- a set[int] parameter grown by a helper.
+
+R1 (tire region cycle since be0dd1fc) is fixed: an order edge never
+contradicts a value path, and nodes at one source position are not
+ordered among themselves. The tire now stops at the run_superstep
+scalar_item_merge stage. New audit finding: source-output-unreturned.
+Measured at 6a3ab933 (`main` 2806360d merged in):
+- corpus 224/224;
+- fuzz seed 43 base: 40/40;
+- seeds 42 and 44 FUZZ_EXT=3: 0 WRONG, LOUD only, all LOUD at `main` too;
+- gate failure names identical to a fresh `main` gate.
+Note: llvmlite must be installed (`pip install llvmlite`) for the tire
+build in a fresh container.
+
 2026-10-23 LANE E, BACKEND PARITY (MEASURED, cloud):
 `TYPED_CHECK_BACKENDS=c,llvm,fortran` runs the corpus through LLVM and
 Fortran as well as C. LLVM went from 132 pass / 5 WRONG / 1 crash / 33
