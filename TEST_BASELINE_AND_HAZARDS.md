@@ -1,3 +1,10 @@
+2026-10-23 LANE E, E12-E14 (MEASURED, cloud): LLVM reads a callee's view of a
+caller list (a load from a span formal), projects an optional tuple's
+presence flags (interleaved output positions/slots), and reads a heap
+arena's element dtype in a loop target. At c8452ec5 (223 programs): C
+223/223, LLVM 223/223 (0 refused), Fortran 135 PASS. Gate names identical
+to main 08ba0171. Fuzz seed 52 llvm,fortran: 0 WRONG / 0 TYPE.
+
 2026-10-23 LANE E, E11 (MEASURED, cloud): a dict accumulating into itself
 through get (d[k] = d.get(k, 0) + x) had float64 rows; C rounded large
 ints silently on main (c304). The planner now accepts a consistent typing

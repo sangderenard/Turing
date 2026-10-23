@@ -441,3 +441,81 @@ unchanged (static, which is what Windows uses).
 - Gate at `b40bcf78` (covers E5-E11), on a clean worktree: aa 89 / ab 7 /
   ac 26 / rec 20. The failure names in every part are the same as main
   `08ba0171`'s.
+
+## E12: a callee's view of a caller list (LLVM refused)
+
+- **Program:** `def size(xs): return len(xs) * 10 + xs[0]` called with a
+  list the caller grew (c188, c305). The same record covered c189, c190,
+  c192, c193 and c269.
+- **Wrong record:** the callee loads its list's length cell, a rank-1 span
+  formal, with no element address before the load. Only GEP results had a
+  span address in the LLVM emitter, so the load was refused ("address
+  value ... has no concorded span").
+- **Rule:** a load from a span formal itself (rank 1 or more, not a heap
+  pointer cell) reads its first element, the address a zero GEP gives.
+- c305 is refused by LLVM at main `08ba0171` and passes here.
+
+### Receipts for E12
+
+- Census at `77784c10` (221 programs, dynamic Fortran runtime): C
+  221/221. LLVM 217 PASS, 0 WRONG, 4 refused (c31, c32, c33: an optional
+  call's aggregate projection; c146: a heap load layout). Fortran 135 PASS,
+  1 WRONG (c22), 3 RUN-FAIL, 0 COMPILE-FAIL.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 49: 12 PASS, 26 FORTRAN-LOUD, 2 LLVM-LOUD, 0 WRONG and 0 TYPE.
+
+## E13: an optional tuple result's presence projections (LLVM refused)
+
+- **Program:** `fork = fork_of(row) if flag > 0 else None` with `fork_of`
+  returning `tuple[int, int] | None`, then `origin, stamp = fork` (c31,
+  c32, c33, c306).
+- **Wrong record:** `ssa_optional_values` interleaves each payload with
+  its presence flag (four outputs for a pair) and rewrote the call's
+  `output_ids`. The call's `output_positions` and `output_slots` still
+  named the two payload slots, so the LLVM emitter knew aggregate members
+  0 and 1 only and refused the presence projections ("aggregate
+  projection 3 ... has no compile-time member").
+- **Rule:** an interleaved optional result restates its positions and
+  slots with its outputs. Both are the callee's result order.
+- c306 is refused by LLVM at main `08ba0171` and passes here. c31, c32 and
+  c33 move from refused to PASS. C reads the same attributes and is
+  unchanged in the census.
+
+### Receipts for E13
+
+- Census at `b27b3c3f` (222 programs, dynamic Fortran runtime): C
+  222/222. **LLVM 221 PASS, 0 WRONG, 1 refused** (c146, a heap load whose
+  result disagrees with its element layout). Fortran 135 PASS, 1 WRONG
+  (c22), 3 RUN-FAIL, 0 COMPILE-FAIL.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 51 (with the optional-pair snippet): 17 PASS, 22 FORTRAN-LOUD,
+  1 LOUD, 0 LLVM-LOUD, 0 WRONG and 0 TYPE.
+
+## E14: a loop target read from an owned heap arena (LLVM refused)
+
+- **Program:** `xs = []; for i in range(n): xs.append(i); if i % 2 == 1:
+  xs.pop(0)`, then `for x in xs: total = total * 10 + x` (c146; c307 is
+  a companion that also passes at main).
+- **Wrong record:** the loop target's Load from the owned heap arena kept
+  a provisional declared `int` (i32). Scalar settlement keeps a Load's
+  declared width as a memory read (the rule for i32 status cells), though
+  the arena's rows are int64. LLVM refused the load ("heap load result
+  disagrees with its declared element layout").
+- **Rule:** a Load through an element address of a heap arena reads the
+  arena's declared element dtype (`heap_element_dtype`). It is not a
+  declared-width load.
+- c146 is refused by LLVM at main `08ba0171` and passes here. **With E12
+  to E14, LLVM refuses no corpus program.**
+
+### Receipts for E14
+
+- Census at `c8452ec5` (223 programs, dynamic Fortran runtime): C
+  223/223. **LLVM 223/223 PASS**, 0 WRONG and 0 refused. Fortran 135 PASS,
+  1 WRONG (c22), 3 RUN-FAIL, 0 COMPILE-FAIL, 3 EMIT-FAIL and 81
+  EMIT-INCOMPLETE.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 52 (with the pop-front snippet): 19 PASS, 19 FORTRAN-LOUD, 2 LOUD,
+  0 LLVM-LOUD, 0 WRONG and 0 TYPE.
+- Gate at `c8452ec5` (covers E5-E14), on a clean worktree: aa 89 / ab 7 /
+  ac 26 / rec 20. The failure names in every part are the same as main
+  `08ba0171`'s.
