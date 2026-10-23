@@ -20119,6 +20119,27 @@ class _ControlSSABuilder(TiledObject):
                 return None
             return self.external_value(int(value_id))
 
+        def owned_length(value_id: int) -> SSAValue | None:
+            """Resolve an output that is a control-owned sequence length.
+
+            Program: ``for x in xs: if x < 0: return x`` then ``return
+            len(xs)`` over a list parameter (lanes plan C7).  Wrong record:
+            the length is loaded only when a consumer asks for it, so the
+            named output resolved to nothing; the length reached ``Ret``
+            through the unnamed outputs, the return merge was never named
+            the output, and recovery replaced the exit Phi by the length:
+            the early return was lost (4 for -3; one finding).  Rule: a
+            returned length is control-owned like a returned row read
+            (and as the unnamed outputs below already treat it).
+            """
+            sequence_id = self.sequence_length_values.get(int(value_id))
+            if sequence_id is None or (
+                sequence_id not in self.sequence_descriptors
+                and sequence_id not in self.native_object_source_ids
+            ):
+                return None
+            return self.external_value(int(value_id))
+
         for name, history in self.named_output_histories.items():
             if self.function_return_edges:
                 # With explicit return edges, source history is the temporal
@@ -20131,7 +20152,7 @@ class _ControlSSABuilder(TiledObject):
                     for value_id in reversed(history)
                     for resolved in (
                         existing_value(value_id) or owned_row_load(value_id)
-                        or owned_literal(value_id),
+                        or owned_length(value_id) or owned_literal(value_id),
                     )
                     if resolved is not None
                 ), None)
@@ -20144,7 +20165,8 @@ class _ControlSSABuilder(TiledObject):
                     resolved
                     for value_id in reversed(history)
                     for resolved in (
-                        existing_value(value_id) or owned_row_load(value_id),
+                        existing_value(value_id) or owned_row_load(value_id)
+                        or owned_length(value_id),
                     )
                     if resolved is not None
                 ), None)
