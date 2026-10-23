@@ -6534,24 +6534,33 @@ def emit_module(
         own_ids = set() if own is None else {
             int(descriptor.sequence_id) for descriptor in own.sequences.values()
         }
+        every_linked = tuple(
+            _linked_frame_sequences(module, function_name)
+            if isinstance(module, IRModule) else ()
+        )
         linked = tuple(
             descriptor
-            for descriptor in (
-                _linked_frame_sequences(module, function_name)
-                if isinstance(module, IRModule) else ()
-            )
+            for descriptor in every_linked
             # A callee's sequence id that collides with one of the entry's
-            # own cannot be published under it; that sequence stays
-            # unpublished (capacity 0, loud "full" status), as before.
+            # own cannot be published under it in the sequence table.
             if int(descriptor.sequence_id) not in own_ids
         )
         if linked:
             linked_sequence_descriptors[function_name] = linked
-        if own is None and not linked:
+        if own is None and not every_linked:
             continue
         described = entry_by_name[function_name]
+        # Program: ``localgrow(x)`` builds ``xs = [7, 5]; xs.append(x)`` and
+        # ``root`` has its own list, both sequence 3 (fuzz seed 46, corpus
+        # c303).  Wrong record: the colliding callee sequence got no runtime
+        # binding, so its hoisted capacity cell stayed 0, every append
+        # reported "full" into a status nobody read, and the callee summed
+        # zeros (Fortran silently wrong where C is right).  Rule: every
+        # linked sequence's capacity is published; a binding carries its own
+        # column shapes, so it never looks its descriptor up by a sequence id
+        # that two functions share.
         published_sequences = (
-            *(() if own is None else own.sequences.values()), *linked,
+            *(() if own is None else own.sequences.values()), *every_linked,
         )
         parameter_names = {parameter.name for parameter in described.parameters}
         extent_parameters = tuple(
@@ -6621,6 +6630,17 @@ def emit_module(
                 "column_parameters": [
                     f"t{int(value_id)}"
                     for value_id in descriptor.column_value_ids
+                    if f"t{int(value_id)}" in parameter_names
+                ],
+                "column_shapes": [
+                    [int(extent) for extent in shape]
+                    for value_id, shape in zip(
+                        descriptor.column_value_ids,
+                        descriptor.column_shapes or tuple(
+                            () for _ in descriptor.column_value_ids
+                        ),
+                        strict=True,
+                    )
                     if f"t{int(value_id)}" in parameter_names
                 ],
                 "local_column_value_ids": [
@@ -7198,9 +7218,18 @@ class FortranCoreNative:
         descriptors = {int(item["sequence_id"]): item for item in
             (metadata.get("sequence_tables") or {}).get(self._entry_record.name, ())}
         for binding in (metadata.get("sequence_runtime_bindings") or {}).get(self._entry_record.name, ()):
-            descriptor = descriptors[int(binding["sequence_id"])]
+            if "column_shapes" in binding:
+                row_shapes = {
+                    int(column.lstrip("t")): tuple(shape)
+                    for column, shape in zip(
+                        binding["column_parameters"], binding["column_shapes"],
+                        strict=True,
+                    )
+                }
+            else:
+                descriptor = descriptors[int(binding["sequence_id"])]
+                row_shapes = dict(zip(descriptor["column_value_ids"], descriptor["column_shapes"], strict=True))
             rows = []
-            row_shapes = dict(zip(descriptor["column_value_ids"], descriptor["column_shapes"], strict=True))
             for column in binding["column_parameters"]:
                 column_id = int(column.lstrip("t"))
                 width = int(np.prod(row_shapes[column_id])) if row_shapes[column_id] else 1
