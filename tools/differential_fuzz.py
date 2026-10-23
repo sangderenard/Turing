@@ -201,6 +201,8 @@ EXTENDED3 = [
     (["xs{v} = []", "for i{v} in range(n % 5 + 2):", "    xs{v}.append(i{v} + {a})", "    if i{v} % 2 == 1:", "        xs{v}.pop(0)", "t{v} = 0", "for x{v} in xs{v}:", "    t{v} = t{v} * 10 + x{v}"], "t{v}"),
     # an optional tuple result unpacked after a None test (lane E)
     (["f{v} = maybe_pair(n, {a}) if n != {b} else None", "r{v} = -1", "if f{v} is not None:", "    p{v}, q{v} = f{v}", "    r{v} = p{v} * 10 + q{v}"], "r{v}"),
+    # a callee that returns an optional scalar, read after a None test (lane E)
+    (["o{v} = maybe_twice(n, {a})", "t{v} = {b}", "if o{v} is not None:", "    t{v} = o{v} - {c}"], "t{v} * 10 + n"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
@@ -241,6 +243,10 @@ def maybe_pair(x: int, y: int) -> tuple[int, int] | None:
     if x > y:
         return None
     return (x + 1, y * 2)
+
+
+def maybe_twice(x: int, y: int):
+    return x * 2 if x != y else None
 
 
 """

@@ -4141,6 +4141,23 @@ class _FunctionEmitter:
                 error_code = int(instr.attributes.get("error_code", 1))
                 body.append(f"    error stop {error_code}")
                 continue
+            if (
+                instr.op == "NoneValue"
+                and instr.res is not None
+                and not self._use_sites.get(instr.res.id)
+                and int(instr.res.id) not in {
+                    int(value.id) for value in self.outputs
+                }
+            ):
+                # Program: ``o = maybe_pick(n, 2); if o is not None: ...``
+                # (fuzz seed 52).  Wrong record: optional lowering leaves the
+                # authored ``None`` as a NoneValue nothing reads (presence is
+                # a separate value), and Fortran has no kind for ``none``, so
+                # the whole program was refused.  Rule: a None that nothing
+                # reads or returns has no runtime statement; a read one is
+                # still refused here.
+                body.append("    ! unread None")
+                continue
             if instr.op in ("Phi", "phi"):
                 # Phi is realised by the predecessors, not here.
                 continue
@@ -5164,6 +5181,36 @@ def emit_module(
     named_outputs = dict(outputs or {})
     for function_name, function in functions.items():
         return_value = function.metadata.get("return_value")
+        own_returns = {
+            tuple(int(value.id) for value in instruction.args): tuple(instruction.args)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Ret", "ret"} and instruction.args
+        }
+        declared_ids = (
+            (int(return_value.id),) if isinstance(return_value, SSAValue)
+            else tuple(
+                int(value_id)
+                for _name, value_id in function.metadata.get("named_outputs") or ()
+            )
+        )
+        if (
+            function_name not in named_outputs
+            and declared_ids
+            and len(own_returns) == 1
+            and len(next(iter(own_returns))) > len(declared_ids)
+            and set(declared_ids) <= set(next(iter(own_returns)))
+        ):
+            # Program: ``def maybe_pick(x, y): return x * 2 if x != y else
+            # None`` (fuzz seed 52).  Wrong record: optional lowering returns
+            # the payload and its presence, but ``return_value`` names the
+            # payload alone (as does ``named_outputs``), so the Fortran callee
+            # declared one output while its callers pass a two-slot aggregate
+            # (gfortran: REAL(8) to INTEGER(8)).  Rule: when the function's
+            # one ``Ret`` returns its declared outputs beside other values,
+            # the ``Ret`` operands are its outputs.
+            named_outputs[function_name] = next(iter(own_returns.values()))
+            continue
         if isinstance(return_value, SSAValue):
             # The function owns its return identity.  A caller-side aggregate
             # projection can carry a different local id for the same slot;
