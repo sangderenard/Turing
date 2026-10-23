@@ -22128,12 +22128,24 @@ def _class_surface_ssa_program(
                 # the contract carries it (one ``python_type``) and the row's
                 # cell as the source, so the one VALUE_TYPE_ABI post below the
                 # linker settles it.  No row, no identity: nothing is posted.
+                #
+                # Program: ``SSASequenceDescriptor.to_mapping`` (bootstrap
+                # unit 069) reads ``self.status_address_id`` declared ``int
+                # | None``.  Wrong record: a record WITH a
+                # ``source_record_view_schema`` row attached the field's
+                # declaration cell above but never read its annotation, and
+                # an optional field's ProgramABI row has no ``python_type``;
+                # the read had no class, so its dict column had no type
+                # evidence for it.  Rule: whichever declaration cell names
+                # the field, its annotation is the declared class.
                 if (
                     contract.get("python_type") is None
-                    and contract.get(
-                        "program_abi_field_declaration_cell"
-                    ) is None
-                    and "." in record_identity
+                    and not contract.get("python_types")
+                    and (
+                        contract.get("program_abi_field_declaration_cell")
+                        is not None
+                        or "." in record_identity
+                    )
                 ):
                     from .concordance_declarations import (
                         CLASS_FIELD_DECLARATION as _ABI_RECORD_FIELD_PAGE,
@@ -22142,7 +22154,9 @@ def _class_surface_ssa_program(
                     _record_module, _, _record_class = (
                         record_identity.rpartition(".")
                     )
-                    _declared_field_cell = shape_identity_book.latest_ref(
+                    _declared_field_cell = contract.get(
+                        "program_abi_field_declaration_cell"
+                    ) or shape_identity_book.latest_ref(
                         _ABI_RECORD_FIELD_PAGE,
                         (_record_module, _record_class, str(field_name)),
                     )
