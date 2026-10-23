@@ -18426,6 +18426,28 @@ def _propagate_native_type_tag_results(
                                         tag if argument is prior_tag else argument
                                         for argument in consumer.args
                                     ]
+                                    # Program: ``if v is not None: t = v * 3``
+                                    # on a value-union call result.  Wrong
+                                    # record: the region feed's view of ``v``
+                                    # kept the provisional tag id after the
+                                    # tag itself was replaced.  Rule: every
+                                    # occurrence of the payload names the
+                                    # linked tag.
+                                    for argument in consumer.args:
+                                        accounting = argument.accounting or {}
+                                        if (
+                                            int(argument.id)
+                                            == int(first_payload.id)
+                                            and accounting.get(
+                                                "native_type_tag_value_id"
+                                            ) == int(prior_tag_id)
+                                        ):
+                                            argument.accounting = {
+                                                **dict(accounting),
+                                                "native_type_tag_value_id": int(
+                                                    tag.id
+                                                ),
+                                            }
                             caller.args = [
                                 argument for argument in caller.args
                                 if argument is not prior_tag
@@ -48470,13 +48492,29 @@ def _class_surface_ssa_program(
                         # Rebind the exact placeholder object, never every
                         # numerically equal id: independent numbering domains
                         # can legitimately collide.
+                        # Program: ``v = maybe(row, flag)`` where ``maybe``
+                        # returns ``row + 1 if flag > 0 else None``.  Wrong
+                        # record: the placeholder is the authored scalar ``v``
+                        # of a value-union result, not an aggregate feed, so
+                        # ``v is None`` and ``return v`` read the (payload,
+                        # tag) container.  Rule: a union result's semantic
+                        # value is its payload projection (the unpack's Load
+                        # already defines the placeholder object itself).
+                        union_payload = next((
+                            values.get(int(caller_id))
+                            for callee_id, caller_id in record.result_bindings
+                            if union_return_layouts.get(int(callee_id))
+                        ), None)
+                        rebound = (
+                            result if union_payload is None else union_payload
+                        )
                         for caller_block in caller.blocks.values():
                             for caller_instruction in caller_block.instrs:
                                 caller_instruction.args = [
                                     _rebind_linked_storage_alias(
                                         argument,
                                         aggregate_placeholder,
-                                        result,
+                                        rebound,
                                     )
                                     for argument in caller_instruction.args
                                 ]
@@ -48484,7 +48522,7 @@ def _class_surface_ssa_program(
                             argument for argument in caller.args
                             if argument is not aggregate_placeholder
                         ]
-                        values[int(record.callsite_id)] = result
+                        values[int(record.callsite_id)] = rebound
                     if returns_physical_result:
                         consumed_result_ids = (
                             {

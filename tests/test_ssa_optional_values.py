@@ -353,3 +353,57 @@ def test_unit_returning_tuple_or_none_refuses_instead_of_returning_the_none():
             source, "root", name="optional_tuple_unit",
             extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
         )
+
+
+def test_is_none_on_an_ifexp_union_call_result_reads_its_tag():
+    # ``maybe`` returns ``row + 1 if flag > 0 else None``: a value union whose
+    # call result is (payload, tag).  ``v is None`` used to compare the int
+    # payload (or the call's container) with None; consumers of ``v`` read
+    # the container.  The test reads the tag; every other use reads payload.
+    source = (
+        "def maybe(row: int, flag: int):\n"
+        "    return row + 1 if flag > 0 else None\n"
+        "def root(row: int, flag: int) -> int:\n"
+        "    v = maybe(row, flag)\n"
+        "    if v is None:\n"
+        "        return -1\n"
+        "    return v\n"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="optional_ifexp_callee",
+        extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+    )
+    root = module.functions[exports[0]]
+    instructions = [
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs
+    ]
+    (call,) = [instruction for instruction in instructions if instruction.op == "Call"]
+    handle = int(call.res.id)
+    assert all(
+        instruction.op == "GetElementPtr"
+        for instruction in instructions
+        if any(int(argument.id) == handle for argument in instruction.args)
+    )
+    tags = dict(root.metadata["native_value_type_tags"])
+    (payload_id, tag_id), = tags.items()
+    none_operands = {
+        int(instruction.res.id)
+        for instruction in instructions
+        if instruction.op == "NoneValue"
+    }
+    assert not [
+        instruction for instruction in instructions
+        if instruction.op in {"Eq", "Ne"}
+        and any(int(argument.id) in none_operands for argument in instruction.args)
+    ]
+    assert any(
+        instruction.op == "Eq"
+        and int(instruction.args[0].id) == int(tag_id)
+        for instruction in instructions
+    )
+    (merge,) = [
+        instruction for instruction in instructions
+        if instruction.op == "Phi"
+    ]
+    assert int(payload_id) in {int(argument.id) for argument in merge.args}
