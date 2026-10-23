@@ -10771,6 +10771,12 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     # the source calls outside loops keep that order; each precedes the
     # next.  A call completes where it ends, so an inner call precedes the
     # call that receives its result.
+    from .fortran_c_shell import _sequence_concat_ops
+
+    concatenation_ids = {
+        int(operation[0])
+        for operation in _sequence_concat_ops(graph.G)[0]
+    }
     sequenced = [
         (int(effect_id), record.get("expression"))
         for effect_id, record in effects
@@ -10785,10 +10791,21 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         # Program: ``xs0 = [1] * (n % 4 + 1)`` then ``swap(xs2)`` (fuzzer
         # p23_32).  A list built by an operator is filled where it is
         # authored, as a call is, so it keeps its place in this order too.
+        # Program: ``xs0 = [n] + [3, 6] + [n * 4]`` then ``push(xs1, n)``
+        # twice and ``len(xs1)`` (fuzzer p13_5; corpus c281).  Wrong
+        # record: a concatenation carries no ``aggregate_kind``, so it was
+        # no member of this order; the reducer fused ``n * 4`` with
+        # ``len(xs1) * 100``, and the concatenation that reads ``n * 4``
+        # placed that region before the pushes (``len(xs1)`` read 0;
+        # clean audit).  Rule: a concatenation is the list operator its
+        # lowering recognizes (``_sequence_concat_ops``).
         (int(node_id), data.get("expr_obj"))
         for node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("expr_obj"), ast.BinOp)
-        and (data.get("attributes") or {}).get("aggregate_kind") == "list"
+        and (
+            (data.get("attributes") or {}).get("aggregate_kind") == "list"
+            or int(data.get("value_id", node_id)) in concatenation_ids
+        )
     ] + [
         # Program: ``xs0 = [5, n, 0]; xs0[1] = 8; xs0[0] += n; xs1 = [7,
         # 7]; push(xs1, n); push(xs1, 2)`` then reads of both (fuzzer
