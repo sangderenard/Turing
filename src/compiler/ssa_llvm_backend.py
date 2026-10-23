@@ -4620,8 +4620,20 @@ def _emit_repository_call_module(
     root_sequences = getattr(module, "sequence_tables", {}).get(function_name)
     root_arguments = {int(value.id): value for value in root.args}
     heap_releases: list[str] = []
-    if root_sequences is not None:
-        for sequence in root_sequences.sequences.values():
+    # Program: c271's ``merged(n)`` called from ``root`` (lane E).  Wrong
+    # record: as in the C wrapper before c217, only the entry's own
+    # sequence table was published, so a callee's hoisted capacity cell
+    # stayed 0, every append reported "full" and ``len(t)`` read 0 in LLVM
+    # while C was right.  Rule: the same linked descriptors the C wrapper
+    # publishes (``_linked_frame_sequences``), respelled in entry ids.
+    from .ssa_c_backend import _linked_frame_sequences
+
+    published_sequences = (
+        *(() if root_sequences is None else root_sequences.sequences.values()),
+        *_linked_frame_sequences(module, function_name),
+    )
+    if published_sequences:
+        for sequence in published_sequences:
             capacity_id = int(sequence.capacity_value_id)
             owner_id = sequence.heap_owner_value_id
             if (sequence.capacity_policy == SSASequenceCapacityPolicy.DYNAMIC
