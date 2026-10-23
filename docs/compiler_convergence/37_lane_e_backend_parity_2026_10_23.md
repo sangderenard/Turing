@@ -225,3 +225,16 @@ refusal.
 
 The corpus adds c290 to c294. The fuzzer's EXTENDED3 pool adds four
 slice snippets and a sum of a folded list.
+
+### Receipts for E4 (in part) and E5
+
+- Census before the rebase onto main (195 programs, without c290-c294):
+  C 195/195. LLVM 181 PASS, 0 WRONG, 14 refused (it was 171 and 24).
+  Fortran unchanged: 103 PASS, 1 WRONG (c22).
+- c290-c294: WRONG in C at main `d8d41cb6`, and PASS in C and LLVM here.
+- Gate at `f0c046b8` (rebased onto main `08ba0171`): aa 89 / ab 7 /
+  ac 26 / rec 20. The failure names in every part are the same as main's,
+  with both run in this container.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm`, seed 43 (40 programs, with the
+  new slice snippets): 30 PASS, 6 LLVM-LOUD, 4 LOUD, 0 WRONG and 0 TYPE.
+  All four LOUD programs are also LOUD on main.

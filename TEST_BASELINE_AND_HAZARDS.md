@@ -1,3 +1,11 @@
+2026-10-23 LANE E, LIST SLICES (MEASURED, cloud): on main, list slices were
+silently wrong in C (a folded slice had no row writer; a runtime slice had
+no lowering), and sum of a folded list reduced one element (an operand
+occurrence kept the provisional shape). Fixed at the writers, doc 37 E5,
+corpus c290-c294. append_slice arithmetic is int64 (LLVM +10 programs).
+Gate at f0c046b8: names identical to main 08ba0171. Fuzz seed 43
+FUZZ_EXT=3 llvm: 0 WRONG / 0 TYPE.
+
 2026-10-23 LANE E, BACKEND PARITY (MEASURED, cloud):
 `TYPED_CHECK_BACKENDS=c,llvm,fortran` runs the corpus through LLVM and
 Fortran as well as C. LLVM went from 132 pass / 5 WRONG / 1 crash / 33
