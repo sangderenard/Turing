@@ -10831,12 +10831,15 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         # fused a row's ``x0 * n`` with ``len(xs1) * 100`` and the birth
         # placed that region before the push (100 for 200; with ``xs1 =
         # []`` a null read).  Rule: an unrolled comprehension's birth is
-        # an effect where it is authored, as a call is.
+        # an effect where it is authored, as a call is.  So is a
+        # comprehension over a runtime range, which is a loop lowered
+        # where it is authored: ``xs0 = [i * 4 for i in range(n % 5 + 1)
+        # if i % 2 == 0]; xs1 = [n, 5]; swap(xs1)`` then reads of ``xs1``
+        # (Lane E fuzzer p42_33; corpus c300) fused ``n % 5 + 1`` with
+        # the reads into a region placed before the call (105 for 150).
         (int(node_id), data.get("expr_obj"))
         for node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("expr_obj"), (ast.ListComp, ast.SetComp))
-        and (data.get("attributes") or {}).get("materialization_kind")
-        == "unrolled_loop"
     ] + [
         # Program: ``xs0 = [5, n, 0]; xs0[1] = 8; xs0[0] += n; xs1 = [7,
         # 7]; push(xs1, n); push(xs1, 2)`` then reads of both (fuzzer

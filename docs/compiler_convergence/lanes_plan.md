@@ -59,7 +59,8 @@ branch has used, merged or not.
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
 | c280-c289 | Silent lane follow-ups (indexed stores and concatenations in the call order; comprehension births; grown sets) | `claude/project-thread-cz18s3` | c280-c289 (full) |
 | c290-c299 | Silent lane: reads before later effects on the same list, returned reads | `claude/project-thread-cz18s3` | c290-c299 (full) |
-| c300-c309 | next free | | |
+| c300-c309 | Silent lane: comprehension loops in the source-call order (Lane E p42_33) | `claude/project-thread-cz18s3` | c300 |
+| c310-c319 | next free | | |
 
 ## Lane A: bootstrap families (and the tire, where it shares a group)
 
