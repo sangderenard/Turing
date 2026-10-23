@@ -33,7 +33,7 @@ branch has used, merged or not.
 |---|---|---|---|
 | c211-c218 | Lane A: A0, A3 and follow-ups | `claude/project-thread-kbkzp7` | c211, c212, c214-c218 |
 | c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c234 |
-| c240-c249 | Lane C: C1 constant-list comprehensions | `claude/project-thread-2nw77p` | c240-c243 |
+| c240-c249 | Lane C: C1 constant-list comprehensions, C15, C2 | `claude/project-thread-2nw77p` | c240-c245 |
 | c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
 | c280-c289 | Silent lane follow-ups (indexed stores and concatenations in the call order) | `claude/project-thread-cz18s3` | c280-c282 |
@@ -60,8 +60,8 @@ silent-capable items first.
 
 | rank | item | where the record is missing (doc 33) | claimed functions | branch | status |
 |---|---|---|---|---|---|
-| C1 | Reductions over a structural aggregate: `any((1 > n, 2 > n))`, `sum(x * n for x in xs)` with `xs` literal | the region takes the aggregate as an unproduced input, and no layer assembles it from its unrolled members (loud in the product at `main`, silent under `emit_ssa_to_c` alone) | region input assembly in `glsl_deployment_strategy`; structural recovery | | open |
-| C2 | A display rebound inside a loop: `xs = [i + n, i]` | `descriptor-member-shared`; unaccounted formal (loud in the product at `main`) | descriptor birth in `precompile_to_ssa` | | open |
+| C1 | Reductions over a structural aggregate: `any((1 > n, 2 > n))`, `sum(x * n for x in xs)` with `xs` literal | the region takes the aggregate as an unproduced input, and no layer assembles it from its unrolled members | `resident_sequence_materialization._list_literal_mutations`; `glsl_deployment_strategy._tensor_descriptor_rule` (loop-target branch) | `claude/project-thread-2nw77p` | list/set comprehension part done (e7f4a46d, landed with PR #788; c240-c243). Still loud by name: generator over a folded list (`any(x > n for x in xs)`: the GeneratorExp materializer is not a declared sequence) and tuple displays |
+| C2 | A display rebound inside a loop: `xs = [i + n, i]` | UNROLLED loop (fixed on the branch, c245): the cloned display had no SOURCE_AGGREGATE_LAYOUT row, so its birth refused (`List # lacks one exact element producer`), and a post-loop `xs[0]` folded to a body node that evaporation never remapped. RETAINED loop (still open, **silent**): `xs = [0, 0]; for i in range(4): t += xs[0]; xs = [i + n, i]` then `len(xs)` reads 0 at `main` 3ffb64d6 (audit: `descriptor-member-shared`); the rebound display has no birth into the carried storage. Also loud: a cloned display with a constant member (`ys = [j * 2, j]` in a second loop; `xs = [i + n, 6, i]`, fuzz p11_77): a constant member the cloned layout names is gone by birth time | `loop_composer.evaporate_unrolled_loops` (cloned layouts, last-iteration reads) | `claude/project-thread-2nw77p` | unrolled form fixed on the branch; retained form open |
 | C3 | Dict `del d[k]` / `d.pop(k)` | placed by graph-id order into a neighbouring region (a cycle); `pop` has no lowering. It should be one lexical mapping effect. | `_control_block_position` (read only); mapping effect lowering | | open |
 | C4 | `d.get(k, 0)` in a loop | control order cycle (c202) | `_sequence_effect_read_edges` | | open |
 | C5 | Standalone slice `ys = xs[1:n]` | no lowering; only `r += xs[a:b]` is recognized | slice recognizer; `ir_sequence_tables` | | open |
@@ -72,6 +72,8 @@ silent-capable items first.
 | C10 | Strings as values (`s = "a" if c else "b"`, `len(s)`, `==`, `startswith`) | dispatch metadata; minted as a root input (c114, c217) | to be scoped | | open: large |
 | C11 | Variadic returns | shared with A6; take it in Lane A | | | see A6 |
 | C12 | A comprehension result mutated afterwards: `ys = [x * n for x in xs]; ys.append(n)` then `len(ys)`, `sum(ys)` | the append node was pruned by loop evaporation; the arena and the reduction kept the comprehension's row count (silent WRONG at `main`) | `loop_composer.evaporate_unrolled_loops` (liveness), `resident_sequence_materialization._static_sequence_capacity_survey`, the comprehension rule in `glsl_deployment_strategy._tensor_descriptor_rule` | `claude/project-thread-cz18s3` (PR #788) | done there (doc 36 §5). Still loud: a set comprehension then `add` (no proven capacity) |
+| C15 | An in-place `sort()` beside an unrolled literal loop or comprehension: `for x in [3, -2, 0]: t += x * n` then `xs = [6, 7, n]; xs.sort(); xs[0] - xs[2]` | loop evaporation's ancestry pruning deleted the `sort` call (no retained record, no consumer); the fold read the display order (silent WRONG at `main` 3ffb64d6; fuzzer p11_29, p11_116, p23_3) | `loop_composer.evaporate_unrolled_loops` (liveness); `resident_sequence_materialization._method_mutation_edges` (new, the edges behind `_method_mutated_receiver_ids`) | `claude/project-thread-2nw77p` | fixed on the branch (c244) |
+| C16 | A comprehension over a folded list beside membership in another folded list: `ys = [x - n for x in [4, 4, 8]]` with `n in [5, 0, 2]` | loud at `main` 3ffb64d6: `List # lacks one exact element producer` (from the list birth in `_list_literal_mutations`); fuzzer tier 1 seed 11 p11_0, p11_24, p11_78, p11_104 (and, with the C2 snippet in the pool, p11_0, p11_23, p11_76, p11_102; all loud at `main` too) | to be trapped; *inferred* to share C2's lost constant member | | open: loud |
 
 ## Lane D: defaults and fallbacks
 

@@ -1726,6 +1726,18 @@ def _receiver_collection_kind(data: Any) -> str | None:
 def _method_mutated_receiver_ids(graph_obj: Any) -> frozenset[int]:
     """Mutable collections whose own method call changes their contents.
 
+    The receivers of ``_method_mutation_edges``.
+    """
+
+    return frozenset(
+        receiver for _call, receiver in _method_mutation_edges(graph_obj)
+    )
+
+
+def _method_mutation_edges(graph_obj: Any) -> frozenset[tuple[int, int]]:
+    """``(call node, receiver)`` for each method call that mutates its
+    mutable collection receiver.
+
     Program: ``xs = [5, n, 2]; xs.pop(0); return xs[0] * 10 + xs[1]``
     (scratch c143).  Wrong record: the structural fold counted only retained
     mutation records, escaped arguments and indexed stores as mutation, so
@@ -1735,8 +1747,8 @@ def _method_mutated_receiver_ids(graph_obj: Any) -> frozenset[int]:
     method only reads it (``_RECEIVER_READING_METHODS``).
     """
 
-    mutated: set[int] = set()
-    for _node_id, data in graph_obj.nodes(data=True):
+    mutated: set[tuple[int, int]] = set()
+    for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
         if not (
             isinstance(expression, ast.Call)
@@ -1754,7 +1766,7 @@ def _method_mutated_receiver_ids(graph_obj: Any) -> frozenset[int]:
                     (ast.List, ast.Set, ast.Dict),
                 )
             ):
-                mutated.add(int(parent))
+                mutated.add((int(node_id), int(parent)))
     return frozenset(mutated)
 
 

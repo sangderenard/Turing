@@ -81,6 +81,11 @@ EXTENDED = [
     (["xs{v} = [{a}, {b}, {c}]"], "int(any([x{v} > n for x{v} in xs{v}])) * 10 + int(all([x{v} > n for x{v} in xs{v}]))"),
     (["xs{v} = [{a}, {b}, {c}]", "ys{v} = [x{v} - n for x{v} in xs{v}]"], "ys{v}[n % 3] * 10 + sum(ys{v})"),
     (["s{v} = {{(x{v} + n) % 3 for x{v} in [{a}, {b}, {c}]}}"], "len(s{v})"),
+    # an unrolled literal loop beside an in-place sort (corpus c244, plan C15)
+    (["t{v} = 0", "for x{v} in [{a}, {b}]:", "    t{v} += x{v} * n", "xs{v} = [{c}, n, {a}]", "xs{v}.sort()"], "xs{v}[0] * 10 + xs{v}[2] + t{v}"),
+    (["ys{v} = [x{v} * n for x{v} in [{a}, {b}]]", "xs{v} = [{c}, n]", "xs{v}.sort(reverse=True)"], "xs{v}[0] * 10 + sum(ys{v})"),
+    # a display rebound inside an unrolled loop (corpus c245, plan C2)
+    (["xs{v} = [{a}]", "for i{v} in range(3):", "    xs{v} = [i{v} + n, {b}, i{v}]"], "len(xs{v}) * 100 + xs{v}[0] * 10 + xs{v}[1]"),
     # chained comparisons whose middle is a builtin conversion or measure,
     # one behind a guarding ``and`` (lanes plan A0)
     (["f{v} = n * 0.5 + {a}"], "1 if 0 <= int(f{v}) <= {b} + 3 else 2"),
