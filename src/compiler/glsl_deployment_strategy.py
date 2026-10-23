@@ -2145,6 +2145,24 @@ def _planned_scalar_dtypes_from(
                     settle(element, node_id, join([
                         literal_dtype(member) for member in literal
                     ]))
+                # Program: ``sum(i * k for i in range(6))`` (corpus c27).
+                # Lane D, D2.  A folded ``range`` is a constant whose rows
+                # are Python ints by construction; nobody read that, so the
+                # generator over it and its reduction took the float64
+                # domain default.  Rule: a range constant's element type is
+                # int64.
+                if isinstance(literal, range):
+                    settle(element, node_id, "int64")
+                continue
+            # A generator expression is a read-only sequence of its ``elt``:
+            # nothing can append to it, so its element type is the ``elt``'s
+            # class (corpus c27).  List and set comprehensions are not typed
+            # here: they can be mutated after their birth, and their element
+            # join belongs to the collection rule with its writers.
+            if op == "generatorexp":
+                elts = parents(data, "elt")
+                if len(elts) == 1:
+                    settle(element, node_id, scalar.get(elts[0]))
                 continue
             if op == "input":
                 kind = attributes.get("binding_kind")
@@ -2434,6 +2452,21 @@ def _planned_scalar_dtypes_from(
                     settle(scalar, node_id, (
                         "int64" if op == "sum" and held == "bool" else held
                     ))
+                    continue
+                # ``sum(xs, start)`` is ``start + x0 + x1 ...``: its class
+                # promotes the rows' class (bools count as ints) with the
+                # start's (corpus c27: ``sum((i - k for i in range(4)), 10)``).
+                if (
+                    (op == "sum" or reference == "sum")
+                    and len(sources) == 2
+                    and sources[0] in element
+                    and not parents(data, "operand")
+                ):
+                    held = element[sources[0]]
+                    settle(scalar, node_id, promote([
+                        "int64" if held == "bool" else held,
+                        scalar.get(sources[1]),
+                    ]))
                     continue
             if op in REGION_PREDICATE_OPS or isinstance(expression, ast.Compare):
                 settle(scalar, node_id, "bool")
