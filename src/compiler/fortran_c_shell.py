@@ -18385,6 +18385,33 @@ def _propagate_native_type_tag_results(
                                 f"provenance at {callee.name}->{caller.name}: "
                                 f"value={int(declared_id)}"
                             )
+                        # Program: ``def wrap(r, f): return maybe(r, f)``.
+                        # Wrong record: the wrapper's return frame registered
+                        # this union under the provisional call-result tag;
+                        # the linked tag then read as a conflicting
+                        # descriptor.  Rule: the descriptor that differs only
+                        # by that provisional tag is revised to the linked
+                        # one; any other difference still conflicts.
+                        incumbent = caller_unions.by_id(
+                            int(result_descriptor.union_id)
+                        )
+                        provisional_tag_id = dict(caller.metadata.get(
+                            "native_value_type_tags", ()
+                        )).get(int(first_payload.id))
+                        if (
+                            incumbent is not None
+                            and provisional_tag_id is not None
+                            and int(incumbent.tag_value_id)
+                            == int(provisional_tag_id)
+                            and int(provisional_tag_id) != int(tag.id)
+                            and replace(
+                                incumbent, tag_value_id=int(tag.id)
+                            ) == result_descriptor
+                        ):
+                            caller_unions.unions.assign(
+                                int(result_descriptor.union_id),
+                                result_descriptor, sources=result_cells,
+                            )
                         caller_unions.register(
                             result_descriptor, sources=result_cells,
                         )
@@ -18461,6 +18488,105 @@ def _propagate_native_type_tag_results(
                                 argument for argument in caller.args
                                 if argument is not prior_tag
                             ]
+                            # Program: ``def wrap(r, f): return maybe(r, f)``.
+                            # Wrong record: the wrapper's published return
+                            # layout (payload, tag) kept the provisional tag,
+                            # so its caller read a slot nothing writes (``is
+                            # None`` always true).  Rule: the layout names
+                            # the linked tag, revised from its own row.
+                            from .structural_concordance import (
+                                aggregate_return_layouts,
+                                publish_aggregate_return_layout,
+                            )
+                            from .ssa_record_return_state import (
+                                function_scope_of,
+                            )
+                            from .concordance_declarations import (
+                                AGGREGATE_RETURN_LAYOUT, FRAME_LINK,
+                            )
+                            from .identity_concordance import (
+                                current_identity_book,
+                            )
+                            for output_id, members in tuple(
+                                aggregate_return_layouts(caller).items()
+                            ):
+                                if int(prior_tag_id) not in members:
+                                    continue
+                                book = current_identity_book()
+                                publish_aggregate_return_layout(
+                                    caller, int(output_id),
+                                    tuple(
+                                        int(tag.id)
+                                        if int(member) == int(prior_tag_id)
+                                        else int(member)
+                                        for member in members
+                                    ),
+                                    sources=(
+                                        book.current_ref(
+                                            AGGREGATE_RETURN_LAYOUT,
+                                            (
+                                                function_scope_of(caller),
+                                                int(output_id),
+                                            ),
+                                        ),
+                                        _frame_value_cell(caller, int(tag.id)),
+                                    ),
+                                    stage=FRAME_LINK,
+                                )
+                            # The same wrong record seen from the wrapper's
+                            # callers: their linked calls name the wrapper's
+                            # outputs by id, the provisional tag among them.
+                            renamed = {int(prior_tag_id): int(tag.id)}
+                            for outer in all_functions.values():
+                                for outer_block in outer.blocks.values():
+                                    for outer_call in outer_block.instrs:
+                                        if (
+                                            outer_call.op not in {"Call", "call"}
+                                            or str(outer_call.attributes.get(
+                                                "callee"
+                                            ) or "") != str(caller.name)
+                                        ):
+                                            continue
+                                        attributes = outer_call.attributes
+                                        if "callee_output_ids" in attributes:
+                                            attributes["callee_output_ids"] = tuple(
+                                                renamed.get(int(value), int(value))
+                                                for value in attributes[
+                                                    "callee_output_ids"
+                                                ]
+                                            )
+                                        if "physical_result_bindings" in attributes:
+                                            attributes[
+                                                "physical_result_bindings"
+                                            ] = tuple(
+                                                (
+                                                    renamed.get(
+                                                        int(callee_id),
+                                                        int(callee_id),
+                                                    ),
+                                                    int(caller_id),
+                                                )
+                                                for callee_id, caller_id in (
+                                                    attributes[
+                                                        "physical_result_bindings"
+                                                    ]
+                                                )
+                                            )
+                                        if "native_result_contract" in attributes:
+                                            attributes[
+                                                "native_result_contract"
+                                            ] = tuple(
+                                                (
+                                                    renamed.get(
+                                                        int(entry[0]),
+                                                        int(entry[0]),
+                                                    ),
+                                                    *tuple(entry[1:]),
+                                                )
+                                                for entry in attributes[
+                                                    "native_result_contract"
+                                                ]
+                                            )
                         prior_tags[int(first_payload.id)] = int(tag.id)
                         caller.metadata["native_value_type_tags"] = tuple(
                             sorted(

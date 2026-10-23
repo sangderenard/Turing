@@ -6479,6 +6479,21 @@ class _ControlSSABuilder(TiledObject):
                 )
                 return (inactive,)
             if (
+                str(value.dtype or "unknown") == "unknown"
+                and tuple(value.shape or ()) == tuple(arm.shape or ())
+                and self.native_value_type_abi.get(int(value_id)) is fact
+            ):
+                # Program: ``def wrap(r, f): return maybe(r, f)`` where
+                # ``maybe`` returns ``r + 1 if f > 0 else None``.  Wrong
+                # record: the forwarded call result is not linked yet, so its
+                # SSA object has no dtype, and an untyped value was read as a
+                # disagreement with its own union frame.  Rule: the value's
+                # own VALUE_TYPE_ABI row types its shared payload slot.
+                value.dtype = str(arm.dtype)
+                self._revise_value(value, self._book().current_ref(
+                    VALUE_TYPE_ABI, (self.lexical_read_scope, int(value_id)),
+                ))
+            if (
                 str(value.dtype or "unknown")
                 != str(arm.dtype or "unknown")
                 or tuple(value.shape or ()) != tuple(arm.shape or ())
@@ -9957,6 +9972,21 @@ class _ControlSSABuilder(TiledObject):
             else getattr(fact, "alternatives", ())
         ))
         if len(alternatives) <= 1 or "builtins.NoneType" not in alternatives:
+            return None
+        # Only a fixed-width value union carries its tag beside the payload.
+        # Program: bootstrap unit 35 (``found = self._resolved(...)``, an
+        # Optional[tuple]).  Wrong record: its ``is None`` minted a pending
+        # tag that nothing publishes; an optional aggregate's presence is a
+        # member of its own layout.  Rule: aggregate or reference arms keep
+        # the ordinary comparison and its optional-aggregate lowering.
+        physical = tuple(
+            fact.get("physical_alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "physical_alternatives", ())
+        )
+        if not physical or any(
+            str(arm.storage) not in {"none", "scalar"} for arm in physical
+        ):
             return None
         return subject_id
 
