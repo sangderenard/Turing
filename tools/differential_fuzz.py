@@ -193,6 +193,8 @@ EXTENDED3 = [
     (["xs{v} = [n, {a}]", "h{v} = head(xs{v})", "swap(xs{v})", "swap(xs{v})", "swap(xs{v})"], "h{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
     # dict.get with a default past float64's exact integers (lane E)
     (["d{v} = {{1: {a}, 2: n}}"], "d{v}.get({b} + 3, 36028797018963969) + d{v}.get(2, {c})"),
+    # a dict that accumulates into itself through get (lane E)
+    (["d{v} = {{}}", "for i{v} in range(n % 4 + 1):", "    d{v}[i{v} % 2] = d{v}.get(i{v} % 2, {a}) + 36028797018963969", "t{v} = 0", "for k{v} in range(3):", "    if k{v} in d{v}:", "        t{v} = t{v} + d{v}[k{v}]"], "t{v}"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v

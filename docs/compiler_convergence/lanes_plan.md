@@ -60,7 +60,8 @@ branch has used, merged or not.
 | c280-c289 | Silent lane follow-ups (indexed stores and concatenations in the call order) | `claude/project-thread-cz18s3` | c280-c282 |
 | c290-c299 | Lane E: list slices, sum of a folded list, slice concatenation widths, loop targets, Fortran list reductions | `claude/project-thread-kbkzp7` | c290-c299 (full) |
 | c300-c309 | Lane E: Fortran span cells, callee swaps, dict.get defaults, colliding callee lists | `claude/project-thread-kbkzp7` | c300-c303 |
-| c310-c319 | next free | | |
+| c310-c329 | Silent lane follow-up (#801) | | |
+| c330-c339 | next free | | |
 
 ## Lane A: bootstrap families (and the tire, where it shares a group)
 
