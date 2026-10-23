@@ -193,6 +193,8 @@ EXTENDED3 = [
     (["xs{v} = [n, {a}]", "h{v} = head(xs{v})", "swap(xs{v})", "swap(xs{v})", "swap(xs{v})"], "h{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
     # dict.get with a default past float64's exact integers (lane E)
     (["d{v} = {{1: {a}, 2: n}}"], "d{v}.get({b} + 3, 36028797018963969) + d{v}.get(2, {c})"),
+    # a callee reads the length of a caller list grown in a loop (lane E)
+    (["xs{v} = [n, {a}]", "for i{v} in range(n % 3 + 1):", "    xs{v}.append(i{v} + {b})"], "width(xs{v}) * 100 + head(xs{v})"),
     # a dict that accumulates into itself through get (lane E)
     (["d{v} = {{}}", "for i{v} in range(n % 4 + 1):", "    d{v}[i{v} % 2] = d{v}.get(i{v} % 2, {a}) + 36028797018963969", "t{v} = 0", "for k{v} in range(3):", "    if k{v} in d{v}:", "        t{v} = t{v} + d{v}[k{v}]"], "t{v}"),
 ]
