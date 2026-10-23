@@ -23772,6 +23772,30 @@ def _schedule_loop_callsites(
             consumed: set[int] = set()
             produced: set[int] = set(produced_sequences(block))
 
+            def loop_offset_starts(loop: Any) -> set[int]:
+                # Program: ``r0 = xs0[-1]; xs0.pop(0)``, then ``for k, x in
+                # enumerate(ys, n % 4 + 4)`` and ``len(xs0)`` (fuzz p91_9).
+                # Wrong record: the loop body's ``enumerate_start`` reads the
+                # start value, but the loop's signature did not list it, so
+                # the start's region was ordered after the loop (62 for
+                # 2389).  Rule: a loop reads the start of every counter its
+                # induction offsets (``induction_offsets``).
+                if not isinstance(loop, LoopBlock):
+                    return set()
+                targets = {
+                    int(target_id)
+                    for _iterable_id, target_id, induction, projection
+                    in control.projected_iterable_bindings
+                    if induction == loop.induction and projection == "induction"
+                }
+                return {
+                    int(start_id)
+                    for target_id, start_id in control.induction_offsets
+                    if int(target_id) in targets
+                }
+
+            consumed.update(loop_offset_starts(block))
+
             def collect_surface(candidate: Any) -> None:
                 if isinstance(candidate, StatementBlock):
                     region_index = scheduled_region(candidate)
@@ -23801,6 +23825,7 @@ def _schedule_loop_callsites(
                     if isinstance(candidate, WhileBlock):
                         consumed.add(int(candidate.predicate_value_id))
                         collect_surface(candidate.condition)
+                    consumed.update(loop_offset_starts(candidate))
                     collect_surface(candidate.body)
                     return
                 signature = dependency_signature(candidate)
