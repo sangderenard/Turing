@@ -21697,9 +21697,36 @@ def _tensor_descriptor_rule(
                     "shape": (), "dtype": str(linked_contract["dtype"]),
                     "rank": 0,
                 }
+            # Program: ``xs = [1, 4, 9]; sum([x * n for x in xs])`` (corpus
+            # c241).  Wrong record: before the structural fold an authored
+            # list display carries no ``aggregate_kind`` attribute, only its
+            # ``elts`` edges, so the target took the domain's float64, the
+            # comprehension row was committed float64 and ``sum`` returned a
+            # float.  Rule: a list display's members are writers of its row,
+            # exactly as its retained appends and folded leaves are.
+            iterable_expression = graph.G.nodes[iterable].get("expr_obj")
+            display_members = (
+                [
+                    int(graph.G.nodes[int(parent)].get("value_id", parent))
+                    for parent, role in (
+                        graph.G.nodes[iterable].get("parents") or ()
+                    )
+                    if str(role).startswith("elts")
+                    and int(parent) in graph.G
+                ]
+                if isinstance(iterable_expression, ast.List)
+                and not any(
+                    isinstance(element, ast.Starred)
+                    for element in iterable_expression.elts
+                )
+                else []
+            )
             if (
                 len(targets) == 1
-                and iterable_attributes.get("aggregate_kind") == "list"
+                and (
+                    iterable_attributes.get("aggregate_kind") == "list"
+                    or display_members
+                )
             ):
                 _retain_source_sequence_mutation_records(graph.G)
                 node_by_value = {
@@ -21722,8 +21749,47 @@ def _tensor_descriptor_rule(
                 row_values.extend(map(int, iterable_attributes.get(
                     "aggregate_leaf_value_ids", ()
                 )))
+                row_values.extend(display_members)
+                def literal_row(value):
+                    # An authored scalar literal member states its Python
+                    # class; the shape query has no rule for a bare int.
+                    member = graph.G.nodes[node_by_value[value]]
+                    if (member.get("attributes") or {}).get(
+                        "aggregate_kind"
+                    ) is not None:
+                        return None
+                    if str(member.get("type")) == "Constant":
+                        literal = member.get("constant")
+                        if literal is None:
+                            literal = (member.get("attributes") or {}).get("value")
+                    else:
+                        # Program: ``ys = [x * n for x in [5, -1]]; sum(ys)``
+                        # (c268).  Wrong record: ``-1`` is a ``neg`` node,
+                        # not a Constant, so its class went unread, the
+                        # row's writers disagreed and the target took the
+                        # domain's float64 (``sum`` returned a float).
+                        # Rule: a member the authored source spells as a
+                        # literal (``ast.literal_eval``) states its class.
+                        try:
+                            literal = ast.literal_eval(member.get("expr_obj"))
+                        except (ValueError, TypeError, SyntaxError):
+                            return None
+                    dtype = (
+                        "bool" if isinstance(literal, bool)
+                        else "int64" if isinstance(literal, int)
+                        else "float64" if isinstance(literal, float)
+                        else None
+                    )
+                    return (
+                        None if dtype is None
+                        else {"shape": (), "dtype": dtype, "rank": 0}
+                    )
+
                 row_descriptors = [
-                    _tensor_descriptor(graph, node_by_value[value], seen)
+                    (
+                        literal_row(value)
+                        or _tensor_descriptor(graph, node_by_value[value], seen)
+                    )
                     if value in node_by_value else None
                     for value in row_values
                 ]
@@ -21928,7 +21994,18 @@ def _tensor_descriptor_rule(
                 iterable_shape = tuple(
                     map(int, (iterable or {}).get("shape") or ())
                 )
-                if exact_one_per_input and iterable_shape:
+                # Program: ``ys = [x * n for x in xs]; ys.append(n)``
+                # then ``sum(ys)`` (c266).  Wrong record: the comprehension's
+                # extent was proven from its iterable although ``ys`` is
+                # mutated afterwards, so ``sum`` reduced over three rows of
+                # four (406 for 407; clean audit).  Rule: a mutated
+                # collection's leading extent is its length cell's, as for a
+                # dynamic iterable (``_mutated_sequence_node_ids``).
+                if (
+                    exact_one_per_input and iterable_shape
+                    and int(data.get("value_id", node_id))
+                    not in _mutated_sequence_node_ids(graph.G)
+                ):
                     return {
                         "shape": (int(iterable_shape[0]), *element_shape),
                         "dtype": str(element.get("dtype") or "float64"),

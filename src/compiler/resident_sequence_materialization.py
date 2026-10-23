@@ -1791,6 +1791,23 @@ def _static_sequence_capacity_survey(
     local_lists = {int(node_id): len(data["expr_obj"].elts)
                    for node_id, data in graph_obj.nodes(data=True)
                    if isinstance(data.get("expr_obj"), ast.List)}
+    # Program: ``ys = [x * n for x in xs]; ys.append(n)`` with ``xs`` a
+    # folded literal, then ``len(ys) * 100 + sum(ys)`` (c266).  Wrong
+    # record: the unrolled comprehension is born here like a display
+    # (``_list_literal_mutations``) but was not a local list, so its later
+    # append was never counted; the arena took the planner's extent (3,),
+    # the append found it full and its status was dropped (306 for 407;
+    # clean audit).  Rule: an unrolled list comprehension is a local list
+    # of its materialized rows.
+    local_lists.update({
+        int(data.get("value_id", node_id)): len(tuple(
+            attributes.get("materialized_value_ids", ())
+        ))
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in ((data.get("attributes") or {}),)
+        if attributes.get("materialization_kind") == "unrolled_loop"
+        and attributes.get("aggregate_kind") == "list"
+    })
     # A list merged from equal-length arm displays (an ``aggregate_phi``)
     # is born at the merge from its member Phis (``_list_literal_
     # mutations``), so it is a local list of that many rows.
@@ -1827,6 +1844,18 @@ def _static_sequence_capacity_survey(
             unknown.add(parent)
             escaped.add(parent)
     bounds.update({key: count for key, count in local_lists.items() if key not in unknown})
+    # Program: ``t = (n + 1, n + 2, n * 3); len(t)`` (c260).  Wrong record:
+    # a tuple display had resident storage but no birth and no bound, so
+    # ``len(t)`` read the frame's zeroed length cell (0 for 3; clean audit).
+    # Rule: a tuple display is born like a list display, and nothing grows
+    # a tuple, so its member count bounds it even when it escapes.
+    for node_id, data in graph_obj.nodes(data=True):
+        expression = data.get("expr_obj")
+        if (isinstance(expression, ast.Tuple)
+                and isinstance(expression.ctx, ast.Load)
+                and not any(isinstance(element, ast.Starred)
+                            for element in expression.elts)):
+            bounds.setdefault(int(node_id), len(expression.elts))
     if control is not None:
         bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
             control, local_lists,
@@ -1881,20 +1910,33 @@ def _static_sequence_capacity_survey(
             return len(literal)
         return None
 
-    for node_id, data in graph_obj.nodes(data=True):
-        if str(data.get("type") or data.get("op") or "") not in {"Add", "add"}:
-            continue
-        operands = [int(parent) for parent, role in data.get("parents") or ()
-                    if str(role) in {"lhs", "rhs"} and int(parent) in graph_obj]
-        if len(operands) != 2 or not all(
-            (graph_obj.nodes[operand].get("attributes") or {}).get("aggregate_kind") == "list"
-            for operand in operands
-        ):
-            continue
-        operand_bounds = [sequence_bound(operand) for operand in operands]
-        value_id = int(data.get("value_id", node_id))
-        if None not in operand_bounds and value_id not in bounds:
-            bounds[value_id] = sum(operand_bounds)
+    # Program: ``xs = [1, 2] + [n, 8]; ys = [n * 2] + xs; len(ys)`` (c263).
+    # Wrong record: a concatenation operand that is itself a concatenation
+    # (an ``Add`` with no aggregate kind) was not a list here, so ``ys`` had
+    # no bound, took the planner's elementwise extent (2,) and ``len(ys)``
+    # read 1 for 5 (clean audit).  Rule: a bounded concatenation is a list
+    # operand like any other; settle the bounds to a fixed point.
+    concatenations: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node_id, data in graph_obj.nodes(data=True):
+            if str(data.get("type") or data.get("op") or "") not in {"Add", "add"}:
+                continue
+            operands = [int(parent) for parent, role in data.get("parents") or ()
+                        if str(role) in {"lhs", "rhs"} and int(parent) in graph_obj]
+            if len(operands) != 2 or not all(
+                (graph_obj.nodes[operand].get("attributes") or {}).get("aggregate_kind") == "list"
+                or int(operand) in concatenations
+                for operand in operands
+            ):
+                continue
+            operand_bounds = [sequence_bound(operand) for operand in operands]
+            value_id = int(data.get("value_id", node_id))
+            if None not in operand_bounds and value_id not in bounds:
+                bounds[value_id] = sum(operand_bounds)
+                concatenations.add(int(node_id))
+                changed = True
     # Program: ``d = {}; for i in range(n % 4 + 1): d[i % 2] = i`` (fuzzer
     # p1_27).  Wrong record: a local dict whose key universe the survey
     # cannot bound was neither bounded nor unbounded, so C refused it as a
@@ -2424,6 +2466,63 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         sequence_id = int(data.get("value_id", node_id))
         expression = data.get("expr_obj")
         attributes = data.get("attributes") or {}
+        # Program: ``xs = [1, 4, 9]; ys = [x > n for x in xs]; any(ys)``
+        # (corpus c240).  Wrong record: the comprehension over a folded
+        # literal evaporated into a ListComp materializer whose rows are
+        # ``materialized_value_ids``, but only displays were born, so the
+        # resident arena kept its zero length and ``any``/``sum``/``len``
+        # read an empty list (silently; the audit saw an operand with no
+        # producer).  Rule: an unrolled list or set comprehension is born
+        # like a display -- one lexical clear, then one append (``add``)
+        # per materialized row, in iteration order -- as the unrolled dict
+        # comprehension already is.
+        if (sequence_id in accepted
+                and attributes.get("materialization_kind") == "unrolled_loop"
+                and attributes.get("aggregate_kind") in {"list", "set"}):
+            is_set = attributes.get("aggregate_kind") == "set"
+            rows = []
+            for ordinal, row_id in enumerate(
+                attributes.get("materialized_value_ids", ())
+            ):
+                producers = nodes_by_value.get(int(row_id), ())
+                if len(producers) != 1:
+                    raise ValueError(
+                        f"comprehension {sequence_id} row {row_id} lacks one "
+                        "exact producer"
+                    )
+                row = graph_obj.nodes[producers[0]]
+                if (row.get("attributes") or {}).get(
+                    "aggregate_kind"
+                ) is not None:
+                    raise ValueError(
+                        f"comprehension {sequence_id} row {row_id} is an "
+                        "aggregate; unrolled aggregate rows have no birth"
+                    )
+                literal = _scalar_constant_member(row)
+                expressions = ()
+                if isinstance(literal, (bool, int, float, str)):
+                    literal = (
+                        string_token(literal) if isinstance(literal, str)
+                        else literal
+                    )
+                    expressions = (ControlExpression("const", literal=literal),)
+                rows.append(ControlSequenceMutation(
+                    sequence_value_id=sequence_id,
+                    operator="add" if is_set else "append",
+                    argument_value_ids=(int(row_id),),
+                    effect_node_id=int(producers[0]),
+                    policy="unique" if is_set else "duplicates",
+                    argument_kind="value",
+                    argument_expressions=expressions,
+                    display_member=(int(node_id), int(ordinal)),
+                ))
+            mutations.append(ControlSequenceMutation(
+                sequence_value_id=sequence_id, operator="clear",
+                argument_value_ids=(), effect_node_id=int(node_id),
+                policy="unique" if is_set else "duplicates",
+            ))
+            mutations.extend(rows)
+            continue
         if (sequence_id not in accepted
                 or attributes.get("producer_kind") not in {"aggregate", "aggregate_phi"}
                 or attributes.get("materialization_kind") is not None):
@@ -2470,7 +2569,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         layout_members = (
             tuple(int(member.value_id) for member in layout.members)
             if isinstance(layout, SourceAggregateLayout)
-            and str(layout.aggregate_kind) in {"list", "set", "frozenset"}
+            and str(layout.aggregate_kind) in {"list", "tuple", "set", "frozenset"}
             else ()
         )
         # Program: ``xs = [5, 7, 11]; return xs[n]`` (c36_literal_index_param).
@@ -2480,7 +2579,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         # length and every ``xs[n]`` read 0.  Rule: the list birth is the
         # SOURCE_AGGREGATE_LAYOUT record's ordered members; the AST, when it
         # survives, only refines a member's spelling.
-        if isinstance(expression, (ast.List, ast.Set)):
+        if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
             if not expression.elts:
                 continue
             elements = tuple(expression.elts)

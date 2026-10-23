@@ -20,11 +20,29 @@ Every item ends with: a corpus program (`tests/native_semantics_corpus/`),
 the full typed corpus check (0 non-PASS), a fuzz seed in the lane's tier
 (0 WRONG, 0 TYPE), and the gate (no new names in all four parts).
 
+## Corpus number reservations
+
+Corpus programs are `tests/native_semantics_corpus/cNNN_<name>.py`. Two
+lanes adding programs at once collided on c218 and c240 to c243 on
+2026-10-22. Before adding a program, claim a range here (on your branch, in
+the same commit as the claim of your item) and number inside it. Take the
+next free block of 10 above the highest row; never reuse a number another
+branch has used, merged or not.
+
+| range | lane / item | branch | used |
+|---|---|---|---|
+| c211-c218 | Lane A: A0, A3 and follow-ups | `claude/project-thread-kbkzp7` | c211, c212, c214-c218 |
+| c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c234 |
+| c240-c249 | Lane C: C1 constant-list comprehensions | `claude/project-thread-2nw77p` | c240-c243 |
+| c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
+| c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
+| c280-c289 | next free | | |
+
 ## Lane A: bootstrap families (and the tire, where it shares a group)
 
 | rank | item | group (doc 34) | claimed functions | branch | status |
 |---|---|---|---|---|---|
-| A1 | Give tuple displays a birth. Place the predicate region that produces the members before the effects that consume them, then birth tuples as lists are born. | S1 | `resident_sequence_materialization._list_literal_mutations`; the region-ownership rule that assigns the members' region to the later conditional (find it with a trap first) | | open: silent on `main` with a clean audit |
+| A1 | Give tuple displays a birth. Place the predicate region that produces the members before the effects that consume them, then birth tuples as lists are born. | S1 | `resident_sequence_materialization._list_literal_mutations`, `resident_sequence_materialization._static_sequence_capacity_survey`, `identity_concordance.CorrelationTable._unborn_display_findings` (new) | `claude/project-thread-cz18s3` | in review: born and bounded; the predicate-region placement did not reproduce at `main` |
 | A2 | Keep a return surface whole. `emit_outputs` must not fall back to `(output_id,)` when an aggregate layout is absent. The control finish publishes the layout. Accepted-unit accounting must not let one value stand for a tuple/optional. Add the false-acceptance check from doc 34 §1.4 to the bootstrap status tool. | B1, T3 | `fortran_c_shell._class_surface_ssa_program.emit_outputs` (nested, line ~28034); the control-finish member Phi publisher; accepted-unit result accounting | | open: false acceptance |
 | A4 | Tire: the result-storage lease mints a record span member's `SSA_VALUE` row as a scalar. Revise it from the record storage contract. `_ssa_structure` reads the registered record storage before calling a shape-empty fact a scalar. | T1 | `structural_concordance._ssa_structure`; the result-storage lease writer in `fortran_c_shell` | | blocked on A0 (re-observe first) |
 | A5 | Measure the core-chain cascade. After A0, ask Albert for a full bootstrap. Fill doc 34 §1.2 and re-file units into groups. | B6, B7 | none (measurement) | | blocked on A0 |
@@ -52,6 +70,7 @@ silent-capable items first.
 | C9 | Multi-element replication `[a, b] * k` | no operation writes its rows; fill repeats one value | `_sequence_concat_ops` | | open |
 | C10 | Strings as values (`s = "a" if c else "b"`, `len(s)`, `==`, `startswith`) | dispatch metadata; minted as a root input (c114, c217) | to be scoped | | open: large |
 | C11 | Variadic returns | shared with A6; take it in Lane A | | | see A6 |
+| C12 | A comprehension result mutated afterwards: `ys = [x * n for x in xs]; ys.append(n)` then `len(ys)`, `sum(ys)` | the append node was pruned by loop evaporation; the arena and the reduction kept the comprehension's row count (silent WRONG at `main`) | `loop_composer.evaporate_unrolled_loops` (liveness), `resident_sequence_materialization._static_sequence_capacity_survey`, the comprehension rule in `glsl_deployment_strategy._tensor_descriptor_rule` | `claude/project-thread-cz18s3` (PR #788) | done there (doc 36 §5). Still loud: a set comprehension then `add` (no proven capacity) |
 
 ## Lane D: defaults and fallbacks
 
