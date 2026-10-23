@@ -113,9 +113,10 @@ branch has used, merged or not. On 2026-10-23 two pairs collided (c290-c293 and 
 | c310-c319 | Silent lane: reads before later effects on the same list, returned reads | `claude/project-thread-cz18s3` | c310-c319 (full) |
 | c320-c329 | Silent lane: comprehension loops and conditional expressions in the source-call order | `claude/project-thread-cz18s3` | c320, c321 |
 | c330-c339 | Silent lane: fixed-capacity full is loud, dict `get` in a loop, callee branch displays | `claude/project-thread-cz18s3` | c330-c332 |
-| c340-c349 | Lane A: W3b wrappers forwarding value unions (renumbered from c290-c293, which Lane E holds) | `claude/project-thread-h4aybe` | c340-c343 (PR #800) |
+| c340-c349 | Lane E: follow-ups after #799 | `claude/project-thread-kbkzp7` | c340-c342 (local) |
 | c350-c359 | Lane E: Fortran positional sequence helpers (renumbered from c330, which the silent lane holds) | `claude/project-thread-kbkzp7` | c350 (PR #799) |
-| c360-c369 | next free | | |
+| c360-c369 | Lane A: W3b wrappers forwarding value unions (renumbered from c290-c293, which Lane E holds) | `claude/project-thread-h4aybe` | c360-c363 (PR #800) |
+| c370-c379 | next free | | |
 
 ## Lane A: bootstrap families (and the tire, where it shares a group)
 
@@ -130,7 +131,7 @@ branch has used, merged or not. On 2026-10-23 two pairs collided (c290-c293 and 
 | A7 | `Any`-typed receivers and generic `str()`/`!r` of facts: runtime type dispatch over the fact classes. | B3 | to be scoped | | open: needs a design note first |
 | A8 | `'|'.join(tokens)` glyph recipe in f-strings (unit 6). | B5 | f-string glyph recipe builder | | open |
 | W3 | A caller's `is None` test on a callee returning `x if c else None` (a conditional value union) did not compile. Two lost records: the linker rebound the call's placeholder (the scalar `v`) to the (payload, tag) container, and `v is None` lowered to `Eq(payload, None)`. Doc 34 §8; corpus c237-c239. | silent behind loud | `fortran_c_shell` linker placeholder rebind; `precompile_to_ssa.lower_control_expression` | `claude/project-thread-h4aybe` | done on the branch |
-| W3b | A wrapper that forwarded a value-union result (`def wrap(...): return maybe(...)`) was refused, and became a silent `is None` once the refusal was lifted. Three lost records. Doc 34 §9; corpus c340-c343 (renumbered from c290-c293). | loud, silent behind it | `precompile_to_ssa._native_value_union_row_payloads`; `fortran_c_shell._propagate_native_type_tag_results` | `claude/project-thread-h4aybe` | done on the branch |
+| W3b | A wrapper that forwarded a value-union result (`def wrap(...): return maybe(...)`) was refused, and became a silent `is None` once the refusal was lifted. Three lost records. Doc 34 §9; corpus c360-c363 (renumbered from c290-c293). | loud, silent behind it | `precompile_to_ssa._native_value_union_row_payloads`; `fortran_c_shell._propagate_native_type_tag_results` | `claude/project-thread-h4aybe` | done on the branch |
 
 ## Lane C: language frontier
 
