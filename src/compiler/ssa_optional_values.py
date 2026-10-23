@@ -491,6 +491,15 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                 presence_id = next(iter(presence_ids))
                 if presence_id in values and values[presence_id].dtype == "bool":
                     presence_by_payload[payload_id] = values[presence_id]
+        from .ssa_reachability import semantic_output_ids_of
+
+        returned_ids = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in _RETURN_OPS
+            for argument in instruction.args
+        }
         lowered_one = True
         while lowered_one:
             lowered_one = False
@@ -593,9 +602,29 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                         payload_args.append(payload)
                         presence_args.append(present)
                     else:
+                        # Program: ``if flag > 0: r = row + 1 else: r = None;
+                        # return r`` (and the bootstrap's single-exit guard
+                        # normalization, which writes exactly that).  Wrong
+                        # record: the merge's binding was
+                        # ``conditional_result``, so the Phi was split but the
+                        # Ret kept only the payload -- the export said "int"
+                        # where Python returns None.  Rule: a Phi is a return
+                        # merge when it is this function's semantic output and
+                        # its own Ret returns it, whatever binding built it.
                         is_return = str(instruction.attributes.get(
                             "binding"
-                        ) or "") == "return_merge"
+                        ) or "") == "return_merge" or (
+                            int(instruction.res.id) in returned_ids
+                            and int(instruction.res.id) in map(
+                                int, semantic_output_ids_of(function),
+                            )
+                            # ``return row + 1 if flag > 0 else None``: the
+                            # native value-union lowering already published
+                            # this output's surface (payload, type tag); a
+                            # second presence would be a third member.
+                            and int(instruction.res.id)
+                            not in aggregate_return_layouts(function)
+                        )
                         presence = SSAValue(
                             mint_ssa_value(
                                 function, OPTIONAL_PRESENCE,
@@ -1020,7 +1049,11 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                     "caller_presence_value_id": int(presence.id),
                     "aggregate_value_id": int(aggregate.id),
                 })
-                index += 1
+                # Program: ``o1 = maybe(n, 3); o2 = maybe(n, 5)``.  Wrong
+                # record: a second ``index += 1`` here skipped the instruction
+                # after the projection -- the next optional call -- so its
+                # ``is not None`` test read the bare payload.  Rule: the
+                # index already stands past the call and its projection.
 
     if receipts:
         metadata = getattr(module, "metadata", None)

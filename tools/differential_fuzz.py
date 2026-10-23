@@ -90,9 +90,33 @@ EXTENDED = [
     # one behind a guarding ``and`` (lanes plan A0)
     (["f{v} = n * 0.5 + {a}"], "1 if 0 <= int(f{v}) <= {b} + 3 else 2"),
     (["xs{v} = [{a}, n, {b}]"], "(1 if 1 < len(xs{v}) <= n else 0) + (2 if n != 0 and 0 < abs({a} // n) < 3 else 0)"),
+    # Optional scalar returns: a statement merge with a None arm, and an
+    # early ``return None`` guard, each tested for presence by the caller.
+    (["o{v} = maybe_inc(n, {a})"], "(-1 if o{v} is None else o{v})"),
+    (["o{v} = maybe_guard(n, {a})", "t{v} = 0", "if o{v} is not None:", "    t{v} = o{v} * 3"], "t{v}"),
+    # A value-union return (``x if c else None``) tested by identity.
+    (["o{v} = maybe_pick(n, {a})", "t{v} = 5", "if o{v} is not None:", "    t{v} = o{v} - 2"], "t{v}"),
 ]
 EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
+
+
+def maybe_inc(x: int, y: int):
+    if x > y:
+        r = x + y
+    else:
+        r = None
+    return r
+
+
+def maybe_guard(x: int, y: int):
+    if x < y:
+        return None
+    return x - y
+
+
+def maybe_pick(x: int, y: int):
+    return x * 2 if x != y else None
 
 
 def first_over(x: int, y: int) -> int:
