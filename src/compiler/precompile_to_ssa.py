@@ -2122,6 +2122,7 @@ class _ControlSSABuilder(TiledObject):
         table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
         table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
         consumer_row_loads: Mapping[int, tuple[Any, ...]] | None = None,
+        effect_preceding_row_reads: Mapping[int, tuple[int, ...]] | None = None,
         resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
         native_object_context: Any = None,
         native_object_module: Any = None,
@@ -2581,6 +2582,15 @@ class _ControlSSABuilder(TiledObject):
             int(result_id): tuple(operation)
             for result_id, operation in (consumer_row_loads or {}).items()
             if int(result_id) not in self.sequence_row_load_operations
+        }
+        # Program: ``xs = [3, n]; xs.append(2); a = xs[1]; xs.pop(1)`` then
+        # ``a + len(xs)`` (scratch lp/c_v).  A consumer row load is emitted
+        # where its value is first asked for; a later effect on the same
+        # sequence (``sequence_read_before_effect_edges``) would then be
+        # read through.  The read is loaded before that effect instead.
+        self.effect_preceding_row_reads: dict[int, tuple[int, ...]] = {
+            int(effect_id): tuple(map(int, reads))
+            for effect_id, reads in (effect_preceding_row_reads or {}).items()
         }
         self.uniform_values: dict[str, SSAValue] = {}
         # Lexical control names (currently loop induction variables) are SSA
@@ -9221,6 +9231,18 @@ class _ControlSSABuilder(TiledObject):
                     ),
                 }
 
+    def _load_reads_before_effect(self, effect_id: int | None) -> None:
+        """Load the pending row reads that source-precede ``effect_id``."""
+
+        preceding = self.__dict__.get("effect_preceding_row_reads") or {}
+        if effect_id is None or not preceding.get(int(effect_id)):
+            return
+        for read_id in preceding.pop(int(effect_id)):
+            pending = self.consumer_row_loads.get(int(read_id))
+            if pending is not None and int(read_id) not in self.external_values:
+                del self.consumer_row_loads[int(read_id)]
+                self._emit_sequence_row_load(*pending)
+
     def emit(
         self,
         op: Handler,
@@ -9230,6 +9252,9 @@ class _ControlSSABuilder(TiledObject):
         attributes: dict[str, Any] | None = None,
     ) -> None:
         resolved_attributes = dict(attributes or {})
+        self._load_reads_before_effect(resolved_attributes.get(
+            "source_effect_node_id", resolved_attributes.get("plan_callsite_id"),
+        ))
         if self.active_deployments:
             resolved_attributes.setdefault(
                 "deployment_memberships",
@@ -16482,6 +16507,9 @@ class _ControlSSABuilder(TiledObject):
     ) -> None:
         """Lower one authored branch and publish its lexical merge values."""
 
+        # A row read before an effect in either arm is loaded here, where
+        # both arms are still ahead (``effect_preceding_row_reads``).
+        self._load_reads_before_effect(conditional.source_node_id)
         predicate_sequence_id = None
         if conditional.entry_record_projections:
             handle_id = int(conditional.entry_record_projections[0][1])
@@ -19946,6 +19974,22 @@ class _ControlSSABuilder(TiledObject):
                 return None
             return self.external_value(int(value_id))
 
+        def owned_row_load(value_id: int) -> SSAValue | None:
+            """Resolve an output that is a control-owned resident row read.
+
+            Program: ``xs = [3, n * 2]; xs.append(5); return xs[1]``
+            (scratch lp/c_n).  Wrong record: the read is a consumer row
+            load, emitted only when a consumer asks ``external_value`` for
+            it; no region consumes a bare returned read, ``existing_value``
+            does not ask, so the output was skipped and the function
+            returned nothing (an empty result; clean audit).  Rule: a
+            returned row read is control-owned like a returned length, so
+            materialize its declared load here.
+            """
+            if int(value_id) not in self.consumer_row_loads:
+                return None
+            return self.external_value(int(value_id))
+
         for name, history in self.named_output_histories.items():
             if self.function_return_edges:
                 # With explicit return edges, source history is the temporal
@@ -19957,7 +20001,8 @@ class _ControlSSABuilder(TiledObject):
                     resolved
                     for value_id in reversed(history)
                     for resolved in (
-                        existing_value(value_id) or owned_literal(value_id),
+                        existing_value(value_id) or owned_row_load(value_id)
+                        or owned_literal(value_id),
                     )
                     if resolved is not None
                 ), None)
@@ -19969,7 +20014,9 @@ class _ControlSSABuilder(TiledObject):
                 value = next((
                     resolved
                     for value_id in reversed(history)
-                    for resolved in (existing_value(value_id),)
+                    for resolved in (
+                        existing_value(value_id) or owned_row_load(value_id),
+                    )
                     if resolved is not None
                 ), None)
                 if value is None:
@@ -21598,6 +21645,7 @@ def lower_control_program_to_ssa(
     table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
     table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
     consumer_row_loads: Mapping[int, tuple[Any, ...]] | None = None,
+    effect_preceding_row_reads: Mapping[int, tuple[int, ...]] | None = None,
     resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
     native_object_context: Any = None,
     native_object_module: Any = None,
@@ -21659,6 +21707,7 @@ def lower_control_program_to_ssa(
         table_region_post_operations=table_region_post_operations,
         table_epilogue_operations=table_epilogue_operations,
         consumer_row_loads=consumer_row_loads,
+        effect_preceding_row_reads=effect_preceding_row_reads,
         resolved_sequence_schemas=resolved_sequence_schemas,
         native_object_context=native_object_context,
         native_object_module=native_object_module,
@@ -24814,6 +24863,7 @@ def lower_control_sections_to_ssa(
         tuple[int, int, int, int, int], ...
     ] = (),
     sequence_row_operations: tuple[tuple[Any, ...], ...] = (),
+    sequence_read_before_effects: tuple[tuple[int, int], ...] = (),
     nested_row_projections: tuple[tuple[int, int, int, str], ...] = (),
     sequence_length_values: Mapping[int, int] | None = None,
     string_table: Any = None,
@@ -25423,6 +25473,12 @@ def lower_control_sections_to_ssa(
         for operation in sequence_row_operations
         if str(operation[0]) == "load"
     }
+    effect_preceding_row_reads: dict[int, tuple[int, ...]] = {}
+    for reader, effect in sequence_read_before_effects:
+        if int(reader) in row_load_by_result:
+            effect_preceding_row_reads[int(effect)] = (
+                *effect_preceding_row_reads.get(int(effect), ()), int(reader),
+            )
     row_store_by_result = {
         int(operation[1]): tuple(operation[1:])
         for operation in sequence_row_operations
@@ -25902,6 +25958,13 @@ def lower_control_sections_to_ssa(
         for instructions in planned_region_instructions.values()
         for instruction in instructions if instruction.res is not None
     }
+    # A read that precedes an effect the control function performs (no
+    # region plans it) is loaded before that effect
+    # (``effect_preceding_row_reads``), never at a later consuming region.
+    effect_preceding_reads = {
+        int(reader) for reader, effect in sequence_read_before_effects
+        if int(effect) not in planned_result_ids
+    }
     if hierarchy_plan is not None:
         for region in hierarchy_plan.items:
             if not (
@@ -25982,6 +26045,24 @@ def lower_control_sections_to_ssa(
                 if value_id in row_load_by_result
                 and value_id not in planned_result_ids
                 and value_id not in captured_row_loads
+                and value_id not in effect_preceding_reads
+            ))))
+            # A row read no region owns that precedes an effect this region
+            # performs (an indexed store; ``sequence_read_before_effects``)
+            # is loaded before the region, not at its later consumer
+            # (scratch lp/c_t: ``a = xs[1]; xs[1] = 9; return a + 0``).
+            region_effect_ids = {
+                int(instruction.res.id) for instruction in instructions
+                if instruction.res is not None
+            }
+            row_loads = tuple(dict.fromkeys((*row_loads, *(
+                row_load_by_result[int(reader)]
+                for reader, effect in sequence_read_before_effects
+                if int(effect) in region_effect_ids
+                and int(reader) in row_load_by_result
+                and int(reader) not in region_effect_ids
+                and int(reader) not in planned_result_ids
+                and int(reader) not in captured_row_loads
             ))))
             captured_row_loads.update(int(operation[0]) for operation in row_loads)
             row_stores = tuple(
@@ -27622,6 +27703,7 @@ def lower_control_sections_to_ssa(
         },
         table_epilogue_operations=tuple(table_epilogue_operations),
         consumer_row_loads=row_load_by_result,
+        effect_preceding_row_reads=effect_preceding_row_reads,
         native_object_context=native_object_context,
         native_object_module=native_object_module,
         native_object_value_ids=native_object_value_ids,

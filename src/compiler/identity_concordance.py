@@ -1516,6 +1516,7 @@ class CorrelationTable:
         found.extend(self._source_sequence_mutation_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
         found.extend(self._unborn_display_findings(module))
+        found.extend(self._unreturned_output_findings(module))
         found.extend(self._live_structure_findings(module))
         found.extend(self._ssa_publication_findings(module))
         found.extend(self._value_type_abi_findings(module))
@@ -3742,6 +3743,37 @@ class CorrelationTable:
                 "member(s) in its source layout, but no instruction writes "
                 "its resident sequence before its length is read",
             ))
+        return found
+
+    @staticmethod
+    def _unreturned_output_findings(module: Any) -> list[Finding]:
+        """Report a function that returns a source value from an empty Ret.
+
+        Program: ``xs = [3, n]; xs.append(2); return xs[2]`` (corpus c310).
+        The function's ``source_output_value_ids`` named the returned read,
+        but its lowering never asked for that read, so the only ``Ret``
+        carried no value and the caller's result was empty, with a clean
+        audit.  The two records are the source outputs and the ``Ret``.
+        """
+
+        found = []
+        for name, function in (getattr(module, "functions", {}) or {}).items():
+            outputs = tuple(
+                (getattr(function, "metadata", {}) or {}).get(
+                    "source_output_value_ids"
+                ) or ()
+            )
+            if not outputs:
+                continue
+            for block in (getattr(function, "blocks", {}) or {}).values():
+                for instruction in block.instrs:
+                    if instruction.op in {"Ret", "ret", "Return", "return"} and not instruction.args:
+                        found.append(Finding(
+                            "source-output-unreturned", name, int(outputs[0]),
+                            f"the source returns {len(outputs)} value(s), "
+                            "but a Ret in block "
+                            f"{getattr(block, 'name', '?')} returns none",
+                        ))
         return found
 
     @staticmethod

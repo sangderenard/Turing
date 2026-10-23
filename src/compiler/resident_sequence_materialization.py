@@ -2042,6 +2042,26 @@ def _static_sequence_capacity_survey(
         int(node_id) for node_id, data in graph_obj.nodes(data=True)
         if isinstance(data.get("expr_obj"), (ast.Dict, ast.Set))
     }
+    # Program: ``ys = {x * n for x in [4, 0, 8]}; ys.add(n + 5)`` (scratch
+    # cs_a).  Wrong record: an unrolled set comprehension is born here like
+    # a set display (``_list_literal_mutations``: one clear, one ``add``
+    # per row) but was no local set, so once ``add`` grew it no rule gave
+    # it a capacity and C refused it.  Rule: an unrolled set comprehension
+    # that a later effect grows is a local set exactly as a set display is.
+    # One nothing grows keeps its rows' exact descriptor (scratch cs_f:
+    # ``{x % 2 + n for x in [1, 3, 5]}`` read 902 for 101 on the dynamic
+    # contract).
+    grown_sets = {int(mutation.sequence_value_id)
+                  for mutation in _sequence_append_call_mutations(graph_obj)
+                  if mutation.operator != "clear"}
+    local_dicts.update(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in ((data.get("attributes") or {}),)
+        if attributes.get("materialization_kind") == "unrolled_loop"
+        and attributes.get("aggregate_kind") == "set"
+        and int(data.get("value_id", node_id)) in grown_sets
+    )
     escaped_dicts = {
         parent for parent in _call_escaped_argument_ids(graph_obj)
         if parent in local_dicts

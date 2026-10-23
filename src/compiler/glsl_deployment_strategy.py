@@ -2111,6 +2111,7 @@ def _planned_scalar_dtypes_from(
             element.setdefault(int(value_id), dtype)
         elif rank == 0 and storage in {"scalar", ""}:
             scalar.setdefault(int(value_id), dtype)
+    get_default_phase = False
     for _round in range(64):
         changed = False
 
@@ -2283,6 +2284,22 @@ def _planned_scalar_dtypes_from(
                         ):
                             settle(scalar, int(target_id), held)
                 continue
+            if (
+                op == "loopresult" and len(parents(data, "value")) == 1
+                and attributes.get("result_kind") == "carried"
+            ):
+                # Program: ``d = {}; for ..: d[k] = d.get(k, 0) + 5`` then
+                # ``return d[0] + len(d)`` in a callee (corpus c330).  Wrong
+                # record: the loop's carried ``d`` (a LoopResult of the
+                # body's store) was read as a comprehension result, so its
+                # element class was unread, ``d[0]`` fell to float64 and
+                # the caller kept a float result the callee no longer had.
+                # Rule: a carried result is the body's value; it holds that
+                # value's element class (and its scalar class).
+                carried = parents(data, "value")[0]
+                settle(element, node_id, element.get(carried))
+                settle(scalar, node_id, scalar.get(carried))
+                continue
             if op == "loopresult" and len(parents(data, "value")) == 1:
                 value = parents(data, "value")[0]
                 # A loop whose carried value is a store (``d[k] = ...``)
@@ -2356,6 +2373,54 @@ def _planned_scalar_dtypes_from(
                 if base:
                     settle(scalar, node_id, element.get(base[0]))
                 continue
+            # Program: ``d = {}; for i in range(n): d[i % 2] = d.get(i % 2,
+            # 0) + 5`` (and ``d = {0: 1}`` with the same loop).  Wrong
+            # record: ``get`` had no rule, so its result entered the ``+ 5``
+            # region at the float64 domain default: an empty table took
+            # float64 rows from that store and returned a float, and a table
+            # with int literals refused the float store.  Rule: ``d.get(k,
+            # default)`` is a row value or the default, so its class is the
+            # join of the table's element class and the default's.  A table
+            # whose only writers are fed by this read has no element class
+            # until the read has one; only then (the second phase, after
+            # every other proof has settled) the default's class seeds it.
+            # A later disagreement is refused by the row concordance, never
+            # absorbed.
+            if op == "get" and isinstance(expression, ast.Call):
+                receiver = parents(data, "operand")
+                defaults = parents(data, "arg:1")
+                # The receiver is the table, a store's version of it, or a
+                # loop's carried version of it.
+                table = receiver[0] if len(receiver) == 1 else None
+                while table is not None and (
+                    operation(G.nodes[table]) in {"indexedstore", "setitem"}
+                    or (
+                        operation(G.nodes[table]) == "loopresult"
+                        and (G.nodes[table].get("attributes") or {}).get(
+                            "result_kind"
+                        ) == "carried"
+                    )
+                ):
+                    base = parents(
+                        G.nodes[table],
+                        "value" if operation(G.nodes[table]) == "loopresult"
+                        else "base",
+                    )
+                    table = base[0] if len(base) == 1 else None
+                if (
+                    table is not None and len(defaults) == 1
+                    and is_collection(table)
+                    and (G.nodes[table].get("attributes") or {}).get(
+                        "aggregate_kind"
+                    ) == "dict"
+                ):
+                    held = element.get(receiver[0])
+                    default_dtype = scalar.get(defaults[0])
+                    if held is not None:
+                        settle(scalar, node_id, join([held, default_dtype]))
+                    elif get_default_phase:
+                        settle(scalar, node_id, default_dtype)
+                continue
             reference = str(attributes.get("static_python_reference") or "")
             if op in {"max", "min", "pop", "sum"} or reference in {
                 "max", "min", "sum",
@@ -2403,7 +2468,9 @@ def _planned_scalar_dtypes_from(
                 arms = parents(data, "body", "orelse")
                 settle(scalar, node_id, join([scalar.get(o) for o in arms]))
         if not changed:
-            break
+            if get_default_phase:
+                break
+            get_default_phase = True
     # A collection enters a region as its arena, whose dtype is its element
     # type.
     return {**element, **scalar}
@@ -10871,11 +10938,17 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     ]
     loops = [(start, end) for start, end, _node, _expression in loop_nodes]
     readers_by_sequence: dict[int, list[tuple[tuple[int, int], int]]] = {}
+    reader_ends: dict[int, tuple[int, int]] = {}
     for node_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
         line = getattr(expression, "lineno", None)
         if line is None:
             continue
+        if getattr(expression, "end_lineno", None) is not None:
+            reader_ends[int(node_id)] = (
+                int(expression.end_lineno),
+                int(getattr(expression, "end_col_offset", 0) or 0),
+            )
         for parent, _role in data.get("parents") or ():
             if parent not in graph.G:
                 continue
@@ -10974,6 +11047,36 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
             or int(data.get("value_id", node_id)) in concatenation_ids
         )
     ] + [
+        # Program: ``ys0 = [x0 * n for x0 in [4, 0, 8]]; xs1 = [3];
+        # push(xs1, n)`` then ``sum(ys0) * 10 + len(xs1) * 100 + xs1[1]``
+        # (fuzzer p32_55; corpus c283).  Wrong record: an unrolled
+        # comprehension is born where it is authored (one clear, one
+        # append per row) but was no member of this order, so the reducer
+        # fused a row's ``x0 * n`` with ``len(xs1) * 100`` and the birth
+        # placed that region before the push (100 for 200; with ``xs1 =
+        # []`` a null read).  Rule: an unrolled comprehension's birth is
+        # an effect where it is authored, as a call is.  So is a
+        # comprehension over a runtime range, which is a loop lowered
+        # where it is authored: ``xs0 = [i * 4 for i in range(n % 5 + 1)
+        # if i % 2 == 0]; xs1 = [n, 5]; swap(xs1)`` then reads of ``xs1``
+        # (Lane E fuzzer p42_33; corpus c320) fused ``n % 5 + 1`` with
+        # the reads into a region placed before the call (105 for 150).
+        (int(node_id), data.get("expr_obj"))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), (ast.ListComp, ast.SetComp))
+    ] + [
+        # Program: ``c0 = 1 if n % 2 == 0 and n > 1 else 7; xs1 = [n, 3];
+        # swap(xs1)`` then ``c0 + xs1[0] * 10 + xs1[1]`` (fuzzer p42_6;
+        # corpus c321).  Wrong record: a conditional expression is lowered
+        # as branches where it is authored, but was no member of this
+        # order, so the reducer fused its predicate ``n % 2 == 0`` with the
+        # reads after the call into one region placed before the branch,
+        # and so before the call (110 for 137).  Rule: a conditional
+        # expression or a short-circuit operator keeps its place too.
+        (int(node_id), data.get("expr_obj"))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), (ast.IfExp, ast.BoolOp))
+    ] + [
         # Program: ``xs0 = [5, n, 0]; xs0[1] = 8; xs0[0] += n; xs1 = [7,
         # 7]; push(xs1, n); push(xs1, 2)`` then reads of both (fuzzer
         # p28_37; corpus c280).  Wrong record: an indexed store was no
@@ -11027,11 +11130,24 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         if int(effect_id) in graph.G
         and getattr(expression, "end_lineno", None) is not None
     })
-    for (_first_position, first), (_second_position, second) in zip(
-        ordered_effects, ordered_effects[1:],
-    ):
-        if first != second:
-            edges.add((first, second))
+    # Program: the tire's ``output[:, :, 11] = ...; output[:, :, 12] =
+    # ...`` stores, which complete where one source position does (planner
+    # lanes plan R1).  Wrong record: members at the same position were
+    # chained by node id, which ran against their value edges (a region
+    # order cycle).  Rule: only a later position is later; members that
+    # share a position are not ordered among themselves.
+    groups: list[list[int]] = []
+    previous_position = None
+    for position, effect_id in ordered_effects:
+        if position != previous_position:
+            groups.append([])
+            previous_position = position
+        groups[-1].append(int(effect_id))
+    for earlier, later in zip(groups, groups[1:]):
+        for first in earlier:
+            for second in later:
+                if first != second:
+                    edges.add((first, second))
     for effect_id, record in effects:
         expression = record.get("expression")
         end_line = getattr(expression, "end_lineno", None)
@@ -11071,7 +11187,137 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         ):
             if start >= end and reader != int(effect_id):
                 edges.add((int(effect_id), reader))
+    # Program: ``xs = [3, n]; xs.append(2); a = xs[1]; xs[1] = 9`` then
+    # ``return a + 0`` (scratch lp/c_t; ``xs.pop(1)`` likewise).  Wrong
+    # record: an effect was ordered only before the reads after it, so
+    # nothing kept an earlier read before it; the read was placed after
+    # the store and returned 9 for n.  Rule: a read of the receiver that
+    # ends before an effect starts precedes that effect (the effect's
+    # outermost enclosing loop, if any).  An indexed store is such an
+    # effect on its base, and an in-place ``sort`` on its receiver.  The
+    # lowering reads these edges too
+    # (``sequence_read_before_effect_edges``): a row read no region owns is
+    # loaded where it is first consumed, so it must be loaded before the
+    # effect instead.
+    stores = [
+        (int(node_id), {
+            "expression": expression,
+            "sequence_value_id": int(
+                graph.G.nodes[int(base)].get("value_id", base)
+            ),
+        })
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) in {"IndexedStore", "sort"}
+        for expression in (data.get("expr_obj"),)
+        for base in (
+            parent for parent, role in data.get("parents") or ()
+            if str(role) in {"base", "operand"} and parent in graph.G
+        )
+    ]
+    read_before_effect: set[tuple[int, int]] = set()
+    branch_nodes = [
+        (int(expression.lineno), int(getattr(expression, "end_lineno", expression.lineno)),
+         int(node_id), expression)
+        for node_id, data in graph.G.nodes(data=True)
+        for expression in (data.get("expr_obj"),)
+        if isinstance(expression, ast.If)
+    ]
+    for effect_id, record in (*effects, *stores):
+        expression = record.get("expression")
+        if int(effect_id) not in graph.G or getattr(
+            expression, "lineno", None
+        ) is None:
+            continue
+        target, start = int(effect_id), (
+            int(expression.lineno),
+            int(getattr(expression, "col_offset", 0) or 0),
+        )
+        # Program: ``a = xs[1]; if n > 0: xs[1] = 7`` (scratch lp3/c_b).
+        # An effect inside a branch is ordered at its outermost enclosing
+        # statement, which the lowering enters before either arm.
+        enclosing = [
+            (block_start, -block_end, node, block)
+            for block_start, block_end, node, block in (*loop_nodes, *branch_nodes)
+            if block_start <= int(expression.lineno) <= block_end
+        ]
+        if enclosing:
+            _start, _end, target, block = min(enclosing)
+            start = (
+                int(block.lineno), int(getattr(block, "col_offset", 0) or 0),
+            )
+        for _reader_start, reader in readers_by_sequence.get(
+            int(record["sequence_value_id"]), (),
+        ):
+            reader_end = reader_ends.get(int(reader))
+            if (reader_end is not None and reader_end <= start
+                    and int(reader) != int(target)):
+                edges.add((int(reader), int(target)))
+                # A loop block names no graph node the lowering enters,
+                # so a read before a loop keeps its consumer placement.
+                if not any(int(target) == node for *_rest, node, _loop in loop_nodes):
+                    read_before_effect.add((int(reader), int(target)))
+    edges = _source_order_edges_within_value_order(graph.G, edges)
+    graph.G.graph["sequence_read_before_effect_edges"] = tuple(
+        sorted(edge for edge in read_before_effect if edge in edges)
+    )
     return frozenset(edges)
+
+
+def _source_order_edges_within_value_order(
+    graph_obj: Any, edges: Iterable[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    """Keep the source-order edges that no value path contradicts.
+
+    Program: the tire's source catalogue, whose functions share line
+    numbers, and ``tuple([slice(None)] * (left.ndim - 1))`` (planner lanes
+    plan R1).  Wrong record: an order edge from source positions ran
+    against a value edge, so the region reducer found a cycle and refused
+    the whole build.  Rule: a value edge is the stronger record; a source
+    position that disagrees with it does not order those nodes.  Edges are
+    kept in source order, each only when it closes no cycle with the value
+    edges and the edges already kept.
+    """
+
+    value = nx.DiGraph()
+    value.add_nodes_from(graph_obj.nodes)
+    for node_id, data in graph_obj.nodes(data=True):
+        for parent, _role in data.get("parents") or ():
+            if parent in graph_obj:
+                value.add_edge(parent, node_id)
+
+    def position(node_id):
+        expression = graph_obj.nodes[node_id].get("expr_obj")
+        return (
+            int(getattr(expression, "lineno", 0) or 0),
+            int(getattr(expression, "col_offset", 0) or 0),
+            int(node_id),
+        )
+
+    try:
+        order = {
+            node: index for index, node in enumerate(
+                nx.lexicographical_topological_sort(value, key=position)
+            )
+        }
+    except nx.NetworkXUnfeasible:
+        return set(edges)
+    kept: set[tuple[int, int]] = set()
+    backward: list[tuple[int, int]] = []
+    for first, second in sorted(
+        set(edges), key=lambda edge: (order.get(edge[0], -1), order.get(edge[1], -1)),
+    ):
+        if first not in order or second not in order:
+            kept.add((first, second))
+        elif order[first] < order[second]:
+            kept.add((first, second))
+            value.add_edge(first, second)
+        else:
+            backward.append((first, second))
+    for first, second in backward:
+        if not nx.has_path(value, second, first):
+            kept.add((first, second))
+            value.add_edge(first, second)
+    return kept
 
 
 def _closure_routing_dependencies(

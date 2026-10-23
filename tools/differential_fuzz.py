@@ -84,6 +84,13 @@ EXTENDED = [
     (["xs{v} = [{a}, {b}, {c}]"], "int(any([x{v} > n for x{v} in xs{v}])) * 10 + int(all([x{v} > n for x{v} in xs{v}]))"),
     (["xs{v} = [{a}, {b}, {c}]", "ys{v} = [x{v} - n for x{v} in xs{v}]"], "ys{v}[n % 3] * 10 + sum(ys{v})"),
     (["s{v} = {{(x{v} + n) % 3 for x{v} in [{a}, {b}, {c}]}}"], "len(s{v})"),
+    # a read of a list before a later store, sort or pop of it, and a
+    # returned read of a grown list (corpus c310-c319)
+    (["xs{v} = [{a}, n]", "xs{v}.append({b})", "r{v} = xs{v}[1]", "xs{v}[1] = n + {c}"], "r{v} * 10 + xs{v}[1] + len(xs{v})"),
+    (["xs{v} = [{a}, n, {b}]", "r{v} = xs{v}[0]", "xs{v}.sort()"], "r{v} * 100 + xs{v}[0]"),
+    (["xs{v} = [{a}, n, {b}]", "r{v} = xs{v}[-1]", "xs{v}.pop(0)"], "r{v} * 10 + len(xs{v})"),
+    # a set comprehension grown by add (corpus c285, c286)
+    (["s{v} = {{(x{v} + n) % 3 for x{v} in [{a}, {b}, {c}]}}", "s{v}.add(n + {a})"], "len(s{v}) * 100 + sum(s{v})"),
     # an unrolled literal loop beside an in-place sort (corpus c244, plan C15)
     (["t{v} = 0", "for x{v} in [{a}, {b}]:", "    t{v} += x{v} * n", "xs{v} = [{c}, n, {a}]", "xs{v}.sort()"], "xs{v}[0] * 10 + xs{v}[2] + t{v}"),
     (["ys{v} = [x{v} * n for x{v} in [{a}, {b}]]", "xs{v} = [{c}, n]", "xs{v}.sort(reverse=True)"], "xs{v}[0] * 10 + sum(ys{v})"),
@@ -158,6 +165,9 @@ EXTENDED2 = [
     (["xs{v} = [{a}, -1] + [n, {b}]", "d{v} = {{1: {c}}}"], "xs{v}[2] * 10 + xs{v}[0] + d{v}[1]"),
     # dict.update from a display stores its rows (A3)
     (["d{v} = {{1: {a}, 2: n}}", "d{v}.update({{1: n + {b}, 3: {c}}})"], "d{v}[1] * 10 + d{v}[2] + len(d{v}) * 100 + d{v}[3]"),
+    # a dict counted through get() in a loop, read after it (c330)
+    (["d{v} = {{}}", "for i{v} in range(n % 4 + {a}):", "    d{v}[i{v} % 2] = d{v}.get(i{v} % 2, {b}) + {c}"], "d{v}[0] + len(d{v}) * 100"),
+    (["d{v} = {{0: n}}", "d{v}[1] = d{v}.get(0, {b}) + {a}"], "d{v}[1] * 10 + len(d{v})"),
 ]
 EXTENDED3 = [
     (["xs{v} = [n, {a}]", "setfirst(xs{v}, {b})"], "len(xs{v}) * 100 + xs{v}[0] * 10 + xs{v}[1]"),
@@ -168,6 +178,8 @@ EXTENDED3 = [
     (["xs{v} = []", "push(xs{v}, n)", "push(xs{v}, {a})", "setfirst(xs{v}, {b})"], "len(xs{v}) * 100 + xs{v}[0] + xs{v}[1]"),
     (["xs{v} = [n, {a}]", "ys{v} = [{b}]", "grow(ys{v}, 2)"], "head(xs{v}) + width(ys{v}) * 10 + ys{v}[-1]"),
     (["xs{v} = [n, {a}, {b}]"], "pick(xs{v}, n % 3) * 10 + width(xs{v})"),
+    # a set grown by a helper (corpus c288, c289)
+    (["s{v} = {{n, {a}}}", "addto(s{v}, {b})", "addto(s{v}, n)"], "len(s{v}) * 100 + sum(s{v})"),
     # backend parity (lane E): a static int and bool tuple read in a loop
     # under a condition, a resident sum/count/index/any, a sort of a
     # display with a parameter, an f-string measured in a callee
@@ -207,6 +219,8 @@ EXTENDED3 = [
     ([], "sum([{a}, {b}, n]) * 10 + min([{c}, n, {a}])"),
     # pop at an index and del on a fixed list (lane E)
     (["xs{v} = [{a}, n, {b}, {c}]", "a{v} = xs{v}.pop(1)", "del xs{v}[0]"], "a{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
+    # a callee list bound to branch displays (c271, c331)
+    (["c{v} = branchpair(n - {a})"], "c{v}"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
@@ -239,6 +253,10 @@ def pick(xs: list[int], i: int) -> int:
     return xs[i]
 
 
+def addto(s: set[int], v: int) -> None:
+    s.add(v)
+
+
 def label(x: int) -> int:
     return len(f"value={int(x)}")
 
@@ -251,6 +269,15 @@ def maybe_pair(x: int, y: int) -> tuple[int, int] | None:
 
 def maybe_twice(x: int, y: int):
     return x * 2 if x != y else None
+
+
+def branchpair(x: int) -> int:
+    if x > 2:
+        t = [x, 1]
+    else:
+        t = [5, 6]
+    t.append(7)
+    return len(t) * 10 + t[0] + t[2]
 
 
 """
