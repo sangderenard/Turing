@@ -6735,10 +6735,13 @@ def _authored_effect_statements(source_graph: Any) -> tuple[str, ...]:
 
     import ast
 
+    # A branch or loop lists its statements as ``body``/``orelse``
+    # parents; that holds the statement, it does not read its value.
     consumed = {
         int(parent)
         for _node_id, data in source_graph.nodes(data=True)
-        for parent, _role in data.get("parents") or ()
+        for parent, role in data.get("parents") or ()
+        if str(role) not in {"body", "orelse"}
     }
     found = []
     for node_id, data in source_graph.nodes(data=True):

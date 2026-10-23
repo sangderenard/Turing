@@ -98,3 +98,6 @@ def test_authored_effects_are_read_from_stores_and_discarded_calls():
     assert _authored_effect_statements(graph) == ("1: layer.count(key)",)
     graph.add_node(4, type="IndexedStore", parents=[(0, "base")])
     assert len(_authored_effect_statements(graph)) == 2
+    # A branch holding the call as its body does not consume its value.
+    graph.add_node(5, type="If", parents=[(3, "test"), (1, "body")])
+    assert len(_authored_effect_statements(graph)) == 2
