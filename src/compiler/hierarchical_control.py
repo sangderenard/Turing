@@ -144,6 +144,7 @@ def compose_hierarchical_control(
         tuple[int, int, str, tuple[int, ...]]
     ] = []
     all_projected_iterables: list[tuple[int, int, str, object]] = []
+    all_induction_offsets: list[tuple[int, int]] = []
     all_recursion_regions: list[RecursionRegion] = []
     all_deployment_regions = []
     next_recursion_region = 0
@@ -344,6 +345,10 @@ def compose_hierarchical_control(
             )
             for iterable, target, induction, projection
             in local.projected_iterable_bindings
+        )
+        all_induction_offsets.extend(
+            (value(target), value(start))
+            for target, start in local.induction_offsets
         )
 
         calls_before: dict[int, list[CallBlock]] = {}
@@ -717,6 +722,7 @@ def compose_hierarchical_control(
         projected_iterable_bindings=tuple(
             dict.fromkeys(all_projected_iterables)
         ),
+        induction_offsets=tuple(dict.fromkeys(all_induction_offsets)),
         recursion_regions=tuple(dict.fromkeys(all_recursion_regions)),
         deployment_regions=tuple(all_deployment_regions),
     )

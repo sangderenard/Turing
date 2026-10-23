@@ -18103,8 +18103,27 @@ class _ControlSSABuilder(TiledObject):
             )
             if projection == "induction":
                 # LOOP_CONTROL: the induction Phi is the target's value.
+                # ``enumerate(a, start)`` counts from ``start``: its counter
+                # is the induction plus that value (``induction_offsets``).
+                counter = induction
+                start_id = dict(
+                    getattr(self.program, "induction_offsets", ()) or ()
+                ).get(int(target_id))
+                if start_id is not None:
+                    start = self.external_value(int(start_id))
+                    counter = self.fresh_value(
+                        dtype="int64", transform=CONTROL_EXPRESSION,
+                        operands=(induction, start),
+                    )
+                    self.emit(
+                        Handler.Add, [induction, start], counter,
+                        attributes={
+                            "binding": "enumerate_start",
+                            "induction": loop.induction,
+                        },
+                    )
                 self._bind(
-                    int(target_id), induction, BindingKind.LOOP_CONTROL,
+                    int(target_id), counter, BindingKind.LOOP_CONTROL,
                     loop_cell, int(iterable_id),
                 )
                 continue

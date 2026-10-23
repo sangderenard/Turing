@@ -3519,11 +3519,10 @@ def test_sequential_loop_body_does_not_own_captured_predecessor_values():
     )
 
 
-def test_enumerate_start_refuses_rather_than_counting_from_zero():
+def test_enumerate_start_offsets_the_counter():
     # Program: ``for k, x in enumerate(xs, 3)``.  The count was bound to the
     # loop induction (which starts at 0) and ``start`` was dropped, so C and
-    # LLVM silently counted from 0.  A start has no loop lowering: it
-    # refuses by name.
+    # LLVM silently counted from 0.  The counter is the induction plus start.
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     source = textwrap.dedent(
@@ -3537,11 +3536,18 @@ def test_enumerate_start_refuses_rather_than_counting_from_zero():
         """
     )
     root = pathlib.Path(__file__).resolve().parents[1]
-    with pytest.raises(ValueError, match="enumerate with a start argument"):
-        lower_ast_source_to_ssa(
-            source, "root", name="enumerate_start",
-            extraction_contract=str(
-                root / "extraction_contracts" / "program_extraction.yaml"
-            ),
-            progress=lambda _: None,
-        )
+    module, _, _ = lower_ast_source_to_ssa(
+        source, "root", name="enumerate_start",
+        extraction_contract=str(
+            root / "extraction_contracts" / "program_extraction.yaml"
+        ),
+        progress=lambda _: None,
+    )
+    offsets = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "enumerate_start"
+    ]
+    assert [str(instruction.op) for instruction in offsets] == ["Add"]
