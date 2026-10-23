@@ -562,9 +562,11 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
                  function_name=name + "__fixed", first_value_id=first_value_id,
                  raise_when_full=False)
              if operation in fills else lower_sequence_insert_at(fixed_descriptor,
-                 function_name=name + "__fixed", first_value_id=first_value_id)
+                 function_name=name + "__fixed", first_value_id=first_value_id,
+                 raise_when_full=False)
              if operation == "insert_at" else lower_sequence_insert(fixed_descriptor,
-                 function_name=name + "__fixed", operation=operation, first_value_id=first_value_id))
+                 function_name=name + "__fixed", operation=operation, first_value_id=first_value_id,
+                 raise_when_full=False))
     if not fixed.complete:
         return fixed
     insert = fixed.functions[0]
@@ -650,12 +652,30 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
     return SSASequenceLowering((function, insert, reserve))
 
 
+def _raise_fixed_capacity_exhausted(builder, block, operation):
+    """A FIXED arena's capacity is a proof; exhausting it means the proof
+    was wrong.  Program: a callee list whose capacity cell stayed 0 (Lane E
+    E10, c303); every append reported "full" into a status nobody reads
+    and the callee summed zeros.  Rule (takeover rule 10): a fixed-capacity
+    write that finds no room raises validation error 75, the same as a
+    fixed fill.  Only the DYNAMIC protocol's insert step reports "full"
+    without raising: its caller reserves and retries."""
+    builder.emit(block, "Call", [], attributes={
+        "callee": "turing_validation_error",
+        "error_code": 75,
+        "source_linked": True,
+        "ssa_sequence_operation": operation,
+        "failure": "fixed_capacity_exhausted",
+    })
+
+
 def lower_sequence_insert(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
     operation: str = "insert",
     first_value_id: int | None = None,
+    raise_when_full: bool = True,
 ) -> SSASequenceLowering:
     """Build fixed-capacity row insertion with optional linear key dedup.
 
@@ -835,6 +855,8 @@ def lower_sequence_insert(
         inserted,
         _status_branch(builder, inserted, 1, result_block),
     ))
+    if raise_when_full:
+        _raise_fixed_capacity_exhausted(builder, full, operation)
     status_values.append((
         full,
         _status_branch(builder, full, 2, result_block),
@@ -1120,6 +1142,7 @@ def lower_record_sequence_append_with_child_copy(
     builder.branch(publish_child, inserted)
 
     inserted_status = _status_branch(builder, inserted, 1, result_block)
+    _raise_fixed_capacity_exhausted(builder, full, "append_child_copy")
     full_status = _status_branch(builder, full, 2, result_block)
     status_result = builder.fresh("int")
     builder.emit(result_block, "Phi", [inserted_status, full_status],
@@ -2160,6 +2183,7 @@ def lower_sequence_append_slice(
     builder.branch(latch, header)
     builder.emit(complete, "Store", [new_length, destination_length_slot])
     complete_status = _status_branch(builder, complete, 1, result)
+    _raise_fixed_capacity_exhausted(builder, full, "append_slice")
     full_status = _status_branch(builder, full, 2, result)
     status = builder.fresh("int")
     builder.emit(
@@ -2319,6 +2343,7 @@ def lower_sequence_pack_bits(
     builder.branch(outer_latch, outer_header)
     builder.emit(complete, "Store", [word_count, destination_length_slot])
     ok = _status_branch(builder, complete, 1, result)
+    _raise_fixed_capacity_exhausted(builder, full, "pack_bits")
     full_status = _status_branch(builder, full, 2, result)
     invalid_status = _status_branch(builder, invalid, 3, result)
     status = builder.fresh("int")
@@ -2419,6 +2444,7 @@ def lower_sequence_prepend(
     builder.emit(store_prefix, "Store", [value, prefix_address])
     builder.emit(store_prefix, "Store", [new_length, length_slot])
     ok = _status_branch(builder, store_prefix, 1, result)
+    _raise_fixed_capacity_exhausted(builder, full, "prepend")
     full_status = _status_branch(builder, full, 2, result)
     status = builder.fresh("int")
     builder.emit(
@@ -2580,6 +2606,7 @@ def lower_sequence_insert_at(
     *,
     function_name: str | None = None,
     first_value_id: int | None = None,
+    raise_when_full: bool = True,
 ) -> SSASequenceLowering:
     """``list.insert(index, row)``: Python's index rule, then a right shift.
 
@@ -2659,6 +2686,8 @@ def lower_sequence_insert_at(
         builder.emit(write, "Store", [value, address])
     builder.emit(write, "Store", [new_length, length_slot])
     inserted = _status_branch(builder, write, 1, result)
+    if raise_when_full:
+        _raise_fixed_capacity_exhausted(builder, full, "insert_at")
     exhausted = _status_branch(builder, full, 2, result)
     status = builder.fresh("int")
     builder.emit(
@@ -2930,6 +2959,7 @@ def lower_sequence_prepend_packed_bytes(
     builder.branch(word_latch, word_header)
     builder.emit(complete, "Store", [new_length, destination_length_slot])
     ok = _status_branch(builder, complete, 1, result)
+    _raise_fixed_capacity_exhausted(builder, full, "prepend_packed_bytes")
     full_status = _status_branch(builder, full, 2, result)
     invalid_status = _status_branch(builder, invalid, 3, result)
     status = builder.fresh("int")

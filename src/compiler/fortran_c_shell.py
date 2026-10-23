@@ -26454,6 +26454,19 @@ def _class_surface_ssa_program(
                     pending.append(child)
             return dependent
 
+        # Program: ``d = {}; for i in range(n): d[i % 2] = d.get(i % 2, 0)
+        # + 5`` then ``return d[0] + len(d)``.  Wrong record: the ``get``
+        # fed only a numerical region, so it was neither control-consumed
+        # nor region-owned, and the SSA prologue emitted it at function entry:
+        # before the literal's clear, outside the loop, with its key read
+        # before definition.  n=3 returned 7.0, not 12.  Rule (as for
+        # memberships below): a keyed read of a sequence this control tree
+        # mutates reads the state at its authored node; only a read of an
+        # unmutated sequence may stay at entry.
+        lookup_mutated_sequence_ids = {
+            int(mutation.sequence_value_id)
+            for mutation in _control_sequence_mutations(control.root)
+        }
         for result_id, key_ids, sequence_id in table_lookups:
             control_consumed = _control_block_consumes_values(
                 control.root, lookup_dependent_value_ids(int(result_id))
@@ -26461,6 +26474,7 @@ def _class_surface_ssa_program(
             if (
                 result_id not in direct_return_ids
                 and not control_consumed
+                and int(sequence_id) not in lookup_mutated_sequence_ids
             ) or result_id in region_owned_nodes:
                 continue
             query = SequenceQueryBlock(
@@ -41662,9 +41676,32 @@ def _class_surface_ssa_program(
                 fact, stage=FRAME_BINDING, mode=Mode.REVISE, cells=cells,
                 reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
             ))
+        # Program: ``merged(n)`` builds ``t = [n, 1]`` or ``t = [5, 6]`` and
+        # is called from ``root`` (corpus c271).  Wrong record: the display
+        # ``[5, 6]`` is a graph Constant whose id is also the column of the
+        # callee's sequence 8, so its formal was bound as a caller literal.
+        # The caller passed a two-element constant as the arena, the
+        # wrapper (which publishes capacities only for frame-owned storage)
+        # left that sequence's capacity 0, and both appends reported "full"
+        # into a status nobody reads.  Rule: a callee formal that names a
+        # cell of one of the callee's sequences is frame storage, never a
+        # literal.
+        callee_sequence_storage_ids = {
+            int(value_id)
+            for sequence in getattr(
+                all_sequence_tables.get(callee_symbol), "sequences", {},
+            ).values()
+            for value_id in (
+                *sequence.column_value_ids, sequence.length_address_id,
+                sequence.capacity_value_id, sequence.status_address_id,
+            )
+            if value_id is not None
+        }
         if child_graph is not None and callee_function is not None:
             for value in callee_function.args:
                 value_id = int(value.id)
+                if value_id in callee_sequence_storage_ids:
+                    continue
                 node = child_graph.nodes.get(value_id)
                 if node is None or str(node.get("type")) not in {
                     "Constant", "Const", "const",

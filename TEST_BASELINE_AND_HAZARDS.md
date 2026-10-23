@@ -1,3 +1,13 @@
+2026-10-23 SILENT LANE: FULL IS LOUD, DICT GET (MEASURED): doc 36 sections
+15-16. A FIXED append/add/insert/slice/prepend/pack that finds no room now
+raises validation error 75 (only the DYNAMIC insert step still reports
+"full", and grows). That exposed c271/c272: a callee's branch display
+`[5, 6]` was bound as a caller literal and its arena got capacity 0 (dead
+arena, so the answers were right). WRONG at `main`: `d[k] = d.get(k, 0) +
+5` in a loop, read after it (7.0 for 12): the get was hoisted to entry
+and typed float64. Measured: corpus 226/226; fuzz 0 WRONG (seeds 45, 46,
+48); gate names identical to `main` 2806360d.
+
 2026-10-23 SILENT LANE ROUND 3 AND R1 (MEASURED): doc 36 sections 10-14.
 These were WRONG at `main` with a clean audit:
 - a comprehension birth, a comprehension loop, or a conditional expression

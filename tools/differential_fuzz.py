@@ -165,6 +165,9 @@ EXTENDED2 = [
     (["xs{v} = [{a}, -1] + [n, {b}]", "d{v} = {{1: {c}}}"], "xs{v}[2] * 10 + xs{v}[0] + d{v}[1]"),
     # dict.update from a display stores its rows (A3)
     (["d{v} = {{1: {a}, 2: n}}", "d{v}.update({{1: n + {b}, 3: {c}}})"], "d{v}[1] * 10 + d{v}[2] + len(d{v}) * 100 + d{v}[3]"),
+    # a dict counted through get() in a loop, read after it (c330)
+    (["d{v} = {{}}", "for i{v} in range(n % 4 + {a}):", "    d{v}[i{v} % 2] = d{v}.get(i{v} % 2, {b}) + {c}"], "d{v}[0] + len(d{v}) * 100"),
+    (["d{v} = {{0: n}}", "d{v}[1] = d{v}.get(0, {b}) + {a}"], "d{v}[1] * 10 + len(d{v})"),
 ]
 EXTENDED3 = [
     (["xs{v} = [n, {a}]", "setfirst(xs{v}, {b})"], "len(xs{v}) * 100 + xs{v}[0] * 10 + xs{v}[1]"),
@@ -185,6 +188,8 @@ EXTENDED3 = [
     (["xs{v} = [{a}, n, {a}, {b}]"], "sum(xs{v}) * 100 + xs{v}.count({a}) * 10 + xs{v}.index(n)"),
     (["xs{v} = [{a}, n, {b}]", "xs{v}.remove(n)"], "len(xs{v}) * 10 + xs{v}[1]"),
     (["c{v} = label(n + {a})"], "c{v}"),
+    # a callee list bound to branch displays (c271, c331)
+    (["c{v} = branchpair(n - {a})"], "c{v}"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
@@ -223,6 +228,15 @@ def addto(s: set[int], v: int) -> None:
 
 def label(x: int) -> int:
     return len(f"value={int(x)}")
+
+
+def branchpair(x: int) -> int:
+    if x > 2:
+        t = [x, 1]
+    else:
+        t = [5, 6]
+    t.append(7)
+    return len(t) * 10 + t[0] + t[2]
 
 
 """

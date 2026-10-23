@@ -2051,6 +2051,7 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
             element.setdefault(int(value_id), dtype)
         elif rank == 0 and storage in {"scalar", ""}:
             scalar.setdefault(int(value_id), dtype)
+    get_default_phase = False
     for _round in range(64):
         changed = False
 
@@ -2186,6 +2187,22 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                         ):
                             settle(scalar, int(target_id), held)
                 continue
+            if (
+                op == "loopresult" and len(parents(data, "value")) == 1
+                and attributes.get("result_kind") == "carried"
+            ):
+                # Program: ``d = {}; for ..: d[k] = d.get(k, 0) + 5`` then
+                # ``return d[0] + len(d)`` in a callee (corpus c330).  Wrong
+                # record: the loop's carried ``d`` (a LoopResult of the
+                # body's store) was read as a comprehension result, so its
+                # element class was unread, ``d[0]`` fell to float64 and
+                # the caller kept a float result the callee no longer had.
+                # Rule: a carried result is the body's value; it holds that
+                # value's element class (and its scalar class).
+                carried = parents(data, "value")[0]
+                settle(element, node_id, element.get(carried))
+                settle(scalar, node_id, scalar.get(carried))
+                continue
             if op == "loopresult" and len(parents(data, "value")) == 1:
                 settle(element, node_id, scalar.get(parents(data, "value")[0]))
                 continue
@@ -2224,6 +2241,54 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                 base = parents(data, "base", "value", "object")
                 if base:
                     settle(scalar, node_id, element.get(base[0]))
+                continue
+            # Program: ``d = {}; for i in range(n): d[i % 2] = d.get(i % 2,
+            # 0) + 5`` (and ``d = {0: 1}`` with the same loop).  Wrong
+            # record: ``get`` had no rule, so its result entered the ``+ 5``
+            # region at the float64 domain default: an empty table took
+            # float64 rows from that store and returned a float, and a table
+            # with int literals refused the float store.  Rule: ``d.get(k,
+            # default)`` is a row value or the default, so its class is the
+            # join of the table's element class and the default's.  A table
+            # whose only writers are fed by this read has no element class
+            # until the read has one; only then (the second phase, after
+            # every other proof has settled) the default's class seeds it.
+            # A later disagreement is refused by the row concordance, never
+            # absorbed.
+            if op == "get" and isinstance(expression, ast.Call):
+                receiver = parents(data, "operand")
+                defaults = parents(data, "arg:1")
+                # The receiver is the table, a store's version of it, or a
+                # loop's carried version of it.
+                table = receiver[0] if len(receiver) == 1 else None
+                while table is not None and (
+                    operation(G.nodes[table]) in {"indexedstore", "setitem"}
+                    or (
+                        operation(G.nodes[table]) == "loopresult"
+                        and (G.nodes[table].get("attributes") or {}).get(
+                            "result_kind"
+                        ) == "carried"
+                    )
+                ):
+                    base = parents(
+                        G.nodes[table],
+                        "value" if operation(G.nodes[table]) == "loopresult"
+                        else "base",
+                    )
+                    table = base[0] if len(base) == 1 else None
+                if (
+                    table is not None and len(defaults) == 1
+                    and is_collection(table)
+                    and (G.nodes[table].get("attributes") or {}).get(
+                        "aggregate_kind"
+                    ) == "dict"
+                ):
+                    held = element.get(receiver[0])
+                    default_dtype = scalar.get(defaults[0])
+                    if held is not None:
+                        settle(scalar, node_id, join([held, default_dtype]))
+                    elif get_default_phase:
+                        settle(scalar, node_id, default_dtype)
                 continue
             reference = str(attributes.get("static_python_reference") or "")
             if op in {"max", "min", "pop", "sum"} or reference in {
@@ -2272,7 +2337,9 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                 arms = parents(data, "body", "orelse")
                 settle(scalar, node_id, join([scalar.get(o) for o in arms]))
         if not changed:
-            break
+            if get_default_phase:
+                break
+            get_default_phase = True
     # A collection enters a region as its arena, whose dtype is its element
     # type.
     return {**element, **scalar}
