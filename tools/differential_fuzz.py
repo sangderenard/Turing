@@ -191,6 +191,8 @@ EXTENDED3 = [
     (["xs{v} = [n, {a}]", "xs{v}.append(n - {b})"], "int(any(xs{v})) * 10 + int(all(xs{v}))"),
     # a callee's scalar result beside a callee swap, Fortran (lane E)
     (["xs{v} = [n, {a}]", "h{v} = head(xs{v})", "swap(xs{v})", "swap(xs{v})", "swap(xs{v})"], "h{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
+    # dict.get with a default past float64's exact integers (lane E)
+    (["d{v} = {{1: {a}, 2: n}}"], "d{v}.get({b} + 3, 36028797018963969) + d{v}.get(2, {c})"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v

@@ -10495,7 +10495,12 @@ def _field_slot_ops(
             if isinstance(literal, (int, float)) and not isinstance(
                 literal, bool
             ):
-                table_lookup_defaults[result_id] = float(literal)
+                # Program: ``cells.get(2, 9)`` over int values (corpus
+                # c64).  Wrong record: the default was minted ``9.0``, so the
+                # int64 Const carried a float payload and Fortran passed
+                # REAL(8) to the helper's INTEGER(8) formal.  Rule: the
+                # default keeps the authored literal's own type.
+                table_lookup_defaults[result_id] = literal
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         if node_operation(data) != "indexedstore":
