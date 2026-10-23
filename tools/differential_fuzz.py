@@ -2,8 +2,9 @@
 C and compared with Python; failures clustered by signature.
 
 usage: python tools/differential_fuzz.py OUTDIR SEED COUNT
-(FUZZ_EXT=1/2/3 widen the grammar: extended builtins, then more control
-and sequences, then helpers that mutate and read a caller's list.
+(FUZZ_EXT=1/2/3/4 widen the grammar: extended builtins, then more control
+and sequences, then helpers that mutate and read a caller's list, then
+whole-collection loops, dict deletion, swaps and replication.
 FUZZ_BACKENDS=llvm,fortran also runs each program through LLVM and/or
 Fortran: a wrong value is WRONG, and a refusal of a program C ran is
 LLVM-LOUD or FORTRAN-LOUD.)
@@ -335,10 +336,39 @@ def build(m: int) -> list[int]:
 '''
 
 
+# FUZZ_EXT=4 (silent-wrong lane): whole-collection loops, dict iteration
+# and deletion, tuple swaps, nested stores, slices then appends, list
+# replication, aliasing and sets.  Seeds 80-83 found the families of corpus
+# c333-c338.
+EXTENDED4 = [
+    (["xs{v} = [n, {a}, {b}, {c}]", "s{v} = 0", "while xs{v}:", "    s{v} = s{v} * 3 + xs{v}.pop()"], "s{v}"),
+    (["d{v} = {{1: n, 2: {a}}}", "s{v} = 0", "for k{v} in d{v}:", "    s{v} += k{v} * d{v}[k{v}]"], "s{v}"),
+    (["d{v} = {{1: n, 3: {a}}}", "s{v} = 0", "for k{v}, w{v} in d{v}.items():", "    s{v} += k{v} * 10 + w{v}"], "s{v}"),
+    (["p{v}, q{v} = n, {a}", "p{v}, q{v} = q{v}, p{v} + q{v}"], "p{v} * 100 + q{v}"),
+    (["m{v} = [[n, {a}], [{b}, {c}]]", "m{v}[1][0] += n"], "m{v}[0][1] * 10 + m{v}[1][0]"),
+    (["xs{v} = [n, {a}, {b}, {c}]", "ys{v} = xs{v}[1:3]", "ys{v}.append(n)"], "len(ys{v}) * 100 + ys{v}[0] + ys{v}[-1]"),
+    (["s{v} = 0", "for i{v}, x{v} in enumerate([n, {a}, {b}]):", "    s{v} += i{v} * x{v}"], "s{v}"),
+    (["s{v} = 0", "for x{v}, y{v} in zip([n, {a}], [{b}, {c}]):", "    s{v} += x{v} * y{v}"], "s{v}"),
+    (["xs{v} = []", "k{v} = n % 5", "while k{v} > 0:", "    xs{v}.insert(0, k{v})", "    k{v} -= 1"], "len(xs{v}) * 10 + (xs{v}[0] if xs{v} else -1)"),
+    (["d{v} = {{1: n, 2: {a}}}", "del d{v}[1]"], "len(d{v}) * 10 + int(1 in d{v}) + d{v}[2]"),
+    (["xs{v} = [{b}, n, {a}]", "xs{v}.sort()", "xs{v}.remove(n)"], "xs{v}[0] * 10 + xs{v}[1]"),
+    (["xs{v} = [n, {a}]", "ys{v} = list(xs{v})", "ys{v}.append({b})", "xs{v}[0] = {c}"], "xs{v}[0] + ys{v}[0] * 10 + len(ys{v}) * 100"),
+    (["xs{v} = [n, {b}, {c}]"], "int(any(x{v} > {a} for x{v} in xs{v})) + 2 * int(all(x{v} > 0 for x{v} in xs{v}))"),
+    (["xs{v} = [n, {a}, {b}]", "ys{v} = xs{v}", "ys{v}.append({c})"], "len(xs{v}) * 10 + xs{v}[-1]"),
+    (["xs{v} = [n, {a}]", "for i{v} in range(2):", "    xs{v}.append(xs{v}[-1] + xs{v}[-2])"], "xs{v}[-1] * 10 + len(xs{v})"),
+    (["d{v} = {{}}", "for x{v} in [n, {a}, n]:", "    d{v}[x{v}] = d{v}.get(x{v}, 0) + 1"], "d{v}[n] * 10 + len(d{v})"),
+    (["xs{v} = [n, {a}, {b}]", "t{v} = 0", "for x{v} in xs{v}:", "    if x{v} > {c}:", "        continue", "    t{v} += x{v}"], "t{v}"),
+    (["s{v} = {{n, {a}}}", "s{v}.discard(n)", "s{v}.add({b})"], "len(s{v}) * 10 + int(n in s{v})"),
+    (["xs{v} = [n, {a}, {b}]", "xs{v}[0], xs{v}[2] = xs{v}[2], xs{v}[0]"], "xs{v}[0] * 100 + xs{v}[2]"),
+    (["xs{v} = [n] * 3", "xs{v}[1] = {a}"], "sum(xs{v}) * 10 + xs{v}[1]"),
+]
+
+
 def make_program(rng):
     pool = SNIPPETS + (EXTENDED if os.environ.get("FUZZ_EXT") else []) + (
-        EXTENDED2 if os.environ.get("FUZZ_EXT") in {"2", "3"} else []) + (
-        EXTENDED3 if os.environ.get("FUZZ_EXT") == "3" else [])
+        EXTENDED2 if os.environ.get("FUZZ_EXT") in {"2", "3", "4"} else []) + (
+        EXTENDED3 if os.environ.get("FUZZ_EXT") in {"3", "4"} else []) + (
+        EXTENDED4 if os.environ.get("FUZZ_EXT") == "4" else [])
     picks = rng.sample(range(len(pool)), rng.randint(1, 3))
     body, exprs = [], []
     for v, index in enumerate(picks):
@@ -347,8 +377,8 @@ def make_program(rng):
         body += ["    " + line.format(**values) for line in lines]
         exprs.append(expr.format(**values))
     text = HELPERS + (EXT_HELPERS if os.environ.get("FUZZ_EXT") else "") + (
-        EXT2_HELPERS if os.environ.get("FUZZ_EXT") in {"2", "3"} else "") + (
-        EXT3_HELPERS if os.environ.get("FUZZ_EXT") == "3" else "") + "def root(n: int) -> int:\n" + "\n".join(body) + "\n    return " + " + ".join(f"({e})" for e in exprs) + "\n"
+        EXT2_HELPERS if os.environ.get("FUZZ_EXT") in {"2", "3", "4"} else "") + (
+        EXT3_HELPERS if os.environ.get("FUZZ_EXT") in {"3", "4"} else "") + "def root(n: int) -> int:\n" + "\n".join(body) + "\n    return " + " + ".join(f"({e})" for e in exprs) + "\n"
     return text, tuple(picks)
 
 
