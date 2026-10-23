@@ -323,6 +323,21 @@ def _propagate_scalar_dtypes(functions) -> None:
                 address_base[int(instruction.res.id)] = int(
                     instruction.args[0].id
                 )
+        # Program: ``xs = []; ... xs.pop(0) ...; for x in xs: total = total
+        # * 10 + x`` (corpus c146).  Wrong record: the loop target's Load
+        # from the owned heap arena kept a provisional declared ``int``
+        # (i32) though the arena's rows are int64, and LLVM refused the
+        # load ("heap load result disagrees with its declared element
+        # layout").  Rule: a Load through an element address of a heap
+        # arena reads the arena's declared element dtype.
+        heap_element_of: dict[int, str] = {}
+        for instruction in instructions:
+            for argument in instruction.args:
+                heap_element = (argument.accounting or {}).get(
+                    "heap_element_dtype"
+                )
+                if heap_element is not None:
+                    heap_element_of[int(argument.id)] = str(heap_element)
 
         # A Python scalar literal is a weak operand: it names a value, not an
         # element width, so beside a typed float operand it does not widen the
@@ -352,6 +367,8 @@ def _propagate_scalar_dtypes(functions) -> None:
             and (not instruction.args or address_base.get(int(instruction.args[0].id))
                  not in aggregate_result_ids)
             and dtype_of.get(int(instruction.res.id), "") in _DECLARED_LITERAL_DTYPES
+            and (not instruction.args or address_base.get(int(instruction.args[0].id))
+                 not in heap_element_of)
         }
 
         def declared_float(instruction) -> str | None:
@@ -421,7 +438,10 @@ def _propagate_scalar_dtypes(functions) -> None:
                     declared = dtype_of.get(result_id, "")
                     base_id = address_base.get(int(instruction.args[0].id))
                     candidate = None if base_id is None else dtype_of.get(base_id)
-                    if (
+                    heap_element = heap_element_of.get(base_id)
+                    if heap_element in integers | floats | {"bool"}:
+                        inferred = heap_element
+                    elif (
                         instruction.attributes.get("lowered_from") in _GATHER
                         and candidate in integers | floats | {"bool"}
                     ):

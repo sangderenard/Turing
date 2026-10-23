@@ -1932,6 +1932,66 @@ def _accepted_semantic_result_bindings(
 
 
 def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
+    """Scalar dtypes the source proves, with self-accumulating dicts.
+
+    Program: ``d = {}; for i in range(n): d[k] = d.get(k, 0) + big``
+    (corpus c304, c178).  Wrong record: the dict's element type is the join
+    of its writers, the writer reads ``d.get``, and ``d.get`` reads the
+    element type: a cycle the pessimistic fixpoint never closes, so the
+    rows fell to the float64 default and C added 2**55 + 1 through float64.
+    Rule: for a dict whose element type is unproven and that is read by
+    ``get`` with a typed default, assume the default's type and accept the
+    assumption only if, under it, the dict's writers join to exactly that
+    type (a consistent typing of the cycle). Otherwise nothing is assumed.
+    """
+
+    proven = _planned_scalar_dtypes_from(graph)
+    G = graph.G
+    hypotheses: dict[int, str] = {}
+    for node_id, data in G.nodes(data=True):
+        if str(data.get("op") or data.get("type") or "").casefold() != "get":
+            continue
+        roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        receiver, default = roles.get("operand"), roles.get("arg:1")
+        if receiver is None or default is None or receiver in proven:
+            continue
+        receiver_data = G.nodes.get(receiver, {})
+        if (receiver_data.get("attributes") or {}).get("aggregate_kind") != "dict":
+            continue
+        dtype = proven.get(default)
+        if dtype not in {"int64", "float64", "bool"}:
+            continue
+        if hypotheses.setdefault(receiver, dtype) != dtype:
+            hypotheses[receiver] = ""
+    hypotheses = {key: value for key, value in hypotheses.items() if value}
+    if not hypotheses:
+        return proven
+    observed: dict[int, str | None] = {}
+    assumed = _planned_scalar_dtypes_from(
+        graph, assumed_elements=hypotheses, observed_writers=observed,
+    )
+    accepted = {
+        receiver: dtype for receiver, dtype in hypotheses.items()
+        if observed.get(receiver) == dtype
+    }
+    if accepted != hypotheses:
+        if not accepted:
+            return proven
+        observed = {}
+        assumed = _planned_scalar_dtypes_from(
+            graph, assumed_elements=accepted, observed_writers=observed,
+        )
+        if any(observed.get(key) != value for key, value in accepted.items()):
+            return proven
+    return assumed
+
+
+def _planned_scalar_dtypes_from(
+    graph: Any,
+    *,
+    assumed_elements: dict[int, str] | None = None,
+    observed_writers: dict[int, str | None] | None = None,
+) -> dict[int, str]:
     """Scalar dtypes the source proves before any region is typed.
 
     Program: ``xs = [n, 7]; max(xs) * 100``, ``d = {1: 10}; d[1] += 5``
@@ -1967,7 +2027,7 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
         return None
 
     scalar: dict[int, str] = {}
-    element: dict[int, str] = {}
+    element: dict[int, str] = dict(assumed_elements or {})
 
     def join(dtypes):
         known = {dtype for dtype in dtypes if dtype is not None}
@@ -2155,6 +2215,43 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                                 ) == "loop"
                             ):
                                 settle(scalar, int(target_id), held)
+                # Program: ``for p, q in zip(xs, ys): t += p * q`` (c171,
+                # c172).  Wrong record: a tuple target has no single name, so
+                # ``p`` and ``q`` were never typed and fell to the float64
+                # default; LLVM refused the i64/double Phi and C multiplied
+                # int rows through float64.  Rule: the i-th name of a tuple
+                # target over ``zip(a, b, ...)`` is an element of the i-th
+                # argument.
+                zipped = G.nodes.get(iterable[0], {}) if iterable else {}
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and (zipped.get("attributes") or {}).get(
+                        "extraction_identity") == "builtins.zip"
+                ):
+                    arguments = sorted(
+                        (int(str(role).split(":", 1)[1]), int(parent))
+                        for parent, role in zipped.get("parents") or ()
+                        if str(role).startswith("arg:") and int(parent) in G
+                    )
+                    if len(arguments) == len(loop_expression.target.elts):
+                        for item, (_position, argument) in zip(
+                            loop_expression.target.elts, arguments,
+                        ):
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id),
+                                           element.get(argument))
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
@@ -2204,12 +2301,40 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                 settle(scalar, node_id, scalar.get(carried))
                 continue
             if op == "loopresult" and len(parents(data, "value")) == 1:
-                settle(element, node_id, scalar.get(parents(data, "value")[0]))
+                value = parents(data, "value")[0]
+                # A loop whose carried value is a store (``d[k] = ...``)
+                # yields the stored collection: its rows have the store's
+                # element type, not a scalar's.
+                stored = operation(G.nodes[value]) in {"indexedstore", "setitem"}
+                settle(element, node_id, (
+                    element.get(value) if stored else scalar.get(value)
+                ))
+                continue
+            if op == "get" and is_collection(
+                (parents(data, "operand") or [-1])[0]
+            ) and (
+                G.nodes[parents(data, "operand")[0]].get("attributes") or {}
+            ).get("aggregate_kind") == "dict" and parents(data, "arg:1"):
+                # ``d.get(k, default)`` is a row of ``d`` or the default.
+                receiver = parents(data, "operand")[0]
+                settle(scalar, node_id, join([
+                    element.get(receiver),
+                    scalar.get(parents(data, "arg:1")[0]),
+                ]))
                 continue
             if is_collection(node_id) and not op.startswith("indexed"):
+                # Program: ``for y in [x * n for x in xs]: t += y``.  Wrong
+                # record: an unrolled comprehension (``sequence_materialization``)
+                # holds its elements as ``arg0``..``argN``, not ``elts``, so its
+                # element type was never joined, the loop target fell to the
+                # float64 default, and C summed int rows through float64
+                # (6 * (2**55 + 1) came back rounded).  Rule: an unrolled
+                # comprehension's members are its ``arg`` parents.
                 members = (
                     parents(data, "values") if isinstance(expression, ast.Dict)
                     or attributes.get("aggregate_kind") == "dict"
+                    else parents(data, "arg")
+                    if attributes.get("producer_kind") == "sequence_materialization"
                     else parents(data, "elts")
                 )
                 writers = [scalar.get(member) for member in members]
@@ -2229,6 +2354,12 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                             scalar.get(value)
                             for value in parents(child_data, "value")
                         )
+                if node_id in (assumed_elements or {}):
+                    if observed_writers is not None:
+                        observed_writers[node_id] = (
+                            join(writers) if writers else None
+                        )
+                    continue
                 if writers:
                     settle(element, node_id, join(writers))
                 continue

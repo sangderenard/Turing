@@ -1,3 +1,56 @@
+2026-10-23 LANE E, E15-E17 (MEASURED, cloud): Fortran emits a callee that
+returns an optional value (c308), states a populated list literal (c293,
+c309; C is silently wrong on c309 at main 2806360d, fixed earlier in this
+PR), and runs pop(i)/del xs[i] on a fixed list (c142, c177, c350: the
+capacity cell was listed as an array argument). At 86b8314d (226
+programs): C 226/226, LLVM 226/226, Fortran 156 PASS. Gate names identical
+to main 08ba0171. Fuzz seed 53 llvm,fortran: 0 WRONG / 0 TYPE.
+
+2026-10-23 LANE E, E12-E14 (MEASURED, cloud): LLVM reads a callee's view of a
+caller list (a load from a span formal), projects an optional tuple's
+presence flags (interleaved output positions/slots), and reads a heap
+arena's element dtype in a loop target. At c8452ec5 (223 programs): C
+223/223, LLVM 223/223 (0 refused), Fortran 135 PASS. Gate names identical
+to main 08ba0171. Fuzz seed 52 llvm,fortran: 0 WRONG / 0 TYPE.
+
+2026-10-23 LANE E, E11 (MEASURED, cloud): a dict accumulating into itself
+through get (d[k] = d.get(k, 0) + x) had float64 rows; C rounded large
+ints silently on main (c304). The planner now accepts a consistent typing
+of that cycle. At b40bcf78 (220 programs): C 220/220, LLVM 210 / 0 WRONG /
+10 refused, Fortran 135 PASS. Gate names identical to main 08ba0171. Fuzz
+seed 48 llvm,fortran: 0 WRONG / 0 TYPE.
+
+2026-10-23 LANE E, E8-E10 (MEASURED, cloud): Fortran rank-0 span formals
+are cells, a load is not folded past a write (callee swap), a callee list
+whose sequence id collides with root's gets its capacity (c303, Fortran
+silent on main). dict.get defaults keep their int type (c302, C and LLVM
+silent on main). HAZARD: an append's "full" status is never read in any
+backend, so a wrong capacity is silent. At a005af88 (219 programs): C
+219/219, LLVM 208 / 0 WRONG / 11 refused, Fortran 135 PASS / 1 WRONG (c22).
+Gate names same as main 08ba0171 after the binding-shape test update. Fuzz
+seed 47 llvm,fortran: 0 WRONG / 0 TYPE.
+
+2026-10-23 LANE E, LOOP TARGETS AND FORTRAN LIST REDUCTIONS (MEASURED,
+cloud): E6, loop targets over an unrolled comprehension or zip were typed
+float64 (C silently rounded big ints, c295-c296); the typed check now
+compares integer answers exactly. E7, Fortran max/min/sum/any/all over a
+resident list reduce over its live length (were COMPILE-FAIL, c297-c299).
+HAZARD: a Linux libgfortran.a is not PIC, so any Fortran library with
+`error stop` fails to link in the cloud container with the default static
+runtime; use TYPED_CHECK_FORTRAN_STANDALONE=0 / FUZZ_FORTRAN_STANDALONE=0.
+At d43227df (215 programs): C 215/215, LLVM 204 PASS / 0 WRONG / 11
+refused, Fortran 126 PASS / 1 WRONG (c22). Gate names identical to main 08ba0171.
+Fuzz seeds 44 (llvm) and 45 (llvm,fortran) FUZZ_EXT=3: 0 WRONG / 0 TYPE.
+Doc 37 E6/E7.
+
+2026-10-23 LANE E, LIST SLICES (MEASURED, cloud): on main, list slices were
+silently wrong in C (a folded slice had no row writer; a runtime slice had
+no lowering), and sum of a folded list reduced one element (an operand
+occurrence kept the provisional shape). Fixed at the writers, doc 37 E5,
+corpus c290-c294. append_slice arithmetic is int64 (LLVM +10 programs).
+Gate at f0c046b8: names identical to main 08ba0171. Fuzz seed 43
+FUZZ_EXT=3 llvm: 0 WRONG / 0 TYPE.
+
 2026-10-23 SILENT LANE: FULL IS LOUD, DICT GET (MEASURED): doc 36 sections
 15-16. A FIXED append/add/insert/slice/prepend/pack that finds no room now
 raises validation error 75 (only the DYNAMIC insert step still reports

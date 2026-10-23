@@ -176,3 +176,405 @@ and c212 from refused to PASS, so LLVM is 171 PASS and 24 refused.
   C returns the list unswapped (n=0 gives 105, want 150). Without the
   comprehension, or without the `sum`, it passes. It was handed to the
   silent wrong answers lane.
+
+## E4 in part: slice concatenation is int64 (LLVM)
+
+- **Program:** `xs = [1, 2] + [n, 8]; return xs[2]` (c264), and nine
+  other concatenations (c166, c173, c210, c218, c262, c263, c273, c281,
+  c282).
+- **Wrong record:** `lower_sequence_append_slice` minted its bounds,
+  lengths and indices as `int`. Scalar settlement widened each `Add` to
+  int64 and left the Phis at `int`, so LLVM refused an i32 Phi with i64
+  incoming. The helper also loaded the int64 length cells as `int`.
+- **Rule:** slice arithmetic has the width of the length cell, int64, like
+  `insert_at`. Its status stays `int`. The caller's bounds and its
+  absent-bound constants are int64 too.
+
+## E5: list slices (C, silent on main)
+
+These were found while writing a corpus program for the item above. On
+main `d8d41cb6`, each of c290-c294 gives a wrong answer in C, with no
+refusal.
+
+1. **Folded slice.**
+   - Program: `xs = [3, 1, 4, 1, 5]; ys = xs[:3]; return ys[n % 3]`.
+   - Wrong record: structural specialization folded `xs[:3]` to the
+     Constant `[3, 1, 4]`, with no parents and no leaves. Nothing wrote its
+     arena, so the reset left length 0 and every row read gave 0.
+     `xs[-4:-1] + [n, 9]` copied zero rows from it.
+   - Rule: a folded slice's rows are its literal. It is initialized like a
+     compile-time table (`literal_rows=`, under the duplicates policy).
+2. **Runtime slice.**
+   - Program: `xs = [3, n, 4]; ys = xs[:2]; return ys[1]`.
+   - Wrong record: the slice declared its own arena, but no operation
+     filled it (0.0 for n).
+   - Rule: `dst = src[lower:upper]` is the sequence mutation `slice`.
+     It resets `dst`, then appends the clipped rows of `src` with the
+     existing `append_slice` helper. Its capacity is the snapshot bound:
+     the source's bound plus its own straight-line appends. A stepped slice
+     is not admitted, and stays on its old path.
+3. **`sum` of a folded list.**
+   - Program: `xs = [3, 1, 4, 7]; return sum(xs) + n`.
+   - Wrong record: the list's Const result settled to int64 `(4,)`. The
+     `sum` operand is another occurrence of the same identity, and it kept
+     the provisional `()`, so C reduced one element (7 for 19). The
+     concordance audit reported it as a finding.
+   - Rule: a published type belongs to the identity. Every occurrence in
+     the function that carried the previous type takes the new one
+     (`publish_ssa_value_type`).
+
+The corpus adds c290 to c294. The fuzzer's EXTENDED3 pool adds four
+slice snippets and a sum of a folded list.
+
+### Receipts for E4 (in part) and E5
+
+- Census before the rebase onto main (195 programs, without c290-c294):
+  C 195/195. LLVM 181 PASS, 0 WRONG, 14 refused (it was 171 and 24).
+  Fortran unchanged: 103 PASS, 1 WRONG (c22).
+- c290-c294: WRONG in C at main `d8d41cb6`, and PASS in C and LLVM here.
+- Gate at `f0c046b8` (rebased onto main `08ba0171`): aa 89 / ab 7 /
+  ac 26 / rec 20. The failure names in every part are the same as main's,
+  with both run in this container.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm`, seed 43 (40 programs, with the
+  new slice snippets): 30 PASS, 6 LLVM-LOUD, 4 LOUD, 0 WRONG and 0 TYPE.
+  All four LOUD programs are also LOUD on main.
+- Census at the rebased head `3668d968` (210 programs): C 210/210, LLVM
+  196 PASS, 0 WRONG, 0 crashes and 14 refused.
+
+## E6: loop targets over a comprehension or `zip` (C silent on main, LLVM refused)
+
+- **Program:** `for y in [x * n for x in xs]: t += y` (c295, c265) and
+  `for p, q in zip(xs, ys): t += p * 3 + q` (c296, c171, c172).
+- **Wrong record:** the planner's scalar proof table
+  (`glsl_deployment_strategy._planned_scalar_dtypes`) never typed these
+  loop targets, so they fell to the float64 domain default.
+  - An unrolled comprehension (`sequence_materialization`) holds its
+    elements as `arg0`..`argN`, not `elts`, so its element type was never
+    joined.
+  - A tuple target has no single name.
+  - C then added int rows through float64. With n = 2**55 + 1, c295 returns
+    216172782113783808 where 216172782113783814 is right. LLVM refused the
+    i64/double Phi.
+- **Why the corpus did not catch it:** the typed check compared integer
+  answers with a relative 1e-12 tolerance, and that tolerance hid the
+  rounding. An integer answer is now compared exactly
+  (`tools/native_corpus_typed_check.py`).
+- **Rule:** an unrolled comprehension's members are its `arg` parents. The
+  i-th name of a tuple target over `zip(a, b, ...)` is an element of the
+  i-th argument.
+- c295 and c296 are WRONG at main `08ba0171` and pass in C and LLVM here.
+  c265, c171 and c172 move from LLVM refused to PASS.
+
+### Receipts for E6
+
+- Census at `ca7c606c` (212 programs): C 212/212. LLVM 201 PASS, 0 WRONG,
+  11 refused. Fortran (static runtime link) 111 PASS, 1 WRONG (c22).
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm`, seed 44 (40 programs, with the
+  comprehension and `zip` snippets): 33 PASS, 3 LLVM-LOUD, 3 LOUD,
+  1 CRASH, 0 WRONG and 0 TYPE. p44_13 (CRASH, an LLVM emission-artifact
+  cell) and the LOUD and LLVM-LOUD programs behave the same on main, except
+  p44_30: it is a C WRONG on main (305 for 302) and an LLVM refusal here.
+- The gate for E6 is the E7 gate below (`d43227df` contains E6).
+
+## E7: Fortran reductions over a resident list (COMPILE-FAIL on main)
+
+- **Program:** `xs = [n, 7, -2, n * 2]; max(xs) * 100 + min(xs)` (c150),
+  float `sum`/`max`/`min` (c154), `sum(xs, n)` after an append (c297,
+  c298), `any(xs)`/`all(xs)` (c299), and `any([x > n for x in xs])`
+  (c240).
+- **Wrong record:**
+  - The arena operand of a reduction over a resident sequence has a
+    shapeless SSA occurrence. The Fortran emitter took the
+    scalar-identity path and wrote `t9 = t6`, which gfortran refuses
+    (ranks 0 and 1).
+  - `any`/`all` with a float64 result passed the mask through `_numeric`,
+    so ANY/ALL got a REAL argument, which gfortran refuses.
+- **Rule:** `max`/`min`/`sum`/`any`/`all` over a resident sequence of
+  scalar rows reduce over its live length, read from the length cell
+  (the formal whose `sequence_length_for` names the arena), left to right
+  as Python and the C emitter do. `max`/`min` of no rows stop with error
+  74 (the C runtime's code) and never read a row. A NaN row propagates.
+  `any`/`all` take a mask (a number's truth is `/= 0`), and their LOGICAL
+  result is converted where it is assigned.
+- Every one of these was loud on main (COMPILE-FAIL or EMIT-INCOMPLETE),
+  never wrong.
+
+### Linking the Fortran runtime in a Linux container
+
+The Fortran artifact links libgfortran statically by default. A Linux
+libgfortran.a is not position independent, so a library that needs the
+runtime (any `error stop`) cannot be linked into a shared object here. That
+showed up as COMPILE-FAIL for list programs that are otherwise right (c135,
+c137, c138, c176, c266, c267, c268, c278, c279). The typed check now takes
+`TYPED_CHECK_FORTRAN_STANDALONE=0` and the fuzzer `FUZZ_FORTRAN_STANDALONE=0`
+to link it dynamically. The emitted program is the same, and the default is
+unchanged (static, which is what Windows uses).
+
+### Receipts for E7
+
+- Census at `d43227df` (215 programs, `TYPED_CHECK_FORTRAN_STANDALONE=0`):
+  C 215/215. LLVM 204 PASS, 0 WRONG, 11 refused. Fortran 126 PASS,
+  1 WRONG (c22, the sine table), 4 RUN-FAIL (c142, c177, c188, c197: a
+  dynamic extent of an internal array is asked of the caller), 5
+  COMPILE-FAIL (c185, c187, c191, c192: a callee's list formal is passed
+  as a scalar or assigned rank 0; c64: a dict value passed REAL to
+  INTEGER), 3 EMIT-FAIL and 76 EMIT-INCOMPLETE.
+- c297-c299 pass in C, LLVM and Fortran here. On main `08ba0171` c297 is
+  EMIT-INCOMPLETE, c298 and c299 COMPILE-FAIL in Fortran.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 45 (40 programs, with the reduction snippets): 15 PASS,
+  20 FORTRAN-LOUD (18 `Alloca`, heap growth has no Fortran emission;
+  2 `NoneValue`), 2 LLVM-LOUD, 3 LOUD, 0 WRONG and 0 TYPE.
+- Gate at `d43227df` (covers E6 and E7), on a clean worktree: aa 89 /
+  ab 7 / ac 26 / rec 20. The failure names in every part are the same as
+  main `08ba0171`'s, with both run in this container.
+
+## E8: a scalar span formal, and a load folded past a write (Fortran)
+
+- **Program:** `a = outer(xs)` where `outer` returns `xs[0]` after a nested
+  callee stores into `xs` (c185, c191, c192, c301), and a callee swap
+  `t = xs[0]; xs[0] = xs[1]; xs[1] = t` (c187, c300).
+- **Wrong record:**
+  - A call result reaches a planned region as a formal with
+    `program_abi_storage: span` and `program_abi_rank: 0`. The Fortran
+    array-contract analysis (the emitter and `call_array_argument_ids`)
+    took every span formal as an array, so the caller declared `t3(extent)`
+    beside a callee that writes a scalar `t3`. gfortran refused it (rank
+    mismatch).
+  - Once that compiled, the swap was silently wrong: the read of `xs[0]`
+    was a one-use `Load`, folded into its consumer, a call placed after the
+    call that writes `xs[0]`. So `t` read the new row.
+- **Rule:** a span formal with an explicit rank of zero is one cell, as the
+  LLVM and C emitters already read it (`_declared_span_rank`). A span
+  whose rank is unstated keeps the array reading. `call_array_argument_ids`
+  takes a `span_formal_is_array` predicate, and only Fortran passes one, so
+  C is unchanged. A load is not folded past a store or a call.
+
+## E9: a `dict.get` default keeps its literal's type (C and LLVM silent on main)
+
+- **Program:** `cells.get(5, 36028797018963969)` over int values (c302),
+  and `cells.get(2, 9)` (c64).
+- **Wrong record:** `fortran_c_shell` minted every lookup default as
+  `float(literal)`. The int64 Const therefore carried `36028797018963968.0`,
+  and C and LLVM returned 36028797018963990 where 36028797018963991 is
+  right. In Fortran the payload was REAL(8) passed to an INTEGER(8)
+  formal, which gfortran refused (c64).
+- **Rule:** the default keeps the authored literal's own type.
+- c302 is WRONG in C and LLVM at main `08ba0171` and passes here. c178's
+  LLVM refusal (an i64 Phi with a double incoming) is not this record and
+  is still open.
+
+## E10: a callee list whose sequence id collides with the entry's (Fortran silent on main)
+
+- **Program:** `grow(x)` builds `xs = [7, 5]; xs.append(x)` and `root` has
+  its own list. Both are sequence 3 (fuzz seed 46 p46_21, corpus c303).
+- **Wrong record:** the Fortran runtime bindings skipped a linked callee
+  sequence whose id collides with one of the entry's own. Its hoisted
+  capacity cell stayed 0, every append reported "full" into a status
+  nobody reads, and the callee summed zeros. c303 returns 2 for 39 at
+  main.
+- **Rule:** every linked sequence's capacity is published. A binding
+  carries its own column shapes, so the runtime never looks its descriptor
+  up by a sequence id that two functions share. The sequence-table
+  metadata is unchanged (it still lists one descriptor per id).
+- **Hazard, not fixed here:** a "full" append status is written and never
+  read, in every backend. A capacity that is wrong for any other reason is
+  silent too.
+
+### Receipts for E8-E10
+
+- Census at `d0801217` (E8, 217 programs, dynamic Fortran runtime): C
+  217/217, LLVM 206 PASS / 0 WRONG / 11 refused, Fortran 133 PASS.
+- Fuzz seed 46 (`llvm,fortran`) at `d0801217` found p46_21, the E10
+  record (Fortran WRONG; FORTRAN-LOUD at main only because another term
+  of the same program did not compile there).
+- Census at `a005af88` (219 programs, dynamic Fortran runtime): C
+  219/219. LLVM 208 PASS, 0 WRONG, 11 refused. Fortran 135 PASS, 1 WRONG
+  (c22), 3 RUN-FAIL (c142, c177, c197: a dynamic extent of an internal
+  array is asked of the caller), 0 COMPILE-FAIL, 3 EMIT-FAIL and 77
+  EMIT-INCOMPLETE (c302 is a new `Alloca` refusal).
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 47 at `a005af88`: 14 PASS, 23 FORTRAN-LOUD, 3 LLVM-LOUD, 0 WRONG
+  and 0 TYPE.
+- Gate at `a005af88`, on a clean worktree: aa 89 / ab 8 / ac 26 / rec 21.
+  aa and ac have the same failure names as main `08ba0171`. ab and rec
+  each had one extra failure,
+  `test_ir_sequence_tables.py::test_sequence_return_surface_correlates_output_with_storage_descriptor`,
+  which pins the exact runtime-binding mapping. A binding now carries
+  `column_shapes` (E10), so the expectation adds `"column_shapes": [[]]`.
+  With that, the test passes; every other name matches main.
+
+## E11: a dict that accumulates into itself through `get` (C silent on main, LLVM refused)
+
+- **Program:** `d = {}; for i in range(n): d[i % 3] = d.get(i % 3, 0) +
+  36028797018963969`, then a membership loop sums `d[k]` (c304, c178).
+- **Wrong record:** the planner's scalar proof table types a collection's
+  rows as the join of its writers. Here the writer reads `d.get`, and
+  `d.get` reads the rows: a cycle that the pessimistic fixpoint never
+  closes. So the rows fell to the float64 default, C added 2**55 + 1
+  through float64 (c304 returns ...968 for ...969), and LLVM refused the
+  i64/double Phi (c178). `get` had no rule at all, and a loop that carries
+  a store yielded no element type.
+- **Rule:**
+  - `d.get(k, default)` is the join of `d`'s rows and the default.
+  - A loop whose carried value is a store yields the stored collection's
+    rows.
+  - For a dict whose rows are unproven and that is read by `get` with a
+    typed default, the planner assumes the default's type. It accepts the
+    assumption only if, under it, the dict's writers join to exactly that
+    type (a consistent typing of the cycle). Otherwise it assumes nothing.
+- c304 is WRONG in C at main `08ba0171` and passes in C and LLVM here.
+  c178 moves from LLVM refused to PASS.
+- **Found beside it, not fixed here (handed to the silent lane):**
+  `d[i % 2] = d.get(i % 2, 0) + 5` in a loop, then `return d[0] + len(d)`,
+  returns 7 for 12 at n = 3, on main too. The audit reports that the
+  post-loop `d[0]` read takes a value defined in the loop body.
+
+### Receipts for E11
+
+- Census at `b40bcf78` (220 programs, dynamic Fortran runtime): C
+  220/220. LLVM 210 PASS, 0 WRONG, 10 refused. Fortran 135 PASS, 1 WRONG
+  (c22), 3 RUN-FAIL, 0 COMPILE-FAIL.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 48 (with the accumulating-dict snippet): 19 PASS, 15 FORTRAN-LOUD,
+  3 LLVM-LOUD, 3 LOUD, 0 WRONG and 0 TYPE.
+- Gate at `b40bcf78` (covers E5-E11), on a clean worktree: aa 89 / ab 7 /
+  ac 26 / rec 20. The failure names in every part are the same as main
+  `08ba0171`'s.
+
+## E12: a callee's view of a caller list (LLVM refused)
+
+- **Program:** `def size(xs): return len(xs) * 10 + xs[0]` called with a
+  list the caller grew (c188, c305). The same record covered c189, c190,
+  c192, c193 and c269.
+- **Wrong record:** the callee loads its list's length cell, a rank-1 span
+  formal, with no element address before the load. Only GEP results had a
+  span address in the LLVM emitter, so the load was refused ("address
+  value ... has no concorded span").
+- **Rule:** a load from a span formal itself (rank 1 or more, not a heap
+  pointer cell) reads its first element, the address a zero GEP gives.
+- c305 is refused by LLVM at main `08ba0171` and passes here.
+
+### Receipts for E12
+
+- Census at `77784c10` (221 programs, dynamic Fortran runtime): C
+  221/221. LLVM 217 PASS, 0 WRONG, 4 refused (c31, c32, c33: an optional
+  call's aggregate projection; c146: a heap load layout). Fortran 135 PASS,
+  1 WRONG (c22), 3 RUN-FAIL, 0 COMPILE-FAIL.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 49: 12 PASS, 26 FORTRAN-LOUD, 2 LLVM-LOUD, 0 WRONG and 0 TYPE.
+
+## E13: an optional tuple result's presence projections (LLVM refused)
+
+- **Program:** `fork = fork_of(row) if flag > 0 else None` with `fork_of`
+  returning `tuple[int, int] | None`, then `origin, stamp = fork` (c31,
+  c32, c33, c306).
+- **Wrong record:** `ssa_optional_values` interleaves each payload with
+  its presence flag (four outputs for a pair) and rewrote the call's
+  `output_ids`. The call's `output_positions` and `output_slots` still
+  named the two payload slots, so the LLVM emitter knew aggregate members
+  0 and 1 only and refused the presence projections ("aggregate
+  projection 3 ... has no compile-time member").
+- **Rule:** an interleaved optional result restates its positions and
+  slots with its outputs. Both are the callee's result order.
+- c306 is refused by LLVM at main `08ba0171` and passes here. c31, c32 and
+  c33 move from refused to PASS. C reads the same attributes and is
+  unchanged in the census.
+
+### Receipts for E13
+
+- Census at `b27b3c3f` (222 programs, dynamic Fortran runtime): C
+  222/222. **LLVM 221 PASS, 0 WRONG, 1 refused** (c146, a heap load whose
+  result disagrees with its element layout). Fortran 135 PASS, 1 WRONG
+  (c22), 3 RUN-FAIL, 0 COMPILE-FAIL.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 51 (with the optional-pair snippet): 17 PASS, 22 FORTRAN-LOUD,
+  1 LOUD, 0 LLVM-LOUD, 0 WRONG and 0 TYPE.
+
+## E14: a loop target read from an owned heap arena (LLVM refused)
+
+- **Program:** `xs = []; for i in range(n): xs.append(i); if i % 2 == 1:
+  xs.pop(0)`, then `for x in xs: total = total * 10 + x` (c146; c307 is
+  a companion that also passes at main).
+- **Wrong record:** the loop target's Load from the owned heap arena kept
+  a provisional declared `int` (i32). Scalar settlement keeps a Load's
+  declared width as a memory read (the rule for i32 status cells), though
+  the arena's rows are int64. LLVM refused the load ("heap load result
+  disagrees with its declared element layout").
+- **Rule:** a Load through an element address of a heap arena reads the
+  arena's declared element dtype (`heap_element_dtype`). It is not a
+  declared-width load.
+- c146 is refused by LLVM at main `08ba0171` and passes here. **With E12
+  to E14, LLVM refuses no corpus program.**
+
+### Receipts for E14
+
+- Census at `c8452ec5` (223 programs, dynamic Fortran runtime): C
+  223/223. **LLVM 223/223 PASS**, 0 WRONG and 0 refused. Fortran 135 PASS,
+  1 WRONG (c22), 3 RUN-FAIL, 0 COMPILE-FAIL, 3 EMIT-FAIL and 81
+  EMIT-INCOMPLETE.
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 52 (with the pop-front snippet): 19 PASS, 19 FORTRAN-LOUD, 2 LOUD,
+  0 LLVM-LOUD, 0 WRONG and 0 TYPE.
+- Gate at `c8452ec5` (covers E5-E14), on a clean worktree: aa 89 / ab 7 /
+  ac 26 / rec 20. The failure names in every part are the same as main
+  `08ba0171`'s.
+
+## E15: a callee that returns an optional value (Fortran refused)
+
+- **Program:** `def maybe_twice(x, y): return x * 2 if x != y else None`,
+  then `o = maybe_twice(n, 2); if o is not None: t = o - 2` (c308).
+- **Wrong record:** the callee's `None` arm is a `NoneValue` that nothing
+  reads once the optional is interleaved, and the callee's single `Ret`
+  carries payload and presence while its declared outputs named only the
+  payload. Fortran refused the `NoneValue` ("no Fortran intrinsic or
+  expression is registered") and would have dropped the presence output.
+- **Rule:** an unread `NoneValue` that is no output emits nothing. When a
+  function's one `Ret` extends its declared outputs and contains all of
+  them, the `Ret` operands are its outputs.
+- c308 is refused by Fortran at main and passes here.
+
+## E16: a populated list literal (Fortran refused)
+
+- **Program:** `sum([4, 6, 1]) + n`, `max([2.5, x, -1.0])` (c309, c293).
+- **Wrong record:** a `Const` whose payload is a flat list and whose
+  declared shape is its own length reached the scalar literal path and
+  was refused ("cannot express literal [4, 6, 1]").
+- **Rule:** such a `Const` is a rank-1 array constant, written element by
+  element in the declared kind. Any other shape still refuses.
+- c293 and c309 now pass in Fortran. c271 and c272 move on to the Alloca
+  refusal. At main `2806360d`, C is **silently wrong** on c309 (`sum` of
+  the literal returns its first element, 604.5 for 1304.5); the folded-list
+  rule from earlier in this PR (c293) already fixes that here.
+
+## E17: pop(i) and del xs[i] on a fixed list (Fortran failed to run)
+
+- **Program:** `xs = [5, n, 2]; xs.pop(0)` (c142), `del xs[i]` (c177),
+  and c350.
+- **Wrong record:** `delete_at`, `insert_at` and `reverse` listed every
+  storage formal as an array argument, including the scalar capacity
+  cell. Fortran gave the caller's capacity a shape-dynamic extent that
+  nothing supplies, and the run stopped with "shape-dynamic Fortran
+  extents require explicit positive extent_overrides".
+- **Rule:** a positional sequence helper's array arguments are its storage
+  formals except the capacity cell (as `allocate` already did), in
+  `ir_sequence_tables._storage_array_ids`.
+- c142, c177 and c350 pass in Fortran. c197 still fails to run: the
+  callee's bool list carries live flags that the caller's list lacks
+  (open).
+
+### Receipts for E15-E17
+
+- Census at `86b8314d` (226 programs, dynamic Fortran runtime): C
+  226/226. LLVM 226/226 PASS. **Fortran 156 PASS** (135 at `c8452ec5`),
+  1 WRONG (c22, the `sin` table), 1 RUN-FAIL (c197), 0 COMPILE-FAIL, 0
+  EMIT-FAIL and 68 EMIT-INCOMPLETE (Alloca heap growth).
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 53 (with the optional-scalar, list-literal and pop/del snippets): 25
+  PASS, 14 FORTRAN-LOUD, 1 LLVM-LOUD, 0 WRONG and 0 TYPE. The LLVM-LOUD is
+  p53_17 (`enumerate` over a list beside a callee loop: "phi physical
+  element i64 disagrees with incoming"); it is loud at main `2806360d` too
+  (open).
+- Gate at `86b8314d` (covers E5-E17), on a clean worktree: aa 89 / ab 7 /
+  ac 26 / rec 20. The failure names in every part are the same as main
+  `08ba0171`'s (main has since moved to `2806360d`, a docs-only change).

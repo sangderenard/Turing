@@ -3335,6 +3335,34 @@ def _emit_repository_call_module(
                     # preceding GEP would discard that proven address and
                     # leave direct length/status loads unrenderable.
                     addressed = pointer(address_argument)
+                formal_index = formal_positions.get(int(address_argument.id))
+                declared_formal = (
+                    None if formal_index is None
+                    else function.args[formal_index]
+                )
+                if (
+                    addressed is None
+                    and declared_formal is not None
+                    and str((declared_formal.accounting or {}).get(
+                        "program_abi_storage"
+                    )) == "span"
+                    and _declared_span_rank(declared_formal) > 0
+                    and (declared_formal.accounting or {}).get(
+                        "heap_element_dtype"
+                    ) is None
+                ):
+                    # Program: ``def size(xs): return len(xs) * 10 + xs[0]``
+                    # called with a grown caller list (corpus c188).  Wrong
+                    # record: the callee loads its list's length cell, a
+                    # rank-1 span formal, with no element address before it,
+                    # and only GEP results had a span address, so the load
+                    # was refused.  Rule: a load from a span formal itself
+                    # reads its first element, the address a zero GEP gives.
+                    addressed = pointer(address_argument)
+                    span_address_types.setdefault(
+                        int(address_argument.id),
+                        _value_llvm_type(declared_formal),
+                    )
                 if addressed is not None:
                     loaded_type = _value_llvm_type(result)
                     heap_address = int(address_argument.id) in owned_heap_addresses

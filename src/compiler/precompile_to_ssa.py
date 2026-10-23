@@ -1226,6 +1226,7 @@ def resolve_sequence_schemas(
                 "duplicates"
                 if str(policy).startswith((
                     "fill=", "literal_bytes=", "literal_glyphs=",
+                    "literal_rows=",
                 ))
                 else "unique"
                 if str(policy).startswith("literal_table=")
@@ -3338,6 +3339,7 @@ class _ControlSSABuilder(TiledObject):
                 "duplicates"
                 if str(policy).startswith((
                     "fill=", "literal_bytes=", "literal_glyphs=",
+                    "literal_rows=",
                 ))
                 else "unique"
                 if str(policy).startswith("literal_table=")
@@ -3360,7 +3362,7 @@ class _ControlSSABuilder(TiledObject):
             elif str(policy).startswith("literal_glyphs="):
                 element_dtype = "int64"
             column_dtypes = None
-            if str(policy).startswith("literal_table="):
+            if str(policy).startswith(("literal_table=", "literal_rows=")):
                 literal_table_rows = tuple(ast.literal_eval(
                     str(policy).split("=", 1)[1]
                 ))
@@ -3451,7 +3453,10 @@ class _ControlSSABuilder(TiledObject):
                     [self.constant_value(len(glyphs), length_cell), length_address],
                     attributes={"binding": "ssa_sequence_literal_glyph_length"},
                 )
-            elif str(policy).startswith("literal_table="):
+            elif str(policy).startswith(("literal_table=", "literal_rows=")):
+                # ``literal_rows=`` is the duplicates-policy twin of a
+                # compile-time table: a list whose rows are proven literals
+                # with no other writer (a folded slice, see fortran_c_shell).
                 rows = literal_table_rows or ()
                 if any(len(tuple(row)) != len(descriptor.column_value_ids)
                        for row in rows):
@@ -4821,6 +4826,7 @@ class _ControlSSABuilder(TiledObject):
     def _emit_sequence_append_slice(
         self, destination_id: int, source_id: int,
         lower_id: int | None, upper_id: int | None,
+        *, lower_literal: int | None = None, upper_literal: int | None = None,
     ) -> None:
         self.ensure_plan_callsite_result(
             int(source_id), location=f"{self.function_name}.append_slice"
@@ -4901,23 +4907,26 @@ class _ControlSSABuilder(TiledObject):
         source_cell = self._sequence_contract_cell(int(source_id))
         if lower_id is None:
             lower_value = self.fresh_value(
-                dtype="int", transform=CONTROL_CONST, operands=(source_cell,),
+                dtype="int64", transform=CONTROL_CONST, operands=(source_cell,),
             )
             self.emit(
-                Handler.Const, [], lower_value, attributes={"value": 0}
+                Handler.Const, [], lower_value, attributes={
+                    "value": 0 if lower_literal is None else int(lower_literal)
+                },
             )
         else:
-            lower_value = self.external_value(int(lower_id), dtype="int")
+            lower_value = self.external_value(int(lower_id), dtype="int64")
         if upper_id is None:
             upper_value = self.fresh_value(
-                dtype="int", transform=CONTROL_CONST, operands=(source_cell,),
+                dtype="int64", transform=CONTROL_CONST, operands=(source_cell,),
             )
             self.emit(
                 Handler.Const, [], upper_value,
-                attributes={"value": 2 ** 31 - 1},
+                attributes={"value": 2 ** 31 - 1 if upper_literal is None
+                            else int(upper_literal)},
             )
         else:
-            upper_value = self.external_value(int(upper_id), dtype="int")
+            upper_value = self.external_value(int(upper_id), dtype="int64")
         status = self.fresh_value(
             dtype="int", transform=REGION_CALL_RESULT,
             operands=(*storage, lower_value, upper_value),
@@ -14071,6 +14080,37 @@ class _ControlSSABuilder(TiledObject):
     ) -> None:
         operation = str(mutation.operator)
         location = f"{path}.sequence_mutation[{mutation.effect_node_id}]"
+        if operation == "slice":
+            # ``dst = src[lower:upper]`` (resident_sequence_materialization.
+            # _source_sequence_slices): reset, then the clipped append.
+            source_id, *bound_ids = map(int, mutation.argument_value_ids)
+            _kind, *spellings = str(mutation.argument_kind).split(":")
+            if (
+                _kind != "slice" or len(spellings) != 2
+                or sum(item.startswith("v") for item in spellings)
+                != len(bound_ids)
+                or any(item[:1] not in {"", "v", "c"} for item in spellings)
+            ):
+                raise ValueError(
+                    f"{location}: slice bounds {bound_ids!r} do not match "
+                    f"{mutation.argument_kind!r}"
+                )
+            values = iter(bound_ids)
+            bounds = [
+                None if not item
+                else ("value", next(values)) if item.startswith("v")
+                else ("literal", int(item[1:]))
+                for item in spellings
+            ]
+            self._emit_sequence_reset(int(mutation.sequence_value_id))
+            self._emit_sequence_append_slice(
+                int(mutation.sequence_value_id), source_id,
+                *(bound[1] if bound and bound[0] == "value" else None
+                  for bound in bounds),
+                lower_literal=(bounds[0][1] if bounds[0] and bounds[0][0] == "literal" else None),
+                upper_literal=(bounds[1][1] if bounds[1] and bounds[1][0] == "literal" else None),
+            )
+            return
         if operation in {"sort", "sorted"} and mutation.source_contract_cell is None:
             raise ValueError(
                 f"{location}: native sort has no exact source contract"

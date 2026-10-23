@@ -1161,6 +1161,86 @@ def _source_sequence_snapshots(graph_obj: Any):
     return tuple(mutations)
 
 
+def _source_sequence_slices(graph_obj: Any):
+    """A unit-stride list slice is a new sequence filled from its source.
+
+    Program: ``xs = [3, n, 4]; ys = xs[:2]; return ys[1]``.  Wrong record:
+    the slice node declared its own arena but nothing wrote it, so ``ys[1]``
+    read an unwritten row (0.0 for n).  Rule: ``dst = src[lower:upper]`` is
+    the mutation ``slice``: reset ``dst``, then append the clipped rows of
+    ``src``.  ``argument_kind`` is ``slice:<lower>:<upper>``, each bound
+    empty (absent), ``v<id>`` (a value, also listed in the arguments) or
+    ``c<int>`` (a literal, as a folded ``slice`` selector carries it).  A
+    stepped or non-integer slice is not admitted here and stays loud.
+    """
+    from .control_source import ControlSequenceMutation
+
+    def value_id(node):
+        return int(graph_obj.nodes[node].get("value_id", node))
+
+    def literal_of(node):
+        data = graph_obj.nodes[node]
+        if str(data.get("type") or data.get("op")) not in {"Constant", "const"}:
+            return False, None
+        return True, (data.get("attributes") or {}).get("value")
+
+    def integer_or_none(value):
+        return value is None or (isinstance(value, int) and not isinstance(value, bool))
+
+    mutations = []
+    for node_id, data in graph_obj.nodes(data=True):
+        attrs = data.get("attributes") or {}
+        if (attrs.get("aggregate_kind") != "list"
+                or attrs.get("producer_kind") != "sequence_slice"):
+            continue
+        roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        source, selector = roles.get("base"), roles.get("index")
+        if source is None or selector is None or source not in graph_obj or selector not in graph_obj:
+            continue
+        if (graph_obj.nodes[source].get("attributes") or {}).get("aggregate_kind") != "list":
+            continue
+        selector_data = graph_obj.nodes[selector]
+        folded, selector_literal = literal_of(selector)
+        arguments, spellings = [value_id(source)], []
+        if folded:
+            if not (isinstance(selector_literal, slice) and selector_literal.step is None
+                    and integer_or_none(selector_literal.start)
+                    and integer_or_none(selector_literal.stop)):
+                continue
+            spellings = ["" if bound is None else f"c{int(bound)}"
+                         for bound in (selector_literal.start, selector_literal.stop)]
+        else:
+            if str(selector_data.get("type") or selector_data.get("op")) != "Slice":
+                continue
+            bounds = {str(role): int(parent) for parent, role in selector_data.get("parents") or ()}
+            if set(bounds) - {"lower", "upper", "step"}:
+                continue
+            if "step" in bounds and literal_of(bounds["step"]) != (True, None):
+                continue
+            for role in ("lower", "upper"):
+                if role not in bounds:
+                    spellings.append("")
+                    continue
+                is_literal, literal = literal_of(bounds[role])
+                if is_literal and not integer_or_none(literal):
+                    break
+                if is_literal:
+                    spellings.append("" if literal is None else f"c{int(literal)}")
+                else:
+                    arguments.append(value_id(bounds[role]))
+                    spellings.append(f"v{value_id(bounds[role])}")
+            else:
+                pass
+            if len(spellings) != 2:
+                continue
+        mutations.append(ControlSequenceMutation(
+            value_id(node_id), "slice", tuple(arguments),
+            int(node_id), policy="duplicates",
+            argument_kind="slice:" + ":".join(spellings),
+        ))
+    return tuple(mutations)
+
+
 def _source_mapping_mutations(graph_obj: Any):
     """Retain copies and writes to graph-owned dictionary materializers."""
     from .control_source import ControlSequenceMutation
@@ -1879,7 +1959,10 @@ def _static_sequence_capacity_survey(
     # snapshot's bound is its source's plus its own straight-line appends;
     # any other growth leaves it unbounded (the dynamic contract), exactly
     # as a local list's.
-    snapshots = tuple(_source_sequence_snapshots(graph_obj))
+    # A slice holds at most its source's rows, so it takes the snapshot
+    # bound: its source's plus its own straight-line appends.
+    snapshots = (*_source_sequence_snapshots(graph_obj),
+                 *_source_sequence_slices(graph_obj))
     snapshot_effects = {int(mutation.effect_node_id) for mutation in snapshots}
     snapshot_ids = {int(mutation.sequence_value_id) for mutation in snapshots}
     snapshot_growth = {sequence_id: 0 for sequence_id in snapshot_ids}
@@ -2180,6 +2263,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
         ))
     mutations.extend(_source_mapping_mutations(graph_obj))
     mutations.extend(_source_sequence_snapshots(graph_obj))
+    mutations.extend(_source_sequence_slices(graph_obj))
     recorded_effect_ids = {
         int(mutation.effect_node_id) for mutation in mutations
     }

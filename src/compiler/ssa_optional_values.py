@@ -213,6 +213,17 @@ def _lower_record_covered_call(
         ),
         "ssa_optional_result": True,
     })
+    # Program: ``fork = fork_of(row) if flag > 0 else None`` with ``fork_of``
+    # returning ``tuple[int, int] | None`` (corpus c31-c33).  Wrong record:
+    # the interleaved outputs replaced ``output_ids`` but the call's
+    # ``output_positions``/``output_slots`` still named the two payload
+    # slots, so LLVM knew aggregate members 0 and 1 only and refused the
+    # presence projections 1 and 3.  Rule: an interleaved optional result
+    # restates its positions and slots with its outputs (both are the
+    # callee's result order).
+    for key in ("output_positions", "output_slots"):
+        if key in call.attributes:
+            call.attributes[key] = tuple(range(len(interleaved)))
     block.instrs[index + 1:index + 1] = projection
     presence = presences[0]
     payload = payloads[0][0].res
