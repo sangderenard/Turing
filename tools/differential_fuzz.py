@@ -241,6 +241,8 @@ EXTENDED3 = [
     (["xs{v} = [{a}, n, {b}]", "ys{v} = [k{v} * x{v} for k{v}, x{v} in enumerate(xs{v})]", "zs{v} = [p{v} * q{v} for p{v}, q{v} in zip(xs{v}, ys{v})]"], "sum(ys{v}) + sum(zs{v})"),
     # enumerate counting from a start (lane E)
     (["t{v} = 0", "for k{v}, x{v} in enumerate([{a}, n, {b}], n % 4 + {c}):", "    t{v} = t{v} * 10 + k{v} * x{v}"], "t{v}"),
+    # a callee filters a list literal in its loop, so it keeps live flags (c197)
+    ([], "positives([{a}, -{b}, {c}]) * 10 + n"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
@@ -289,6 +291,14 @@ def maybe_pair(x: int, y: int) -> tuple[int, int] | None:
 
 def maybe_twice(x: int, y: int):
     return x * 2 if x != y else None
+
+
+def positives(xs: list[int]) -> int:
+    t = 0
+    for x in xs:
+        if x > 0:
+            t += x
+    return t
 
 
 def branchpair(x: int) -> int:
