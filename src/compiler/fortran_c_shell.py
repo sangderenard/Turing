@@ -47480,7 +47480,21 @@ def _class_surface_ssa_program(
                         # private map.  Ask the shared page which kind can
                         # actually materialize it; otherwise one callsite
                         # restores the slot and another refuses the call.
-                        try:
+                        #
+                        # Lane D, item D3. Wrong record: this call sat in an
+                        # ``except Exception: pass``.  A literal binding
+                        # (``default_literal``, ``caller_literal``) carries
+                        # its value as its source -- ``[1, 2]``, ``'v='``,
+                        # or an int -- so ``int(source)`` raised for lists
+                        # and strings (c62, c271, c272), and an int literal
+                        # would have been looked up as a caller value id.
+                        # Rule: only a binding that names a caller slot asks
+                        # the page which kind materializes it; a literal is
+                        # never a slot, and the lookup itself is not
+                        # allowed to fail silently.
+                        if kind in {
+                            "caller_value", "caller_alias", "caller_storage"
+                        }:
                             from .identity_concordance import (
                                 current_identity_book,
                                 materializing_binding_kind,
@@ -47491,8 +47505,6 @@ def _class_surface_ssa_program(
                                 record.callee_symbol or callee.name,
                                 int(argument.id), int(source), kind,
                             )
-                        except Exception:
-                            pass
                         if kind in {
                             "caller_value", "caller_alias", "caller_storage"
                         }:
