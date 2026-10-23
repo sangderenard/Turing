@@ -259,6 +259,40 @@ def module_storage_requirements(
                     if not bounds.issubset(flag_shapes):
                         flag_shapes.update(bounds)
                         changed = True
+            # Program: ``count_true([True, False, True])`` where the callee
+            # loops ``for b in bs: if b: ...`` (c197; lane E).  Wrong
+            # record: the callee's list formal keeps live flags, its column
+            # was bounded to three rows, but the flags were bounded only by
+            # the static and comprehension bounds above, so the flag formal
+            # and the caller actual minted for it had no element count and
+            # the Fortran entry asked for an extent no feed can supply.
+            # Rule: a live-flag arena holds one flag per row of its
+            # sequence, so each bound on the first column's rows bounds it.
+            for descriptor in (
+                () if sequence_table is None
+                else sequence_table.sequences.values()
+            ):
+                if (
+                    descriptor.live_flags_value_id is None
+                    or not descriptor.column_value_ids
+                ):
+                    continue
+                row_rank = len(tuple(
+                    (descriptor.column_shapes or ((),))[0]
+                ))
+                bounds = {
+                    (shape[0],)
+                    for shape in shapes[caller_name].get(
+                        int(descriptor.column_value_ids[0]), ()
+                    )
+                    if len(shape) == row_rank + 1
+                }
+                flag_shapes = shapes[caller_name].setdefault(
+                    int(descriptor.live_flags_value_id), set()
+                )
+                if not bounds.issubset(flag_shapes):
+                    flag_shapes.update(bounds)
+                    changed = True
             for block in getattr(caller, "blocks", {}).values():
                 instructions = tuple(getattr(block, "instrs", ()))
                 for call in instructions:

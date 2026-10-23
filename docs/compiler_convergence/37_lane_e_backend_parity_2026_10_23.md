@@ -674,3 +674,36 @@ unchanged (static, which is what Windows uses).
 - Gate at `eeb508be` and at main `4a0f5452`, each on a clean worktree:
   aa 89 / ab 8 / ac 26 / rec 21 on both, with the same failure names in
   every part.
+
+## E21: a live-flag arena is bounded by its column's rows
+
+- **Program:** `count_true([True, False, True])` where the callee loops
+  `for b in bs: if b: c += 1` (c197), `positives([4, -2, 7, -9, 1])` with
+  `if x > 0` in its loop (c358), and two flag literals into one callee
+  (c359).
+- **Wrong record:** the callee's list formal keeps live flags. Storage
+  requirements bounded the flags only from the static and comprehension
+  capacity bounds, never from the column, which was bounded to the
+  literal's rows. So the flag formal, and the caller actual minted for it,
+  had no element count. The Fortran entry then asked for
+  `extent_dynamic_..._1`, an extent no feed can supply, and each run
+  refused (RUN-FAIL on all three programs at main `a67c8a9c`). C and LLVM
+  were not affected.
+- **Rule:** a live-flag arena holds one flag per row of its sequence, so
+  each bound on the first column's rows bounds it
+  (`ssa_storage_requirements.module_storage_requirements`). The call
+  binding then carries the bound to the caller's actual.
+
+### Receipts for E21
+
+- Census at `9e50732a` on main `a67c8a9c` (273 programs): C 271/273, LLVM
+  269/271, Fortran 184 PASS (c197, c358 and c359 included), 1 WRONG (c22,
+  by design), 0 RUN-FAIL, 86 EMIT-INCOMPLETE. The C and LLVM misses are
+  c334 and c335 (refused at lowering) and c337 and c338 (LLVM refuses a
+  phi type). Each does the same at main `a67c8a9c`.
+- Fuzz seed 58 (`FUZZ_EXT=3`, `llvm,fortran`, 30 programs, with the
+  `positives` snippet in two of them): 15 PASS, 14 FORTRAN-LOUD (Alloca),
+  1 LOUD, 0 WRONG and 0 TYPE.
+- Gate at `9e50732a` and at main `a67c8a9c`, each on a clean worktree:
+  aa 89 / ab 8 / ac 26 / rec 21 on both, with the same failure names in
+  every part.

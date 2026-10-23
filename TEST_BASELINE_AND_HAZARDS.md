@@ -1,3 +1,10 @@
+2026-10-23 LANE E, E21 (MEASURED, cloud): a live-flag arena is bounded by its
+column's rows, so Fortran runs a callee that filters a list literal (c197,
+c358, c359; RUN-FAIL "shape-dynamic Fortran extents" at main a67c8a9c). At
+9e50732a (273 programs): C 271/273, LLVM 269/271 (c334, c335, c337, c338 do
+the same on main), Fortran 184 PASS, 0 RUN-FAIL. Fuzz seed 58: 0 WRONG / 0 TYPE. Gate names identical
+to main a67c8a9c.
+
 2026-10-23 LANE E, E20 (MEASURED, cloud): `enumerate(xs, start)` counts from
 start (ControlProgram.induction_offsets; it was silently 0-based at main
 2806360d and refused since #805). At eeb508be on main 4a0f5452 (262
