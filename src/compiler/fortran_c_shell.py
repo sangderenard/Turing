@@ -16327,8 +16327,14 @@ def _record_sequence_projection_bindings(
 def _sequence_row_operations(
     graph_obj: Any,
     sequence_declarations: Iterable[tuple[int, str, int, bool]],
+    recorded_residents: Mapping[int, int] | None = None,
 ) -> tuple[tuple[Any, ...], ...]:
-    """Recover positional reads/writes of fixed-width sequence rows."""
+    """Recover positional reads/writes of fixed-width sequence rows.
+
+    ``recorded_residents`` are promoted arenas (``value -> resident``): the
+    exit port of a loop that rebinds a list names its initial arena, which
+    neither the name history nor the single-parent rule below re-derives.
+    """
 
     sequence_declarations = tuple(sequence_declarations)
     positional_sequences = {int(sequence_id) for sequence_id, policy, _width, _writable
@@ -16350,11 +16356,19 @@ def _sequence_row_operations(
         for value_id in history
     }
     resident_by_value.update({sequence_id: sequence_id for sequence_id in widths})
+    recorded = {
+        int(value_id): int(resident)
+        for value_id, resident in dict(recorded_residents or {}).items()
+        if int(resident) in widths
+    }
+    resident_by_value.update(recorded)
     changed = True
     aliases = _loop_carried_storage_aliases(graph_obj)
     while changed:
         changed = False
         for alias_id, source_id in aliases.items():
+            if int(alias_id) in recorded:
+                continue
             resident = resident_by_value.get(int(source_id))
             if resident is not None and resident_by_value.get(int(alias_id)) != resident:
                 resident_by_value[int(alias_id)] = resident
@@ -16378,6 +16392,8 @@ def _sequence_row_operations(
             if len(residents) == 1:
                 value_id = int(data.get("value_id", node_id))
                 resident = next(iter(residents))
+                if value_id in recorded:
+                    continue
                 if resident_by_value.get(value_id) != resident:
                     resident_by_value[value_id] = resident
                     changed = True
@@ -26813,7 +26829,10 @@ def _class_surface_ssa_program(
                         int(mutation.argument_value_ids[0]),
                     )
                     for mutation in control_mutations
-                    if str(mutation.operator) == "sorted"
+                    # A ``replace`` (a list rebound in a retained loop, corpus
+                    # c246) copies its source's rows into the destination,
+                    # so the destination holds as many rows as the source.
+                    if str(mutation.operator) in {"sorted", "replace"}
                     and mutation.argument_value_ids
                 ),
             ))
@@ -27247,7 +27266,12 @@ def _class_surface_ssa_program(
                     _sequence_inplace_bit_pack_call_ops(graph)
                 ),
                 sequence_row_operations=_sequence_row_operations(
-                    graph_obj, sequence_declarations
+                    graph_obj, sequence_declarations,
+                    {
+                        int(value_id): int(resident_id)
+                        for value_id, (resident_id, _kind)
+                        in conditional_sequence_aliases.items()
+                    },
                 ),
                 nested_row_projections=_nested_row_projection_ops(
                     graph_obj, control

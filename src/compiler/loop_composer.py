@@ -2080,9 +2080,15 @@ def materialize_retained_loop_ports(
             port_attributes["value_source_id"] = source_id
             port_tensor = copy.deepcopy(dict(source_data.get("tensor") or {}))
             source_attributes = source_data.get("attributes") or {}
+            # Program: ``xs = [7, 8]; for i in range(n): xs = [xs[1] + n,
+            # i]`` then ``return xs[0]`` (corpus c247).  Wrong record: the
+            # exit port copied the body display's leaf ledger, so the
+            # post-loop ``xs[0]`` folded to the body member and a loop that
+            # ran zero times returned it instead of 7 (silent).  Rule: the
+            # body's members are the port's members only on iterations
+            # that ran; the port keeps the kind, never the leaves.
             for key in (
-                "producer_kind", "aggregate_kind",
-                "aggregate_leaf_value_ids", "tensor_output_descriptors",
+                "producer_kind", "aggregate_kind", "tensor_output_descriptors",
             ):
                 if key in source_attributes:
                     port_attributes[key] = copy.deepcopy(source_attributes[key])

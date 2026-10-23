@@ -23262,6 +23262,18 @@ def _fold_callsite_structural_values(
         _loop_carried_initial_ids,
     )
     loop_carried_initial_ids = set(_loop_carried_initial_ids(graph.G))
+    # The UPDATED arm of a loop's carried binding is the body's value; after
+    # the loop the binding is the loop's exit value, which equals that body
+    # value only when the loop ran.  Its ledger proves no projection either.
+    loop_carried_updated_ids = {
+        int(updated)
+        for _loop_id, loop_data in graph.G.nodes(data=True)
+        for _initial, updated in (
+            (loop_data.get("attributes") or {}).get(
+                "loop_carried_bindings", {}
+            ) or {}
+        ).values()
+    }
 
     def constant(data: Mapping[str, Any]) -> Any:
         try:
@@ -24979,9 +24991,18 @@ def _fold_callsite_structural_values(
                     # already keeps out of ``known``), and neither is a
                     # mutated or carried base's initializer ledger; neither
                     # proves a projection.
+                    # Program: ``xs = [7, 8]; for i in range(n): xs =
+                    # [xs[1] + n, i]`` then ``return xs[0]`` (corpus c247).
+                    # Wrong record: the post-loop ``xs[0]`` (still an
+                    # Indexed of the body's display before loop ports
+                    # exist) folded to the body member, so a loop that ran
+                    # zero times returned that member, not 7 (silent).
+                    # Rule: a loop-carried updated value is not an
+                    # invariant either; its ledger proves no projection.
                     if (
                         index_ids[0] not in loop_carried_initial_ids
                         and base_ids[0] not in loop_carried_initial_ids
+                        and base_ids[0] not in loop_carried_updated_ids
                         and base_ids[0] not in mutated_sequence_ids
                         and base_attributes.get("producer_kind")
                         in {"aggregate", "aggregate_phi"}
