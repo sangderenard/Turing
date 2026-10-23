@@ -2567,6 +2567,19 @@ def _planned_scalar_dtypes_from(
             if op in REGION_PREDICATE_OPS or isinstance(expression, ast.Compare):
                 settle(scalar, node_id, "bool")
                 continue
+            # Lane D, D2 step 3.  Programs: ``any(x > n for x in xs)``,
+            # ``xs.count(3) + xs.index(5)`` (corpus c165, c176).  Python
+            # fixes these results' classes whatever the operands are:
+            # ``any``/``all`` return ``bool``, and a sequence's ``count`` and
+            # ``index`` return ``int``.  Nobody stated that, so the results
+            # and everything computed from them took the float64 domain
+            # default.
+            if op in {"any", "all"} or reference in {"any", "all"}:
+                settle(scalar, node_id, "bool")
+                continue
+            if op in {"count", "index"} and parents(data, "operand"):
+                settle(scalar, node_id, "int64")
+                continue
             if op in REGION_INTEGER_RESULT_OPS or reference == "len":
                 settle(scalar, node_id, "int64")
                 continue
