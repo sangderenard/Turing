@@ -5100,7 +5100,7 @@ def analyze_shader_loop_reductions(
                 "static_python_reference"
             )
             if reference == "enumerate":
-                # Program: ``for k, x in enumerate(xs, 3)`` (c332).  Wrong
+                # Program: ``for k, x in enumerate(xs, 3)``.  Wrong
                 # record: the count was bound to the loop induction, which
                 # starts at 0, and the ``start`` argument was dropped, so C
                 # and LLVM silently counted from 0.  Rule: a ``start`` has no
