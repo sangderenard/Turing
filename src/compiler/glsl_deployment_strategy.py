@@ -11423,6 +11423,13 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
                     or str(graph.G.nodes[reader].get("type")) == "IndexedStore"
                     or nx.has_path(graph.G, int(effect_id), int(reader))
                     or nx.has_path(graph.G, int(reader), int(effect_id))
+                    # An alias (``ys = xs; ys[1] = 9`` then ``xs[1]``, c143)
+                    # shares the consumed version with reads in later
+                    # statements; only a read in the store's own statement
+                    # is evaluated before it.
+                    or getattr(
+                        graph.G.nodes[reader].get("expr_obj"), "lineno", None
+                    ) != int(line)
                 ):
                     continue
                 edges.add((int(reader), int(effect_id)))
