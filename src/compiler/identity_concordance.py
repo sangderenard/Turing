@@ -9391,12 +9391,23 @@ def invalidate_proven_shape(
     # made ten), even though there was no shape proof to withdraw.
     if not recorded:
         return
+    # Program: the managed balloon tire's ``np.maximum(..., 0.0)`` at
+    # ``balloon_tire_vector_step`` line 372.  Lane D, D3a follow-up.  The
+    # call-result cone visits a value twice from one unchanged source, and
+    # the second visit re-posted the identical withdrawal with the identical
+    # cell set, which the book refuses (REVISE without a changed source).
+    # The cone's old blanket try swallowed that; removing it (#798) stopped
+    # the tire at deployment select.  Rule: a row whose latest fact is
+    # already this same withdrawal has nothing left to withdraw.  Any other
+    # prior state still posts, and a refusal there stays loud.
+    proposed = ("invalidated", source_id, str(reason))
+    if max(recorded, key=lambda entry: int(entry[0]))[1] == proposed:
+        return
     cells = tuple(dict.fromkeys((
         *source_cells, *(() if state_ref is None else (state_ref,)),
     )))
     _post_or_unsourced(
-        book, PROVEN_SHAPE_PAGE, row,
-        ("invalidated", source_id, str(reason)),
+        book, PROVEN_SHAPE_PAGE, row, proposed,
         book.registry.declare_stage(str(reason)), cells,
         SHAPE_SOURCE_NOT_ON_BOOK,
     )
