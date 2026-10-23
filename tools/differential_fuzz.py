@@ -132,6 +132,8 @@ EXTENDED2 = [
     # a list bound to equal-length displays on two branches (c271)
     (["if n > {a}:", "    t{v} = [n, {b}]", "else:", "    t{v} = [{c}, n]", "t{v}.append({a})"], "len(t{v}) * 100 + t{v}[0] * 10 + t{v}[2]"),
     (["t{v} = [n, {b}] if n % 2 == 0 else [{c}, {a}]"], "len(t{v}) * 10 + t{v}[1]"),
+    # a set bound to displays on two branches (c274)
+    (["s{v} = {{n, {a}}} if n > {b} else {{{c}, 2}}", "s{v}.add({a})"], "len(s{v}) * 10 + int({c} in s{v})"),
     # concatenation of displays then a dict display (p16_29, region order)
     (["xs{v} = [{a}, -1] + [n, {b}]", "d{v} = {{1: {c}}}"], "xs{v}[2] * 10 + xs{v}[0] + d{v}[1]"),
     # dict.update from a display stores its rows (A3)
