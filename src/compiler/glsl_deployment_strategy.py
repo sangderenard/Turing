@@ -2252,6 +2252,45 @@ def _planned_scalar_dtypes_from(
                                 ):
                                     settle(scalar, int(target_id),
                                            element.get(argument))
+                # Program: ``for k, x in enumerate(xs): t += k * x`` (c351).
+                # Wrong record: as with ``zip``, the tuple target's names were
+                # never typed, so ``x`` fell to the float64 default; C
+                # multiplied large int rows through float64 (silently wrong)
+                # and LLVM refused the i64/double Phi.  Rule: over
+                # ``enumerate(a[, start])`` the first name is an int64 count
+                # and the second is an element of ``a``.
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and len(loop_expression.target.elts) == 2
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and (zipped.get("attributes") or {}).get(
+                        "extraction_identity") == "builtins.enumerate"
+                ):
+                    counted = [
+                        int(parent)
+                        for parent, role in zipped.get("parents") or ()
+                        if str(role) == "arg:0" and int(parent) in G
+                    ]
+                    if counted:
+                        held_types = (
+                            "int64", element.get(counted[0]),
+                        )
+                        for item, held in zip(
+                            loop_expression.target.elts, held_types,
+                        ):
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer

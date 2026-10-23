@@ -5100,6 +5100,21 @@ def analyze_shader_loop_reductions(
                 "static_python_reference"
             )
             if reference == "enumerate":
+                # Program: ``for k, x in enumerate(xs, 3)`` (c332).  Wrong
+                # record: the count was bound to the loop induction, which
+                # starts at 0, and the ``start`` argument was dropped, so C
+                # and LLVM silently counted from 0.  Rule: a ``start`` has no
+                # lowering here, so it refuses by name rather than being
+                # ignored.
+                started = [
+                    role for _parent, role in iterable_data.get("parents", ())
+                    if str(role) not in {"arg", "args", "arg:0", "arg0", "callee"}
+                ]
+                if started:
+                    raise ValueError(
+                        "enumerate with a start argument has no loop "
+                        f"lowering; iterable={iterable_id}, roles={started!r}"
+                    )
                 source_id = next(
                     (
                         int(parent)
