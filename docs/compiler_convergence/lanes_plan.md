@@ -23,7 +23,7 @@ unrolled form of C2), #794 (D2 step 1). No lane PR is open.
 | 1 | A2 remainder: false acceptance. 55 units now report `compiled-unverified`; check each export against its source surface (doc 34 §1.4) | A | yes, **observed** once (unit 027) | the 55 are the only units whose answers would be trusted; one false acceptance there is a silent wrong answer |
 | 2 | C2 retained form: a display rebound inside a retained loop reads `len(xs)` as 0 | C | yes, **observed** at `3ffb64d6` | silent with a `descriptor-member-shared` finding; any loop that rebinds a list |
 | 3 | D3a stale `proven_shape` after a refused withdrawal | D | **inferred** yes | 4 corpus programs reach it; nobody has shown a reader of the stale shape |
-| 4 | R1 tire region-fusion cycle from be0dd1fc (#791) | silent lane | no, loud | blocks the tire benchmark at depth 0; a regression, so it goes before new frontier |
+| 4 | R1 tire region-fusion cycle from be0dd1fc (#791), and W3c, the two-unit bootstrap regression from #796 | silent lane, A | no, loud | regressions of the two benchmarks, so they go before new frontier |
 | 5 | D2 next sources (`range` constants, generator elements, `dict.get`, `StaticReference`) | D | **inferred** yes (a wrong dtype is a TYPE result) | 8,056 fallbacks left in 80 programs; depth is the planner |
 | 6 | A2b tuple-or-`None` returns | A | no: loud by name on the A2 branch | bootstrap units with `fork = None` patterns |
 | 7 | G1 `formatted glyph component has no resident producer` (12 bootstrap units fail on it themselves) | A | no, loud | the largest own-failure family in the bootstrap; f-strings are everywhere in the compiler (**inferred** to share A8 and D3a's glyph helpers) |
@@ -71,6 +71,14 @@ moved with each merge (**observed**):
 - `6e621cd5` (#791) to `d8d41cb6`: a cycle in the depth-0 region
   reduction (R1).
 
+**Rerun at `4b81b85a` (after #796).** The tire still hits R1. The
+bootstrap compiles 53/370 units, down from 55 (**observed**). Unit 35,
+`IdentityPage._virtual_fact`, goes from compiled to partial. Its shortfall
+is an unexplained public argument, an int64 tag of a pending
+Optional[tuple] call result (value 8). Unit 183, `IdentityPage.cell`, then
+fails as its dependent. Units 36, 186 and 225 also fail now on the
+dependency, which hides their own earlier errors. That is W3c.
+
 ## How claims work
 
 A claim names the functions an item will edit. Two lanes never hold claims
@@ -110,6 +118,7 @@ branch has used, merged or not.
 | A2b | Lower a returned tuple-or-`None` (`if c: return (a, b)` / `return None` in a bootstrap unit; `fork = (a, b)` / `fork = None; return fork` anywhere). It refuses by name now (`its newest binding ... was not materialized`), was silent before. Observed by the silent-wrong-answers thread: the planner builds the aggregate Phi (presence member 15, member Phis 16, 17), but the root's return reads the handle (10) instead of that layout, and the tuple's region is then pruned as dead. | B1 | the control finish's output resolution in `precompile_to_ssa`; find the pruner with a trap | | open: loud |
 | A4 | Tire: the result-storage lease mints a record span member's `SSA_VALUE` row as a scalar. Revise it from the record storage contract. `_ssa_structure` reads the registered record storage before calling a shape-empty fact a scalar. Repro idea: lift `Metrics` with its `error_present` span (15,) into a scratch program that returns the record through one call edge. Suspected pass (**inferred**): the lease writer, which reads the fact's empty shape before the record storage. | T1 | `structural_concordance._ssa_structure`; the result-storage lease writer in `fortran_c_shell` | | open: A0 merged; re-observe at `main` first (needs a tire run, see A5) |
 | R1 | Tire: a cycle in the depth-0 region reduction (`reduce_scheduled_shader_regions`, `nx.topological_generations` on the quotient graph). The tire builds past it at `7b3ec6e1` and fails at `6e621cd5`, so be0dd1fc (list concatenations in the source-call order) introduced it. Repro idea: rebuild the tire with a hook on `_sequence_effect_read_edges` that prints the concatenation edges, and find the one that closes the cycle; then lift that function. Suspected (**inferred**): a concatenation ordered after a call whose value it feeds. | T0 | `glsl_deployment_strategy._sequence_effect_read_edges` | `claude/project-thread-cz18s3` (asked) | open: regression |
+| W3c | Regression from #796 (W3): a value-union call's `is None` now reads a tag that nothing publishes when the union is Optional[tuple]. Unit 35 `IdentityPage._virtual_fact` shows `unexplained-public-arguments` with `native_type_tag_pending_call_result` for value 8, and unit 183 fails as its dependent. Repro idea: `def f(c): return (1, 2) if c else None` and a caller `x = f(c); return 0 if x is None else x[0]`. Suspected (**inferred**): the W3 tag read needs A2b's tuple-or-None layout, which is not there yet. Supply the tag from that layout, or refuse by name before minting it. | B1 | the W3 tag read in `ssa_optional_values` / `fortran_c_shell` (the code #796 added) | `claude/project-thread-h4aybe` (asked) | open: regression, before A2 |
 | G1 | `formatted glyph component has no resident producer: value=N projection='scalar'`: 12 bootstrap units fail on it themselves, for example `id_space.describe`, `CorrelationTable._abi_or_member_key` and `_graph_work_publication_findings`. Repro idea: lift `id_space.describe` and lower it through the public entry. Suspected (**inferred**): the f-string glyph recipe takes a scalar component whose producer was folded or pruned. It may share the `append_decimal_integer_glyphs` path with D3a. | new | f-string glyph recipe builder (shared with A8) | | open |
 | A6 | Variadic returns: the sequence-lane lowering for `return ()`/`(x,)`/`[]`/`[x]` (units 034, 162, 212). | B2 | reducer VARIADIC consumer in `precompile_to_ssa`; `ir_sequence_tables` | `claude/project-thread-kbkzp7` | claimed 2026-10-22; list returns fixed or refused (doc 35), tuple variadic and two-edge list lowering open |
 | A7 | `Any`-typed receivers and generic `str()`/`!r` of facts: runtime type dispatch over the fact classes. | B3 | to be scoped | | open: needs a design note first |
