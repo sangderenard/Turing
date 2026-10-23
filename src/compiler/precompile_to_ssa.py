@@ -3551,6 +3551,12 @@ class _ControlSSABuilder(TiledObject):
                     [count, length_address],
                     attributes={"binding": "ssa_sequence_literal_length"},
                 )
+        # The tables a keyed ``del`` clears rows of (their live flags then
+        # mark deleted rows, not only the rows a filtered loop kept).
+        self.keyed_deletion_sequence_ids = {
+            int(deletion[2]) for deletion in table_deletions
+            if deletion[2] is not None
+        }
         self.lexical_membership_arguments: dict[int, tuple[Any, ...]] = {}
         self._captured_instruction_sink: list[Instr] | None = None
         lexical_membership_ids = {
@@ -18088,7 +18094,9 @@ class _ControlSSABuilder(TiledObject):
         # Wrong record: the loop ran over the physical rows, and a keyed
         # delete only clears the row's live flag, so the deleted key was
         # still visited (57 for 37).  Nothing here skips a cleared row.
-        # Rule: iterating a table that carries live flags is refused.
+        # Rule: iterating a table with a keyed delete is refused.  (A list
+        # formal a filtered loop reads also carries live flags, c359; those
+        # mark kept rows, not deletions, so they are not refused.)
         for iterable_id, _target_id, induction_name, *_projection in (
             *self.program.iterable_bindings,
             *self.program.projected_iterable_bindings,
@@ -18103,6 +18111,7 @@ class _ControlSSABuilder(TiledObject):
             if (
                 descriptor is not None
                 and descriptor.live_flags_value_id is not None
+                and sequence_id in self.keyed_deletion_sequence_ids
             ):
                 raise ValueError(
                     f"{path}: loop {loop.induction} iterates table "
