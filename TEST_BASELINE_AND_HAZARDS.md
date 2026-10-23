@@ -1,3 +1,11 @@
+2026-10-23 LANE E, E15-E17 (MEASURED, cloud): Fortran emits a callee that
+returns an optional value (c308), states a populated list literal (c293,
+c309; C is silently wrong on c309 at main 2806360d, fixed earlier in this
+PR), and runs pop(i)/del xs[i] on a fixed list (c142, c177, c330: the
+capacity cell was listed as an array argument). At 86b8314d (226
+programs): C 226/226, LLVM 226/226, Fortran 156 PASS. Gate names identical
+to main 08ba0171. Fuzz seed 53 llvm,fortran: 0 WRONG / 0 TYPE.
+
 2026-10-23 LANE E, E12-E14 (MEASURED, cloud): LLVM reads a callee's view of a
 caller list (a load from a span formal), projects an optional tuple's
 presence flags (interleaved output positions/slots), and reads a heap

@@ -519,3 +519,62 @@ unchanged (static, which is what Windows uses).
 - Gate at `c8452ec5` (covers E5-E14), on a clean worktree: aa 89 / ab 7 /
   ac 26 / rec 20. The failure names in every part are the same as main
   `08ba0171`'s.
+
+## E15: a callee that returns an optional value (Fortran refused)
+
+- **Program:** `def maybe_twice(x, y): return x * 2 if x != y else None`,
+  then `o = maybe_twice(n, 2); if o is not None: t = o - 2` (c308).
+- **Wrong record:** the callee's `None` arm is a `NoneValue` that nothing
+  reads once the optional is interleaved, and the callee's single `Ret`
+  carries payload and presence while its declared outputs named only the
+  payload. Fortran refused the `NoneValue` ("no Fortran intrinsic or
+  expression is registered") and would have dropped the presence output.
+- **Rule:** an unread `NoneValue` that is no output emits nothing. When a
+  function's one `Ret` extends its declared outputs and contains all of
+  them, the `Ret` operands are its outputs.
+- c308 is refused by Fortran at main and passes here.
+
+## E16: a populated list literal (Fortran refused)
+
+- **Program:** `sum([4, 6, 1]) + n`, `max([2.5, x, -1.0])` (c309, c293).
+- **Wrong record:** a `Const` whose payload is a flat list and whose
+  declared shape is its own length reached the scalar literal path and
+  was refused ("cannot express literal [4, 6, 1]").
+- **Rule:** such a `Const` is a rank-1 array constant, written element by
+  element in the declared kind. Any other shape still refuses.
+- c293 and c309 now pass in Fortran. c271 and c272 move on to the Alloca
+  refusal. At main `2806360d`, C is **silently wrong** on c309 (`sum` of
+  the literal returns its first element, 604.5 for 1304.5); the folded-list
+  rule from earlier in this PR (c293) already fixes that here.
+
+## E17: pop(i) and del xs[i] on a fixed list (Fortran failed to run)
+
+- **Program:** `xs = [5, n, 2]; xs.pop(0)` (c142), `del xs[i]` (c177),
+  and c330.
+- **Wrong record:** `delete_at`, `insert_at` and `reverse` listed every
+  storage formal as an array argument, including the scalar capacity
+  cell. Fortran gave the caller's capacity a shape-dynamic extent that
+  nothing supplies, and the run stopped with "shape-dynamic Fortran
+  extents require explicit positive extent_overrides".
+- **Rule:** a positional sequence helper's array arguments are its storage
+  formals except the capacity cell (as `allocate` already did), in
+  `ir_sequence_tables._storage_array_ids`.
+- c142, c177 and c330 pass in Fortran. c197 still fails to run: the
+  callee's bool list carries live flags that the caller's list lacks
+  (open).
+
+### Receipts for E15-E17
+
+- Census at `86b8314d` (226 programs, dynamic Fortran runtime): C
+  226/226. LLVM 226/226 PASS. **Fortran 156 PASS** (135 at `c8452ec5`),
+  1 WRONG (c22, the `sin` table), 1 RUN-FAIL (c197), 0 COMPILE-FAIL, 0
+  EMIT-FAIL and 68 EMIT-INCOMPLETE (Alloca heap growth).
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 53 (with the optional-scalar, list-literal and pop/del snippets): 25
+  PASS, 14 FORTRAN-LOUD, 1 LLVM-LOUD, 0 WRONG and 0 TYPE. The LLVM-LOUD is
+  p53_17 (`enumerate` over a list beside a callee loop: "phi physical
+  element i64 disagrees with incoming"); it is loud at main `2806360d` too
+  (open).
+- Gate at `86b8314d` (covers E5-E17), on a clean worktree: aa 89 / ab 7 /
+  ac 26 / rec 20. The failure names in every part are the same as main
+  `08ba0171`'s (main has since moved to `2806360d`, a docs-only change).
