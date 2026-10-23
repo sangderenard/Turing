@@ -197,6 +197,8 @@ EXTENDED3 = [
     (["xs{v} = [n, {a}]", "for i{v} in range(n % 3 + 1):", "    xs{v}.append(i{v} + {b})"], "width(xs{v}) * 100 + head(xs{v})"),
     # a dict that accumulates into itself through get (lane E)
     (["d{v} = {{}}", "for i{v} in range(n % 4 + 1):", "    d{v}[i{v} % 2] = d{v}.get(i{v} % 2, {a}) + 36028797018963969", "t{v} = 0", "for k{v} in range(3):", "    if k{v} in d{v}:", "        t{v} = t{v} + d{v}[k{v}]"], "t{v}"),
+    # a pop from the front inside the growing loop, then iteration (lane E)
+    (["xs{v} = []", "for i{v} in range(n % 5 + 2):", "    xs{v}.append(i{v} + {a})", "    if i{v} % 2 == 1:", "        xs{v}.pop(0)", "t{v} = 0", "for x{v} in xs{v}:", "    t{v} = t{v} * 10 + x{v}"], "t{v}"),
     # an optional tuple result unpacked after a None test (lane E)
     (["f{v} = maybe_pair(n, {a}) if n != {b} else None", "r{v} = -1", "if f{v} is not None:", "    p{v}, q{v} = f{v}", "    r{v} = p{v} * 10 + q{v}"], "r{v}"),
 ]
