@@ -618,6 +618,12 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                             and int(instruction.res.id) in map(
                                 int, semantic_output_ids_of(function),
                             )
+                            # ``return row + 1 if flag > 0 else None``: the
+                            # native value-union lowering already published
+                            # this output's surface (payload, type tag); a
+                            # second presence would be a third member.
+                            and int(instruction.res.id)
+                            not in aggregate_return_layouts(function)
                         )
                         presence = SSAValue(
                             mint_ssa_value(

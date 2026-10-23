@@ -308,31 +308,35 @@ _PROGRAM_CONTRACT = str(
 
 def test_unit_returning_a_statement_merged_optional_exports_its_presence():
     # ``r = row + 1`` / ``r = None`` merge into a ``conditional_result`` Phi
-    # that the unit's Ret returns.  The export is (payload, presence), as for
-    # a ``return_merge``; before, Ret was the payload alone.
-    source = (
-        "def root(row: int, flag: int):\n"
+    # that the unit's Ret returns.  The export is the output's whole
+    # published surface -- payload and the member that says which arm ran --
+    # exactly as for ``return row + 1 if flag > 0 else None``; before, Ret
+    # was the payload alone.
+    for body in (
         "    if flag > 0:\n"
         "        r = row + 1\n"
         "    else:\n"
         "        r = None\n"
-        "    return r\n"
-    )
-    module, _outputs, exports = lower_ast_source_to_ssa(
-        source, "root", name="optional_statement_unit",
-        extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
-    )
-    root = module.functions[exports[0]]
-    (ret,) = [
-        instruction for block in root.blocks.values()
-        for instruction in block.instrs if instruction.op == "Ret"
-    ]
-    assert [value.dtype for value in ret.args] == ["int64", "bool"]
-    presence = ret.args[1]
-    assert (presence.accounting or {}).get("ssa_optional_payload_id") == int(
-        ret.args[0].id
-    )
-    assert check_optional_merges(module) == []
+        "    return r\n",
+        "    return row + 1 if flag > 0 else None\n",
+    ):
+        module, _outputs, exports = lower_ast_source_to_ssa(
+            "def root(row: int, flag: int):\n" + body,
+            "root", name="optional_statement_unit",
+            extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+        )
+        root = module.functions[exports[0]]
+        (ret,) = [
+            instruction for block in root.blocks.values()
+            for instruction in block.instrs if instruction.op == "Ret"
+        ]
+        layouts = dict(root.metadata["aggregate_return_layouts"])
+        assert len(ret.args) == 2
+        assert layouts == {
+            int(ret.args[0].id): tuple(int(value.id) for value in ret.args)
+        }
+        assert ret.args[0].dtype == "int64"
+        assert check_optional_merges(module) == []
 
 
 def test_unit_returning_tuple_or_none_refuses_instead_of_returning_the_none():

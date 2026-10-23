@@ -22732,31 +22732,53 @@ def _class_surface_ssa_program(
                 # Program: ``if x > y: r = x + y else: r = None; return r``
                 # called as ``o = maybe_inc(n, 2)``, then ``(-1 if o is None
                 # else o) + n`` (doc 34 W1).  Wrong record: the name merge of
-                # ``r`` (a Phi of its conditional's ``body``/``orelse`` arms)
-                # carried no contract, so the callee's return and the
-                # caller's call result had no class and the sum's region fell
+                # ``r`` carried no contract, so neither the callee's return
+                # nor the caller's call had a class and the sum's region fell
                 # to float64 (-4 came back as 1.8e19).  Rule: a statement
-                # name merge of a source conditional with a ``None`` arm (an
-                # optional) settles from its arms exactly as an IfExp and a
-                # member merge do.  Other name merges (``t = pair(row)`` /
-                # ``t = (7, 8)``, corpus c29) keep their own settlement.
+                # name merge of an optional (one arm the ``None`` literal)
+                # carries its payload arm's class, as a guard-form optional
+                # return (``if x < y: return None``) already does; its
+                # presence is lowered separately (``ssa_optional_values``),
+                # so it is not a tagged union.
+                if (
+                    str(data.get("type") or "") == "Phi"
+                    and member_attributes.get("source_conditional_id")
+                    is not None
+                    and member_attributes.get("conditional_result_of") is None
+                    and member_attributes.get("aggregate_parent_value_id")
+                    is None
+                ):
+                    merge_id = int(data.get("value_id", node_id))
+                    arm_classes = [
+                        (contracts.get(int(parent)) or {}).get("python_type")
+                        for parent, role in data.get("parents") or ()
+                        if str(role) in {"body", "orelse"}
+                    ]
+                    payload_classes = {
+                        str(identity) for identity in arm_classes
+                        if identity is not None
+                        and str(identity) != "builtins.NoneType"
+                    }
+                    incumbent = contracts.get(merge_id) or {}
+                    if (
+                        len(arm_classes) == 2
+                        and "builtins.NoneType" in arm_classes
+                        and None not in arm_classes
+                        and len(payload_classes) == 1
+                        and not incumbent.get("python_types")
+                        and incumbent.get("python_type") is None
+                    ):
+                        contracts.setdefault(merge_id, {})["python_type"] = (
+                            next(iter(payload_classes))
+                        )
+                        conditional_changed = True
+                    continue
                 member_merge = (
                     str(data.get("type") or "") == "Phi"
                     and (
                         member_attributes.get("conditional_result_of") is not None
                         or member_attributes.get("aggregate_parent_value_id")
                         is not None
-                        or (
-                            member_attributes.get("source_conditional_id")
-                            is not None
-                            and any(
-                                (contracts.get(int(parent)) or {}).get(
-                                    "python_type"
-                                ) == "builtins.NoneType"
-                                for parent, role in data.get("parents") or ()
-                                if str(role) in {"body", "orelse"}
-                            )
-                        )
                     )
                 )
                 if not (
