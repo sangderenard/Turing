@@ -647,3 +647,30 @@ unchanged (static, which is what Windows uses).
 - Gate at `09401a20` and at main `230369c5`, each on a clean worktree:
   aa 89 / ab 8 / ac 26 / rec 21 on both. The failure names in every part
   are the same; ac and rec each gain the new passing test.
+
+## E20: enumerate counts from its start
+
+- **Program:** `for k, x in enumerate(xs, 3): t += k * x` (c354), a
+  parameter start (c355), `start=` by keyword (c356), and a comprehension
+  over `enumerate(xs, 2)` (c357).
+- **Wrong record:** the counter target was bound to the loop induction,
+  which starts at 0, and `start` was dropped. C and LLVM counted from 0
+  silently at main `2806360d`; since #805 it was refused by name.
+- **Rule:** `loop_composer` records the start as an induction offset,
+  `ControlProgram.induction_offsets` (counter target, start value). It is
+  carried through control composition, projection and the hierarchical
+  merge, and counted as a control dependency. The counter is the induction
+  plus the start (`precompile_to_ssa`, binding `enumerate_start`). A start
+  given in any other way still refuses by name. Test:
+  `test_loop_composer.py::test_enumerate_start_offsets_the_counter`.
+
+### Receipts for E20
+
+- Census at `eeb508be` on main `4a0f5452` (262 programs): C 262/262, LLVM
+  262/262, Fortran 176 PASS, 1 WRONG (c22), 1 RUN-FAIL (c197), 84
+  EMIT-INCOMPLETE.
+- Fuzz seed 57 (`FUZZ_EXT=3`, `llvm,fortran`, 30 programs, with the
+  enumerate-start snippet): 17 PASS, 13 FORTRAN-LOUD, 0 WRONG and 0 TYPE.
+- Gate at `eeb508be` and at main `4a0f5452`, each on a clean worktree:
+  aa 89 / ab 8 / ac 26 / rec 21 on both, with the same failure names in
+  every part.
