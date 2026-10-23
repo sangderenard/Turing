@@ -550,7 +550,7 @@ unchanged (static, which is what Windows uses).
 ## E17: pop(i) and del xs[i] on a fixed list (Fortran failed to run)
 
 - **Program:** `xs = [5, n, 2]; xs.pop(0)` (c142), `del xs[i]` (c177),
-  and c330.
+  and c350.
 - **Wrong record:** `delete_at`, `insert_at` and `reverse` listed every
   storage formal as an array argument, including the scalar capacity
   cell. Fortran gave the caller's capacity a shape-dynamic extent that
@@ -559,7 +559,7 @@ unchanged (static, which is what Windows uses).
 - **Rule:** a positional sequence helper's array arguments are its storage
   formals except the capacity cell (as `allocate` already did), in
   `ir_sequence_tables._storage_array_ids`.
-- c142, c177 and c330 pass in Fortran. c197 still fails to run: the
+- c142, c177 and c350 pass in Fortran. c197 still fails to run: the
   callee's bool list carries live flags that the caller's list lacks
   (open).
 
