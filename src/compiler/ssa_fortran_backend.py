@@ -890,10 +890,31 @@ class _FunctionEmitter:
             for value in self.function.args
             if str(value.dtype or "").casefold() in {"ptr", "pointer"}
         )
+        sequence_columns = set() if sequence_table is None else {
+            int(column)
+            for descriptor in sequence_table.sequences.values()
+            for column in descriptor.column_value_ids
+        }
         for value_id, value_shape in (value_shapes or {}).items():
             current = self._value_types.get(int(value_id))
-            if current is None or tuple(current.shape):
+            if current is None:
                 continue
+            if tuple(current.shape):
+                # Program: ``xs = [1, 2] + [n, 8]; xs[2]`` (c264, c166,
+                # c263; lane E).  Wrong record: the concat column kept its
+                # operand's static shape (2,), so the entry allocated two
+                # rows for four, the second append_slice reported
+                # "exhausted" into an unread status, and xs[2] read past
+                # the arena.  Rule: a sequence column's arena is what the
+                # storage requirement proves it must hold.
+                required = tuple(map(int, value_shape))
+                if not (
+                    int(value_id) in sequence_columns
+                    and len(required) == len(tuple(current.shape))
+                    and all(isinstance(item, int) for item in current.shape)
+                    and math.prod(required) > math.prod(current.shape)
+                ):
+                    continue
             self._value_types[int(value_id)] = SSAValue(
                 current.id,
                 current.dtype,
