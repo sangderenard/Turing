@@ -2232,7 +2232,17 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                 operands = [o for o in operands if o not in element]
                 settle(scalar, node_id, promote([scalar.get(o) for o in operands]))
                 continue
-            if isinstance(expression, ast.IfExp):
+            # Program: ``if a > b: r = a - b ... else: r = (b - a) * 2;
+            # return r + 1`` (corpus c01).  Wrong record: the statement
+            # join (a ``Phi`` with ``test``/``body``/``orelse`` parents, the
+            # same shape as ``IfExp``) had no rule, so ``r`` and everything
+            # computed from it took the float64 domain default in
+            # ``_value_shape_dtype`` (Lane D, D2: that site takes 9,521 of
+            # the planner's 9,547 float64 fallbacks across the 184 corpus
+            # programs at 3ffb64d; branch joins are one of its sources).
+            # Rule: a branch join's class is the join of its arms, exactly
+            # as for a conditional expression.
+            if isinstance(expression, ast.IfExp) or op == "phi":
                 arms = parents(data, "body", "orelse")
                 settle(scalar, node_id, join([scalar.get(o) for o in arms]))
         if not changed:
