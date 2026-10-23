@@ -3357,6 +3357,18 @@ class _ControlSSABuilder(TiledObject):
                     else "int64" if fill_literal is None
                     else None
                 )
+                if isinstance(fill_literal, tuple):
+                    # Program: ``xs = [n] * 3; xs[1] = 3``.  Wrong record:
+                    # a runtime member left the rows unclassed, so the
+                    # control function stored them float64 while every
+                    # region read them int64.  Rule: the rows hold the class
+                    # the regions prove for the sequence, else the member's.
+                    proven = (
+                        self.region_value_meta.get(int(sequence_id))
+                        or self.region_value_meta.get(int(fill_literal[1]))
+                    )
+                    if proven is not None:
+                        element_dtype = str(proven.dtype)
             elif str(policy).startswith("literal_bytes="):
                 element_dtype = "int"
             elif str(policy).startswith("literal_glyphs="):
@@ -4736,11 +4748,17 @@ class _ControlSSABuilder(TiledObject):
         )
         self._register_sequence_lowering(lowering)
         contract_cell = self._sequence_contract_cell(int(sequence_id))
-        value = self.fresh_value(
-            dtype=str(descriptor.column_dtypes[0]), transform=CONTROL_CONST,
-            operands=(contract_cell,),
-        )
-        self.emit(Handler.Const, [], value, attributes={"value": literal})
+        if isinstance(literal, tuple):
+            # ``[n] * k``: the member is a runtime value (its value id).
+            value = self.external_value(
+                int(literal[1]), dtype=str(descriptor.column_dtypes[0]),
+            )
+        else:
+            value = self.fresh_value(
+                dtype=str(descriptor.column_dtypes[0]), transform=CONTROL_CONST,
+                operands=(contract_cell,),
+            )
+            self.emit(Handler.Const, [], value, attributes={"value": literal})
         status = self.fresh_value(
             dtype="int", transform=REGION_CALL_RESULT,
             operands=(contract_cell, value),
@@ -5309,13 +5327,41 @@ class _ControlSSABuilder(TiledObject):
                     len(descriptor.column_value_ids)
                 ]
                 value = SSAValue(value_id, dtype="int64")
-                self.emit(
-                    Handler.Load, [length_cell], value,
-                    attributes={
-                        "binding": "ssa_sequence_length_value",
-                        "sequence_id": int(sequence_id),
-                    },
-                )
+                if descriptor.live_flags_value_id is not None:
+                    # Program: ``d = {1: n, 2: 3}; del d[1]; len(d)``.
+                    # Wrong record: ``len`` loaded the length cell, which
+                    # still counts the tombstoned row, and returned 2.
+                    # Rule: a table that retains deleted rows has the
+                    # length of its live rows.
+                    from .ir_sequence_tables import lower_sequence_live_length
+
+                    helper_name = self._sequence_helper_name(
+                        int(sequence_id), "live_length",
+                    )
+                    self._register_sequence_lowering(lower_sequence_live_length(
+                        descriptor,
+                        function_name=helper_name,
+                        first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+                    ))
+                    self.emit(
+                        Handler.Call,
+                        list(self.sequence_storage_values[int(sequence_id)]),
+                        value,
+                        attributes={
+                            "callee": helper_name,
+                            "source_linked": True,
+                            "ssa_sequence_operation": "live_length",
+                            "sequence_id": int(sequence_id),
+                        },
+                    )
+                else:
+                    self.emit(
+                        Handler.Load, [length_cell], value,
+                        attributes={
+                            "binding": "ssa_sequence_length_value",
+                            "sequence_id": int(sequence_id),
+                        },
+                    )
                 # SEQUENCE_LENGTH: the sequence's contract cell is the cause.
                 self._bind(
                     value_id, value, BindingKind.SEQUENCE_LENGTH,
@@ -24057,6 +24103,49 @@ def _schedule_loop_callsites(
                                 position, last_terminal,
                             ))
 
+                # Program: ``d = {1: n, 2: 4}; del d[1]`` beside list work,
+                # then ``int(1 in d)`` (fuzzer p81_13).  Wrong record: the
+                # deletion rides as a pre-operation of the region after it
+                # in value order, and the membership query that follows it
+                # in source was placed before that region (WAR by run
+                # position), so the query found the deleted key (1397 for
+                # 397; clean audit).  Rule: a query of a table whose result
+                # follows a deletion of that table reads after the region
+                # that carries the deletion.  Where the region also needs
+                # the query, the order is a cycle and lowering refuses.
+                deletions_by_position: dict[int, list[tuple[int, int]]] = {}
+                for position, child in enumerate(run):
+                    if not isinstance(child, StatementBlock):
+                        continue
+                    recorded_region = scheduled_region(child)
+                    if recorded_region is None:
+                        continue
+                    for kind, arguments in _region_table_operations(
+                        recorded_region,
+                        table_region_operations,
+                        table_region_post_operations,
+                    ):
+                        if kind == "delete" and arguments[2] is not None:
+                            deletions_by_position.setdefault(position, []).append(
+                                (int(arguments[0]), int(arguments[2]))
+                            )
+                for position, child in enumerate(run):
+                    if not (
+                        isinstance(child, SequenceQueryBlock)
+                        and child.producer_loop_node_id is None
+                    ):
+                        continue
+                    for carrier, deletions in deletions_by_position.items():
+                        if carrier != position and any(
+                            sequence_id == int(child.sequence_value_id)
+                            and effect_id < int(child.result_value_id)
+                            for effect_id, sequence_id in deletions
+                        ):
+                            require(position, carrier, (
+                                "sequence_delete_raw",
+                                int(child.sequence_value_id),
+                            ))
+
                 def depends_on(current: int, prerequisite: int) -> bool:
                     """Whether exact value/effect edges already order these."""
 
@@ -25216,6 +25305,13 @@ def lower_control_sections_to_ssa(
     # element and requested extent must agree in every numerical region and in
     # the control/helper function that surrounds those regions.
     for sequence_id, literal, count_id in sequence_fills.values():
+        region_value_meta[int(count_id)] = Meta((), "int")
+        if isinstance(literal, tuple):
+            # A runtime member: the rows hold its class.
+            member = region_value_meta.get(int(literal[1]))
+            if member is not None:
+                region_value_meta[int(sequence_id)] = Meta((), member.dtype)
+            continue
         element_dtype = (
             "bool" if isinstance(literal, bool)
             else "int" if isinstance(literal, int)
@@ -25224,7 +25320,6 @@ def lower_control_sections_to_ssa(
             else "unknown"
         )
         region_value_meta[int(sequence_id)] = Meta((), element_dtype)
-        region_value_meta[int(count_id)] = Meta((), "int")
     for _iterable_id, target_id, _induction_name, projection in (
         control.projected_iterable_bindings
     ):

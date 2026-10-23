@@ -3141,6 +3141,89 @@ def lower_sequence_contains(
     return SSASequenceLowering((function,))
 
 
+def lower_sequence_live_length(
+    descriptor: SSASequenceDescriptor,
+    *,
+    function_name: str | None = None,
+    first_value_id: int | None = None,
+) -> SSASequenceLowering:
+    """Count the live rows of a table that retains deleted rows.
+
+    ``del d[k]`` clears a live flag and leaves the physical row resident, so
+    the length cell counts rows ever written, not Python's ``len(d)``.
+    """
+
+    if descriptor.live_flags_value_id is None:
+        raise ValueError("live length requires caller-visible live flags")
+    storage = _storage_values(descriptor)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=storage, minimum=first_value_id
+    ))
+    entry = builder.block("entry")
+    header = builder.block("count_header")
+    body = builder.block("count_body")
+    result_block = builder.block("result")
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
+    length_slot = builder.fresh("ptr")
+    length = builder.fresh("int64")
+    builder.emit(
+        entry,
+        "GetElementPtr",
+        [SSAValue(descriptor.length_address_id, dtype="int64", shape=(1,)), zero],
+        length_slot,
+    )
+    builder.emit(entry, "Load", [length_slot], length)
+    builder.branch(entry, header)
+    index = builder.fresh("int64")
+    count = builder.fresh("int64")
+    next_index = builder.fresh("int64")
+    next_count = builder.fresh("int64")
+    builder.emit(
+        header, "Phi", [zero, next_index], index,
+        attributes={"incoming_blocks": (entry.name, body.name)},
+    )
+    builder.emit(
+        header, "Phi", [zero, next_count], count,
+        attributes={"incoming_blocks": (entry.name, body.name)},
+    )
+    continues = builder.fresh("bool")
+    builder.emit(header, "Lt", [index, length], continues)
+    builder.cond(header, continues, body, result_block)
+    live_address = builder.fresh("ptr")
+    live = builder.fresh("bool")
+    live_count = builder.fresh("int64")
+    builder.emit(
+        body,
+        "GetElementPtr",
+        [SSAValue(descriptor.live_flags_value_id, dtype="bool"), index],
+        live_address,
+    )
+    builder.emit(body, "Load", [live_address], live)
+    builder.emit(body, "Select", [live, one, zero], live_count)
+    builder.emit(body, "Add", [count, live_count], next_count)
+    builder.emit(body, "Add", [index, one], next_index)
+    builder.branch(body, header)
+    builder.emit(result_block, "Ret", [count])
+    name = function_name or f"ssa_sequence_{descriptor.sequence_id}_live_length"
+    function = Function(
+        name,
+        list(storage),
+        builder.blocks,
+        metadata={
+            "ssa_sequence_operation": "live_length",
+            "sequence_id": descriptor.sequence_id,
+            "sequence_array_argument_ids": tuple((
+                *map(int, descriptor.column_value_ids),
+                int(descriptor.length_address_id),
+                int(descriptor.live_flags_value_id),
+            )),
+            "named_outputs": (("length", int(count.id)),),
+        },
+    )
+    return SSASequenceLowering((function,))
+
+
 def lower_sequence_equal(
     left: SSASequenceDescriptor,
     right: SSASequenceDescriptor,
@@ -4579,6 +4662,7 @@ __all__ = [
     "lower_sequence_insert",
     "schedule_joined_sequence_mutations",
     "lower_table_lookup",
+    "lower_sequence_live_length",
     "lower_table_delete",
     "lower_table_delete_first",
     "lower_child_table_delete",
