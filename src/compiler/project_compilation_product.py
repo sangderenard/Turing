@@ -6725,6 +6725,35 @@ def compile_project_call(
     return receipt
 
 
+def _authored_effect_statements(source_graph: Any) -> tuple[str, ...]:
+    """The source's effect nodes: stores, deletes and discarded calls.
+
+    A store is an ``IndexedStore``/``SetAttr``/``DelItem`` node; a call is
+    an effect when no node consumes its result (``xs.append(3)`` as a
+    statement), read from the graph's own parent edges.
+    """
+
+    import ast
+
+    consumed = {
+        int(parent)
+        for _node_id, data in source_graph.nodes(data=True)
+        for parent, _role in data.get("parents") or ()
+    }
+    found = []
+    for node_id, data in source_graph.nodes(data=True):
+        expression = data.get("expr_obj")
+        kind = str(data.get("type") or "")
+        if kind in {"IndexedStore", "SetAttr", "DelItem", "DelAttr"} or (
+            isinstance(expression, ast.Call) and int(node_id) not in consumed
+        ):
+            found.append(
+                f"{getattr(expression, 'lineno', '?')}: "
+                + (ast.unparse(expression)[:80] if isinstance(expression, ast.AST) else kind)
+            )
+    return tuple(dict.fromkeys(found))
+
+
 def _one_value_aggregate_return(source: Any) -> str | None:
     """Why the source's return is not one plain value, else None.
 
@@ -7263,6 +7292,25 @@ def _compile_resolved_process_graph_unit_impl(
                 shortfalls.append({
                     "kind": "concordance-consumer-refusal",
                     "details": list(refusals),
+                })
+        # Program: unit 031 ``thaw_page`` (effects on ``page.__dict__``) and
+        # ``shell_telemetry.compile_count`` (``layer.count(...)``).  Wrong
+        # record: every authored effect was pruned, the export was a lone
+        # ``Ret`` with no outputs, and the unit was admitted.  Rule: an
+        # export with no outputs and no lowered instruction besides control
+        # flow and constants is refused while its source holds an effect
+        # statement (a discarded call, an attribute or item store, a delete).
+        if not published_outputs and correlated:
+            lowered_ops = {
+                str(instruction.op)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+            }
+            authored_effects = _authored_effect_statements(source_graph)
+            if lowered_ops <= {"Ret", "ret", "Br", "br", "Const", "const"} and authored_effects:
+                shortfalls.append({
+                    "kind": "authored-effects-without-lowering",
+                    "statements": list(authored_effects[:8]),
                 })
         if unresolved_calls:
             shortfalls.append({

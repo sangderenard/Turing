@@ -79,3 +79,22 @@ def test_status_tool_reports_one_value_for_a_tuple(tmp_path):
     assert [row["unit"] for row in report["false_acceptance_findings"]] == [
         "unit_001"
     ]
+
+
+def test_authored_effects_are_read_from_stores_and_discarded_calls():
+    import ast
+
+    from src.compiler.project_compilation_product import (
+        _authored_effect_statements,
+    )
+
+    graph = nx.DiGraph()
+    graph.add_node(0, type="Input", parents=[])
+    graph.add_node(1, type="Call", parents=[(0, "operand")],
+                   expr_obj=ast.parse("layer.count(key)").body[0].value)
+    graph.add_node(2, type="Call", parents=[(0, "arg:0")],
+                   expr_obj=ast.parse("len(xs)").body[0].value)
+    graph.add_node(3, type="Add", parents=[(2, "lhs")])
+    assert _authored_effect_statements(graph) == ("1: layer.count(key)",)
+    graph.add_node(4, type="IndexedStore", parents=[(0, "base")])
+    assert len(_authored_effect_statements(graph)) == 2

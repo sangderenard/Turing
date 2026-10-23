@@ -231,6 +231,7 @@ def check_unit_result_layouts(product_root: str | Path) -> dict[str, Any]:
     root = Path(product_root).resolve()
     checked = []
     findings = []
+    empty = []
     for unit_path in sorted(root.glob("units/*/unit.json")):
         receipt = _read_json(unit_path)
         if receipt.get("status") != "compiled-unverified":
@@ -261,6 +262,11 @@ def check_unit_result_layouts(product_root: str | Path) -> dict[str, Any]:
                 problems.append("native output paths differ from published outputs")
             if kind == "tuple" and len(published) < 2:
                 problems.append("a tuple layout publishes one value")
+            lowered_ops = {
+                str(instruction.op)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+            }
             row = {
                 "unit": unit_path.parent.name,
                 "qualified_names": list(receipt.get("qualified_names") or ()),
@@ -272,10 +278,17 @@ def check_unit_result_layouts(product_root: str | Path) -> dict[str, Any]:
             checked.append(row)
             if problems:
                 findings.append(row)
+            if not published and lowered_ops <= {"Ret", "ret", "Br", "br", "Const", "const"}:
+                # Inference, not a finding: a body with effects may have
+                # been pruned whole (unit 031 ``thaw_page``); the product's
+                # ``authored-effects-without-lowering`` refusal reads the
+                # source, which this receipt does not carry.
+                empty.append(row)
     return {
         "product_root": root.as_posix(),
         "checked_exports": len(checked),
         "false_acceptance_findings": findings,
+        "exports_lowered_to_nothing": empty,
     }
 
 
