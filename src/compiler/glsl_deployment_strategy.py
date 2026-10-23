@@ -10807,6 +10807,21 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
             or int(data.get("value_id", node_id)) in concatenation_ids
         )
     ] + [
+        # Program: ``ys0 = [x0 * n for x0 in [4, 0, 8]]; xs1 = [3];
+        # push(xs1, n)`` then ``sum(ys0) * 10 + len(xs1) * 100 + xs1[1]``
+        # (fuzzer p32_55; corpus c283).  Wrong record: an unrolled
+        # comprehension is born where it is authored (one clear, one
+        # append per row) but was no member of this order, so the reducer
+        # fused a row's ``x0 * n`` with ``len(xs1) * 100`` and the birth
+        # placed that region before the push (100 for 200; with ``xs1 =
+        # []`` a null read).  Rule: an unrolled comprehension's birth is
+        # an effect where it is authored, as a call is.
+        (int(node_id), data.get("expr_obj"))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), (ast.ListComp, ast.SetComp))
+        and (data.get("attributes") or {}).get("materialization_kind")
+        == "unrolled_loop"
+    ] + [
         # Program: ``xs0 = [5, n, 0]; xs0[1] = 8; xs0[0] += n; xs1 = [7,
         # 7]; push(xs1, n); push(xs1, 2)`` then reads of both (fuzzer
         # p28_37; corpus c280).  Wrong record: an indexed store was no
