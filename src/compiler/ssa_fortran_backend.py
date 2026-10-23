@@ -890,10 +890,31 @@ class _FunctionEmitter:
             for value in self.function.args
             if str(value.dtype or "").casefold() in {"ptr", "pointer"}
         )
+        sequence_columns = set() if sequence_table is None else {
+            int(column)
+            for descriptor in sequence_table.sequences.values()
+            for column in descriptor.column_value_ids
+        }
         for value_id, value_shape in (value_shapes or {}).items():
             current = self._value_types.get(int(value_id))
-            if current is None or tuple(current.shape):
+            if current is None:
                 continue
+            if tuple(current.shape):
+                # Program: ``xs = [1, 2] + [n, 8]; xs[2]`` (c264, c166,
+                # c263; lane E).  Wrong record: the concat column kept its
+                # operand's static shape (2,), so the entry allocated two
+                # rows for four, the second append_slice reported
+                # "exhausted" into an unread status, and xs[2] read past
+                # the arena.  Rule: a sequence column's arena is what the
+                # storage requirement proves it must hold.
+                required = tuple(map(int, value_shape))
+                if not (
+                    int(value_id) in sequence_columns
+                    and len(required) == len(tuple(current.shape))
+                    and all(isinstance(item, int) for item in current.shape)
+                    and math.prod(required) > math.prod(current.shape)
+                ):
+                    continue
             self._value_types[int(value_id)] = SSAValue(
                 current.id,
                 current.dtype,
@@ -912,6 +933,46 @@ class _FunctionEmitter:
                 current.device,
                 dict(current.accounting or {}),
             )
+        # Program: ``for x in (1, 5, 9): if x <= n: r += x`` (c275, c156,
+        # c27; lane E).  Wrong record: a static aggregate constant (dtype
+        # ``ssa.aggregate``, shape ``()``) read through element addresses had
+        # no Fortran spelling and refused the whole module.  Rule, as in the
+        # LLVM lane: when every use is an element address, the constant is a
+        # rank-1 array of its payload's own kind and length.
+        uses: dict[int, set[tuple[str, int]]] = {}
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                for position, argument in enumerate(instr.args):
+                    uses.setdefault(int(argument.id), set()).add(
+                        (str(instr.op), position)
+                    )
+        self._static_aggregate_constants: dict[int, tuple[Any, ...]] = {}
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                if instr.op not in ("Const", "const") or instr.res is None:
+                    continue
+                payload = instr.attributes.get("constant")
+                if payload is None:
+                    payload = instr.attributes.get("value")
+                if not isinstance(payload, (list, tuple)) or not payload:
+                    continue
+                if any(isinstance(item, (list, tuple, str, bytes)) for item in payload):
+                    continue
+                if tuple(instr.res.shape or ()) or not uses.get(int(instr.res.id)) or any(
+                    op not in {"GetElementPtr", "getelementptr"} or position != 0
+                    for op, position in uses[int(instr.res.id)]
+                ):
+                    continue
+                kind = (
+                    "bool" if all(isinstance(item, bool) for item in payload)
+                    else "int64" if all(isinstance(item, int) for item in payload)
+                    else "float64"
+                )
+                self._static_aggregate_constants[int(instr.res.id)] = tuple(payload)
+                self._value_types[int(instr.res.id)] = SSAValue(
+                    instr.res.id, kind, (len(payload),), instr.res.device,
+                    dict(instr.res.accounting or {}),
+                )
         self.outputs = tuple(self._typed(value) for value in self.outputs)
         self.dynamic_array_extents = {
             int(instr.args[0].id): (
@@ -3699,6 +3760,19 @@ class _FunctionEmitter:
                         0,
                         self._typed(instr.res).dtype or self.dtype,
                     )
+                static_items = self._static_aggregate_constants.get(
+                    int(instr.res.id)
+                ) if instr.res is not None else None
+                if static_items is not None:
+                    typed = self._typed(instr.res)
+                    return _array_literal(
+                        [
+                            float(item) if typed.dtype == "float64" else item
+                            for item in static_items
+                        ],
+                        tuple(typed.shape),
+                        dtype=typed.dtype,
+                    )
                 try:
                     return _literal(
                         payload,
@@ -3799,7 +3873,14 @@ class _FunctionEmitter:
             if op in {"FloorDiv", "floordiv"} and str(
                 instr.res.dtype or self.dtype
             ) in _INTEGER_DTYPES:
-                return f"({args[0]} / {args[1]})"
+                # Python floors; Fortran's integer ``/`` truncates toward
+                # zero, so ``-7 // 3`` gave -2 (c04, c15, c24; lane E).
+                # ``a - modulo(a, b)`` is an exact multiple of ``b`` whose
+                # quotient is the floor, with ``modulo`` taking b's sign as
+                # Python's ``%`` does.
+                a = f"int({args[0]}, c_int64_t)"
+                b = f"int({args[1]}, c_int64_t)"
+                return f"(({a} - modulo({a}, {b})) / {b})"
             if op in {"Mod", "mod"} and str(
                 instr.res.dtype or self.dtype
             ) in _INTEGER_DTYPES:
@@ -4047,9 +4128,36 @@ class _FunctionEmitter:
         indent: int = 4,
     ) -> None:
         pad = " " * indent
-        for predecessor, result, incoming in self._phi_targets.get(target, ()):
-            if predecessor != source:
-                continue
+        # Program: ``for i in range(10): if i * i > n: break`` then
+        # ``return i`` (c124; lane E).  Wrong record: an edge's Phi copies
+        # were written in declaration order, so ``i_after = i`` read the
+        # ``i`` the previous copy had already advanced (10 for 9).  Rule:
+        # the copies of one edge are parallel; write a copy only after
+        # every copy that reads its target, and refuse a cycle by name.
+        pending = [
+            (result, incoming)
+            for predecessor, result, incoming in self._phi_targets.get(target, ())
+            if predecessor == source
+        ]
+        while pending:
+            ready = next(
+                (
+                    position for position, (result, _incoming) in enumerate(pending)
+                    if not any(
+                        _name(other_incoming) == _name(result)
+                        and _name(other_result) != _name(result)
+                        for other_result, other_incoming in pending
+                    )
+                ),
+                None,
+            )
+            if ready is None:
+                raise FortranEmissionError(
+                    f"phi copies on edge {source} -> {target} form a cycle "
+                    f"({', '.join(_name(result) for result, _ in pending)}); "
+                    "a parallel copy needs a temporary this emitter does not declare"
+                )
+            result, incoming = pending.pop(ready)
             expression = self._coerce_value_to_target(
                 result, incoming, _name(incoming)
             )
@@ -4882,6 +4990,23 @@ def emit_module(
             continue
         declared = tuple(function.metadata.get("named_outputs") or ())
         if not declared:
+            # Program: ``while b != 0: a, b = b, a % b`` (c18; lane E).
+            # Wrong record: a planned region with no return metadata was
+            # named by its CALLERS' projection loads, and the last call site
+            # won, so ``planned_region_0`` published the caller's id 955
+            # while its body computed ``t3`` and left the output unwritten
+            # (gcd(48, 18) returned 48).  Rule: as for ``return_value``, a
+            # function's own ``Ret`` operands are its outputs; the caller
+            # catalogue is consulted only when there is no single ``Ret``.
+            returned = {
+                tuple(int(value.id) for value in instruction.args): tuple(instruction.args)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Ret", "ret"} and instruction.args
+            }
+            if len(returned) == 1:
+                named_outputs[function_name] = next(iter(returned.values()))
+                continue
             projected = aggregate_outputs.get(str(function_name))
             if projected:
                 named_outputs[function_name] = tuple(
@@ -6207,10 +6332,40 @@ def emit_module(
         for function_name, function in functions.items()
     }
     entry_by_name = {entry.name: entry for entry in entry_points}
-    for function_name, table in module_sequence_tables.items():
-        described = entry_by_name.get(function_name)
-        if described is None:
+    # Program: c217 (``with_list(n)`` and ``with_dict(n)`` called from
+    # ``root``; lane E).  Wrong record: only an entry's OWN sequence table
+    # was published, so a callee's hoisted capacity cell stayed 0, every
+    # append and store reported "full", and the root returned 0 -- the C
+    # wrapper's record before c217.  Rule: the same linked descriptors the
+    # C and LLVM wrappers publish (``_linked_frame_sequences``), in entry
+    # ids.
+    from .ssa_c_backend import _linked_frame_sequences
+
+    linked_sequence_descriptors: dict[str, tuple[Any, ...]] = {}
+    for function_name in entry_by_name:
+        own = module_sequence_tables.get(function_name)
+        own_ids = set() if own is None else {
+            int(descriptor.sequence_id) for descriptor in own.sequences.values()
+        }
+        linked = tuple(
+            descriptor
+            for descriptor in (
+                _linked_frame_sequences(module, function_name)
+                if isinstance(module, IRModule) else ()
+            )
+            # A callee's sequence id that collides with one of the entry's
+            # own cannot be published under it; that sequence stays
+            # unpublished (capacity 0, loud "full" status), as before.
+            if int(descriptor.sequence_id) not in own_ids
+        )
+        if linked:
+            linked_sequence_descriptors[function_name] = linked
+        if own is None and not linked:
             continue
+        described = entry_by_name[function_name]
+        published_sequences = (
+            *(() if own is None else own.sequences.values()), *linked,
+        )
         parameter_names = {parameter.name for parameter in described.parameters}
         extent_parameters = tuple(
             parameter.name
@@ -6255,7 +6410,7 @@ def emit_module(
                         f"source_length:{parameter.source_name}"
                     )
         bindings = []
-        for descriptor in table.sequences.values():
+        for descriptor in published_sequences:
             required_ids = (
                 int(descriptor.length_address_id),
                 int(descriptor.capacity_value_id),
@@ -6433,9 +6588,22 @@ def emit_module(
                         ) else {}),
                     }
                     for descriptor in table.sequences.values()
+                ] + [
+                    descriptor.to_mapping()
+                    for descriptor in linked_sequence_descriptors.get(function_name, ())
                 ]
                 for function_name, table in module_sequence_tables.items()
                 if function_name in functions and table.sequences
+            } | {
+                function_name: [
+                    descriptor.to_mapping() for descriptor in linked
+                ]
+                for function_name, linked in linked_sequence_descriptors.items()
+                if function_name in functions
+                and not (
+                    function_name in module_sequence_tables
+                    and module_sequence_tables[function_name].sequences
+                )
             },
             # A sequence arena can be both an ABI input/inout and the authored
             # return value.  Ordinary scalar output accounting intentionally

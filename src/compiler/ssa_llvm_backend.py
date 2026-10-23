@@ -808,6 +808,15 @@ def integer_scalar_lines(
     if operation == "Neg" and len(operands) == 1:
         return ([f"{register} = sub {operand_type} 0, {operands[0]}"],
                 operand_type)
+    if operation in {"Abs", "abs"} and len(operands) == 1:
+        # ``abs(n - 3)`` on an int stayed loud in LLVM (lane E fuzz, 3 of
+        # 30 programs).  Integer magnitude, no round trip through double.
+        return ([
+            f"{register}.neg = sub {operand_type} 0, {operands[0]}",
+            f"{register}.below = icmp slt {operand_type} {operands[0]}, 0",
+            f"{register} = select i1 {register}.below, "
+            f"{operand_type} {register}.neg, {operand_type} {operands[0]}",
+        ], operand_type)
     if operation == "Invert" and len(operands) == 1:
         # The canonical authored ``~mask`` opcode preserves its integer
         # domain. The old double fallback rejected it, despite an i64
@@ -1909,6 +1918,9 @@ def _emit_repository_call_module(
     internal_call_records: list[tuple[str | None, str, tuple[str, ...]]] = []
     emitted_functions: list[str] = []
     emitted_names: list[str] = []
+    from .ssa_storage_requirements import module_storage_requirements
+
+    frame_storage_requirements = module_storage_requirements(module)
     for name in reachable:
         function = module.functions[name]
         outputs = function_outputs[name]
@@ -1957,6 +1969,10 @@ def _emit_repository_call_module(
             for value in function.args
             if (value.accounting or {}).get("tensor_extent_kind") == "shape"
         }
+        # Element storage of a static aggregate constant read only through
+        # element addresses: the payload's own scalar kind, not the
+        # ``ssa.aggregate`` result's default ``double``.
+        aggregate_constant_types: dict[int, str] = {}
         allocated: set[int] = set()
         output_pointer = {
             int(value.id): f"%out.{index}"
@@ -2021,8 +2037,28 @@ def _emit_repository_call_module(
             llvm_type = _value_llvm_type(value)
             count = _value_element_count(value)
             register = f"%value.{value_id}"
+            # Program: ``len(f"v={int(x)}")`` in a callee (c62, lane E).
+            # Wrong record: compiler-frame storage this function owns (the
+            # f-string's glyph-token arena) was sized by its SSA shape, one
+            # cell, while its literal glyphs wrote two; the second store
+            # overran the stack frame and the process died.  Rule: as in
+            # the C lane's activation arrays, owned frame storage takes the
+            # solved storage requirement and starts zeroed.
+            owned_frame = (
+                str((value.accounting or {}).get("compiler_frame_storage") or "")
+                == str(name)
+            )
+            if owned_frame:
+                requirement = frame_storage_requirements.get(name, {}).get(value_id)
+                if requirement is not None and requirement.element_count is not None:
+                    count = max(count, int(requirement.element_count))
             if value_id not in allocated:
                 _frame_slot(register, llvm_type, count, entry_allocas, entry_frees)
+                if owned_frame:
+                    entry_allocas.append(
+                        f"  call void @llvm.memset.p0.i64(ptr {register}, i8 0, "
+                        f"i64 {count * _LLVM_TYPE_BYTES.get(str(llvm_type), 8)}, i1 false)"
+                    )
                 allocated.add(value_id)
             pointers[value_id] = register
             return register
@@ -2684,6 +2720,25 @@ def _emit_repository_call_module(
                         payload = flattened[0]
                     else:
                         aggregate_items = tuple(flattened) or (0,)
+                        # A tuple of ints stored as doubles and read back
+                        # through an element address as ``load i64`` is the
+                        # double's bit pattern: ``for x in (1, 5, 9)`` saw
+                        # 4607182418800017408.  When every use is an element
+                        # address, store the payload's own kind so the
+                        # address stride and the readers' loads agree.
+                        if all(
+                            consumer.op in {"GetElementPtr", "getelementptr"}
+                            and position == 0
+                            for candidate_block in function.blocks.values()
+                            for consumer in candidate_block.instrs
+                            for position, argument in enumerate(consumer.args)
+                            if int(argument.id) == result_id
+                        ):
+                            aggregate_constant_types[result_id] = (
+                                "i1" if all(isinstance(item, bool) for item in flattened)
+                                else "i64" if all(isinstance(item, int) for item in flattened)
+                                else "double"
+                            )
                         if (
                             result_id not in pointers
                             and result_id not in output_pointer
@@ -2691,7 +2746,10 @@ def _emit_repository_call_module(
                         ):
                             register = f"%value.{result_id}"
                             _frame_slot(
-                                register, _value_llvm_type(result),
+                                register,
+                                aggregate_constant_types.get(
+                                    result_id, _value_llvm_type(result),
+                                ),
                                 len(aggregate_items),
                                 entry_allocas, entry_frees,
                             )
@@ -2699,7 +2757,9 @@ def _emit_repository_call_module(
                             pointers[result_id] = register
                 target = pointer(result)
                 if aggregate_items is not None:
-                    llvm_type = _value_llvm_type(result)
+                    llvm_type = aggregate_constant_types.get(
+                        result_id, _value_llvm_type(result),
+                    )
                     for index, item in enumerate(aggregate_items):
                         slot = f"%const.slot.{tag}.{index}"
                         body.append(
@@ -3226,7 +3286,9 @@ def _emit_repository_call_module(
                                 f"  {summed} = add i32 {scaled}, {index}"
                             )
                             offset = summed
-                        element_type = _value_llvm_type(base)
+                        element_type = aggregate_constant_types.get(
+                            int(base.id), _value_llvm_type(base),
+                        )
                         base_pointer = pointer(base)
                         heap_element = (base.accounting or {}).get("heap_element_dtype")
                         if heap_element is not None:
@@ -3279,6 +3341,19 @@ def _emit_repository_call_module(
                     if heap_address and span_address_types.get(int(address_argument.id)) != loaded_type:
                         shortfalls.append(LLVMEmissionShortfall(name, operation,
                             "heap load result disagrees with its declared element layout; explicit conversion required"))
+                        continue
+                    stored_type = span_address_types.get(int(address_argument.id))
+                    if (
+                        stored_type is not None
+                        and stored_type != loaded_type
+                        and "double" in {stored_type, loaded_type}
+                    ):
+                        # Loading an integer from a double cell (or the
+                        # reverse) reads the other kind's bit pattern.
+                        shortfalls.append(LLVMEmissionShortfall(name, operation,
+                            f"{loaded_type} load of %t{result_id} from a "
+                            f"{stored_type} element of %t{int(address_argument.id)}; "
+                            "explicit conversion required"))
                         continue
                     if (loaded_type in {"double", "i32", "i1"}
                             or int(address_argument.id) in owned_heap_addresses
@@ -4299,6 +4374,230 @@ def _emit_repository_call_module(
                     block_exit_label[active_block] = done
                 continue
 
+            if (
+                operation in {"max", "min", "all", "any", "sum"}
+                and result is not None
+                and (
+                    len(instruction.args) == 1
+                    or (operation == "sum" and len(instruction.args) == 2)
+                )
+                and not tuple(result.shape or ())
+                and (
+                    tuple(instruction.args[0].shape or ())
+                    or (instruction.args[0].accounting or {}).get(
+                        "program_abi_storage"
+                    ) in {"span", "sequence"}
+                    or (instruction.args[0].accounting or {}).get(
+                        "heap_element_dtype"
+                    ) is not None
+                )
+            ):
+                # Program: ``xs = [6, 3, 6, n]; sum(xs)`` and ``max(xs)``
+                # (c278, c150-c154; lane E).  Wrong record: a flat reduction
+                # of a sequence to a scalar had no LLVM emission (``sum``) or
+                # died in a binary template (``max``), so the C lane's rule
+                # stood alone.  Rule, as in C: reduce over the static extent
+                # or the sequence's own live length cell, left to right;
+                # ``max``/``min`` of no rows raises error 74.
+                source = instruction.args[0]
+                accounting = dict(source.accounting or {})
+                heap_layout = accounting.get("heap_element_dtype")
+                if heap_layout is not None:
+                    from ..transmogrifier.dtype_layout import layout_for
+                    element_type = layout_for(heap_layout).llvm_type
+                    base_pointer = load_as(source, "ptr", f"red.base.{tag}")
+                else:
+                    element_type = aggregate_constant_types.get(
+                        int(source.id), _value_llvm_type(source),
+                    )
+                    base_pointer = pointer(source)
+                if element_type == "ptr":
+                    element_type = "i64"
+                static_shape = tuple(source.shape or ())
+                count = None
+                if accounting.get("sequence_static_length") is not None:
+                    count = str(int(accounting["sequence_static_length"]))
+                elif static_shape and all(
+                    isinstance(item, int) for item in static_shape
+                ) and accounting.get("program_abi_storage") not in {
+                    "span", "sequence",
+                }:
+                    count = str(_math.prod(static_shape))
+                else:
+                    sequence_ids = {
+                        int(candidate)
+                        for candidate in (
+                            accounting.get("sequence_id"),
+                            accounting.get("compiler_frame_sequence_id"),
+                            int(source.id),
+                        )
+                        if candidate is not None
+                    }
+                    lengths = tuple(
+                        formal for formal in function.args
+                        if (formal.accounting or {}).get("sequence_length_for")
+                        is not None
+                        and int(formal.accounting["sequence_length_for"])
+                        in sequence_ids
+                    )
+                    direct = accounting.get("sequence_length_value_id")
+                    if direct is not None:
+                        lengths = tuple(
+                            formal for formal in function.args
+                            if int(formal.id) == int(direct)
+                        ) or lengths
+                    if len(lengths) == 1:
+                        count = load_as(lengths[0], "i64", f"red.n.{tag}")
+                if count is None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"flat {operation} reduction over %t{int(source.id)} "
+                        "has no static extent or live length cell",
+                    ))
+                    continue
+                result_type = _value_llvm_type(result)
+                accumulator_type = (
+                    "i1" if operation in {"any", "all"} else result_type
+                )
+                if accumulator_type not in {"i1", "i32", "i64", "double"}:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"flat {operation} reduction into {accumulator_type}",
+                    ))
+                    continue
+                floating = accumulator_type == "double"
+                entry_label = block_exit_label.get(
+                    active_block or "", active_block or "entry",
+                )
+                fail = f"red.fail.{tag}"
+                init = f"red.init.{tag}"
+                head = f"red.head.{tag}"
+                loop_body = f"red.body.{tag}"
+                done = f"red.done.{tag}"
+                index = f"%red.i.{tag}"
+                nxt = f"%red.next.{tag}"
+                acc = f"%red.acc.{tag}"
+                acc_next = f"%red.acc.next.{tag}"
+                ordered = operation in {"max", "min"}
+
+                def element(at: str, label: str) -> str:
+                    body.append(
+                        f"  %red.addr.{label}.{tag} = getelementptr "
+                        f"{element_type}, ptr {base_pointer}, i64 {at}"
+                    )
+                    body.append(
+                        f"  %red.v.{label}.{tag} = load {element_type}, "
+                        f"ptr %red.addr.{label}.{tag}, align {_align(element_type)}"
+                    )
+                    loaded = f"%red.v.{label}.{tag}"
+                    if operation in {"any", "all"}:
+                        truth = f"%red.t.{label}.{tag}"
+                        if element_type in {"double", "float"}:
+                            # NaN is truthy, as in Python.
+                            body.append(
+                                f"  {truth} = fcmp une {element_type} {loaded}, 0.0"
+                            )
+                        else:
+                            body.append(
+                                f"  {truth} = icmp ne {element_type} {loaded}, 0"
+                            )
+                        return truth
+                    return convert_loaded(
+                        loaded, element_type, accumulator_type,
+                        f"red.{label}.{tag}",
+                    )
+
+                if ordered:
+                    body.append(f"  %red.empty.{tag} = icmp sle i64 {count}, 0")
+                    body.append(
+                        f"  br i1 %red.empty.{tag}, label %{fail}, label %{init}"
+                    )
+                    body.append(f"{fail}:")
+                    body.append("  call void @turing_validation_error(i32 74)")
+                    body.append(f"  br label %{done}")
+                else:
+                    body.append(f"  br label %{init}")
+                body.append(f"{init}:")
+                if ordered:
+                    initial = element("0", "first")
+                    first_index = "1"
+                elif operation == "sum":
+                    initial = (
+                        load_as(instruction.args[1], accumulator_type, f"red.start.{tag}")
+                        if len(instruction.args) == 2
+                        else literal(0, accumulator_type)
+                    )
+                    first_index = "0"
+                else:
+                    initial = "true" if operation == "all" else "false"
+                    first_index = "0"
+                body.append(f"  br label %{head}")
+                body.append(f"{head}:")
+                body.append(
+                    f"  {index} = phi i64 [ {first_index}, %{init} ], "
+                    f"[ {nxt}, %{loop_body} ]"
+                )
+                body.append(
+                    f"  {acc} = phi {accumulator_type} [ {initial}, %{init} ], "
+                    f"[ {acc_next}, %{loop_body} ]"
+                )
+                body.append(f"  %red.more.{tag} = icmp slt i64 {index}, {count}")
+                body.append(
+                    f"  br i1 %red.more.{tag}, label %{loop_body}, label %{done}"
+                )
+                body.append(f"{loop_body}:")
+                item = element(index, "row")
+                if operation == "sum":
+                    body.append(
+                        f"  {acc_next} = {'fadd' if floating else 'add'} "
+                        f"{accumulator_type} {acc}, {item}"
+                    )
+                elif operation == "any":
+                    body.append(f"  {acc_next} = or i1 {acc}, {item}")
+                elif operation == "all":
+                    body.append(f"  {acc_next} = and i1 {acc}, {item}")
+                else:
+                    keep = f"%red.take.{tag}"
+                    if floating:
+                        # NaN propagates, as in the C lane: once NaN no
+                        # comparison displaces it, and a NaN row enters.
+                        body.append(
+                            f"  {keep}.cmp = fcmp {'ogt' if operation == 'max' else 'olt'} "
+                            f"double {item}, {acc}"
+                        )
+                        body.append(f"  {keep}.nan = fcmp uno double {item}, {item}")
+                        body.append(f"  {keep} = or i1 {keep}.cmp, {keep}.nan")
+                    else:
+                        body.append(
+                            f"  {keep} = icmp {'sgt' if operation == 'max' else 'slt'} "
+                            f"{accumulator_type} {item}, {acc}"
+                        )
+                    body.append(
+                        f"  {acc_next} = select i1 {keep}, "
+                        f"{accumulator_type} {item}, {accumulator_type} {acc}"
+                    )
+                body.append(f"  {nxt} = add i64 {index}, 1")
+                body.append(f"  br label %{head}")
+                body.append(f"{done}:")
+                reduced = f"%red.out.{tag}"
+                incoming = [f"[ {acc}, %{head} ]"]
+                if ordered:
+                    incoming.insert(0, f"[ {literal(0, accumulator_type)}, %{fail} ]")
+                body.append(
+                    f"  {reduced} = phi {accumulator_type} " + ", ".join(incoming)
+                )
+                stored = convert_loaded(
+                    reduced, accumulator_type, result_type, f"red.store.{tag}",
+                )
+                body.append(
+                    f"  store {result_type} {stored}, ptr {pointer(result)}, "
+                    f"align {_align(result_type)}"
+                )
+                if active_block is not None:
+                    block_exit_label[active_block] = done
+                register_cache.clear()
+                continue
+
             if template is not None and result is not None:
                 result_type = _value_llvm_type(result)
                 operand_argument_types = [
@@ -4609,6 +4908,17 @@ def _emit_repository_call_module(
         local = f"%root.frame.{storage_index}"
         _frame_slot(local, llvm_type, count, wrapper, wrapper_frees)
         entry_span.take(UnitKind.DECLARATION, args=(value,), spelling=local)
+        # Program: ``xs = [5, n, 2, 9]; xs.sort()`` (lane E, c275).  Wrong
+        # record: the root frame's private cells were bare allocas, so the
+        # sort's scratch length read garbage, its reserve refused, and the
+        # list came back unsorted in LLVM while C was right.  Rule: as in
+        # the C wrapper (``memset`` of every owned activation), root-owned
+        # frame storage starts zeroed before any publication below.
+        wrapper.append(
+            f"  call void @llvm.memset.p0.i64(ptr {local}, i8 0, i64 "
+            f"{int(count) * _LLVM_TYPE_BYTES.get(str(llvm_type), 8)}, i1 false)"
+        )
+        entry_span.take(UnitKind.STATEMENT, args=(value,), spelling=local)
         public_pointer[int(value.id)] = local
         allocated_counts[int(value.id)] = count
     # [10,20].append(30) emitted all three row writes correctly, but LLVM's
@@ -4620,8 +4930,20 @@ def _emit_repository_call_module(
     root_sequences = getattr(module, "sequence_tables", {}).get(function_name)
     root_arguments = {int(value.id): value for value in root.args}
     heap_releases: list[str] = []
-    if root_sequences is not None:
-        for sequence in root_sequences.sequences.values():
+    # Program: c271's ``merged(n)`` called from ``root`` (lane E).  Wrong
+    # record: as in the C wrapper before c217, only the entry's own
+    # sequence table was published, so a callee's hoisted capacity cell
+    # stayed 0, every append reported "full" and ``len(t)`` read 0 in LLVM
+    # while C was right.  Rule: the same linked descriptors the C wrapper
+    # publishes (``_linked_frame_sequences``), respelled in entry ids.
+    from .ssa_c_backend import _linked_frame_sequences
+
+    published_sequences = (
+        *(() if root_sequences is None else root_sequences.sequences.values()),
+        *_linked_frame_sequences(module, function_name),
+    )
+    if published_sequences:
+        for sequence in published_sequences:
             capacity_id = int(sequence.capacity_value_id)
             owner_id = sequence.heap_owner_value_id
             if (sequence.capacity_policy == SSASequenceCapacityPolicy.DYNAMIC
