@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import os
 import sys
 from dataclasses import replace
@@ -849,7 +850,8 @@ def _promote_conditional_sequence_aliases(
     """
 
     from .control_source import (
-        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock, WhileBlock,
+        CallBlock, ConditionalBlock, ControlSequenceMutation, LoopBlock,
+        SequenceBlock, SequenceQueryBlock, WhileBlock,
     )
 
     copyable_sequence_kinds = {"list", "bytes", "bytearray"}
@@ -930,6 +932,7 @@ def _promote_conditional_sequence_aliases(
 
     promoted_aliases: dict[int, tuple[int, str]] = {}
     destination_ids: set[int] = set()
+    rebirth_ports: dict[int, int] = {}
 
     def promote(block):
         if isinstance(block, ConditionalBlock):
@@ -1005,11 +1008,81 @@ def _promote_conditional_sequence_aliases(
             promoted_body = promote(block.body)
             scalar_carries = []
             sequence_updates: set[tuple[int, int]] = set()
+            rebirths = []
+            port_by_carry = {
+                (int(updated), int(initial)): int(port)
+                for port, initial, updated in block.result_ports
+            }
+            loop_node = (
+                graph_obj.nodes.get(int(block.source_loop_node_id), {})
+                if block.source_loop_node_id is not None else {}
+            )
+            carried_names = {
+                (int(updated), int(initial)): str(name)
+                for name, (initial, updated) in dict(
+                    (loop_node.get("attributes") or {}).get(
+                        "loop_carried_bindings"
+                    ) or {}
+                ).items()
+            }
+            identities = dict(graph_obj.graph.get("identity_table") or {})
             for updated_id, initial_id in block.carried_aliases:
                 updated_id = int(updated_id)
                 initial_id = int(initial_id)
                 updated_resident = resident_by_value.get(updated_id)
                 initial_resident = resident_by_value.get(initial_id)
+                # Program: ``xs = [0, 0]; for i in range(4): t += xs[0];
+                # xs = [i + n, i]`` then ``len(xs)`` (corpus c246).  Wrong
+                # record: the rebound list kept a scalar carry, so only its
+                # handle went through the loop Phi and the exit list's length
+                # was never written (``len`` read 0, silently).  Rule: a list
+                # the body rebinds to another list is carried like a branch
+                # rebinding -- the body's list is copied into the initial
+                # arena at the end of each iteration (one ``replace``).
+                if (
+                    updated_resident is not None
+                    and initial_resident is not None
+                    and updated_resident != initial_resident
+                    and kind_by_value.get(updated_id) in copyable_sequence_kinds
+                    and kind_by_value.get(initial_id)
+                    == kind_by_value.get(updated_id)
+                    and (updated_id, initial_id) in carried_names
+                    and (updated_id, initial_id) in port_by_carry
+                ):
+                    # The copy overwrites the initial list.  That is the
+                    # binding's own storage only while no other name or
+                    # container holds either list: ``ys = xs`` before the
+                    # loop must still read ``[7, 8]`` afterwards.
+                    name = carried_names[(updated_id, initial_id)]
+                    holders = sorted(
+                        str(other)
+                        for other, history in identities.items()
+                        if str(other) != name
+                        and {initial_id, updated_id} & set(map(int, history))
+                    ) + sorted(
+                        f"node {int(reader)}"
+                        for reader, reader_data in graph_obj.nodes(data=True)
+                        for parent, role in reader_data.get("parents") or ()
+                        if int(parent) in {initial_id, updated_id}
+                        and str(role).startswith("elts")
+                    )
+                    if holders:
+                        raise ValueError(
+                            f"list {name!r} is rebound inside a retained "
+                            f"loop while {', '.join(holders)} also holds "
+                            "it; a rebound loop list is carried by copying "
+                            "into its initial storage, which only one name "
+                            "may own"
+                        )
+                    rebirths.append(ControlSequenceMutation(
+                        int(initial_resident), "replace",
+                        (int(updated_resident),),
+                        port_by_carry[(updated_id, initial_id)],
+                        policy="duplicates",
+                    ))
+                    sequence_updates.add((updated_id, initial_id))
+                    destination_ids.add(int(initial_resident))
+                    continue
                 if (
                     updated_resident is None
                     or initial_resident is None
@@ -1038,11 +1111,17 @@ def _promote_conditional_sequence_aliases(
                 resident_by_value[int(port_id)] = resident_id
                 kind_by_value[int(port_id)] = kind
                 promoted_aliases[int(port_id)] = (resident_id, kind)
+                if any(
+                    int(mutation.effect_node_id) == int(port_id)
+                    for mutation in rebirths
+                ):
+                    rebirth_ports[int(port_id)] = resident_id
             return replace(
                 block,
                 body=promoted_body,
                 carried_aliases=tuple(scalar_carries),
                 result_ports=tuple(scalar_ports),
+                sequence_mutations=(*block.sequence_mutations, *rebirths),
             )
         if isinstance(block, WhileBlock):
             return replace(
@@ -1055,6 +1134,34 @@ def _promote_conditional_sequence_aliases(
         return block
 
     promoted = replace(control, root=promote(control.root))
+    if rebirth_ports:
+        # A query of a rebound loop list's exit port (``len(xs)`` after the
+        # loop) reads the initial arena the body's list was copied into;
+        # the port has no storage of its own.
+        def retarget(item):
+            if isinstance(item, SequenceQueryBlock):
+                resident = rebirth_ports.get(int(item.sequence_value_id))
+                return item if resident is None else replace(
+                    item, sequence_value_id=int(resident),
+                )
+            if isinstance(item, tuple):
+                entries = tuple(retarget(entry) for entry in item)
+                return item if all(
+                    new is old for new, old in zip(entries, item)
+                ) else entries
+            if (dataclasses.is_dataclass(item) and not isinstance(item, type)
+                    and type(item).__module__ == ConditionalBlock.__module__):
+                changes = {}
+                for field in dataclasses.fields(item):
+                    value = getattr(item, field.name)
+                    if isinstance(value, tuple) or dataclasses.is_dataclass(value):
+                        retargeted = retarget(value)
+                        if retargeted is not value:
+                            changes[field.name] = retargeted
+                return replace(item, **changes) if changes else item
+            return item
+
+        promoted = replace(promoted, root=retarget(promoted.root))
     return promoted, promoted_aliases, tuple(sorted(destination_ids))
 
 
@@ -1157,6 +1264,86 @@ def _source_sequence_snapshots(graph_obj: Any):
             continue
         mutations.append(ControlSequenceMutation(
             int(node_id), "replace", (source,), int(node_id), policy="duplicates",
+        ))
+    return tuple(mutations)
+
+
+def _source_sequence_slices(graph_obj: Any):
+    """A unit-stride list slice is a new sequence filled from its source.
+
+    Program: ``xs = [3, n, 4]; ys = xs[:2]; return ys[1]``.  Wrong record:
+    the slice node declared its own arena but nothing wrote it, so ``ys[1]``
+    read an unwritten row (0.0 for n).  Rule: ``dst = src[lower:upper]`` is
+    the mutation ``slice``: reset ``dst``, then append the clipped rows of
+    ``src``.  ``argument_kind`` is ``slice:<lower>:<upper>``, each bound
+    empty (absent), ``v<id>`` (a value, also listed in the arguments) or
+    ``c<int>`` (a literal, as a folded ``slice`` selector carries it).  A
+    stepped or non-integer slice is not admitted here and stays loud.
+    """
+    from .control_source import ControlSequenceMutation
+
+    def value_id(node):
+        return int(graph_obj.nodes[node].get("value_id", node))
+
+    def literal_of(node):
+        data = graph_obj.nodes[node]
+        if str(data.get("type") or data.get("op")) not in {"Constant", "const"}:
+            return False, None
+        return True, (data.get("attributes") or {}).get("value")
+
+    def integer_or_none(value):
+        return value is None or (isinstance(value, int) and not isinstance(value, bool))
+
+    mutations = []
+    for node_id, data in graph_obj.nodes(data=True):
+        attrs = data.get("attributes") or {}
+        if (attrs.get("aggregate_kind") != "list"
+                or attrs.get("producer_kind") != "sequence_slice"):
+            continue
+        roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        source, selector = roles.get("base"), roles.get("index")
+        if source is None or selector is None or source not in graph_obj or selector not in graph_obj:
+            continue
+        if (graph_obj.nodes[source].get("attributes") or {}).get("aggregate_kind") != "list":
+            continue
+        selector_data = graph_obj.nodes[selector]
+        folded, selector_literal = literal_of(selector)
+        arguments, spellings = [value_id(source)], []
+        if folded:
+            if not (isinstance(selector_literal, slice) and selector_literal.step is None
+                    and integer_or_none(selector_literal.start)
+                    and integer_or_none(selector_literal.stop)):
+                continue
+            spellings = ["" if bound is None else f"c{int(bound)}"
+                         for bound in (selector_literal.start, selector_literal.stop)]
+        else:
+            if str(selector_data.get("type") or selector_data.get("op")) != "Slice":
+                continue
+            bounds = {str(role): int(parent) for parent, role in selector_data.get("parents") or ()}
+            if set(bounds) - {"lower", "upper", "step"}:
+                continue
+            if "step" in bounds and literal_of(bounds["step"]) != (True, None):
+                continue
+            for role in ("lower", "upper"):
+                if role not in bounds:
+                    spellings.append("")
+                    continue
+                is_literal, literal = literal_of(bounds[role])
+                if is_literal and not integer_or_none(literal):
+                    break
+                if is_literal:
+                    spellings.append("" if literal is None else f"c{int(literal)}")
+                else:
+                    arguments.append(value_id(bounds[role]))
+                    spellings.append(f"v{value_id(bounds[role])}")
+            else:
+                pass
+            if len(spellings) != 2:
+                continue
+        mutations.append(ControlSequenceMutation(
+            value_id(node_id), "slice", tuple(arguments),
+            int(node_id), policy="duplicates",
+            argument_kind="slice:" + ":".join(spellings),
         ))
     return tuple(mutations)
 
@@ -1879,7 +2066,10 @@ def _static_sequence_capacity_survey(
     # snapshot's bound is its source's plus its own straight-line appends;
     # any other growth leaves it unbounded (the dynamic contract), exactly
     # as a local list's.
-    snapshots = tuple(_source_sequence_snapshots(graph_obj))
+    # A slice holds at most its source's rows, so it takes the snapshot
+    # bound: its source's plus its own straight-line appends.
+    snapshots = (*_source_sequence_snapshots(graph_obj),
+                 *_source_sequence_slices(graph_obj))
     snapshot_effects = {int(mutation.effect_node_id) for mutation in snapshots}
     snapshot_ids = {int(mutation.sequence_value_id) for mutation in snapshots}
     snapshot_growth = {sequence_id: 0 for sequence_id in snapshot_ids}
@@ -2180,6 +2370,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
         ))
     mutations.extend(_source_mapping_mutations(graph_obj))
     mutations.extend(_source_sequence_snapshots(graph_obj))
+    mutations.extend(_source_sequence_slices(graph_obj))
     recorded_effect_ids = {
         int(mutation.effect_node_id) for mutation in mutations
     }

@@ -466,6 +466,26 @@ def _declaration(value: SSAValue, *, elemental: bool) -> str:
     return kind if elemental else kind
 
 
+def _span_formal_is_array(value: SSAValue) -> bool:
+    """Whether a ``program_abi_storage: span`` formal is an array.
+
+    Program: ``a = outer(xs)`` where ``outer`` returns ``xs[0]`` (corpus
+    c185).  Wrong record: the call result reaches a planned region as a
+    span formal whose accounting states ``program_abi_rank: 0``, and the
+    span storage alone made it an assumed-size array here, so the caller
+    declared ``t3(extent)`` beside a callee writing a scalar ``t3`` (gfortran:
+    rank mismatch).  Rule: a span with an explicit rank of zero is one cell,
+    as the LLVM and C emitters already read it (``_declared_span_rank``); a
+    span whose rank is unstated keeps the array reading.
+    """
+
+    accounting = value.accounting or {}
+    if str(accounting.get("program_abi_storage")) != "span":
+        return False
+    rank = accounting.get("program_abi_rank")
+    return rank is None or int(rank) > 0 or tuple(value.shape or ()) != ()
+
+
 def _name(value: SSAValue) -> str:
     return f"t{value.id}"
 
@@ -828,8 +848,7 @@ class _FunctionEmitter:
             int(argument.id)
             for argument in self.function.args
             if (
-                str((argument.accounting or {}).get("program_abi_storage"))
-                == "span"
+                _span_formal_is_array(argument)
                 or int((argument.accounting or {}).get(
                     "program_abi_rank", 0
                 )) > 0
@@ -1405,7 +1424,32 @@ class _FunctionEmitter:
             return False
         if uses[0][0] != block.name:
             return False
+        if instr.op in ("Load", "load") and self._written_between(
+            instr, block, uses[0][1],
+        ):
+            # Program: ``t = xs[0]; xs[0] = xs[1]; xs[1] = t`` in a callee
+            # (corpus c187).  Wrong record: the read of ``xs[0]`` was folded
+            # into its consumer, a call placed after the call that writes
+            # ``xs[0]``, so it read the new row.  Rule: a load is not moved
+            # past a store or a call.
+            return False
         return not self._is_subscripted_by(result, uses[0])
+
+    def _written_between(
+        self, instr: Instr, block: BasicBlock, use_position: int,
+    ) -> bool:
+        """Whether memory may be written between ``instr`` and its use."""
+
+        positions = [
+            position for position, candidate in enumerate(block.instrs)
+            if candidate is instr
+        ]
+        if len(positions) != 1:
+            return True
+        return any(
+            candidate.op in ("Store", "store", "Call", "call")
+            for candidate in block.instrs[positions[0] + 1:use_position]
+        )
 
     def _is_subscripted_by(
         self, value: SSAValue, use: tuple[str, int]
@@ -1948,6 +1992,7 @@ class _FunctionEmitter:
             operation in _COMPARISON
             or operation in _LOGICAL_BINARY
             or operation in _LOGICAL_RESULT_UNARY
+            or (operation in ("all", "any") and len(instr.args) == 1)
         )
 
     def _collect_producers(self) -> None:
@@ -3315,6 +3360,136 @@ class _FunctionEmitter:
             f"{source_name}(1:{upper})"
         ]
 
+    def _sequence_live_length(self, source: SSAValue) -> str | None:
+        """The live row count of a resident sequence operand, or None.
+
+        Sequence lowering passes the mutable length cell as an ordinary
+        formal whose ``sequence_length_for`` receipt names the arena's
+        descriptor; its first element is the live length.  This is the
+        same edge the C emitter reads (``sequence_extent_parts``).
+        """
+
+        accounting = dict(source.accounting or {})
+        if tuple(accounting.get("sequence_row_shape") or ()):
+            return None
+        static_length = accounting.get("sequence_static_length")
+        if static_length is not None:
+            return f"{int(static_length)}_c_int64_t"
+        sequence_ids = {
+            int(candidate)
+            for candidate in (
+                accounting.get("sequence_id"),
+                accounting.get("compiler_frame_sequence_id"),
+                int(source.id),
+            )
+            if candidate is not None
+        }
+        length_cells = tuple(
+            formal
+            for formal in self.function.args
+            if (formal.accounting or {}).get("sequence_length_for") is not None
+            and int(formal.accounting["sequence_length_for"]) in sequence_ids
+        )
+        if len(length_cells) != 1:
+            return None
+        return f"{_name(length_cells[0])}(1)"
+
+    def _sequence_reduction(
+        self, instr: Instr, operation: str,
+    ) -> list[str] | None:
+        """``max``/``min``/``sum``/``all``/``any`` over a resident sequence.
+
+        Program: ``xs = [n, 7, -2, n * 2]; return max(xs) * 100 + min(xs)``
+        (corpus c150).  Wrong record: the arena operand's SSA occurrence is
+        shapeless, so the reduction took the scalar-identity path and wrote
+        ``t9 = t6``, which gfortran refuses (ranks 0 and 1).  Rule: a
+        sequence of scalar rows reduces over its live length, read from its
+        length cell, left to right as Python and the C emitter do; ``max``
+        and ``min`` of no rows stop with the C runtime's error 74 (Python's
+        ValueError) and never read a row; a NaN row propagates.
+        """
+
+        if operation not in ("max", "min", "sum", "all", "any"):
+            return None
+        if not instr.args or tuple(instr.args[0].shape or ()):
+            return None
+        source = instr.args[0]
+        accounting = dict(source.accounting or {})
+        if not (
+            accounting.get("sequence_arena")
+            or accounting.get("program_abi_storage") in ("span", "sequence")
+        ):
+            return None
+        if len(instr.args) not in ((1, 2) if operation == "sum" else (1,)):
+            return None
+        length = self._sequence_live_length(source)
+        if length is None:
+            return None
+        target = _name(instr.res)
+        rows = self._operand(source)
+        index = f"turing_red_{instr.res.id}_i"
+        accumulator = f"turing_red_{instr.res.id}"
+        result_kind = _declaration(instr.res, elemental=True)
+        real_rows = str(source.dtype or self.dtype) not in _INTEGER_DTYPES
+        logical_rows = str(source.dtype or "") in _LOGICAL_DTYPES
+        if logical_rows and operation not in ("all", "any"):
+            return None
+        lines = [
+            "    block",
+            f"      integer(c_int64_t) :: {index}",
+            f"      {result_kind} :: {accumulator}",
+        ]
+        if operation in ("all", "any"):
+            # A row's truth is ``!= 0`` (NaN is truthy), as in Python and C.
+            logical_result = str(instr.res.dtype or "") in _LOGICAL_DTYPES
+            truth = ".true." if logical_result else "1"
+            falsity = ".false." if logical_result else "0"
+            initial, found = (
+                (truth, falsity) if operation == "all" else (falsity, truth)
+            )
+            row_truth = (
+                f"{rows}({index})" if logical_rows
+                else f"{rows}({index}) /= 0"
+            )
+            condition = (
+                f".not. ({row_truth})" if operation == "all" else row_truth
+            )
+            lines.extend((
+                f"      {accumulator} = {initial}",
+                f"      do {index} = 1, {length}",
+                f"        if ({condition}) {accumulator} = {found}",
+                "      end do",
+            ))
+        elif operation == "sum":
+            start = (
+                self._operand(instr.args[1]) if len(instr.args) == 2 else "0"
+            )
+            lines.extend((
+                f"      {accumulator} = {start}",
+                f"      do {index} = 1, {length}",
+                f"        {accumulator} = {accumulator} + {rows}({index})",
+                "      end do",
+            ))
+        else:
+            comparison = ">" if operation == "max" else "<"
+            nan_clause = (
+                f" .or. {rows}({index}) /= {rows}({index})"
+                if real_rows else ""
+            )
+            lines.extend((
+                f"      if ({length} <= 0) error stop 74",
+                f"      {accumulator} = {rows}(1)",
+                f"      do {index} = 2, {length}",
+                f"        if ({rows}({index}) {comparison} {accumulator}"
+                f"{nan_clause}) {accumulator} = {rows}({index})",
+                "      end do",
+            ))
+        lines.extend((
+            f"      {target} = {accumulator}",
+            "    end block",
+        ))
+        return lines
+
     def _statements(self, instr: Instr) -> list[str] | None:
         """Ops that are a Fortran *statement* rather than one expression.
 
@@ -3328,6 +3503,9 @@ class _FunctionEmitter:
         operation = instr.attributes.get("tensor_operation") or instr.op
         if instr.res is None:
             return None
+        sequence_reduction = self._sequence_reduction(instr, operation)
+        if sequence_reduction is not None:
+            return sequence_reduction
         batched = self._batched_matmul(instr, operation)
         if batched is not None:
             return batched
@@ -3773,6 +3951,30 @@ class _FunctionEmitter:
                         tuple(typed.shape),
                         dtype=typed.dtype,
                     )
+                if (
+                    isinstance(payload, (list, tuple))
+                    and payload
+                    and instr.res is not None
+                    and not any(
+                        isinstance(item, (list, tuple, str, bytes))
+                        for item in payload
+                    )
+                    and tuple(self._typed(instr.res).shape or ())
+                    == (len(payload),)
+                ):
+                    # A populated list literal whose declared shape is its
+                    # own length (``[4, 6, 1]`` feeding ``sum``) is a rank-1
+                    # array constant, stated element for element in the
+                    # declared kind.  Any other shape still refuses below.
+                    typed = self._typed(instr.res)
+                    return _array_literal(
+                        [
+                            float(item) if typed.dtype == "float64" else item
+                            for item in payload
+                        ],
+                        tuple(typed.shape),
+                        dtype=typed.dtype or self.dtype,
+                    )
                 try:
                     return _literal(
                         payload,
@@ -3851,6 +4053,15 @@ class _FunctionEmitter:
                 # Summing a mask counts its true elements, which Fortran
                 # states directly; SUM rejects a LOGICAL argument outright.
                 return f"count({args[0]})"
+            if op in ("all", "any"):
+                # Program: ``any([x > n for x in xs])`` (corpus c240).  Wrong
+                # record: a float64 result made ``_numeric`` turn the mask
+                # operand into REAL, and ANY/ALL take only LOGICAL.  Rule:
+                # the operand is a mask (a number is its truth, != 0); the
+                # LOGICAL result is converted where it is assigned.
+                if not self._is_logical(instr.args[0]):
+                    return _REDUCTION[op].format(f"({args[0]} /= 0)")
+                return _REDUCTION[op].format(args[0])
             args = self._numeric(instr, args)
             return _REDUCTION[op].format(*args)
         if op in _TERNARY and len(args) == 3:
@@ -3953,6 +4164,23 @@ class _FunctionEmitter:
                 # impossible to link.
                 error_code = int(instr.attributes.get("error_code", 1))
                 body.append(f"    error stop {error_code}")
+                continue
+            if (
+                instr.op == "NoneValue"
+                and instr.res is not None
+                and not self._use_sites.get(instr.res.id)
+                and int(instr.res.id) not in {
+                    int(value.id) for value in self.outputs
+                }
+            ):
+                # Program: ``o = maybe_pick(n, 2); if o is not None: ...``
+                # (fuzz seed 52).  Wrong record: optional lowering leaves the
+                # authored ``None`` as a NoneValue nothing reads (presence is
+                # a separate value), and Fortran has no kind for ``none``, so
+                # the whole program was refused.  Rule: a None that nothing
+                # reads or returns has no runtime statement; a read one is
+                # still refused here.
+                body.append("    ! unread None")
                 continue
             if instr.op in ("Phi", "phi"):
                 # Phi is realised by the predecessors, not here.
@@ -4977,6 +5205,36 @@ def emit_module(
     named_outputs = dict(outputs or {})
     for function_name, function in functions.items():
         return_value = function.metadata.get("return_value")
+        own_returns = {
+            tuple(int(value.id) for value in instruction.args): tuple(instruction.args)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Ret", "ret"} and instruction.args
+        }
+        declared_ids = (
+            (int(return_value.id),) if isinstance(return_value, SSAValue)
+            else tuple(
+                int(value_id)
+                for _name, value_id in function.metadata.get("named_outputs") or ()
+            )
+        )
+        if (
+            function_name not in named_outputs
+            and declared_ids
+            and len(own_returns) == 1
+            and len(next(iter(own_returns))) > len(declared_ids)
+            and set(declared_ids) <= set(next(iter(own_returns)))
+        ):
+            # Program: ``def maybe_pick(x, y): return x * 2 if x != y else
+            # None`` (fuzz seed 52).  Wrong record: optional lowering returns
+            # the payload and its presence, but ``return_value`` names the
+            # payload alone (as does ``named_outputs``), so the Fortran callee
+            # declared one output while its callers pass a two-slot aggregate
+            # (gfortran: REAL(8) to INTEGER(8)).  Rule: when the function's
+            # one ``Ret`` returns its declared outputs beside other values,
+            # the ``Ret`` operands are its outputs.
+            named_outputs[function_name] = next(iter(own_returns.values()))
+            continue
         if isinstance(return_value, SSAValue):
             # The function owns its return identity.  A caller-side aggregate
             # projection can carry a different local id for the same slot;
@@ -5140,6 +5398,7 @@ def emit_module(
         function_name: set(value_ids)
         for function_name, value_ids in call_array_argument_ids(
             functions, call_is_semantic_edge=lambda instruction: not _static_span_assignment(instruction),
+            span_formal_is_array=_span_formal_is_array,
         ).items()
     }
     method_mutated_bases: dict[str, set[int]] = {}
@@ -5152,8 +5411,7 @@ def emit_module(
             int(argument.id)
             for argument in function.args
             if (
-                str((argument.accounting or {}).get("program_abi_storage"))
-                == "span"
+                _span_formal_is_array(argument)
                 or int((argument.accounting or {}).get(
                     "program_abi_rank", 0
                 )) > 0
@@ -6347,24 +6605,33 @@ def emit_module(
         own_ids = set() if own is None else {
             int(descriptor.sequence_id) for descriptor in own.sequences.values()
         }
+        every_linked = tuple(
+            _linked_frame_sequences(module, function_name)
+            if isinstance(module, IRModule) else ()
+        )
         linked = tuple(
             descriptor
-            for descriptor in (
-                _linked_frame_sequences(module, function_name)
-                if isinstance(module, IRModule) else ()
-            )
+            for descriptor in every_linked
             # A callee's sequence id that collides with one of the entry's
-            # own cannot be published under it; that sequence stays
-            # unpublished (capacity 0, loud "full" status), as before.
+            # own cannot be published under it in the sequence table.
             if int(descriptor.sequence_id) not in own_ids
         )
         if linked:
             linked_sequence_descriptors[function_name] = linked
-        if own is None and not linked:
+        if own is None and not every_linked:
             continue
         described = entry_by_name[function_name]
+        # Program: ``localgrow(x)`` builds ``xs = [7, 5]; xs.append(x)`` and
+        # ``root`` has its own list, both sequence 3 (fuzz seed 46, corpus
+        # c303).  Wrong record: the colliding callee sequence got no runtime
+        # binding, so its hoisted capacity cell stayed 0, every append
+        # reported "full" into a status nobody read, and the callee summed
+        # zeros (Fortran silently wrong where C is right).  Rule: every
+        # linked sequence's capacity is published; a binding carries its own
+        # column shapes, so it never looks its descriptor up by a sequence id
+        # that two functions share.
         published_sequences = (
-            *(() if own is None else own.sequences.values()), *linked,
+            *(() if own is None else own.sequences.values()), *every_linked,
         )
         parameter_names = {parameter.name for parameter in described.parameters}
         extent_parameters = tuple(
@@ -6434,6 +6701,17 @@ def emit_module(
                 "column_parameters": [
                     f"t{int(value_id)}"
                     for value_id in descriptor.column_value_ids
+                    if f"t{int(value_id)}" in parameter_names
+                ],
+                "column_shapes": [
+                    [int(extent) for extent in shape]
+                    for value_id, shape in zip(
+                        descriptor.column_value_ids,
+                        descriptor.column_shapes or tuple(
+                            () for _ in descriptor.column_value_ids
+                        ),
+                        strict=True,
+                    )
                     if f"t{int(value_id)}" in parameter_names
                 ],
                 "local_column_value_ids": [
@@ -7011,9 +7289,18 @@ class FortranCoreNative:
         descriptors = {int(item["sequence_id"]): item for item in
             (metadata.get("sequence_tables") or {}).get(self._entry_record.name, ())}
         for binding in (metadata.get("sequence_runtime_bindings") or {}).get(self._entry_record.name, ()):
-            descriptor = descriptors[int(binding["sequence_id"])]
+            if "column_shapes" in binding:
+                row_shapes = {
+                    int(column.lstrip("t")): tuple(shape)
+                    for column, shape in zip(
+                        binding["column_parameters"], binding["column_shapes"],
+                        strict=True,
+                    )
+                }
+            else:
+                descriptor = descriptors[int(binding["sequence_id"])]
+                row_shapes = dict(zip(descriptor["column_value_ids"], descriptor["column_shapes"], strict=True))
             rows = []
-            row_shapes = dict(zip(descriptor["column_value_ids"], descriptor["column_shapes"], strict=True))
             for column in binding["column_parameters"]:
                 column_id = int(column.lstrip("t"))
                 width = int(np.prod(row_shapes[column_id])) if row_shapes[column_id] else 1

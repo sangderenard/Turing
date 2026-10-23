@@ -17,6 +17,7 @@ def call_array_argument_ids(
     function_names: Iterable[str] | None = None,
     *,
     call_is_semantic_edge: Callable[[object], bool] | None = None,
+    span_formal_is_array: Callable[[object], bool] | None = None,
 ) -> dict[str, frozenset[int]]:
     """Return array-valued formal ids for each selected function.
 
@@ -24,6 +25,9 @@ def call_array_argument_ids(
     the Fortran backend.  It intentionally does not infer from dtype: scalar
     and span values may share a dtype, while a rankless helper formal becomes
     a span as soon as its body indexes it.
+
+    ``span_formal_is_array`` lets a backend say which ``span`` formals are
+    arrays; by default every span formal is.
     """
 
     selected = tuple(
@@ -42,8 +46,12 @@ def call_array_argument_ids(
             for argument in function.args
             if (
                 tuple(argument.shape or ())
-                or str((argument.accounting or {}).get("program_abi_storage"))
-                == "span"
+                or (
+                    str((argument.accounting or {}).get("program_abi_storage"))
+                    == "span"
+                    if span_formal_is_array is None
+                    else span_formal_is_array(argument)
+                )
                 or int((argument.accounting or {}).get("program_abi_rank", 0) or 0) > 0
                 or int((argument.accounting or {}).get("ssa_call_rank", 0) or 0) > 0
             )

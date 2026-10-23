@@ -17,11 +17,21 @@ BACKENDS = tuple(
 unknown_backends = set(BACKENDS) - {"c", "llvm", "fortran"}
 if unknown_backends:
     raise SystemExit(f"unknown TYPED_CHECK_BACKENDS entries: {sorted(unknown_backends)}")
+# The Fortran artifact links its runtime statically by default.  A Linux
+# libgfortran.a is not position independent, so a library that needs the
+# runtime (``error stop``) cannot link there; TYPED_CHECK_FORTRAN_STANDALONE=0
+# links libgfortran dynamically instead.  The emitted program is the same.
+FORTRAN_STANDALONE = os.environ.get("TYPED_CHECK_FORTRAN_STANDALONE", "1") != "0"
 
 
 def judge(feeds, expect, flat, kinds):
     exp = list(expect) if isinstance(expect, tuple) else [expect]
-    ok = len(flat) == len(exp) and all(abs(float(a) - float(b)) <= 1e-12 * max(1.0, abs(float(b))) for a, b in zip(flat, exp))
+    # An integer answer is exact: a float64 round trip of 6 * (2**55 + 1)
+    # passed under the relative tolerance (a comprehension row typed float64).
+    ok = len(flat) == len(exp) and all(
+        (float(a).is_integer() and int(a) == b) if isinstance(b, int) and not isinstance(b, bool)
+        else abs(float(a) - float(b)) <= 1e-12 * max(1.0, abs(float(b)))
+        for a, b in zip(flat, exp))
     want_kinds = ["b" if isinstance(e, bool) else "i" if isinstance(e, int) else "f" if isinstance(e, float) else "?" for e in exp]
     type_ok = all(w == "?" or k == w or (w == "i" and k in "iu") or (w == "b" and k in "biu") for k, w in zip(kinds, want_kinds))
     return ("ok" if type_ok else f"TYPE {feeds} got kinds {kinds} want {want_kinds}") if ok else f"WRONG {feeds} got {flat} want {exp}"
@@ -92,7 +102,7 @@ def run_fortran(module, export, params, outs, inputs, ns):
         from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
         built = compile_fortran_module_c_shell(
             fortran_module, {}, pathlib.Path(tempfile.mkdtemp()), library=True,
-            entrypoint=export, name=export[:48],
+            entrypoint=export, name=export[:48], standalone=FORTRAN_STANDALONE,
         )
         record = next(e for e in fortran_module.api.entry_points if str(e.name) == export)
         native = FortranCoreNative(built.executable_path, record, fortran_module.api)

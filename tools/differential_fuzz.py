@@ -96,6 +96,13 @@ EXTENDED = [
     (["ys{v} = [x{v} * n for x{v} in [{a}, {b}]]", "xs{v} = [{c}, n]", "xs{v}.sort(reverse=True)"], "xs{v}[0] * 10 + sum(ys{v})"),
     # a display rebound inside an unrolled loop (corpus c245, plan C2)
     (["xs{v} = [{a}]", "for i{v} in range(3):", "    xs{v} = [i{v} + n, {b}, i{v}]"], "len(xs{v}) * 100 + xs{v}[0] * 10 + xs{v}[1]"),
+    # a display rebound inside a retained loop that reads it (corpus c246)
+    (["xs{v} = [{a}]", "t{v} = 0", "for i{v} in range(4):", "    t{v} += len(xs{v}) * 10 + xs{v}[-1]", "    xs{v} = [i{v}, n, {b}]"], "t{v} * 10 + len(xs{v})"),
+    # ... and read by subscript after a loop that may run zero times (c247)
+    (["xs{v} = [{a}, {b}]", "for i{v} in range(n):", "    xs{v} = [xs{v}[1] + i{v}, n, {c}]"], "xs{v}[0] * 10 + xs{v}[1] + len(xs{v})"),
+    # an extend by an all-constant display beside a comprehension over a
+    # folded list (corpus c248, plan C16)
+    (["ys{v} = [{a}, n]", "ys{v}.extend([{b}, {c}])", "ws{v} = [z{v} - n for z{v} in [{a}, {c}]]"], "ys{v}[3] * 10 + sum(ws{v}) + len(ys{v})"),
     # chained comparisons whose middle is a builtin conversion or measure,
     # one behind a guarding ``and`` (lanes plan A0)
     (["f{v} = n * 0.5 + {a}"], "1 if 0 <= int(f{v}) <= {b} + 3 else 2"),
@@ -106,6 +113,8 @@ EXTENDED = [
     (["o{v} = maybe_guard(n, {a})", "t{v} = 0", "if o{v} is not None:", "    t{v} = o{v} * 3"], "t{v}"),
     # A value-union return (``x if c else None``) tested by identity.
     (["o{v} = maybe_pick(n, {a})", "t{v} = 5", "if o{v} is not None:", "    t{v} = o{v} - 2"], "t{v}"),
+    # The same union forwarded unchanged by a wrapper.
+    (["o{v} = wrap_pick(n, {a})"], "(-3 if o{v} is None else o{v} + 1)"),
 ]
 EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
@@ -127,6 +136,10 @@ def maybe_guard(x: int, y: int):
 
 def maybe_pick(x: int, y: int):
     return x * 2 if x != y else None
+
+
+def wrap_pick(x: int, y: int):
+    return maybe_pick(x + 1, y)
 
 
 def first_over(x: int, y: int) -> int:
@@ -188,6 +201,37 @@ EXTENDED3 = [
     (["xs{v} = [{a}, n, {a}, {b}]"], "sum(xs{v}) * 100 + xs{v}.count({a}) * 10 + xs{v}.index(n)"),
     (["xs{v} = [{a}, n, {b}]", "xs{v}.remove(n)"], "len(xs{v}) * 10 + xs{v}[1]"),
     (["c{v} = label(n + {a})"], "c{v}"),
+    # list slices (lane E): a folded slice, a slice of a display holding a
+    # parameter, a slice with a runtime lower bound, a sum of a folded list
+    (["xs{v} = [{a}, {b}, {c}, {a}]", "ys{v} = xs{v}[1:3] + [n]"], "len(ys{v}) * 100 + ys{v}[0] * 10 + ys{v}[2]"),
+    (["xs{v} = [{a}, n, {b}]", "ys{v} = xs{v}[-2:]"], "ys{v}[0] * 10 + len(ys{v})"),
+    (["xs{v} = [{a}, n, {b}, {c}]", "ys{v} = xs{v}[n % 3:]"], "len(ys{v}) * 10 + ys{v}[0]"),
+    (["xs{v} = [{a}, {b}, {c}]"], "sum(xs{v}) + n"),
+    # loop targets over an unrolled comprehension and over zip (lane E)
+    (["t{v} = 0", "for y{v} in [x{v} * n for x{v} in [{a}, {b}]]:", "    t{v} += y{v}"], "t{v}"),
+    (["t{v} = 0", "for p{v}, q{v} in zip([{a}, n], [n, {b}]):", "    t{v} += p{v} * {c} + q{v}"], "t{v}"),
+    # max/min/sum over a resident list, Fortran reduces over the live
+    # length (lane E)
+    (["xs{v} = [n, {a}, n * {b}]", "xs{v}.append({c} - n)"], "max(xs{v}) * 1000 + min(xs{v}) * 10 + sum(xs{v}, n)"),
+    (["xs{v} = [n, {a}]", "xs{v}.append(n - {b})"], "int(any(xs{v})) * 10 + int(all(xs{v}))"),
+    # a callee's scalar result beside a callee swap, Fortran (lane E)
+    (["xs{v} = [n, {a}]", "h{v} = head(xs{v})", "swap(xs{v})", "swap(xs{v})", "swap(xs{v})"], "h{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
+    # dict.get with a default past float64's exact integers (lane E)
+    (["d{v} = {{1: {a}, 2: n}}"], "d{v}.get({b} + 3, 36028797018963969) + d{v}.get(2, {c})"),
+    # a callee reads the length of a caller list grown in a loop (lane E)
+    (["xs{v} = [n, {a}]", "for i{v} in range(n % 3 + 1):", "    xs{v}.append(i{v} + {b})"], "width(xs{v}) * 100 + head(xs{v})"),
+    # a dict that accumulates into itself through get (lane E)
+    (["d{v} = {{}}", "for i{v} in range(n % 4 + 1):", "    d{v}[i{v} % 2] = d{v}.get(i{v} % 2, {a}) + 36028797018963969", "t{v} = 0", "for k{v} in range(3):", "    if k{v} in d{v}:", "        t{v} = t{v} + d{v}[k{v}]"], "t{v}"),
+    # a pop from the front inside the growing loop, then iteration (lane E)
+    (["xs{v} = []", "for i{v} in range(n % 5 + 2):", "    xs{v}.append(i{v} + {a})", "    if i{v} % 2 == 1:", "        xs{v}.pop(0)", "t{v} = 0", "for x{v} in xs{v}:", "    t{v} = t{v} * 10 + x{v}"], "t{v}"),
+    # an optional tuple result unpacked after a None test (lane E)
+    (["f{v} = maybe_pair(n, {a}) if n != {b} else None", "r{v} = -1", "if f{v} is not None:", "    p{v}, q{v} = f{v}", "    r{v} = p{v} * 10 + q{v}"], "r{v}"),
+    # a callee that returns an optional scalar, read after a None test (lane E)
+    (["o{v} = maybe_twice(n, {a})", "t{v} = {b}", "if o{v} is not None:", "    t{v} = o{v} - {c}"], "t{v} * 10 + n"),
+    # reductions over a populated list literal (lane E)
+    ([], "sum([{a}, {b}, n]) * 10 + min([{c}, n, {a}])"),
+    # pop at an index and del on a fixed list (lane E)
+    (["xs{v} = [{a}, n, {b}, {c}]", "a{v} = xs{v}.pop(1)", "del xs{v}[0]"], "a{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
     # a callee list bound to branch displays (c271, c331)
     (["c{v} = branchpair(n - {a})"], "c{v}"),
 ]
@@ -228,6 +272,16 @@ def addto(s: set[int], v: int) -> None:
 
 def label(x: int) -> int:
     return len(f"value={int(x)}")
+
+
+def maybe_pair(x: int, y: int) -> tuple[int, int] | None:
+    if x > y:
+        return None
+    return (x + 1, y * 2)
+
+
+def maybe_twice(x: int, y: int):
+    return x * 2 if x != y else None
 
 
 def branchpair(x: int) -> int:
@@ -385,6 +439,9 @@ def run_one(text):
             built = compile_fortran_module_c_shell(
                 fortran, {}, pathlib.Path(tempfile.mkdtemp()), library=True,
                 entrypoint=exports[0], name=exports[0][:48],
+                # FUZZ_FORTRAN_STANDALONE=0 links libgfortran dynamically
+                # (a Linux libgfortran.a is not position independent).
+                standalone=os.environ.get("FUZZ_FORTRAN_STANDALONE", "1") != "0",
             )
             record = next(e for e in fortran.api.entry_points if str(e.name) == exports[0])
             native = FortranCoreNative(built.executable_path, record, fortran.api)

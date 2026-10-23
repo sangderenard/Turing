@@ -407,3 +407,41 @@ def test_is_none_on_an_ifexp_union_call_result_reads_its_tag():
         if instruction.op == "Phi"
     ]
     assert int(payload_id) in {int(argument.id) for argument in merge.args}
+
+
+def test_a_wrapper_forwarding_a_union_result_exports_the_linked_tag():
+    # ``wrap`` returns ``maybe(...)`` unchanged.  Its union frame was built
+    # around the provisional call-result tag; the linked tag must replace it
+    # in the wrapper's return layout and in its callers' call records.
+    source = (
+        "def maybe(row: int, flag: int):\n"
+        "    return row + 1 if flag > 0 else None\n"
+        "def wrap(row: int, flag: int):\n"
+        "    return maybe(row, flag)\n"
+        "def root(row: int, flag: int) -> int:\n"
+        "    v = wrap(row, flag)\n"
+        "    if v is None:\n"
+        "        return -7\n"
+        "    return v\n"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="optional_union_wrapper",
+        extraction_contract=_PROGRAM_CONTRACT, progress=lambda _: None,
+    )
+    (wrap,) = [
+        function for name, function in module.functions.items()
+        if "__wrap" in name and "planned_region" not in name
+    ]
+    (ret,) = [
+        instruction for block in wrap.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    ]
+    ret_ids = tuple(int(value.id) for value in ret.args)
+    assert len(ret_ids) == 2
+    assert set(dict(wrap.metadata["aggregate_return_layouts"]).values()) == {ret_ids}
+    root = module.functions[exports[0]]
+    (call,) = [
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Call"
+    ]
+    assert tuple(map(int, call.attributes["callee_output_ids"])) == ret_ids

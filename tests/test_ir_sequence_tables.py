@@ -1578,6 +1578,7 @@ def test_sequence_return_surface_correlates_output_with_storage_descriptor():
         function.name: [{
             "sequence_id": 60,
             "column_parameters": ["t60"],
+            "column_shapes": [[]],
             "local_column_value_ids": [],
             "length_parameter": "t61",
             "capacity_parameter": "t62",

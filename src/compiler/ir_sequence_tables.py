@@ -397,6 +397,26 @@ def lower_sequence_allocate(
     return SSASequenceLowering((function,))
 
 
+def _storage_array_ids(
+    descriptor: SSASequenceDescriptor,
+    storage: tuple[SSAValue, ...],
+) -> tuple[int, ...]:
+    """The storage formals a positional helper indexes as arrays.
+
+    The capacity cell is a scalar formal (``_storage_values`` declares it
+    with no shape, and ``allocate`` already leaves it out).  Program:
+    ``xs = [5, n, 2]; xs.pop(0)``.  Wrong record: ``delete_at`` listed the
+    capacity among its array arguments, so Fortran gave the caller's scalar
+    capacity a shape-dynamic extent nothing could supply, and the call failed
+    to run.  Rule: every storage formal except the capacity cell.
+    """
+
+    return tuple(
+        int(value.id) for value in storage
+        if int(value.id) != int(descriptor.capacity_value_id)
+    )
+
+
 def _status_branch(
     builder: _Builder,
     block: BasicBlock,
@@ -2014,8 +2034,8 @@ def lower_sequence_append_slice(
     builder = _Builder(_first_fresh_identity(
         destination, source, values=all_storage, minimum=first_value_id
     ))
-    lower = builder.fresh("int")
-    upper = builder.fresh("int")
+    lower = builder.fresh("int64")
+    upper = builder.fresh("int64")
     entry = builder.block("entry")
     lower_negative = builder.block("lower_negative")
     lower_negative_zero = builder.block("lower_negative_zero")
@@ -2040,12 +2060,12 @@ def lower_sequence_append_slice(
     full = builder.block("capacity_exhausted")
     result = builder.block("result")
 
-    zero = builder.const(entry, 0)
-    one = builder.const(entry, 1)
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
     source_length_slot = builder.fresh("ptr")
-    source_length = builder.fresh("int")
+    source_length = builder.fresh("int64")
     destination_length_slot = builder.fresh("ptr")
-    old_length = builder.fresh("int")
+    old_length = builder.fresh("int64")
     builder.emit(entry, "GetElementPtr", [SSAValue(
         source.length_address_id, dtype="int64", shape=(1,)
     ), zero], source_length_slot)
@@ -2058,7 +2078,7 @@ def lower_sequence_append_slice(
     builder.emit(entry, "Lt", [lower, zero], lower_is_negative)
     builder.cond(entry, lower_is_negative, lower_negative, lower_nonnegative)
 
-    relative_lower = builder.fresh("int")
+    relative_lower = builder.fresh("int64")
     builder.emit(lower_negative, "Add", [source_length, lower], relative_lower)
     relative_lower_is_negative = builder.fresh("bool")
     builder.emit(
@@ -2082,7 +2102,7 @@ def lower_sequence_append_slice(
     )
     builder.branch(lower_nonnegative_length, lower_merge)
     builder.branch(lower_nonnegative_value, lower_merge)
-    normalized_lower = builder.fresh("int")
+    normalized_lower = builder.fresh("int64")
     builder.emit(
         lower_merge,
         "Phi",
@@ -2101,7 +2121,7 @@ def lower_sequence_append_slice(
         lower_merge, upper_is_negative, upper_negative, upper_nonnegative
     )
 
-    relative_upper = builder.fresh("int")
+    relative_upper = builder.fresh("int64")
     builder.emit(upper_negative, "Add", [source_length, upper], relative_upper)
     relative_upper_is_negative = builder.fresh("bool")
     builder.emit(
@@ -2125,7 +2145,7 @@ def lower_sequence_append_slice(
     )
     builder.branch(upper_nonnegative_length, bounds_merge)
     builder.branch(upper_nonnegative_value, bounds_merge)
-    normalized_upper = builder.fresh("int")
+    normalized_upper = builder.fresh("int64")
     builder.emit(
         bounds_merge,
         "Phi",
@@ -2145,8 +2165,8 @@ def lower_sequence_append_slice(
     builder.cond(bounds_merge, nonempty, capacity, empty)
     empty_status = _status_branch(builder, empty, 1, result)
 
-    requested = builder.fresh("int")
-    new_length = builder.fresh("int")
+    requested = builder.fresh("int64")
+    new_length = builder.fresh("int64")
     builder.emit(capacity, "Sub", [normalized_upper, normalized_lower], requested)
     builder.emit(capacity, "Add", [old_length, requested], new_length)
     within_capacity = builder.fresh("bool")
@@ -2154,8 +2174,8 @@ def lower_sequence_append_slice(
         destination.capacity_value_id, dtype="int64"
     )], within_capacity)
     builder.cond(capacity, within_capacity, header, full)
-    index = builder.fresh("int")
-    next_index = builder.fresh("int")
+    index = builder.fresh("int64")
+    next_index = builder.fresh("int64")
     builder.emit(
         header, "Phi", [zero, next_index], index,
         attributes={"incoming_blocks": (capacity.name, latch.name)},
@@ -2163,10 +2183,10 @@ def lower_sequence_append_slice(
     continues = builder.fresh("bool")
     builder.emit(header, "Lt", [index, requested], continues)
     builder.cond(header, continues, body, complete)
-    source_index = builder.fresh("int")
+    source_index = builder.fresh("int64")
     source_address = builder.fresh("ptr")
     value = builder.fresh(source.column_dtypes[0])
-    destination_index = builder.fresh("int")
+    destination_index = builder.fresh("int64")
     destination_address = builder.fresh("ptr")
     builder.emit(body, "Add", [normalized_lower, index], source_index)
     builder.emit(body, "GetElementPtr", [SSAValue(
@@ -2594,7 +2614,7 @@ def lower_sequence_delete_at(
         metadata={
             "ssa_sequence_operation": "delete_at",
             "sequence_id": descriptor.sequence_id,
-            "sequence_array_argument_ids": tuple(int(value.id) for value in storage),
+            "sequence_array_argument_ids": _storage_array_ids(descriptor, storage),
             "status_values": {"removed": 1, "index_outside": 2},
             "named_outputs": (("status", int(status.id)),),
         },
@@ -2701,7 +2721,7 @@ def lower_sequence_insert_at(
         metadata={
             "ssa_sequence_operation": "insert_at",
             "sequence_id": descriptor.sequence_id,
-            "sequence_array_argument_ids": tuple(int(value.id) for value in storage),
+            "sequence_array_argument_ids": _storage_array_ids(descriptor, storage),
             "status_values": {"inserted": 1, "capacity_exhausted": 2},
             "named_outputs": (("status", int(status.id)),),
         },
@@ -2775,7 +2795,7 @@ def lower_sequence_reverse(
         metadata={
             "ssa_sequence_operation": "reverse",
             "sequence_id": descriptor.sequence_id,
-            "sequence_array_argument_ids": tuple(int(value.id) for value in storage),
+            "sequence_array_argument_ids": _storage_array_ids(descriptor, storage),
             "status_values": {"reversed": 1},
             "named_outputs": (("status", int(status.id)),),
         },

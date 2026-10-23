@@ -4740,30 +4740,52 @@ def test_single_aggregate_return_keeps_structured_tensor_descriptors():
 
 
 def test_callsite_shape_discards_padded_scalar_result_descriptors():
+    from src.compiler.concordance_declarations import (
+        INGESTION, INGESTION_VALUE, INGEST_SOURCE, NodeFact,
+    )
     from src.compiler.glsl_deployment_strategy import (
         _apply_callsite_tensor_descriptors,
     )
-
-    graph = ProcessGraph(materialize_memory=False)
-    graph.G.graph["identity_table"] = {"grid": (1,)}
-    graph.G.add_node(
-        1, type="Input", op="input",
-        attributes={"binding_name": "grid"},
-        tensor={"shape": (1, 1, 1), "dtype": "float64"},
-    )
-    graph.G.add_node(
-        2, type="Call", op="min",
-        attributes={"tensor_candidate": "min", "dim": 3},
-        parents=((1, "operand"),),
-        tensor={"shape": (1, 1, 1), "dtype": "float64"},
+    from src.compiler.identity_concordance import (
+        Mode, Novel, begin_identity_book, end_identity_book,
     )
 
-    _apply_callsite_tensor_descriptors(
-        graph, {"grid": {"shape": (8, 4, 128, 2), "dtype": "float64"}},
-    )
+    # The graph is assembled by hand, so it registers its nodes on the book
+    # the way ``ensure_node`` does: one ``ingestion_value`` row per node in
+    # the build's ingestion scope.  The withdrawal of node 2's descriptor
+    # stands on node 1's cell; without the rows it has no cause to stand on.
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        graph.G.graph["identity_table"] = {"grid": (1,)}
+        scope = book.mint_scope("ingestion:padded_scalar_result")
+        graph.G.graph["ingestion_value_scope"] = scope
+        graph.G.add_node(
+            1, type="Input", op="input",
+            attributes={"binding_name": "grid"},
+            tensor={"shape": (1, 1, 1), "dtype": "float64"},
+        )
+        graph.G.add_node(
+            2, type="Call", op="min",
+            attributes={"tensor_candidate": "min", "dim": 3},
+            parents=((1, "operand"),),
+            tensor={"shape": (1, 1, 1), "dtype": "float64"},
+        )
+        for node, semantic_type, op in ((1, "Input", "input"), (2, "Call", "min")):
+            book.post(
+                INGESTION_VALUE, (scope, node),
+                NodeFact(semantic_type, op, ""), stage=INGESTION,
+                provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+            )
 
-    assert graph.G.nodes[1]["tensor"]["shape"] == (8, 4, 128, 2)
-    assert "tensor" not in graph.G.nodes[2]
+        _apply_callsite_tensor_descriptors(
+            graph, {"grid": {"shape": (8, 4, 128, 2), "dtype": "float64"}},
+        )
+
+        assert graph.G.nodes[1]["tensor"]["shape"] == (8, 4, 128, 2)
+        assert "tensor" not in graph.G.nodes[2]
+    finally:
+        end_identity_book(token)
 
 
 def test_shape_constant_waits_for_authoritative_callsite_descriptor():

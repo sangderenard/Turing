@@ -9893,6 +9893,30 @@ def _field_slot_ops(
                 f"literal_table={encoded_rows!r}",
                 2,
             ))
+        # Program: ``xs = [3, 1, 4, 1, 5]; ys = xs[:3]; return ys[n % 3]``.
+        # Wrong record: structural specialization folded the slice to the
+        # Constant ``[3, 1, 4]`` with no parents and no leaves, so nothing
+        # wrote its arena: the reset stored length 0 and every row read
+        # returned 0 (and ``xs[:3] + [n, 9]`` copied zero rows).  Rule: a
+        # folded slice's rows are its literal; initialize them like a
+        # compile-time table, under the list's duplicates policy.
+        folded_slice = attributes.get("value")
+        if (
+            aggregate_kind == "list"
+            and attributes.get("producer_kind") == "sequence_slice"
+            and attributes.get("structural_specialization")
+            and not leaf_ids
+            and isinstance(folded_slice, (list, tuple))
+            and folded_slice
+            and all(
+                isinstance(item, (bool, int, float)) for item in folded_slice
+            )
+        ):
+            sequence_initializations.append((
+                sequence_id,
+                f"literal_rows={tuple((item,) for item in folded_slice)!r}",
+                1,
+            ))
         sequence_items = attributes.get("compile_time_sequence_items")
         if (
             aggregate_kind in {"set", "frozenset"}
@@ -10480,7 +10504,12 @@ def _field_slot_ops(
             if isinstance(literal, (int, float)) and not isinstance(
                 literal, bool
             ):
-                table_lookup_defaults[result_id] = float(literal)
+                # Program: ``cells.get(2, 9)`` over int values (corpus
+                # c64).  Wrong record: the default was minted ``9.0``, so the
+                # int64 Const carried a float payload and Fortran passed
+                # REAL(8) to the helper's INTEGER(8) formal.  Rule: the
+                # default keeps the authored literal's own type.
+                table_lookup_defaults[result_id] = literal
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         if node_operation(data) != "indexedstore":
@@ -11088,6 +11117,15 @@ def _sequence_concat_ops(
         resident_by_value.setdefault(int(resident_id), int(resident_id))
         kind_by_value[int(value_id)] = str(kind)
         kind_by_value.setdefault(int(resident_id), str(kind))
+    # A structural alias is the recorded arena of its value.  The exit port
+    # of a loop that rebinds a list (corpus c246) has the body's display as
+    # its one parent, but its arena is the initial list the body's list is
+    # copied into; the single-parent rule below must not re-derive it.
+    recorded_residents = {
+        int(value_id) for value_id, (_resident, kind)
+        in dict(structural_aliases or {}).items()
+        if str(kind) in sequence_kinds
+    }
     # IndexedStore and its loop-result versions are deterministic names for
     # the same resident arena.  Retain that correlation while recognizing
     # structural concatenations across control-versioned sequence names.
@@ -11110,6 +11148,8 @@ def _sequence_concat_ops(
             }:
                 continue
             value_id = int(data.get("value_id", node_id))
+            if value_id in recorded_residents:
+                continue
             resolved_parents = {
                 (
                     int(resident_by_value[parent_value]),
@@ -16325,8 +16365,14 @@ def _record_sequence_projection_bindings(
 def _sequence_row_operations(
     graph_obj: Any,
     sequence_declarations: Iterable[tuple[int, str, int, bool]],
+    recorded_residents: Mapping[int, int] | None = None,
 ) -> tuple[tuple[Any, ...], ...]:
-    """Recover positional reads/writes of fixed-width sequence rows."""
+    """Recover positional reads/writes of fixed-width sequence rows.
+
+    ``recorded_residents`` are promoted arenas (``value -> resident``): the
+    exit port of a loop that rebinds a list names its initial arena, which
+    neither the name history nor the single-parent rule below re-derives.
+    """
 
     sequence_declarations = tuple(sequence_declarations)
     positional_sequences = {int(sequence_id) for sequence_id, policy, _width, _writable
@@ -16348,11 +16394,19 @@ def _sequence_row_operations(
         for value_id in history
     }
     resident_by_value.update({sequence_id: sequence_id for sequence_id in widths})
+    recorded = {
+        int(value_id): int(resident)
+        for value_id, resident in dict(recorded_residents or {}).items()
+        if int(resident) in widths
+    }
+    resident_by_value.update(recorded)
     changed = True
     aliases = _loop_carried_storage_aliases(graph_obj)
     while changed:
         changed = False
         for alias_id, source_id in aliases.items():
+            if int(alias_id) in recorded:
+                continue
             resident = resident_by_value.get(int(source_id))
             if resident is not None and resident_by_value.get(int(alias_id)) != resident:
                 resident_by_value[int(alias_id)] = resident
@@ -16376,6 +16430,8 @@ def _sequence_row_operations(
             if len(residents) == 1:
                 value_id = int(data.get("value_id", node_id))
                 resident = next(iter(residents))
+                if value_id in recorded:
+                    continue
                 if resident_by_value.get(value_id) != resident:
                     resident_by_value[value_id] = resident
                     changed = True
@@ -18385,6 +18441,33 @@ def _propagate_native_type_tag_results(
                                 f"provenance at {callee.name}->{caller.name}: "
                                 f"value={int(declared_id)}"
                             )
+                        # Program: ``def wrap(r, f): return maybe(r, f)``.
+                        # Wrong record: the wrapper's return frame registered
+                        # this union under the provisional call-result tag;
+                        # the linked tag then read as a conflicting
+                        # descriptor.  Rule: the descriptor that differs only
+                        # by that provisional tag is revised to the linked
+                        # one; any other difference still conflicts.
+                        incumbent = caller_unions.by_id(
+                            int(result_descriptor.union_id)
+                        )
+                        provisional_tag_id = dict(caller.metadata.get(
+                            "native_value_type_tags", ()
+                        )).get(int(first_payload.id))
+                        if (
+                            incumbent is not None
+                            and provisional_tag_id is not None
+                            and int(incumbent.tag_value_id)
+                            == int(provisional_tag_id)
+                            and int(provisional_tag_id) != int(tag.id)
+                            and replace(
+                                incumbent, tag_value_id=int(tag.id)
+                            ) == result_descriptor
+                        ):
+                            caller_unions.unions.assign(
+                                int(result_descriptor.union_id),
+                                result_descriptor, sources=result_cells,
+                            )
                         caller_unions.register(
                             result_descriptor, sources=result_cells,
                         )
@@ -18461,6 +18544,105 @@ def _propagate_native_type_tag_results(
                                 argument for argument in caller.args
                                 if argument is not prior_tag
                             ]
+                            # Program: ``def wrap(r, f): return maybe(r, f)``.
+                            # Wrong record: the wrapper's published return
+                            # layout (payload, tag) kept the provisional tag,
+                            # so its caller read a slot nothing writes (``is
+                            # None`` always true).  Rule: the layout names
+                            # the linked tag, revised from its own row.
+                            from .structural_concordance import (
+                                aggregate_return_layouts,
+                                publish_aggregate_return_layout,
+                            )
+                            from .ssa_record_return_state import (
+                                function_scope_of,
+                            )
+                            from .concordance_declarations import (
+                                AGGREGATE_RETURN_LAYOUT, FRAME_LINK,
+                            )
+                            from .identity_concordance import (
+                                current_identity_book,
+                            )
+                            for output_id, members in tuple(
+                                aggregate_return_layouts(caller).items()
+                            ):
+                                if int(prior_tag_id) not in members:
+                                    continue
+                                book = current_identity_book()
+                                publish_aggregate_return_layout(
+                                    caller, int(output_id),
+                                    tuple(
+                                        int(tag.id)
+                                        if int(member) == int(prior_tag_id)
+                                        else int(member)
+                                        for member in members
+                                    ),
+                                    sources=(
+                                        book.current_ref(
+                                            AGGREGATE_RETURN_LAYOUT,
+                                            (
+                                                function_scope_of(caller),
+                                                int(output_id),
+                                            ),
+                                        ),
+                                        _frame_value_cell(caller, int(tag.id)),
+                                    ),
+                                    stage=FRAME_LINK,
+                                )
+                            # The same wrong record seen from the wrapper's
+                            # callers: their linked calls name the wrapper's
+                            # outputs by id, the provisional tag among them.
+                            renamed = {int(prior_tag_id): int(tag.id)}
+                            for outer in all_functions.values():
+                                for outer_block in outer.blocks.values():
+                                    for outer_call in outer_block.instrs:
+                                        if (
+                                            outer_call.op not in {"Call", "call"}
+                                            or str(outer_call.attributes.get(
+                                                "callee"
+                                            ) or "") != str(caller.name)
+                                        ):
+                                            continue
+                                        attributes = outer_call.attributes
+                                        if "callee_output_ids" in attributes:
+                                            attributes["callee_output_ids"] = tuple(
+                                                renamed.get(int(value), int(value))
+                                                for value in attributes[
+                                                    "callee_output_ids"
+                                                ]
+                                            )
+                                        if "physical_result_bindings" in attributes:
+                                            attributes[
+                                                "physical_result_bindings"
+                                            ] = tuple(
+                                                (
+                                                    renamed.get(
+                                                        int(callee_id),
+                                                        int(callee_id),
+                                                    ),
+                                                    int(caller_id),
+                                                )
+                                                for callee_id, caller_id in (
+                                                    attributes[
+                                                        "physical_result_bindings"
+                                                    ]
+                                                )
+                                            )
+                                        if "native_result_contract" in attributes:
+                                            attributes[
+                                                "native_result_contract"
+                                            ] = tuple(
+                                                (
+                                                    renamed.get(
+                                                        int(entry[0]),
+                                                        int(entry[0]),
+                                                    ),
+                                                    *tuple(entry[1:]),
+                                                )
+                                                for entry in attributes[
+                                                    "native_result_contract"
+                                                ]
+                                            )
                         prior_tags[int(first_payload.id)] = int(tag.id)
                         caller.metadata["native_value_type_tags"] = tuple(
                             sorted(
@@ -25255,6 +25437,23 @@ def _class_surface_ssa_program(
                     expression.ctx, ast.Load
                 ):
                     singleton_name_aliases[int(value_id)] = source_id
+        # The exit port of a loop that rebinds a list (corpus c246) copies
+        # the body list's aggregate attributes, but its arena is the initial
+        # list the promotion carried it into: it names that storage and is
+        # not a list of its own.
+        promoted_loop_ports = {
+            int(value_id)
+            for value_id, (resident_id, _kind)
+            in conditional_sequence_aliases.items()
+            if int(value_id) != int(resident_id)
+            and str(graph_node_by_value.get(int(value_id), {}).get("type"))
+            == "LoopResult"
+        }
+        if promoted_loop_ports:
+            sequence_declarations = tuple(
+                declaration for declaration in sequence_declarations
+                if int(declaration[0]) not in promoted_loop_ports
+            )
         if conditional_sequence_destinations:
             sequence_declarations = tuple(
                 (
@@ -26874,7 +27073,10 @@ def _class_surface_ssa_program(
                         int(mutation.argument_value_ids[0]),
                     )
                     for mutation in control_mutations
-                    if str(mutation.operator) == "sorted"
+                    # A ``replace`` (a list rebound in a retained loop, corpus
+                    # c246) copies its source's rows into the destination,
+                    # so the destination holds as many rows as the source.
+                    if str(mutation.operator) in {"sorted", "replace"}
                     and mutation.argument_value_ids
                 ),
             ))
@@ -27308,7 +27510,12 @@ def _class_surface_ssa_program(
                     _sequence_inplace_bit_pack_call_ops(graph)
                 ),
                 sequence_row_operations=_sequence_row_operations(
-                    graph_obj, sequence_declarations
+                    graph_obj, sequence_declarations,
+                    {
+                        int(value_id): int(resident_id)
+                        for value_id, (resident_id, _kind)
+                        in conditional_sequence_aliases.items()
+                    },
                 ),
                 sequence_read_before_effects=tuple(
                     graph_obj.graph.get("sequence_read_before_effect_edges")
