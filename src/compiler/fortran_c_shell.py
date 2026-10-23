@@ -25006,6 +25006,19 @@ def _class_surface_ssa_program(
             graph_obj.graph.get("planner_specializations") or {},
             graph_obj.graph.get("planner_tensor_descriptors") or {},
         )
+        # Program: ``head(xs0); xs2.append(0); head(xs2)`` (scratch s28
+        # c_g).  Wrong record: the first callsite's copy bound ``xs`` by its
+        # display members, the second bound it whole as grown storage; both
+        # copies carried empty literal/tensor contracts, so both lowered as
+        # ``x__head`` and the first call read the second's frame.  Rule: a
+        # member-bound aggregate is part of the callsite contract.
+        aggregate_specialization = (
+            graph_obj.graph.get("planner_aggregate_descriptors") or {}
+        )
+        if aggregate_specialization:
+            specialization_contract = (
+                *specialization_contract, aggregate_specialization,
+            )
         # A record-only callsite variant IS a different executable contract.
         # root(Actual)->relay(Declared)->leaf(Declared) used to overwrite both
         # variants under one symbol because only literals/tensors were keyed.
@@ -25045,7 +25058,23 @@ def _class_surface_ssa_program(
         # ``specialization_contract``; a later shell with the same symbol
         # and the same contract calls that executable, and a different
         # contract under one symbol (a digest collision) is refused.
-        shell_contract = repr(specialization_contract)
+        # The contract alone missed a member-bound aggregate (scratch s28
+        # c_g), so the shell's own input frame is compared too: one
+        # executable has one frame, and a reused symbol whose shell binds
+        # its formals differently is refused here rather than linked.
+        shell_frame = tuple(sorted(
+            (
+                str(attributes.get("binding_name")),
+                str(attributes.get("aggregate_parent_binding")),
+                repr(attributes.get(
+                    "aggregate_path", attributes.get("aggregate_index"),
+                )),
+            )
+            for _node_id, data in graph_obj.nodes(data=True)
+            if data.get("type") == "Input"
+            for attributes in (data.get("attributes") or {},)
+        ))
+        shell_contract = (repr(specialization_contract), shell_frame)
         if symbol in lowered_symbol_contracts:
             if lowered_symbol_contracts[symbol] != shell_contract:
                 from .identity_concordance import ConcordanceRefusal

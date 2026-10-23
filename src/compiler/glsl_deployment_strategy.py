@@ -19629,6 +19629,9 @@ def _propagate_callsite_tensor_specializations(
         specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
             descriptors
         )
+        specialized.G.graph["planner_aggregate_descriptors"] = copy.deepcopy(
+            aggregate_descriptors
+        )
         _apply_callsite_tensor_descriptors(specialized, descriptors)
         _apply_callsite_aggregate_descriptors(
             specialized, aggregate_descriptors,
@@ -27852,6 +27855,11 @@ def _callsite_specialized_shell_type(
     )
     specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
         tensor_descriptors
+    )
+    # A member-bound aggregate formal is a different frame from the same
+    # formal bound whole as storage; the symbol digest reads this record.
+    specialized.G.graph["planner_aggregate_descriptors"] = copy.deepcopy(
+        aggregate_descriptors
     )
     if record_descriptors:
         parameter_records = copy.deepcopy(dict(

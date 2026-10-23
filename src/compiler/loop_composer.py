@@ -1802,6 +1802,26 @@ def evaporate_unrolled_loops(
         live.update(
             int(call_id) for call_id, _receiver in _method_mutation_edges(graph.G)
         )
+        # Program: ``for y in [x * n for x in [6, 3]]: t += y`` beside ``m =
+        # [[n, 5], [5, 5]]; m[1][0] = n`` then ``t + m[1][0]`` (fuzzer
+        # p85_45).  Wrong record: a store through the projection ``m[1]``
+        # publishes a version nothing reads (the later read projects ``m``
+        # again), so this pruning deleted the store; the structural fold then
+        # read the inner display's initializer (5 for n; clean audit).  Rule:
+        # an indexed store outside the evaporated loops is an effect, so it is
+        # live.
+        evaporated_body_ids = {
+            int(node_id)
+            for plan in plans
+            if int(plan.loop.node_id) in handled_loop_ids
+            for node_id in plan.loop.body_nodes
+        }
+        live.update(
+            int(node_id)
+            for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("type")) == "IndexedStore"
+            and int(node_id) not in evaporated_body_ids
+        )
         # Dataflow ancestry alone is insufficient to retain source control:
         # loop nodes own their bodies semantically, and are not necessarily a
         # value predecessor of the function's return roots.  Evaporating an

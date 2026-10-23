@@ -2725,18 +2725,16 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 for leaf in (graph_obj.nodes[row_id].get("attributes")
                              or {}).get("aggregate_leaf_value_ids", ())
             )
-            literal = (
-                _scalar_constant_member(
-                    graph_obj.nodes[nodes_by_value[leaves[0]][0]]
-                )
-                if len(leaves) == 1 and len(nodes_by_value.get(leaves[0], ())) == 1
-                else None
-            )
-            if len(row_ids) != 1 or not isinstance(literal, (bool, int, float)):
+            # One member, literal or runtime, is born by the fill (``[n] *
+            # 3``, corpus c334/c335: the fill reads the member's value).
+            # Only a wider row has no birth.
+            if len(row_ids) != 1 or len(leaves) != 1 or len(
+                nodes_by_value.get(leaves[0], ())
+            ) != 1:
                 raise ValueError(
                     f"list {sequence_id} replicates a row other than one "
-                    "literal member; a replication is lowered only as the "
-                    "fill of one literal"
+                    "member; a replication is lowered only as the fill of "
+                    "one member"
                 )
         if (sequence_id in accepted
                 and attributes.get("materialization_kind") == "unrolled_loop"
