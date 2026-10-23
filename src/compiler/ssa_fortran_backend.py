@@ -3799,7 +3799,14 @@ class _FunctionEmitter:
             if op in {"FloorDiv", "floordiv"} and str(
                 instr.res.dtype or self.dtype
             ) in _INTEGER_DTYPES:
-                return f"({args[0]} / {args[1]})"
+                # Python floors; Fortran's integer ``/`` truncates toward
+                # zero, so ``-7 // 3`` gave -2 (c04, c15, c24; lane E).
+                # ``a - modulo(a, b)`` is an exact multiple of ``b`` whose
+                # quotient is the floor, with ``modulo`` taking b's sign as
+                # Python's ``%`` does.
+                a = f"int({args[0]}, c_int64_t)"
+                b = f"int({args[1]}, c_int64_t)"
+                return f"(({a} - modulo({a}, {b})) / {b})"
             if op in {"Mod", "mod"} and str(
                 instr.res.dtype or self.dtype
             ) in _INTEGER_DTYPES:
@@ -4047,9 +4054,36 @@ class _FunctionEmitter:
         indent: int = 4,
     ) -> None:
         pad = " " * indent
-        for predecessor, result, incoming in self._phi_targets.get(target, ()):
-            if predecessor != source:
-                continue
+        # Program: ``for i in range(10): if i * i > n: break`` then
+        # ``return i`` (c124; lane E).  Wrong record: an edge's Phi copies
+        # were written in declaration order, so ``i_after = i`` read the
+        # ``i`` the previous copy had already advanced (10 for 9).  Rule:
+        # the copies of one edge are parallel; write a copy only after
+        # every copy that reads its target, and refuse a cycle by name.
+        pending = [
+            (result, incoming)
+            for predecessor, result, incoming in self._phi_targets.get(target, ())
+            if predecessor == source
+        ]
+        while pending:
+            ready = next(
+                (
+                    position for position, (result, _incoming) in enumerate(pending)
+                    if not any(
+                        _name(other_incoming) == _name(result)
+                        and _name(other_result) != _name(result)
+                        for other_result, other_incoming in pending
+                    )
+                ),
+                None,
+            )
+            if ready is None:
+                raise FortranEmissionError(
+                    f"phi copies on edge {source} -> {target} form a cycle "
+                    f"({', '.join(_name(result) for result, _ in pending)}); "
+                    "a parallel copy needs a temporary this emitter does not declare"
+                )
+            result, incoming = pending.pop(ready)
             expression = self._coerce_value_to_target(
                 result, incoming, _name(incoming)
             )
@@ -4882,6 +4916,23 @@ def emit_module(
             continue
         declared = tuple(function.metadata.get("named_outputs") or ())
         if not declared:
+            # Program: ``while b != 0: a, b = b, a % b`` (c18; lane E).
+            # Wrong record: a planned region with no return metadata was
+            # named by its CALLERS' projection loads, and the last call site
+            # won, so ``planned_region_0`` published the caller's id 955
+            # while its body computed ``t3`` and left the output unwritten
+            # (gcd(48, 18) returned 48).  Rule: as for ``return_value``, a
+            # function's own ``Ret`` operands are its outputs; the caller
+            # catalogue is consulted only when there is no single ``Ret``.
+            returned = {
+                tuple(int(value.id) for value in instruction.args): tuple(instruction.args)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Ret", "ret"} and instruction.args
+            }
+            if len(returned) == 1:
+                named_outputs[function_name] = next(iter(returned.values()))
+                continue
             projected = aggregate_outputs.get(str(function_name))
             if projected:
                 named_outputs[function_name] = tuple(

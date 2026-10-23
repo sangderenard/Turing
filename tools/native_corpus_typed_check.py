@@ -73,18 +73,55 @@ def run_isolated(function, *args):
     return result
 
 
-def run_fortran(module, export):
-    # The Fortran backend has no execution harness here; without a
-    # compiler on the machine, emission is all that can be checked, and
-    # the line says so rather than passing.
-    from src.compiler.ssa_fortran_backend import emit_module, fortran_compiler
+def run_fortran(module, export, params, outs, inputs, ns):
+    # Compiled and executed through the packed Fortran core ABI when a
+    # compiler is on the machine; without one, emission is all that can be
+    # checked, and the line says so rather than passing.
+    from src.compiler.ssa_fortran_backend import (
+        FortranCoreNative, emit_module, fortran_compiler,
+    )
     try:
-        emit_module(module, progress=lambda _: None)
+        fortran_module = emit_module(module, progress=lambda _: None)
     except Exception as e:
-        return f"EMIT-FAIL {type(e).__name__}: {str(e)[:300]}"
+        return f"EMIT-FAIL {type(e).__name__}: {str(e)[:300]}", None
+    if not getattr(fortran_module, "complete", True):
+        return f"EMIT-INCOMPLETE {[s.format()[:150] for s in fortran_module.shortfalls[:2]]}", None
     if fortran_compiler() is None:
-        return "EMITTED, NOT RUN (no Fortran compiler on this machine)"
-    return "EMITTED, NOT RUN (no execution harness)"
+        return "EMITTED, NOT RUN (no Fortran compiler on this machine)", None
+    try:
+        from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
+        built = compile_fortran_module_c_shell(
+            fortran_module, {}, pathlib.Path(tempfile.mkdtemp()), library=True,
+            entrypoint=export, name=export[:48],
+        )
+        record = next(e for e in fortran_module.api.entry_points if str(e.name) == export)
+        native = FortranCoreNative(built.executable_path, record, fortran_module.api)
+    except Exception as e:
+        return f"COMPILE-FAIL {type(e).__name__}: {str(e)[:300]}", None
+    results, values = [], []
+    for feeds in inputs:
+        try:
+            ex = native.prepare_execution({params[k]: np.array([v]) for k, v in feeds.items()}).run()
+            arrays = [np.asarray(ex.buffers[v.id]) for v in outs]
+            flat = [x for a in arrays for x in a.reshape(-1).tolist()]
+            values.append(flat)
+            results.append(judge(feeds, ns["root"](**feeds), flat, [a.dtype.kind for a in arrays]))
+        except Exception as e:
+            values.append(None)
+            results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
+    bad = [r for r in results if r != "ok"]
+    return f"{'PASS' if not bad else 'FAIL'} {bad[:3]}", values
+
+
+def disagreements(inputs, c_values, other_values):
+    return [
+        f"{feeds} c={c} other={o}"
+        for feeds, c, o in zip(inputs, c_values, other_values)
+        if c is not None and o is not None and (
+            len(c) != len(o)
+            or any(abs(float(a) - float(b)) > 1e-12 * max(1.0, abs(float(a))) for a, b in zip(c, o))
+        )
+    ]
 
 
 for path in sorted(pathlib.Path(sys.argv[1]).glob("c*.py")):
@@ -129,16 +166,12 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("c*.py")):
     if "llvm" in BACKENDS:
         verdict, llvm_values = run_isolated(run_llvm, module, exports[0], params, outs, inputs, ns)
         print(f"{path.stem}: LLVM {verdict}")
-        if llvm_values is not None:
-            disagreements = [
-                f"{feeds} c={c} llvm={l}"
-                for feeds, c, l in zip(inputs, c_values, llvm_values)
-                if c is not None and l is not None and (
-                    len(c) != len(l)
-                    or any(abs(float(a) - float(b)) > 1e-12 * max(1.0, abs(float(a))) for a, b in zip(c, l))
-                )
-            ]
-            if disagreements:
-                print(f"{path.stem}: DISAGREE c/llvm {disagreements[:2]}")
+        found = disagreements(inputs, c_values, llvm_values or ())
+        if found:
+            print(f"{path.stem}: DISAGREE c/llvm {found[:2]}")
     if "fortran" in BACKENDS:
-        print(f"{path.stem}: FORTRAN {run_fortran(module, exports[0])}")
+        verdict, fortran_values = run_isolated(run_fortran, module, exports[0], params, outs, inputs, ns)
+        print(f"{path.stem}: FORTRAN {verdict}")
+        found = disagreements(inputs, c_values, fortran_values or ())
+        if found:
+            print(f"{path.stem}: DISAGREE c/fortran {found[:2]}")
