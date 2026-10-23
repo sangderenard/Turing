@@ -104,6 +104,10 @@ EXTENDED = [
     # an extend by an all-constant display beside a comprehension over a
     # folded list (corpus c248, plan C16)
     (["ys{v} = [{a}, n]", "ys{v}.extend([{b}, {c}])", "ws{v} = [z{v} - n for z{v} in [{a}, {c}]]"], "ys{v}[3] * 10 + sum(ws{v}) + len(ys{v})"),
+    # len of a dict after a keyed delete, also after an unrolled loop
+    # (corpus c370, plan C3)
+    (["d{v} = {{1: {a}, 2: n, 3: {b}}}", "del d{v}[2]"], "len(d{v}) * 10 + n"),
+    (["e{v} = {{}}", "for i{v} in range(4):", "    e{v}[i{v}] = i{v} + n", "del e{v}[{c} % 4]"], "len(e{v})"),
     # chained comparisons whose middle is a builtin conversion or measure,
     # one behind a guarding ``and`` (lanes plan A0)
     (["f{v} = n * 0.5 + {a}"], "1 if 0 <= int(f{v}) <= {b} + 3 else 2"),

@@ -18084,6 +18084,32 @@ class _ControlSSABuilder(TiledObject):
             value = self._emit_native_object_operation('get', pair_receipt['source_iterable_value_id'], (key,), value_id)
             self.current.instrs[-1].attributes['native_pair_projection'] = {'contract_cell': pair_receipt['contract_cell']}
             bound_loop_target_ids.update((key_id, value_id))
+        # Program: ``d = {1: 10, 2: 20, 3: 30}; del d[2]; for k in d: ...``.
+        # Wrong record: the loop ran over the physical rows, and a keyed
+        # delete only clears the row's live flag, so the deleted key was
+        # still visited (57 for 37).  Nothing here skips a cleared row.
+        # Rule: iterating a table that carries live flags is refused.
+        for iterable_id, _target_id, induction_name, *_projection in (
+            *self.program.iterable_bindings,
+            *self.program.projected_iterable_bindings,
+        ):
+            if induction_name != loop.induction:
+                continue
+            sequence_id, seen = int(iterable_id), set()
+            while sequence_id in self.value_aliases and sequence_id not in seen:
+                seen.add(sequence_id)
+                sequence_id = int(self.value_aliases[sequence_id])
+            descriptor = self.sequence_descriptors.get(sequence_id)
+            if (
+                descriptor is not None
+                and descriptor.live_flags_value_id is not None
+            ):
+                raise ValueError(
+                    f"{path}: loop {loop.induction} iterates table "
+                    f"{sequence_id}, whose deleted rows stay resident behind "
+                    "cleared live flags; iteration over a table with "
+                    "deletions is not lowered"
+                )
         for iterable_id, target_id, induction_name in (
             self.program.iterable_bindings
         ):
@@ -25035,6 +25061,7 @@ def lower_control_sections_to_ssa(
     table_deletions: tuple[
         tuple[int, int | tuple[int, ...], int | None, str], ...
     ] = (),
+    table_deletion_bases: Mapping[int, int] | None = None,
     retained_sequence_ids: tuple[int, ...] = (),
     nested_sequence_ids: tuple[int, ...] = (),
     nested_tensor_sequence_ids: tuple[int, ...] = (),
@@ -27455,8 +27482,32 @@ def lower_control_sections_to_ssa(
     iterable_source_ids = {
         int(binding[0]) for binding in control.iterable_bindings
     }
+    # Program: ``e = {}; for i in range(4): e[i] = i + n`` then ``del e[0];
+    # len(e)`` (fuzzer p11_63; lanes plan C3).  Wrong record: the delete
+    # keeps its authored id while the unrolled stores are minted after it,
+    # so the value-order rule below put it before the region that carries
+    # the first store, and it deleted from an empty table (4 for 3).  Rule:
+    # a delete whose table version is a scheduled store follows that store.
+    store_placements: dict[int, tuple[list, int]] = {}
+    for operations_by_region in (
+        table_region_operations, table_region_post_operations,
+    ):
+        for operations in operations_by_region.values():
+            for position, (kind, arguments) in enumerate(operations):
+                if kind == "store":
+                    store_placements[int(arguments[0])] = (operations, position)
     for deletion in table_deletions:
         effect_id = int(deletion[0])
+        base_store = store_placements.get(
+            int((table_deletion_bases or {}).get(effect_id, -1))
+        )
+        if base_store is not None:
+            operations, position = base_store
+            operations.insert(position + 1, ("delete", deletion))
+            for key, (placed, placed_position) in tuple(store_placements.items()):
+                if placed is operations and placed_position > position:
+                    store_placements[key] = (placed, placed_position + 1)
+            continue
         preceding = [
             (value_id, region_index)
             for value_id, region_index in region_source_values

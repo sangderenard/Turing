@@ -27740,6 +27740,20 @@ def _class_surface_ssa_program(
                 table_lookup_defaults=table_lookup_defaults,
                 table_stores=table_stores,
                 table_deletions=table_deletions,
+                # The table version each keyed delete reads (its ``base``).
+                table_deletion_bases={
+                    int(data.get("value_id", node_id)): int(
+                        graph_obj.nodes[base].get("value_id", base)
+                    )
+                    for node_id, data in graph_obj.nodes(data=True)
+                    if str(data.get("type") or "") == "DelItem"
+                    for base in (next((
+                        int(parent)
+                        for parent, role in data.get("parents") or ()
+                        if str(role) == "base" and int(parent) in graph_obj
+                    ), None),)
+                    if base is not None
+                },
                 retained_sequence_ids=retained_sequence_ids,
                 nested_sequence_ids=nested_sequence_ids,
                 nested_tensor_sequence_ids=nested_tensor_sequence_ids,
