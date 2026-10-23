@@ -1909,6 +1909,9 @@ def _emit_repository_call_module(
     internal_call_records: list[tuple[str | None, str, tuple[str, ...]]] = []
     emitted_functions: list[str] = []
     emitted_names: list[str] = []
+    from .ssa_storage_requirements import module_storage_requirements
+
+    frame_storage_requirements = module_storage_requirements(module)
     for name in reachable:
         function = module.functions[name]
         outputs = function_outputs[name]
@@ -1957,6 +1960,10 @@ def _emit_repository_call_module(
             for value in function.args
             if (value.accounting or {}).get("tensor_extent_kind") == "shape"
         }
+        # Element storage of a static aggregate constant read only through
+        # element addresses: the payload's own scalar kind, not the
+        # ``ssa.aggregate`` result's default ``double``.
+        aggregate_constant_types: dict[int, str] = {}
         allocated: set[int] = set()
         output_pointer = {
             int(value.id): f"%out.{index}"
@@ -2021,8 +2028,28 @@ def _emit_repository_call_module(
             llvm_type = _value_llvm_type(value)
             count = _value_element_count(value)
             register = f"%value.{value_id}"
+            # Program: ``len(f"v={int(x)}")`` in a callee (c62, lane E).
+            # Wrong record: compiler-frame storage this function owns (the
+            # f-string's glyph-token arena) was sized by its SSA shape, one
+            # cell, while its literal glyphs wrote two; the second store
+            # overran the stack frame and the process died.  Rule: as in
+            # the C lane's activation arrays, owned frame storage takes the
+            # solved storage requirement and starts zeroed.
+            owned_frame = (
+                str((value.accounting or {}).get("compiler_frame_storage") or "")
+                == str(name)
+            )
+            if owned_frame:
+                requirement = frame_storage_requirements.get(name, {}).get(value_id)
+                if requirement is not None and requirement.element_count is not None:
+                    count = max(count, int(requirement.element_count))
             if value_id not in allocated:
                 _frame_slot(register, llvm_type, count, entry_allocas, entry_frees)
+                if owned_frame:
+                    entry_allocas.append(
+                        f"  call void @llvm.memset.p0.i64(ptr {register}, i8 0, "
+                        f"i64 {count * _LLVM_TYPE_BYTES.get(str(llvm_type), 8)}, i1 false)"
+                    )
                 allocated.add(value_id)
             pointers[value_id] = register
             return register
@@ -2684,6 +2711,25 @@ def _emit_repository_call_module(
                         payload = flattened[0]
                     else:
                         aggregate_items = tuple(flattened) or (0,)
+                        # A tuple of ints stored as doubles and read back
+                        # through an element address as ``load i64`` is the
+                        # double's bit pattern: ``for x in (1, 5, 9)`` saw
+                        # 4607182418800017408.  When every use is an element
+                        # address, store the payload's own kind so the
+                        # address stride and the readers' loads agree.
+                        if all(
+                            consumer.op in {"GetElementPtr", "getelementptr"}
+                            and position == 0
+                            for candidate_block in function.blocks.values()
+                            for consumer in candidate_block.instrs
+                            for position, argument in enumerate(consumer.args)
+                            if int(argument.id) == result_id
+                        ):
+                            aggregate_constant_types[result_id] = (
+                                "i1" if all(isinstance(item, bool) for item in flattened)
+                                else "i64" if all(isinstance(item, int) for item in flattened)
+                                else "double"
+                            )
                         if (
                             result_id not in pointers
                             and result_id not in output_pointer
@@ -2691,7 +2737,10 @@ def _emit_repository_call_module(
                         ):
                             register = f"%value.{result_id}"
                             _frame_slot(
-                                register, _value_llvm_type(result),
+                                register,
+                                aggregate_constant_types.get(
+                                    result_id, _value_llvm_type(result),
+                                ),
                                 len(aggregate_items),
                                 entry_allocas, entry_frees,
                             )
@@ -2699,7 +2748,9 @@ def _emit_repository_call_module(
                             pointers[result_id] = register
                 target = pointer(result)
                 if aggregate_items is not None:
-                    llvm_type = _value_llvm_type(result)
+                    llvm_type = aggregate_constant_types.get(
+                        result_id, _value_llvm_type(result),
+                    )
                     for index, item in enumerate(aggregate_items):
                         slot = f"%const.slot.{tag}.{index}"
                         body.append(
@@ -3226,7 +3277,9 @@ def _emit_repository_call_module(
                                 f"  {summed} = add i32 {scaled}, {index}"
                             )
                             offset = summed
-                        element_type = _value_llvm_type(base)
+                        element_type = aggregate_constant_types.get(
+                            int(base.id), _value_llvm_type(base),
+                        )
                         base_pointer = pointer(base)
                         heap_element = (base.accounting or {}).get("heap_element_dtype")
                         if heap_element is not None:
@@ -3279,6 +3332,19 @@ def _emit_repository_call_module(
                     if heap_address and span_address_types.get(int(address_argument.id)) != loaded_type:
                         shortfalls.append(LLVMEmissionShortfall(name, operation,
                             "heap load result disagrees with its declared element layout; explicit conversion required"))
+                        continue
+                    stored_type = span_address_types.get(int(address_argument.id))
+                    if (
+                        stored_type is not None
+                        and stored_type != loaded_type
+                        and "double" in {stored_type, loaded_type}
+                    ):
+                        # Loading an integer from a double cell (or the
+                        # reverse) reads the other kind's bit pattern.
+                        shortfalls.append(LLVMEmissionShortfall(name, operation,
+                            f"{loaded_type} load of %t{result_id} from a "
+                            f"{stored_type} element of %t{int(address_argument.id)}; "
+                            "explicit conversion required"))
                         continue
                     if (loaded_type in {"double", "i32", "i1"}
                             or int(address_argument.id) in owned_heap_addresses
@@ -4609,6 +4675,17 @@ def _emit_repository_call_module(
         local = f"%root.frame.{storage_index}"
         _frame_slot(local, llvm_type, count, wrapper, wrapper_frees)
         entry_span.take(UnitKind.DECLARATION, args=(value,), spelling=local)
+        # Program: ``xs = [5, n, 2, 9]; xs.sort()`` (lane E, c275).  Wrong
+        # record: the root frame's private cells were bare allocas, so the
+        # sort's scratch length read garbage, its reserve refused, and the
+        # list came back unsorted in LLVM while C was right.  Rule: as in
+        # the C wrapper (``memset`` of every owned activation), root-owned
+        # frame storage starts zeroed before any publication below.
+        wrapper.append(
+            f"  call void @llvm.memset.p0.i64(ptr {local}, i8 0, i64 "
+            f"{int(count) * _LLVM_TYPE_BYTES.get(str(llvm_type), 8)}, i1 false)"
+        )
+        entry_span.take(UnitKind.STATEMENT, args=(value,), spelling=local)
         public_pointer[int(value.id)] = local
         allocated_counts[int(value.id)] = count
     # [10,20].append(30) emitted all three row writes correctly, but LLVM's

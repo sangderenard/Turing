@@ -5574,13 +5574,21 @@ class _ControlSSABuilder(TiledObject):
                 )
         return None
 
-    def constant_value(self, literal: int, *operands: Any) -> SSAValue:
+    def constant_value(
+        self, literal: int, *operands: Any, dtype: str = "int",
+    ) -> SSAValue:
         """An int literal the builder needs: CONTROL_CONST from ``operands``
         (the cells of what the literal indexes or bounds; a bare literal has
-        no identity cell of its own and names the function root)."""
+        no identity cell of its own and names the function root).
+
+        A literal that enters a loop Phi takes the Phi's dtype: an ``int``
+        zero entering an ``int64`` index Phi (or an ``int`` False entering a
+        ``bool`` accumulator) is a representation change no Phi can make,
+        and the LLVM lane refused every resident ``sum``/``any``/``count``
+        loop on it (lane E)."""
 
         value = self.fresh_value(
-            dtype="int", transform=CONTROL_CONST, operands=operands,
+            dtype=dtype, transform=CONTROL_CONST, operands=operands,
         )
         self.emit(
             Handler.Const,
@@ -11706,9 +11714,9 @@ class _ControlSSABuilder(TiledObject):
             body = self.new_block("sequence_any_body")
             latch = self.new_block("sequence_any_latch")
             exit_block = self.new_block("sequence_any_exit")
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
-            false = self.constant_value(False, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
+            false = self.constant_value(False, length, dtype="bool")
             next_index = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION,
                 operands=(length,),
@@ -11858,8 +11866,8 @@ class _ControlSSABuilder(TiledObject):
             retained = self.new_block("sequence_maximum_loop_retained")
             latch = self.new_block("sequence_maximum_latch")
             exit_block = self.new_block("sequence_maximum_exit")
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
             next_index = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
             )
@@ -12001,7 +12009,7 @@ class _ControlSSABuilder(TiledObject):
                 ))
                 return
             if start is None:
-                start = self.constant_value(0, length)
+                start = self.constant_value(0, length, dtype="int64")
             elif str(start.dtype) != "int64":
                 widened = self.fresh_value(
                     dtype="int64", transform=CONTROL_CAST, operands=(start,),
@@ -12015,8 +12023,8 @@ class _ControlSSABuilder(TiledObject):
             header = self.new_block("sequence_sum_header")
             body = self.new_block("sequence_sum_body")
             exit_block = self.new_block("sequence_sum_exit")
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
             next_index = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
             )
@@ -12125,8 +12133,8 @@ class _ControlSSABuilder(TiledObject):
             exit_block = self.new_block(f"sequence_{query.operation}_exit")
             found = None if counting else self.new_block("sequence_index_found")
             missing = None if counting else self.new_block("sequence_index_missing")
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
             next_index = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
             )
@@ -12217,7 +12225,7 @@ class _ControlSSABuilder(TiledObject):
                         **attributes,
                     },
                 )
-                absent = self.constant_value(-1, length)
+                absent = self.constant_value(-1, length, dtype="int64")
                 self.branch(exit_block)
                 self.current = found
                 self.branch(exit_block)
@@ -14904,8 +14912,8 @@ class _ControlSSABuilder(TiledObject):
                 dtype="int64", transform=LOAD, operands=(length_address,),
             )
             self.emit(Handler.Load, [length_address], length, attributes=attributes)
-            zero = self.constant_value(0, length)
-            one = self.constant_value(1, length)
+            zero = self.constant_value(0, length, dtype="int64")
+            one = self.constant_value(1, length, dtype="int64")
             scan_header = self.new_block("sequence_remove_scan")
             scan_body = self.new_block("sequence_remove_compare")
             scan_latch = self.new_block("sequence_remove_next")
@@ -14987,8 +14995,6 @@ class _ControlSSABuilder(TiledObject):
                 operands=(length, one),
             )
             self.current = shift_header
-            self.emit(Handler.Sub, [length, one], new_length,
-                      attributes=attributes)
             next_shift = self.fresh_value(
                 dtype="int64", transform=CONTROL_EXPRESSION,
                 operands=(scan_index, one),
@@ -14997,6 +15003,8 @@ class _ControlSSABuilder(TiledObject):
                 dtype="int64", transform=PHI_LOOP_HEADER,
                 operands=(scan_index, next_shift),
             )
+            # The header's Phi leads its block: LLVM rejects a Phi after the
+            # ``length - 1`` it once followed (c137, lane E).
             self.emit(
                 Handler.Phi, [scan_index, next_shift], shift_index,
                 attributes={
@@ -15004,6 +15012,8 @@ class _ControlSSABuilder(TiledObject):
                     "incoming_blocks": (scan_body.name, shift_latch.name),
                 },
             )
+            self.emit(Handler.Sub, [length, one], new_length,
+                      attributes=attributes)
             shifting = self.fresh_value(
                 dtype="bool", transform=CONTROL_PREDICATE,
                 operands=(shift_index, new_length),

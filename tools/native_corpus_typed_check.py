@@ -79,7 +79,7 @@ def run_fortran(module, export):
     # the line says so rather than passing.
     from src.compiler.ssa_fortran_backend import emit_module, fortran_compiler
     try:
-        emit_module(module)
+        emit_module(module, progress=lambda _: None)
     except Exception as e:
         return f"EMIT-FAIL {type(e).__name__}: {str(e)[:300]}"
     if fortran_compiler() is None:
