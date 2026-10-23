@@ -81,6 +81,8 @@ EXTENDED = [
     (["xs{v} = [{a}, {b}, {c}]"], "int(any([x{v} > n for x{v} in xs{v}])) * 10 + int(all([x{v} > n for x{v} in xs{v}]))"),
     (["xs{v} = [{a}, {b}, {c}]", "ys{v} = [x{v} - n for x{v} in xs{v}]"], "ys{v}[n % 3] * 10 + sum(ys{v})"),
     (["s{v} = {{(x{v} + n) % 3 for x{v} in [{a}, {b}, {c}]}}"], "len(s{v})"),
+    # a set comprehension grown by add (corpus c285, c286)
+    (["s{v} = {{(x{v} + n) % 3 for x{v} in [{a}, {b}, {c}]}}", "s{v}.add(n + {a})"], "len(s{v}) * 100 + sum(s{v})"),
     # an unrolled literal loop beside an in-place sort (corpus c244, plan C15)
     (["t{v} = 0", "for x{v} in [{a}, {b}]:", "    t{v} += x{v} * n", "xs{v} = [{c}, n, {a}]", "xs{v}.sort()"], "xs{v}[0] * 10 + xs{v}[2] + t{v}"),
     (["ys{v} = [x{v} * n for x{v} in [{a}, {b}]]", "xs{v} = [{c}, n]", "xs{v}.sort(reverse=True)"], "xs{v}[0] * 10 + sum(ys{v})"),
@@ -139,6 +141,8 @@ EXTENDED3 = [
     (["xs{v} = []", "push(xs{v}, n)", "push(xs{v}, {a})", "setfirst(xs{v}, {b})"], "len(xs{v}) * 100 + xs{v}[0] + xs{v}[1]"),
     (["xs{v} = [n, {a}]", "ys{v} = [{b}]", "grow(ys{v}, 2)"], "head(xs{v}) + width(ys{v}) * 10 + ys{v}[-1]"),
     (["xs{v} = [n, {a}, {b}]"], "pick(xs{v}, n % 3) * 10 + width(xs{v})"),
+    # a set grown by a helper (corpus c288, c289)
+    (["s{v} = {{n, {a}}}", "addto(s{v}, {b})", "addto(s{v}, n)"], "len(s{v}) * 100 + sum(s{v})"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
@@ -169,6 +173,10 @@ def swap(xs: list[int]) -> None:
 
 def pick(xs: list[int], i: int) -> int:
     return xs[i]
+
+
+def addto(s: set[int], v: int) -> None:
+    s.add(v)
 
 
 """
