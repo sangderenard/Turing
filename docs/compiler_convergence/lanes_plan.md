@@ -33,7 +33,7 @@ branch has used, merged or not.
 |---|---|---|---|
 | c211-c218 | Lane A: A0, A3 and follow-ups | `claude/project-thread-kbkzp7` | c211, c212, c214-c218 |
 | c230-c239 | Lane A: A2 optional returns | `claude/project-thread-h4aybe` | c230-c234 |
-| c240-c249 | Lane C: C1 constant-list comprehensions, C15 | `claude/project-thread-2nw77p` | c240-c244 |
+| c240-c249 | Lane C: C1 constant-list comprehensions, C15, C2 | `claude/project-thread-2nw77p` | c240-c245 |
 | c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
 | c280-c289 | next free | | |
@@ -60,7 +60,7 @@ silent-capable items first.
 | rank | item | where the record is missing (doc 33) | claimed functions | branch | status |
 |---|---|---|---|---|---|
 | C1 | Reductions over a structural aggregate: `any((1 > n, 2 > n))`, `sum(x * n for x in xs)` with `xs` literal | the region takes the aggregate as an unproduced input, and no layer assembles it from its unrolled members | `resident_sequence_materialization._list_literal_mutations`; `glsl_deployment_strategy._tensor_descriptor_rule` (loop-target branch) | `claude/project-thread-2nw77p` | list/set comprehension part done (e7f4a46d, landed with PR #788; c240-c243). Still loud by name: generator over a folded list (`any(x > n for x in xs)`: the GeneratorExp materializer is not a declared sequence) and tuple displays |
-| C2 | A display rebound inside a loop: `xs = [i + n, i]` | `descriptor-member-shared`; unaccounted formal (loud in the product at `main`) | descriptor birth in `precompile_to_ssa` | | open |
+| C2 | A display rebound inside a loop: `xs = [i + n, i]` | UNROLLED loop (fixed on the branch, c245): the cloned display had no SOURCE_AGGREGATE_LAYOUT row, so its birth refused (`List # lacks one exact element producer`), and a post-loop `xs[0]` folded to a body node that evaporation never remapped. RETAINED loop (still open, **silent**): `xs = [0, 0]; for i in range(4): t += xs[0]; xs = [i + n, i]` then `len(xs)` reads 0 at `main` 3ffb64d6 (audit: `descriptor-member-shared`); the rebound display has no birth into the carried storage. Also loud: two unrolled loops whose last display folds to a constant (`ys = [j * 2, j]`): the induction constant the layout names is gone | `loop_composer.evaporate_unrolled_loops` (cloned layouts, last-iteration reads) | `claude/project-thread-2nw77p` | unrolled form fixed on the branch; retained form open |
 | C3 | Dict `del d[k]` / `d.pop(k)` | placed by graph-id order into a neighbouring region (a cycle); `pop` has no lowering. It should be one lexical mapping effect. | `_control_block_position` (read only); mapping effect lowering | | open |
 | C4 | `d.get(k, 0)` in a loop | control order cycle (c202) | `_sequence_effect_read_edges` | | open |
 | C5 | Standalone slice `ys = xs[1:n]` | no lowering; only `r += xs[a:b]` is recognized | slice recognizer; `ir_sequence_tables` | | open |

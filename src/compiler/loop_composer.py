@@ -1054,6 +1054,60 @@ def evaporate_unrolled_loops(
         )
         return constant_id
 
+    def post_cloned_layout(source_id: int, mapping: dict[int, int]) -> None:
+        from ..common.tensors.topological_reducer import node_identity_cell
+        from .concordance_declarations import (
+            LOOP_COMPOSER,
+            SOURCE_AGGREGATE_LAYOUT,
+            SourceAggregateLayout,
+            SourceAggregateMember,
+        )
+        from .identity_concordance import (
+            Derived, Mode, current_identity_book,
+        )
+
+        scope = graph.G.graph.get("source_aggregate_layout_scope")
+        clone_id = mapping.get(int(source_id))
+        if scope is None or clone_id is None:
+            return
+        book = current_identity_book()
+        row = (scope, int(source_id))
+        layout = book.page(SOURCE_AGGREGATE_LAYOUT).latest(row)
+        if not isinstance(layout, SourceAggregateLayout):
+            return
+        if layout.conditional_cell is not None or layout.arm_layout_cells:
+            return  # a conditional layout's arms are not cloned here
+        source_cell = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, row)
+        members = []
+        for member in layout.members:
+            value_id = int(mapping.get(int(member.value_id), member.value_id))
+            if value_id not in graph.G:
+                return
+            members.append(SourceAggregateMember(
+                value_id,
+                (
+                    member.value_cell if value_id == int(member.value_id)
+                    else node_identity_cell(graph, value_id)
+                ),
+                tuple(dict.fromkeys((
+                    source_cell, member.value_cell, *member.source_cells,
+                ))),
+            ))
+        target_row = (scope, int(clone_id))
+        book.post(
+            SOURCE_AGGREGATE_LAYOUT, target_row,
+            SourceAggregateLayout(str(layout.aggregate_kind), tuple(members)),
+            stage=LOOP_COMPOSER,
+            provenance=Derived(tuple(dict.fromkeys((
+                source_cell, node_identity_cell(graph, int(clone_id)),
+                *(member.value_cell for member in members),
+            )))),
+            mode=Mode.CONCORD,
+        )
+        attributes = dict(graph.G.nodes[int(clone_id)].get("attributes") or {})
+        attributes["source_aggregate_layout_row"] = target_row
+        graph.G.nodes[int(clone_id)]["attributes"] = attributes
+
     for plan in plans:
         loop_id = int(plan.loop.node_id)
         if loop_id in handled_loop_ids:
@@ -1407,6 +1461,17 @@ def evaporate_unrolled_loops(
                 mapping[source_id] = add_clone(source_id, parents)
                 if source_id in linked_call_occurrences:
                     effect_live_call_clones.add(mapping[source_id])
+            # Program: ``xs = [0, 0]; for i in range(4): xs = [i + n, i]``
+            # then ``len(xs)`` (corpus c245; lanes plan C2, C16).  Wrong
+            # record: a display cloned into an iteration had no
+            # SOURCE_AGGREGATE_LAYOUT row (only its source did), and its
+            # deep-copied AST no longer named its cloned members, so the
+            # list birth found no exact element producer and refused.
+            # Rule: a cloned display's layout is its source's layout with
+            # every member carried through this iteration's mapping, as the
+            # canonical relabel carries layouts into canonical ids.
+            for source_id in body_order:
+                post_cloned_layout(int(source_id), mapping)
             for _name, initial, updated in carried_bindings:
                 if int(updated) in mapping:
                     carried_values[int(initial)] = int(mapping[int(updated)])
@@ -1493,6 +1558,32 @@ def evaporate_unrolled_loops(
                 ),
                 (int(final_value),),
             )
+        # Program: ``xs = [0, 0]; for i in range(4): xs = [i + n, i]`` then
+        # ``xs[0] * 100`` (corpus c245; lanes plan C2).  Wrong record: the
+        # structural fold had already read ``xs[0]`` at the loop exit as the
+        # body display's member ``i + n`` -- a body node -- and evaporation
+        # redirected only carried bindings, so the post-loop read kept the
+        # source body node with its target operand removed (an ``Add`` of
+        # one operand; refused at emission).  Rule: a body value read after
+        # the loop is its last iteration's copy, as a carried binding's
+        # final value is.
+        if last_mapping:
+            for body_id in sorted(body_ids):
+                final_id = last_mapping.get(int(body_id))
+                if final_id is None or int(body_id) not in graph.G:
+                    continue
+                if any(
+                    int(child) not in body_ids
+                    and int(child) not in target_ids
+                    and int(child) not in {
+                        int(member.loop.node_id) for member in selected_plans
+                    }
+                    and (graph.G.nodes[int(child)].get("attributes") or {}).get(
+                        "unrolled_from"
+                    ) is None
+                    for child in graph.G.successors(int(body_id))
+                ):
+                    _replace_parent_value(graph, int(body_id), (int(final_id),))
         for collection_id, values in publications.items():
             if values:
                 _replace_parent_value(
