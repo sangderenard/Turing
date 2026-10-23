@@ -2452,6 +2452,16 @@ def _planned_scalar_dtypes_from(
                     else parents(data, "elts")
                 )
                 writers = [scalar.get(member) for member in members]
+                # Lane D, D2 step 4.  Program: ``ys = sorted(xs); ys[0]``
+                # (corpus c127, c129).  ``sorted`` returns a new list of its
+                # argument's rows; nobody read that, so every row of ``ys``
+                # took the float64 domain default.  Rule: a sorted
+                # materialization holds its argument's element class, joined
+                # with its own later writers.
+                if attributes.get("producer_kind") == "sorted_materialization":
+                    writers.extend(
+                        element.get(source) for source in parents(data, "arg:0")
+                    )
                 for record in records.values():
                     if int(record.get("sequence_value_id", -1)) == int(
                         data.get("value_id", node_id)
@@ -2591,6 +2601,42 @@ def _planned_scalar_dtypes_from(
                 if operands and all(scalar.get(o) is not None for o in operands):
                     settle(scalar, node_id, "float64")
                 continue
+            # Lane D, D2 step 4.  Program: ``xs = [5, 7] + [n, 7]; xs[2]``
+            # (corpus c166).  Concatenation's rows are its operands' rows, so
+            # its element class is their join, with the result's own later
+            # writers; nobody read that, so ``xs[2]`` took the float64 domain
+            # default.  An operand whose element class is not yet proven
+            # leaves the result unproven.
+            if op == "add" and isinstance(expression, ast.BinOp):
+                operands = parents(data, "lhs", "rhs")
+                if (
+                    len(operands) == 2
+                    and all(is_collection(o) or o in element for o in operands)
+                    and not any(o in scalar for o in operands)
+                ):
+                    writers = [element.get(o) for o in operands]
+                    for child in G.successors(node_id):
+                        child_data = G.nodes[child]
+                        if operation(child_data) in {"indexedstore", "setitem"}:
+                            writers.extend(
+                                scalar.get(value)
+                                for value in parents(child_data, "value")
+                            )
+                    for record in records.values():
+                        if int(record.get("sequence_value_id", -1)) == int(
+                            data.get("value_id", node_id)
+                        ) and str(record.get("operator")) in {
+                            "append", "add", "insert",
+                        }:
+                            arguments = tuple(
+                                record.get("argument_value_ids") or ()
+                            )
+                            writers.append(
+                                scalar.get(int(arguments[-1]))
+                                if arguments else None
+                            )
+                    settle(element, node_id, join(writers))
+                    continue
             if op in REGION_DTYPE_PRESERVING_OPS:
                 operands = parents(data, "lhs", "rhs", "operand", "arg:")
                 operands = [o for o in operands if o not in element]
