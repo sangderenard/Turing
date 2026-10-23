@@ -24107,6 +24107,24 @@ def _schedule_loop_callsites(
                 terminal_guard_candidates: list[tuple[int, int]] = []
                 for position, child in enumerate(run):
                     reads, writes = sequence_accesses(child)
+                    # Program: ``if n > 6: t = [n, 3] else: t = [8, n]``,
+                    # ``t.append(6)``, then a comprehension (fuzz p85_1).
+                    # Wrong record: the join's birth (clear, then one
+                    # append per member) sat after the append in the run,
+                    # and the write-after-write rule ordered the birth after
+                    # it, so the clear erased the append (len 2 for 3;
+                    # clean audit).  Rule: an access of an arena follows its
+                    # birth wherever the birth sits in the run, and a birth
+                    # takes no write-after-access edge from an access it
+                    # precedes.
+                    for arena in reads | writes:
+                        if position in births.get(int(arena), ()):
+                            continue
+                        for birth in births.get(int(arena), ()):
+                            if birth > position:
+                                require(position, birth, (
+                                    "sequence_birth", int(arena)
+                                ))
                     for arena in reads:
                         if arena in last_write:
                             require(position, last_write[arena], (
@@ -24135,6 +24153,11 @@ def _schedule_loop_callsites(
                             ):
                                 continue
                             prior = last_access[arena]
+                            if (
+                                position in births.get(int(arena), ())
+                                and prior not in births.get(int(arena), ())
+                            ):
+                                continue
                             if (prior, position) in follows:
                                 # The latest reader follows this write; the
                                 # latest reader that does not, else the last
