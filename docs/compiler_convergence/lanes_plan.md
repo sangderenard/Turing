@@ -117,6 +117,21 @@ committed inventory script and classify every hit.
 | D4 | `"int"` vs `"int64"` spellings reaching physical checks (rule 7) | to be listed by the inventory | | open |
 | D5 | Name, suffix and position matching (`.endswith(`, `[0]` on argument lists) in decision paths | to be listed by the inventory | | open: inventory first |
 
+## Lane E: backend parity
+
+`TYPED_CHECK_BACKENDS=c,llvm,fortran python tools/native_corpus_typed_check.py tests/native_semantics_corpus`
+runs every corpus program through LLVM (executed) and Fortran (emitted;
+this container has no Fortran compiler) beside C. A `DISAGREE` line or an
+LLVM `WRONG`/`RUN-CRASH` is a finding; `FUZZ_BACKENDS=llvm` does the same
+for the fuzzer. Corpus block c275-c279. Receipts: doc 37.
+
+| rank | item | claimed functions | branch | status |
+|---|---|---|---|---|
+| E1 | LLVM wrong answers and crashes (static tuples, root frame cells, owned frame storage) | `ssa_llvm_backend`: aggregate `Const`, `GetElementPtr`, `Load`, `pointer()`, the public wrapper's frame | `claude/project-thread-kbkzp7` | fixed locally, PR after #789 |
+| E2 | LLVM refusals: loop literals entering int64/bool Phis, flat reductions | `precompile_to_ssa` sequence query lowerings (`sum`/`any`/`count`/`index`/`remove`); `ssa_llvm_backend` reduction arm | `claude/project-thread-kbkzp7` | fixed locally, PR after #789 |
+| E3 | Fortran: `cannot express literal (tuple/list)` (9 programs) | `ssa_fortran_backend` constant emission | | open |
+| E4 | LLVM refusals still standing: `address value ... has no concorded span` (callee reads of a caller list), `aggregate projection ... has no compile-time member` (optional calls), integer ops on i64 | to be scoped | | open |
+
 ## Done
 
 - A2, optional return surfaces, W1 (an optional helper's merge has no class) and W3 (a value-union call's `is None`): branch `claude/project-thread-h4aybe`, receipts in doc 34 §6 to §8. Corpus block c230 to c239 belongs to this thread (used up).
