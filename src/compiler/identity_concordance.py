@@ -7541,20 +7541,42 @@ def invalidate_shape_transformation(
     page = book.page(SHAPE_STATE_PAGE)
     row = (_shape_key(scope), value_id)
     fact = ("invalidated", source_id, str(reason))
-    if page.latest(row) != fact:
+    incumbent = page.latest(row)
+    if incumbent != fact:
         source_ref = book.latest_ref(SHAPE_STATE_PAGE, (
             _shape_key(scope if source_scope is None else source_scope),
             source_id,
         ))
-        return _post_or_unsourced(
-            book, SHAPE_STATE_PAGE, row, fact,
-            book.registry.declare_stage(str(reason)),
-            tuple(dict.fromkeys((
-                *source_cells,
-                *(() if source_ref is None else (source_ref,)),
-            ))),
-            SHAPE_SOURCE_NOT_ON_BOOK,
-        )
+        try:
+            return _post_or_unsourced(
+                book, SHAPE_STATE_PAGE, row, fact,
+                book.registry.declare_stage(str(reason)),
+                tuple(dict.fromkeys((
+                    *source_cells,
+                    *(() if source_ref is None else (source_ref,)),
+                ))),
+                SHAPE_SOURCE_NOT_ON_BOOK,
+            )
+        except ConcordanceRefusal:
+            # Program: ``s = f"a@{n}"; return len(s)`` (corpus c57; also
+            # c02, c58, c62).  Lane D, D3a.  The descriptor invalidation
+            # cone withdrew the glyph helpers' rows a third time, under a
+            # different reason, from the same unchanged identity cell, and
+            # the book refused the revision.  The caller swallowed every
+            # exception, so this looked like a lost withdrawal that left a
+            # stale ``proven_shape``.  Observed instead: each refused row's
+            # latest fact was already a withdrawal, and no ``proven_shape``
+            # row existed.  Rule: a row whose latest fact is already a
+            # withdrawal has nothing to withdraw, and the refusal of a
+            # second, causeless withdrawal is that fact, not a failure.
+            # Every other refusal stays loud.
+            if (
+                isinstance(incumbent, tuple)
+                and incumbent
+                and incumbent[0] == "invalidated"
+            ):
+                return book.latest_ref(SHAPE_STATE_PAGE, row)
+            raise
     return book.latest_ref(SHAPE_STATE_PAGE, row)
 
 
