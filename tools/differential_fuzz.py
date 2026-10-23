@@ -185,6 +185,10 @@ EXTENDED3 = [
     # loop targets over an unrolled comprehension and over zip (lane E)
     (["t{v} = 0", "for y{v} in [x{v} * n for x{v} in [{a}, {b}]]:", "    t{v} += y{v}"], "t{v}"),
     (["t{v} = 0", "for p{v}, q{v} in zip([{a}, n], [n, {b}]):", "    t{v} += p{v} * {c} + q{v}"], "t{v}"),
+    # max/min/sum over a resident list, Fortran reduces over the live
+    # length (lane E)
+    (["xs{v} = [n, {a}, n * {b}]", "xs{v}.append({c} - n)"], "max(xs{v}) * 1000 + min(xs{v}) * 10 + sum(xs{v}, n)"),
+    (["xs{v} = [n, {a}]", "xs{v}.append(n - {b})"], "int(any(xs{v})) * 10 + int(all(xs{v}))"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v

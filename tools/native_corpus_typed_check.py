@@ -17,6 +17,11 @@ BACKENDS = tuple(
 unknown_backends = set(BACKENDS) - {"c", "llvm", "fortran"}
 if unknown_backends:
     raise SystemExit(f"unknown TYPED_CHECK_BACKENDS entries: {sorted(unknown_backends)}")
+# The Fortran artifact links its runtime statically by default.  A Linux
+# libgfortran.a is not position independent, so a library that needs the
+# runtime (``error stop``) cannot link there; TYPED_CHECK_FORTRAN_STANDALONE=0
+# links libgfortran dynamically instead.  The emitted program is the same.
+FORTRAN_STANDALONE = os.environ.get("TYPED_CHECK_FORTRAN_STANDALONE", "1") != "0"
 
 
 def judge(feeds, expect, flat, kinds):
@@ -97,7 +102,7 @@ def run_fortran(module, export, params, outs, inputs, ns):
         from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
         built = compile_fortran_module_c_shell(
             fortran_module, {}, pathlib.Path(tempfile.mkdtemp()), library=True,
-            entrypoint=export, name=export[:48],
+            entrypoint=export, name=export[:48], standalone=FORTRAN_STANDALONE,
         )
         record = next(e for e in fortran_module.api.entry_points if str(e.name) == export)
         native = FortranCoreNative(built.executable_path, record, fortran_module.api)

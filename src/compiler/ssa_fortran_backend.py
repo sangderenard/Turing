@@ -1948,6 +1948,7 @@ class _FunctionEmitter:
             operation in _COMPARISON
             or operation in _LOGICAL_BINARY
             or operation in _LOGICAL_RESULT_UNARY
+            or (operation in ("all", "any") and len(instr.args) == 1)
         )
 
     def _collect_producers(self) -> None:
@@ -3315,6 +3316,136 @@ class _FunctionEmitter:
             f"{source_name}(1:{upper})"
         ]
 
+    def _sequence_live_length(self, source: SSAValue) -> str | None:
+        """The live row count of a resident sequence operand, or None.
+
+        Sequence lowering passes the mutable length cell as an ordinary
+        formal whose ``sequence_length_for`` receipt names the arena's
+        descriptor; its first element is the live length.  This is the
+        same edge the C emitter reads (``sequence_extent_parts``).
+        """
+
+        accounting = dict(source.accounting or {})
+        if tuple(accounting.get("sequence_row_shape") or ()):
+            return None
+        static_length = accounting.get("sequence_static_length")
+        if static_length is not None:
+            return f"{int(static_length)}_c_int64_t"
+        sequence_ids = {
+            int(candidate)
+            for candidate in (
+                accounting.get("sequence_id"),
+                accounting.get("compiler_frame_sequence_id"),
+                int(source.id),
+            )
+            if candidate is not None
+        }
+        length_cells = tuple(
+            formal
+            for formal in self.function.args
+            if (formal.accounting or {}).get("sequence_length_for") is not None
+            and int(formal.accounting["sequence_length_for"]) in sequence_ids
+        )
+        if len(length_cells) != 1:
+            return None
+        return f"{_name(length_cells[0])}(1)"
+
+    def _sequence_reduction(
+        self, instr: Instr, operation: str,
+    ) -> list[str] | None:
+        """``max``/``min``/``sum``/``all``/``any`` over a resident sequence.
+
+        Program: ``xs = [n, 7, -2, n * 2]; return max(xs) * 100 + min(xs)``
+        (corpus c150).  Wrong record: the arena operand's SSA occurrence is
+        shapeless, so the reduction took the scalar-identity path and wrote
+        ``t9 = t6``, which gfortran refuses (ranks 0 and 1).  Rule: a
+        sequence of scalar rows reduces over its live length, read from its
+        length cell, left to right as Python and the C emitter do; ``max``
+        and ``min`` of no rows stop with the C runtime's error 74 (Python's
+        ValueError) and never read a row; a NaN row propagates.
+        """
+
+        if operation not in ("max", "min", "sum", "all", "any"):
+            return None
+        if not instr.args or tuple(instr.args[0].shape or ()):
+            return None
+        source = instr.args[0]
+        accounting = dict(source.accounting or {})
+        if not (
+            accounting.get("sequence_arena")
+            or accounting.get("program_abi_storage") in ("span", "sequence")
+        ):
+            return None
+        if len(instr.args) not in ((1, 2) if operation == "sum" else (1,)):
+            return None
+        length = self._sequence_live_length(source)
+        if length is None:
+            return None
+        target = _name(instr.res)
+        rows = self._operand(source)
+        index = f"turing_red_{instr.res.id}_i"
+        accumulator = f"turing_red_{instr.res.id}"
+        result_kind = _declaration(instr.res, elemental=True)
+        real_rows = str(source.dtype or self.dtype) not in _INTEGER_DTYPES
+        logical_rows = str(source.dtype or "") in _LOGICAL_DTYPES
+        if logical_rows and operation not in ("all", "any"):
+            return None
+        lines = [
+            "    block",
+            f"      integer(c_int64_t) :: {index}",
+            f"      {result_kind} :: {accumulator}",
+        ]
+        if operation in ("all", "any"):
+            # A row's truth is ``!= 0`` (NaN is truthy), as in Python and C.
+            logical_result = str(instr.res.dtype or "") in _LOGICAL_DTYPES
+            truth = ".true." if logical_result else "1"
+            falsity = ".false." if logical_result else "0"
+            initial, found = (
+                (truth, falsity) if operation == "all" else (falsity, truth)
+            )
+            row_truth = (
+                f"{rows}({index})" if logical_rows
+                else f"{rows}({index}) /= 0"
+            )
+            condition = (
+                f".not. ({row_truth})" if operation == "all" else row_truth
+            )
+            lines.extend((
+                f"      {accumulator} = {initial}",
+                f"      do {index} = 1, {length}",
+                f"        if ({condition}) {accumulator} = {found}",
+                "      end do",
+            ))
+        elif operation == "sum":
+            start = (
+                self._operand(instr.args[1]) if len(instr.args) == 2 else "0"
+            )
+            lines.extend((
+                f"      {accumulator} = {start}",
+                f"      do {index} = 1, {length}",
+                f"        {accumulator} = {accumulator} + {rows}({index})",
+                "      end do",
+            ))
+        else:
+            comparison = ">" if operation == "max" else "<"
+            nan_clause = (
+                f" .or. {rows}({index}) /= {rows}({index})"
+                if real_rows else ""
+            )
+            lines.extend((
+                f"      if ({length} <= 0) error stop 74",
+                f"      {accumulator} = {rows}(1)",
+                f"      do {index} = 2, {length}",
+                f"        if ({rows}({index}) {comparison} {accumulator}"
+                f"{nan_clause}) {accumulator} = {rows}({index})",
+                "      end do",
+            ))
+        lines.extend((
+            f"      {target} = {accumulator}",
+            "    end block",
+        ))
+        return lines
+
     def _statements(self, instr: Instr) -> list[str] | None:
         """Ops that are a Fortran *statement* rather than one expression.
 
@@ -3328,6 +3459,9 @@ class _FunctionEmitter:
         operation = instr.attributes.get("tensor_operation") or instr.op
         if instr.res is None:
             return None
+        sequence_reduction = self._sequence_reduction(instr, operation)
+        if sequence_reduction is not None:
+            return sequence_reduction
         batched = self._batched_matmul(instr, operation)
         if batched is not None:
             return batched
@@ -3851,6 +3985,15 @@ class _FunctionEmitter:
                 # Summing a mask counts its true elements, which Fortran
                 # states directly; SUM rejects a LOGICAL argument outright.
                 return f"count({args[0]})"
+            if op in ("all", "any"):
+                # Program: ``any([x > n for x in xs])`` (corpus c240).  Wrong
+                # record: a float64 result made ``_numeric`` turn the mask
+                # operand into REAL, and ANY/ALL take only LOGICAL.  Rule:
+                # the operand is a mask (a number is its truth, != 0); the
+                # LOGICAL result is converted where it is assigned.
+                if not self._is_logical(instr.args[0]):
+                    return _REDUCTION[op].format(f"({args[0]} /= 0)")
+                return _REDUCTION[op].format(args[0])
             args = self._numeric(instr, args)
             return _REDUCTION[op].format(*args)
         if op in _TERNARY and len(args) == 3:
