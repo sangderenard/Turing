@@ -10841,6 +10841,18 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         for node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("expr_obj"), (ast.ListComp, ast.SetComp))
     ] + [
+        # Program: ``c0 = 1 if n % 2 == 0 and n > 1 else 7; xs1 = [n, 3];
+        # swap(xs1)`` then ``c0 + xs1[0] * 10 + xs1[1]`` (fuzzer p42_6;
+        # corpus c301).  Wrong record: a conditional expression is lowered
+        # as branches where it is authored, but was no member of this
+        # order, so the reducer fused its predicate ``n % 2 == 0`` with the
+        # reads after the call into one region placed before the branch,
+        # and so before the call (110 for 137).  Rule: a conditional
+        # expression or a short-circuit operator keeps its place too.
+        (int(node_id), data.get("expr_obj"))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), (ast.IfExp, ast.BoolOp))
+    ] + [
         # Program: ``xs0 = [5, n, 0]; xs0[1] = 8; xs0[0] += n; xs1 = [7,
         # 7]; push(xs1, n); push(xs1, 2)`` then reads of both (fuzzer
         # p28_37; corpus c280).  Wrong record: an indexed store was no
@@ -10894,11 +10906,24 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         if int(effect_id) in graph.G
         and getattr(expression, "end_lineno", None) is not None
     })
-    for (_first_position, first), (_second_position, second) in zip(
-        ordered_effects, ordered_effects[1:],
-    ):
-        if first != second:
-            edges.add((first, second))
+    # Program: the tire's ``output[:, :, 11] = ...; output[:, :, 12] =
+    # ...`` stores, which complete where one source position does (planner
+    # lanes plan R1).  Wrong record: members at the same position were
+    # chained by node id, which ran against their value edges (a region
+    # order cycle).  Rule: only a later position is later; members that
+    # share a position are not ordered among themselves.
+    groups: list[list[int]] = []
+    previous_position = None
+    for position, effect_id in ordered_effects:
+        if position != previous_position:
+            groups.append([])
+            previous_position = position
+        groups[-1].append(int(effect_id))
+    for earlier, later in zip(groups, groups[1:]):
+        for first in earlier:
+            for second in later:
+                if first != second:
+                    edges.add((first, second))
     for effect_id, record in effects:
         expression = record.get("expression")
         end_line = getattr(expression, "end_lineno", None)
@@ -11007,10 +11032,68 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
                 # so a read before a loop keeps its consumer placement.
                 if not any(int(target) == node for *_rest, node, _loop in loop_nodes):
                     read_before_effect.add((int(reader), int(target)))
+    edges = _source_order_edges_within_value_order(graph.G, edges)
     graph.G.graph["sequence_read_before_effect_edges"] = tuple(
-        sorted(read_before_effect)
+        sorted(edge for edge in read_before_effect if edge in edges)
     )
     return frozenset(edges)
+
+
+def _source_order_edges_within_value_order(
+    graph_obj: Any, edges: Iterable[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    """Keep the source-order edges that no value path contradicts.
+
+    Program: the tire's source catalogue, whose functions share line
+    numbers, and ``tuple([slice(None)] * (left.ndim - 1))`` (planner lanes
+    plan R1).  Wrong record: an order edge from source positions ran
+    against a value edge, so the region reducer found a cycle and refused
+    the whole build.  Rule: a value edge is the stronger record; a source
+    position that disagrees with it does not order those nodes.  Edges are
+    kept in source order, each only when it closes no cycle with the value
+    edges and the edges already kept.
+    """
+
+    value = nx.DiGraph()
+    value.add_nodes_from(graph_obj.nodes)
+    for node_id, data in graph_obj.nodes(data=True):
+        for parent, _role in data.get("parents") or ():
+            if parent in graph_obj:
+                value.add_edge(parent, node_id)
+
+    def position(node_id):
+        expression = graph_obj.nodes[node_id].get("expr_obj")
+        return (
+            int(getattr(expression, "lineno", 0) or 0),
+            int(getattr(expression, "col_offset", 0) or 0),
+            int(node_id),
+        )
+
+    try:
+        order = {
+            node: index for index, node in enumerate(
+                nx.lexicographical_topological_sort(value, key=position)
+            )
+        }
+    except nx.NetworkXUnfeasible:
+        return set(edges)
+    kept: set[tuple[int, int]] = set()
+    backward: list[tuple[int, int]] = []
+    for first, second in sorted(
+        set(edges), key=lambda edge: (order.get(edge[0], -1), order.get(edge[1], -1)),
+    ):
+        if first not in order or second not in order:
+            kept.add((first, second))
+        elif order[first] < order[second]:
+            kept.add((first, second))
+            value.add_edge(first, second)
+        else:
+            backward.append((first, second))
+    for first, second in backward:
+        if not nx.has_path(value, second, first):
+            kept.add((first, second))
+            value.add_edge(first, second)
+    return kept
 
 
 def _closure_routing_dependencies(
