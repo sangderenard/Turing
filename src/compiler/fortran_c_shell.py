@@ -9730,9 +9730,18 @@ def _field_slot_ops(
         lexical_sequence_ids.setdefault(
             ("parameter", str(parameter_name)), sequence_id
         )
+        # Program: ``def add1(s: set[int], v: int): s.add(v)`` (scratch
+        # cs_i).  Wrong record: the added row's ProgramABI identity made
+        # ``s`` a record sequence, and this declaration said ``duplicates``
+        # over the authored ``set`` contract committed above, so lowering
+        # refused the helper.  Rule: a record sequence keeps the row policy
+        # its authored contract committed; the record names only its rows.
+        committed = committed_sequence_contract(
+            sequence_contract_scope, sequence_id
+        )
         sequence_declarations.append((
             sequence_id,
-            "duplicates",
+            "duplicates" if committed is None else committed.policy,
             len(_sequence_record_storage_columns(record)),
             bool(record.get("mutable", False)),
         ))
