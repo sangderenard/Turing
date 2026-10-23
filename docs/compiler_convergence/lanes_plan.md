@@ -59,7 +59,8 @@ branch has used, merged or not.
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
 | c280-c289 | Silent lane follow-ups (indexed stores and concatenations in the call order) | `claude/project-thread-cz18s3` | c280-c282 |
 | c290-c299 | Lane E: list slices, sum of a folded list, slice concatenation widths, loop targets, Fortran list reductions | `claude/project-thread-kbkzp7` | c290-c299 (full) |
-| c300-c309 | next free | | |
+| c300-c309 | Lane E: Fortran span cells, callee swaps, dict.get defaults, colliding callee lists | `claude/project-thread-kbkzp7` | c300-c303 |
+| c310-c319 | next free | | |
 
 ## Lane A: bootstrap families (and the tire, where it shares a group)
 
@@ -133,6 +134,7 @@ for the fuzzer. Corpus block c275-c279. Receipts: doc 37.
 | E3 | Fortran: `cannot express literal (tuple/list)` (9 programs) | `ssa_fortran_backend` constant emission | | open |
 | E5 | List slices were silently wrong in C on main: a folded slice had no row writer, a runtime slice had no lowering, and `sum` of a folded list reduced one element | `fortran_c_shell` sequence initializations; `resident_sequence_materialization._source_sequence_slices`; `precompile_to_ssa` slice mutation; `ssa_record_return_state.publish_ssa_value_type` | `claude/project-thread-kbkzp7` | fixed locally (c290-c294) |
 | E7 | Fortran reductions over a resident list (`max`/`min`/`sum`/`any`/`all`) were emitted as a scalar copy (COMPILE-FAIL), and `any`/`all` got a REAL mask. Remaining Fortran COMPILE-FAIL: a callee's list formal passed as a scalar (c185, c187, c191, c192), a dict value REAL to INTEGER (c64) | `ssa_fortran_backend._sequence_reduction` | `claude/project-thread-kbkzp7` | fixed locally (c297-c299) |
+| E8-E10 | Fortran: a rank-0 span formal is one cell, a load is not folded past a write (c187 swap), a colliding callee list gets its capacity (c303, silent on main). C and LLVM: a `dict.get` default kept its float payload and rounded large ints (c302, silent on main). Open: a "full" append status is never read in any backend | `ssa_fortran_backend`, `ssa_call_storage`, `fortran_c_shell` lookup defaults | `claude/project-thread-kbkzp7` | fixed locally (c300-c303) |
 | E4 | LLVM refusals still standing: `address value ... has no concorded span` (callee reads of a caller list), `aggregate projection ... has no compile-time member` (optional calls), `dict.get` default Phi (c178). Loop targets over comprehensions and `zip` are fixed (E6, c295-c296). Slice concatenation's i32/i64 Phis are fixed (`ir_sequence_tables.lower_sequence_append_slice` is int64) | `ir_sequence_tables` | `claude/project-thread-kbkzp7` | in part |
 
 ## Done

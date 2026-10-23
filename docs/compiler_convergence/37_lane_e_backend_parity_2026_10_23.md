@@ -328,3 +328,78 @@ unchanged (static, which is what Windows uses).
 - Gate at `d43227df` (covers E6 and E7), on a clean worktree: aa 89 /
   ab 7 / ac 26 / rec 20. The failure names in every part are the same as
   main `08ba0171`'s, with both run in this container.
+
+## E8: a scalar span formal, and a load folded past a write (Fortran)
+
+- **Program:** `a = outer(xs)` where `outer` returns `xs[0]` after a nested
+  callee stores into `xs` (c185, c191, c192, c301), and a callee swap
+  `t = xs[0]; xs[0] = xs[1]; xs[1] = t` (c187, c300).
+- **Wrong record:**
+  - A call result reaches a planned region as a formal with
+    `program_abi_storage: span` and `program_abi_rank: 0`. The Fortran
+    array-contract analysis (the emitter and `call_array_argument_ids`)
+    took every span formal as an array, so the caller declared `t3(extent)`
+    beside a callee that writes a scalar `t3`. gfortran refused it (rank
+    mismatch).
+  - Once that compiled, the swap was silently wrong: the read of `xs[0]`
+    was a one-use `Load`, folded into its consumer, a call placed after the
+    call that writes `xs[0]`. So `t` read the new row.
+- **Rule:** a span formal with an explicit rank of zero is one cell, as the
+  LLVM and C emitters already read it (`_declared_span_rank`). A span
+  whose rank is unstated keeps the array reading. `call_array_argument_ids`
+  takes a `span_formal_is_array` predicate, and only Fortran passes one, so
+  C is unchanged. A load is not folded past a store or a call.
+
+## E9: a `dict.get` default keeps its literal's type (C and LLVM silent on main)
+
+- **Program:** `cells.get(5, 36028797018963969)` over int values (c302),
+  and `cells.get(2, 9)` (c64).
+- **Wrong record:** `fortran_c_shell` minted every lookup default as
+  `float(literal)`. The int64 Const therefore carried `36028797018963968.0`,
+  and C and LLVM returned 36028797018963990 where 36028797018963991 is
+  right. In Fortran the payload was REAL(8) passed to an INTEGER(8)
+  formal, which gfortran refused (c64).
+- **Rule:** the default keeps the authored literal's own type.
+- c302 is WRONG in C and LLVM at main `08ba0171` and passes here. c178's
+  LLVM refusal (an i64 Phi with a double incoming) is not this record and
+  is still open.
+
+## E10: a callee list whose sequence id collides with the entry's (Fortran silent on main)
+
+- **Program:** `grow(x)` builds `xs = [7, 5]; xs.append(x)` and `root` has
+  its own list. Both are sequence 3 (fuzz seed 46 p46_21, corpus c303).
+- **Wrong record:** the Fortran runtime bindings skipped a linked callee
+  sequence whose id collides with one of the entry's own. Its hoisted
+  capacity cell stayed 0, every append reported "full" into a status
+  nobody reads, and the callee summed zeros. c303 returns 2 for 39 at
+  main.
+- **Rule:** every linked sequence's capacity is published. A binding
+  carries its own column shapes, so the runtime never looks its descriptor
+  up by a sequence id that two functions share. The sequence-table
+  metadata is unchanged (it still lists one descriptor per id).
+- **Hazard, not fixed here:** a "full" append status is written and never
+  read, in every backend. A capacity that is wrong for any other reason is
+  silent too.
+
+### Receipts for E8-E10
+
+- Census at `d0801217` (E8, 217 programs, dynamic Fortran runtime): C
+  217/217, LLVM 206 PASS / 0 WRONG / 11 refused, Fortran 133 PASS.
+- Fuzz seed 46 (`llvm,fortran`) at `d0801217` found p46_21, the E10
+  record (Fortran WRONG; FORTRAN-LOUD at main only because another term
+  of the same program did not compile there).
+- Census at `a005af88` (219 programs, dynamic Fortran runtime): C
+  219/219. LLVM 208 PASS, 0 WRONG, 11 refused. Fortran 135 PASS, 1 WRONG
+  (c22), 3 RUN-FAIL (c142, c177, c197: a dynamic extent of an internal
+  array is asked of the caller), 0 COMPILE-FAIL, 3 EMIT-FAIL and 77
+  EMIT-INCOMPLETE (c302 is a new `Alloca` refusal).
+- Fuzz, `FUZZ_EXT=3 FUZZ_BACKENDS=llvm,fortran FUZZ_FORTRAN_STANDALONE=0`,
+  seed 47 at `a005af88`: 14 PASS, 23 FORTRAN-LOUD, 3 LLVM-LOUD, 0 WRONG
+  and 0 TYPE.
+- Gate at `a005af88`, on a clean worktree: aa 89 / ab 8 / ac 26 / rec 21.
+  aa and ac have the same failure names as main `08ba0171`. ab and rec
+  each had one extra failure,
+  `test_ir_sequence_tables.py::test_sequence_return_surface_correlates_output_with_storage_descriptor`,
+  which pins the exact runtime-binding mapping. A binding now carries
+  `column_shapes` (E10), so the expectation adds `"column_shapes": [[]]`.
+  With that, the test passes; every other name matches main.

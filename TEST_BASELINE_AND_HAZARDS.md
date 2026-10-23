@@ -1,3 +1,13 @@
+2026-10-23 LANE E, E8-E10 (MEASURED, cloud): Fortran rank-0 span formals
+are cells, a load is not folded past a write (callee swap), a callee list
+whose sequence id collides with root's gets its capacity (c303, Fortran
+silent on main). dict.get defaults keep their int type (c302, C and LLVM
+silent on main). HAZARD: an append's "full" status is never read in any
+backend, so a wrong capacity is silent. At a005af88 (219 programs): C
+219/219, LLVM 208 / 0 WRONG / 11 refused, Fortran 135 PASS / 1 WRONG (c22).
+Gate names same as main 08ba0171 after the binding-shape test update. Fuzz
+seed 47 llvm,fortran: 0 WRONG / 0 TYPE.
+
 2026-10-23 LANE E, LOOP TARGETS AND FORTRAN LIST REDUCTIONS (MEASURED,
 cloud): E6, loop targets over an unrolled comprehension or zip were typed
 float64 (C silently rounded big ints, c295-c296); the typed check now
