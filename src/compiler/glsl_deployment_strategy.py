@@ -11586,13 +11586,14 @@ def _resolve_binding_name(shell: Any, captured: Any, feed_id: int):
     # planned tree rather than assuming they are the same object.
     value = (getattr(captured, "feeds", None) or {}).get(feed_id)
     storage = _capture_storage_identity(value) if value is not None else None
+    # Lane D, item D3: the walk used to sit in ``except Exception: pass``,
+    # so a failed walk silently narrowed the search to ``shell`` and a feed
+    # could resolve to no name.  No corpus program raised here; a walk that
+    # fails is a fault in the planned tree and is now reported as one.
     candidates = [shell]
-    try:
-        candidates.extend(_walk_planned_shells(
-            shell, include_function_registry=False
-        ))
-    except Exception:
-        pass
+    candidates.extend(_walk_planned_shells(
+        shell, include_function_registry=False
+    ))
     for candidate in candidates:
         names = getattr(candidate, "_capture_input_names", None) or {}
         direct = names.get(feed_id)
