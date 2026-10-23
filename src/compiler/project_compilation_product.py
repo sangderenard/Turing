@@ -6725,6 +6725,42 @@ def compile_project_call(
     return receipt
 
 
+def _one_value_aggregate_return(source: Any) -> str | None:
+    """Why the source's return is not one plain value, else None.
+
+    Read from the reducer's return-site receipts: a site returning a tuple,
+    sites of different arity, or a ``None`` site beside a value site.
+    """
+
+    kinds = tuple(
+        (source.G.graph.get("return_container_kinds") or {}).values()
+    )
+    if any(kind not in {None, "value"} for kind in kinds):
+        return f"return site kinds {sorted(map(str, set(kinds)))}"
+    sites = tuple(
+        tuple(site or ())
+        for site in (source.G.graph.get("return_slot_values") or {}).values()
+    )
+    if len({len(site) for site in sites}) > 1:
+        return "return sites of different arity"
+
+    def returns_none(site: tuple) -> bool:
+        if len(site) != 1 or site[0] is None or int(site[0]) not in source.G:
+            return False
+        node = source.G.nodes[int(site[0])]
+        attributes = node.get("attributes") or {}
+        return str(node.get("type")) in {"Constant", "Const", "const"} and (
+            ("value" in attributes and attributes["value"] is None)
+            or ("value" not in attributes and "constant" in node
+                and node["constant"] is None)
+        )
+
+    none_sites = sum(1 for site in sites if returns_none(site))
+    if 0 < none_sites < len(sites):
+        return "a None return site beside a value site"
+    return None
+
+
 def _accepted_physical_output_paths(
     paths: Mapping[tuple[int, ...], int],
     published_ids: set[int],
@@ -7330,6 +7366,38 @@ def _compile_resolved_process_graph_unit_impl(
                 if len(paths) == 1 and len(published_ids) == 1 and kind not in {"tuple", "list"}:
                     # A scalar Return/Phi is the one published value, even
                     # when several authored return sites feed that Phi.
+                    # Program: unit 027 ``_fork_of_scope`` (``return row,
+                    # column`` or ``return None``; doc 32).  Wrong record: the
+                    # sites' kinds disagree, so ``kind`` was None and one
+                    # published payload was accepted for an optional pair.
+                    # Rule: the scalar reading needs every return site to be
+                    # one plain value of one arity, and no site to return
+                    # ``None`` beside a value; otherwise one value would stand
+                    # for a tuple or an optional, and the layout is refused.
+                    aggregate_reason = _one_value_aggregate_return(source)
+                    if aggregate_reason is not None:
+                        accounting = next((
+                            record for record in unit_accounting
+                            if str(record.get("ssa_function") or "")
+                            == str(export_name)
+                        ), None)
+                        if accounting is None:
+                            raise ValueError(
+                                "one-value aggregate return has no unit "
+                                f"accounting row: {export_name}"
+                            )
+                        accounting["shortfalls"].append({
+                            "kind": "one-value-aggregate-return",
+                            "reason": aggregate_reason,
+                            "authored_paths": [
+                                [list(path), int(value_id)]
+                                for path, value_id in paths.items()
+                            ],
+                            "published_output_ids": sorted(published_ids),
+                        })
+                        accounting["complete"] = False
+                        compiled_complete = False
+                        continue
                     paths = {(0,): int(outputs[str(export_name)][0].id)}
             else:
                 raise ValueError("native result layout has no authoritative source reference")

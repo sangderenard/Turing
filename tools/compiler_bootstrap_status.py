@@ -215,6 +215,70 @@ def build_status(
     }
 
 
+def check_unit_result_layouts(product_root: str | Path) -> dict[str, Any]:
+    """Check every admitted unit's exported results against its layout.
+
+    A ``compiled-unverified`` unit of a provenance product
+    (``<out>/products/provenance-core/*/growth/product``) is a false
+    acceptance when one export's ``Ret`` operands, published outputs and
+    ``native_output_paths`` are not the same values, or when a ``tuple``
+    layout has a single leaf (doc 34 section 1.4: unit 027 once exported one
+    member of an optional pair).
+    """
+
+    import pickle
+
+    root = Path(product_root).resolve()
+    checked = []
+    findings = []
+    for unit_path in sorted(root.glob("units/*/unit.json")):
+        receipt = _read_json(unit_path)
+        if receipt.get("status") != "compiled-unverified":
+            continue
+        artifact = unit_path.parent / str(receipt.get("artifact") or "")
+        with artifact.open("rb") as handle:
+            module, outputs, exports = pickle.load(handle)
+        for export in exports:
+            function = module.functions[str(export)]
+            published = [int(value.id) for value in outputs.get(str(export), ())]
+            returns = [
+                [int(value.id) for value in instruction.args]
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Ret", "ret"}
+            ]
+            paths = [
+                int(value_id)
+                for _path, value_id in function.metadata.get(
+                    "native_output_paths", ()
+                )
+            ]
+            kind = function.metadata.get("native_return_container_kind")
+            problems = []
+            if any(sorted(operands) != sorted(published) for operands in returns):
+                problems.append("Ret operands differ from published outputs")
+            if published and sorted(paths) != sorted(published):
+                problems.append("native output paths differ from published outputs")
+            if kind == "tuple" and len(published) < 2:
+                problems.append("a tuple layout publishes one value")
+            row = {
+                "unit": unit_path.parent.name,
+                "qualified_names": list(receipt.get("qualified_names") or ()),
+                "export": str(export),
+                "published_output_ids": published,
+                "return_container_kind": kind,
+                "problems": problems,
+            }
+            checked.append(row)
+            if problems:
+                findings.append(row)
+    return {
+        "product_root": root.as_posix(),
+        "checked_exports": len(checked),
+        "false_acceptance_findings": findings,
+    }
+
+
 def _exercise(report: dict[str, Any]) -> None:
     from src.compiler.compiler_bootstrap_runtime import (
         activate_registered_compiler_bootstraps,
@@ -381,7 +445,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--write", type=Path,
         help="also write the complete per-batch graph report as JSON",
     )
+    parser.add_argument(
+        "--check-product", type=Path,
+        help="check a provenance product's admitted unit result layouts "
+        "(<out>/products/provenance-core/*/growth/product) and exit "
+        "nonzero on a false acceptance",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.check_product is not None:
+        layout_report = check_unit_result_layouts(arguments.check_product)
+        print(json.dumps(layout_report, indent=2, sort_keys=True))
+        return 1 if layout_report["false_acceptance_findings"] else 0
     report = build_status(arguments.bootstrap_root, arguments.registry)
     if arguments.exercise:
         _exercise(report)
