@@ -10861,7 +10861,7 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         # comprehension over a runtime range, which is a loop lowered
         # where it is authored: ``xs0 = [i * 4 for i in range(n % 5 + 1)
         # if i % 2 == 0]; xs1 = [n, 5]; swap(xs1)`` then reads of ``xs1``
-        # (Lane E fuzzer p42_33; corpus c300) fused ``n % 5 + 1`` with
+        # (Lane E fuzzer p42_33; corpus c320) fused ``n % 5 + 1`` with
         # the reads into a region placed before the call (105 for 150).
         (int(node_id), data.get("expr_obj"))
         for node_id, data in graph.G.nodes(data=True)
@@ -10869,7 +10869,7 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     ] + [
         # Program: ``c0 = 1 if n % 2 == 0 and n > 1 else 7; xs1 = [n, 3];
         # swap(xs1)`` then ``c0 + xs1[0] * 10 + xs1[1]`` (fuzzer p42_6;
-        # corpus c301).  Wrong record: a conditional expression is lowered
+        # corpus c321).  Wrong record: a conditional expression is lowered
         # as branches where it is authored, but was no member of this
         # order, so the reducer fused its predicate ``n % 2 == 0`` with the
         # reads after the call into one region placed before the branch,

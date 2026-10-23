@@ -85,7 +85,7 @@ EXTENDED = [
     (["xs{v} = [{a}, {b}, {c}]", "ys{v} = [x{v} - n for x{v} in xs{v}]"], "ys{v}[n % 3] * 10 + sum(ys{v})"),
     (["s{v} = {{(x{v} + n) % 3 for x{v} in [{a}, {b}, {c}]}}"], "len(s{v})"),
     # a read of a list before a later store, sort or pop of it, and a
-    # returned read of a grown list (corpus c290-c299)
+    # returned read of a grown list (corpus c310-c319)
     (["xs{v} = [{a}, n]", "xs{v}.append({b})", "r{v} = xs{v}[1]", "xs{v}[1] = n + {c}"], "r{v} * 10 + xs{v}[1] + len(xs{v})"),
     (["xs{v} = [{a}, n, {b}]", "r{v} = xs{v}[0]", "xs{v}.sort()"], "r{v} * 100 + xs{v}[0]"),
     (["xs{v} = [{a}, n, {b}]", "r{v} = xs{v}[-1]", "xs{v}.pop(0)"], "r{v} * 10 + len(xs{v})"),

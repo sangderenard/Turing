@@ -3749,7 +3749,7 @@ class CorrelationTable:
     def _unreturned_output_findings(module: Any) -> list[Finding]:
         """Report a function that returns a source value from an empty Ret.
 
-        Program: ``xs = [3, n]; xs.append(2); return xs[2]`` (corpus c290).
+        Program: ``xs = [3, n]; xs.append(2); return xs[2]`` (corpus c310).
         The function's ``source_output_value_ids`` named the returned read,
         but its lowering never asked for that read, so the only ``Ret``
         carried no value and the caller's result was empty, with a clean
