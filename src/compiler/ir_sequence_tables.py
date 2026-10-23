@@ -397,6 +397,26 @@ def lower_sequence_allocate(
     return SSASequenceLowering((function,))
 
 
+def _storage_array_ids(
+    descriptor: SSASequenceDescriptor,
+    storage: tuple[SSAValue, ...],
+) -> tuple[int, ...]:
+    """The storage formals a positional helper indexes as arrays.
+
+    The capacity cell is a scalar formal (``_storage_values`` declares it
+    with no shape, and ``allocate`` already leaves it out).  Program:
+    ``xs = [5, n, 2]; xs.pop(0)``.  Wrong record: ``delete_at`` listed the
+    capacity among its array arguments, so Fortran gave the caller's scalar
+    capacity a shape-dynamic extent nothing could supply, and the call failed
+    to run.  Rule: every storage formal except the capacity cell.
+    """
+
+    return tuple(
+        int(value.id) for value in storage
+        if int(value.id) != int(descriptor.capacity_value_id)
+    )
+
+
 def _status_branch(
     builder: _Builder,
     block: BasicBlock,
@@ -2568,7 +2588,7 @@ def lower_sequence_delete_at(
         metadata={
             "ssa_sequence_operation": "delete_at",
             "sequence_id": descriptor.sequence_id,
-            "sequence_array_argument_ids": tuple(int(value.id) for value in storage),
+            "sequence_array_argument_ids": _storage_array_ids(descriptor, storage),
             "status_values": {"removed": 1, "index_outside": 2},
             "named_outputs": (("status", int(status.id)),),
         },
@@ -2672,7 +2692,7 @@ def lower_sequence_insert_at(
         metadata={
             "ssa_sequence_operation": "insert_at",
             "sequence_id": descriptor.sequence_id,
-            "sequence_array_argument_ids": tuple(int(value.id) for value in storage),
+            "sequence_array_argument_ids": _storage_array_ids(descriptor, storage),
             "status_values": {"inserted": 1, "capacity_exhausted": 2},
             "named_outputs": (("status", int(status.id)),),
         },
@@ -2746,7 +2766,7 @@ def lower_sequence_reverse(
         metadata={
             "ssa_sequence_operation": "reverse",
             "sequence_id": descriptor.sequence_id,
-            "sequence_array_argument_ids": tuple(int(value.id) for value in storage),
+            "sequence_array_argument_ids": _storage_array_ids(descriptor, storage),
             "status_values": {"reversed": 1},
             "named_outputs": (("status", int(status.id)),),
         },

@@ -205,6 +205,8 @@ EXTENDED3 = [
     (["o{v} = maybe_twice(n, {a})", "t{v} = {b}", "if o{v} is not None:", "    t{v} = o{v} - {c}"], "t{v} * 10 + n"),
     # reductions over a populated list literal (lane E)
     ([], "sum([{a}, {b}, n]) * 10 + min([{c}, n, {a}])"),
+    # pop at an index and del on a fixed list (lane E)
+    (["xs{v} = [{a}, n, {b}, {c}]", "a{v} = xs{v}.pop(1)", "del xs{v}[0]"], "a{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
