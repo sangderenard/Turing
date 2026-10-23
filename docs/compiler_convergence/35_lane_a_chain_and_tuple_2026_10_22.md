@@ -216,3 +216,20 @@ spelling of a literal, not a value it produces for anyone else
 Measured at `57052b8d`: corpus 170/170 PASS, 0 findings; fuzz `FUZZ_EXT=3`
 seeds 25 and 29 60/60 each (seed 25 held p25_25); gate aa 89 / ab 7 /
 ac 26 / rec 20, same names as the parent.
+
+## After PR #786: a set merged from branch displays (`d9e25a81`)
+
+`s = {1, n} if n > 0 else {2, 3}` was refused at C emission because the
+private sequence had no capacity (loud on main). A set merged from its
+arms' displays now gets the same member-Phi birth as a list (c271), under
+the unique `add` policy, with the same named refusals. Corpus c274, fuzz
+snippet. Measured at `d9e25a81`: corpus 171/171 PASS, 0 findings; fuzz
+`FUZZ_EXT=2` seed 33 60/60; `FUZZ_EXT=3` seed 34 59 PASS, 1 LOUD. That
+LOUD is p34_21, "control_block: no source cell", in a fork copy where a
+folded display lost its member nodes. It is loud on main too. Gate aa 89 /
+ab 7 / ac 26 / rec 20, same names as the parent. `FUZZ_EXT=3` seeds 30 to
+32 at `1955080f` passed 180/180.
+
+Still loud, and found while I was here: a list or set merged from branches
+next to a loop that fills a dict (`... lacks one exact element producer`,
+also on main), and the fork-copy case above.
