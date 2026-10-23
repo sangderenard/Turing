@@ -99,6 +99,8 @@ EXTENDED = [
     (["o{v} = maybe_guard(n, {a})", "t{v} = 0", "if o{v} is not None:", "    t{v} = o{v} * 3"], "t{v}"),
     # A value-union return (``x if c else None``) tested by identity.
     (["o{v} = maybe_pick(n, {a})", "t{v} = 5", "if o{v} is not None:", "    t{v} = o{v} - 2"], "t{v}"),
+    # The same union forwarded unchanged by a wrapper.
+    (["o{v} = wrap_pick(n, {a})"], "(-3 if o{v} is None else o{v} + 1)"),
 ]
 EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
@@ -120,6 +122,10 @@ def maybe_guard(x: int, y: int):
 
 def maybe_pick(x: int, y: int):
     return x * 2 if x != y else None
+
+
+def wrap_pick(x: int, y: int):
+    return maybe_pick(x + 1, y)
 
 
 def first_over(x: int, y: int) -> int:
