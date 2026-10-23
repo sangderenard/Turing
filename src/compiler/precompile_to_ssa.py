@@ -24038,6 +24038,63 @@ def _schedule_loop_callsites(
                             writes |= child_writes
                     return reads, writes
 
+                # Program: ``d = {1: n, 2: 4}; del d[1]`` beside list work,
+                # then ``int(1 in d)`` (fuzzer p81_13).  Wrong record: the
+                # deletion rides as a pre-operation of the region after it
+                # in value order, and the membership query that follows it
+                # in source was placed before that region (WAR by run
+                # position), so the query found the deleted key (1397 for
+                # 397; clean audit).  Rule: a query of a table whose result
+                # follows a deletion of that table reads after the region
+                # that carries the deletion.  Where the region also needs
+                # the query, the order is a cycle and lowering refuses.
+                # Program: ``d = {}; for i in range(4): d[i % 2] =
+                # d.get(i % 2, 0) + n`` (the plan's C4; the loop unrolls).
+                # Wrong record: the same for a keyed store: all four
+                # ``get``s ran before the first store (-33 for -66; clean
+                # audit).  Rule: a keyed store is such a write too.
+                # The run position of such a query says nothing about it, so
+                # it takes no write-after-read edge to that carrier either.
+                follows: set[tuple[int, int]] = set()
+                deletions_by_position: dict[int, list[tuple[int, int]]] = {}
+                for position, child in enumerate(run):
+                    if not isinstance(child, StatementBlock):
+                        continue
+                    recorded_region = scheduled_region(child)
+                    if recorded_region is None:
+                        continue
+                    for kind, arguments in _region_table_operations(
+                        recorded_region,
+                        table_region_operations,
+                        table_region_post_operations,
+                    ):
+                        if kind not in {"store", "delete"}:
+                            continue
+                        _operation_reads, operation_writes = (
+                            _table_operation_sequence_accesses(kind, arguments)
+                        )
+                        deletions_by_position.setdefault(position, []).extend(
+                            (int(arguments[0]), int(sequence_id))
+                            for sequence_id in operation_writes
+                        )
+                for position, child in enumerate(run):
+                    if not (
+                        isinstance(child, SequenceQueryBlock)
+                        and child.producer_loop_node_id is None
+                    ):
+                        continue
+                    for carrier, deletions in deletions_by_position.items():
+                        if carrier != position and any(
+                            sequence_id == int(child.sequence_value_id)
+                            and effect_id < int(child.result_value_id)
+                            for effect_id, sequence_id in deletions
+                        ):
+                            follows.add((position, carrier))
+                            require(position, carrier, (
+                                "sequence_delete_raw",
+                                int(child.sequence_value_id),
+                            ))
+
                 # Three of the four dependence kinds, and not the fourth:
                 #   RAW  a read after a write   -- last_write
                 #   WAR  a write after a read   -- last_access
@@ -24045,6 +24102,7 @@ def _schedule_loop_callsites(
                 #   RAR  a read after a read    -- NONE, reads commute
                 last_access: dict[int, int] = {}
                 last_write: dict[int, int] = {}
+                reads_since_write: dict[int, list[int]] = {}
                 last_terminal = None
                 terminal_guard_candidates: list[tuple[int, int]] = []
                 for position, child in enumerate(run):
@@ -24076,13 +24134,28 @@ def _schedule_loop_callsites(
                                 and position in births.get(int(arena), ())
                             ):
                                 continue
-                            require(position, last_access[arena], (
+                            prior = last_access[arena]
+                            if (prior, position) in follows:
+                                # The latest reader follows this write; the
+                                # latest reader that does not, else the last
+                                # write, precedes it.
+                                prior = max((
+                                    reader
+                                    for reader in reads_since_write.get(arena, ())
+                                    if (reader, position) not in follows
+                                ), default=last_write.get(arena))
+                                if prior is None:
+                                    continue
+                            require(position, prior, (
                                 access_kind, int(arena)
                             ))
                     for arena in reads | writes:
                         last_access[arena] = position
+                    for arena in reads - writes:
+                        reads_since_write.setdefault(arena, []).append(position)
                     for arena in writes:
                         last_write[arena] = position
+                        reads_since_write[arena] = []
                     # A source-placed call following a guarded continue/return
                     # must not execute on that terminal edge while waiting for
                     # the guard's numerical producer.
@@ -24101,49 +24174,6 @@ def _schedule_loop_callsites(
                         ):
                             terminal_guard_candidates.append((
                                 position, last_terminal,
-                            ))
-
-                # Program: ``d = {1: n, 2: 4}; del d[1]`` beside list work,
-                # then ``int(1 in d)`` (fuzzer p81_13).  Wrong record: the
-                # deletion rides as a pre-operation of the region after it
-                # in value order, and the membership query that follows it
-                # in source was placed before that region (WAR by run
-                # position), so the query found the deleted key (1397 for
-                # 397; clean audit).  Rule: a query of a table whose result
-                # follows a deletion of that table reads after the region
-                # that carries the deletion.  Where the region also needs
-                # the query, the order is a cycle and lowering refuses.
-                deletions_by_position: dict[int, list[tuple[int, int]]] = {}
-                for position, child in enumerate(run):
-                    if not isinstance(child, StatementBlock):
-                        continue
-                    recorded_region = scheduled_region(child)
-                    if recorded_region is None:
-                        continue
-                    for kind, arguments in _region_table_operations(
-                        recorded_region,
-                        table_region_operations,
-                        table_region_post_operations,
-                    ):
-                        if kind == "delete" and arguments[2] is not None:
-                            deletions_by_position.setdefault(position, []).append(
-                                (int(arguments[0]), int(arguments[2]))
-                            )
-                for position, child in enumerate(run):
-                    if not (
-                        isinstance(child, SequenceQueryBlock)
-                        and child.producer_loop_node_id is None
-                    ):
-                        continue
-                    for carrier, deletions in deletions_by_position.items():
-                        if carrier != position and any(
-                            sequence_id == int(child.sequence_value_id)
-                            and effect_id < int(child.result_value_id)
-                            for effect_id, sequence_id in deletions
-                        ):
-                            require(position, carrier, (
-                                "sequence_delete_raw",
-                                int(child.sequence_value_id),
                             ))
 
                 def depends_on(current: int, prerequisite: int) -> bool:
