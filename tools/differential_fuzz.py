@@ -93,6 +93,9 @@ EXTENDED = [
     (["xs{v} = [{a}]", "t{v} = 0", "for i{v} in range(4):", "    t{v} += len(xs{v}) * 10 + xs{v}[-1]", "    xs{v} = [i{v}, n, {b}]"], "t{v} * 10 + len(xs{v})"),
     # ... and read by subscript after a loop that may run zero times (c247)
     (["xs{v} = [{a}, {b}]", "for i{v} in range(n):", "    xs{v} = [xs{v}[1] + i{v}, n, {c}]"], "xs{v}[0] * 10 + xs{v}[1] + len(xs{v})"),
+    # an extend by an all-constant display beside a comprehension over a
+    # folded list (corpus c248, plan C16)
+    (["ys{v} = [{a}, n]", "ys{v}.extend([{b}, {c}])", "ws{v} = [z{v} - n for z{v} in [{a}, {c}]]"], "ys{v}[3] * 10 + sum(ws{v}) + len(ys{v})"),
     # chained comparisons whose middle is a builtin conversion or measure,
     # one behind a guarding ``and`` (lanes plan A0)
     (["f{v} = n * 0.5 + {a}"], "1 if 0 <= int(f{v}) <= {b} + 3 else 2"),

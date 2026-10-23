@@ -1841,6 +1841,38 @@ def evaporate_unrolled_loops(
         live.intersection_update(int(node_id) for node_id in graph.G)
         for root in tuple(live):
             live.update(int(node_id) for node_id in nx.ancestors(graph.G, root))
+        # Program: ``ys = [1, n]; ys.extend([1, 4])`` beside ``ws = [z - n
+        # for z in zs]`` with ``zs`` a folded literal (corpus c248, lanes
+        # plan C16).  Wrong record: the structural fold turned the
+        # all-constant ``[1, 4]`` into a Constant with no element edges, so
+        # its members had no consumer and this pruning deleted them; the
+        # list birth then found no producer for a member its
+        # SOURCE_AGGREGATE_LAYOUT row names (loud).  Rule: the members a
+        # live aggregate's layout names are live with it.
+        layout_scope = graph.G.graph.get("source_aggregate_layout_scope")
+        if layout_scope is not None:
+            from .concordance_declarations import (
+                SOURCE_AGGREGATE_LAYOUT, SourceAggregateLayout,
+            )
+            from .identity_concordance import current_identity_book
+
+            layout_page = current_identity_book().page(SOURCE_AGGREGATE_LAYOUT)
+            pending = list(live)
+            while pending:
+                aggregate_id = pending.pop()
+                layout = layout_page.latest((layout_scope, int(aggregate_id)))
+                if not isinstance(layout, SourceAggregateLayout):
+                    continue
+                for member in layout.members:
+                    member_id = int(member.value_id)
+                    if member_id in live or member_id not in graph.G:
+                        continue
+                    for node_id in (
+                        member_id, *nx.ancestors(graph.G, member_id),
+                    ):
+                        if int(node_id) not in live:
+                            live.add(int(node_id))
+                            pending.append(int(node_id))
         graph.G.remove_nodes_from(
             tuple(node_id for node_id in graph.G if node_id not in live)
         )
