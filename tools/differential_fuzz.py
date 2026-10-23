@@ -182,6 +182,9 @@ EXTENDED3 = [
     (["xs{v} = [{a}, n, {b}]", "ys{v} = xs{v}[-2:]"], "ys{v}[0] * 10 + len(ys{v})"),
     (["xs{v} = [{a}, n, {b}, {c}]", "ys{v} = xs{v}[n % 3:]"], "len(ys{v}) * 10 + ys{v}[0]"),
     (["xs{v} = [{a}, {b}, {c}]"], "sum(xs{v}) + n"),
+    # loop targets over an unrolled comprehension and over zip (lane E)
+    (["t{v} = 0", "for y{v} in [x{v} * n for x{v} in [{a}, {b}]]:", "    t{v} += y{v}"], "t{v}"),
+    (["t{v} = 0", "for p{v}, q{v} in zip([{a}, n], [n, {b}]):", "    t{v} += p{v} * {c} + q{v}"], "t{v}"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v

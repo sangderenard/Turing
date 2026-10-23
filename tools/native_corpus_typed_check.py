@@ -21,7 +21,12 @@ if unknown_backends:
 
 def judge(feeds, expect, flat, kinds):
     exp = list(expect) if isinstance(expect, tuple) else [expect]
-    ok = len(flat) == len(exp) and all(abs(float(a) - float(b)) <= 1e-12 * max(1.0, abs(float(b))) for a, b in zip(flat, exp))
+    # An integer answer is exact: a float64 round trip of 6 * (2**55 + 1)
+    # passed under the relative tolerance (a comprehension row typed float64).
+    ok = len(flat) == len(exp) and all(
+        (float(a).is_integer() and int(a) == b) if isinstance(b, int) and not isinstance(b, bool)
+        else abs(float(a) - float(b)) <= 1e-12 * max(1.0, abs(float(b)))
+        for a, b in zip(flat, exp))
     want_kinds = ["b" if isinstance(e, bool) else "i" if isinstance(e, int) else "f" if isinstance(e, float) else "?" for e in exp]
     type_ok = all(w == "?" or k == w or (w == "i" and k in "iu") or (w == "b" and k in "biu") for k, w in zip(kinds, want_kinds))
     return ("ok" if type_ok else f"TYPE {feeds} got kinds {kinds} want {want_kinds}") if ok else f"WRONG {feeds} got {flat} want {exp}"

@@ -58,7 +58,7 @@ branch has used, merged or not.
 | c260-c269 | Lane A: S1 tuple birth, W2 concatenations; Lane C: C12, C13, C14 | `claude/project-thread-cz18s3` | c260-c269 (full) |
 | c270-c279 | Lane A: A0 thread follow-ups (calls in source order, branch-merged displays) | `claude/project-thread-kbkzp7` | c270, c271 |
 | c280-c289 | Silent lane follow-ups (indexed stores and concatenations in the call order) | `claude/project-thread-cz18s3` | c280-c282 |
-| c290-c299 | Lane E: list slices, sum of a folded list, slice concatenation widths | `claude/project-thread-kbkzp7` | c290-c294 |
+| c290-c299 | Lane E: list slices, sum of a folded list, slice concatenation widths | `claude/project-thread-kbkzp7` | c290-c296 |
 | c300-c309 | next free | | |
 
 ## Lane A: bootstrap families (and the tire, where it shares a group)
@@ -132,7 +132,7 @@ for the fuzzer. Corpus block c275-c279. Receipts: doc 37.
 | E2 | LLVM refusals: loop literals entering int64/bool Phis, flat reductions | `precompile_to_ssa` sequence query lowerings (`sum`/`any`/`count`/`index`/`remove`); `ssa_llvm_backend` reduction arm | `claude/project-thread-kbkzp7` | fixed locally, PR after #789 |
 | E3 | Fortran: `cannot express literal (tuple/list)` (9 programs) | `ssa_fortran_backend` constant emission | | open |
 | E5 | List slices were silently wrong in C on main: a folded slice had no row writer, a runtime slice had no lowering, and `sum` of a folded list reduced one element | `fortran_c_shell` sequence initializations; `resident_sequence_materialization._source_sequence_slices`; `precompile_to_ssa` slice mutation; `ssa_record_return_state.publish_ssa_value_type` | `claude/project-thread-kbkzp7` | fixed locally (c290-c294) |
-| E4 | LLVM refusals still standing: `address value ... has no concorded span` (callee reads of a caller list), `aggregate projection ... has no compile-time member` (optional calls), Phis over float-typed comprehension rows (c171, c172, c178, c265). Slice concatenation's i32/i64 Phis are fixed (`ir_sequence_tables.lower_sequence_append_slice` is int64) | `ir_sequence_tables` | `claude/project-thread-kbkzp7` | in part |
+| E4 | LLVM refusals still standing: `address value ... has no concorded span` (callee reads of a caller list), `aggregate projection ... has no compile-time member` (optional calls), `dict.get` default Phi (c178). Loop targets over comprehensions and `zip` are fixed (E6, c295-c296). Slice concatenation's i32/i64 Phis are fixed (`ir_sequence_tables.lower_sequence_append_slice` is int64) | `ir_sequence_tables` | `claude/project-thread-kbkzp7` | in part |
 
 ## Done
 

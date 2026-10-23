@@ -2154,6 +2154,43 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                                 ) == "loop"
                             ):
                                 settle(scalar, int(target_id), held)
+                # Program: ``for p, q in zip(xs, ys): t += p * q`` (c171,
+                # c172).  Wrong record: a tuple target has no single name, so
+                # ``p`` and ``q`` were never typed and fell to the float64
+                # default; LLVM refused the i64/double Phi and C multiplied
+                # int rows through float64.  Rule: the i-th name of a tuple
+                # target over ``zip(a, b, ...)`` is an element of the i-th
+                # argument.
+                zipped = G.nodes.get(iterable[0], {}) if iterable else {}
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and (zipped.get("attributes") or {}).get(
+                        "extraction_identity") == "builtins.zip"
+                ):
+                    arguments = sorted(
+                        (int(str(role).split(":", 1)[1]), int(parent))
+                        for parent, role in zipped.get("parents") or ()
+                        if str(role).startswith("arg:") and int(parent) in G
+                    )
+                    if len(arguments) == len(loop_expression.target.elts):
+                        for item, (_position, argument) in zip(
+                            loop_expression.target.elts, arguments,
+                        ):
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id),
+                                           element.get(argument))
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
@@ -2190,9 +2227,18 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
                 settle(element, node_id, scalar.get(parents(data, "value")[0]))
                 continue
             if is_collection(node_id) and not op.startswith("indexed"):
+                # Program: ``for y in [x * n for x in xs]: t += y``.  Wrong
+                # record: an unrolled comprehension (``sequence_materialization``)
+                # holds its elements as ``arg0``..``argN``, not ``elts``, so its
+                # element type was never joined, the loop target fell to the
+                # float64 default, and C summed int rows through float64
+                # (6 * (2**55 + 1) came back rounded).  Rule: an unrolled
+                # comprehension's members are its ``arg`` parents.
                 members = (
                     parents(data, "values") if isinstance(expression, ast.Dict)
                     or attributes.get("aggregate_kind") == "dict"
+                    else parents(data, "arg")
+                    if attributes.get("producer_kind") == "sequence_materialization"
                     else parents(data, "elts")
                 )
                 writers = [scalar.get(member) for member in members]

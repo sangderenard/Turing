@@ -240,3 +240,27 @@ slice snippets and a sum of a folded list.
   All four LOUD programs are also LOUD on main.
 - Census at the rebased head `3668d968` (210 programs): C 210/210, LLVM
   196 PASS, 0 WRONG, 0 crashes and 14 refused.
+
+## E6: loop targets over a comprehension or `zip` (C silent on main, LLVM refused)
+
+- **Program:** `for y in [x * n for x in xs]: t += y` (c295, c265) and
+  `for p, q in zip(xs, ys): t += p * 3 + q` (c296, c171, c172).
+- **Wrong record:** the planner's scalar proof table
+  (`glsl_deployment_strategy._planned_scalar_dtypes`) never typed these
+  loop targets, so they fell to the float64 domain default.
+  - An unrolled comprehension (`sequence_materialization`) holds its
+    elements as `arg0`..`argN`, not `elts`, so its element type was never
+    joined.
+  - A tuple target has no single name.
+  - C then added int rows through float64. With n = 2**55 + 1, c295 returns
+    216172782113783808 where 216172782113783814 is right. LLVM refused the
+    i64/double Phi.
+- **Why the corpus did not catch it:** the typed check compared integer
+  answers with a relative 1e-12 tolerance, and that tolerance hid the
+  rounding. An integer answer is now compared exactly
+  (`tools/native_corpus_typed_check.py`).
+- **Rule:** an unrolled comprehension's members are its `arg` parents. The
+  i-th name of a tuple target over `zip(a, b, ...)` is an element of the
+  i-th argument.
+- c295 and c296 are WRONG at main `08ba0171` and pass in C and LLVM here.
+  c265, c171 and c172 move from LLVM refused to PASS.
