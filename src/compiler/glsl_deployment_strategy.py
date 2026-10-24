@@ -2640,6 +2640,36 @@ def _planned_scalar_dtypes_from(
                     writers.extend(
                         element.get(source) for source in parents(data, "arg:0")
                     )
+                # Lane D, D2.  Program: ``rep = [1]`` then ``if k > 2: rep =
+                # [k, 1, 2]`` and ``sum(rep) + max(rep)`` (corpus c442).  A
+                # branch join that is itself a collection holds its arms'
+                # rows, with its own later writers (the Phi rule below never
+                # sees it, because this rule takes every collection first).
+                if op == "phi":
+                    writers.extend(
+                        element.get(arm)
+                        for arm in parents(data, "body", "orelse")
+                    )
+                # Lane D, D2.  Program: ``rep = list(xs)`` on a branch, then
+                # ``rep[0] * 10 + rep[-1]`` (corpus c441).  A copy of a
+                # sequence (``list(xs)``, ``tuple(xs)``, ``set(xs)``) holds
+                # its argument's rows; nobody read that, so the copy's rows
+                # took the float64 domain default.  Iterating a dict yields
+                # its keys, not its rows, so a dict argument proves nothing
+                # here.
+                if (
+                    attributes.get("producer_kind") == "aggregate_materialization"
+                    and str(attributes.get("static_python_reference") or "")
+                    in {"list", "tuple", "set", "frozenset"}
+                ):
+                    sources = parents(data, "arg:0")
+                    writers.extend(
+                        None if (
+                            G.nodes[source].get("attributes") or {}
+                        ).get("aggregate_kind") == "dict"
+                        else element.get(source)
+                        for source in sources
+                    )
                 # Lane D, D2.  Program: ``def setfirst(xs: list[int], v:
                 # int): xs[0] = v`` (corpus c180).  The parameter's
                 # annotation states its element class
