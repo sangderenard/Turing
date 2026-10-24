@@ -41,8 +41,6 @@ building an EXT=5 tier aimed at these areas.
 | 9 | Everything else below, by lane table order | | | |
 
 Waiting on Albert (his call, not a lane's):
-- **`max(x, y)` over multi-element tensors** lowers as an elementwise
-  maximum (#829), where Python raises. Keep it or refuse it?
 - **PR1, pack-core semantics.** `x[i]` on a `Precision[2]` array loads one
   double at index i, with a constant 0.0 low limb, and `y[i]` stores only
   the leading limb. So the microprecision benchmark's interleaved-limb feeds
@@ -56,6 +54,10 @@ Waiting on Albert (his call, not a lane's):
   still mis-lowers fields: per-method float64 arenas, and stores placed
   regardless of control flow. Class DLLs should come from the catalogue.
   Retire the adapter, or redirect it?
+
+Decided on 2026-10-24 (09:10): builtin `max(x, y)` over multi-element tensors is
+refused, as Python refuses it. Elementwise maximum is `emax`, with `emin`
+beside it, and the tensor lowering thread is implementing both.
 
 Decided on 2026-10-24: a stored callable field, such as `self.trace(...)`
 set from outside, lowers as a real native-to-host callback, a function
