@@ -63,3 +63,7 @@ the requested graphics context but must not install its own presentation
 pipeline. The interior controller confirms the transfer explicitly; absence
 of that confirmation is a runtime error rather than an implicit fallback that
 would create two owners of one canvas.
+
+The component ABI is the logical authority. The source packaging and physical
+resource/launch metadata required by Nodus are recorded separately in
+[`NODUS_SHADER_DEPLOYMENT_REQUEST.md`](NODUS_SHADER_DEPLOYMENT_REQUEST.md).
