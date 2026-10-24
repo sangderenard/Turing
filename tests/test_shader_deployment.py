@@ -304,11 +304,18 @@ def test_deployable_spirv_refuses_what_one_invocation_cannot_carry():
     (u,) = _spans(1, 0)
     total = SSAValue(1, "float32", ())
     reduced = Function("reduced", [u], {"entry": BasicBlock("entry", [
-        Instr("sum", [u], total), Instr("Ret", [], None),
+        Instr("sum", [u], total, attributes={"axis": 0}), Instr("Ret", [], None),
+    ])})
+    (w,) = _spans(1, 0)
+    first, second = SSAValue(1, "float32", ()), SSAValue(2, "float32", ())
+    twice = Function("twice", [w], {"entry": BasicBlock("entry", [
+        Instr("sum", [w], first), Instr("add", [first, first], second),
+        Instr("Ret", [], None),
     ])})
     for function, outputs, reason in (
         (mixed, [z], "one rank"),
-        (reduced, [total], "is a scalar beside"),
+        (reduced, [total], "over an axis"),
+        (twice, [second], "is a scalar beside"),
     ):
         refused = emit_deployable_compute_shader(function, outputs=outputs)
         assert not refused.complete and refused.source == ""
@@ -590,6 +597,129 @@ def test_reductions_over_instances_match_python_on_vulkan(tmp_path):
         np.testing.assert_allclose(got[name][:count], want, rtol=1e-5, atol=1e-6)
         assert np.isnan(got[name][7])
         assert (got[name][count:] == 12345).all()
+
+
+def _runtime_reduction(op, dtype="float32", start=False):
+    """``op`` of one runtime-sized rank-2 span (``sum`` optionally from a
+    scalar ``start`` feed)."""
+
+    (x,) = _spans(2, 0, dtype=dtype)
+    arguments = [x]
+    if start:
+        arguments.append(SSAValue(1, dtype, ()))
+    result_dtype = "float32" if op == "mean" else dtype
+    result = SSAValue(5, result_dtype, ())
+    function = Function(f"reduce_{op}", arguments, {"entry": BasicBlock("entry", [
+        Instr(op, arguments, result), Instr("Ret", [], None),
+    ])})
+    return function, [result]
+
+
+def test_runtime_sized_reduction_deploys_as_one_looping_invocation():
+    function, outputs = _runtime_reduction("sum", start=True)
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    assert shader.reduction == "sum" and "OpLoopMerge" in shader.source
+    record = spirv_deployment(shader).to_mapping()
+    views = {item["name"]: item["realizes"][0] for item in record["resources"]}
+    assert views["feed_0"]["rank"] == 2 and views["feed_0"]["shape"] is None
+    assert views["feed_0"]["byte_extent"] == {
+        "control": "element_count", "index": 0, "scale": 4,
+    }
+    for name in ("feed_1", "output_0"):
+        assert views[name]["rank"] == 0 and views[name]["shape"] == []
+        assert views[name]["byte_extent"] == 4
+    launch = record["launch"]
+    assert launch["group_count"]["rule"] == "fixed"
+    assert launch["group_count"]["groups"] == 1
+    assert launch["element_count"]["elements_of"] == views["feed_0"]["slot"]
+    assert launch["element_count"]["reduction"] == "sum"
+    assert launch["element_count"]["minimum"] == 0
+    for op in ("max", "min", "mean"):
+        function, outputs = _runtime_reduction(op)
+        shader = emit_deployable_compute_shader(function, outputs=outputs)
+        assert spirv_deployment(shader).to_mapping()["launch"][
+            "element_count"]["minimum"] == 1
+
+
+_RUNTIME_REDUCTIONS = [
+    ("sum", "float32", False), ("sum", "float32", True), ("prod", "float32", False),
+    ("max", "float32", False), ("min", "float32", False), ("mean", "float32", False),
+    ("all", "float32", False), ("any", "float32", False),
+    ("sum", "int32", False), ("max", "int32", False),
+]
+
+
+@pytest.mark.parametrize("op,dtype,start", _RUNTIME_REDUCTIONS)
+@pytest.mark.parametrize("extents", [(7, 5), (0, 3)])
+def test_runtime_sized_reduction_matches_python_on_vulkan(
+    tmp_path, op, dtype, start, extents,
+):
+    probe = _vulkan_probe(tmp_path)
+    function, outputs = _runtime_reduction(op, dtype, start)
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    product = publish_spirv_product(tmp_path / "product", shader)
+    record = product.deployment
+    rng = np.random.default_rng(11)
+    if dtype == "int32":
+        x = rng.integers(-9, 9, extents).astype(np.int32)
+    else:
+        x = (rng.standard_normal(extents) * 0.9 + 0.1).astype(np.float32)
+        if op in ("all", "any") and x.size:
+            x[1, 2] = 0.0
+        if op in ("max", "min") and x.size:
+            x[3, 1] = np.nan
+    sentinel = 12345
+    fed = {0: x, 1: np.array([2.5 if dtype == "float32" else 2], dtype=dtype)}
+    buffers = {}
+    for resource in record["resources"]:
+        view = resource["realizes"][0]
+        if resource["access"] == "read":
+            # A zero-length buffer cannot be bound; pad the empty span.
+            fed_value = fed[view["value_id"]].reshape(-1)
+            buffers[resource["binding"]] = (
+                fed_value if fed_value.size else np.zeros(1, dtype=dtype)
+            )
+        else:
+            result_dtype = "float32" if op == "mean" else dtype
+            buffers[resource["binding"]] = np.full(4, sentinel, dtype=result_dtype)
+    (control,) = record["launch"]["controls"]
+    buffers[control["binding"]] = np.array([x.size], dtype=np.uint32)
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    # Two groups launched where the record asks for one: only invocation 0
+    # folds, so the extra invocations change nothing.
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), "2", "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    output = next(
+        item for item in record["resources"] if item["access"] == "read_write"
+    )
+    got = np.fromfile(paths[output["binding"]], dtype="float32" if op == "mean" else dtype)
+    assert (got[1:] == sentinel).all()
+    flat = x.reshape(-1)
+    if not flat.size and op in ("max", "min", "mean"):
+        assert got[0] == sentinel  # no value: nothing written
+        return
+    if op == "sum":
+        want = sum(flat.tolist(), fed[1][0].item() if start else 0)
+    elif op == "prod":
+        want = np.prod(flat.astype(np.float64))
+    elif op in ("max", "min"):
+        want = getattr(np, op)(flat)
+    elif op == "mean":
+        want = flat.astype(np.float64).mean()
+    else:
+        want = float(getattr(np, op)(flat))
+    np.testing.assert_allclose(got[0], want, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "int32"])

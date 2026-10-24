@@ -604,13 +604,19 @@ def spirv_deployment(shader: Any) -> ShaderDeployment:
             ports[int(item.value_id)].slot for item in shader.bindings
             if item.role == "feed" and getattr(item, "runtime_rank", 0)
         ), None)
+    # Reduction mode: one invocation folds the span feed into element 0 of
+    # the one output, so the output is a single element and the launch is
+    # one group.
+    reduction = getattr(shader, "reduction", None)
     resources = []
     for binding in shader.bindings:
         if binding.role == "control":
             continue
         port = ports[int(binding.value_id)]
         if element_rank:
-            broadcast = bool(getattr(binding, "broadcast", False))
+            broadcast = bool(getattr(binding, "broadcast", False)) or (
+                reduction is not None and binding.role == "output"
+            )
             extent = (
                 binding.element_bytes if broadcast
                 else control_ref("element_count", 0, scale=binding.element_bytes)
@@ -668,13 +674,19 @@ def spirv_deployment(shader: Any) -> ShaderDeployment:
         resources=tuple(resources),
         launch=LaunchContract(
             local_size=local,
-            group_count={
-                "rule": "ceil_div",
-                "work": "element_count",
-                "invocations_per_group": local[0],
-                "groups": None,
-                "axis": "x",
-            },
+            group_count=(
+                {
+                    "rule": "fixed", "work": None,
+                    "invocations_per_group": local[0], "groups": 1,
+                    "axis": "x",
+                } if reduction is not None else {
+                    "rule": "ceil_div",
+                    "work": "element_count",
+                    "invocations_per_group": local[0],
+                    "groups": None,
+                    "axis": "x",
+                }
+            ),
             element_count={
                 "source": "storage-word", "control": "element_count",
                 "kind": "element_count", "rank": element_rank or 1,
@@ -682,6 +694,13 @@ def spirv_deployment(shader: Any) -> ShaderDeployment:
                 # Element mode: the product of the span feeds' runtime
                 # extents (which must agree; the host checks them).
                 **({"elements_of": first_feed} if element_rank else {}),
+                # max/min/mean of no elements has no value; the shader
+                # then writes nothing.
+                **(
+                    {"reduction": reduction, "minimum": (
+                        1 if reduction in ("max", "min", "mean") else 0
+                    )} if reduction is not None else {}
+                ),
             },
             extents={
                 "type": "uint32_t",

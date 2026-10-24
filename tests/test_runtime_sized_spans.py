@@ -349,10 +349,10 @@ def test_rank_only_region_deploys_as_elementwise_spirv(tmp_path):
         assert validated.returncode == 0, validated.stderr
 
 
-def test_static_reductions_deploy_and_runtime_ones_are_refused(tmp_path):
+def test_reduction_regions_deploy_static_and_runtime_sized(tmp_path):
     """``x.mean() - y.prod()`` lowers to one region per reduction.  With a
-    static shape each reduction region deploys; over runtime-sized spans it
-    is refused by name rather than read as an elementwise op."""
+    static shape each reduction region unrolls; over runtime-sized spans it
+    deploys as one invocation looping over the host's element count."""
 
     import shutil
     import subprocess
@@ -397,10 +397,24 @@ def test_static_reductions_deploy_and_runtime_ones_are_refused(tmp_path):
         )
         assert validated.returncode == 0, validated.stderr
 
-    for ops, shader in regions("red_runtime", None):
-        if ops & {"mean", "prod"}:
-            assert not shader.complete
-            assert "one element per invocation" in shader.shortfalls[0].reason
+    looped = [
+        shader for ops, shader in regions("red_runtime", None)
+        if ops & {"mean", "prod"}
+    ]
+    assert {shader.reduction for shader in looped} == {"mean", "prod"}
+    for shader in looped:
+        assert shader.complete, shader.shortfalls
+        if not (shutil.which("spirv-as") and shutil.which("spirv-val")):
+            continue
+        text = tmp_path / f"{shader.reduction}.spvasm"
+        text.write_text(shader.source)
+        binary = tmp_path / f"{shader.reduction}.spv"
+        for command in (
+            ["spirv-as", "--target-env", "vulkan1.1", str(text), "-o", str(binary)],
+            ["spirv-val", "--target-env", "vulkan1.1", str(binary)],
+        ):
+            ran = subprocess.run(command, capture_output=True, text=True)
+            assert ran.returncode == 0, ran.stderr
 
 
 # -- builtin max/min of one tensor ------------------------------------------

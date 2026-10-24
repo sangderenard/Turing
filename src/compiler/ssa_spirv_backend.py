@@ -514,6 +514,59 @@ def _elementwise_runtime_rank(
     return rank, None
 
 
+def _runtime_reduction(
+    function: Function, outputs: Sequence[SSAValue],
+) -> tuple[Instr | None, str | None]:
+    """The one whole-span reduction ``function`` computes, if that is all.
+
+    Reduction mode applies when the function's only instruction (besides
+    ``Ret``) is ``sum``/``prod``/``max``/``min``/``mean``/``all``/``any`` of
+    a runtime-sized span argument to its one scalar output, with no axis;
+    ``sum`` may carry a scalar ``start`` argument. Returns ``(instr, None)``,
+    ``(None, reason)`` for a reduction it cannot carry, or ``(None, None)``
+    when the function is not a reduction at all.
+    """
+
+    if len(function.blocks) != 1:
+        return None, None
+    block = next(iter(function.blocks.values()))
+    body = [
+        instr for instr in block.instrs
+        if instr.op not in ("Ret", "ret", "Return", "return")
+    ]
+    if len(body) != 1:
+        return None, None
+    (instr,) = body
+    op = str(instr.attributes.get("tensor_operation") or instr.op)
+    if op not in _REDUCTION_OPS or not instr.args or not _runtime_sized(instr.args[0]):
+        return None, None
+    source = instr.args[0]
+    arguments = {int(value.id) for value in function.args}
+    if (
+        instr.res is None
+        or tuple(instr.res.shape or ())
+        or _runtime_sized(instr.res)
+        or [int(value.id) for value in outputs] != [int(instr.res.id)]
+    ):
+        return None, f"{op} of %t{source.id} must be the one scalar output"
+    if instr.attributes.get("axis") is not None or instr.attributes.get("dim") is not None:
+        return None, f"{op} over an axis of a runtime-sized span"
+    if int(source.id) not in arguments:
+        return None, f"%t{source.id} is not a feed of {function.name}"
+    if len(instr.args) > (2 if op == "sum" else 1) or any(
+        int(value.id) not in arguments or value.shape or _runtime_sized(value)
+        for value in instr.args[1:]
+    ):
+        return None, f"{op} takes one span (and for sum a scalar start feed)"
+    if str(instr.res.dtype or DEFAULT_DTYPE) == "bool":
+        return None, f"a bool {op} result has no storage-buffer spelling"
+    if op == "mean" and _DTYPE_KIND.get(str(instr.res.dtype or DEFAULT_DTYPE)) != "float":
+        return None, "mean needs a float result"
+    if op not in ("all", "any") and _DTYPE_KIND.get(str(source.dtype or DEFAULT_DTYPE)) == "bool":
+        return None, f"a {op} over bool elements"
+    return instr, None
+
+
 class _FunctionEmitter:
     """Translate one straight-line SSA ``Function`` into SPIR-V.
 
@@ -1428,6 +1481,9 @@ class SPIRVDeployableShader:
     #: that carries it; ``None`` when the function was refused.
     component_abi: Any = None
     api: Any = None
+    #: Reduction mode: the whole-span reduction one invocation computes by
+    #: looping over ``element_count`` elements (``None`` otherwise).
+    reduction: str | None = None
     product_kind = DEPLOYABLE_SHADER
 
     @property
@@ -1464,9 +1520,11 @@ def emit_deployable_compute_shader(
     stated, no static shape) runs in ELEMENT mode instead: invocation ``i``
     computes element ``i`` of every span, rank-0 feeds broadcast (each
     invocation reads their element 0), and ``element_count`` is the product
-    of the host's extents. What neither mode can carry (mixed span ranks, a
-    non-elementwise operation over a span, a boolean element, no result) is
-    a shortfall, never a guessed layout.
+    of the host's extents. A lone whole-span reduction of a runtime-sized
+    span runs in REDUCTION mode: one invocation loops over the host's
+    element count (``_emit_runtime_reduction_shader``). What no mode can
+    carry (mixed span ranks, a non-elementwise operation over a span, a
+    boolean element, no result) is a shortfall, never a guessed layout.
     """
 
     name = str(name or function.name)
@@ -1488,6 +1546,21 @@ def emit_deployable_compute_shader(
             f"invocation; {function.name} names none",
         ))
         return refused()
+    # Reduction mode: one whole-span reduction of a runtime-sized span runs
+    # in ONE invocation, which loops over the host's element count.
+    reduction, reason = _runtime_reduction(function, outputs)
+    if reason is not None:
+        shortfalls.append(SPIRVShortfall(
+            "<entry>", "*",
+            f"{function.name} reduces a runtime-sized span but cannot run "
+            f"as one looping invocation: {reason}",
+        ))
+        return refused()
+    if reduction is not None:
+        return _emit_runtime_reduction_shader(
+            function, reduction, dtype=dtype, local=local, name=name,
+            module=module,
+        )
     # Element mode: an elementwise function over runtime-sized spans of one
     # rank runs one ELEMENT per invocation instead of one instance; its
     # rank-0 feeds broadcast (every invocation reads element 0).
@@ -1804,6 +1877,299 @@ def emit_deployable_compute_shader(
         name, "\n".join(lines) + "\n", function.name, local, tuple(bindings),
         capabilities=tuple(sorted(builder.capabilities)),
         component_abi=component_abi, api=api,
+    )
+
+
+def _emit_runtime_reduction_shader(
+    function: Function,
+    instr: Instr,
+    *,
+    dtype: str,
+    local: tuple[int, int, int],
+    name: str,
+    module: IRModule | None,
+) -> SPIRVDeployableShader:
+    """Reduction mode: one invocation folds a runtime-sized span.
+
+    Program: ``x.sum()`` with ``x`` declared ``storage: span, rank: 2`` and
+    no shape. The unrolled library has no count to unroll, and element mode
+    writes one element per invocation, so the region was refused. Rule:
+    invocation 0 loops ``i`` over ``[0, element_count)`` in a structured
+    loop, folding element ``i`` left to right exactly as the unrolled form
+    does (NaN enters ``max``/``min`` and stays; NaN is true for
+    ``all``/``any``), and writes element 0 of ``output_0``. The launch is one
+    group. ``max``, ``min`` and ``mean`` of no elements have no value: the
+    shader then writes nothing, and the record says ``minimum`` 1.
+    """
+
+    op = str(instr.attributes.get("tensor_operation") or instr.op)
+    source, result = instr.args[0], instr.res
+    shortfalls = list(_precision_shortfalls(
+        module if module is not None else function, (function.name,)
+    ).get(function.name, ()))
+    if shortfalls:
+        return SPIRVDeployableShader(
+            name, "", function.name, local, (), tuple(shortfalls),
+        )
+    builder = _ModuleBuilder(linkage=False)
+    folding = _FunctionEmitter(
+        function, builder, dtype=dtype, outputs=(result,), runtime_elements=True,
+    )
+    uint = builder.uint_type()
+    boolean = builder.scalar_type("bool")
+    void = builder.void_type()
+    zero, one = builder.uint_constant(0), builder.uint_constant(1)
+    source_dtype = str(source.dtype or dtype)
+    result_dtype = str(result.dtype or dtype)
+    source_kind = _DTYPE_KIND.get(source_dtype)
+    result_kind = _DTYPE_KIND.get(result_dtype)
+    source_type = builder.scalar_type(source_dtype)
+    result_type = builder.scalar_type(result_dtype)
+    decorations: list[str] = []
+
+    def declare(line: str) -> None:
+        builder.type_lines.append(line)
+
+    declare(f"%v3uint = OpTypeVector {uint} 3")
+    declare(f"%gid = OpVariable {builder.pointer_type('Input', '%v3uint')} Input")
+    decorations.append("OpDecorate %gid BuiltIn GlobalInvocationId")
+    block_types: dict[str, tuple[str, str]] = {}
+
+    def block_for(element_type: str, stride: int) -> tuple[str, str]:
+        if element_type not in block_types:
+            runtime, block = builder.fresh("rtarr"), builder.fresh("blk")
+            declare(f"{runtime} = OpTypeRuntimeArray {element_type}")
+            declare(f"{block} = OpTypeStruct {runtime}")
+            decorations.append(f"OpDecorate {runtime} ArrayStride {stride}")
+            decorations.append(f"OpDecorate {block} Block")
+            decorations.append(f"OpMemberDecorate {block} 0 Offset 0")
+            block_types[element_type] = (
+                block, builder.pointer_type("StorageBuffer", element_type),
+            )
+        return block_types[element_type]
+
+    bindings: list[SPIRVStorageBinding] = []
+    variables: dict[int, tuple[str, str, str]] = {}
+    for binding, (role, value) in enumerate(
+        [("feed", value) for value in function.args] + [("output", result)]
+    ):
+        value_dtype = str(value.dtype or dtype)
+        spelling, stride = _STORAGE_ELEMENT[value_dtype]
+        element_type = builder.scalar_type(value_dtype)
+        block, element_pointer = block_for(element_type, stride)
+        variable = f"%{role}_{binding}"
+        declare(
+            f"{variable} = OpVariable "
+            f"{builder.pointer_type('StorageBuffer', block)} StorageBuffer"
+        )
+        decorations.append(f"OpDecorate {variable} DescriptorSet 0")
+        decorations.append(f"OpDecorate {variable} Binding {binding}")
+        if role == "feed":
+            decorations.append(f"OpDecorate {variable} NonWritable")
+            variables[int(value.id)] = (variable, element_type, element_pointer)
+        else:
+            variables[-1] = (variable, element_type, element_pointer)
+        spans = role == "feed" and _runtime_sized(value)
+        bindings.append(SPIRVStorageBinding(
+            binding, f"feed_{value.id}" if role == "feed" else "output_0",
+            role, spelling, stride,
+            "read" if role == "feed" else "read_write", int(value.id),
+            runtime_rank=_declared_rank(value) if spans else 0,
+            broadcast=not spans,
+        ))
+    control_binding = len(bindings)
+    control_block = builder.fresh("ctl")
+    declare(f"{control_block} = OpTypeStruct {uint}")
+    decorations.append(f"OpDecorate {control_block} Block")
+    decorations.append(f"OpMemberDecorate {control_block} 0 Offset 0")
+    declare(
+        f"%control = OpVariable "
+        f"{builder.pointer_type('StorageBuffer', control_block)} StorageBuffer"
+    )
+    decorations.append("OpDecorate %control DescriptorSet 0")
+    decorations.append(f"OpDecorate %control Binding {control_binding}")
+    decorations.append("OpDecorate %control NonWritable")
+    bindings.append(SPIRVStorageBinding(
+        control_binding, "control", "control", "u32", 4, "read",
+    ))
+
+    logical = op in ("all", "any")
+    accumulator_type = boolean if logical else result_type
+    span_variable, _span_type, span_pointer = variables[int(source.id)]
+    body = [
+        f"%main = OpFunction {void} None {builder.function_type(void, ())}",
+        "%main_entry = OpLabel",
+        f"%i_var = OpVariable {builder.pointer_type('Function', uint)} Function",
+        f"%acc_var = OpVariable {builder.pointer_type('Function', accumulator_type)} Function",
+        "%gid_v = OpLoad %v3uint %gid",
+        f"%index = OpCompositeExtract {uint} %gid_v 0",
+        f"%count_ptr = OpAccessChain {builder.pointer_type('StorageBuffer', uint)} %control {zero}",
+        f"%count = OpLoad {uint} %count_ptr",
+        f"%first = OpIEqual {boolean} %index {zero}",
+    ]
+    nonempty = op in ("max", "min", "mean")
+    if nonempty:
+        body.extend([
+            f"%some = OpUGreaterThan {boolean} %count {zero}",
+            f"%run = OpLogicalAnd {boolean} %first %some",
+        ])
+    run = "%run" if nonempty else "%first"
+    body.extend([
+        "OpSelectionMerge %main_merge None",
+        f"OpBranchConditional {run} %main_body %main_merge",
+        "%main_body = OpLabel",
+    ])
+
+    def element(at: str, tag: str) -> str:
+        body.append(f"%{tag}_ptr = OpAccessChain {span_pointer} {span_variable} {zero} {at}")
+        body.append(f"%{tag} = OpLoad {source_type} %{tag}_ptr")
+        if logical:
+            if source_kind == "float":
+                test = builder.constant(source_dtype, 0.0)
+                body.append(f"%{tag}_t = OpFUnordNotEqual {boolean} %{tag} {test}")
+            elif source_kind == "int":
+                test = builder.constant(source_dtype, 0)
+                body.append(f"%{tag}_t = OpINotEqual {boolean} %{tag} {test}")
+            else:
+                return f"%{tag}"
+            return f"%{tag}_t"
+        converted = folding._convert(f"%{tag}", source_dtype, result_dtype, body)
+        if converted is None:
+            raise SPIRVEmissionError(
+                f"no conversion from {source_dtype} to {result_dtype}"
+            )
+        return converted
+
+    if logical:
+        initial = builder.constant("bool", op == "all")
+    elif op in ("max", "min"):
+        initial = element(zero, "e0")
+    elif op == "sum" and len(instr.args) == 2:
+        start = instr.args[1]
+        start_variable, start_type, start_pointer = variables[int(start.id)]
+        body.append(f"%start_ptr = OpAccessChain {start_pointer} {start_variable} {zero} {zero}")
+        body.append(f"%start = OpLoad {start_type} %start_ptr")
+        initial = folding._convert(
+            "%start", str(start.dtype or dtype), result_dtype, body,
+        )
+        if initial is None:
+            raise SPIRVEmissionError(
+                f"no conversion from {start.dtype} to {result_dtype}"
+            )
+    else:
+        initial = builder.constant(result_dtype, 1 if op == "prod" else 0)
+    body.extend([
+        f"OpStore %acc_var {initial}",
+        f"OpStore %i_var {zero}",
+        "OpBranch %loop_head",
+        "%loop_head = OpLabel",
+        "OpLoopMerge %loop_merge %loop_continue None",
+        "OpBranch %loop_test",
+        "%loop_test = OpLabel",
+        f"%iv = OpLoad {uint} %i_var",
+        f"%more = OpULessThan {boolean} %iv %count",
+        "OpBranchConditional %more %loop_body %loop_merge",
+        "%loop_body = OpLabel",
+        f"%acc = OpLoad {accumulator_type} %acc_var",
+    ])
+    value = element("%iv", "ev")
+    if logical:
+        folded = "OpLogicalAnd" if op == "all" else "OpLogicalOr"
+        body.append(f"%next_acc = {folded} {boolean} %acc {value}")
+    elif op in ("max", "min"):
+        compare = (
+            ("OpFOrdGreaterThan" if op == "max" else "OpFOrdLessThan")
+            if result_kind == "float"
+            else ("OpSGreaterThan" if op == "max" else "OpSLessThan")
+        )
+        body.append(f"%wins = {compare} {boolean} {value} %acc")
+        wins = "%wins"
+        if result_kind == "float":
+            body.append(f"%nan = OpIsNan {boolean} {value}")
+            body.append(f"%wins_or_nan = OpLogicalOr {boolean} %wins %nan")
+            wins = "%wins_or_nan"
+        body.append(f"%next_acc = OpSelect {result_type} {wins} {value} %acc")
+    else:
+        kind, payload = folding._resolve(
+            "mul" if op == "prod" else "add", result_dtype, 2,
+        )
+        folding._apply(kind, payload, result_type, "%next_acc", ["%acc", value], instr, body)
+    output_variable, _output_type, output_pointer = variables[-1]
+    body.extend([
+        "OpStore %acc_var %next_acc",
+        "OpBranch %loop_continue",
+        "%loop_continue = OpLabel",
+        f"%iv_next = OpIAdd {uint} %iv {one}",
+        "OpStore %i_var %iv_next",
+        "OpBranch %loop_head",
+        "%loop_merge = OpLabel",
+        f"%total = OpLoad {accumulator_type} %acc_var",
+    ])
+    final = "%total"
+    if logical and result_kind != "bool":
+        body.append(
+            f"%final = OpSelect {result_type} %total "
+            f"{builder.constant(result_dtype, 1)} {builder.constant(result_dtype, 0)}"
+        )
+        final = "%final"
+    elif op == "mean":
+        body.append(f"%count_f = OpConvertUToF {result_type} %count")
+        kind, payload = folding._resolve("Div", result_dtype, 2)
+        folding._apply(kind, payload, result_type, "%final", ["%total", "%count_f"], instr, body)
+        final = "%final"
+    body.extend([
+        f"%out_ptr = OpAccessChain {output_pointer} {output_variable} {zero} {zero}",
+        f"OpStore %out_ptr {final}",
+        "OpBranch %main_merge",
+        "%main_merge = OpLabel",
+        "OpReturn",
+        "OpFunctionEnd",
+    ])
+
+    lines = [f"OpCapability {item}" for item in sorted(builder.capabilities)]
+    if builder.needs_glsl_ext:
+        lines.append('%glsl = OpExtInstImport "GLSL.std.450"')
+    lines.append("OpMemoryModel Logical GLSL450")
+    lines.append('OpEntryPoint GLCompute %main "main" %gid')
+    lines.append(f"OpExecutionMode %main LocalSize {local[0]} {local[1]} {local[2]}")
+    lines.extend(decorations)
+    lines.extend(builder.decorations)
+    lines.extend(builder.type_lines)
+    lines.append("")
+    lines.extend(body)
+    from .compiled_program_api import CompiledProgramAPI, EntryPoint
+    from .shader_component_abi import component_abi_from_layout
+    from .shader_stages import COMPUTE, BufferBinding, ShaderIOLayout
+
+    def port(item: SPIRVStorageBinding) -> BufferBinding:
+        return BufferBinding(item.name, item.role, item.dtype, item.binding, item.value_id)
+
+    layout = ShaderIOLayout(
+        COMPUTE.name,
+        feeds=tuple(port(item) for item in bindings if item.role == "feed"),
+        outputs=tuple(port(item) for item in bindings if item.role == "output"),
+    )
+    component_abi = component_abi_from_layout(
+        name, "spirv", layout,
+        decorations={
+            "execution_model": "GLCompute",
+            "workgroup_size": local,
+            "sentinel_policy": "validate-before-dispatch/publish-after-dispatch",
+        },
+    )
+    api = CompiledProgramAPI(
+        module=name, language="spirv", entry="main",
+        entry_points=(EntryPoint("main", "main", "numerical"),),
+        metadata={
+            "stage": COMPUTE.name,
+            "io_layout": layout.to_mapping(),
+            "component_abi": component_abi.to_mapping(),
+        },
+    )
+    return SPIRVDeployableShader(
+        name, "\n".join(lines) + "\n", function.name, local, tuple(bindings),
+        capabilities=tuple(sorted(builder.capabilities)),
+        component_abi=component_abi, api=api, reduction=op,
     )
 
 
