@@ -2824,6 +2824,16 @@ def _planned_scalar_dtypes_from(
             if isinstance(expression, ast.IfExp) or op == "phi":
                 arms = parents(data, "body", "orelse")
                 settle(scalar, node_id, join([scalar.get(o) for o in arms]))
+                continue
+            # Lane D, D2.  Program: ``if a > 0 and b < n: ...``, ``x = p or
+            # q`` (corpus c07, c155).  Python's ``and``/``or`` returns one of
+            # its operands, so its class is their join, as a branch join's
+            # is.  Nobody read that, so every ``BoolOp`` (and what it fed)
+            # took the float64 domain default.  An operand still unproven
+            # leaves it unproven.
+            if isinstance(expression, ast.BoolOp):
+                operands = parents(data, "value")
+                settle(scalar, node_id, join([scalar.get(o) for o in operands]))
         if not changed:
             if get_default_phase:
                 break
