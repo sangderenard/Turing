@@ -5786,6 +5786,8 @@ def emit_module(
             if instruction.res is not None
         )
         for descriptor in table.records.values():
+            if _conceptual_record(descriptor, available_value_ids):
+                continue
             for field in descriptor.fields:
                 missing_values = set(field.value_ids) - available_value_ids
                 if missing_values:
@@ -7662,12 +7664,17 @@ def emit_module(
             ],
             "record_table_schema": "turing.repository-ssa-record-table.v1",
             "record_tables": {
-                function_name: [
+                function_name: records
+                for function_name, table in module_record_tables.items()
+                if function_name in functions
+                for records in ([
                     descriptor.to_mapping()
                     for descriptor in table.records.values()
-                ]
-                for function_name, table in module_record_tables.items()
-                if function_name in functions and table.records
+                    if not _conceptual_record(
+                        descriptor, _function_value_ids(functions[function_name]),
+                    )
+                ],)
+                if records
             },
             "value_union_table_schema": (
                 "turing.repository-ssa-value-union-table.v1"
@@ -7686,6 +7693,50 @@ def emit_module(
     return FortranModule(
         name, "\n".join(lines) + "\n", subroutines, api=api,
         precision_sections=module_precision_sections,
+    )
+
+
+def _function_value_ids(function: Any) -> set[int]:
+    """Every SSA id a function defines: its formals and instruction results."""
+
+    value_ids = {int(value.id) for value in function.args}
+    value_ids.update(
+        int(instruction.res.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+    )
+    return value_ids
+
+
+def _conceptual_record(descriptor: Any, available_value_ids: set[int]) -> bool:
+    """A record descriptor with no physical presence in its function.
+
+    Program: ``s = S(0); if c > 0: s.n = c * 2 else: s.n = 7 - c; return
+    s.n`` (corpus c397).  The record is a compile-time correlation: neither
+    its id nor any field value is an SSA value of ``root`` (the constructor's
+    ``0`` is overwritten on both arms and never emitted).  The C backend reads
+    record tables only for record parameters; Fortran refused the module with
+    "record 'S' field 'n' names absent SSA values [2]".  Rule: a descriptor
+    is checked (and exported) only when the record or one of its field values
+    is resident; a resident record with an absent field still refuses, and so
+    does any record with a field naming storage (a span, sequence, nested
+    record or reference): those name arenas the function must hold.
+    """
+
+    if int(descriptor.record_id) in available_value_ids:
+        return False
+    if any(
+        str(getattr(field.storage, "value", field.storage)) != "scalar"
+        or field.sequence_id is not None
+        or field.record_id is not None
+        for field in descriptor.fields
+    ):
+        return False
+    return not any(
+        int(value_id) in available_value_ids
+        for field in descriptor.fields
+        for value_id in field.value_ids
     )
 
 
