@@ -899,6 +899,34 @@ def lower_fused_program_to_ssa(
     return function, tuple(shortfalls)
 
 
+def _control_placed_table_delete_ids(root: Any) -> set[int]:
+    """Effect ids of keyed deletes the control tree carries as table-delete
+    mutations, at any depth (an arm, a loop body, a call)."""
+
+    placed: set[int] = set()
+
+    def visit(block: Any) -> None:
+        if block is None or isinstance(block, (str, int)):
+            return
+        if isinstance(block, SequenceMutationBlock):
+            if block.mutation.argument_kind in {
+                "table_delete_key", "table_delete_keys",
+            }:
+                placed.add(int(block.mutation.effect_node_id))
+            return
+        for child in getattr(block, "blocks", ()) or ():
+            visit(child)
+        for name in ("body", "orelse", "callee", "default", "finalbody"):
+            visit(getattr(block, name, None))
+        for _label, child in getattr(block, "cases", ()) or ():
+            visit(child)
+        for child in getattr(block, "lanes", ()) or ():
+            visit(child)
+
+    visit(root)
+    return placed
+
+
 def lower_fused_integral_to_repository_ssa(
     program: FusedProgram,
     *,
@@ -3606,18 +3634,8 @@ class _ControlSSABuilder(TiledObject):
             for kind, operation in operations
         }
         # A keyed delete placed as its own control effect (a table-delete
-        # mutation in a top-level sequence) is scheduled there, not here.
-        def control_placed_deletes(block: Any):
-            if isinstance(block, SequenceBlock):
-                for child in block.blocks:
-                    yield from control_placed_deletes(child)
-            elif isinstance(block, SequenceMutationBlock) and (
-                block.mutation.argument_kind
-                in {"table_delete_key", "table_delete_keys"}
-            ):
-                yield int(block.mutation.effect_node_id)
-
-        placed_delete_ids = set(control_placed_deletes(program.root))
+        # mutation anywhere in the control tree) is scheduled there, not here.
+        placed_delete_ids = _control_placed_table_delete_ids(program.root)
         scheduled_table_operations.update(
             ("delete", tuple(deletion)) for deletion in table_deletions
             if int(deletion[0]) in placed_delete_ids
@@ -27871,8 +27889,14 @@ def lower_control_sections_to_ssa(
             survey_region_arms(child, depth + 1)
 
     survey_region_arms(control.root, 0)
+    # A held delete the shell installed in its arm as a table-delete
+    # mutation is placed already; the value-order rules below are for the
+    # deletes no control block carries.
+    control_placed_delete_ids = _control_placed_table_delete_ids(control.root)
     for deletion in table_deletions:
         effect_id = int(deletion[0])
+        if effect_id in control_placed_delete_ids:
+            continue
         base_store = store_placements.get(
             int((table_deletion_bases or {}).get(effect_id, -1))
         )
