@@ -2202,7 +2202,18 @@ def _planned_scalar_dtypes_from(
                             or linked_class or ""
                         ).removeprefix("builtins.")
                     ))
-                continue
+                    # An annotated collection parameter (``xs: list[int]``)
+                    # is a collection: its element class joins its
+                    # annotation with its writers, in the collection rule.
+                    if (
+                        attributes.get("aggregate_kind") in collection_kinds
+                        and attributes.get("sequence_element_class_ref")
+                    ):
+                        pass
+                    else:
+                        continue
+                else:
+                    continue
             if op == "for":
                 iterable = parents(data, "iterable")
                 stop = parents(data, "stop", "start", "step")
@@ -2480,6 +2491,23 @@ def _planned_scalar_dtypes_from(
                     writers.extend(
                         element.get(source) for source in parents(data, "arg:0")
                     )
+                # Lane D, D2.  Program: ``def setfirst(xs: list[int], v:
+                # int): xs[0] = v`` (corpus c180).  The parameter's
+                # annotation states its element class
+                # (``sequence_element_class_ref``, posted with its
+                # ``parameter_annotation`` cell); nobody read it, so the
+                # callee's rows took the float64 domain default until the
+                # caller's linked ABI arrived.  Rule: an annotated
+                # collection parameter's element class is its annotation's,
+                # joined with its writers.
+                if (
+                    op == "input"
+                    and attributes.get("binding_kind") == "parameter"
+                    and attributes.get("sequence_element_class_ref")
+                ):
+                    writers.append(classes.get(str(
+                        attributes["sequence_element_class_ref"]
+                    ).removeprefix("builtins.")))
                 for record in records.values():
                     if int(record.get("sequence_value_id", -1)) == int(
                         data.get("value_id", node_id)
