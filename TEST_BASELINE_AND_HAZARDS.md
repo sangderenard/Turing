@@ -1,3 +1,17 @@
+# Test baseline and hazards log
+
+**New entries do not go in this file.** Each entry is its own file in
+[docs/hazards/](docs/hazards/), named `YYYYMMDDTHHMMSSZ_<branch>.md` (UTC time
+of writing, then the branch with `/` spelled `-`), so two PRs never edit the
+same lines. Create one with `python tools/hazards_log.py new`.
+
+**Read order: newest first.** Read the files in `docs/hazards/` from the
+newest name down, then the entries below, which were written before the split
+and are kept unchanged. `python tools/hazards_log.py` prints them in that
+order, so "read the top of the log" is still one step.
+
+<!-- end of header: entries written before the split follow -->
+
 2026-10-24 LANE E, E22b (MEASURED, cloud): a scheduled region with no body
 (only a post-operation fill) runs only its post-operations instead of calling
 an undefined numerical_region_N (C LOUD at main daaa83c0, c409). Re-measured on
