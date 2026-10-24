@@ -181,7 +181,13 @@ class GLSLComputeArtifact:
     ``scalar_order`` starts with the count's value id and then names, in
     layout order, the value id behind each element of ``scalars[]``.  The
     count travels as a uint because it guards the dispatch; every other
-    scalar is a float64 coefficient and stays a double.
+    scalar is a float64 coefficient and stays a double.  When the count is
+    baked (``baked_count``) the block has no header: ``scalars[]`` starts at
+    byte 0 and ``scalar_order`` holds only coefficients.
+
+    ``component_abi``, ``deployment()`` and ``write()`` publish this layout
+    as a ``turing.shader-component.v1`` record and a deployable product
+    (``shader_deployment.precision_compute_deployment``).
     """
 
     name: str
@@ -209,6 +215,102 @@ class GLSLComputeArtifact:
     @property
     def complete(self) -> bool:
         return not self.shortfalls
+
+    @property
+    def coefficient_order(self) -> tuple[int, ...]:
+        """The value ids behind ``scalars[]``, in layout order."""
+
+        return (
+            tuple(self.scalar_order) if self.baked_count is not None
+            else tuple(self.scalar_order[1:])
+        )
+
+    @property
+    def component_abi(self):
+        """The logical ports: read buffers and coefficients, then written buffers.
+
+        A written buffer is declared without ``readonly`` and is an output.
+        Each coefficient is a feed carried in the scalars block, so its
+        ``backend_binding`` is that block's binding. The element count is a
+        launch control, not a port.
+        """
+
+        from .shader_component_abi import (
+            ComponentPort,
+            ComponentSentinels,
+            ShaderComponentABI,
+        )
+
+        written = {int(value_id) for value_id in self.written_buffers}
+        scalar_binding = len(self.buffer_order)
+        rows = [
+            (f"buffer_{slot}", "feed", "f64", int(value_id), slot)
+            for slot, value_id in enumerate(self.buffer_order)
+            if int(value_id) not in written
+        ]
+        rows += [
+            (f"scalar_{index}", "feed", "f64", int(value_id), scalar_binding)
+            for index, value_id in enumerate(self.coefficient_order)
+        ]
+        rows += [
+            (f"buffer_{slot}", "output", "f64", int(value_id), slot)
+            for slot, value_id in enumerate(self.buffer_order)
+            if int(value_id) in written
+        ]
+        ports = tuple(
+            ComponentPort(
+                slot=index, name=name, role=role, dtype=dtype,
+                value_id=value_id, backend_binding=binding,
+                transport="storage-buffer",
+            )
+            for index, (name, role, dtype, value_id, binding) in enumerate(rows)
+        )
+        return ShaderComponentABI(
+            component_id=self.name,
+            language="glsl-430",
+            stage="compute",
+            entrypoint="main",
+            ports=ports,
+            sentinels=ComponentSentinels.for_ports(len(ports)),
+            decorations={
+                "execution_model": "compute",
+                "workgroup_size": (int(self.local_size), 1, 1),
+                "scalar_binding": scalar_binding,
+                "precision_sections": bool(self.precision_sections),
+            },
+        )
+
+    def deployment(self):
+        from .shader_deployment import precision_compute_deployment
+        return precision_compute_deployment(self)
+
+    def write(self, directory: Any):
+        """Publish source, API sidecar, request manifest and digests."""
+
+        from .compiled_program_api import CompiledProgramAPI, EntryPoint
+        from .shader_deployment import publish_shader_source
+
+        if not self.complete:
+            raise ValueError(
+                "GLSL compute artifact has emission shortfalls and no source "
+                "to publish: " + "; ".join(
+                    f"{item.operation}: {item.reason}" for item in self.shortfalls[:8]
+                )
+            )
+        api = CompiledProgramAPI(
+            module=self.name,
+            language="glsl-430",
+            entry="main",
+            entry_points=(EntryPoint("main", "main", "numerical"),),
+            metadata={
+                "stage": "compute",
+                "component_abi": self.component_abi.to_mapping(),
+            },
+        )
+        return publish_shader_source(
+            directory, name=self.name, source=self.source, suffix=".comp",
+            api=api, deployment=self.deployment(),
+        ).source_path
 
     def _ensure_program(self) -> int:
         """Compile and link the shader once; reuse the program afterwards.
@@ -728,7 +830,10 @@ def emit_ssa_module_to_glsl_compute(
         interface.append(
             "    uint element_count;  // the wrapper's loop bound"
         )
-    interface.append("    uint _pad0;          // aligns the doubles to 8")
+        interface.append("    uint _pad0;          // aligns the doubles to 8")
+    # With the count baked there is no header: the doubles start at byte 0,
+    # which is where prepare_execution packs them. A lone _pad0 here would
+    # shift every coefficient by one slot.
     interface.append("    double scalars[];    // coefficients, layout order")
     interface.append("} feed;")
 
