@@ -397,7 +397,14 @@ def _subtract_with_borrow(state: MachineExecutionState, instruction) -> MachineE
 
 def _move(state: MachineExecutionState, instruction) -> MachineExecutionState:
     width = _data_width(instruction, 0)
-    return write_operand(state, instruction, 0, read_operand(state, instruction, 1, width=width), width=width)
+    value = read_operand(state, instruction, 1, width=width)
+    if (
+        isinstance(instruction.operands[0], VectorRegisterOperand)
+        and instruction.token.name == "MOVQ_XMMM64_XMM"
+    ):
+        # 66 0f d6 into a register clears bits 64..127, unlike MOVSD.
+        return write_operand(state, instruction, 0, value, width=128)
+    return write_operand(state, instruction, 0, value, width=width)
 
 
 def _lea(state: MachineExecutionState, instruction) -> MachineExecutionState:
@@ -1371,6 +1378,36 @@ def _vector_compare_equal_qwords(
     return write_operand(state, instruction, 0, low | (high << 64), width=128)
 
 
+def _vector_lanes(left: int, right: int, lane: int, subtract: bool) -> int:
+    mask = _mask(lane)
+    result = 0
+    for shift in range(0, 128, lane):
+        a = (left >> shift) & mask
+        b = (right >> shift) & mask
+        result |= (((a - b) if subtract else (a + b)) & mask) << shift
+    return result
+
+
+def _vector_add_dwords(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    left = read_operand(state, instruction, 0, width=128)
+    right = read_operand(state, instruction, 1, width=128)
+    return write_operand(
+        state, instruction, 0, _vector_lanes(left, right, 32, False), width=128,
+    )
+
+
+def _vector_subtract_dwords(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    left = read_operand(state, instruction, 0, width=128)
+    right = read_operand(state, instruction, 1, width=128)
+    return write_operand(
+        state, instruction, 0, _vector_lanes(left, right, 32, True), width=128,
+    )
+
+
 def _vector_subtract_qwords(
     state: MachineExecutionState, instruction,
 ) -> MachineExecutionState:
@@ -1486,6 +1523,8 @@ def default_effect_handlers() -> Mapping[int, object]:
         MachineSemanticToken.VECTOR_ADD_QWORDS: _vector_add_qwords,
         MachineSemanticToken.VECTOR_COMPARE_EQUAL_QWORDS: _vector_compare_equal_qwords,
         MachineSemanticToken.VECTOR_SUBTRACT_QWORDS: _vector_subtract_qwords,
+        MachineSemanticToken.VECTOR_ADD_DWORDS: _vector_add_dwords,
+        MachineSemanticToken.VECTOR_SUBTRACT_DWORDS: _vector_subtract_dwords,
         MachineSemanticToken.VECTOR_SHUFFLE_DWORDS: _vector_shuffle_dwords,
         MachineSemanticToken.VECTOR_SIGNED_INT32_TO_FLOAT64: _vector_signed_int32_to_float64,
         MachineSemanticToken.SCALAR_FLOAT64_COMPARE_ORDERED: _scalar_float64_compare_ordered,

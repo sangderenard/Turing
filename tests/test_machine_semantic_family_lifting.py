@@ -71,8 +71,8 @@ def test_every_authoritative_token_legalizes_to_repository_ssa():
     # intentionally excluded from the legacy-prefix tensor write head until
     # that head carries explicit VEX fields.  ENDBR64 is excluded too: its
     # ModRM byte is part of the opcode, which a head row cannot pin.
-    assert len(profile.rows) == 314
-    assert len(X86InstructionToken) == 320
+    assert len(profile.rows) == 323
+    assert len(X86InstructionToken) == 329
     assert failures == []
 
 
@@ -1883,6 +1883,17 @@ def test_comiss_lowers_encoded_binary32_ordered_comparison_and_flags():
     (b"\x48\x19\xf6\xc3", "SBB_RM64_R64", "Sub"),
     (b"\x66\x0f\xef\xc0\xc3", "PXOR_XMM_XMMM128", "Xor"),
     (b"\x55\x48\x89\xe5\xc9\xc3", "PUSH_R64", "Load"),
+    (b"\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00\xc3", "NOP_RM_CS", "Ret"),
+    (b"\x66\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00\xc3", "NOP_RM_CS", "Ret"),
+    (b"\x66\x0f\xd6\x45\xb8\xc3", "MOVQ_XMMM64_XMM", "Store"),
+    (b"\x66\x0f\xd6\xc8\xc3", "MOVQ_XMMM64_XMM", "And"),
+    (b"\x48\x0f\x4c\xc2\xc3", "CMOVL_R64_RM64", "Select"),
+    (b"\x83\xd8\xff\xc3", "SBB_RM32_IMM8", "Sub"),
+    (b"\x48\x83\xd8\xff\xc3", "SBB_RM64_IMM8", "Sub"),
+    (b"\x48\x83\x5d\xc8\xff\xc3", "SBB_RM64_IMM8", "Store"),
+    (b"\x66\x0f\xfa\xc7\xc3", "PSUBD_XMM_XMMM128", "VectorSubtractModulo"),
+    (b"\x66\x0f\xfe\xc1\xc3", "PADDD_XMM_XMMM128", "VectorAddModulo"),
+    (b"\x0f\x9d\xc0\xc3", "SETGE_RM8", "Select"),
 ))
 def test_new_sre_frontier_families_lower_to_repository_ssa(
     encoded, token, required_op,
