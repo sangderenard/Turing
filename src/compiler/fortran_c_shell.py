@@ -22832,6 +22832,28 @@ def _class_surface_ssa_program(
                     id(caller_graph), int(planned_call.callsite_id),
                     int(caller_id),
                 ))
+                # One row per EDGE.  A formal legitimately has many callers;
+                # putting them on one row made a normal fan-in look like a
+                # value changing its mind.  Program: ``g = make(n); g(3)``
+                # (a returned closure).  Wrong record: this post sat in the
+                # actual-argument loop below, reading the last binding's ids
+                # (one edge posted once per actual) and raising
+                # UnboundLocalError for a call with no bindings.  Rule: the
+                # row is posted per binding.
+                edge_row = (
+                    str(callee_graph.graph.get("function_name")),
+                    int(callee_id),
+                    str(caller_graph.graph.get("function_name")),
+                    int(caller_id),
+                )
+                _frame_post(
+                    _CALL_EDGE, edge_row, "argument",
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(
+                        _frame_graph_cell(caller_graph, int(caller_id)),
+                        _frame_graph_cell(callee_graph, int(callee_id)),
+                    ),
+                )
             # An aggregate bound by its members (``_aggregate_binds_by_member``:
             # neither side mutates it) reaches the callee as values; the call
             # cannot grow it, so it is an exact, non-growing site as well.
@@ -22855,23 +22877,6 @@ def _class_surface_ssa_program(
                         id(caller_graph), int(planned_call.callsite_id),
                         int(actual_id),
                     ))
-                # One row per EDGE.  A formal legitimately has many callers;
-                # putting them on one row made a normal fan-in look like a
-                # value changing its mind.
-                edge_row = (
-                    str(callee_graph.graph.get("function_name")),
-                    int(callee_id),
-                    str(caller_graph.graph.get("function_name")),
-                    int(caller_id),
-                )
-                _frame_post(
-                    _CALL_EDGE, edge_row, "argument",
-                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
-                    cells=(
-                        _frame_graph_cell(caller_graph, int(caller_id)),
-                        _frame_graph_cell(callee_graph, int(callee_id)),
-                    ),
-                )
             # Results carry the same exact value contract in the opposite
             # direction.  Keeping them in this fixed point lets a shaped
             # callee return feed the next call before either caller partitions
