@@ -9,7 +9,10 @@ disagreement.
 
 from __future__ import annotations
 
+import pytest
+
 from src.compiler.project_compilation_product import compile_project_call
+from src.compiler.ssa_fortran_backend import FortranEmissionError
 
 
 SOURCE = '''
@@ -33,3 +36,35 @@ def test_any_valued_local_mapping_stores_the_opaque_value(tmp_path):
         source, "run", tmp_path / "unit", progress_bars=False,
     )
     assert receipt["repository_ssa_complete"]
+
+
+GROWN_FIELD = '''
+from typing import Any, Mapping
+
+
+class Rec:
+    def __init__(self) -> None:
+        self._root_frame: dict[int, Any] | None = None
+
+    def run(self, ids: list[int], arguments: Mapping[int, Any]) -> int:
+        values: dict[int, Any] = {}
+        self._root_frame = values
+        for key in ids:
+            if key in arguments:
+                values[int(key)] = arguments[key]
+        return len(values)
+'''
+
+
+def test_keyed_field_assigned_a_grown_mapping_is_refused_by_field(tmp_path):
+    # The keyed field's view is caller-supplied and exactly full (length and
+    # capacity are one part); the frame's grown arena used to die in the
+    # heap descriptor invariant with no name.
+    source = tmp_path / "grown_field.py"
+    source.write_text(GROWN_FIELD, encoding="utf-8")
+    with pytest.raises(FortranEmissionError, match=(
+        r"keyed field Rec\._root_frame is assigned a mapping this frame grows"
+    )):
+        compile_project_call(
+            source, "Rec.run", tmp_path / "unit", progress_bars=False,
+        )
