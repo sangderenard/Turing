@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import pickle
 import queue
+import struct
 import subprocess
 import symtable
 import sys
@@ -2768,6 +2769,17 @@ def partition_authored_source(
             if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         selected.update((id(item), item) for item in class_support)
+        # ``__init__`` declares the field layout as surely as the class-level
+        # annotations above do (``self.track_time = track_time`` with an
+        # annotated parameter).  Dropping it gave a method's unit a receiver
+        # record view missing those fields, which then disagreed with the
+        # declared module's view of the same class.
+        selected.update(
+            (id(member), member)
+            for member in class_owner.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name == "__init__"
+        )
         linked_method_names = {
             name.split(".", 1)[1]
             for name in linked_dependencies
@@ -4897,6 +4909,12 @@ def _resolved_process_graph_dispatch_table() -> dict[type, Any]:
     dispatch[io.TextIOWrapper] = _reduce_import_owned_text_stream
     dispatch[type(threading.Lock())] = lambda _lock: (_new_lock, ())
     dispatch[type(threading.RLock())] = lambda _lock: (_new_rlock, ())
+    # Program: ``SSAReferenceEvaluator._external_call`` compiled as its own
+    # unit.  Wrong record: its graph binds ``struct.Struct`` layouts, which
+    # stock pickle refuses, so the unit died at worker hand-off with a
+    # TypeError instead of reaching the compiler.  Rule: a ``Struct`` is an
+    # immutable layout fully named by its format string.
+    dispatch[struct.Struct] = lambda layout: (struct.Struct, (layout.format,))
     return dispatch
 
 

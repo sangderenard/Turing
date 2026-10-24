@@ -38,7 +38,7 @@ def judge(feeds, expect, flat, kinds):
     return ("ok" if type_ok else f"TYPE {feeds} got kinds {kinds} want {want_kinds}") if ok else f"WRONG {feeds} got {flat} want {exp}"
 
 
-def run_llvm(module, export, params, outs, inputs, ns):
+def run_llvm(module, export, params, outs, inputs, expects):
     from src.compiler.ssa_llvm_backend import (
         compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
     )
@@ -50,13 +50,13 @@ def run_llvm(module, export, params, outs, inputs, ns):
     except Exception as e:
         return f"EMIT-FAIL {type(e).__name__}: {str(e)[:300]}", None
     results, values = [], []
-    for feeds in inputs:
+    for feeds, expect in zip(inputs, expects):
         try:
             ex = prepare_artifact_execution(art, {params[k]: np.array([v]) for k, v in feeds.items()}).run()
             arrays = [np.asarray(ex.buffers[v.id]) for v in outs]
             flat = [x for a in arrays for x in a.reshape(-1).tolist()]
             values.append(flat)
-            results.append(judge(feeds, ns["root"](**feeds), flat, [a.dtype.kind for a in arrays]))
+            results.append(judge(feeds, expect, flat, [a.dtype.kind for a in arrays]))
         except Exception as e:
             values.append(None)
             results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
@@ -64,13 +64,22 @@ def run_llvm(module, export, params, outs, inputs, ns):
     return f"{'PASS' if not bad else 'FAIL'} {bad[:3]}", values
 
 
+def _isolated_entry(queue, function, args):
+    queue.put(function(*args))
+
+
 def run_isolated(function, *args):
     """Run ``function`` in a forked child: a native crash in one backend is
     that program's finding, not the end of the corpus run."""
     import multiprocessing
-    context = multiprocessing.get_context("fork")
+    # Windows parity receipt (2026-10-24): the backend corpus stopped before
+    # its first Fortran compile because Windows has no ``fork`` context.
+    # Spawn a guarded module-level child there; Unix retains fork's lower
+    # serialization cost.  Backend inputs contain only authored expectations,
+    # never the dynamically exec'd Python function namespace.
+    context = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
     queue = context.Queue()
-    child = context.Process(target=lambda: queue.put(function(*args)))
+    child = context.Process(target=_isolated_entry, args=(queue, function, args))
     child.start()
     try:
         result = queue.get(timeout=600)
@@ -84,7 +93,7 @@ def run_isolated(function, *args):
     return result
 
 
-def run_fortran(module, export, params, outs, inputs, ns):
+def run_fortran(module, export, params, outs, inputs, expects):
     # Compiled and executed through the packed Fortran core ABI when a
     # compiler is on the machine; without one, emission is all that can be
     # checked, and the line says so rather than passing.
@@ -110,13 +119,13 @@ def run_fortran(module, export, params, outs, inputs, ns):
     except Exception as e:
         return f"COMPILE-FAIL {type(e).__name__}: {str(e)[:300]}", None
     results, values = [], []
-    for feeds in inputs:
+    for feeds, expect in zip(inputs, expects):
         try:
             ex = native.prepare_execution({params[k]: np.array([v]) for k, v in feeds.items()}).run()
             arrays = [np.asarray(ex.buffers[v.id]) for v in outs]
             flat = [x for a in arrays for x in a.reshape(-1).tolist()]
             values.append(flat)
-            results.append(judge(feeds, ns["root"](**feeds), flat, [a.dtype.kind for a in arrays]))
+            results.append(judge(feeds, expect, flat, [a.dtype.kind for a in arrays]))
         except Exception as e:
             values.append(None)
             results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
@@ -135,54 +144,61 @@ def disagreements(inputs, c_values, other_values):
     ]
 
 
-for path in sorted(pathlib.Path(sys.argv[1]).glob("c*.py")):
-    src = path.read_text()
-    inputs = ast.literal_eval(src.split("# INPUTS", 1)[1].strip())
-    ns = {}
-    exec(compile(src, str(path), "exec"), ns)
-    try:
-        module, _, exports = lower_ast_source_to_ssa(src, "root", name="corpus_" + path.stem, extraction_contract=ROOT + "/extraction_contracts/program_extraction.yaml", progress=lambda _: None)
-    except Exception as e:
-        print(f"{path.stem}: LOWER-FAIL {type(e).__name__}: {str(e)[:300]}"); continue
-    rep = " ".join(l.strip() for l in concordance_report(module, limit=3).splitlines()[:1] + [l for l in concordance_report(module, limit=3).splitlines() if l.startswith("     ")][:2])
-    try:
-        root = module.functions[exports[0]]
-        params = dict(root.metadata['parameter_names'])
-        from src.compiler.project_compilation_product import _unexplained_root_argument_ids
-        if _unexplained_root_argument_ids(root):
-            print(f"{path.stem}: PRODUCT-REFUSES unexplained root inputs {_unexplained_root_argument_ids(root)} | {rep}"); continue
-        outs = [i.args for b in root.blocks.values() for i in b.instrs if i.op == 'Ret'][0]
-        art = emit_ssa_to_c(module, exports[0])
-        if not art.complete:
-            print(f"{path.stem}: EMIT-INCOMPLETE {art.shortfalls[:2]} | {rep}"); continue
-        d = pathlib.Path(tempfile.mkdtemp()); art.compile(d / "native")
-    except Exception as e:
-        print(f"{path.stem}: EMIT-FAIL {type(e).__name__}: {str(e)[:300]} | {rep}"); continue
-    results = []
-    c_values = []
-    for feeds in inputs:
-        expect = ns["root"](**feeds)
+def main():
+    for path in sorted(pathlib.Path(sys.argv[1]).glob("c*.py")):
+        src = path.read_text()
+        inputs = ast.literal_eval(src.split("# INPUTS", 1)[1].strip())
+        # A class defined with no __name__ gets __module__ "builtins", which
+        # sends the static-binding walk through the builtins module itself.
+        ns = {"__name__": "corpus_" + path.stem}
+        exec(compile(src, str(path), "exec"), ns)
+        expects = [ns["root"](**feeds) for feeds in inputs]
         try:
-            ex = art.prepare_execution({params[k]: np.array([v]) for k, v in feeds.items()}).run()
-            got = [ex.buffers[v.id].reshape(-1).tolist() for v in outs]
-            kinds = [ex.buffers[v.id].dtype.kind for v in outs]
-            flat = [x for g in got for x in g]
-            c_values.append(flat)
-            results.append(judge(feeds, expect, flat, kinds))
+            module, _, exports = lower_ast_source_to_ssa(src, "root", name="corpus_" + path.stem, extraction_contract=ROOT + "/extraction_contracts/program_extraction.yaml", progress=lambda _: None)
         except Exception as e:
-            c_values.append(None)
-            results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
-    bad = [r for r in results if r != "ok"]
-    print(f"{path.stem}: {'PASS' if not bad else 'FAIL'} {bad[:3]} | {rep}")
-    if "llvm" in BACKENDS:
-        verdict, llvm_values = run_isolated(run_llvm, module, exports[0], params, outs, inputs, ns)
-        print(f"{path.stem}: LLVM {verdict}")
-        found = disagreements(inputs, c_values, llvm_values or ())
-        if found:
-            print(f"{path.stem}: DISAGREE c/llvm {found[:2]}")
-    if "fortran" in BACKENDS:
-        verdict, fortran_values = run_isolated(run_fortran, module, exports[0], params, outs, inputs, ns)
-        print(f"{path.stem}: FORTRAN {verdict}")
-        found = disagreements(inputs, c_values, fortran_values or ())
-        if found:
-            print(f"{path.stem}: DISAGREE c/fortran {found[:2]}")
+            print(f"{path.stem}: LOWER-FAIL {type(e).__name__}: {str(e)[:300]}"); continue
+        rep = " ".join(l.strip() for l in concordance_report(module, limit=3).splitlines()[:1] + [l for l in concordance_report(module, limit=3).splitlines() if l.startswith("     ")][:2])
+        try:
+            root = module.functions[exports[0]]
+            params = dict(root.metadata['parameter_names'])
+            from src.compiler.project_compilation_product import _unexplained_root_argument_ids
+            if _unexplained_root_argument_ids(root):
+                print(f"{path.stem}: PRODUCT-REFUSES unexplained root inputs {_unexplained_root_argument_ids(root)} | {rep}"); continue
+            outs = [i.args for b in root.blocks.values() for i in b.instrs if i.op == 'Ret'][0]
+            art = emit_ssa_to_c(module, exports[0])
+            if not art.complete:
+                print(f"{path.stem}: EMIT-INCOMPLETE {art.shortfalls[:2]} | {rep}"); continue
+            d = pathlib.Path(tempfile.mkdtemp()); art.compile(d / "native")
+        except Exception as e:
+            print(f"{path.stem}: EMIT-FAIL {type(e).__name__}: {str(e)[:300]} | {rep}"); continue
+        results = []
+        c_values = []
+        for feeds, expect in zip(inputs, expects):
+            try:
+                ex = art.prepare_execution({params[k]: np.array([v]) for k, v in feeds.items()}).run()
+                got = [ex.buffers[v.id].reshape(-1).tolist() for v in outs]
+                kinds = [ex.buffers[v.id].dtype.kind for v in outs]
+                flat = [x for g in got for x in g]
+                c_values.append(flat)
+                results.append(judge(feeds, expect, flat, kinds))
+            except Exception as e:
+                c_values.append(None)
+                results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
+        bad = [r for r in results if r != "ok"]
+        print(f"{path.stem}: {'PASS' if not bad else 'FAIL'} {bad[:3]} | {rep}")
+        if "llvm" in BACKENDS:
+            verdict, llvm_values = run_isolated(run_llvm, module, exports[0], params, outs, inputs, expects)
+            print(f"{path.stem}: LLVM {verdict}")
+            found = disagreements(inputs, c_values, llvm_values or ())
+            if found:
+                print(f"{path.stem}: DISAGREE c/llvm {found[:2]}")
+        if "fortran" in BACKENDS:
+            verdict, fortran_values = run_isolated(run_fortran, module, exports[0], params, outs, inputs, expects)
+            print(f"{path.stem}: FORTRAN {verdict}")
+            found = disagreements(inputs, c_values, fortran_values or ())
+            if found:
+                print(f"{path.stem}: DISAGREE c/fortran {found[:2]}")
+
+
+if __name__ == "__main__":
+    main()

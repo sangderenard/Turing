@@ -89,6 +89,7 @@ from .ast_control_normalization import (
     _normalize_constant_membership as _normalize_constant_membership,
     _normalize_builtin_divmod as _normalize_builtin_divmod,
     _normalize_mapping_get as _normalize_mapping_get,
+    _normalize_set_constructor as _normalize_set_constructor,
     _normalize_direct_tail_recursion as _normalize_direct_tail_recursion,
     _normalize_none_default_assignments as _normalize_none_default_assignments,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
@@ -7146,6 +7147,36 @@ def _authored_dataclass_record_views(
                 methods[statement.name] = statement
         initializer = methods.get("__init__")
         if initializer is not None:
+            # ``self.scale = scale`` stores the parameter's authored
+            # annotation as surely as ``self.scale: int = scale`` does, while
+            # the initializer never rebinds that name.  Without it every
+            # method that read the field had no receiver record view and the
+            # unit was refused ("missing used parameter self").
+            initializer_arguments = (
+                *initializer.args.posonlyargs, *initializer.args.args,
+                *initializer.args.kwonlyargs,
+            )
+            rebound_names = {
+                name.id
+                for node in ast.walk(initializer)
+                for target in (
+                    node.targets if isinstance(node, ast.Assign)
+                    else (node.target,)
+                    if isinstance(node, (
+                        ast.AugAssign, ast.AnnAssign, ast.For,
+                        ast.AsyncFor, ast.NamedExpr,
+                    ))
+                    else ()
+                )
+                for name in ast.walk(target)
+                if isinstance(name, ast.Name)
+            }
+            annotated_parameters = {
+                argument.arg: argument.annotation
+                for argument in initializer_arguments
+                if argument.annotation is not None
+                and argument.arg not in rebound_names
+            }
             for node in ast.walk(initializer):
                 target = None
                 receipt = None
@@ -7154,7 +7185,12 @@ def _authored_dataclass_record_views(
                     receipt = field_receipt(node.annotation)
                 elif isinstance(node, ast.Assign) and len(node.targets) == 1:
                     target = node.targets[0]
-                    receipt = initialized_field_receipt(node.value)
+                    receipt = (
+                        field_receipt(annotated_parameters[node.value.id])
+                        if isinstance(node.value, ast.Name)
+                        and node.value.id in annotated_parameters
+                        else initialized_field_receipt(node.value)
+                    )
                 if not (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
@@ -10400,10 +10436,23 @@ def _field_slot_ops(
             # in this field is the record instance; consulting only the former
             # degraded a specialized ``Metrics`` write to an untyped scalar
             # receiver slot.
+            #
+            # A typed scalar parameter carries its annotation's class as
+            # ``result_class_ref`` too (``scale: int`` -> ``'int'``), beside
+            # ``value_kind='scalar'``, the read view of its
+            # ``scalar_parameter`` row.  Reading that class as a record
+            # instance made ``self.scale = scale`` a nested record field
+            # naming a record no table holds ("record 'K' field 'scale' names
+            # absent record 0").  A scalar is stored in a scalar slot.
             nested_class_identity = (
                 source_attributes.get("result_class_ref")
                 or source_attributes.get("class_ref")
             )
+            if (
+                source_attributes.get("value_kind") == "scalar"
+                and source_attributes.get("class_ref") is None
+            ):
+                nested_class_identity = None
             if nested_class_identity is not None:
                 nested_record_fields[slot_of[canonical_attribute]] = (
                     str(nested_class_identity), int(source_id)
@@ -32672,6 +32721,7 @@ def _class_surface_ssa_program(
                 returned_record_layouts
             )
         output_identity_aliases = {}
+        output_final_ids = {}
         for output_name in output_names:
             final_id = named_output_ids.get(str(output_name))
             history = tuple(map(
@@ -32687,9 +32737,22 @@ def _class_surface_ssa_program(
             # such as 60, already concorded as 60 -> physical arena 2, makes
             # output recovery invent the reverse 2 -> 60 edge and a false
             # identity cycle.
-            final_id = _concordant_function_resident(function, final_id)
+            output_final_ids[str(output_name)] = (
+                _concordant_function_resident(function, final_id), history,
+            )
+        # Program: ``a = k * 3; b = a; if k > 2: b = b + 1; return a, b``.
+        # Wrong record: ``b``'s history (2, 7, 8) published 2 -> 8, though 2
+        # is still ``a``'s final output; Ret selection followed the alias and
+        # returned ``b`` twice (10, 10 for 9, 10).  Rule: an earlier identity
+        # of one output is not an alias of it while another authored output
+        # still ends there.
+        live_final_ids = {
+            int(final_id) for final_id, _history in output_final_ids.values()
+        }
+        for final_id, history in output_final_ids.values():
             for identity in history:
-                if int(identity) != int(final_id):
+                if (int(identity) != int(final_id)
+                        and int(identity) not in live_final_ids):
                     output_identity_aliases[int(identity)] = int(final_id)
         if output_identity_aliases:
             # Output history is semantic control identity, not substitutable
@@ -40043,6 +40106,31 @@ def _class_surface_ssa_program(
                         revised_fields.append(record_field)
                         continue
                     roles = dict(decomposition)
+                    # Program: ``SSAReferenceEvaluator.run``:
+                    # ``values: dict[int, Any] = {}``,
+                    # ``self._root_frame = values``, then ``values[key] = ...``
+                    # in a loop.  Wrong record: the keyed field's published
+                    # view is the caller-supplied, exactly full one (length
+                    # and capacity are one part), and advancing the frame's
+                    # DYNAMIC arena onto it died in the descriptor invariant
+                    # with no name.  Rule: a field view with no capacity part
+                    # cannot hold a mapping this frame grows; refuse by field.
+                    if (
+                        str(getattr(
+                            old_sequence.capacity_policy, "value",
+                            old_sequence.capacity_policy,
+                        )) == "dynamic"
+                        and int(roles[("length_address_id",)])
+                        == int(roles[("capacity_value_id",)])
+                    ):
+                        raise FortranEmissionError(
+                            "keyed field "
+                            f"{record_field.storage_identity} is assigned a "
+                            f"mapping this frame grows (sequence "
+                            f"{int(old_sequence_id)} in {symbol}); the "
+                            "field's caller-supplied view is exactly full "
+                            "and has no capacity part to hold it"
+                        )
                     columns = tuple(
                         int(roles[("column", position)])
                         for position in range(len(old_sequence.column_value_ids))
@@ -56857,6 +56945,41 @@ def _emit_class_surface_module(
             )
             + "; refusing to emit a library without them"
         )
+    # A call through a stored callable -- ``self.notify(n)`` where the class
+    # table lists ``notify`` as a FIELD, not a method -- has no lowering: no
+    # method_ref, no callee_ref, no indirect callable record.  As a
+    # statement its result has no consumer, so nothing downstream asked for
+    # it and the library shipped the method with the call removed (the
+    # callable's effects silently gone).  The public entry already refuses
+    # this through its unresolved call table; the class surface has no such
+    # table, so read the method graph's own class-table record here.
+    from .glsl_deployment_strategy import (
+        _stored_callable_field_call, _walk_planned_shells,
+    )
+
+    unlowered_field_calls = []
+    for planned in _walk_planned_shells(
+        deployment, include_function_registry=False,
+    ):
+        graph = getattr(getattr(planned, "process_graph", None), "G", None)
+        if graph is None:
+            continue
+        for node_id, data in graph.nodes(data=True):
+            field = _stored_callable_field_call(graph, data)
+            if field is None or any(
+                (data.get("attributes") or {}).get(key) is not None
+                for key in ("method_ref", "callee_ref", "indirect_callable_id")
+            ):
+                continue
+            unlowered_field_calls.append(
+                f"{field[0]}.{graph.graph.get('function_name')}: "
+                f"{ast.unparse(data['expr_obj'])} (node {int(node_id)})"
+            )
+    if unlowered_field_calls:
+        raise FortranEmissionError(
+            "class surface has a call through a stored callable field with "
+            "no lowered invocation: " + "; ".join(unlowered_field_calls)
+        )
     emitted = emit_module(
         ssa_module,
         name=f"{artifact_name}_fortran",
@@ -58559,6 +58682,7 @@ def _lower_ast_source_to_ssa_impl(
     chained_comparison_receipts.extend(_normalize_constant_membership(tree))
     chained_comparison_receipts.extend(_normalize_builtin_divmod(tree))
     chained_comparison_receipts.extend(_normalize_mapping_get(tree))
+    chained_comparison_receipts.extend(_normalize_set_constructor(tree))
     short_circuit_receipts = list(_normalize_binary_short_circuit(tree))
     loop_else_receipts = list(_normalize_loop_else(tree))
     if chained_comparison_receipts:
@@ -58975,6 +59099,9 @@ def _lower_ast_source_to_ssa_impl(
         )
         chained_comparison_receipts.extend(
             _normalize_mapping_get(discovered_tree)
+        )
+        chained_comparison_receipts.extend(
+            _normalize_set_constructor(discovered_tree)
         )
         short_circuit_receipts.extend(
             _normalize_binary_short_circuit(discovered_tree)

@@ -110,10 +110,17 @@ def test_every_dream_section_has_a_graph_and_explicit_language_dispatch():
     assert compilations[4].translation_table == "acorn.parse"
     assert compilations[4].executable is True
     assert compilations[4].shortfalls == ()
-    assert {node["id"] for node in compilations[4].graph["nodes"]} == {
+    # The memory graph's node identity is an integer; the declaration's
+    # name is the node's data.
+    names = {
+        node["id"]: node["declaration_name"]
+        for node in compilations[4].graph["nodes"]
+    }
+    assert set(names.values()) == {
         "updateGPUIndicator", "installTuringDisplay",
     }
-    assert set(compilations[4].graph["roots"]) == {
+    assert all(node_id.isdigit() for node_id in names)
+    assert {names[root] for root in compilations[4].graph["roots"]} == {
         "updateGPUIndicator", "installTuringDisplay",
     }
 

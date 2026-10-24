@@ -8,11 +8,46 @@ tests on llvmpipe: same 27 failures / 4 errors as main cbe2263. C corpus
 328/328. Fuzz seed 65 (40): 0 WRONG / 0 TYPE. Gate names identical to main
 cbe2263 in all four parts. See doc 38.
 
+2026-10-24 RECORD FIELD WRITES (MEASURED, cloud): a field read of a record
+the function constructed was folded to the constructor argument past every
+later write, so `s = S(0); if c: s.n = 1; return s.n` returned 0. c396-c399
+were all WRONG at main ef49715. The read now takes its field-state version.
+A field rewritten in a loop is refused by name. The corpus had no class
+programs because the typed check, the corpus test and the fuzzer exec'd
+programs with no __name__ (RecursionError); that is fixed. Catalogue class
+units: annotated-parameter fields, `__init__` kept in unit slices, int64 slot
+index. At 48607a8 on caf2e77: corpus 327/327 (main 323/323); gate names
+identical to caf2e77. Fuzz seed 97 FUZZ_EXT=4: 0 WRONG / 0 TYPE.
+AbstractTensor catalogue (autograd cut): 75 complete, 70 native libraries.
+NOT GREEN: compile_class_to_dll (deprecated) still mis-lowers fields. See
+doc 40.
+
+2026-10-24 LANE E, E22a (MEASURED, cloud): a heap sequence reduces over its
+live length, not its pointer cell (C summed the arena address: WRONG at main
+dd340a1b for ints, c407; floats did not compile, c408). At 73eb8a36 (331
+programs): C 331/331, LLVM 330/331 (c367, same on main), Fortran 330 PASS
+(c22 by design). Fuzz seed 65: 0 WRONG / 0 TYPE. Gate names identical to
+main dd340a1b.
+
 2026-10-24 LANE E, E24 (MEASURED, cloud): a table delete counts rows with an
 int64 counter, so LLVM compiles every keyed-delete program (12 were refused
 on an i32/i64 phi at main 11944336). At 376f1f19 (328 programs): C 328/328, LLVM
 327/328 (c367, same on main), Fortran 327 PASS (c22 by design). Fuzz seed
 64: 0 WRONG / 0 TYPE. Gate names identical to main 11944336.
+
+2026-10-24 WINDOWS PARITY (MEASURED, Windows, origin/main d440cd27): the C
+corpus is 328/328 PASS.  MinGW gfortran is 327 PASS plus c22's recorded LUT
+sin difference; owned-heap c400-c403 PASS.  Bootstrap completed its current
+358-unit plan with 47 compiled-unverified, 72 partial and 239 failed; the
+admitted count matches the cloud's 47, while the changed plan size makes the
+old 371 denominator non-comparable.  The managed tire reaches the same
+`function_output` alias disagreement recorded by the cloud.  Windows fixes
+make the Git Bash gate use the sanctioned interpreter and LF inputs, declare
+pytest-timeout, export the validation-runtime DLL ABI, keep SPIR-V tool names
+stable across `.EXE`, use multiprocessing spawn in the corpus driver, and
+make the bootstrap script directly runnable.  Gate ab was 255 passed / 7
+baseline failures; aa/ac/rec reached Windows' 900-second timeout.  See
+`docs/compiler_convergence/windows_parity_2026-10-24.md`.
 
 2026-10-24 GLSL ARENA CONTROLS (MEASURED, cloud): composed GLSL shaders read
 u_count/u_extent/u_slot from two read-only std430 storage blocks (set 0,

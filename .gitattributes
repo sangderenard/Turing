@@ -1,0 +1,6 @@
+# Windows parity receipt (2026-10-24): Git for Windows checked the gate's
+# argument and baseline lists out as CRLF.  Bash command substitution kept
+# each carriage return in the pytest path and baseline name, so collection
+# stopped before the first test.  These files are shell input and require LF.
+tools/gate/*.sh text eol=lf
+tools/gate/*.txt text eol=lf

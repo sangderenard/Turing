@@ -11,9 +11,20 @@
 set -u
 tree=$(cd "$1" && pwd); logs=$(mkdir -p "$2" && cd "$2" && pwd)
 here=$(cd "$(dirname "$0")" && pwd)
-(cd "$tree" && python3 -m pytest $(cat "$here/part_ab.txt") -q --collect-only -p no:cacheprovider >/dev/null 2>&1)
+# Windows parity receipt (2026-10-24): Git Bash exposes the repository's
+# Python 3 interpreter as `python`; `python3` was absent (or a Store stub that
+# does not run), so every gate part stopped in `timeout` before collection.
+# Linux hosts may have no `python` at all.  Use $PYTHON when given, else the
+# first of python3/python that actually runs.
+py=${PYTHON:-}
+if [ -z "$py" ]; then
+  for candidate in python3 python; do
+    if "$candidate" -c 'import sys' >/dev/null 2>&1; then py=$candidate; break; fi
+  done
+fi
+(cd "$tree" && "$py" -m pytest $(cat "$here/part_ab.txt") -q --collect-only -p no:cacheprovider >/dev/null 2>&1)
 for part in aa ab ac rec; do
-  (cd "$tree" && timeout 5400 python3 -m pytest $(cat "$here/part_$part.txt") \
+  (cd "$tree" && timeout 5400 "$py" -m pytest $(cat "$here/part_$part.txt") \
      -q --tb=line -p no:cacheprovider --timeout 900 -rf > "$logs/part_$part.log" 2>&1) &
 done
 wait

@@ -124,7 +124,8 @@ words past the element count are untouched with an extra group dispatched.
 - Deployable SPIR-V for a NON-elementwise function over runtime-sized spans
   (a reduction, a matmul). That needs a structured loop in the library
   function, because static shapes are unrolled. Elementwise ones deploy in
-  element mode (see "Element mode").
+  element mode (see "Element mode"), and whole-array reductions over STATIC
+  shapes unroll (see "Reductions").
 
 ## Vulkan-ready arena controls (follow-up, 2026-10-24)
 
@@ -239,3 +240,25 @@ Evidence: `test_runtime_sized_elementwise_deploys_one_element_per_invocation`,
 are untouched), and
 `tests/test_runtime_sized_spans.py::test_rank_only_region_deploys_as_elementwise_spirv`
 (the sanctioned entry's region deploys and passes spirv-val).
+
+## Reductions (static shapes)
+
+Program: `x.mean() - y.prod()` with `x` and `y` of static shape (5,). Each
+reduction lowers to its own region, and the SPIR-V library refused every one
+("reductions over arrays are not yet supported").
+
+Rule: a whole-array `sum`, `prod`, `max`, `min`, `mean`, `all` or `any` of
+a static array unrolls. Elements are loaded row-major and folded left to
+right. `sum(xs, start)` starts from `start`. `max` and `min` let a NaN in
+and never displace one, which matches numpy and the C backend. `all` and
+`any` count NaN as true. `mean` divides the sum by the element count and
+needs a float result. An axis reduction, a bool sum, and `max`, `min` or
+`mean` of no elements are refused by name. Over runtime-sized spans a
+reduction still has no spelling (see Open).
+
+Evidence: `tests/test_ssa_spirv_backend.py::test_whole_array_reductions_assemble_and_validate`
+(float32, float64, int32 pass spirv-val),
+`tests/test_shader_deployment.py::test_reductions_over_instances_match_python_on_vulkan`
+(lavapipe, 200 (2, 3) instances with one NaN, matches numpy), and
+`tests/test_runtime_sized_spans.py::test_static_reductions_deploy_and_runtime_ones_are_refused`
+(the sanctioned entry's reduction regions deploy and pass spirv-val).

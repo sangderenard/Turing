@@ -1698,6 +1698,29 @@ def _indexed_store_source(graph: Any, value_id: Any) -> Any:
     return value_id
 
 
+def _is_row_collection(graph: Any, value_id: Any) -> bool:
+    """Whether a subscript base is a list or dict, which takes no array mask.
+
+    Program: ``def bump(xs: list[int], n): for i in range(4): xs[i % 2] +=
+    n`` with the caller reading its own list (corpus c375).  Wrong record:
+    the annotated formal has no concorded class during reduction, so the
+    masked-update rule rebound ``xs`` to a ``where`` value and the caller's
+    list never changed (13 for -53, silently).  Rule: besides the concorded
+    class, the formal's ``aggregate_kind`` (from its annotation) says it is
+    a list.
+    """
+
+    target = getattr(graph, "G", graph)
+    if _resolved_source_value_class(graph, value_id)[0] in {
+        "builtins.list", "builtins.dict",
+    }:
+        return True
+    if not isinstance(value_id, int) or value_id not in target:
+        return False
+    attributes = target.nodes[value_id].get("attributes") or {}
+    return attributes.get("aggregate_kind") in {"list", "dict"}
+
+
 def _concorded_numeric_descriptor(
     graph: Any, value_id: Any,
 ) -> NumericFeatureDescriptor | None:
@@ -5034,6 +5057,11 @@ def _normalize_lexical_values(
     # cursor is captured at a conditional's entry and reset at each arm's
     # boundary, and the merge names the arm cells by their captured Refs.
     field_state_cursor: dict[tuple[int, str], _Ref] = {}
+    #: ``(receiver name, field)`` pairs assigned anywhere in the body of each
+    #: loop being reduced, innermost last.  The reducer merges no field state
+    #: at a loop, so the first pass over a body sees no cursor for a field
+    #: the body itself rewrites later; that read is not the construction's.
+    loop_body_field_writes: list[frozenset[tuple[str, str]]] = []
     # The most recent node that mutated ``(receiver_node_id, attr)`` --
     # a whole-attribute ``SetAttr`` or an element-wise ``obj.field[i, j] =``
     # ``IndexedStore``.  A later bare read of the same field consults this so
@@ -6829,8 +6857,25 @@ def _normalize_lexical_values(
                     defaults[field.name] = copy.deepcopy(field.default)
             class_descriptor["field_defaults"] = defaults
         function_reference = (
-            function_table.reference(target_name) if target_name else None
+            function_table.lexical_reference(target_name) if target_name else None
         )
+        target_identity = (
+            str(getattr(target, "__module__", "") or ""),
+            str(getattr(target, "__qualname__", "") or ""),
+        )
+        if all(target_identity):
+            # A static reference names its exact object: its definition is
+            # the entry declared with that (module, qualname), never the
+            # last function that happened to share its bare name (``re``'s
+            # ``_compile`` versus ``re._compiler._compile``).  A builtin
+            # has no source definition at all.
+            exact = function_table.reference_by_source_identity(
+                target_identity,
+            )
+            if exact is not None:
+                function_reference = exact
+            elif target_identity[0] == "builtins":
+                function_reference = None
         if getattr(target, "__self__", None) is not None:
             # A bound runtime/builtin method is identified by both callable
             # and receiver.  Linking it to an unrelated source method by the
@@ -8057,7 +8102,7 @@ def _normalize_lexical_values(
                 static_value = static_bindings.get(expression.id)
                 function_reference = (
                     (lexical_function_bindings or {}).get(expression.id)
-                    or function_table.reference(expression.id)
+                    or function_table.lexical_reference(expression.id)
                 )
                 if (
                     producer_id is None
@@ -8290,9 +8335,81 @@ def _normalize_lexical_values(
                         )
                     )
                 )
+                # The constructor argument is the field's value only while
+                # nothing has touched the field since construction.  The
+                # read's field-state cursor is that record: a write, merge or
+                # loop exit there means the argument is a stale value.
+                # Folding past it returned ``S(0)``'s 0 for ``if c > 0:
+                # s.n = 1; return s.n`` and dropped every later write.
+                constructed_state = field_state_at(
+                    field_state_cursor.get(
+                        (int(receiver), str(expression.attr))
+                    )
+                )
                 if (
                     isinstance(receiver_expression, ast.Call)
                     and len(matching_records) == 1
+                    and isinstance(constructed_state, _FieldState)
+                    and constructed_state.kind in {
+                        _FieldStateKind.WRITTEN,
+                        _FieldStateKind.MERGED,
+                        _FieldStateKind.ARM_SELECTED,
+                        _FieldStateKind.LOOP_EXIT,
+                    }
+                ):
+                    # The field of a record this function constructed has no
+                    # storage of its own: its current value IS the value the
+                    # cursor names (the last write, or the merge/loop-exit
+                    # version of the writes), exactly as a static receiver's
+                    # assigned field is read above.
+                    current_value = _cell_node_id(constructed_state.value)
+                    if current_value is not None and current_value in graph.G:
+                        _redirect_value(
+                            graph, int(attribute_id), int(current_value)
+                        )
+                        return int(current_value)
+                rewritten_by_enclosing_loop = (
+                    isinstance(expression.value, ast.Name)
+                    and any(
+                        (str(expression.value.id), str(expression.attr))
+                        in writes
+                        for writes in loop_body_field_writes
+                    )
+                )
+                if (
+                    isinstance(receiver_expression, ast.Call)
+                    and len(matching_records) == 1
+                    and (
+                        rewritten_by_enclosing_loop
+                        or (
+                            isinstance(constructed_state, _Unresolved)
+                            and constructed_state.reason
+                            == _LOOP_EXIT_FIELD_STATE_UNMERGED
+                        )
+                    )
+                ):
+                    # A record this function constructed has no field storage;
+                    # its field's value is the field-state cursor, and the
+                    # reducer merges no field state at a loop.  Say so rather
+                    # than read the constructor argument or nothing.
+                    raise ValueError(
+                        "local record field written in a loop has no merged "
+                        f"value: {getattr(expression.value, 'id', '?')}."
+                        f"{expression.attr} at line "
+                        f"{getattr(expression, 'lineno', '?')} "
+                        "(loop_exit_field_state_unmerged)"
+                    )
+                if (
+                    isinstance(receiver_expression, ast.Call)
+                    and len(matching_records) == 1
+                    and (
+                        constructed_state is None
+                        or (
+                            isinstance(constructed_state, _FieldState)
+                            and constructed_state.kind
+                            is _FieldStateKind.OBSERVED
+                        )
+                    )
                 ):
                     field_names = tuple(
                         map(
@@ -8311,7 +8428,11 @@ def _normalize_lexical_values(
                             field_expression = receiver_expression.args[position]
                     if field_expression is not None:
                         field_value = resolve_expression(field_expression)
-                        if isinstance(field_value, int):
+                        if isinstance(field_value, int) and (
+                            constructed_state is None
+                            or _cell_node_id(constructed_state.value)
+                            == int(field_value)
+                        ):
                             field_attributes = (
                                 graph.G.nodes.get(field_value, {}).get(
                                     "attributes"
@@ -13214,15 +13335,24 @@ def _normalize_lexical_values(
                 # dict takes no array mask, so its subscript is one row.  A
                 # base already stored into is read through the stores'
                 # ``base`` edges to the sequence that carries the class.
-                and _resolved_source_value_class(
-                    graph,
-                    _indexed_store_source(
-                        graph,
-                        environment.get(body_statement.target.value.id),
+                # A formal not yet read has no Input; its annotation's
+                # aggregate kind (the record its Input is built from) says.
+                and not (
+                    isinstance(body_statement.target.value, ast.Name)
+                    and (
+                        _is_row_collection(graph, _indexed_store_source(
+                            graph,
+                            environment.get(body_statement.target.value.id),
+                        ))
+                        or (
+                            environment.get(body_statement.target.value.id)
+                            is None
+                            and parameter_aggregate_kinds.get(
+                                body_statement.target.value.id
+                            ) in {"list", "dict"}
+                        )
                     )
-                    if isinstance(body_statement.target.value, ast.Name)
-                    else None,
-                )[0] not in {"builtins.list", "builtins.dict"}
+                )
                 and not all(
                     isinstance(item, ast.Slice)
                     or (
@@ -14510,8 +14640,24 @@ def _normalize_lexical_values(
                 # body updates such as ``data = data[0] if data else []``.
                 before_loop = dict(environment)
             before_loop_field_cells = dict(field_state_cursor)
-            for nested in body_statement.body:
-                reduce_statement(nested)
+            loop_body_field_writes.append(frozenset(
+                (str(target.value.id), str(target.attr))
+                for nested in body_statement.body
+                for member in source_walk(nested)
+                for target in (
+                    member.targets if isinstance(member, ast.Assign)
+                    else (member.target,)
+                    if isinstance(member, (ast.AugAssign, ast.AnnAssign))
+                    else ()
+                )
+                if isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+            ))
+            try:
+                for nested in body_statement.body:
+                    reduce_statement(nested)
+            finally:
+                loop_body_field_writes.pop()
             for nested in body_statement.orelse:
                 reduce_statement(nested)
             loop_id = id(body_statement)
@@ -17530,6 +17676,23 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             return {}
         key = _annotation_storage(columns[0])
         value = _annotation_storage(columns[1])
+        # Program: ``values: dict[int, Any] = {}`` then
+        # ``values[key] = arguments[key]`` (SSAReferenceEvaluator.run).
+        # Wrong record: an ``Any`` value fell to the record branch of
+        # ``_annotation_storage``, so the row declared an int64 handle of a
+        # record named 'Any' and the store of the opaque value refused as a
+        # row dtype disagreement.  Rule: a mapping's arbitrary-object VALUE
+        # is the fixed-width opaque handle, as in the keyed-value receipt
+        # (``_authored_annotation_field_receipt``).  An ``Any`` key and an
+        # ``Any`` inside a nested aggregate keep their integer row handle.
+        if (
+            isinstance(columns[1], ast.Name)
+            and columns[1].id in {"Any", "object"}
+        ) or (
+            isinstance(columns[1], ast.Attribute)
+            and columns[1].attr == "Any"
+        ):
+            value = {"dtype": "opaque_ref"}
         if key.get("dtype") is None or value.get("dtype") is None:
             return {}
         return {
@@ -18477,6 +18640,31 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             metadata={
                 "source_type": type(statement).__name__,
                 "source_node": node_id,
+                # A method is never a bare name's lexical callee
+                # (``FunctionTable.lexical_reference``).
+                **(
+                    {"method_owner": str(method_owners[node_id])}
+                    if method_owners.get(node_id) is not None
+                    else {}
+                ),
+                # The authored (module, qualname) of a discovered
+                # definition: two modules' same-named functions never share
+                # it (``FunctionTable.reference_by_source_identity``).
+                **(
+                    {"source_identity": tuple(map(str, getattr(
+                        function_definitions[node_id],
+                        "_python_source_identity",
+                    )))}
+                    if isinstance(getattr(
+                        function_definitions[node_id],
+                        "_python_source_identity", None,
+                    ), tuple)
+                    and len(getattr(
+                        function_definitions[node_id],
+                        "_python_source_identity",
+                    )) == 2
+                    else {}
+                ),
                 **(
                     {
                         "process_graph_boundary": getattr(
@@ -22073,7 +22261,19 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     )
                     reference = None
                 else:
-                    reference = function_table.reference(callee_name)
+                    owner_identity = (
+                        None if owner is None
+                        else function_table.entry(owner).metadata.get(
+                            "source_identity"
+                        )
+                    )
+                    reference = function_table.lexical_reference(
+                        callee_name,
+                        module=(
+                            None if not owner_identity
+                            else str(owner_identity[0])
+                        ),
+                    )
                 if (
                     not callee_is_parameter
                     and reference is None

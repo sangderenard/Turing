@@ -2798,6 +2798,21 @@ def _planned_scalar_dtypes_from(
             if reference in REGION_SCALAR_CAST_DTYPES:
                 settle(scalar, node_id, REGION_SCALAR_CAST_DTYPES[reference])
                 continue
+            # Silent lane, D6.  Program: ``x = n * 1.25 + 0.5; return
+            # math.floor(x) + 1`` (corpus c437).  Wrong record: nothing
+            # proved the result class, so the operand rule typed the
+            # result float64 and an int program returned a float.  Rule:
+            # on a proven scalar, ``math.floor``/``ceil``/``trunc`` and
+            # one-argument ``round`` return ``int`` in Python.
+            if reference in {
+                "round", "math.floor", "math.ceil", "math.trunc",
+            }:
+                arguments = parents(data, "arg:")
+                if len(arguments) == 1 and scalar.get(arguments[0]) in {
+                    "int64", "float64", "bool",
+                }:
+                    settle(scalar, node_id, "int64")
+                continue
             if op in {"truediv", "div"}:
                 operands = parents(data, "lhs", "rhs")
                 if operands and all(scalar.get(o) is not None for o in operands):
@@ -4390,6 +4405,13 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
+                if operation in {"floor", "ceil", "trunc", "round"}:
+                    # A scalar ``math.floor(x)`` is a Python ``int`` whatever
+                    # its operand's class; the source proof says so
+                    # (``_planned_scalar_dtypes_from``), the operand does not.
+                    proven = planned_scalar_dtypes().get(int(current))
+                    if proven is not None:
+                        dtype = str(proven)
                 if operation in {
                     "sum", "prod", "min", "max", "any", "all",
                     "unsqueeze", "squeeze",
@@ -21358,6 +21380,21 @@ class _StructuralValueAlias:
     source_id: int
 
 
+def _holds_runtime_fact(value: Any, unresolved: Any) -> bool:
+    """Whether a folded container value has a runtime member anywhere."""
+
+    if value is unresolved or isinstance(value, _ProgramABIValueFact):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _holds_runtime_fact(item, unresolved)
+            for pair in value.items() for item in pair
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_holds_runtime_fact(item, unresolved) for item in value)
+    return False
+
+
 @dataclass(frozen=True)
 class _ProgramABIValueFact:
     """Declared source type attached to a physical native parameter."""
@@ -24021,6 +24058,49 @@ def _tensor_descriptor_rule(
     }
 
 
+def _stored_callable_field_call(graph: Any, data: Mapping[str, Any]):
+    """``(class, field)`` when a node calls a callable stored on ``self``.
+
+    ``self.notify(n)`` where the method graph's class-table record lists
+    ``notify`` as a field and not a method is a call through a stored
+    callable, not a method call and not an operator: its spelling can
+    coincide with a tensor operator (``trace``) without being one.  Reads
+    only the graph's own records: ``method_binding``, ``method_owner``,
+    ``class_table`` and the receiver Input's binding to the first positional
+    parameter.
+    """
+
+    if graph.graph.get("method_binding") != "instance":
+        return None
+    expression = data.get("expr_obj")
+    if not (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+    ):
+        return None
+    owner = str(graph.graph.get("method_owner") or "")
+    record = dict((graph.graph.get("class_table") or {}).get(owner) or {})
+    positional = tuple(graph.graph.get("positional_parameters") or ())
+    if not record or not positional:
+        return None
+    name = str(expression.func.attr)
+    if name not in set(map(str, record.get("fields") or ())) or name in set(
+        map(str, dict(record.get("methods") or {}))
+    ):
+        return None
+    for parent, role in data.get("parents") or ():
+        if str(role) not in {"operand", "receiver"} or parent not in graph:
+            continue
+        receiver = graph.nodes[parent]
+        if (
+            str(receiver.get("type")) == "Input"
+            and (receiver.get("attributes") or {}).get("binding_name")
+            == positional[0]
+        ):
+            return owner, name
+    return None
+
+
 def _remove_dead_metadata_nodes(
     graph: Any,
     protected_values: Any,
@@ -24057,6 +24137,15 @@ def _remove_dead_metadata_nodes(
 
     def is_candidate(node_id: int, data: Mapping[str, Any]) -> bool:
         if int(node_id) in effect_ids:
+            return False
+        # Program: ``self.trace(i)`` with ``trace`` a stored callable field
+        # (SSAReferenceEvaluator._execute).  Wrong record: the spelling reads
+        # as the tensor operator ``trace``, so the unconsumed call was pruned
+        # here as a dead pure tensor call and the class route shipped the
+        # method without it.  Rule: a call through a stored callable field
+        # is an effect the class surface must lower or refuse, never dead
+        # metadata.
+        if _stored_callable_field_call(graph.G, data) is not None:
             return False
         attributes = data.get("attributes") or {}
         dead_pure_tensor_call = bool(
@@ -24985,6 +25074,10 @@ def _fold_callsite_structural_values(
             if node_type == "List" or isinstance(expression, ast.List):
                 return list(values)
             if node_type == "Set" or isinstance(expression, ast.Set):
+                # ``{1, 2, n}``: a runtime member may equal a literal one,
+                # so the display's members (and its length) are not known.
+                if _holds_runtime_fact(values, unresolved):
+                    return unresolved
                 return set(values)
             return tuple(values)
         if node_type in {"GetAttr", "Attribute"} or isinstance(
@@ -25577,6 +25670,18 @@ def _fold_callsite_structural_values(
                 return isinstance(values[0], accepted)
         if any(value is unresolved or isinstance(value, _ProgramABIValueFact)
                for value in values):
+            return unresolved
+        if name in {"set", "frozenset", "any", "all", "sorted", "max", "min"} and any(
+            _holds_runtime_fact(value, unresolved) for value in values
+        ):
+            # Program: ``values = [1, 2, 2, n]; len(set(values))`` (silent
+            # lane; the SSA interpreter thread's c470-c472).  Wrong record:
+            # the list's known value held ``n`` as its declared-parameter
+            # fact, ``set`` hashed that fact as one more distinct member,
+            # and ``len`` folded to 3, which is wrong when n is 1 or 2.
+            # Rule: a runtime member is not a value; dedupe, truth and
+            # order over one prove nothing.  ``len`` and ``list`` keep
+            # their count and order, which hold whatever the member is.
             return unresolved
         try:
             if name in {"bool", "int", "float"}:
@@ -26254,6 +26359,24 @@ def _fold_callsite_structural_values(
                     ) is not None
                 )
                 if len(parent_descriptors) != len(numerical_parents):
+                    parent_descriptors = ()
+                # Program: ``max(y)`` over a static (5,) ``y``.  Wrong
+                # record: the lone operand "broadcast" to (5,), so the
+                # builtin read as an elementwise Max (C refused it, LLVM
+                # raised).  Rule: builtin ``max``/``min`` of ONE rank-1
+                # iterable returns one of its elements -- a scalar.
+                if (
+                    operation in {"max", "min"}
+                    and isinstance(data.get("expr_obj"), ast.Call)
+                    and isinstance(data["expr_obj"].func, ast.Name)
+                    and len(data["expr_obj"].args) == 1
+                    and len(parent_descriptors) == 1
+                    and len(tuple(parent_descriptors[0]["shape"])) == 1
+                ):
+                    data["tensor"] = {
+                        "shape": (),
+                        "dtype": parent_descriptors[0]["dtype"],
+                    }
                     parent_descriptors = ()
                 if parent_descriptors:
                     try:
