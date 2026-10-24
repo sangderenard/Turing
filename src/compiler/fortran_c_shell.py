@@ -32664,6 +32664,7 @@ def _class_surface_ssa_program(
                 returned_record_layouts
             )
         output_identity_aliases = {}
+        output_final_ids = {}
         for output_name in output_names:
             final_id = named_output_ids.get(str(output_name))
             history = tuple(map(
@@ -32679,9 +32680,22 @@ def _class_surface_ssa_program(
             # such as 60, already concorded as 60 -> physical arena 2, makes
             # output recovery invent the reverse 2 -> 60 edge and a false
             # identity cycle.
-            final_id = _concordant_function_resident(function, final_id)
+            output_final_ids[str(output_name)] = (
+                _concordant_function_resident(function, final_id), history,
+            )
+        # Program: ``a = k * 3; b = a; if k > 2: b = b + 1; return a, b``.
+        # Wrong record: ``b``'s history (2, 7, 8) published 2 -> 8, though 2
+        # is still ``a``'s final output; Ret selection followed the alias and
+        # returned ``b`` twice (10, 10 for 9, 10).  Rule: an earlier identity
+        # of one output is not an alias of it while another authored output
+        # still ends there.
+        live_final_ids = {
+            int(final_id) for final_id, _history in output_final_ids.values()
+        }
+        for final_id, history in output_final_ids.values():
             for identity in history:
-                if int(identity) != int(final_id):
+                if (int(identity) != int(final_id)
+                        and int(identity) not in live_final_ids):
                     output_identity_aliases[int(identity)] = int(final_id)
         if output_identity_aliases:
             # Output history is semantic control identity, not substitutable
