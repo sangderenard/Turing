@@ -848,27 +848,3 @@ unchanged (static, which is what Windows uses).
   program.
 - Gate at `73eb8a36` and at main `dd340a1b`, each on a clean worktree: aa 89 /
   ab 7 / ac 26 / rec 20 on both, with the same failure names in every part.
-
-## E22b: a scheduled region with no body runs only its post-operations
-
-- **Program:** `ys1 = sorted(xs1); xs2 = [6] * (n % 4 + 1)` after `xs1`
-  grows in a loop (c409, fuzz p60_9).
-- **Wrong record:** the replication's region kept only its post-operation
-  (the fill), because its count came from another region. No body was
-  lowered and no signature recorded, yet the control still emitted a call
-  to the defaulted `numerical_region_N`. C refused the undefined function
-  (LOUD at main `daaa83c0`).
-- **Rule:** when the lowering records its regions' signatures, a scheduled
-  region that has no signature, no pre-operations and no stores has no
-  body, so its post-operations are its whole work
-  (`ControlSSABuilder.emit_region_call`, sharing
-  `_emit_region_post_operations`).
-
-### Receipts for E22b
-
-- Corpus at `6b1204e3` on main `daaa83c0` (332 programs): C 332/332, LLVM
-  331/332 (c367, same at main), Fortran 331 PASS, 1 WRONG (c22, by design).
-- Fuzz seed 66 (`FUZZ_EXT=3`, `llvm,fortran`, 30 programs): 30 PASS,
-  0 WRONG and 0 TYPE.
-- Gate at `6b1204e3` and at main `daaa83c0`, each on a clean worktree: aa 89 /
-  ab 7 / ac 26 / rec 20 on both, with the same failure names in every part.
