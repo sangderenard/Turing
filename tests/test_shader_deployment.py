@@ -29,6 +29,7 @@ from src.compiler.shader_deployment import (
     SPIRV_PRODUCT_SCHEMA,
     publish_extracted_shader,
     publish_spirv_product,
+    spirv_deployment,
 )
 from src.compiler.shader_extractor import ExtractedShader
 from src.compiler.ssa_spirv_backend import (
@@ -276,21 +277,65 @@ def test_spirv_library_and_deployable_shader_are_separate_products(tmp_path):
     )
 
 
-def test_deployable_spirv_refuses_what_one_element_per_invocation_cannot_carry():
-    a = SSAValue(0, "float32", (4,))
-    b = SSAValue(1, "float32", (4,))
-    r = SSAValue(2, "float32", (4,))
-    shaped = Function("shaped", [a, b], {"entry": BasicBlock("entry", [
+def test_deployable_spirv_refuses_what_one_instance_per_invocation_cannot_carry():
+    # A runtime-sized span states its rank, not its extents: one instance
+    # per invocation cannot be laid out, and the scalar reading of it would
+    # be element 0.
+    a = SSAValue(0, "float32", (), accounting={"program_abi_rank": 1})
+    b = SSAValue(1, "float32", (), accounting={"program_abi_rank": 1})
+    r = SSAValue(2, "float32", (), accounting={"program_abi_rank": 1})
+    runtime = Function("runtime", [a, b], {"entry": BasicBlock("entry", [
         Instr("add", [a, b], r), Instr("Ret", [], None),
     ])})
-    refused = emit_deployable_compute_shader(shaped, outputs=[r])
+    refused = emit_deployable_compute_shader(runtime, outputs=[r])
     assert not refused.complete and refused.source == ""
-    assert any("has shape (4,)" in item.reason for item in refused.shortfalls)
+    assert any("runtime-sized span" in item.reason for item in refused.shortfalls)
+    library = emit_function(runtime, outputs=[r])
+    assert any("runtime-sized span" in item.reason for item in library.shortfalls)
 
-    function, result = _scalar()
-    two = emit_deployable_compute_shader(function, outputs=[result, result])
-    assert not two.complete
-    assert any("exactly one result" in item.reason for item in two.shortfalls)
+    function, _result = _scalar()
+    none = emit_deployable_compute_shader(function, outputs=[])
+    assert not none.complete
+    assert any("at least one result" in item.reason for item in none.shortfalls)
+
+
+def _instanced():
+    """``(a + b) * s`` and ``a - b`` over (2, 3) instances, ``s`` scalar."""
+
+    a, b = SSAValue(0, "float32", (2, 3)), SSAValue(1, "float32", (2, 3))
+    s = SSAValue(2, "float32", ())
+    total, scaled, difference = (
+        SSAValue(3, "float32", (2, 3)), SSAValue(4, "float32", (2, 3)),
+        SSAValue(5, "float32", (2, 3)),
+    )
+    function = Function("instanced", [a, b, s], {"entry": BasicBlock("entry", [
+        Instr("add", [a, b], total), Instr("mul", [total, s], scaled),
+        Instr("sub", [a, b], difference), Instr("Ret", [], None),
+    ])})
+    return function, [scaled, difference]
+
+
+def test_deployable_spirv_states_instance_shapes_and_every_output():
+    function, outputs = _instanced()
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    record = spirv_deployment(shader).to_mapping()
+    views = {
+        item["name"]: item["realizes"][0] for item in record["resources"]
+    }
+    assert [item["name"] for item in record["resources"]] == [
+        "feed_0", "feed_1", "feed_2", "output_0", "output_1",
+    ]
+    for name in ("feed_0", "feed_1", "output_0", "output_1"):
+        view = views[name]
+        assert view["instance_shape"] == [2, 3]
+        assert view["rank"] == 3 and view["shape"] is None
+        assert view["byte_extent"] == {
+            "control": "element_count", "index": 0, "scale": 4 * 6,
+        }
+    assert views["feed_2"]["instance_shape"] == []
+    assert views["feed_2"]["byte_extent"]["scale"] == 4
+    assert views["output_1"]["extents_from"] == views["output_0"]["extents_from"]
 
 
 _HAVE_SPIRV_TOOLS = all(shutil.which(tool) for tool in ("spirv-as", "spirv-val"))
@@ -371,6 +416,60 @@ def test_deployable_spirv_matches_python_when_run_from_its_record(tmp_path, dtyp
         expected = {"add": np.add, "mul": np.multiply, "sub": np.subtract}[op](*feeds)
     assert output[:count].tobytes() == expected.tobytes()
     assert (output[count:] == 12345).all()
+
+
+def test_instanced_deployable_spirv_matches_python_on_vulkan(tmp_path):
+    probe = _vulkan_probe(tmp_path)
+    function, outputs = _instanced()
+    product = publish_spirv_product(
+        tmp_path / "product",
+        emit_deployable_compute_shader(function, outputs=outputs),
+    )
+    record = product.deployment
+    count = 300
+    rng = np.random.default_rng(3)
+    a = rng.standard_normal((count, 2, 3)).astype(np.float32)
+    b = rng.standard_normal((count, 2, 3)).astype(np.float32)
+    s = rng.standard_normal(count).astype(np.float32)
+    fed = {0: a, 1: b, 2: s}
+    buffers = {}
+    for resource in record["resources"]:
+        view = resource["realizes"][0]
+        per_instance = math.prod(view["instance_shape"])
+        if resource["access"] == "read":
+            buffers[resource["binding"]] = fed[view["value_id"]]
+        else:
+            buffers[resource["binding"]] = np.full(
+                (count + 64) * per_instance, 12345, dtype=np.float32,
+            )
+    (control,) = record["launch"]["controls"]
+    buffers[control["binding"]] = np.array([count], dtype=np.uint32)
+    group = record["launch"]["group_count"]["invocations_per_group"]
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), str(math.ceil(count / group) + 1),
+         "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    outputs_by_name = {
+        item["name"]: np.fromfile(paths[item["binding"]], dtype=np.float32)
+        for item in record["resources"] if item["access"] == "read_write"
+    }
+    expected = {
+        "output_0": ((a + b) * s[:, None, None]).reshape(-1),
+        "output_1": (a - b).reshape(-1),
+    }
+    for name, want in expected.items():
+        got = outputs_by_name[name]
+        np.testing.assert_allclose(got[: count * 6], want, rtol=1e-6)
+        assert (got[count * 6:] == 12345).all()
 
 
 @pytest.mark.parametrize("dtype", ["float32", "int32"])

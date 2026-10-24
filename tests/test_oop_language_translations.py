@@ -9,8 +9,8 @@ import pytest
 from src.compiler.dream_document import _run_javascript_ast_parser, DreamDocumentError
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.transmogrifier.graph.oop_language_translations import (
+    build_javascript_structural_graph,
     estree_dict_to_node,
-    install_js_role_schemas,
 )
 
 
@@ -21,8 +21,7 @@ def _js_process_graph(source: str) -> ProcessGraph:
         pytest.skip(f"no node executable available to parse JS: {error}")
     root = estree_dict_to_node(tree)
     graph = ProcessGraph(materialize_memory=False)
-    install_js_role_schemas(graph)
-    graph.build_graph(root)
+    build_javascript_structural_graph(graph, root, owner="test.js")
     return graph
 
 
@@ -61,3 +60,22 @@ def test_arrow_function_and_call_expression_reach_process_graph():
     assert "ArrowFunctionExpression" in types
     assert "CallExpression" in types
     assert "BinaryExpression" in types
+
+
+def test_javascript_schema_treats_operator_as_data_and_marks_structural_product():
+    graph = _js_process_graph("const result = a + b;")
+
+    assert "+" not in _types(graph)
+    binary = next(
+        data for _, data in graph.G.nodes(data=True)
+        if data.get("type") == "BinaryExpression"
+    )
+    assert {role for _, role in binary["parents"]} == {"left", "right"}
+
+
+def test_javascript_schema_installation_does_not_mutate_python_role_schemas():
+    from src.transmogrifier.operator_defs import role_schemas
+
+    before = dict(role_schemas)
+    _js_process_graph("const f = (x) => x + 1;")
+    assert role_schemas == before

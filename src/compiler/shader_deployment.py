@@ -101,6 +101,9 @@ class PortView:
     shape: tuple[int, ...] | None
     extents_from: str | int | None = None
     value_id: int | None = None
+    #: The static shape of one instance when the resource holds a run of
+    #: instances back to back (deployable SPIR-V); None otherwise.
+    instance_shape: tuple[int, ...] | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         mapping: dict[str, Any] = {
@@ -114,6 +117,8 @@ class PortView:
             mapping["extents_from"] = self.extents_from
         if self.value_id is not None:
             mapping["value_id"] = self.value_id
+        if self.instance_shape is not None:
+            mapping["instance_shape"] = list(self.instance_shape)
         return mapping
 
 
@@ -593,16 +598,23 @@ def spirv_deployment(shader: Any) -> ShaderDeployment:
         if binding.role == "control":
             continue
         port = ports[int(binding.value_id)]
-        extent = control_ref("element_count", 0, scale=binding.element_bytes)
+        # One instance per invocation: ``element_count`` instances of
+        # ``prod(instance_shape)`` elements each, row-major, back to back.
+        instance = tuple(getattr(binding, "instance_shape", ()) or ())
+        extent = control_ref(
+            "element_count", 0,
+            scale=binding.element_bytes * math.prod(instance),
+        )
         resources.append(PhysicalResource(
             name=binding.name, kind="storage-buffer", access=binding.access,
             layout="std430", dtype=binding.dtype, element_bytes=binding.element_bytes,
             set=0, binding=binding.binding, byte_extent=extent,
             capabilities=tuple(item for item in shader.capabilities if item != "Shader"),
             realizes=(PortView(
-                port.slot, 0, extent, 1, None,
+                port.slot, 0, extent, 1 + len(instance), None,
                 "fed" if binding.role == "feed" else first_feed,
                 port.value_id,
+                instance_shape=instance,
             ),),
         ))
     control = next(item for item in shader.bindings if item.role == "control")

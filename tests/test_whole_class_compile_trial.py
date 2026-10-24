@@ -8,7 +8,14 @@ visible, so its reading of the planned set and the surface is pinned here.
 
 from __future__ import annotations
 
+import ctypes
+import os
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+
+from src.compiler.ssa_fortran_backend import fortran_compiler
 
 from tools.trial_whole_class_compile import method_coverage, run_class_route
 
@@ -35,10 +42,9 @@ def test_class_route_plans_every_seeded_method(tmp_path):
     assert route["planned_methods"] == ["__init__", "bump", "twice"]
     coverage = route["method_coverage"]
     assert set(coverage) == {"__init__", "bump", "twice"}
-    # Every method the module lacks is named, never silently passed over.
-    assert route["false_acceptance_candidates"] == sorted(
-        method for method, state in coverage.items() if state == "missing"
-    )
+    assert coverage == {
+        "__init__": "present", "bump": "present", "twice": "present",
+    }
 
 
 def test_method_coverage_reads_source_qualified_names():
@@ -70,11 +76,29 @@ def test_class_route_never_ships_a_library_without_a_planned_method(tmp_path):
     source.write_text(ACC, encoding="utf-8")
     route = run_class_route(source, "Acc", tmp_path / "out")
     assert route["planned_methods"] == ["__init__", "add"]
-    missing = route["false_acceptance_candidates"]
-    if route["refusal"] is None:
-        # A library was produced: it must hold every method.
-        assert missing == []
-    else:
-        # A dropped method is refused by name, never passed over.
-        for method in missing:
-            assert repr(method) in route["refusal"]["message"]
+    # Every seeded activation root is prepared, so the whole-object module
+    # holds every method (whether or not a Fortran compiler is installed).
+    assert route["method_coverage"] == {"__init__": "present", "add": "present"}
+    assert route["false_acceptance_candidates"] == []
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None, reason="the class route emits through Fortran",
+)
+def test_seeded_method_runs_natively_and_matches_python(tmp_path):
+    source = tmp_path / "acc.py"
+    source.write_text(ACC, encoding="utf-8")
+    route = run_class_route(source, "Acc", tmp_path / "out")
+    assert route["refusal"] is None, route["refusal"]
+    if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(str(Path(fortran_compiler()).resolve().parent))
+    library = ctypes.CDLL(route["library"])
+    add = library.Acc__add
+    add.restype = None
+    add.argtypes = [
+        ctypes.c_int64, ctypes.c_int64, ctypes.POINTER(ctypes.c_int64),
+    ]
+    for a, b in ((2, 3), (-7, 4), (2 ** 40, 5)):
+        result = ctypes.c_int64()
+        add(a, b, ctypes.byref(result))
+        assert result.value == a + b

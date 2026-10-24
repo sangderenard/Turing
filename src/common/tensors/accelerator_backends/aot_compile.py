@@ -1560,6 +1560,23 @@ def _lower_process_graph_to_compilation(
                     reduction_cache=region_catalogue,
                     progress=_report,
                 )
+                # Every other activation root is a program this compile
+                # promised too (the class route's seeded methods).  Preparing
+                # the entry walks only the entry's callsite tree, so a seed's
+                # shell reached the whole-object lowering with no control
+                # program and was dropped.  Prepare each root's own tree.
+                for root_reference in getattr(
+                    deployment, "activation_root_references", (),
+                ):
+                    root_shell = deployment.function_shells.get(
+                        int(root_reference)
+                    )
+                    if root_shell is None or root_shell is function_shell:
+                        continue
+                    root_shell.prepare_graph_precompile(
+                        reduction_cache=region_catalogue,
+                        progress=_report,
+                    )
                 if checkpoint_store is not None:
                     _report("aot: saving prepared-plan checkpoint")
                     try:

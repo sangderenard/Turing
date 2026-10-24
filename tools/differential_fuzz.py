@@ -290,6 +290,8 @@ EXTENDED3 = [
     (["t{v} = 0", "for k{v}, x{v} in enumerate([{a}, n, {b}], n % 4 + {c}):", "    t{v} = t{v} * 10 + k{v} * x{v}"], "t{v}"),
     # a callee filters a list literal in its loop, so it keeps live flags (c197)
     ([], "positives([{a}, -{b}, {c}]) * 10 + n"),
+    # a tuple target over dict items holding a large int (E23; lane E)
+    (["d{v} = {{{a}: n + 36028797018963969, {b}: {c}}}", "t{v} = 0", "for k{v}, w{v} in d{v}.items():", "    t{v} += k{v} * 10 + w{v}"], "t{v}"),
     # a list grown at run time, then sorted (Fortran list growth; lane E)
     (["xs{v} = []", "for k{v} in range(n % 4 + {a} + 1):", "    xs{v}.append((k{v} * {b} + n) % 9)", "ys{v} = sorted(xs{v})"], "ys{v}[0] * 100 + ys{v}[-1] * 10 + len(xs{v})"),
 ]
@@ -404,6 +406,8 @@ def build(m: int) -> list[int]:
 EXTENDED4 = [
     (["o{v} = maybe_pick(n + 1, {a})", "d{v} = {{1: {b}, 2: n, 3: {c}}}", "del d{v}[2]"], "(-3 if o{v} is None else o{v} + 1) + len(d{v}) * 10"),
     (["d{v} = {{1: {a}, 2: n}}", "del d{v}[1]", "d{v}[1] = {b}"], "len(d{v}) * 10 + d{v}[1]"),
+    (["d{v} = {{1: {a}, 2: n}}", "g{v} = d{v}.get(n % 3)"], "({b} if g{v} is None else g{v}) * 10 + len(d{v})"),
+    (["d{v} = {{1: {a}, 2: n}}", "m{v} = n * {b}", "g{v} = d{v}.get(n % 4, m{v})"], "g{v} * 10 + d{v}.get(2, {c})"),
     (["d{v} = {{1: {a}, 2: n, 3: {b}}}", "del d{v}[2]", "xs{v} = [{c}, n, 7]", "xs{v}[1] = {a}"], "len(d{v}) * 100 + xs{v}[0] * 10 + xs{v}[1]"),
     (["d{v} = {{1: {a}, 2: n}}", "k{v} = d{v}[n % 3] if n > {b} else d{v}[1]"], "k{v} * 10 + len(d{v})"),
     (["d{v} = {{1: {a}, 2: n}}", "del d{v}[n % 3 + 1]"], "len(d{v}) * 10 + d{v}.get(1, {b})"),
