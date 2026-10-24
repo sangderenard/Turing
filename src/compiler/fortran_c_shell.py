@@ -25783,7 +25783,7 @@ def _class_surface_ssa_program(
         # list the promotion carried it into: it names that storage and is
         # not a list of its own.
         # Program: ``rep = [9]; if k > 2: rep = [k, 1, 2]`` then
-        # ``len(rep)`` (corpus c392).  Wrong record: the merge of a list
+        # ``len(rep)`` (corpus c440).  Wrong record: the merge of a list
         # rebound on one branch was promoted into the initial list's arena
         # (the branch copies its list there), but it kept a declaration of
         # its own, so its reads went to a never-written arena (the audit

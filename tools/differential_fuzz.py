@@ -131,11 +131,11 @@ EXTENDED = [
     (["o{v} = maybe_pick(n, {a})", "q{v} = None if o{v} is None else o{v} * 3 - {b}"], "(-9 if q{v} is None else q{v})"),
     (["o{v} = bump_pick(n, {a})"], "(-4 if o{v} is None else o{v})"),
     # a while test through ``.item()`` of a carried tensor, re-evaluated
-    # by the latch (corpus c369/c390/c391, lanes plan A4)
+    # by the latch (corpus c369/c444/c445, lanes plan A4)
     (["c{v} = item_steps(n + {a})"], "c{v} * 3"),
     (["t{v} = AbstractTensor.tensor(0.0)", "k{v} = 0", "while (t{v} * 2.0).item() < n + {a}:", "    t{v} = t{v} + 1.0", "    k{v} += 1"], "k{v} + int(t{v}.item())"),
     # a list rebound on one branch to a list of another length (corpus
-    # c392-c395, the tire's ``metrics.unresolved_report = list(lines)``)
+    # c440-c443, the tire's ``metrics.unresolved_report = list(lines)``)
     (["r{v} = [{a}, {c}]", "if n > {a}:", "    r{v} = [n, {b}, {c}, 1]"], "sum(r{v}) * 10 + len(r{v}) + max(r{v})"),
     (["r{v} = [{c}]", "if n % 2 == 0:", "    w{v} = [n]", "    for i{v} in range({a}):", "        w{v}.append(i{v} + {b})", "    r{v} = list(w{v})"], "len(r{v}) * 10 + r{v}[-1]"),
 ]
