@@ -70,7 +70,8 @@ the input whose extents an output takes, `extents.order` entries are
 - **WebGL fragment**. Sampled textures (by uniform name) and draw buffers
   (by location), `turing_resolution` when sampling is normalized.
 - **Extracted host shader**. Exact source plus filename, line, source
-  symbol, compiler call and digest. No component ABI is derived yet.
+  symbol, compiler call and digest, and a component ABI read from the
+  source's own global declarations (section "Extracted shader interface").
 - **Deployable SPIR-V** (`ssa_spirv_backend.emit_deployable_compute_shader`).
   `main` is a GLCompute entry with `LocalSize`; it reads one element of each
   feed at `GlobalInvocationId.x`, calls the library translation of the SSA
@@ -89,7 +90,12 @@ the input whose extents an output takes, `extents.order` entries are
   Closed by the follow-up below; the record no longer carries it.
 - `graphics-stage` (WebGL): a raster pipeline with the companion vertex
   stage, not a compute dispatch.
-- `no-component-abi` (extracted shaders).
+- `no-component-abi` (extracted shaders): only when the declared
+  interface cannot be read with certainty, with the reader's reason.
+- `link-assigned` (extracted shaders): a resource whose binding or
+  location the source leaves to the host program or the linker.
+- `host-launch` (extracted compute shaders): the host's dispatch call picks
+  the group count.
 - Deployable SPIR-V refuses by name: a runtime-sized span (rank stated, no
   static shape), a dtype with no storage element (bool), or no result.
   Array-shaped values and several results are carried (see "Instances").
@@ -118,7 +124,6 @@ words past the element count are untouched with an extra group dispatched.
 - The installed control shell (`compose_control_shader`) compiles for
   Vulkan now (section "Vulkan-ready control shell"), but it is not a
   published product yet.
-- A component ABI for extracted host shaders.
 - The precision-core compute lane (`ssa_glsl_compute_backend`) has no
   component ABI, so it has no product yet.
 - Deployable SPIR-V for a matmul, an axis reduction, or any function that
@@ -242,3 +247,59 @@ That second test runs on lavapipe and covers:
 - a NaN for `max`/`min`;
 - an empty span, where `max`/`min`/`mean` leave the sentinel untouched;
 - two groups launched, with no effect beyond the first invocation.
+
+## Extracted shader interface (follow-up, 2026-10-24)
+
+Wrong record: every extracted host shader was published with no component
+ABI and the `no-component-abi` shortfall, so a consumer had to parse the
+source to find what to bind.
+
+Rule: `glsl_interface.read_glsl_interface` reads the global declarations,
+and only those: stage inputs and outputs (`attribute`/`varying` by stage),
+default-block uniforms, opaque uniforms, uniform/buffer/IO blocks and their
+members, `layout` qualifiers, and a compute `local_size`. Function bodies,
+comments, `const`/`shared` globals and builtin redeclarations are not
+interface. `extracted_shader_component` turns each declaration into one
+`turing.shader-component.v1` port (feeds, then outputs, then uniforms, each
+in declaration order) and one physical resource:
+
+| Declaration | role | transport / kind | access |
+| --- | --- | --- | --- |
+| vertex `in` | feed | vertex-attribute | read |
+| other `in` | feed | stage-input | read |
+| fragment `out` | output | draw-buffer | write |
+| other `out` | output | stage-output | write |
+| `buffer` block | feed if `readonly`, else output | storage-buffer | read / write / read_write |
+| `uniform` block | uniform | uniform-buffer | read |
+| sampler/texture | feed | texture / sampled-texture | read |
+| image | feed if `readonly`, else output | storage-image | as declared |
+| plain `uniform` | uniform | default-uniform (by name) | read |
+
+Dtypes: `f32`/`i32`/`u32`/`bool`, vectors `f32x4`, matrices `f32x4x4`
+(columns first), opaque types by GLSL name, and `block` for a block of
+several members, whose members are listed on the resource. A runtime-sized
+array is `shape: null`, `extents_from: "fed"`. `backend_binding` is the
+declared binding, else the declared location, else `-1`. A sampler, image or
+block without a `binding`, a vertex attribute without a `location`, or one
+of several fragment outputs without one, is named in a `link-assigned`
+shortfall. Graphics stages keep `graphics-stage`. A compute shader states
+its local size and carries `host-launch`.
+
+Refused by name (the product keeps `no-component-abi` with the reason):
+conditional compilation (`#if`, `#ifdef`, ...), a macro in a global
+declaration, a struct-typed interface variable or block member, and a
+non-literal array size or layout value.
+
+Evidence:
+
+- `tests/test_extracted_shader_interface.py`, with `glslangValidator`'s
+  reflection database (`-l -q --reflect-separate-buffers`) as the oracle:
+  for all 24 shaders the extractor finds in `src` (12 vertex, 12 fragment),
+  every uniform, block, buffer variable, pipeline input and output glslang
+  reports appears in the record with the same type, binding and runtime-array
+  status. The same check passes on a compute shader with every resource kind;
+- on llvmpipe, an extracted compute shader runs from its record alone
+  (storage buffers bound at the record's bindings, uniforms set by the
+  record's names, groups from its local size) and matches numpy over 1000
+  elements, with the words past the count left untouched.
+
