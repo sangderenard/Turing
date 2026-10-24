@@ -277,26 +277,81 @@ def test_spirv_library_and_deployable_shader_are_separate_products(tmp_path):
     )
 
 
-def test_deployable_spirv_refuses_what_one_instance_per_invocation_cannot_carry():
-    # A runtime-sized span states its rank, not its extents: one instance
-    # per invocation cannot be laid out, and the scalar reading of it would
-    # be element 0.
-    a = SSAValue(0, "float32", (), accounting={"program_abi_rank": 1})
-    b = SSAValue(1, "float32", (), accounting={"program_abi_rank": 1})
-    r = SSAValue(2, "float32", (), accounting={"program_abi_rank": 1})
+def _spans(rank, *ids, dtype="float32"):
+    return [
+        SSAValue(i, dtype, (), accounting={"program_abi_rank": rank})
+        for i in ids
+    ]
+
+
+def test_deployable_spirv_refuses_what_one_invocation_cannot_carry():
+    # The library unrolls static shapes only: a runtime-sized span is
+    # refused there, never read as its element 0.
+    a, b, r = _spans(1, 0, 1, 2)
     runtime = Function("runtime", [a, b], {"entry": BasicBlock("entry", [
         Instr("add", [a, b], r), Instr("Ret", [], None),
     ])})
-    refused = emit_deployable_compute_shader(runtime, outputs=[r])
-    assert not refused.complete and refused.source == ""
-    assert any("runtime-sized span" in item.reason for item in refused.shortfalls)
     library = emit_function(runtime, outputs=[r])
     assert any("runtime-sized span" in item.reason for item in library.shortfalls)
+
+    # Element mode needs one rank, elementwise operations, span outputs.
+    (x,) = _spans(1, 0)
+    (y,) = _spans(2, 1)
+    (z,) = _spans(2, 2)
+    mixed = Function("mixed", [x, y], {"entry": BasicBlock("entry", [
+        Instr("add", [x, y], z), Instr("Ret", [], None),
+    ])})
+    (u,) = _spans(1, 0)
+    total = SSAValue(1, "float32", ())
+    reduced = Function("reduced", [u], {"entry": BasicBlock("entry", [
+        Instr("sum", [u], total), Instr("Ret", [], None),
+    ])})
+    for function, outputs, reason in (
+        (mixed, [z], "one rank"),
+        (reduced, [total], "is a scalar beside"),
+    ):
+        refused = emit_deployable_compute_shader(function, outputs=outputs)
+        assert not refused.complete and refused.source == ""
+        assert any(reason in item.reason for item in refused.shortfalls), (
+            refused.shortfalls
+        )
 
     function, _result = _scalar()
     none = emit_deployable_compute_shader(function, outputs=[])
     assert not none.complete
     assert any("at least one result" in item.reason for item in none.shortfalls)
+
+
+def _elementwise_runtime():
+    """``(a + b) * s`` over runtime-sized rank-2 spans, ``s`` a scalar."""
+
+    a, b, total, scaled = _spans(2, 0, 1, 3, 4)
+    s = SSAValue(2, "float32", ())
+    function = Function("runtime", [a, b, s], {"entry": BasicBlock("entry", [
+        Instr("add", [a, b], total), Instr("mul", [total, s], scaled),
+        Instr("Ret", [], None),
+    ])})
+    return function, [scaled]
+
+
+def test_runtime_sized_elementwise_deploys_one_element_per_invocation():
+    function, outputs = _elementwise_runtime()
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    record = spirv_deployment(shader).to_mapping()
+    views = {item["name"]: item["realizes"][0] for item in record["resources"]}
+    for name in ("feed_0", "feed_1", "output_0"):
+        assert views[name]["rank"] == 2 and views[name]["shape"] is None
+        assert views[name]["byte_extent"] == {
+            "control": "element_count", "index": 0, "scale": 4,
+        }
+    assert views["feed_0"]["extents_from"] == "fed"
+    assert views["output_0"]["extents_from"] == views["feed_0"]["slot"]
+    # The scalar broadcasts: one element, read by every invocation.
+    assert views["feed_2"]["rank"] == 0 and views["feed_2"]["byte_extent"] == 4
+    element_count = record["launch"]["element_count"]
+    assert element_count["rank"] == 2
+    assert element_count["elements_of"] == views["feed_0"]["slot"]
 
 
 def _instanced():
@@ -543,3 +598,49 @@ def test_glsl_arena_product_runs_on_vulkan_from_its_record(tmp_path, dtype):
         expected = np.add(*feeds)
     assert result[start:start + count].tobytes() == expected.tobytes()
     assert (result[start + count:start + count + 3] == 0xDEADBEEF).all()
+
+
+def test_runtime_sized_deployable_spirv_matches_python_on_vulkan(tmp_path):
+    probe = _vulkan_probe(tmp_path)
+    function, outputs = _elementwise_runtime()
+    product = publish_spirv_product(
+        tmp_path / "product",
+        emit_deployable_compute_shader(function, outputs=outputs),
+    )
+    record = product.deployment
+    rng = np.random.default_rng(5)
+    # Extents the shader never saw: the host supplies their product.
+    a = rng.standard_normal((17, 13)).astype(np.float32)
+    b = rng.standard_normal((17, 13)).astype(np.float32)
+    s = np.array([0.75], dtype=np.float32)
+    count = a.size
+    fed = {0: a, 1: b, 2: s}
+    buffers = {}
+    for resource in record["resources"]:
+        view = resource["realizes"][0]
+        if resource["access"] == "read":
+            buffers[resource["binding"]] = fed[view["value_id"]]
+        else:
+            buffers[resource["binding"]] = np.full(count + 64, 12345, dtype=np.float32)
+    (control,) = record["launch"]["controls"]
+    buffers[control["binding"]] = np.array([count], dtype=np.uint32)
+    group = record["launch"]["group_count"]["invocations_per_group"]
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), str(math.ceil(count / group) + 1),
+         "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    output = next(
+        item for item in record["resources"] if item["access"] == "read_write"
+    )
+    got = np.fromfile(paths[output["binding"]], dtype=np.float32)
+    np.testing.assert_allclose(got[:count], ((a + b) * s[0]).reshape(-1), rtol=1e-6)
+    assert (got[count:] == 12345).all()

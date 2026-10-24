@@ -121,8 +121,10 @@ words past the element count are untouched with an extra group dispatched.
 - A component ABI for extracted host shaders.
 - The precision-core compute lane (`ssa_glsl_compute_backend`) has no
   component ABI, so it has no product yet.
-- Deployable SPIR-V for runtime-sized spans (it needs a structured loop in
-  the library function; static shapes are unrolled).
+- Deployable SPIR-V for a NON-elementwise function over runtime-sized spans
+  (a reduction, a matmul). That needs a structured loop in the library
+  function, because static shapes are unrolled. Elementwise ones deploy in
+  element mode (see "Element mode").
 
 ## Vulkan-ready arena controls (follow-up, 2026-10-24)
 
@@ -176,3 +178,27 @@ Evidence: `test_deployable_spirv_states_instance_shapes_and_every_output`,
 and `test_instanced_deployable_spirv_matches_python_on_vulkan`. On lavapipe,
 over 300 instances, both outputs match numpy and the words past the
 instance count are untouched.
+
+## Element mode (runtime-sized spans)
+
+Program: `(x - y) * (x + y) * 0.5` with `x` and `y` declared `storage: span,
+rank: 2` and no shape. Its lowered region is elementwise over runtime-sized
+spans. Wrong record: the deployable entry refused it, because instances need
+static extents.
+
+Rule: when every span is runtime-sized with one rank R, and every operation
+over a span is elementwise with a span result, invocation `i` computes
+element `i` of every span. Rank-0 feeds broadcast: each invocation reads
+their element 0, and their `byte_extent` is one element. `element_count` is
+the product of the host's extents (`launch.element_count.rank` = R,
+`elements_of` = the first span feed's slot). Span views state `rank` R,
+`shape` null, and `extents_from` (`"fed"`, or the first span feed's slot for
+an output). Mixed ranks, a reduction, or a scalar output beside span outputs
+are refused by name.
+
+Evidence: `test_runtime_sized_elementwise_deploys_one_element_per_invocation`,
+`test_runtime_sized_deployable_spirv_matches_python_on_vulkan` (lavapipe, a
+(17, 13) feed the shader never saw, matches numpy; the words past the count
+are untouched), and
+`tests/test_runtime_sized_spans.py::test_rank_only_region_deploys_as_elementwise_spirv`
+(the sanctioned entry's region deploys and passes spirv-val).

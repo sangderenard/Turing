@@ -593,11 +593,46 @@ def spirv_deployment(shader: Any) -> ShaderDeployment:
     abi = shader.component_abi
     ports = {int(port.value_id): port for port in abi.ports if port.value_id is not None}
     first_feed = next((port.slot for port in abi.ports if port.role == "feed"), None)
+    # Element mode (an elementwise function over runtime-sized spans): one
+    # element per invocation; outputs take the first span feed's extents.
+    element_rank = max(
+        (int(getattr(item, "runtime_rank", 0) or 0) for item in shader.bindings),
+        default=0,
+    )
+    if element_rank:
+        first_feed = next((
+            ports[int(item.value_id)].slot for item in shader.bindings
+            if item.role == "feed" and getattr(item, "runtime_rank", 0)
+        ), None)
     resources = []
     for binding in shader.bindings:
         if binding.role == "control":
             continue
         port = ports[int(binding.value_id)]
+        if element_rank:
+            broadcast = bool(getattr(binding, "broadcast", False))
+            extent = (
+                binding.element_bytes if broadcast
+                else control_ref("element_count", 0, scale=binding.element_bytes)
+            )
+            resources.append(PhysicalResource(
+                name=binding.name, kind="storage-buffer", access=binding.access,
+                layout="std430", dtype=binding.dtype,
+                element_bytes=binding.element_bytes,
+                set=0, binding=binding.binding, byte_extent=extent,
+                capabilities=tuple(
+                    item for item in shader.capabilities if item != "Shader"
+                ),
+                realizes=(PortView(
+                    port.slot, 0, extent,
+                    0 if broadcast else int(binding.runtime_rank),
+                    () if broadcast else None,
+                    None if broadcast
+                    else "fed" if binding.role == "feed" else first_feed,
+                    port.value_id,
+                ),),
+            ))
+            continue
         # One instance per invocation: ``element_count`` instances of
         # ``prod(instance_shape)`` elements each, row-major, back to back.
         instance = tuple(getattr(binding, "instance_shape", ()) or ())
@@ -642,7 +677,11 @@ def spirv_deployment(shader: Any) -> ShaderDeployment:
             },
             element_count={
                 "source": "storage-word", "control": "element_count",
-                "kind": "element_count", "rank": 1, "shape": None, "value": None,
+                "kind": "element_count", "rank": element_rank or 1,
+                "shape": None, "value": None,
+                # Element mode: the product of the span feeds' runtime
+                # extents (which must agree; the host checks them).
+                **({"elements_of": first_feed} if element_rank else {}),
             },
             extents={
                 "type": "uint32_t",
