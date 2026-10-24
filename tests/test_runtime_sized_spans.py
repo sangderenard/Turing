@@ -120,6 +120,28 @@ def _backends():
 
 BACKENDS = _backends()
 
+
+@pytest.mark.parametrize(
+    "program,expected",
+    (("c411_rank_two_first_row.py", 7.0),
+     ("c412_rank_two_last_row.py", 4.0)),
+)
+def test_fortran_rank_two_span_reads_the_authored_cell(
+    tmp_path, program, expected,
+):
+    source = (
+        REPO / "tests" / "fortran_span_corpus" / program
+    ).read_text(encoding="utf-8")
+    module, entry, parameters, result = _lower(
+        tmp_path, source, program.removesuffix(".py"), 2, shape=(2, 3),
+    )
+    values = np.asarray([[1.0, 7.0, 3.0], [4.0, 2.0, 9.0]])
+    feeds = {parameters["x"]: values}
+    for backend in BACKENDS:
+        _artifact, execution = _run(backend, module, entry, feeds, tmp_path)
+        got = np.asarray(execution.buffers[result.id]).reshape(-1).tolist()
+        assert got == [expected], (backend, program, got)
+
 #: A representative AbstractTensor operation: several elementwise steps,
 #: a broadcast scalar constant, and an intermediate that is not an output.
 REPRESENTATIVE = "def f(x, y):\n    return (x - y) * (x + y) * 0.5\n"
