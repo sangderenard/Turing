@@ -164,11 +164,14 @@ def test_loop_lowers_to_header_body_exit_blocks_with_phis():
 
 @needs_node
 @pytest.mark.parametrize("source", [
-    # break/continue/return leave a loop other than through its condition.
-    "/** @param {number} n */ function root(n) { let s = 0; "
-    "for (let i = 0; i < n; i++) { if (i > 2) { break; } s += i; } return s; }",
+    # return and labeled exits leave a loop other than through its header.
     "/** @param {number} n */ function root(n) { let s = 0; "
     "while (s < n) { return s; } return 1; }",
+    "/** @param {number} n */ function root(n) { let s = 0; "
+    "outer: for (let i = 0; i < n; i++) { break outer; } return s; }",
+    # A loop with neither a condition nor a break never leaves.
+    "/** @param {number} n */ function root(n) { let s = 0; "
+    "for (;;) { s += n; } return s; }",
     # A carried value that changes kind has no single dtype.
     "/** @param {number} n */ function root(n) { let x = 0; "
     "for (let i = 0; i < n; i++) { x = x > 0; } return x; }",
@@ -269,3 +272,22 @@ def test_lowering_inside_an_open_compile_posts_to_that_book():
     finally:
         end_identity_book(token)
     assert lowered.module.metadata["identity_book"] is book
+
+
+@needs_node
+def test_break_and_continue_are_flags_on_the_loop():
+    source = (
+        "/** @param {number} n */ function root(n) { let s = 0; "
+        "for (let i = 0; i < n && i < 40; i++) "
+        "{ if (i % 2 === 0) continue; if (s > 20) break; s += i; } return s; }"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    phis = [
+        instruction.attributes["binding_name"]
+        for instruction in lowered.module.functions["root"].blocks["loop0_header"].instrs
+        if instruction.op == "Phi"
+    ]
+    # The break flag is carried; the continue flag is per iteration.
+    assert sorted(phis) == ["%break0", "i", "s"]
+    assert check_program(source, "[[0], [3], [9], [100], [NaN], [Infinity]]") == "PASS"
