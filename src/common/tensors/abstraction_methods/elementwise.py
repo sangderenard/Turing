@@ -405,6 +405,28 @@ def minimum(self, other):
     return finalize(result)
 
 
+# ---------------------- emax / emin: builtin max per element -----------------
+# ``max(x, y)`` of multi-element tensors raises in Python (a tensor's truth
+# value is ambiguous), and ``maximum`` is numpy's rule (NaN propagates, a tie
+# takes ``other``).  ``emax`` is the builtin's own rule applied element by
+# element: ``other`` replaces ``self`` only where it is strictly greater, so a
+# NaN in ``self`` stays and a NaN in ``other`` never wins.
+def emax(self, other):
+    """Elementwise builtin ``max``: ``other`` where ``other > self``, else ``self``."""
+    from ..abstraction import AbstractTensor
+    if not isinstance(self, AbstractTensor):
+        self = AbstractTensor.tensor(self)
+    return AbstractTensor.where(other > self, other, self)
+
+
+def emin(self, other):
+    """Elementwise builtin ``min``: ``other`` where ``other < self``, else ``self``."""
+    from ..abstraction import AbstractTensor
+    if not isinstance(self, AbstractTensor):
+        self = AbstractTensor.tensor(self)
+    return AbstractTensor.where(other < self, other, self)
+
+
 # ---------------------- atan2 / round / floor --------------------------
 # Needed for phase (magnitude/angle) work: atan2 converts a real/imaginary
 # pair to an angle, and round is required for principal-argument unwrapping

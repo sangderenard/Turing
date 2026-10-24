@@ -3923,6 +3923,8 @@ from .abstraction_methods.elementwise import (
     sigmoid as elementwise_sigmoid,
     maximum as elementwise_maximum,
     minimum as elementwise_minimum,
+    emax as elementwise_emax,
+    emin as elementwise_emin,
     atan2 as elementwise_atan2,
     round as elementwise_round,
     floor as elementwise_floor,
@@ -3957,6 +3959,8 @@ AbstractTensor.where     = staticmethod(elementwise_where)
 AbstractTensor.sign      = elementwise_sign
 AbstractTensor.maximum   = elementwise_maximum
 AbstractTensor.minimum   = elementwise_minimum
+AbstractTensor.emax      = elementwise_emax
+AbstractTensor.emin      = elementwise_emin
 AbstractTensor.atan2     = elementwise_atan2
 AbstractTensor.round     = elementwise_round
 AbstractTensor.floor     = elementwise_floor

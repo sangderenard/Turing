@@ -144,6 +144,9 @@ EXTENDED = [
     # a list rebound on one branch to a list of another length (corpus
     # c440-c443, the tire's ``metrics.unresolved_report = list(lines)``)
     (["r{v} = [{a}, {c}]", "if n > {a}:", "    r{v} = [n, {b}, {c}, 1]"], "sum(r{v}) * 10 + len(r{v}) + max(r{v})"),
+    # builtin max/min keep a NaN only when it comes first, and a NaN is
+    # unequal to itself (c540, c541)
+    (["f{v} = n * 1e308 * 10.0", "g{v} = f{v} - f{v}"], "int(max(g{v}, {a}) == {a}) * 100 + int(max({a}, g{v}) == {a}) * 10 + int(min(g{v}, {b}) != min(g{v}, {b}))"),
     (["r{v} = [{c}]", "if n % 2 == 0:", "    w{v} = [n]", "    for i{v} in range({a}):", "        w{v}.append(i{v} + {b})", "    r{v} = list(w{v})"], "len(r{v}) * 10 + r{v}[-1]"),
     # a copied name (``b = a``) rebound after the copy, in straight code,
     # in one arm of an if/else, and as the seed of a loop that reads the
