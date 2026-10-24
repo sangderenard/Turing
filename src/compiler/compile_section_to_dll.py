@@ -70,19 +70,42 @@ def compile_class_to_dll(
     source, class_name, outdir, *, progress=None, python_package=None,
     extraction_contract=PROGRAM_EXTRACTION_CONTRACT,
 ):
-    """Compile a whole class to a DLL with no privileged entry function.
+    """Compile a whole class to one shared library with no privileged entry.
 
-    The class is the unit: the dependency closure is seeded from EVERY method
-    (constructors included), so the whole object is retained and compiled as one
-    general dependency. Object state flows through get/set-attribute field slots,
-    which is what keeps it safe. Each method already emits ``bind(C, name=...)``,
-    so all export cleanly from one shared library.
+    DEPRECATED, and redirected.  The class is still the unit: the closure is
+    seeded from EVERY method (constructors included), and the methods share
+    one ``self`` record, so one library exports them all.  That lowering is
+    now the canonical repository-SSA compiler (``lower_ast_source_to_ssa``),
+    then Fortran emission and the shared-library link; the handle is the same
+    ``FortranCShellExecutable``.
+
+    Program: ``__init__(self, c, n): self.n = 0; if c: self.n = n``.  Wrong
+    record: this adapter called the legacy ``compile_ast_fortran_c_shell``,
+    which derives no record ABI for the receiver, so every field cell was
+    float64 and both stores ran at entry, outside the ``if`` (``get()``
+    returned 0 for c true).  The canonical lowering stores each field in its
+    arm, in a typed column (int64 for ``n``).
     """
 
-    from src.compiler.compiler_entrypoints import warn_legacy_source_compiler
-    from src.compiler.fortran_c_shell import compile_ast_fortran_c_shell
+    import warnings
 
-    warn_legacy_source_compiler("compile_class_to_dll")
+    from src.compiler.compiler_entrypoints import CANONICAL_SOURCE_COMPILER
+    from src.compiler.fortran_c_shell import (
+        compile_fortran_module_c_shell, lower_ast_source_to_ssa,
+    )
+    from src.compiler.ssa_fortran_backend import emit_module
+
+    with warnings.catch_warnings():
+        # Loud: shown every time, whatever the caller's warning filters.
+        warnings.simplefilter("always", DeprecationWarning)
+        warnings.warn(
+            f"compile_class_to_dll is deprecated and is redirected to "
+            f"{CANONICAL_SOURCE_COMPILER} (every method of {class_name!r} "
+            "seeded, one shared self record), then Fortran emission and a "
+            "shared-library link. Call that route directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     methods = _class_method_names(source, class_name)
     if not methods:
@@ -94,11 +117,15 @@ def compile_class_to_dll(
         f"{class_name}.__init__" if "__init__" in methods else qualified[0]
     )
     seeds = tuple(name for name in qualified if name != nominal)
-    return compile_ast_fortran_c_shell(
-        source, nominal, {}, outdir, name=class_name,
-        library=True, dependency_seeds=seeds, progress=progress,
-        runtime_closure_only=True, python_package=python_package,
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, nominal, name=class_name, dependency_seeds=seeds,
+        python_package=python_package,
         extraction_contract=extraction_contract,
+        progress=progress,
+    )
+    fortran_module = emit_module(module, progress=progress)
+    return compile_fortran_module_c_shell(
+        fortran_module, {}, outdir, name=class_name, library=True,
     )
 
 
