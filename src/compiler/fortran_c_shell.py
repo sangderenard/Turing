@@ -20834,11 +20834,11 @@ def _class_surface_ssa_program(
     """
 
     from .native_code_retention import (
-        WINDOWS_AMD64_NATIVE_LINKER,
+        host_build_target,
         resolve_build_target,
     )
     resolved_build_target = resolve_build_target(
-        build_target or WINDOWS_AMD64_NATIVE_LINKER
+        build_target or host_build_target()
     )
 
     from ..transmogrifier.ssa import (
@@ -57753,7 +57753,7 @@ def _lower_ast_source_to_ssa_impl(
         activate_registered_compiler_bootstraps,
     )
     from .native_code_retention import (
-        WINDOWS_AMD64_NATIVE_LINKER,
+        host_build_target,
         resolve_build_target,
     )
 
@@ -57761,7 +57761,7 @@ def _lower_ast_source_to_ssa_impl(
     # backend/decompiler decision receives this same record; no pass is
     # allowed to reinterpret a target-name string independently.
     build_target = resolve_build_target(
-        build_target or WINDOWS_AMD64_NATIVE_LINKER
+        build_target or host_build_target()
     )
 
     compile_substage("source normalisation: activate accepted compiler versions")
