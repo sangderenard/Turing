@@ -119,6 +119,7 @@ from .hierarchical_plan import (  # noqa: E402
 )
 from .ssa_llvm_backend import _BINARY as _LIKENESS_BINARY  # noqa: E402
 from .ssa_llvm_backend import _UNARY as _LIKENESS_UNARY  # noqa: E402
+from ..transmogrifier.ssa import Function, Instr, SSAValue  # noqa: E402
 
 _BINARY = {
     "Add": lambda a, b: a + b,
@@ -427,7 +428,7 @@ class SSAReferenceEvaluator:
 
     # -- internals --------------------------------------------------------
 
-    def _execute(self, function: Any, values: dict[int, Any]) -> tuple:
+    def _execute(self, function: Function, values: dict[int, Any]) -> tuple:
         blocks = dict(function.blocks)
         order = list(blocks)
         current = order[0]
@@ -485,7 +486,7 @@ class SSAReferenceEvaluator:
         return returned
 
     @staticmethod
-    def _operation_name(instruction: Any) -> str:
+    def _operation_name(instruction: Instr) -> str:
         """The instruction's operation, resolved the way backends resolve it.
 
         Two conventions meet here and both are already established in the
@@ -516,8 +517,8 @@ class SSAReferenceEvaluator:
 
     def _step(
         self,
-        function: Any,
-        instruction: Any,
+        function: Function,
+        instruction: Instr,
         values: dict[int, Any],
         previous: str | None,
     ) -> None:
@@ -703,7 +704,7 @@ class SSAReferenceEvaluator:
             "Add it deliberately rather than letting the evaluator guess."
         )
 
-    def _call(self, instruction: Any, values: dict[int, Any]) -> None:
+    def _call(self, instruction: Instr, values: dict[int, Any]) -> None:
         if instruction.attributes.get("external_reference"):
             self._external_call(instruction, values)
             return
@@ -858,7 +859,7 @@ class SSAReferenceEvaluator:
                 returned[0] if len(returned) == 1 else list(returned)
             )
 
-    def _external_call(self, instruction: Any, values: dict[int, Any]) -> None:
+    def _external_call(self, instruction: Instr, values: dict[int, Any]) -> None:
         """Execute one SSA capability call through the physical shell records."""
 
         from .shell_external_references import (
@@ -929,7 +930,7 @@ class SSAReferenceEvaluator:
         if instruction.res is not None:
             values[int(instruction.res.id)] = result
 
-    def _value(self, values: dict[int, Any], value: Any) -> Any:
+    def _value(self, values: dict[int, Any], value: SSAValue) -> Any:
         """The stored object, address included -- no dereference."""
         key = int(value.id)
         if key in values:
@@ -939,7 +940,7 @@ class SSAReferenceEvaluator:
             "use its own definition does not dominate"
         )
 
-    def _operand(self, values: dict[int, Any], value: Any) -> Any:
+    def _operand(self, values: dict[int, Any], value: SSAValue) -> Any:
         """The stored object as an arithmetic operand, dereferenced.
 
         The repository IR does NOT insert a Load before every use of an
