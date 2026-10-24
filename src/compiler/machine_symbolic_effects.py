@@ -343,6 +343,8 @@ def symbolic_effect_for_instruction(instruction) -> MachineSymbolicEffect:
         MachineSemanticToken.VECTOR_ADD_QWORDS,
         MachineSemanticToken.VECTOR_COMPARE_EQUAL_QWORDS,
         MachineSemanticToken.VECTOR_SUBTRACT_QWORDS,
+        MachineSemanticToken.VECTOR_ADD_DWORDS,
+        MachineSemanticToken.VECTOR_SUBTRACT_DWORDS,
     }:
         read(0)
         read(1)

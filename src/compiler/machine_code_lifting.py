@@ -1806,19 +1806,20 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 raise MachineLiftError(
                     f"{source.address:#x}: malformed vector move operands"
                 )
-            width = (
-                64
-                if token is X86InstructionToken.MOVSD_XMM_XMMM64
-                else 128
-            )
+            low_qword = token in {
+                X86InstructionToken.MOVSD_XMM_XMMM64,
+                X86InstructionToken.MOVQ_XMMM64_XMM,
+            }
+            width = 64 if low_qword else 128
             moved = self.read_vector_operand(
                 operands[1], source, width=width,
             )
             self.write_vector_operand(
                 operands[0], moved, source, width=width,
                 # Legacy MOVSD changes the low scalar lane while retaining
-                # the destination's high 64 bits. Full-width moves replace it.
-                preserve_upper=(width < 128),
+                # the destination's high 64 bits; MOVQ (66 0f d6) clears
+                # them. Full-width moves replace the register.
+                preserve_upper=token is X86InstructionToken.MOVSD_XMM_XMMM64,
             )
             return
         if semantic is MachineSemanticToken.STRING_COMPARE:
@@ -2226,6 +2227,32 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 Handler.VectorCompareEqualMask, (left, right), source,
                 dtype="int128", lane_width=64, vector_width=128,
                 true_lane_mask=(1 << 64) - 1, false_lane_mask=0,
+                machine_vector_bit_pattern=True,
+            )
+            self.write_vector_operand(
+                operands[0], result, source, width=128,
+            )
+            return
+        if semantic in {
+            MachineSemanticToken.VECTOR_ADD_DWORDS,
+            MachineSemanticToken.VECTOR_SUBTRACT_DWORDS,
+        }:
+            if len(operands) != 2 or not isinstance(
+                operands[0], VectorRegisterOperand
+            ) or not isinstance(
+                operands[1], (VectorRegisterOperand, EffectiveAddressOperand)
+            ):
+                raise MachineLiftError(
+                    f"{source.address:#x}: malformed packed dword operands"
+                )
+            left = self.read_vector_operand(operands[0], source, width=128)
+            right = self.read_vector_operand(operands[1], source, width=128)
+            result = self.emit(
+                Handler.VectorAddModulo
+                if semantic is MachineSemanticToken.VECTOR_ADD_DWORDS
+                else Handler.VectorSubtractModulo,
+                (left, right), source,
+                dtype="int128", lane_width=32, vector_width=128,
                 machine_vector_bit_pattern=True,
             )
             self.write_vector_operand(
@@ -2993,7 +3020,8 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
             if len(operands) != 2 or not isinstance(
                 operands[0], (RegisterOperand, EffectiveAddressOperand)
             ) or not isinstance(
-                operands[1], (RegisterOperand, EffectiveAddressOperand)
+                operands[1],
+                (RegisterOperand, EffectiveAddressOperand, ImmediateOperand),
             ):
                 raise MachineLiftError(f"{source.address:#x}: malformed SBB operands")
             width = self.operand_width(source, 0)
