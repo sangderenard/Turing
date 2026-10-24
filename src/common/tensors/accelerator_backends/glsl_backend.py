@@ -506,6 +506,22 @@ _ARENA_BLOCK = (
     "{ uint arena[]; };"
 )
 
+# A composed shader's launch controls live in two read-only storage blocks
+# beside the arena, not in default-block uniforms: GLSL for Vulkan has no
+# loose non-opaque uniforms, and storage blocks at contiguous bindings are
+# the one resource kind every client binds the same way. The control shell
+# already reads its tables this way (TuringSlotTable/TuringDispatchExtents
+# at bindings 4 and 6); a composed shader uses the next free bindings so
+# its whole interface is set 0, bindings 0..2.
+LAUNCH_SLOT_BINDING = 1
+LAUNCH_EXTENT_BINDING = 2
+_LAUNCH_CONTROL_BLOCKS = (
+    f"layout(std430, binding = {LAUNCH_SLOT_BINDING}) readonly buffer "
+    "TuringLaunchSlots { uint u_slot[]; };",
+    f"layout(std430, binding = {LAUNCH_EXTENT_BINDING}) readonly buffer "
+    "TuringLaunchExtents { uint u_count; uint u_extent[]; };",
+)
+
 
 class _GLStorage:
     """Shared physical storage for one or more differently shaped GL views."""
@@ -1488,9 +1504,7 @@ def compose_shader(
             _SHADER_HEADER.format(local_size=local_size),
             _ARENA_BLOCK,
             "",
-            "uniform uint u_count;",
-            f"uniform uint u_extent[{max(1, len(snippets))}];",
-            f"uniform uint u_slot[{max(1, total_slots)}];",
+            *_LAUNCH_CONTROL_BLOCKS,
             *shared,
             "",
             *([*helpers, ""] if helpers else []),
@@ -6139,7 +6153,6 @@ def emit_stack_source(
 # ---------------------------------------------------------------------------
 
 _program_cache: dict[tuple[int, str], int] = {}
-_uniform_location_cache: dict[tuple[int, str], int] = {}
 _cache_stats = {
     "hits": 0,
     "misses": 0,
@@ -6937,32 +6950,13 @@ def _bind_chunk(binding: int, chunk: GLChunk) -> None:
         )
 
 
-def _uniform_uint_array(program_id: int, name: str, values) -> None:
-    """Upload one ``uniform uint[]`` by name, if the program declares it."""
-
-    from OpenGL import GL
-
-    key = (program_id, name)
-    loc = _uniform_location_cache.get(key)
-    if loc is None:
-        loc = int(GL.glGetUniformLocation(program_id, name))
-        _uniform_location_cache[key] = loc
-    values = [int(value) for value in values]
-    if loc != -1 and values:
-        GL.glUniform1uiv(
-            loc, len(values), (GL.GLuint * len(values))(*values)
-        )
-
-
 def _bind_arena(
     program_id: int, chunks, outputs, extents=None
 ) -> None:
-    """Bind the one arena and hand the shader its slot offsets and extents.
+    """Bind the one arena.
 
-    Nothing else is bound.  A value is reached by index, so the number of
-    values a shader touches no longer competes for binding points.  Each
-    composed operation also gets its own element count, because operations
-    sharing a program do not have to share an extent.
+    A value is reached by index, so the number of values a shader touches
+    no longer competes for binding points.
     """
 
     from OpenGL import GL
@@ -6971,11 +6965,58 @@ def _bind_arena(
     GL.glBindBufferBase(
         GL.GL_SHADER_STORAGE_BUFFER, ARENA_BINDING, _ARENA.buffer
     )
-    _uniform_uint_array(
-        program_id, "u_slot",
-        [chunk._offset for chunk in (*chunks, *outputs)],
+
+
+class _LaunchControlBuffers:
+    """The two small storage buffers a composed shader's controls ride in."""
+
+    __slots__ = ("slots", "extents")
+
+    def __init__(self) -> None:
+        self.slots = None
+        self.extents = None
+
+    def bind(self, slots: Sequence[int], count: int, extents: Sequence[int]) -> None:
+        """Upload and bind ``u_slot[]`` and ``u_count, u_extent[]``.
+
+        Each upload re-specifies the buffer's store, so a dispatch already
+        queued keeps reading the words it was launched with.
+        """
+
+        from OpenGL import GL
+
+        if self.slots is None:
+            self.slots = int(GL.glGenBuffers(1))
+            self.extents = int(GL.glGenBuffers(1))
+        for buffer, binding, words in (
+            (self.slots, LAUNCH_SLOT_BINDING, [int(item) for item in slots]),
+            (
+                self.extents, LAUNCH_EXTENT_BINDING,
+                [int(count), *(int(item) for item in extents)],
+            ),
+        ):
+            data = np.asarray(words or [0], dtype=np.uint32)
+            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, buffer)
+            GL.glBufferData(
+                GL.GL_SHADER_STORAGE_BUFFER, data.nbytes, data, GL.GL_STREAM_DRAW,
+            )
+            GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, binding, buffer)
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+
+
+_LAUNCH_CONTROLS = _LaunchControlBuffers()
+
+
+def _bind_launch_controls(chunks, outputs, count: int, extents) -> None:
+    """Hand a composed shader its slot offsets, launch count and extents.
+
+    Each composed operation gets its own element count, because operations
+    sharing a program do not have to share an extent.
+    """
+
+    _LAUNCH_CONTROLS.bind(
+        [chunk._offset for chunk in (*chunks, *outputs)], count, extents,
     )
-    _uniform_uint_array(program_id, "u_extent", extents or ())
 
 
 def _dispatch_many(
@@ -6990,7 +7031,8 @@ def _dispatch_many(
         return
     if not outputs:
         raise ValueError("a compute dispatch needs at least one output")
-    binding_count = 1
+    # The arena plus the two launch-control blocks.
+    binding_count = 3
     _dispatch_stats["calls"] += 1
     _dispatch_stats["work_items"] += int(plan.count)
 
@@ -7007,14 +7049,8 @@ def _dispatch_many(
     if batch is not None:
         batch.max_bindings = max(batch.max_bindings, binding_count)
         GL.glUseProgram(program_id)
-        uniform_key = (program_id, "u_count")
-        loc = _uniform_location_cache.get(uniform_key)
-        if loc is None:
-            loc = int(GL.glGetUniformLocation(program_id, "u_count"))
-            _uniform_location_cache[uniform_key] = loc
-        if loc != -1:
-            GL.glUniform1ui(loc, plan.count)
-        _bind_arena(program_id, chunks, outputs, (plan.count,))
+        _bind_arena(program_id, chunks, outputs)
+        _bind_launch_controls(chunks, outputs, plan.count, (plan.count,))
         GL.glDispatchCompute(*plan.groups)
         GL.glMemoryBarrier(
             GL.GL_SHADER_STORAGE_BARRIER_BIT
@@ -7036,15 +7072,8 @@ def _dispatch_many(
     succeeded = False
     try:
         GL.glUseProgram(program_id)
-        uniform_key = (program_id, "u_count")
-        loc = _uniform_location_cache.get(uniform_key)
-        if loc is None:
-            loc = int(GL.glGetUniformLocation(program_id, "u_count"))
-            _uniform_location_cache[uniform_key] = loc
-        if loc != -1:
-            GL.glUniform1ui(loc, plan.count)
-
-        _bind_arena(program_id, chunks, outputs, (plan.count,))
+        _bind_arena(program_id, chunks, outputs)
+        _bind_launch_controls(chunks, outputs, plan.count, (plan.count,))
 
         GL.glDispatchCompute(*plan.groups)
         # Without this the readback may observe stale memory. It is the GPU
@@ -7056,7 +7085,7 @@ def _dispatch_many(
         for output in outputs:
             output._mark_gpu_written()
 
-        for binding in range(binding_count):
+        for binding in (ARENA_BINDING, LAUNCH_SLOT_BINDING, LAUNCH_EXTENT_BINDING):
             GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, binding, 0)
         GL.glUseProgram(0)
         succeeded = True

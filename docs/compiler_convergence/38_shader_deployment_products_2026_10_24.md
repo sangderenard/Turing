@@ -52,14 +52,17 @@ the input whose extents an output takes, `extents.order` entries are
 
 ## Per emitter (observed from each emitter's own code)
 
-- **Desktop GLSL compute** (`glsl_component_backend`). One resource: the
-  std430 `Arena` of `uint` words at set 0, binding 0. Every port is a view
-  at `4 * u_slot[slot]` bytes, extent `4 * u_extent[0]` unless a static shape
+- **Desktop GLSL compute** (`glsl_component_backend`). The std430 `Arena`
+  of `uint` words at set 0, binding 0, plus two read-only std430 control
+  blocks: `TuringLaunchSlots { uint u_slot[]; }` at binding 1 and
+  `TuringLaunchExtents { uint u_count; uint u_extent[]; }` at binding 2
+  (section "Vulkan-ready arena controls" below). Every port is a view at
+  `4 * u_slot[slot]` bytes, extent `4 * u_extent[0]` unless a static shape
   was given. Controls: `u_count` and `u_extent[0]` are the element count,
-  `u_slot[i]` the arena word offset of port `i` (`_bind_arena`,
-  `_dispatch_many`). Group count: any grid covering the element count
-  (`turing_linear_gid` folds x/y/z; the `u_extent[0]` guard stops the rest).
-  The logical `backend_binding` numbers are not descriptor bindings here.
+  `u_slot[i]` the arena word offset of port `i` (`_bind_launch_controls`).
+  Group count: any grid covering the element count (`turing_linear_gid`
+  folds x/y/z; the `u_extent[0]` guard stops the rest). The logical
+  `backend_binding` numbers are not descriptor bindings here.
 - **WGSL** (`ssa_webgpu_backend`). One storage buffer per port at
   `@group(0) @binding(backend_binding)`, extent `4 * count` (times the member
   count when packed), exact groups from the launch plan, count baked as a
@@ -80,12 +83,10 @@ the input whose extents an output takes, `extents.order` entries are
 
 ## Shortfalls published (each checked, not assumed)
 
-- `vulkan-default-uniform-controls` (GLSL compute): `u_count`, `u_extent`
-  and `u_slot` are default-block uniforms. `glslangValidator` accepts the
-  source for OpenGL and refuses it with `-V`: "non-opaque uniforms outside a
-  block: not allowed when using GLSL for Vulkan". Making the arena
-  Vulkan-ready needs the controls in a uniform block or push constants,
-  which changes the GL runtime's binding code; it is not done here.
+- `vulkan-default-uniform-controls` (GLSL compute), as first published:
+  `u_count`, `u_extent` and `u_slot` were default-block uniforms, which
+  `glslangValidator -V` refuses ("non-opaque uniforms outside a block").
+  Closed by the follow-up below; the record no longer carries it.
 - `graphics-stage` (WebGL): a raster pipeline with the companion vertex
   stage, not a compute dispatch.
 - `no-component-abi` (extracted shaders).
@@ -113,8 +114,40 @@ words past the element count are untouched with an extra group dispatched.
 
 ## Open
 
-- A Vulkan-ready spelling of the GLSL arena controls.
+- The installed control shell (`compose_control_shader`) still declares
+  `uniform uint u_count` (and `u_debug_capacity`, `u_dispatch_iteration`);
+  it is not a published product yet.
 - A component ABI for extracted host shaders.
 - The precision-core compute lane (`ssa_glsl_compute_backend`) has no
   component ABI, so it has no product yet.
 - Deployable SPIR-V for array-shaped SSA values and multi-result functions.
+
+## Vulkan-ready arena controls (follow-up, 2026-10-24)
+
+`compose_shader`, the one place a composed elementwise/structural shader is
+finished, now declares its controls as read-only std430 storage blocks at
+set 0, bindings 1 and 2, the same mechanism the control shell already used
+for its tables (bindings 4 and 6). The two tables are separate so a wrong
+extent count can never shift the slot offsets. Writers changed with it:
+
+- the GL host (`_bind_launch_controls`, called from both `_dispatch_many`
+  paths) uploads `u_slot[]` and `[u_count, *u_extent]` into two small
+  buffers, re-specifying each store per dispatch so a queued dispatch keeps
+  its own words. `_bind_arena` binds only the arena, so the control shell's
+  own bindings are untouched. The dispatch now unbinds 0..2;
+- the standalone BLAS C shell (`glsl_blas_deployment`) binds the same two
+  buffers instead of calling `glUniform*`.
+
+Evidence (cloud: llvmpipe OpenGL 4.5, lavapipe Vulkan):
+
+- the GPU test set (`test_glsl_backend`, `test_glsl_fused_network`,
+  `test_glsl_jit_backend`, BLAS, shader tests and others) fails the same 28
+  names and errors the same 4 on this branch and on main; the operator tests
+  that compare against numpy pass on both;
+- the published GLSL compute product compiles with `glslangValidator` for
+  OpenGL and with `-V --target-env vulkan1.1`, and run on Vulkan from its
+  record alone (resources, control derivations, byte offsets, group rule) it
+  matches numpy bit for bit for float32 and int32 add over 777 elements, with
+  arena words past the output left untouched;
+- the BLAS shell compiles for x86_64-windows-gnu with `-Wall -Werror`. It
+  has not been run here; it needs Windows.
