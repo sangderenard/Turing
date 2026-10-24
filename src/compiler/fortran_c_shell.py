@@ -12522,6 +12522,52 @@ def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[i
     return result
 
 
+def _held_table_delete_ids(graph) -> frozenset[int]:
+    """Keyed deletes an ``if`` arm holds; every other delete runs
+    unconditionally.
+
+    A delete is held when it is an arm's ``body``/``orelse`` statement, or
+    when its branch compartment is an ``if`` arm.  ``for i in range(3): if
+    i == n: del d[2]`` records only the loop's ``body`` edge to the ``if``,
+    not the ``if``'s edge to the delete, so the edge alone missed it.
+    """
+
+    from .glsl_deployment_strategy import (
+        _branch_compartments,
+        _source_control_records,
+    )
+
+    graph_obj = graph.G
+    deletes = {
+        int(node_id): int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        if str(data.get("type") or "") == "DelItem"
+    }
+    if not deletes:
+        return frozenset()
+    memberships = _branch_compartments(graph)
+    records = _source_control_records(graph_obj)
+    held = {
+        deletes[int(parent)]
+        for _node_id, data in graph_obj.nodes(data=True)
+        for parent, role in data.get("parents") or ()
+        if str(role) in {"body", "orelse"} and int(parent) in deletes
+    }
+    held.update(
+        value_id
+        for node_id, value_id in deletes.items()
+        if any(
+            str(arm) in {"body", "orelse"}
+            and isinstance(
+                (records.get(int(owner)) or {}).get("expression"),
+                (ast.If, ast.IfExp),
+            )
+            for owner, arm in memberships.get(int(node_id), ())
+        )
+    )
+    return frozenset(held)
+
+
 def _sequence_mutation_owner_id(mutation) -> int:
     """The graph node whose authored position places this mutation.
 
@@ -26853,6 +26899,43 @@ def _class_surface_ssa_program(
                 scalar_writes=scalar_writes,
             )
             lexical_sequence_shortfalls = (*lexical_sequence_shortfalls, *scalar_write_shortfalls)
+        # Program: ``for i in range(3): if i == n: del d[2]`` then
+        # ``len(d)`` (silent lane, scratch s43/f).  Wrong record: a keyed
+        # delete an ``if`` holds owns no numerical region, so its arm was
+        # projected away and the delete rode the nearest region in value
+        # order -- after the loop, unconditionally -- and ``len(d)`` was 1
+        # for 2 (clean audit).  Rule: a held keyed delete is an authored
+        # control effect like a held append: a table-delete mutation placed
+        # in its arm (synthesized from the retained conditional when the arm
+        # has no region), so it runs exactly when and where its ``if`` does.
+        from .control_source import ControlSequenceMutation
+        held_table_delete_ids = _held_table_delete_ids(graph)
+        held_table_deletes = tuple(
+            ControlSequenceMutation(
+                sequence_value_id=int(sequence_id),
+                operator="delete",
+                argument_value_ids=(
+                    tuple(map(int, key)) if isinstance(key, tuple)
+                    else (int(key),)
+                ),
+                effect_node_id=int(effect_id),
+                argument_kind=(
+                    "table_delete_keys" if isinstance(key, tuple)
+                    else "table_delete_key"
+                ),
+            )
+            for effect_id, key, sequence_id, _storage in table_deletions
+            if int(effect_id) in held_table_delete_ids
+            and int(effect_id) in graph_obj
+            and sequence_id is not None
+            and key != ()
+        )
+        if held_table_deletes:
+            control, held_delete_shortfalls = _install_lexical_sequence_mutations(
+                control, graph, getattr(shell, "dispatch_subgraphs", ()),
+                extra_mutations=held_table_deletes,
+            )
+            lexical_sequence_shortfalls = (*lexical_sequence_shortfalls, *held_delete_shortfalls)
             # Numerical region order alone does not represent reads of mutable
             # fields. Restore authored sibling order before the dependency
             # scheduler: an early bool(field) must precede the conditional
@@ -27806,6 +27889,14 @@ def _class_surface_ssa_program(
                 table_lookups=table_lookups,
                 table_lookup_loop_owners=table_lookup_loop_owners,
                 table_lookup_defaults=table_lookup_defaults,
+                # An authored ``d[k]`` read requires its key (KeyError when
+                # absent); ``d.get`` does not.
+                table_lookup_required_ids=frozenset(
+                    int(data.get("value_id", node_id))
+                    for node_id, data in graph_obj.nodes(data=True)
+                    if str(data.get("op") or data.get("type") or "").casefold()
+                    == "indexed"
+                ),
                 table_stores=table_stores,
                 table_deletions=table_deletions,
                 # The table version each keyed delete reads (its ``base``).
@@ -27822,17 +27913,7 @@ def _class_surface_ssa_program(
                     ), None),)
                     if base is not None
                 },
-                # Keyed deletes an ``if``/loop holds as a ``body``/``orelse``
-                # statement; every other delete runs unconditionally.
-                table_deletion_held_ids=frozenset(
-                    int(graph_obj.nodes[parent].get("value_id", parent))
-                    for _node_id, data in graph_obj.nodes(data=True)
-                    for parent, role in data.get("parents") or ()
-                    if str(role) in {"body", "orelse"}
-                    and int(parent) in graph_obj
-                    and str(graph_obj.nodes[parent].get("type") or "")
-                    == "DelItem"
-                ),
+                table_deletion_held_ids=_held_table_delete_ids(graph),
                 retained_sequence_ids=retained_sequence_ids,
                 nested_sequence_ids=nested_sequence_ids,
                 nested_tensor_sequence_ids=nested_tensor_sequence_ids,

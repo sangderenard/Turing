@@ -400,6 +400,11 @@ def build(m: int) -> list[int]:
 EXTENDED4 = [
     (["o{v} = maybe_pick(n + 1, {a})", "d{v} = {{1: {b}, 2: n, 3: {c}}}", "del d{v}[2]"], "(-3 if o{v} is None else o{v} + 1) + len(d{v}) * 10"),
     (["d{v} = {{1: {a}, 2: n}}", "del d{v}[1]", "d{v}[1] = {b}"], "len(d{v}) * 10 + d{v}[1]"),
+    (["d{v} = {{1: {a}, 2: n}}", "k{v} = d{v}[n % 3] if n > {b} else d{v}[1]"], "k{v} * 10 + len(d{v})"),
+    (["d{v} = {{1: {a}, 2: n}}", "del d{v}[n % 3 + 1]"], "len(d{v}) * 10 + d{v}.get(1, {b})"),
+    (["d{v} = {{1: n, 2: {a}}}", "for i{v} in range(3):", "    if i{v} == n:", "        del d{v}[2]"], "len(d{v}) * 10 + d{v}.get(2, {b})"),
+    (["d{v} = {{1: n, 2: {a}}}", "if n > {b}:", "    del d{v}[1]"], "len(d{v}) * 10 + d{v}.get(1, {c})"),
+    (["d{v} = {{1: n, 2: {a}}}", "d{v}[1] = n + {b}", "del d{v}[2]", "d{v}[2] = {c}", "if n > {a}:", "    d{v}[4] = n"], "len(d{v}) * 1000 + d{v}[1] * 100 + d{v}[2] * 10 + d{v}.get(4, 0)"),
     (["s{v} = {{n, {a}}}", "s{v}.add({b})", "xs{v} = [{c}, n, {a}]", "ys{v} = xs{v}[-2:]"], "len(s{v}) * 100 + sum(s{v}) + ys{v}[0] * 10 + len(ys{v})"),
     (["xs{v} = [n, {a}]", "r{v} = xs{v}[0]", "swap(xs{v})"], "r{v} * 100 + head(xs{v}) * 10 + xs{v}[1]"),
     (["d{v} = {{0: n}}", "d{v}[1] = d{v}.get(0, -1) + {a}", "t{v} = 0", "for y{v} in [x{v} * n for x{v} in [{b}, 0]]:", "    t{v} += y{v}", "xs{v} = [n, {c}]", "h{v} = head(xs{v})", "swap(xs{v})"], "d{v}[1] * 10 + len(d{v}) + t{v} + h{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
