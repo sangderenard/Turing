@@ -147,7 +147,23 @@ def settle_call_result_types(functions, emit_outputs, function_values):
         for value in function_values(function).values():
             accounting = value.accounting or {}
             recorded = _recorded_type(function, value)
-            physical = (accounting.get('physical_dtype') or accounting.get('program_abi_storage')) and recorded[0] not in {None, '', 'unknown'}
+            physical_fields = _row_physical(function, value)
+            # The generated VJP's bw_matmul call result 81 has a posted
+            # rank-2 span, but its shape is still unresolved ().  Storage
+            # alone cannot make that empty shape a complete rank-3 type
+            # decision: the exact unbroadcast result later supplies (2, 2).
+            # An unstated rank does not contradict an exact scalar physical
+            # dtype (the bool incumbent test).  Only a POSTED positive rank
+            # proves that an empty shape is still missing extents.
+            complete_shape = (
+                bool(recorded[1])
+                or physical_fields.get('rank') in {None, 0}
+            )
+            physical = (
+                bool(accounting.get('physical_dtype') or accounting.get('program_abi_storage'))
+                and recorded[0] not in {None, '', 'unknown'}
+                and complete_shape
+            )
             ledger.propose((function.name, int(value.id)),
                 'physical_storage' if physical else 'provisional',
                 ('initial', recorded), after=recorded,
