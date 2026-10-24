@@ -446,6 +446,9 @@ EXTENDED4 = [
     # Corpus c390-c395: the parameter n rebound in a loop arm that never reads it.
     (["for j{v} in range({c} % 4 + 1):", "    if j{v} > 1:", "        n = j{v} * {a}"], "n"),
     # Corpus c436: an int ``round`` of a float, ties to even, read by int math.
+    # Corpus c470-c472, c480, c481: sets of runtime rows, built after their source.
+    (["xs{v} = [i{v} % 3 for i{v} in range(n % 5 + {c})]", "s{v} = {{x{v} for x{v} in xs{v}}}"], "len(s{v}) * 10 + len(set(xs{v}))"),
+    (["t{v} = {{{a}, n % 4, 1}}", "u{v} = [0, n % {a}]"], "len(t{v}) * 10 + int(any(u{v}))"),
     (["r{v} = round(n * 0.5 + {a} * 0.25)", "s{v} = 0", "for i{v} in range({c} % 3 + 1):", "    s{v} += round(i{v} * 0.5 - n * 0.75)"], "r{v} * 10 + s{v}"),
 ]
 

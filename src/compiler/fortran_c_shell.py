@@ -89,6 +89,7 @@ from .ast_control_normalization import (
     _normalize_constant_membership as _normalize_constant_membership,
     _normalize_builtin_divmod as _normalize_builtin_divmod,
     _normalize_mapping_get as _normalize_mapping_get,
+    _normalize_set_constructor as _normalize_set_constructor,
     _normalize_direct_tail_recursion as _normalize_direct_tail_recursion,
     _normalize_none_default_assignments as _normalize_none_default_assignments,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
@@ -58559,6 +58560,7 @@ def _lower_ast_source_to_ssa_impl(
     chained_comparison_receipts.extend(_normalize_constant_membership(tree))
     chained_comparison_receipts.extend(_normalize_builtin_divmod(tree))
     chained_comparison_receipts.extend(_normalize_mapping_get(tree))
+    chained_comparison_receipts.extend(_normalize_set_constructor(tree))
     short_circuit_receipts = list(_normalize_binary_short_circuit(tree))
     loop_else_receipts = list(_normalize_loop_else(tree))
     if chained_comparison_receipts:
@@ -58975,6 +58977,9 @@ def _lower_ast_source_to_ssa_impl(
         )
         chained_comparison_receipts.extend(
             _normalize_mapping_get(discovered_tree)
+        )
+        chained_comparison_receipts.extend(
+            _normalize_set_constructor(discovered_tree)
         )
         short_circuit_receipts.extend(
             _normalize_binary_short_circuit(discovered_tree)

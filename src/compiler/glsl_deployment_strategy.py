@@ -21337,6 +21337,21 @@ class _StructuralValueAlias:
     source_id: int
 
 
+def _holds_runtime_fact(value: Any, unresolved: Any) -> bool:
+    """Whether a folded container value has a runtime member anywhere."""
+
+    if value is unresolved or isinstance(value, _ProgramABIValueFact):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _holds_runtime_fact(item, unresolved)
+            for pair in value.items() for item in pair
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_holds_runtime_fact(item, unresolved) for item in value)
+    return False
+
+
 @dataclass(frozen=True)
 class _ProgramABIValueFact:
     """Declared source type attached to a physical native parameter."""
@@ -24964,6 +24979,10 @@ def _fold_callsite_structural_values(
             if node_type == "List" or isinstance(expression, ast.List):
                 return list(values)
             if node_type == "Set" or isinstance(expression, ast.Set):
+                # ``{1, 2, n}``: a runtime member may equal a literal one,
+                # so the display's members (and its length) are not known.
+                if _holds_runtime_fact(values, unresolved):
+                    return unresolved
                 return set(values)
             return tuple(values)
         if node_type in {"GetAttr", "Attribute"} or isinstance(
@@ -25556,6 +25575,18 @@ def _fold_callsite_structural_values(
                 return isinstance(values[0], accepted)
         if any(value is unresolved or isinstance(value, _ProgramABIValueFact)
                for value in values):
+            return unresolved
+        if name in {"set", "frozenset", "any", "all", "sorted", "max", "min"} and any(
+            _holds_runtime_fact(value, unresolved) for value in values
+        ):
+            # Program: ``values = [1, 2, 2, n]; len(set(values))`` (silent
+            # lane; the SSA interpreter thread's c470-c472).  Wrong record:
+            # the list's known value held ``n`` as its declared-parameter
+            # fact, ``set`` hashed that fact as one more distinct member,
+            # and ``len`` folded to 3, which is wrong when n is 1 or 2.
+            # Rule: a runtime member is not a value; dedupe, truth and
+            # order over one prove nothing.  ``len`` and ``list`` keep
+            # their count and order, which hold whatever the member is.
             return unresolved
         try:
             if name in {"bool", "int", "float"}:

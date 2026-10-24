@@ -4618,26 +4618,93 @@ def overlay_scheduled_control(
         in control.projected_iterable_bindings
         if str(projection) == "induction"
     }
+    # Program: ``values = [i % 3 for i in range(n)]; seen = {v for v in
+    # values}; len(seen)`` (silent lane; the SSA interpreter thread's
+    # c471).  Wrong record: the set comprehension's loop has no region of
+    # its own (its row is the loop target itself), so it was placed at the
+    # schedule root, ahead of the loop that fills ``values``; it read an
+    # empty list and ``len`` returned 0 for n=7, where Python gives 3.
+    # Rule: a region-less loop over a collection another loop produces runs
+    # after that producer loop.
+    def producer_control(value_id: int) -> int | None:
+        if source_graph is None:
+            return None
+        graph_view = getattr(source_graph, "G", source_graph)
+        data = graph_view.nodes.get(int(value_id)) if int(value_id) in graph_view else None
+        if data is None or str(data.get("type")) != "LoopResult":
+            return None
+        loop_node = next((
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role) == "control"
+        ), None)
+        matches = [
+            index for index, control in enumerate(controls)
+            if isinstance(control.root, LoopBlock)
+            and control.root.source_loop_node_id is not None
+            and int(control.root.source_loop_node_id) == loop_node
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    after_producer: dict[int, list[int]] = {}
+    for index, control in enumerate(controls):
+        if (
+            control.region_indices
+            or index in nested_children_overall
+            or not isinstance(control.root, LoopBlock)
+            or control.root.source_loop_node_id is None
+            or direct_children.get(index)
+            or _anchored_control(control)
+        ):
+            continue
+        producers = {
+            producer
+            for iterable, _target, _induction in control.iterable_bindings
+            for producer in (producer_control(int(iterable)),)
+            if producer is not None and producer != index
+        }
+        if len(producers) == 1:
+            after_producer.setdefault(producers.pop(), []).append(index)
+    deferred = {
+        index for indices in after_producer.values() for index in indices
+    }
+    placed: set[int] = set()
+
+    def with_dependents(index: int, block: ControlBlock) -> list[ControlBlock]:
+        """``block`` followed by the region-less loops reading its rows."""
+
+        emitted = [block]
+        for dependent in after_producer.get(index, ()):
+            if dependent in placed:
+                continue
+            placed.add(dependent)
+            emitted.extend(with_dependents(dependent, nested_root(dependent)))
+        return emitted
+
     blocks = [
-        nested_root(index)
-        for index, control in enumerate(controls)
-        if not control.region_indices
-        and index not in nested_children_overall
-        and (
-            # An effect-only guard inside an otherwise empty class surface
-            # has no scheduled region. Its declared containment edge still
-            # owns the guard and return. Materialize that owner so nested_root
-            # does not silently discard the child before callsite placement.
-            (bool(direct_children.get(index)) and not _anchored_control(control))
-            or isinstance(control.root, LoopBlock)
+        emitted
+        for index, block in (
+            (index, nested_root(index))
+            for index, control in enumerate(controls)
+            if not control.region_indices
+            and index not in nested_children_overall
+            and index not in deferred
             and (
-                bool(control.root.sequence_mutations)
-                or str(control.root.induction) in call_only_inductions
-                or control.root.source_loop_node_id is not None
+                # An effect-only guard inside an otherwise empty class surface
+                # has no scheduled region. Its declared containment edge still
+                # owns the guard and return. Materialize that owner so nested_root
+                # does not silently discard the child before callsite placement.
+                (bool(direct_children.get(index)) and not _anchored_control(control))
+                or isinstance(control.root, LoopBlock)
+                and (
+                    bool(control.root.sequence_mutations)
+                    or str(control.root.induction) in call_only_inductions
+                    or control.root.source_loop_node_id is not None
+                )
+                or isinstance(control.root, WhileBlock)
+                and bool(control.root.sequence_mutations)
             )
-            or isinstance(control.root, WhileBlock)
-            and bool(control.root.sequence_mutations)
         )
+        for emitted in with_dependents(index, block)
     ]
     # Region-less controls that declare an anchor (a guard clause whose arm
     # is only a return/call): those nested under another control were
@@ -4657,12 +4724,21 @@ def overlay_scheduled_control(
         replacement = replacements.get(region_index)
         if replacement is not None:
             blocks.append(replacement)
+            for producer in after_producer:
+                if region_index in controlled_sets[producer]:
+                    blocks.extend(with_dependents(producer, None)[1:])
         elif region_index not in covered:
             blocks.append(StatementBlock((
                 f"__scheduled_region_{region_index}__",
             )))
     for anchored_blocks in anchored_top_level.values():
         blocks.extend(anchored_blocks)
+    # A producer this schedule never embedded leaves its readers where
+    # region-less loops always went: the schedule root.
+    unplaced = [index for index in sorted(deferred) if index not in placed]
+    if unplaced:
+        placed.update(unplaced)
+        blocks[:0] = [nested_root(index) for index in unplaced]
 
     def stable_key(value):
         if isinstance(value, slice):
