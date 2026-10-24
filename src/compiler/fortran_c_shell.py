@@ -12805,17 +12805,9 @@ def _control_block_position(
         # the call's start, before the region computing its key ``i % 3``
         # (scratch c202: the lookup read the key before its definition).
         # It completes where its call ends.
-        position = node_position(int(block.source_call_node_id))
-        call = (graph_obj.nodes.get(int(block.source_call_node_id)) or {}).get(
-            "expr_obj"
-        ) if int(block.source_call_node_id) in graph_obj else None
-        if getattr(call, "end_lineno", None) is None:
-            return position
-        return max(position, (
-            int(call.end_lineno),
-            int(getattr(call, "end_col_offset", 0) or 0),
-            int(block.source_call_node_id),
-        ))
+        return _call_completion_position(
+            graph_obj, int(block.source_call_node_id), node_position,
+        )
     if isinstance(block, ResourceScopeBlock):
         return node_position(block.source_scope_id)
     if isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
@@ -12828,7 +12820,13 @@ def _control_block_position(
                 (1 << 30, 0, 0),
             )
         if line.startswith("__plan_callsite_") and line.endswith("__"):
-            return node_position(int(line[len("__plan_callsite_"):-2]))
+            # A call executes after its arguments, like a query: placed at the
+            # call's start, ``bump({0: 1, 1: 3}, n)`` ran before the member
+            # stores of the dict display it was passed, and the callee's
+            # required-key lookup refused at run time.
+            return _call_completion_position(
+                graph_obj, int(line[len("__plan_callsite_"):-2]), node_position,
+            )
     if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
         return _conditional_block_position(graph_obj, int(block.source_node_id))
     if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
@@ -12845,6 +12843,24 @@ def _control_block_position(
             for child in block.blocks
         )
     return (1 << 30, 0, 0)
+
+
+def _call_completion_position(
+    graph_obj: Any, call_id: int, node_position: Any,
+) -> tuple[int, int, int]:
+    """Authored position at which a call completes: where its call ends."""
+
+    position = node_position(int(call_id))
+    call = (graph_obj.nodes.get(int(call_id)) or {}).get(
+        "expr_obj"
+    ) if int(call_id) in graph_obj else None
+    if getattr(call, "end_lineno", None) is None:
+        return position
+    return max(position, (
+        int(call.end_lineno),
+        int(getattr(call, "end_col_offset", 0) or 0),
+        int(call_id),
+    ))
 
 
 def _loop_block_position(graph_obj: Any, node_id: int) -> tuple[int, int, int]:
