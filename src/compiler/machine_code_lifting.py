@@ -4158,6 +4158,19 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 Handler.Add, (rsp, self.constant(8, source, dtype="int64")), source,
                 dtype="int64", machine_register="RSP",
             )
+        elif token is X86InstructionToken.LEAVE:
+            # The saved RBP is read through the frame pointer itself; RSP
+            # is the frame pointer plus the popped slot.
+            frame = self.value(X86Register.RBP, source)
+            saved = self.emit(
+                Handler.Load, (self.memory, frame), source,
+                dtype="int64", machine_state="stack-pop", width=64,
+            )
+            self.registers[X86Register.RBP] = saved
+            self.registers[X86Register.RSP] = self.emit(
+                Handler.Add, (frame, self.constant(8, source, dtype="int64")), source,
+                dtype="int64", machine_register="RSP",
+            )
         elif token in {X86InstructionToken.SUB_R64_IMM8, X86InstructionToken.ADD_R64_IMM8}:
             destination, immediate = operands
             if not isinstance(destination, RegisterOperand) or not isinstance(immediate, ImmediateOperand):

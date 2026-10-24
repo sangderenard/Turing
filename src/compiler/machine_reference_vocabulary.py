@@ -407,6 +407,12 @@ class X86InstructionToken(IntEnum):
     VMOVNTDQ_M256_YMM = 311
     REP_STOSB = 312
     ENDBR64 = 313
+    OR_RM64_R64 = 314
+    OR_RM8_R8 = 315
+    SBB_RM32_R32 = 316
+    SBB_RM64_R64 = 317
+    PXOR_XMM_XMMM128 = 318
+    LEAVE = 319
 
 
 class MachineSemanticToken(IntEnum):
@@ -493,6 +499,7 @@ class MachineSemanticToken(IntEnum):
     VECTOR_SIGNED_INT32_TO_FLOAT64 = 78
     ATOMIC_INCREMENT = 79
     VECTOR_INSERT_128_LANE = 80
+    STACK_FRAME_LEAVE = 81
 
 
 class X86Register(IntEnum):
@@ -3765,6 +3772,41 @@ _X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
         b"\xaa", _decode_rep_stosb_operands, allow_rex=False,
         allowed_legacy_prefixes=frozenset({0xf3}),
         required_legacy_prefixes=frozenset({0xf3}),
+    ),
+    # Register/memory-destination forms GCC emits where MSVC chose the
+    # register-destination opcode (0b, 0a, 1b) the vocabulary already has.
+    InstructionSpec(
+        X86InstructionToken.OR_RM64_R64, MachineSemanticToken.BITWISE_OR,
+        b"\x09", _decode_binary_rm64_r64_operands,
+        allow_rex=True, allow_rex_w=True, require_rex_w=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.OR_RM8_R8, MachineSemanticToken.BITWISE_OR,
+        b"\x08", _decode_binary_rm8_r8_operands, allow_rex=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.SBB_RM32_R32,
+        MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW,
+        b"\x19", _decode_binary_rm32_r32_operands, allow_rex=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.SBB_RM64_R64,
+        MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW,
+        b"\x19", _decode_binary_rm64_r64_operands,
+        allow_rex=True, allow_rex_w=True, require_rex_w=True,
+    ),
+    # The SSE2 integer form of XORPS: the same 128 bits, a different domain.
+    InstructionSpec(
+        X86InstructionToken.PXOR_XMM_XMMM128, MachineSemanticToken.VECTOR_XOR,
+        b"\x0f\xef", _decode_vector_reg_rm_operands, allow_rex=True,
+        allowed_legacy_prefixes=frozenset({0x66}),
+        required_legacy_prefixes=frozenset({0x66}),
+    ),
+    # The frame epilogue GCC emits with frame pointers (Debian and Ubuntu
+    # CPython): RSP := RBP, then RBP := pop.
+    InstructionSpec(
+        X86InstructionToken.LEAVE, MachineSemanticToken.STACK_FRAME_LEAVE,
+        b"\xc9", _decode_no_operands, allow_rex=False,
     ),
     # CET's indirect-branch landing mark (F3 0F 1E FA), which GCC places at
     # every System V function entry and PLT stub.  It has no architectural
