@@ -120,18 +120,47 @@ class Walker:
 
 
 @pytest.mark.parametrize("name", ["notify", "trace"])
-def test_call_through_a_stored_callable_field_is_refused_by_name(
-    tmp_path, name,
-):
+def test_call_through_a_stored_callable_field_calls_the_host(tmp_path, name):
     # ``trace`` also spells a tensor operator: the unconsumed call used to be
     # pruned as a dead pure tensor call and the library shipped without it.
+    # It is now a call through the host's function pointer
+    # (tests/test_host_callback_fields.py), and it must happen.
+    import yaml
+
     source = tmp_path / "walker.py"
     source.write_text(STORED_CALLABLE.format(name=name), encoding="utf-8")
     route = run_class_route(source, "Walker", tmp_path / "out")
-    assert route["library"] is None
-    refusal = route["refusal"]
-    assert refusal is not None and refusal["type"] == "FortranEmissionError"
-    assert (
-        "call through a stored callable field with no lowered invocation: "
-        f"Walker.poke: self.{name}(n)"
-    ) in refusal["message"]
+    assert route["refusal"] is None
+    api = yaml.safe_load(
+        (tmp_path / "out" / "class_route" / "Walker.api.yaml").read_text()
+    )
+    entry = next(
+        item for item in api["entry_points"] if item["name"] == "Walker__poke"
+    )
+    calls = []
+    callback = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int64)(
+        lambda _context, value: calls.append(value)
+    )
+    values = {
+        "n": 41,
+        f"{name}.__callback_function": ctypes.cast(
+            callback, ctypes.c_void_p,
+        ).value,
+        f"{name}.__callback_context": 0,
+    }
+    result = ctypes.c_int64()
+    arguments, types = [], []
+    for parameter in entry["parameters"]:
+        if parameter["role"] == "output":
+            arguments.append(ctypes.byref(result))
+            types.append(ctypes.POINTER(ctypes.c_int64))
+        else:
+            arguments.append(values[parameter["source_name"]])
+            types.append(ctypes.c_int64)
+    library = ctypes.CDLL(
+        str(tmp_path / "out" / "class_route" / "Walker.so")
+    )
+    function = getattr(library, entry["symbol"])
+    function.argtypes = types
+    function(*arguments)
+    assert (result.value, calls) == (42, [41])
