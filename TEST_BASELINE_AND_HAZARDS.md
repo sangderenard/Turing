@@ -1,3 +1,10 @@
+2026-10-24 LANE E, E22b (MEASURED, cloud): a scheduled region with no body
+(only a post-operation fill) runs only its post-operations instead of calling
+an undefined numerical_region_N (C LOUD at main daaa83c0, c409). At 6b1204e3 (332
+programs): C 332/332, LLVM 331/332 (c367, same on main), Fortran 331 PASS
+(c22 by design). Fuzz seed 66: 0 WRONG / 0 TYPE. Gate names identical to
+main daaa83c0.
+
 2026-10-24 RECORD FIELD WRITES (MEASURED, cloud): a field read of a record
 the function constructed was folded to the constructor argument past every
 later write, so `s = S(0); if c: s.n = 1; return s.n` returned 0. c396-c399
