@@ -23912,6 +23912,7 @@ def _mutated_sequence_node_ids(
             initial = merged_attributes.get("initial_value_id")
             if (
                 merged_attributes.get("producer_kind") == "aggregate_phi"
+                and merged_attributes.get("aggregate_kind") == "list"
                 and initial is not None
                 and int(initial) in graph_obj
                 and any(
