@@ -2338,6 +2338,63 @@ def _planned_scalar_dtypes_from(
                                     ) == "loop"
                                 ):
                                     settle(scalar, int(target_id), held)
+                # Program: ``for k, w in d.items(): s += k * 10 + w`` (c337,
+                # c404, c405; lane E).  Wrong record: as with ``zip``, the
+                # tuple target's names were never typed, so both fell to the
+                # float64 default; C summed int rows through float64 (a large
+                # int value came back rounded) and Fortran refused the int64
+                # actuals for REAL(8) formals.  Rule: over ``d.items()`` the
+                # first name is a key of ``d`` (the join of its key members
+                # and its stores' indices) and the second is a row of ``d``.
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and len(loop_expression.target.elts) == 2
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and operation(zipped) == "items"
+                ):
+                    tables = parents(zipped, "operand")
+                    table = tables[0] if len(tables) == 1 else None
+                    if (
+                        table is not None
+                        and is_collection(table)
+                        and (G.nodes[table].get("attributes") or {}).get(
+                            "aggregate_kind"
+                        ) == "dict"
+                    ):
+                        keys = [
+                            scalar.get(key)
+                            for key in parents(G.nodes[table], "keys")
+                        ]
+                        for child in G.successors(table):
+                            if operation(G.nodes[child]) in {
+                                "indexedstore", "setitem",
+                            }:
+                                keys.extend(
+                                    scalar.get(index)
+                                    for index in parents(
+                                        G.nodes[child], "index",
+                                    )
+                                )
+                        held_types = (
+                            join(keys) if keys else None,
+                            element.get(table),
+                        )
+                        for item, held in zip(
+                            loop_expression.target.elts, held_types,
+                        ):
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
