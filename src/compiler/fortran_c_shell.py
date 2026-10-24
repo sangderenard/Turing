@@ -71,6 +71,7 @@ from .fortran_toolchain import (
     aggressive_c_flags,
     aggressive_fortran_flags,
     gnu_lto_flag,
+    stage_standalone_fortran_runtime,
     standalone_fortran_link_flags,
     standalone_runtime_shim_sources,
 )
@@ -9074,6 +9075,21 @@ def compile_fortran_module_c_shell(
                 runtime_dependencies.append(
                     {"name": dll_name, "path": candidate.as_posix()}
                 )
+    if standalone and compiler is not None and (
+        has_primary_fortran or any(
+            section.language == "fortran" for section in native_object_sections
+        )
+    ):
+        try:
+            staged_runtime = stage_standalone_fortran_runtime(
+                compiler, output, shared=library,
+            )
+        except ValueError as error:
+            raise FortranEmissionError(str(error)) from error
+        runtime_dependencies.extend(
+            {"name": path.name, "path": path.as_posix(), "owner": "gnu-fortran"}
+            for path in staged_runtime
+        )
     if runtime_dependencies:
         metadata = dict(api.metadata)
         metadata["runtime_dependencies"] = runtime_dependencies
@@ -9165,7 +9181,7 @@ def compile_fortran_module_c_shell(
     if uses_fortran_runtime:
         try:
             link_flags = (
-                standalone_fortran_link_flags(compiler)
+                standalone_fortran_link_flags(compiler, shared=library)
                 if standalone else (gnu_lto_flag(),)
             )
         except ValueError as error:
@@ -9184,6 +9200,10 @@ def compile_fortran_module_c_shell(
     ]
     if library and os.name == "nt":
         link_command.append("-Wl,--export-all-symbols")
+    if selected_cpython is not None and os.name != "nt":
+        # The private CPython adapter opens libpython with dlopen; glibc
+        # before 2.34 keeps it in libdl (later glibc keeps a stub libdl).
+        link_command.append("-ldl")
     if not library and _display_configuration(module, entry):
         link_command.extend(("-mwindows", "-lgdi32", "-luser32"))
     commands.append(link_command)

@@ -7572,6 +7572,7 @@ def compile_module(
     import sys
     from .fortran_toolchain import (
         aggressive_fortran_flags,
+        stage_standalone_fortran_runtime,
         standalone_fortran_link_flags,
         standalone_runtime_shim_sources,
     )
@@ -7589,8 +7590,11 @@ def compile_module(
     ))
     try:
         link_flags = (
-            standalone_fortran_link_flags(compiler) if standalone else ()
+            standalone_fortran_link_flags(compiler, shared=True)
+            if standalone else ()
         )
+        if standalone:
+            stage_standalone_fortran_runtime(compiler, workdir, shared=True)
     except ValueError as error:
         raise FortranEmissionError(str(error)) from error
     shim_sources = standalone_runtime_shim_sources(

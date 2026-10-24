@@ -30,13 +30,13 @@ def test_private_runtime_is_staged_with_manifest_and_no_site_packages(tmp_path):
 
     manifest = json.loads(staged.manifest_path.read_text(encoding="utf-8"))
     assert (staged.directory / runtime.dll.name).is_file()
-    stdlib = staged.directory / f"python{runtime.version[0]}{runtime.version[1]}.zip"
+    stdlib, library_directory, _extensions = runtime.staged_layout(staged.directory)
     with zipfile.ZipFile(stdlib) as archive:
         assert "encodings/__init__.py" in archive.namelist()
         assert not any("site-packages" in name for name in archive.namelist())
     assert manifest["requested_modules"] == ["_pickle", "yaml"]
     assert any(name.casefold() == "pyyaml" for name in manifest["installed_distributions"])
-    assert (staged.directory / "Lib" / "yaml" / "__init__.py").is_file()
+    assert (library_directory / "yaml" / "__init__.py").is_file()
     assert manifest["provenance"] == "supplied"
 
 
