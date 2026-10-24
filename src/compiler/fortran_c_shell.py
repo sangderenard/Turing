@@ -26194,16 +26194,35 @@ def _class_surface_ssa_program(
                     )
                 return (int(node.get("value_id", node_id)),)
 
-            if (
+            aggregate_root = bool(
                 root_attributes.get("producer_kind") == "aggregate"
                 and root_attributes.get("aggregate_leaf_value_ids")
-            ):
+            )
+            if aggregate_root:
                 required_root_output_value_ids.extend(
                     aggregate_leaf_ids(int(root_id))
                 )
-            required_root_output_value_ids.append(int(
-                root_data.get("value_id", root_id)
-            ))
+            # Program: ``if flag > 0: return (0, k)`` then ``return (1, 0)``
+            # (corpus c461).  Wrong record: the all-literal tail tuple was
+            # folded to one aggregate Constant, and requiring it made the
+            # control function own it as a literal output beside its own
+            # leaves: the fallthrough carried three slots against the early
+            # return's two ("return_slot[2]" unresolved).  Rule: a folded
+            # aggregate literal is its leaves, exactly like an authored
+            # aggregate root; it is not one more output.  A literal holding
+            # ``None`` is an optional member, whose return layout is not
+            # this one: ``(0, k)`` / ``(1, None)`` stays refused here
+            # rather than reaching a caller that reads another layout.
+            folded_literal = root_attributes.get("value")
+            if not (
+                aggregate_root
+                and str(root_data.get("type")) in {"Constant", "Const", "const"}
+                and isinstance(folded_literal, tuple)
+                and not any(member is None for member in folded_literal)
+            ):
+                required_root_output_value_ids.append(int(
+                    root_data.get("value_id", root_id)
+                ))
             root_value_id = int(root_data.get("value_id", root_id))
             concat_kind = next((
                 kind

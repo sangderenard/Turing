@@ -22686,8 +22686,14 @@ def _tensor_descriptor_rule(
                 _input_class_scope(graph.G),
                 int(data.get("value_id", node_id)),
             ))
+            # An authored ``int`` value is the repository's int64 (the
+            # root formal's own SSA dtype).  The loop target's ``int`` is
+            # the composer's carried index, not this value: ``[n, 0]``
+            # handed to ``use(rec)`` described ``rec[0]`` as ``int``
+            # while the caller's ``n`` was int64 -- "incompatible physical
+            # call inputs" (corpus c397).
             scalar_dtype = {
-                "builtins.int": _ARITHMETIC_LOOP_TARGET_DTYPE,
+                "builtins.int": "int64",
                 "builtins.bool": "bool",
                 "builtins.float": "float64",
             }.get(
