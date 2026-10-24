@@ -5021,6 +5021,15 @@ def _normalize_lexical_values(
     defining value; source-language ``Load`` and ``Store`` wrappers disappear.
     """
 
+    # The module a bare name in this definition resolves in first
+    # (``FunctionTable.lexical_reference``): ``re.compile``'s ``_compile``
+    # is ``re._compile``, never ``re._compiler._compile``.
+    statement_identity = getattr(statement, "_python_source_identity", None)
+    statement_module = (
+        str(statement_identity[0])
+        if isinstance(statement_identity, tuple) and len(statement_identity) == 2
+        else None
+    )
     graph = function_graph
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
@@ -8102,7 +8111,9 @@ def _normalize_lexical_values(
                 static_value = static_bindings.get(expression.id)
                 function_reference = (
                     (lexical_function_bindings or {}).get(expression.id)
-                    or function_table.lexical_reference(expression.id)
+                    or function_table.lexical_reference(
+                        expression.id, module=statement_module,
+                    )
                 )
                 if (
                     producer_id is None
