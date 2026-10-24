@@ -956,6 +956,13 @@ class CModuleArtifact:
     shortfalls: tuple[CEmissionShortfall, ...]
     buffer_shapes: tuple[tuple[int, ...], ...] = ()
     extent_order: tuple[tuple[int, str, int | None], ...] = ()
+    #: ``(output id, input id)``: a runtime-sized result whose extents are
+    #: that public input's, axis for axis.  The caller allocates it so.
+    output_extent_sources: tuple[tuple[int, int], ...] = ()
+    #: Per public buffer: its rank (independent of any static shape) and its
+    #: role (input / output / inout / other).  Read by ``runtime_abi``.
+    buffer_ranks: tuple[int, ...] = ()
+    buffer_roles: tuple[str, ...] = ()
     #: True when any emitted instruction belonged to a precision section.
     #: Carried on the artifact because the refusal it gates happens at
     #: COMPILE time, where the instructions are no longer visible.
@@ -996,6 +1003,27 @@ class CModuleArtifact:
     @property
     def complete(self) -> bool:
         return not self.shortfalls
+
+    def runtime_abi(self) -> dict[str, Any]:
+        """The buffer/extent calling contract (``runtime_abi``), as data."""
+
+        from .runtime_abi import runtime_abi_description
+
+        return runtime_abi_description(
+            entry=self.name, backend="c", extent_type="int64_t",
+            buffer_order=self.buffer_order, buffer_dtypes=self.buffer_dtypes,
+            buffer_shapes=self.buffer_shapes or tuple(
+                () for _ in self.buffer_order
+            ),
+            buffer_ranks=self.buffer_ranks or tuple(
+                len(tuple(shape or ())) for shape in self.buffer_shapes
+            ),
+            buffer_roles=self.buffer_roles or tuple(
+                "other" for _ in self.buffer_order
+            ),
+            extent_order=self.extent_order,
+            output_extent_sources=self.output_extent_sources,
+        )
 
     def write_layout_header(
         self, directory: str | Path,
@@ -1217,6 +1245,16 @@ class CModuleArtifact:
         }
         buffers: dict[int, Any] = {}
         shapes = self.buffer_shapes or tuple(() for _ in self.buffer_order)
+        for output_id, source_id in self.output_extent_sources:
+            if int(output_id) in shape_overrides:
+                continue
+            source = feed_values.get(int(source_id))
+            if source is None:
+                raise ValueError(
+                    f"runtime-sized result {output_id} takes its extents "
+                    f"from input {source_id}, which was not fed"
+                )
+            shape_overrides[int(output_id)] = tuple(np.shape(source))
         for value_id, dtype, shape in zip(
             self.buffer_order, self.buffer_dtypes, shapes
         ):
@@ -2164,6 +2202,12 @@ def emit_ssa_module_to_c(
             ) and instruction.args:
                 current = (owner_name, int(instruction.args[0].id))
                 continue
+            extent_operand = _elementwise_extent_operand(instruction)
+            if extent_operand is not None:
+                # A runtime-sized elementwise result takes its extent
+                # operand's extents (the planner's elementwise law).
+                current = (owner_name, int(extent_operand.id))
+                continue
             if (
                 (operation == "binary_double" or callee == "binary_double")
                 and len(instruction.args) >= 2
@@ -2242,8 +2286,10 @@ def emit_ssa_module_to_c(
 
     # Copy the working LLVM lane's extent ABI: only functions that consume
     # dynamic extents, and callers on paths to them, receive the hidden slot.
-    from .hierarchical_plan import is_predicate_operation
-    from .ssa_llvm_backend import _declared_span_rank, scalar_likeness
+    from .ssa_llvm_backend import (
+        _declared_span_rank, _elementwise_extent_operand, _runtime_sized_span,
+        scalar_likeness,
+    )
 
     extent_users: set[str] = {
         owner for owner in reachable
@@ -2258,8 +2304,9 @@ def emit_ssa_module_to_c(
         for instruction in block.instrs
         if instruction.res is not None
         and _declared_span_rank(instruction.res) > 0
-        and scalar_likeness(str(instruction.op)) is not None
-        and not is_predicate_operation(instruction.op)
+        and scalar_likeness(TENSOR_OPERATION_SCALAR_SPELLING.get(
+            str(instruction.op).casefold(), str(instruction.op),
+        )) is not None
     )
 
     def _extent_needs_runtime(owner: str, instruction) -> bool:
@@ -2402,6 +2449,16 @@ def emit_ssa_module_to_c(
             name = f"frame_storage_{len(frame_allocations)}"
             frame_allocations.append((
                 element_type, name, max(1, int(count)),
+            ))
+            return name
+
+        def runtime_activation_array(element_type: str, count: str) -> str:
+            """Owned C storage whose element count is read at run time."""
+
+            name = f"frame_storage_{len(frame_allocations)}"
+            frame_allocations.append((
+                element_type, name,
+                f"((size_t)({count}) > 0 ? (size_t)({count}) : 1)",
             ))
             return name
 
@@ -3016,6 +3073,161 @@ def emit_ssa_module_to_c(
             return held
 
         formals_by_id = {int(value.id): value for value in function.args}
+
+        def emit_elementwise_span(instruction, op: str) -> None:
+            nonlocal needs_validation_runtime
+            result = instruction.res
+            result_id = int(result.id)
+            result_type = buffer_type(result)
+            static = tuple(result.shape or ())
+            if static and not all(isinstance(item, int) for item in static):
+                shortfalls.append(CEmissionShortfall(
+                    op, f"elementwise {op} over symbolic shape {static!r} in {fn}",
+                ))
+                return
+            if static:
+                count = str(math.prod(static))
+            else:
+                slot = extent_slot(fn, result_id, "element_count", None)
+                if slot is None:
+                    shortfalls.append(CEmissionShortfall(
+                        op, f"elementwise {op} over runtime-sized %t{result_id} "
+                        f"has no public storage origin in {fn}",
+                    ))
+                    return
+                count = f"extents[{slot}]"
+            index = f"ew_i_{result_id}"
+            elements: list[str] = []
+            checks: list[str] = []
+            for argument in instruction.args:
+                shape = tuple(argument.shape or ())
+                if _declared_span_rank(argument) == 0 and not shape:
+                    held = scalar_operand(argument)
+                    if held is None:
+                        return
+                    elements.append(f"({held})")
+                    continue
+                if static:
+                    if shape != static:
+                        shortfalls.append(CEmissionShortfall(
+                            op, f"elementwise {op} broadcasts {shape!r} to "
+                            f"{static!r}; C spells only equal extents in {fn}",
+                        ))
+                        return
+                elif not _runtime_sized_span(argument) or (
+                    _declared_span_rank(argument) != _declared_span_rank(result)
+                ):
+                    shortfalls.append(CEmissionShortfall(
+                        op, f"elementwise {op} mixes runtime-sized %t{result_id} "
+                        f"with operand %t{argument.id} of shape {shape!r} in {fn}",
+                    ))
+                    return
+                else:
+                    # Axis by axis: equal element counts over different
+                    # extents ((2, 3) against (3, 2)) are a broadcast error
+                    # in Python, not a flat elementwise walk.
+                    for axis in range(_declared_span_rank(result)):
+                        operand_slot = extent_slot(
+                            fn, int(argument.id), "dim", axis,
+                        )
+                        result_slot = extent_slot(fn, result_id, "dim", axis)
+                        if operand_slot is None or result_slot is None:
+                            shortfalls.append(CEmissionShortfall(
+                                op, f"runtime-sized operand %t{argument.id} "
+                                f"has no public storage origin in {fn}",
+                            ))
+                            return
+                        if operand_slot != result_slot:
+                            checks.append(
+                                f"extents[{operand_slot}] != "
+                                f"extents[{result_slot}]"
+                            )
+                source = address_operand(argument)
+                if source is None:
+                    return
+                elements.append(
+                    f"((const {buffer_type(argument)} *)({source}))[{index}]"
+                )
+            integral = all(map(is_integer, instruction.args))
+            # The graph's own spellings (``neg``, ``abs``) are the same
+            # operations as the tables' capitalized keys.
+            op = next((
+                key for table in (
+                    _BINARY, _C_COMPARISONS, _FLOORED, _UNARY,
+                    {"Max": None, "Min": None, "Pow": None},
+                )
+                for key in table if key.casefold() == op.casefold()
+            ), op)
+            if op in _BINARY and len(elements) == 2:
+                if op == "Div" and not _is_integer_dtype(result.dtype):
+                    expression = (
+                        f"((double){elements[0]} / (double){elements[1]})"
+                    )
+                elif integral and op in {"Add", "Sub", "Mul"}:
+                    unsigned = _unsigned_c_type(result.dtype)
+                    expression = (
+                        f"({result_type})(({unsigned}){elements[0]} "
+                        f"{_BINARY[op]} ({unsigned}){elements[1]})"
+                    )
+                else:
+                    expression = f"({elements[0]} {_BINARY[op]} {elements[1]})"
+            elif op in _C_COMPARISONS and len(elements) == 2:
+                expression = (
+                    f"({elements[0]} {_C_COMPARISONS[op]} {elements[1]})"
+                )
+            elif op in _FLOORED and len(elements) == 2:
+                helper = _FLOORED[op][0 if integral else 1]
+                expression = f"{helper}({elements[0]}, {elements[1]})"
+            elif op in {"Max", "Min"} and len(elements) == 2:
+                comparison = ">" if op == "Max" else "<"
+                expression = (
+                    f"(({elements[0]}) {comparison} ({elements[1]}) "
+                    f"? ({elements[0]}) : ({elements[1]}))"
+                )
+            elif op == "Pow" and len(elements) == 2 and not integral:
+                expression = f"pow({elements[0]}, {elements[1]})"
+            elif op == "Neg" and len(elements) == 1:
+                expression = f"(-{elements[0]})"
+            elif (
+                op in _UNARY and _UNARY[op] is not None
+                and len(elements) == 1 and not integral
+            ):
+                expression = f"{_UNARY[op]}({elements[0]})"
+            else:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"elementwise {op} over a span has no C loop "
+                    f"spelling in {fn}",
+                ))
+                return
+            destination = output_destinations.get(result_id)
+            if destination is None or result_id in formals_by_id:
+                destination = (
+                    activation_array(result_type, int(count)) if static
+                    else runtime_activation_array(result_type, count)
+                )
+            loop = (
+                f"for (ptrdiff_t {index} = 0; {index} < (ptrdiff_t)({count}); "
+                f"++{index}) (({result_type} *)({destination}))[{index}] = "
+                f"({result_type})({expression});"
+            )
+            if checks:
+                prototype = "void turing_validation_error(uint32_t error_code);"
+                if prototype not in prototypes:
+                    prototypes.append(prototype)
+                needs_validation_runtime = True
+                # A runtime broadcast is not stated by the planner's law:
+                # disagreeing extents raise (77), never read past a buffer.
+                body.append(
+                    f"        if ({' || '.join(checks)}) "
+                    f"turing_validation_error(77u); else {loop}"
+                )
+            else:
+                body.append(f"        {loop}")
+            expressions[result_id] = destination
+            addresses[result_id] = destination
+            object_expressions[id(result)] = destination
+            object_addresses[id(result)] = destination
+            address_buffer_types[result_id] = result_type
 
         def heap_element(value) -> str | None:
             """Element layout of a heap arena pointer CELL, else None.
@@ -5300,6 +5512,28 @@ def emit_ssa_module_to_c(
                     object_addresses[id(instruction.res)] = f"t{result_id}"
                     heap_allocation_ids.add(result_id)
                     continue
+                span_op = TENSOR_OPERATION_SCALAR_SPELLING.get(
+                    op.casefold(), op,
+                )
+                if (
+                    scalar_likeness(span_op) is not None
+                    and (
+                        _declared_span_rank(instruction.res) > 0
+                        or tuple(instruction.res.shape or ())
+                    )
+                ):
+                    # Program: ``def f(x, y): return x * y`` with x, y spans,
+                    # declared ``shape: [4]`` or rank-only.  Wrong spelling:
+                    # the scalar arm below declared ``const double t2 =
+                    # *x * *y`` -- element 0 -- and never wrote the span, so
+                    # (4,) returned zeros and the rank-only program one
+                    # number, both reported complete.  Rule: an elementwise
+                    # operation whose result is a span is a loop over that
+                    # span's elements (as in the LLVM lane), sized by its
+                    # static shape or its runtime extents; any form this arm
+                    # cannot spell is refused by name.
+                    emit_elementwise_span(instruction, span_op)
+                    continue
                 args = [scalar_operand(value) for value in instruction.args]
                 if any(value is None for value in args):
                     continue
@@ -5967,6 +6201,7 @@ def emit_ssa_module_to_c(
     storage_requirements = function_storage_requirements(module, function_name)
     buffer_order: list[int] = []
     buffer_shapes: list[tuple[int, ...]] = []
+    output_extent_sources: list[tuple[int, int]] = []
     buffer_dtypes: list[str] = []
     entry_lines: list[str] = []
     root_allocations: list[tuple[str, str, int]] = []
@@ -6160,6 +6395,28 @@ def emit_ssa_module_to_c(
         if output_id in buffer_order:
             rendered_actuals.append(f"b{buffer_order.index(output_id)}")
             continue
+        if _runtime_sized_span(output):
+            # A runtime-sized public result is allocated from the public
+            # input whose extents it takes (``output_extent_sources``),
+            # followed from the call-result hop through the shape edges.
+            # One with no such input is refused, never sized one element.
+            hop = (output.accounting or {}).get("ssa_call_result_from")
+            origin = (
+                None if not hop
+                else resolve_span_origin(str(hop[0]), int(hop[1]))
+            )
+            if (
+                origin is None or origin[0] != "public"
+                or int(origin[1]) not in buffer_order
+                or int(origin[1]) not in root_formal_ids
+            ):
+                shortfalls.append(CEmissionShortfall(
+                    "Ret", f"runtime-sized result %t{output_id} takes its "
+                    "extents from no public input; refusing to size it as "
+                    "one element",
+                ))
+            else:
+                output_extent_sources.append((output_id, int(origin[1])))
         buffer_order.append(output_id)
         buffer_shapes.append(tuple(
             storage_requirements.get(output_id).shape
@@ -6457,6 +6714,12 @@ def emit_ssa_module_to_c(
         buffer_shapes=buffer_shapes, buffer_order_cell=buffer_order_cell,
         unit_cells=(wrapper_header_unit, *formal_units), stage=EMISSION_C,
     )
+    from .runtime_abi import public_buffer_contract
+
+    public_ranks, public_roles = public_buffer_contract(
+        buffer_order, root.args, native_outputs[function_name],
+        _declared_span_rank,
+    )
     return CModuleArtifact(
         external_slots=external_slot_rows(module, slot_functions),
         linked_llvm=tuple(linked_llvm),
@@ -6470,6 +6733,9 @@ def emit_ssa_module_to_c(
         shortfalls=tuple(shortfalls),
         buffer_shapes=tuple(buffer_shapes),
         extent_order=tuple(extent_order),
+        output_extent_sources=tuple(output_extent_sources),
+        buffer_ranks=public_ranks,
+        buffer_roles=public_roles,
         precision_sections=precision_present,
         pool_required=bool(pooled_regions) or effect_guard_used[0],
         pooled_regions=tuple(pooled_regions),

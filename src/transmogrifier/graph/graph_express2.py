@@ -40,6 +40,7 @@ from .python_special_cases import (
     python_dispatch_entry_expressions,
 )
 from .python_identity_programs import resolve_python_identity
+from .closure_values import lower_returned_closures
 from ...common.tensors.operator_catalog import (
     include_ast_parent_outside_abstract_tensor,
 )
@@ -858,10 +859,17 @@ def _source_ast_definition(value):
         source = textwrap.dedent(inspect.getsource(value))
     except (OSError, TypeError):
         return None
-    parsed = ast.parse(
-        source,
-        filename=str(inspect.getsourcefile(value) or "<resolved-parent>"),
-    )
+    try:
+        parsed = ast.parse(
+            source,
+            filename=str(inspect.getsourcefile(value) or "<resolved-parent>"),
+        )
+    except SyntaxError:
+        # ``re.PatternError`` is defined in ``re/_constants.py`` but names
+        # ``re`` as its module, so ``inspect`` returns lines of the wrong file
+        # (AbstractTensor discovery raised here).  Lines that do not parse
+        # are not the definition: its source is unavailable, as above.
+        return None
     definition = next(
         (
             statement
@@ -6300,6 +6308,11 @@ class ProcessGraph(TiledObject):
         tree = _lower_consumed_generator_loops(tree)
         tree = dissolve_spans(tree)
 
+        if not resolve_unresolved_parents:
+            # Without pursuit the tree already holds every definition; a
+            # returned closure becomes a capture record before spans and
+            # pursuit activity are stamped (closure_values.py).
+            self._closure_value_receipts = lower_returned_closures(tree)
         parent_links = ()
         unresolved_calls = ()
         self._graph_profile_verbose = bool(profile_verbose) or bool(
@@ -6369,6 +6382,10 @@ class ProcessGraph(TiledObject):
             # construction would leave a false control-divergence ``With``.
             tree = lower_python_shell_file_contexts(tree)
             tree = lower_python_threading(tree)
+            # Pursuit has gathered every definition that can name a
+            # closure-returning function, so the whole-tree conversion sees
+            # all of its call sites (closure_values.py).
+            self._closure_value_receipts = lower_returned_closures(tree)
             dispatch_operations = tuple(getattr(tree, "_turing_dispatch_operations", ()))
             if dispatch_operations:
                 self.G.graph["dispatch_operations"] = dispatch_operations

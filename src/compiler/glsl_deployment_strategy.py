@@ -21314,6 +21314,13 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "bitwise_and", "bitwise_or", "bitwise_xor",
 })
 
+#: The elementwise binary operations whose result is a truth value.
+_ELEMENTWISE_PREDICATE_OPERATIONS = frozenset({
+    "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
+    "eq", "ne", "lt", "le", "gt", "ge",
+    "logical_and", "logical_or", "logical_xor",
+})
+
 
 def _deepest_fact(page: Any, row: Any) -> Any:
     """The fact recorded at the deepest causal position for this row."""
@@ -21348,6 +21355,29 @@ def descriptor_states_a_shape(descriptor: Any) -> bool:
     return bool(shape) or str(
         descriptor.get("dtype") or "unknown"
     ) != "unknown"
+
+
+def _runtime_sized_descriptor(descriptor: Any) -> bool:
+    """True when a descriptor states a rank but no extents: a runtime-sized
+    span (``storage: span, rank: N`` with no ``shape``), whose extents arrive
+    with the call.  It is neither a rank-0 scalar nor an unsettled query."""
+
+    return bool(
+        isinstance(descriptor, Mapping)
+        and not tuple(descriptor.get("shape") or ())
+        and int(descriptor.get("rank", 0) or 0) > 0
+        and str(descriptor.get("metadata_state") or "") == "dynamic"
+    )
+
+
+def _elementwise_operands(data: Mapping) -> tuple[int, ...]:
+    return tuple(
+        int(parent)
+        for parent, role in data.get("parents") or ()
+        if str(role).casefold() in {
+            "lhs", "rhs", "left", "right", "operand", "value", "other",
+        }
+    )
 
 
 #: The dtype a ``range`` loop target carries.  Python's ``range`` yields
@@ -22247,6 +22277,21 @@ def _tensor_descriptor_rule(
         # resulting exact shape in the concordance below.
         provisional_tensor = dict(tensor)
         tensor = {}
+    elif (
+        descriptor_operation in _ELEMENTWISE_BINARY_OPERATIONS
+        and not tuple(tensor.get("shape") or ())
+        and any(
+            _runtime_sized_descriptor(_tensor_descriptor(graph, operand, seen))
+            for operand in _elementwise_operands(data)
+            if operand in graph.G
+        )
+    ):
+        # The graph domain's scalar default (shape ()) predates the
+        # declaration that an operand is a runtime-sized span.  Re-derive
+        # from the operands; the elementwise law below states the runtime
+        # rank, or an unsettled descriptor, never the scalar default.
+        provisional_tensor = dict(tensor)
+        tensor = {}
     elif tensor.get("metadata_state") == "dynamic" or (
         descriptor_operation == "tensor"
     ) or (
@@ -22641,8 +22686,14 @@ def _tensor_descriptor_rule(
                 _input_class_scope(graph.G),
                 int(data.get("value_id", node_id)),
             ))
+            # An authored ``int`` value is the repository's int64 (the
+            # root formal's own SSA dtype).  The loop target's ``int`` is
+            # the composer's carried index, not this value: ``[n, 0]``
+            # handed to ``use(rec)`` described ``rec[0]`` as ``int``
+            # while the caller's ``n`` was int64 -- "incompatible physical
+            # call inputs" (corpus c465).
             scalar_dtype = {
-                "builtins.int": _ARITHMETIC_LOOP_TARGET_DTYPE,
+                "builtins.int": "int64",
                 "builtins.bool": "bool",
                 "builtins.float": "float64",
             }.get(
@@ -23036,6 +23087,10 @@ def _tensor_descriptor_rule(
                 for index, (side, operand) in enumerate(zip(sides, operands)):
                     if side is None or tuple(side.get("shape") or ()):
                         continue
+                    if _runtime_sized_descriptor(side):
+                        # A declared rank with runtime extents is settled:
+                        # its extents are the call's, not still unknown.
+                        continue
                     node = graph.G.nodes[operand]
                     attributes = node.get("attributes") or {}
                     semantic_operand = str(
@@ -23082,12 +23137,7 @@ def _tensor_descriptor_rule(
                     if broadcast is not None:
                         dtype = (
                             "bool"
-                            if operation in {
-                                "equal", "not_equal", "less", "less_equal",
-                                "greater", "greater_equal", "eq", "ne", "lt",
-                                "le", "gt", "ge", "logical_and", "logical_or",
-                                "logical_xor",
-                            }
+                            if operation in _ELEMENTWISE_PREDICATE_OPERATIONS
                             else str(np.result_type(*(
                                 np.dtype(str(side.get("dtype")))
                                 for side in _promoting_sides(
@@ -23102,6 +23152,68 @@ def _tensor_descriptor_rule(
                             "dtype": dtype,
                             "rank": len(broadcast),
                         }
+                # Program: ``def f(x, y): return x * y`` with x and y
+                # declared ``storage: span, rank: 1`` and no ``shape``.
+                # Wrong record: both operands answered a dynamic rank-1
+                # descriptor, neither states extents, so the law above
+                # declined and the node's provisional graph-domain default
+                # (shape (), rank 0) answered instead -- a scalar multiply of
+                # element 0 on every backend, reported complete.  Rule: a
+                # rank-known runtime-sized operand is a fact about RANK.  When
+                # every side is either such a span of one rank R or a stated
+                # rank-0 scalar, the result is a runtime-sized rank-R span
+                # whose extents are its span operands' (the transformation
+                # edges posted below record which).  Mixed static and runtime
+                # extents, or runtime spans of different ranks, would need a
+                # runtime broadcast law this pass does not state: those answer
+                # an unsettled descriptor, never the scalar default.
+                runtime_sized = _runtime_sized_descriptor
+                if any(runtime_sized(side) for side in sides):
+                    ranks = {
+                        int(side["rank"]) for side in sides
+                        if runtime_sized(side)
+                    }
+                    scalar_sides = all(
+                        runtime_sized(side)
+                        or (
+                            side is not None
+                            and descriptor_states_a_shape(side)
+                            and not tuple(side.get("shape") or ())
+                        )
+                        for side in sides
+                    )
+                    known_dtypes = tuple(
+                        np.dtype(str(side.get("dtype")))
+                        for side in (
+                            _promoting_sides(graph, operands, sides)
+                            if scalar_sides else ()
+                        )
+                        if str(side.get("dtype") or "unknown") != "unknown"
+                    )
+                    dtype = (
+                        "bool"
+                        if operation in _ELEMENTWISE_PREDICATE_OPERATIONS
+                        else str(np.result_type(*known_dtypes))
+                        if known_dtypes else "unknown"
+                    )
+                    if len(ranks) == 1 and scalar_sides:
+                        return {
+                            "shape": (),
+                            "dtype": dtype,
+                            "rank": next(iter(ranks)),
+                            "metadata_state": "dynamic",
+                        }
+                    return {
+                        "shape": (),
+                        "dtype": "unknown",
+                        "rank": max(
+                            max(ranks),
+                            *(len(tuple(side.get("shape") or ()))
+                              for side in sides if side is not None),
+                        ),
+                        "metadata_state": "dynamic",
+                        "unsettled_broadcast": True,
+                    }
         if operation in {"zeros", "ones", "empty", "full"}:
             shape_source = next((
                 int(parent)

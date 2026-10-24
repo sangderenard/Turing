@@ -12522,6 +12522,52 @@ def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[i
     return result
 
 
+def _held_table_delete_ids(graph) -> frozenset[int]:
+    """Keyed deletes an ``if`` arm holds; every other delete runs
+    unconditionally.
+
+    A delete is held when it is an arm's ``body``/``orelse`` statement, or
+    when its branch compartment is an ``if`` arm.  ``for i in range(3): if
+    i == n: del d[2]`` records only the loop's ``body`` edge to the ``if``,
+    not the ``if``'s edge to the delete, so the edge alone missed it.
+    """
+
+    from .glsl_deployment_strategy import (
+        _branch_compartments,
+        _source_control_records,
+    )
+
+    graph_obj = graph.G
+    deletes = {
+        int(node_id): int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        if str(data.get("type") or "") == "DelItem"
+    }
+    if not deletes:
+        return frozenset()
+    memberships = _branch_compartments(graph)
+    records = _source_control_records(graph_obj)
+    held = {
+        deletes[int(parent)]
+        for _node_id, data in graph_obj.nodes(data=True)
+        for parent, role in data.get("parents") or ()
+        if str(role) in {"body", "orelse"} and int(parent) in deletes
+    }
+    held.update(
+        value_id
+        for node_id, value_id in deletes.items()
+        if any(
+            str(arm) in {"body", "orelse"}
+            and isinstance(
+                (records.get(int(owner)) or {}).get("expression"),
+                (ast.If, ast.IfExp),
+            )
+            for owner, arm in memberships.get(int(node_id), ())
+        )
+    )
+    return frozenset(held)
+
+
 def _sequence_mutation_owner_id(mutation) -> int:
     """The graph node whose authored position places this mutation.
 
@@ -22832,6 +22878,28 @@ def _class_surface_ssa_program(
                     id(caller_graph), int(planned_call.callsite_id),
                     int(caller_id),
                 ))
+                # One row per EDGE.  A formal legitimately has many callers;
+                # putting them on one row made a normal fan-in look like a
+                # value changing its mind.  Program: ``g = make(n); g(3)``
+                # (a returned closure).  Wrong record: this post sat in the
+                # actual-argument loop below, reading the last binding's ids
+                # (one edge posted once per actual) and raising
+                # UnboundLocalError for a call with no bindings.  Rule: the
+                # row is posted per binding.
+                edge_row = (
+                    str(callee_graph.graph.get("function_name")),
+                    int(callee_id),
+                    str(caller_graph.graph.get("function_name")),
+                    int(caller_id),
+                )
+                _frame_post(
+                    _CALL_EDGE, edge_row, "argument",
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    cells=(
+                        _frame_graph_cell(caller_graph, int(caller_id)),
+                        _frame_graph_cell(callee_graph, int(callee_id)),
+                    ),
+                )
             # An aggregate bound by its members (``_aggregate_binds_by_member``:
             # neither side mutates it) reaches the callee as values; the call
             # cannot grow it, so it is an exact, non-growing site as well.
@@ -22855,23 +22923,6 @@ def _class_surface_ssa_program(
                         id(caller_graph), int(planned_call.callsite_id),
                         int(actual_id),
                     ))
-                # One row per EDGE.  A formal legitimately has many callers;
-                # putting them on one row made a normal fan-in look like a
-                # value changing its mind.
-                edge_row = (
-                    str(callee_graph.graph.get("function_name")),
-                    int(callee_id),
-                    str(caller_graph.graph.get("function_name")),
-                    int(caller_id),
-                )
-                _frame_post(
-                    _CALL_EDGE, edge_row, "argument",
-                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
-                    cells=(
-                        _frame_graph_cell(caller_graph, int(caller_id)),
-                        _frame_graph_cell(callee_graph, int(callee_id)),
-                    ),
-                )
             # Results carry the same exact value contract in the opposite
             # direction.  Keeping them in this fixed point lets a shaped
             # callee return feed the next call before either caller partitions
@@ -26189,16 +26240,29 @@ def _class_surface_ssa_program(
                     )
                 return (int(node.get("value_id", node_id)),)
 
-            if (
+            aggregate_root = bool(
                 root_attributes.get("producer_kind") == "aggregate"
                 and root_attributes.get("aggregate_leaf_value_ids")
-            ):
+            )
+            if aggregate_root:
                 required_root_output_value_ids.extend(
                     aggregate_leaf_ids(int(root_id))
                 )
-            required_root_output_value_ids.append(int(
-                root_data.get("value_id", root_id)
-            ))
+            # Program: ``if flag > 0: return (0, k)`` then ``return (1, 0)``
+            # (corpus c461).  Wrong record: the all-literal tail tuple was
+            # folded to one aggregate Constant, and requiring it made the
+            # control function own it as a literal output beside its own
+            # leaves: the fallthrough carried three slots against the early
+            # return's two ("return_slot[2]" unresolved).  Rule: a folded
+            # aggregate literal is its leaves, exactly like an authored
+            # aggregate root; it is not one more output.
+            if not (
+                aggregate_root
+                and str(root_data.get("type")) in {"Constant", "Const", "const"}
+            ):
+                required_root_output_value_ids.append(int(
+                    root_data.get("value_id", root_id)
+                ))
             root_value_id = int(root_data.get("value_id", root_id))
             concat_kind = next((
                 kind
@@ -26835,6 +26899,43 @@ def _class_surface_ssa_program(
                 scalar_writes=scalar_writes,
             )
             lexical_sequence_shortfalls = (*lexical_sequence_shortfalls, *scalar_write_shortfalls)
+        # Program: ``for i in range(3): if i == n: del d[2]`` then
+        # ``len(d)`` (silent lane, scratch s43/f).  Wrong record: a keyed
+        # delete an ``if`` holds owns no numerical region, so its arm was
+        # projected away and the delete rode the nearest region in value
+        # order -- after the loop, unconditionally -- and ``len(d)`` was 1
+        # for 2 (clean audit).  Rule: a held keyed delete is an authored
+        # control effect like a held append: a table-delete mutation placed
+        # in its arm (synthesized from the retained conditional when the arm
+        # has no region), so it runs exactly when and where its ``if`` does.
+        from .control_source import ControlSequenceMutation
+        held_table_delete_ids = _held_table_delete_ids(graph)
+        held_table_deletes = tuple(
+            ControlSequenceMutation(
+                sequence_value_id=int(sequence_id),
+                operator="delete",
+                argument_value_ids=(
+                    tuple(map(int, key)) if isinstance(key, tuple)
+                    else (int(key),)
+                ),
+                effect_node_id=int(effect_id),
+                argument_kind=(
+                    "table_delete_keys" if isinstance(key, tuple)
+                    else "table_delete_key"
+                ),
+            )
+            for effect_id, key, sequence_id, _storage in table_deletions
+            if int(effect_id) in held_table_delete_ids
+            and int(effect_id) in graph_obj
+            and sequence_id is not None
+            and key != ()
+        )
+        if held_table_deletes:
+            control, held_delete_shortfalls = _install_lexical_sequence_mutations(
+                control, graph, getattr(shell, "dispatch_subgraphs", ()),
+                extra_mutations=held_table_deletes,
+            )
+            lexical_sequence_shortfalls = (*lexical_sequence_shortfalls, *held_delete_shortfalls)
             # Numerical region order alone does not represent reads of mutable
             # fields. Restore authored sibling order before the dependency
             # scheduler: an early bool(field) must precede the conditional
@@ -27788,6 +27889,14 @@ def _class_surface_ssa_program(
                 table_lookups=table_lookups,
                 table_lookup_loop_owners=table_lookup_loop_owners,
                 table_lookup_defaults=table_lookup_defaults,
+                # An authored ``d[k]`` read requires its key (KeyError when
+                # absent); ``d.get`` does not.
+                table_lookup_required_ids=frozenset(
+                    int(data.get("value_id", node_id))
+                    for node_id, data in graph_obj.nodes(data=True)
+                    if str(data.get("op") or data.get("type") or "").casefold()
+                    == "indexed"
+                ),
                 table_stores=table_stores,
                 table_deletions=table_deletions,
                 # The table version each keyed delete reads (its ``base``).
@@ -27804,6 +27913,7 @@ def _class_surface_ssa_program(
                     ), None),)
                     if base is not None
                 },
+                table_deletion_held_ids=_held_table_delete_ids(graph),
                 retained_sequence_ids=retained_sequence_ids,
                 nested_sequence_ids=nested_sequence_ids,
                 nested_tensor_sequence_ids=nested_tensor_sequence_ids,
@@ -60873,6 +60983,8 @@ def compile_ast_fortran_c_shell(
     runtime_closure_only: bool = False,
     trace: bool = False,
     cpython_runtime: str | Path | None = None,
+    python_package: str | None = None,
+    extraction_contract: Any = None,
 ) -> FortranCShellExecutable:
     """Compile Python AST through the registered Fortran target and C shell.
 
@@ -60919,6 +61031,12 @@ def compile_ast_fortran_c_shell(
         precompile_only=True,
         bake_mode="whole_program",
         python_bindings=dict(python_bindings or {}),
+        # The package relative imports in ``source`` resolve against
+        # (``from . import autograd`` inside AbstractTensor.__init__).
+        python_package=python_package,
+        # Which reachable modules are ingested as Python, which stay native
+        # boundaries (stdlib, third party), and which are intrinsic.
+        extraction_contract=extraction_contract,
         progress=progress,
         checkpoint=checkpoint,
         mutable_parameters=tuple(mutable_parameters),

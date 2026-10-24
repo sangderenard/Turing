@@ -8,6 +8,13 @@ No lowering code changed. At 010ca12 (298 programs): C 298/298, same as main
 93b97b3. Fuzz seed 61 (40): 0 WRONG / 0 TYPE. Gate names identical to
 main 93b97b3 in all four parts. See doc 38.
 
+2026-10-24 LANE E, E22 (MEASURED, cloud): Fortran emits owned-heap lists
+(Alloca, copy_elements, release_owner through c_ptr cells and c_f_pointer
+views), so the 86 programs that stopped at EMIT-INCOMPLETE run. At ea3e85b5
+on main 39fe7283 (303 programs): C 303/303, LLVM 298/303 (c337, c338, c367,
+c370, c371 do the same on main), Fortran 302 PASS (c22 by design). Fuzz seeds
+59-62: 0 WRONG / 0 TYPE. Gate names identical to main 39fe7283.
+
 2026-10-23 LANE E, E21 (MEASURED, cloud): a live-flag arena is bounded by its
 column's rows, so Fortran runs a callee that filters a list literal (c197,
 c358, c359; RUN-FAIL "shape-dynamic Fortran extents" at main a67c8a9c). At

@@ -1975,6 +1975,45 @@ def test_mapping_update_lowers_to_existing_table_store_identity():
     )
 
 
+def test_table_store_status_full_raises_capacity_error_at_runtime():
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            20,
+            "update",
+            (21, 22),
+            23,
+            policy="unique",
+            argument_kind="mapping_items",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="mapping_update_full",
+        first_value_id=1000,
+        sequence_declarations=((20, "unique", 2, True),),
+        sequence_column_dtypes={20: ("int64", "float64")},
+    )
+    checks = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "ssa_table_store_status"
+    ]
+
+    assert shortfalls == ()
+    assert any(
+        str(instruction.op).casefold() == "eq" for instruction in checks
+    )
+    assert any(
+        str(instruction.op).casefold() == "call"
+        and instruction.attributes.get("callee") == "turing_validation_error"
+        and instruction.attributes.get("error_code") == 75
+        for instruction in checks
+    )
+
+
 def test_table_store_operands_refine_provisional_row_dtypes():
     control = ControlProgram(LoopBlock(
         "item", "0", "1", "1", SequenceBlock(()),

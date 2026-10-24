@@ -77,6 +77,9 @@ EXTENDED = [
     # an early return beside a returned length of a list parameter (corpus
     # c372, plan C7)
     (["c{v} = neg_or_len([{a}, n, n - {b}])"], "c{v}"),
+    # an augmented store at a computed list index in a loop (corpus c373,
+    # plan C6)
+    (["xs{v} = [{a}, 0, {b}]", "for i{v} in range({c} + 2):", "    xs{v}[(i{v} + n) % 3] += i{v} + {a}"], "xs{v}[0] * 100 + xs{v}[1] * 10 + xs{v}[2]"),
     (["xs{v} = []", "k{v} = n % 5 + 2", "while k{v} > 0:", "    xs{v}.append(k{v})", "    k{v} -= 2"], "len(xs{v}) * 10 + xs{v}[0]"),
     (["xs{v} = [{a}, n, {b}]", "for j{v} in range(len(xs{v})):", "    xs{v}[j{v}] = xs{v}[j{v}] * 2"], "xs{v}[0] + xs{v}[1] + xs{v}[2]"),
     (["xs{v} = [n, {a}, {b}]", "m{v} = xs{v}[0]", "for x{v} in xs{v}:", "    if x{v} > m{v}:", "        m{v} = x{v}"], "m{v}"),
@@ -283,6 +286,8 @@ EXTENDED3 = [
     (["t{v} = 0", "for k{v}, x{v} in enumerate([{a}, n, {b}], n % 4 + {c}):", "    t{v} = t{v} * 10 + k{v} * x{v}"], "t{v}"),
     # a callee filters a list literal in its loop, so it keeps live flags (c197)
     ([], "positives([{a}, -{b}, {c}]) * 10 + n"),
+    # a list grown at run time, then sorted (Fortran list growth; lane E)
+    (["xs{v} = []", "for k{v} in range(n % 4 + {a} + 1):", "    xs{v}.append((k{v} * {b} + n) % 9)", "ys{v} = sorted(xs{v})"], "ys{v}[0] * 100 + ys{v}[-1] * 10 + len(xs{v})"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
@@ -393,6 +398,13 @@ def build(m: int) -> list[int]:
 # replication, aliasing and sets.  Seeds 80-83 found the families of corpus
 # c333-c338.
 EXTENDED4 = [
+    (["o{v} = maybe_pick(n + 1, {a})", "d{v} = {{1: {b}, 2: n, 3: {c}}}", "del d{v}[2]"], "(-3 if o{v} is None else o{v} + 1) + len(d{v}) * 10"),
+    (["d{v} = {{1: {a}, 2: n}}", "del d{v}[1]", "d{v}[1] = {b}"], "len(d{v}) * 10 + d{v}[1]"),
+    (["d{v} = {{1: {a}, 2: n}}", "k{v} = d{v}[n % 3] if n > {b} else d{v}[1]"], "k{v} * 10 + len(d{v})"),
+    (["d{v} = {{1: {a}, 2: n}}", "del d{v}[n % 3 + 1]"], "len(d{v}) * 10 + d{v}.get(1, {b})"),
+    (["d{v} = {{1: n, 2: {a}}}", "for i{v} in range(3):", "    if i{v} == n:", "        del d{v}[2]"], "len(d{v}) * 10 + d{v}.get(2, {b})"),
+    (["d{v} = {{1: n, 2: {a}}}", "if n > {b}:", "    del d{v}[1]"], "len(d{v}) * 10 + d{v}.get(1, {c})"),
+    (["d{v} = {{1: n, 2: {a}}}", "d{v}[1] = n + {b}", "del d{v}[2]", "d{v}[2] = {c}", "if n > {a}:", "    d{v}[4] = n"], "len(d{v}) * 1000 + d{v}[1] * 100 + d{v}[2] * 10 + d{v}.get(4, 0)"),
     (["s{v} = {{n, {a}}}", "s{v}.add({b})", "xs{v} = [{c}, n, {a}]", "ys{v} = xs{v}[-2:]"], "len(s{v}) * 100 + sum(s{v}) + ys{v}[0] * 10 + len(ys{v})"),
     (["xs{v} = [n, {a}]", "r{v} = xs{v}[0]", "swap(xs{v})"], "r{v} * 100 + head(xs{v}) * 10 + xs{v}[1]"),
     (["d{v} = {{0: n}}", "d{v}[1] = d{v}.get(0, -1) + {a}", "t{v} = 0", "for y{v} in [x{v} * n for x{v} in [{b}, 0]]:", "    t{v} += y{v}", "xs{v} = [n, {c}]", "h{v} = head(xs{v})", "swap(xs{v})"], "d{v}[1] * 10 + len(d{v}) + t{v} + h{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),

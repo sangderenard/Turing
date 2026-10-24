@@ -1674,6 +1674,29 @@ def _resolved_source_value_class(
     return str(fact[0]), max(int(fact[1]), 1)
 
 
+def _indexed_store_source(graph: Any, value_id: Any) -> Any:
+    """The sequence an ``IndexedStore`` chain writes, by its ``base`` edges."""
+
+    target = getattr(graph, "G", graph)
+    seen: set[int] = set()
+    while (
+        isinstance(value_id, int)
+        and value_id in target
+        and value_id not in seen
+        and target.nodes[value_id].get("type") == "IndexedStore"
+    ):
+        seen.add(value_id)
+        value_id = next(
+            (
+                parent
+                for parent, role in target.nodes[value_id].get("parents") or ()
+                if role == "base"
+            ),
+            None,
+        )
+    return value_id
+
+
 def _concorded_numeric_descriptor(
     graph: Any, value_id: Any,
 ) -> NumericFeatureDescriptor | None:
@@ -13129,6 +13152,24 @@ def _normalize_lexical_values(
                     )
             elif (
                 isinstance(body_statement.target, ast.Subscript)
+                # Program: ``xs = [0, 0, 0, 0]; for i in range(6):
+                # xs[i % 4] += i + n`` (corpus c373).  Wrong record: an
+                # index that was not a constant or a loop target was taken
+                # for a boolean mask by its spelling, so the store became
+                # ``where(i % 4, xs + i + n, xs)`` and C had no spelling
+                # for it.  Rule: a base whose recorded class is a list or
+                # dict takes no array mask, so its subscript is one row.  A
+                # base already stored into is read through the stores'
+                # ``base`` edges to the sequence that carries the class.
+                and _resolved_source_value_class(
+                    graph,
+                    _indexed_store_source(
+                        graph,
+                        environment.get(body_statement.target.value.id),
+                    )
+                    if isinstance(body_statement.target.value, ast.Name)
+                    else None,
+                )[0] not in {"builtins.list", "builtins.dict"}
                 and not all(
                     isinstance(item, ast.Slice)
                     or (

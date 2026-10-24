@@ -265,6 +265,229 @@ def _lower_record_covered_call(
     return index + 1 + len(projection)
 
 
+def _member_optional_return(callee: Any) -> tuple[tuple[int, ...], dict[int, int]] | None:
+    """``(physical Ret ids, {payload id: presence id})`` of a callee whose
+    Ret returns optional members beside other outputs, else None."""
+
+    from .structural_concordance import aggregate_return_layouts
+
+    returns = [
+        instruction
+        for block in callee.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in _RETURN_OPS
+    ]
+    if not returns:
+        return None
+    physical = tuple(int(argument.id) for argument in returns[0].args)
+    if any(
+        tuple(int(argument.id) for argument in ret.args) != physical
+        for ret in returns[1:]
+    ):
+        return None
+    members = {}
+    for output_id, layout in aggregate_return_layouts(callee).items():
+        layout = tuple(map(int, layout))
+        if (
+            len(layout) == 2 and layout[0] == int(output_id)
+            and layout[0] in physical and layout[1] in physical
+            and physical.index(layout[1]) == physical.index(layout[0]) + 1
+        ):
+            members[layout[0]] = layout[1]
+    if not members or len(physical) < 3:
+        return None
+    return physical, members
+
+
+def _lower_member_optional_call(
+    caller_name: str, caller: Any, block: Any, index: int, call: Any,
+    callee: Any, producers: dict[int, Any], receipts: list[dict[str, Any]],
+) -> int | None:
+    """Caller side of optional members in a wider return.
+
+    Program: ``if flag > 0: return (0, k)`` then ``return (flag, None)``
+    (corpus c462).  The callee's Ret is ``(slot0, payload1, presence1)``;
+    the caller still projected logical positions, so a member after an
+    optional one read the presence, and ``f[1] is None`` read the payload.
+    Rule: each projection loads its output's physical position, and an
+    identity test of an optional member reads that member's presence.
+    Returns the next instruction index, or None when the call is not one.
+    """
+
+    from .concordance_declarations import (
+        ADDRESS, CONTROL_CONST, OPTIONAL_PRESENCE, RECORD_RETURN_REPAIR,
+    )
+    from .ssa_record_return_state import mint_ssa_value
+
+    shape = _member_optional_return(callee)
+    if shape is None:
+        return None
+    physical, members = shape
+    callee_outputs = tuple(map(int, call.attributes.get("callee_output_ids", ())))
+    output_ids = tuple(map(int, call.attributes.get("output_ids", ())))
+    if (
+        not callee_outputs or len(callee_outputs) != len(output_ids)
+        or tuple(callee_outputs) == physical
+        or not set(members) & set(callee_outputs)
+        or any(output not in physical for output in callee_outputs)
+    ):
+        return None
+    aggregate = call.res
+    uses: dict[int, int] = {}
+    for candidate_block in caller.blocks.values():
+        for instruction in candidate_block.instrs:
+            for argument in instruction.args:
+                uses[int(argument.id)] = uses.get(int(argument.id), 0) + 1
+
+    def refuse(missing: str) -> ValueError:
+        return ValueError(
+            f"call %{int(aggregate.id)} of {callee.name!r} in "
+            f"{caller_name!r} returns optional members "
+            f"{tuple(members)} beside other outputs and cannot be "
+            f"lowered: {missing}"
+        )
+
+    payload_loads: dict[int, Any] = {}
+    for candidate_block in caller.blocks.values():
+        for instruction in candidate_block.instrs:
+            if (
+                instruction.op != "GetElementPtr"
+                or not instruction.args
+                or int(instruction.args[0].id) != int(aggregate.id)
+            ):
+                continue
+            const = producers.get(int(instruction.args[1].id))
+            if const is None or const.op != "Const":
+                raise refuse("a projection index is not a constant")
+            if uses.get(int(const.res.id), 0) != 1:
+                raise refuse("a projection index is shared")
+            logical = int(const.attributes.get("value"))
+            if not 0 <= logical < len(callee_outputs):
+                raise refuse(f"projection {logical} is outside the outputs")
+            slot = physical.index(callee_outputs[logical])
+            const.attributes["value"] = slot
+            instruction.attributes["aggregate_index"] = slot
+            load = next((
+                consumer
+                for consumer_block in caller.blocks.values()
+                for consumer in consumer_block.instrs
+                if consumer.op == "Load" and consumer.args
+                and int(consumer.args[0].id) == int(instruction.res.id)
+            ), None)
+            if load is not None:
+                load.attributes["aggregate_index"] = slot
+                if callee_outputs[logical] in members:
+                    payload_loads[callee_outputs[logical]] = load
+    projection: list[Instr] = []
+    presence_by_payload: dict[int, SSAValue] = {}
+    for payload_id, load in payload_loads.items():
+        payload = load.res
+        payload.accounting = {
+            **dict(payload.accounting or {}), "ssa_optional_payload": True,
+        }
+        presence = SSAValue(
+            mint_ssa_value(
+                caller, OPTIONAL_PRESENCE, (payload,),
+                dtype="bool", stage=RECORD_RETURN_REPAIR,
+            ),
+            dtype="bool",
+            accounting={
+                "ssa_optional_presence": True,
+                "ssa_optional_payload_id": int(payload.id),
+            },
+        )
+        slot = physical.index(members[payload_id])
+        position_value = SSAValue(mint_ssa_value(
+            caller, CONTROL_CONST, (aggregate,), dtype="int",
+            stage=RECORD_RETURN_REPAIR,
+        ), dtype="int")
+        address = SSAValue(mint_ssa_value(
+            caller, ADDRESS, (aggregate, position_value),
+            dtype="ptr", stage=RECORD_RETURN_REPAIR,
+        ), dtype="ptr")
+        projection.extend((
+            Instr("Const", [], position_value, attributes={"value": slot}),
+            Instr("GetElementPtr", [aggregate, position_value], address,
+                  attributes={"aggregate_index": slot}),
+            Instr("Load", [address], presence, attributes={
+                "aggregate_index": slot,
+                "source_output_id": int(presence.id),
+                "ssa_optional_result": True,
+            }),
+        ))
+        presence_by_payload[int(payload.id)] = presence
+        receipts.append({
+            "function": str(callee.name),
+            "caller": str(caller_name),
+            "callsite_id": call.attributes.get("plan_callsite_id"),
+            "payload_value_id": int(payload_id),
+            "presence_value_id": int(members[payload_id]),
+            "caller_payload_value_id": int(payload.id),
+            "caller_presence_value_id": int(presence.id),
+            "priority": "exact_member_optional_return",
+            "tie_policy": "incumbent",
+        })
+    # The call's outputs restate the callee's physical order.
+    caller_by_callee = dict(zip(callee_outputs, output_ids))
+    presence_ids = {
+        int(members[callee_id]): int(presence_by_payload[
+            int(payload_loads[callee_id].res.id)
+        ].id)
+        for callee_id in payload_loads
+    }
+    contract = {
+        int(entry[0]): entry
+        for entry in call.attributes.get("native_result_contract", ()) or ()
+    }
+    call.attributes.update({
+        "callee_output_ids": physical,
+        "output_ids": tuple(
+            caller_by_callee.get(item, presence_ids.get(item, item))
+            for item in physical
+        ),
+        "native_result_contract": tuple(
+            contract.get(item, (item, "bool", ())) for item in physical
+        ),
+        "physical_result_bindings": tuple(
+            (item, caller_by_callee.get(item, presence_ids.get(item, item)))
+            for item in physical
+        ),
+    })
+    for key in ("output_positions", "output_slots"):
+        if key in call.attributes:
+            call.attributes[key] = tuple(range(len(physical)))
+    aggregate.shape = (len(physical),)
+    block.instrs[index + 1:index + 1] = projection
+    for consumer_block in caller.blocks.values():
+        for consumer in consumer_block.instrs:
+            if consumer.op not in (_EQ_OPS | _NE_OPS):
+                continue
+            payload = next((
+                value for value in consumer.args
+                if int(value.id) in presence_by_payload
+            ), None)
+            if payload is None:
+                continue
+            other = tuple(value for value in consumer.args if value is not payload)
+            if len(other) != 1:
+                continue
+            none_producer = producers.get(int(other[0].id))
+            if none_producer is None or none_producer.op not in _NONE_OPS:
+                continue
+            presence = presence_by_payload[int(payload.id)]
+            consumer.args = [presence]
+            consumer.op = "LNot" if consumer.op in _EQ_OPS else "Cast"
+            consumer.attributes.update({
+                "target_dtype": "bool",
+                "optional_presence_test": True,
+                "payload_value_id": int(payload.id),
+                "presence_value_id": int(presence.id),
+                "priority": "exact_member_optional_call_result",
+                "tie_policy": "incumbent",
+            })
+    return index + 1 + len(projection)
+
+
 def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
     """Split every proven scalar-or-None return into payload and presence.
 
@@ -746,7 +969,26 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                                 layouts[int(instruction.res.id)] = (
                                     int(instruction.res.id), int(presence.id),
                                 )
-                                contracts[str(function_name)] = receipt
+                                # Program: ``if flag > 0: return (0, k)``
+                                # then ``return (flag, None)`` (corpus
+                                # c462).  Wrong record: the whole-function
+                                # scalar contract was taken for a Ret of
+                                # two outputs, so the caller rewrote the
+                                # call as (payload, presence) and read the
+                                # first member's value as a member table:
+                                # a segfault.  Rule: the scalar contract
+                                # holds only for a function whose every Ret
+                                # returns this one value; a wider Ret keeps
+                                # the per-output layout published above.
+                                if all(
+                                    len(terminator.args) == 1
+                                    and int(terminator.args[0].id)
+                                    == int(instruction.res.id)
+                                    for candidate_block in function.blocks.values()
+                                    for terminator in candidate_block.instrs
+                                    if terminator.op in _RETURN_OPS
+                                ):
+                                    contracts[str(function_name)] = receipt
                             optional_cell = structure_book.current_ref(
                                 OPTIONAL_VALUE_STRUCTURE,
                                 (structure_scope, int(instruction.res.id)),
@@ -942,6 +1184,16 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
                             caller_name, caller, block, index, call,
                             position_receipts, producers, receipts,
                         )
+                        continue
+                    member_index = (
+                        None if callee_function is None
+                        else _lower_member_optional_call(
+                            caller_name, caller, block, index, call,
+                            callee_function, producers, receipts,
+                        )
+                    )
+                    if member_index is not None:
+                        index = member_index
                         continue
                 if (
                     call.op not in {"Call", "call"}

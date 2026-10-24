@@ -387,12 +387,16 @@ def test_numpy_asarray_is_frontend_tensor_normalization_before_slice(tmp_path):
     )
 
 
-def test_rank_alone_is_not_enough(tmp_path):
+def test_rank_alone_states_a_runtime_sized_span(tmp_path):
     """Recorded so the distinction is not lost again.
 
-    ``rank`` says how many axes there are; the gate reads how long they are.
-    A rank-only declaration leaves the value shapeless, which is exactly why
-    the rank that ``program_abi`` already carried never fixed this.
+    ``rank`` says how many axes there are; ``shape`` says how long they are.
+    A rank-only declaration leaves the value shapeless -- its extents arrive
+    with the call -- and shapeless used to read as scalar: ``x * y`` over
+    rank-1 spans compiled to ``x[0] * y[0]`` on every backend, reported
+    complete.  The empty shape stays (no extent is guessed), and the rank
+    rides the accounting instead, so the multiply is a rank-1 span the
+    backends loop over (``tests/test_runtime_sized_spans.py`` runs it).
     """
 
     values = [
@@ -401,9 +405,25 @@ def test_rank_alone_is_not_enough(tmp_path):
         {"function": "f", "parameter": "y", "storage": "span",
          "dtype": "float64", "rank": 1, "python_type": TENSOR_TYPE},
     ]
-    formals, operands = _lowered(tmp_path, values, "rankonly")
-    assert all(shape == () for shape in formals.values())
-    assert operands[0][1] == ()
+    contract = _contract(tmp_path, values)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _ = lower_ast_source_to_ssa(
+            SOURCE, "f", name="rankonly", extraction_contract=contract
+        )
+    products = [
+        instruction.res
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op).casefold() == "mul"
+    ]
+    assert products, "expected a multiply"
+    for product in products:
+        assert tuple(product.shape) == ()
+        accounting = dict(product.accounting or {})
+        assert accounting.get("program_abi_storage") == "span"
+        assert int(accounting.get("program_abi_rank") or 0) == 1
 
 
 def test_nested_record_leaf_becomes_the_only_physical_input(tmp_path):

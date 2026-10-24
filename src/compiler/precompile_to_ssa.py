@@ -899,6 +899,34 @@ def lower_fused_program_to_ssa(
     return function, tuple(shortfalls)
 
 
+def _control_placed_table_delete_ids(root: Any) -> set[int]:
+    """Effect ids of keyed deletes the control tree carries as table-delete
+    mutations, at any depth (an arm, a loop body, a call)."""
+
+    placed: set[int] = set()
+
+    def visit(block: Any) -> None:
+        if block is None or isinstance(block, (str, int)):
+            return
+        if isinstance(block, SequenceMutationBlock):
+            if block.mutation.argument_kind in {
+                "table_delete_key", "table_delete_keys",
+            }:
+                placed.add(int(block.mutation.effect_node_id))
+            return
+        for child in getattr(block, "blocks", ()) or ():
+            visit(child)
+        for name in ("body", "orelse", "callee", "default", "finalbody"):
+            visit(getattr(block, name, None))
+        for _label, child in getattr(block, "cases", ()) or ():
+            visit(child)
+        for child in getattr(block, "lanes", ()) or ():
+            visit(child)
+
+    visit(root)
+    return placed
+
+
 def lower_fused_integral_to_repository_ssa(
     program: FusedProgram,
     *,
@@ -1001,6 +1029,7 @@ def lower_fused_integral_to_repository_ssa(
             table_epilogue_operations=tuple(
                 ("store", store) for store in table_stores
             ),
+            host_reads_table_status=True,
         )
         identity_tokens = dict(
             (getattr(program, "extras", None) or {}).get(
@@ -1658,9 +1687,50 @@ def _contract_physical(
     return None
 
 
+def _runtime_rank_physical(
+    book: Any, shape_scope: Any, value: Any,
+) -> tuple[dict[str, Any], Ref] | None:
+    """A shapeless region result's runtime rank, read from its shape state.
+
+    Program: ``def f(x, y): return x * y`` with x and y declared
+    ``storage: span, rank: 1`` and no ``shape``.  Wrong record: the planner's
+    descriptor for the product said rank 1, runtime extents
+    (``shape_transformation_state``), and the region ``value`` carried that
+    rank as accounting, but its ``ssa_value`` row was posted scalar with no
+    rank -- so call-result settlement carried a scalar to the caller and
+    every backend sized a one-element result.  Rule: a result with no shape
+    and no contract row whose graph identity's shape state is a runtime-sized
+    span posts ``storage: span`` and that rank, DERIVED from the state cell.
+    """
+
+    from .identity_concordance import (
+        SHAPE_STATE_PAGE, descriptor_from_shape_transformation_state,
+    )
+
+    if shape_scope is None or tuple(value.shape or ()):
+        return None
+    row = (tuple(shape_scope), int(value.id))
+    cell = book.latest_ref(SHAPE_STATE_PAGE, row)
+    if cell is None:
+        return None
+    fact = book.page(SHAPE_STATE_PAGE).latest(row)
+    if not (isinstance(fact, tuple) and fact and fact[0] == "resolved"):
+        return None
+    descriptor = descriptor_from_shape_transformation_state(fact[1])
+    if not (
+        descriptor is not None
+        and not tuple(descriptor.get("shape") or ())
+        and int(descriptor.get("rank", 0) or 0) > 0
+        and str(descriptor.get("metadata_state") or "") == "dynamic"
+        and str(descriptor.get("dtype")) == str(value.dtype)
+    ):
+        return None
+    return {"storage": "span", "rank": int(descriptor["rank"])}, cell
+
+
 def _post_planned_region_identities(
     book: Any, scope: str, function: Function, signature_cell: Any,
-    graph_cell: Any,
+    graph_cell: Any, shape_scope: Any = None,
 ) -> None:
     """The identity cells of one planned region function (plan 100, 4.1
     item 2 and 2.6), posted where ``lower_control_sections_to_ssa``
@@ -1747,6 +1817,7 @@ def _post_planned_region_identities(
                 else _contract_physical(
                     book, value, graph_cell(int(value.id)),
                 )
+                or _runtime_rank_physical(book, shape_scope, value)
             )
             book.post(
                 SSA_VALUE, row,
@@ -2101,6 +2172,7 @@ class _ControlSSABuilder(TiledObject):
         table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
         lexical_table_lookup_result_ids: tuple[int, ...] = (),
         table_lookup_defaults: dict[int, int | float] | None = None,
+        table_lookup_required_ids: frozenset[int] = frozenset(),
         table_stores: tuple[
             tuple[int, int | tuple[int, ...], int, int], ...
         ] = (),
@@ -2121,6 +2193,7 @@ class _ControlSSABuilder(TiledObject):
         table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
         table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
         table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+        host_reads_table_status: bool = False,
         consumer_row_loads: Mapping[int, tuple[Any, ...]] | None = None,
         effect_preceding_row_reads: Mapping[int, tuple[int, ...]] | None = None,
         resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
@@ -2370,6 +2443,10 @@ class _ControlSSABuilder(TiledObject):
             tuple[int, str, tuple[int, ...]]
         ] = []
         self.table_lookup_defaults = dict(table_lookup_defaults or {})
+        # ``d[k]`` lookups (not ``d.get``): an absent key raises KeyError.
+        self.table_lookup_required_ids = frozenset(
+            map(int, table_lookup_required_ids)
+        )
         self.lexical_table_lookup_result_ids = frozenset(map(
             int, lexical_table_lookup_result_ids,
         ))
@@ -2548,6 +2625,12 @@ class _ControlSSABuilder(TiledObject):
             ).items()
         }
         self.table_epilogue_operations = tuple(table_epilogue_operations)
+        # A table store reports a full fixed-capacity table as status 2
+        # in its status arena.  Only the structural resident table
+        # integral publishes that arena to its host, whose verifier probes
+        # the capacity-exhausted outcome; every other caller is compiled
+        # code that never reads it, so the store must check it itself.
+        self.host_reads_table_status = bool(host_reads_table_status)
         # A structural type predicate can be emitted before the numerical
         # region which owns its subject's sequence-row payload load. Keep the
         # exact scheduled projection addressable by result identity so the
@@ -3597,6 +3680,13 @@ class _ControlSSABuilder(TiledObject):
             )
             for kind, operation in operations
         }
+        # A keyed delete placed as its own control effect (a table-delete
+        # mutation anywhere in the control tree) is scheduled there, not here.
+        placed_delete_ids = _control_placed_table_delete_ids(program.root)
+        scheduled_table_operations.update(
+            ("delete", tuple(deletion)) for deletion in table_deletions
+            if int(deletion[0]) in placed_delete_ids
+        )
         for result_id, query_id, sequence_id in table_lookups:
             if int(result_id) in self.lexical_table_lookup_result_ids:
                 continue
@@ -3937,15 +4027,27 @@ class _ControlSSABuilder(TiledObject):
         from .ir_sequence_tables import lower_table_lookup
 
         default_literal = self.table_lookup_defaults.get(int(result_id))
+        # Program: ``d = {1: n, 2: 5}; return d[n]`` with ``n = 7`` (silent
+        # lane, scratch s43/k).  Wrong record: the lookup's absent branch
+        # returned 0 where Python raises KeyError (clean audit).  Rule: an
+        # authored subscript read requires its key; its helper raises
+        # validation error 84 (``required_key_absent``) on the absent path.
+        # ``d.get`` keeps its default (or zero) branch.
+        required = (
+            default_literal is None
+            and int(result_id) in self.table_lookup_required_ids
+        )
         helper_name = self._sequence_helper_name(
             int(sequence_id),
-            "lookup_or_default" if default_literal is not None else "lookup",
+            "lookup_or_default" if default_literal is not None
+            else "lookup_required" if required else "lookup",
         )
         lowering = lower_table_lookup(
             descriptor,
             function_name=helper_name,
             default_parameter=default_literal is not None,
             first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+            required=required,
         )
         self._register_sequence_lowering(lowering)
         pool = descriptor.child_table_pool
@@ -4372,6 +4474,7 @@ class _ControlSSABuilder(TiledObject):
                     ),
                 },
             )
+            self._require_table_store_room(int(sequence_id), int(_effect_id))
             return
         actual_dtypes = tuple(
             str(_canonical_sequence_dtype(value.dtype) or "unknown")
@@ -4452,6 +4555,101 @@ class _ControlSSABuilder(TiledObject):
                 "sequence_id": int(sequence_id),
             },
         )
+        self._require_table_store_room(int(sequence_id), int(_effect_id))
+
+    def _require_table_store_room(self, sequence_id: int, effect_id: int) -> None:
+        """Raise when the keyed store just emitted found no free row.
+
+        Program: a store past a FIXED table's proven capacity (scratch
+        s42/t2 before its capacity bound counted deleted rows).  Wrong
+        record: the store helper reports "full" as status 2 into the
+        table's status cell (the ABI the structural resident-table verifier
+        probes), and no caller read it, so the row was dropped and
+        ``len(d)`` was 1 for 2 (clean audit).  Rule (takeover rule 10, as a
+        fixed append raises): the caller reads the status and a full store
+        raises validation error 75.
+        """
+
+        if self.host_reads_table_status:
+            return
+        self._raise_on_table_status(
+            sequence_id, effect_id, 2,
+            binding="ssa_table_store_status",
+            error_code=75, failure="fixed_capacity_exhausted",
+        )
+
+    def _require_table_delete_found(
+        self, sequence_id: int, effect_id: int,
+    ) -> None:
+        """Raise KeyError's validation error when a keyed delete found no
+        live row.
+
+        Program: ``d = {1: n, 2: 5}; del d[n]`` with ``n = 7`` (silent lane,
+        scratch s43/j).  Wrong record: the delete helper reports "absent" as
+        status 0 and no caller read it, so the program went on where Python
+        raises KeyError (clean audit).  Rule: the caller reads the status;
+        absent raises validation error 84 (``required_key_absent``), the
+        code a required lookup raises.
+        """
+
+        if self.host_reads_table_status:
+            return
+        self._raise_on_table_status(
+            sequence_id, effect_id, 0,
+            binding="ssa_table_delete_status",
+            error_code=84, failure="required_key_absent",
+        )
+
+    def _raise_on_table_status(
+        self, sequence_id: int, effect_id: int, failing_status: int, *,
+        binding: str, error_code: int, failure: str,
+    ) -> None:
+        """Read a table's status cell after a helper call; raise
+        ``error_code`` when it holds ``failing_status``."""
+
+        attributes = {
+            "binding": str(binding),
+            "sequence_id": int(sequence_id),
+            "source_effect_node_id": int(effect_id),
+        }
+        status_arena = self.sequence_status_values[int(sequence_id)]
+        zero = self.constant_value(0, status_arena)
+        address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(status_arena, zero),
+        )
+        self.emit(
+            Handler.GetElementPtr, [status_arena, zero], address,
+            attributes=attributes,
+        )
+        status = self.fresh_value(
+            dtype="int", transform=LOAD, operands=(address,),
+        )
+        self.emit(Handler.Load, [address], status, attributes=attributes)
+        failed = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE, operands=(status,),
+        )
+        self.emit(
+            Handler.Eq,
+            [status, self.constant_value(int(failing_status), status)],
+            failed,
+            attributes=attributes,
+        )
+        failing = self.new_block("validation_fail")
+        passing = self.new_block("validation_pass")
+        self.conditional_branch(failed, failing, passing)
+        self.current = failing
+        self.emit(
+            Handler.Call,
+            [],
+            attributes={
+                "callee": "turing_validation_error",
+                "error_code": int(error_code),
+                "failure": str(failure),
+                **attributes,
+            },
+        )
+        self.branch(passing)
+        self.current = passing
 
     def _sequence_row_index(
         self, sequence_id: int, index_id: int, literal: int | None,
@@ -4626,7 +4824,8 @@ class _ControlSSABuilder(TiledObject):
 
     def _emit_table_delete(
         self, effect_id: int, key_id: int | tuple[int, ...],
-        sequence_id: int | None, storage_identity: str
+        sequence_id: int | None, storage_identity: str,
+        *, required: bool = True,
     ) -> None:
         if sequence_id is None:
             match = re.fullmatch(r"nested-table-value:(\d+)", storage_identity)
@@ -4733,6 +4932,10 @@ class _ControlSSABuilder(TiledObject):
                 "sequence_id": int(sequence_id),
             },
         )
+        # ``del d[k]`` and ``d.pop(k)`` require the key; the first-live
+        # delete has no authored key to require.
+        if required and not first_live:
+            self._require_table_delete_found(int(sequence_id), int(effect_id))
 
     def _emit_sequence_fill(
         self, sequence_id: int, literal: bool | int | float | None, count_id: int
@@ -5265,10 +5468,15 @@ class _ControlSSABuilder(TiledObject):
         # and ``xs1`` stayed empty.  Rule: an operation replaces its region
         # only when the region has nothing left to publish (its signature's
         # outputs: a planned region is pure, so a body with no outputs is
-        # no work).
+        # no work).  Program: ``d = {1: 5, 2: n}; del d[1]; d[3] = 4``
+        # (scratch s42/t3).  Wrong record: the delete was the region's
+        # pre-operation and the store its post-operation; the delete claimed
+        # to replace the output-less region, so the call -- and the store
+        # emitted after it -- never ran (``len(d)`` 1 for 2; clean audit).
+        # Rule: a region with post-operations is not replaced either.
         return replaces_region and not tuple(
             self.region_signatures.get(int(region_index), ((), ()))[1]
-        )
+        ) and not self.table_region_post_operations.get(int(region_index))
 
     def _register_sequence_lowering(self, lowering) -> None:
         """Install helpers through ``register_sequence_lowering``, caused by
@@ -11768,6 +11976,17 @@ class _ControlSSABuilder(TiledObject):
         *,
         path: str,
     ) -> None:
+        if mutation.argument_kind in {"table_delete_key", "table_delete_keys"}:
+            # A keyed ``del`` placed as its own control effect (see the
+            # delete-carrier rule where table deletions are settled).
+            keys = tuple(map(int, mutation.argument_value_ids))
+            self._emit_table_delete(
+                int(mutation.effect_node_id),
+                keys if mutation.argument_kind == "table_delete_keys" else keys[0],
+                int(mutation.sequence_value_id),
+                f"sequence:{int(mutation.sequence_value_id)}",
+            )
+            return
         if mutation.predicate_expression is None:
             self._lower_sequence_mutation_body(mutation, path=path)
             return
@@ -15377,6 +15596,7 @@ class _ControlSSABuilder(TiledObject):
                     int(mutation.effect_node_id), key_id,
                     int(destination.sequence_id),
                     f"sequence:{int(destination.sequence_id)}",
+                    required=not optional_none,
                 )
                 return
             if operation == "setdefault":
@@ -21812,6 +22032,7 @@ def lower_control_program_to_ssa(
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
     lexical_table_lookup_result_ids: tuple[int, ...] = (),
     table_lookup_defaults: dict[int, int | float] | None = None,
+    table_lookup_required_ids: frozenset[int] = frozenset(),
     table_stores: tuple[
         tuple[int, int | tuple[int, ...], int, int], ...
     ] = (),
@@ -21832,6 +22053,7 @@ def lower_control_program_to_ssa(
     table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
     table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
     table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+    host_reads_table_status: bool = False,
     consumer_row_loads: Mapping[int, tuple[Any, ...]] | None = None,
     effect_preceding_row_reads: Mapping[int, tuple[int, ...]] | None = None,
     resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
@@ -21878,6 +22100,7 @@ def lower_control_program_to_ssa(
         table_lookups=table_lookups,
         lexical_table_lookup_result_ids=lexical_table_lookup_result_ids,
         table_lookup_defaults=table_lookup_defaults,
+        table_lookup_required_ids=table_lookup_required_ids,
         table_stores=table_stores,
         table_deletions=table_deletions,
         retained_sequence_ids=retained_sequence_ids,
@@ -21894,6 +22117,7 @@ def lower_control_program_to_ssa(
         table_region_operations=table_region_operations,
         table_region_post_operations=table_region_post_operations,
         table_epilogue_operations=table_epilogue_operations,
+        host_reads_table_status=host_reads_table_status,
         consumer_row_loads=consumer_row_loads,
         effect_preceding_row_reads=effect_preceding_row_reads,
         resolved_sequence_schemas=resolved_sequence_schemas,
@@ -23270,6 +23494,54 @@ def _inject_field_slot_access(
     ), field_locations
 
 
+def _insert_before_region_holder(
+    block: Any, region_index: int, inserted: Any,
+) -> Any:
+    """``block`` with ``inserted`` placed just before the statement of a
+    top-level sequence that holds scheduled region ``region_index`` (the
+    region itself, or the branch/loop holding it), or None when no such
+    statement exists.  Only sequences are entered, so the placement runs
+    unconditionally, once."""
+
+    def holds(candidate: Any) -> bool:
+        if isinstance(candidate, StatementBlock):
+            return any(
+                (match := _REGION_MARKER.fullmatch(str(line))) is not None
+                and int(match.group(1)) == int(region_index)
+                for line in candidate.lines
+            )
+        for name in (
+            "blocks", "body", "orelse", "condition", "default", "callee",
+            "finalbody", "lanes",
+        ):
+            child = getattr(candidate, name, None)
+            children = child if isinstance(child, tuple) else (child,)
+            if any(
+                item is not None and not isinstance(item, (str, int))
+                and holds(item)
+                for item in children
+            ):
+                return True
+        return any(holds(item) for _label, item in getattr(candidate, "cases", ()) or ())
+
+    if not isinstance(block, SequenceBlock):
+        return None
+    for position, child in enumerate(block.blocks):
+        if not holds(child):
+            continue
+        if isinstance(child, SequenceBlock):
+            nested = _insert_before_region_holder(child, region_index, inserted)
+            if nested is None:
+                return None
+            return replace(block, blocks=(
+                *block.blocks[:position], nested, *block.blocks[position + 1:],
+            ))
+        return replace(block, blocks=(
+            *block.blocks[:position], inserted, *block.blocks[position:],
+        ))
+    return None
+
+
 def _schedule_loop_callsites(
     control: ControlProgram,
     hierarchy_plan: "PlanClosure | None",
@@ -23279,6 +23551,7 @@ def _schedule_loop_callsites(
     ] | None = None,
     callsite_projection_ids: Mapping[int, tuple[int, ...]] | None = None,
     callsite_stored_argument_ids: Mapping[int, frozenset[int]] | None = None,
+    sequence_length_values: Mapping[int, int] | None = None,
     pure_region_indices: frozenset[int] = frozenset(),
     table_region_operations: Mapping[int, Any] | None = None,
     table_region_post_operations: Mapping[int, Any] | None = None,
@@ -24127,6 +24400,22 @@ def _schedule_loop_callsites(
                     values it writes in; a query reads.
                     """
                     reads, writes = set(), set()
+                    # Program: ``d = {1: 5, 2: n, 3: 8}; del d[2]`` placed as
+                    # its own control effect, then ``len(d) * 10 + n`` (fuzz
+                    # p106_43).  Wrong record: ``len(d)`` is emitted where
+                    # its value is first consumed (``sequence_length_values``),
+                    # so the region consuming it showed no read of ``d``, and
+                    # the delete was scheduled after it (len 3 for 2).  Rule:
+                    # a statement consuming a sequence's length reads that
+                    # sequence.
+                    if isinstance(candidate, StatementBlock) and sequence_length_values:
+                        length_signature = dependency_signature(candidate)
+                        if length_signature is not None:
+                            reads.update(
+                                int(sequence_length_values[int(value_id)])
+                                for value_id in length_signature[0]
+                                if int(value_id) in sequence_length_values
+                            )
                     # PROGRAM SHAPE: a region ``StatementBlock`` whose effects
                     # (append/extend/store/pack_bits/lookup ...) are recorded
                     # in table_region_operations / _post_operations.  WRONG
@@ -25236,6 +25525,7 @@ def lower_control_sections_to_ssa(
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
     table_lookup_loop_owners: Mapping[int, int] | None = None,
     table_lookup_defaults: dict[int, int | float] | None = None,
+    table_lookup_required_ids: frozenset[int] = frozenset(),
     table_stores: tuple[
         tuple[int, int | tuple[int, ...], int, int], ...
     ] = (),
@@ -25243,6 +25533,7 @@ def lower_control_sections_to_ssa(
         tuple[int, int | tuple[int, ...], int | None, str], ...
     ] = (),
     table_deletion_bases: Mapping[int, int] | None = None,
+    table_deletion_held_ids: frozenset[int] = frozenset(),
     retained_sequence_ids: tuple[int, ...] = (),
     nested_sequence_ids: tuple[int, ...] = (),
     nested_tensor_sequence_ids: tuple[int, ...] = (),
@@ -27619,7 +27910,7 @@ def lower_control_sections_to_ssa(
             )
             _post_planned_region_identities(
                 _book(), str(tensor_shape_concordance_scope), region_function,
-                signature_cell, _graph_cell,
+                signature_cell, _graph_cell, shape_scope=shape_scope,
             )
             _concord_region_feed_consumers(
                 lexical_read_scope, tensor_shape_concordance_scope,
@@ -27677,8 +27968,40 @@ def lower_control_sections_to_ssa(
             for position, (kind, arguments) in enumerate(operations):
                 if kind == "store":
                     store_placements[int(arguments[0])] = (operations, position)
+    # How many branch/loop arms hold each scheduled region.
+    region_arm_depth: dict[int, int] = {}
+
+    def survey_region_arms(block: Any, depth: int) -> None:
+        if isinstance(block, StatementBlock) and len(block.lines) == 1:
+            match = _REGION_MARKER.fullmatch(str(block.lines[0]))
+            if match is not None:
+                region_arm_depth[int(match.group(1))] = depth
+        if isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                survey_region_arms(child, depth)
+            return
+        # Any other nested block (an arm, a loop or while body, a case) runs
+        # under a condition or repeatedly; counted as one arm deeper.
+        for name in (
+            "body", "orelse", "condition", "default", "callee", "finalbody",
+        ):
+            child = getattr(block, name, None)
+            if child is not None and not isinstance(child, (str, int)):
+                survey_region_arms(child, depth + 1)
+        for _label, child in getattr(block, "cases", ()) or ():
+            survey_region_arms(child, depth + 1)
+        for child in getattr(block, "lanes", ()) or ():
+            survey_region_arms(child, depth + 1)
+
+    survey_region_arms(control.root, 0)
+    # A held delete the shell installed in its arm as a table-delete
+    # mutation is placed already; the value-order rules below are for the
+    # deletes no control block carries.
+    control_placed_delete_ids = _control_placed_table_delete_ids(control.root)
     for deletion in table_deletions:
         effect_id = int(deletion[0])
+        if effect_id in control_placed_delete_ids:
+            continue
         base_store = store_placements.get(
             int((table_deletion_bases or {}).get(effect_id, -1))
         )
@@ -27707,6 +28030,53 @@ def lower_control_sections_to_ssa(
             table_region_operations.setdefault(region_index, []).append(("delete", deletion))
         elif following:
             _value_id, region_index = min(following)
+            # Program: ``o = maybe_pick(n + 1, 1); d = {1: 5, 2: n, 3: 8};
+            # del d[2]``, then ``(-3 if o is None else o + 1) + len(d) * 10``
+            # (fuzz p106_43).  Wrong record: the first region after the
+            # delete in value order is ``o + 1``, which runs only in the
+            # conditional's ``else`` arm, so the delete rode into that arm
+            # and ``len(d)`` was 3 whenever ``o`` was None (27 for 17; clean
+            # audit).  A later region outside every arm is no carrier
+            # either: there the delete followed the ``len`` that reads the
+            # table.  Rule: a delete no ``if``/loop holds, whose first
+            # region is held by an arm, is its own control effect: a
+            # table-delete mutation placed just before the statement that
+            # holds that arm, where it runs once and before every reader
+            # the scheduler orders after a write of the table.
+            if (
+                effect_id not in table_deletion_held_ids
+                and region_arm_depth.get(int(region_index), 0)
+            ):
+                if deletion[2] is not None:
+                    placed_root = _insert_before_region_holder(
+                        control.root, int(region_index),
+                        SequenceMutationBlock(ControlSequenceMutation(
+                            sequence_value_id=int(deletion[2]),
+                            operator="delete",
+                            argument_value_ids=(
+                                tuple(map(int, deletion[1]))
+                                if isinstance(deletion[1], tuple)
+                                else (int(deletion[1]),)
+                            ),
+                            effect_node_id=effect_id,
+                            argument_kind=(
+                                "table_delete_keys"
+                                if isinstance(deletion[1], tuple)
+                                else "table_delete_key"
+                            ),
+                        )),
+                    )
+                    if placed_root is not None:
+                        control = replace(control, root=placed_root)
+                        continue
+                shortfalls.append(SSALoweringShortfall(
+                    "ssa-table", "unconditional-delete-carrier",
+                    control_name,
+                    f"delete {effect_id} runs unconditionally, but the "
+                    f"region after it ({int(region_index)}) runs inside a "
+                    "branch or loop arm",
+                ))
+                continue
             table_region_operations.setdefault(region_index, []).insert(0, ("delete", deletion))
         else:
             table_epilogue_operations.append(("delete", deletion))
@@ -27876,6 +28246,7 @@ def lower_control_sections_to_ssa(
         region_dependency_signatures,
         callsite_projection_ids=callsite_projection_ids,
         callsite_stored_argument_ids=callsite_stored_argument_ids,
+        sequence_length_values=sequence_length_values,
         pure_region_indices=frozenset(
             index for index, instructions in planned_region_instructions.items()
             if all(instruction.op in _PURE_REGION_OPS for instruction in instructions)
@@ -28107,6 +28478,7 @@ def lower_control_sections_to_ssa(
         table_lookups=table_lookups,
         lexical_table_lookup_result_ids=lexical_table_lookup_ids,
         table_lookup_defaults=table_lookup_defaults,
+        table_lookup_required_ids=table_lookup_required_ids,
         table_stores=table_stores,
         table_deletions=table_deletions,
         retained_sequence_ids=retained_sequence_ids,
