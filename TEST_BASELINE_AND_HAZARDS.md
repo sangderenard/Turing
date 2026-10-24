@@ -1,3 +1,12 @@
+2026-10-24 WINDOWS LLVM ROW EXPORT (MEASURED, Windows, base a6fdb31a):
+linking the explicitly exported validation runtime disabled MinGW's automatic
+export of the plain LLVM row entry, so Nodus correctly refused the retained
+DLL named by its own Buffer ABI descriptor. Windows shared builds now pass a
+focused `.def` file naming that declared entry. `tests/test_ssa_llvm_backend.py`:
+21 passed, 3 skipped. Real Nodus crossings execute runtime rank 1 `(7,)` and
+rank 2 `(2,3)` LLVM rows; a `(2,3)`/`(3,2)` mismatch returns validation code
+77 and publishes no output token. No SSA lowering or numerical law changed.
+
 2026-10-24 PRECISION COMPUTE PRODUCT (MEASURED, cloud): the precision-core
 GLSL compute lane publishes its SSBO ABI (component ABI, turing.shader-
 deployment.v1 record, product). Fixed a silent wrong answer: with a baked

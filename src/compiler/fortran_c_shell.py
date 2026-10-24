@@ -20811,6 +20811,7 @@ def _class_surface_ssa_program(
     tensor_ssa_reference: Any = None,
     progress: Callable[[str], None] | None = None,
     release_dispatch_regions: bool = False,
+    build_target: Any = None,
 ):
     """Lower every planned method of a whole object to one reusable SSA unit.
 
@@ -20831,6 +20832,14 @@ def _class_surface_ssa_program(
     This boundary deliberately precedes Fortran emission so the fully lowered
     whole-object SSA can be inspected and verified before target emission.
     """
+
+    from .native_code_retention import (
+        WINDOWS_AMD64_NATIVE_LINKER,
+        resolve_build_target,
+    )
+    resolved_build_target = resolve_build_target(
+        build_target or WINDOWS_AMD64_NATIVE_LINKER
+    )
 
     from ..transmogrifier.ssa import (
         IRModule, SSAMachineControlTable, SSAMachineIndirectTable,
@@ -24416,15 +24425,12 @@ def _class_surface_ssa_program(
             host_native_module = entry.metadata.get("host_native_module")
             host_root_function = all_functions.get(str(host_root))
             if host_root_function is not None:
-                from .native_code_retention import (
-                    WINDOWS_AMD64_NATIVE_LINKER,
-                    select_host_implementation,
-                )
+                from .native_code_retention import select_host_implementation
                 implementation_decision = select_host_implementation(
                     repository_ssa_complete=host_repository_ssa_complete,
                     machine_state_ssa_complete=host_machine_state_complete,
                     retained_native_module=host_native_module,
-                    target=WINDOWS_AMD64_NATIVE_LINKER,
+                    target=resolved_build_target,
                 )
                 host_root_function.metadata.update({
                     "host_ssa_complete": (
@@ -57047,6 +57053,9 @@ def _class_surface_ssa_program(
         f"complete; functions={len(lowered_module.functions)} "
         f"exports={len(export_symbols)}"
     )
+    lowered_module.metadata["build_target"] = (
+        resolved_build_target.to_mapping()
+    )
 
     return (
         lowered_module,
@@ -57063,6 +57072,7 @@ def lower_class_surface_to_ssa(
     artifact_name: str,
     *,
     tensor_ssa_reference: Any = None,
+    build_target: Any = None,
 ):
     """Public target-neutral entry to the repository whole-object lowering.
 
@@ -57078,6 +57088,7 @@ def lower_class_surface_to_ssa(
         compilation,
         artifact_name,
         tensor_ssa_reference=tensor_ssa_reference,
+        build_target=build_target,
     )
 
 
@@ -57197,6 +57208,7 @@ def _lower_resolved_process_graph_deployment(
     allow_authored_source_callees: bool = False,
     assignment_normalization: Iterable[Any] = (),
     progress: Callable[[str], None] | None = None,
+    build_target: Any = None,
 ):
     """Lower an already reduced ProcessGraph through the canonical backend path.
 
@@ -57480,6 +57492,7 @@ def _lower_resolved_process_graph_deployment(
         # This function owns ``deployment`` and reads nothing of it after the
         # lowering returns.
         release_dispatch_regions=True,
+        build_target=build_target,
     )
     stage_boundary("ssa-source: repository SSA lowered")
     if linked_source_region_ssa:
@@ -57721,6 +57734,7 @@ def _lower_ast_source_to_ssa_impl(
     stop_after_compilation_unit_plan: bool = False,
     retain_linked_piece_bodies: bool = True,
     native_object_context: Any = None,
+    build_target: Any = None,
 ):
     """Ingest one complete authored program and lower it directly to SSA.
 
@@ -57737,6 +57751,17 @@ def _lower_ast_source_to_ssa_impl(
 
     from .compiler_bootstrap_runtime import (
         activate_registered_compiler_bootstraps,
+    )
+    from .native_code_retention import (
+        WINDOWS_AMD64_NATIVE_LINKER,
+        resolve_build_target,
+    )
+
+    # Resolve the platform contract before source ingestion.  Every later
+    # backend/decompiler decision receives this same record; no pass is
+    # allowed to reinterpret a target-name string independently.
+    build_target = resolve_build_target(
+        build_target or WINDOWS_AMD64_NATIVE_LINKER
     )
 
     compile_substage("source normalisation: activate accepted compiler versions")
@@ -60139,6 +60164,7 @@ def _lower_ast_source_to_ssa_impl(
         linked_source_region_ssa=linked_source_region_ssa,
         assignment_normalization=assignment_receipts,
         progress=progress,
+        build_target=build_target,
     )
     # Deployment stamps the exact shape/copy scope onto each retained source
     # graph.  Index those identities only after that writer has run; an index

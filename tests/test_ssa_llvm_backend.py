@@ -25,6 +25,7 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
 )
 from src.compiler.precompile_to_ssa import lower_precompile_and_control_to_ssa
 from src.compiler.ssa_llvm_backend import (
+    LLVMFunctionArtifact,
     compile_artifact,
     emit_ssa_function_to_llvm,
     integer_scalar_lines,
@@ -48,6 +49,30 @@ def _native_scalar_buffers(artifact, values):
     ))
     extents = (ctypes.c_int32 * len(artifact.extent_order))()
     return buffers, pointers, extents
+
+
+def test_validation_runtime_does_not_hide_the_declared_llvm_entry(tmp_path):
+    """An explicit runtime export must not suppress the product entry.
+
+    MinGW's automatic DLL export changes behaviour as soon as the linked
+    validation-runtime C object contributes its explicit dllexport symbols.
+    The retained product must still publish the entry named by its own
+    artifact record.
+    """
+
+    artifact = LLVMFunctionArtifact(
+        name="declared_llvm_entry",
+        llvm_ir=(
+            'source_filename = "declared-llvm-entry"\n'
+            "define void @declared_llvm_entry(ptr %buffers, ptr %extents) {\n"
+            "entry:\n  ret void\n}\n"
+        ),
+        buffer_order=(), buffer_shapes=(), extent_order=(), shortfalls=(),
+        needs_validation_runtime=True,
+    )
+    native = compile_artifact(artifact, directory=tmp_path / "native")
+    library = ctypes.CDLL(str(native.library_path))
+    assert getattr(library, artifact.name) is not None
 
 
 def test_structural_tokens_absence_and_copy_emit_in_repository_llvm(tmp_path):
