@@ -2968,6 +2968,7 @@ def test_bootstrap_collection_mutation_occurrence_ledger_is_not_collapsed(target
             ("pending", "pop", "duplicates"),
                 ("annotation_rows", "append", "duplicates"),
                 ("annotation_rows", "append", "duplicates"),
+                ("return_sources", "append", "duplicates"),
                 ("parameter_sources", "append", "duplicates"),
             ],
     }
