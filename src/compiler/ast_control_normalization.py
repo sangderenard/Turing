@@ -904,6 +904,235 @@ def _normalize_set_constructor(
     return tuple(receipts)
 
 
+
+def _normalize_function_selection(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """Spell a call through a choice of module functions as a choice of calls.
+
+    Program: ``f = inc if i == 0 else neg; return f(a)`` (the SSA
+    interpreter thread's function-reference probe c05).  Wrong record: the
+    callee was a conditional value with no lowering, so the product dropped
+    the parameter ``a`` and its ``Ret`` returned nothing (the concordance
+    audit flagged a missing return value; the if-statement spellings were
+    refused or left an operand with no value).  Rule: a local name whose
+    every binding selects among module-level functions, and whose every
+    read is the callee of a call, is a selector: each binding stores which
+    function it chose, and each call is the conditional over the known
+    functions' direct calls.  ``(inc if c else neg)(a)`` is
+    ``inc(a) if c else neg(a)``: Python evaluates the callee's test before
+    the arguments, and exactly one arm's arguments run.
+    """
+
+    module_functions = {
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    rebound = {
+        name
+        for node in ast.walk(tree)
+        for name in (
+            node.id if isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del)) else None,
+            node.arg if isinstance(node, ast.arg) else None,
+            (node.asname or node.name) if isinstance(node, ast.alias)
+            else None,
+            *(node.names if isinstance(node, (ast.Global, ast.Nonlocal))
+              else ()),
+        )
+        if name in module_functions
+    }
+    defined_twice = {
+        name for name in module_functions
+        if sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == name
+        ) != 1
+    }
+    known = module_functions - rebound - defined_twice
+    if not known:
+        return ()
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    receipts: list[dict[str, Any]] = []
+
+    def leaves(value: ast.AST) -> list[str] | None:
+        if isinstance(value, ast.Name) and value.id in known:
+            return [value.id]
+        if isinstance(value, ast.IfExp):
+            body, orelse = leaves(value.body), leaves(value.orelse)
+            if body is not None and orelse is not None:
+                return body + orelse
+        return None
+
+    def selected_calls(selector: ast.AST, call: ast.Call) -> ast.AST:
+        """``selector`` (a function choice) applied to ``call``'s arguments."""
+
+        if isinstance(selector, ast.Name):
+            return ast.copy_location(ast.Call(
+                func=ast.Name(id=selector.id, ctx=ast.Load()),
+                args=copy.deepcopy(call.args),
+                keywords=copy.deepcopy(call.keywords),
+            ), call)
+        return ast.copy_location(ast.IfExp(
+            test=selector.test,
+            body=selected_calls(selector.body, call),
+            orelse=selected_calls(selector.orelse, call),
+        ), call)
+
+    def index_tree(value: ast.AST, order: list[str]) -> ast.AST:
+        if isinstance(value, ast.Name):
+            return ast.copy_location(
+                ast.Constant(value=order.index(value.id)), value,
+            )
+        return ast.copy_location(ast.IfExp(
+            test=value.test,
+            body=index_tree(value.body, order),
+            orelse=index_tree(value.orelse, order),
+        ), value)
+
+    def selectors(function: ast.AST) -> dict[str, list[str]]:
+        """Local names of ``function`` that only select and call functions."""
+
+        stores: dict[str, list[ast.AST]] = {}
+        loads: dict[str, list[ast.AST]] = {}
+        callee_reads: set[int] = set()
+        nested: set[str] = set()
+        parameters = {argument.arg for argument in ast.walk(function.args)
+                      if isinstance(argument, ast.arg)}
+        disqualified: set[str] = set(parameters)
+        for node in ast.walk(function):
+            if node is not function and isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                       ast.ClassDef),
+            ):
+                nested.update(
+                    item.id for item in ast.walk(node)
+                    if isinstance(item, ast.Name)
+                )
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                disqualified.update(node.names)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                callee_reads.add(id(node.func))
+            if isinstance(node, ast.Assign):
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and leaves(node.value) is not None
+                ):
+                    stores.setdefault(node.targets[0].id, []).append(node)
+                    continue
+            if isinstance(node, ast.Name):
+                if isinstance(node.ctx, ast.Load):
+                    loads.setdefault(node.id, []).append(node)
+        for node in ast.walk(function):
+            # Every store of a selector is one of its recorded assignments.
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                if not any(
+                    assignment.targets[0] is node
+                    for assignment in stores.get(node.id, ())
+                ):
+                    disqualified.add(node.id)
+        chosen: dict[str, list[str]] = {}
+        for name, assignments in stores.items():
+            if name in disqualified or name in nested or name in known:
+                continue
+            reads = loads.get(name, ())
+            if not reads or not all(id(read) in callee_reads for read in reads):
+                continue
+            order: list[str] = []
+            for assignment in assignments:
+                for leaf in leaves(assignment.value) or ():
+                    if leaf not in order:
+                        order.append(leaf)
+            chosen[name] = order
+        return chosen
+
+    class Direct(ast.NodeTransformer):
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if isinstance(node.func, ast.IfExp) and leaves(node.func) is not None:
+                receipts.append({
+                    "line": int(getattr(node, "lineno", -1)),
+                    "column": int(getattr(node, "col_offset", -1)),
+                    "selection": "inline",
+                })
+                return selected_calls(node.func, node)
+            return node
+
+    Direct().visit(tree)
+
+    for function in [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]:
+        for name, order in selectors(function).items():
+            selector = "_turing_callee_" + name
+            while selector in used:
+                selector = "_" + selector
+            used.add(selector)
+
+            def call_of(call: ast.Call, position: int = 0) -> ast.AST:
+                direct = ast.copy_location(ast.Call(
+                    func=ast.Name(id=order[position], ctx=ast.Load()),
+                    args=copy.deepcopy(call.args),
+                    keywords=copy.deepcopy(call.keywords),
+                ), call)
+                if position == len(order) - 1:
+                    return direct
+                return ast.copy_location(ast.IfExp(
+                    test=ast.Compare(
+                        left=ast.Name(id=selector, ctx=ast.Load()),
+                        ops=[ast.Eq()],
+                        comparators=[ast.Constant(value=position)],
+                    ),
+                    body=direct,
+                    orelse=call_of(call, position + 1),
+                ), call)
+
+            class Rewriter(ast.NodeTransformer):
+                def visit_Assign(self, node):  # noqa: N802
+                    node = self.generic_visit(node)
+                    if (
+                        len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)
+                        and node.targets[0].id == name
+                    ):
+                        return ast.copy_location(ast.Assign(
+                            targets=[ast.Name(id=selector, ctx=ast.Store())],
+                            value=index_tree(node.value, order),
+                        ), node)
+                    return node
+
+                def visit_Call(self, node):  # noqa: N802
+                    node = self.generic_visit(node)
+                    if isinstance(node.func, ast.Name) and node.func.id == name:
+                        return call_of(node)
+                    return node
+
+            Rewriter().visit(function)
+            receipts.append({
+                "line": int(getattr(function, "lineno", -1)),
+                "column": int(getattr(function, "col_offset", -1)),
+                "selection": name,
+                "functions": tuple(order),
+            })
+    # A choice of functions that is still a value here is passed, copied or
+    # returned rather than called.  Nothing lowers a function-valued choice:
+    # it once lost its call's parameter and return value silently.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.IfExp) and leaves(node) is not None:
+            raise ValueError(
+                "function_selection_value: a conditional choice of functions "
+                f"({ast.unparse(node)!r}, line {getattr(node, 'lineno', '?')}) "
+                "is used as a value, not as the callee of a call or a "
+                "local name that is only called; it has no lowering"
+            )
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
 _MAPPING_ANNOTATIONS = frozenset({
     "dict", "Dict", "Mapping", "MutableMapping", "defaultdict",
     "OrderedDict",

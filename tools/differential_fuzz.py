@@ -518,7 +518,85 @@ class Rec:
 """
 
 
+# FUZZ_EXT=5: aimed at the families the silent lane found on 2026-10-24
+# (EXT=3/4 seeds were saturated): dict deletes, absent keys and ``get``,
+# ``items()`` over big ints, set displays and comprehensions, local record
+# classes written after construction and in arms, a copied name that either
+# side rebinds, and stores through list/dict formals.
+EXT5_HELPERS = """class Pt:
+    def __init__(self, x: int, y: int):
+        self.x = x
+        self.y = y
+
+
+class Acc:
+    def __init__(self, k: int):
+        self.k = k
+        self.total = 0
+
+    def add(self, v: int) -> None:
+        self.total += v * self.k
+
+    @staticmethod
+    def scale(a: int, b: int) -> int:
+        return a * b - 1
+
+
+def setkey(d: dict[int, int], k: int, v: int) -> None:
+    d[k] = v
+
+
+def dropkey(d: dict[int, int], k: int) -> None:
+    if k in d:
+        del d[k]
+
+
+"""
+
+EXTENDED5 = [
+    (["d{v} = {{1: n, 2: {a}, 3: {b}}}", "del d{v}[{c} % 3 + 1]", "g{v} = d{v}.get(n % 4)"], "len(d{v}) * 100 + ({b} if g{v} is None else g{v}) * 10 + d{v}.get(2, -1)"),
+    (["d{v} = {{}}", "for k{v} in range(n % 4 + 1):", "    d{v}[k{v}] = k{v} * {a}", "if (n % 3) in d{v}:", "    del d{v}[n % 3]"], "len(d{v}) * 10 + d{v}.get({b} % 4, 7)"),
+    (["d{v} = {{1: n * 4000000000, 2: {a} * 3000000000}}", "s{v} = 0", "for k{v}, w{v} in d{v}.items():", "    s{v} += k{v} * w{v}"], "s{v} % 1000003"),
+    (["d{v} = {{n % 3: {a}, 5: {b}}}", "e{v} = d{v}.get(n % 3, -1) + d{v}.get(4, {c})"], "e{v} * 10 + len(d{v})"),
+    (["s{v} = {{{a}, n % 3, {b} % 3}}", "s{v}.add(n % 5)", "s{v}.discard({c} % 3)"], "len(s{v}) * 10 + int((n % 3) in s{v})"),
+    (["s{v} = {{x{v} % {a} for x{v} in range(n % 6 + 1)}}"], "len(s{v}) * 10 + int(0 in s{v})"),
+    (["xs{v} = [n % 3, {a}, n % 3]", "s{v} = set(xs{v})", "t{v} = frozenset(x{v} + 1 for x{v} in xs{v})"], "len(s{v}) * 10 + len(t{v})"),
+    (["d{v} = {{1: n, 2: {a}}}", "t{v} = len(d{v})", "g{v} = d{v}.get({c} + 5, -1)", "d{v}[{c} + 5] = {b}"], "t{v} * 1000 + g{v} * 100 + len(d{v}) * 10 + d{v}[{c} + 5]"),
+    (["ys{v} = [{a}, n]", "ys{v}[1] = {b}", "ys{v}[0] += n", "xs{v} = [n % 3, {c}]", "s{v} = set(xs{v})", "t{v} = set(xs{v})"], "(ys{v}[0] + ys{v}[1]) + (len(s{v}) * 10 + len(t{v}))"),
+    (["p{v} = Pt(n, {a})", "p{v}.x = p{v}.x + {b}"], "p{v}.x * 10 + p{v}.y"),
+    (["p{v} = Pt({a}, {b})", "if n > {c}:", "    p{v}.y = n", "else:", "    p{v}.x = -n"], "p{v}.x * 100 + p{v}.y"),
+    (["q{v} = Acc({a})", "q{v}.add(n)", "q{v}.add({b})"], "q{v}.total + Acc.scale(n, {c})"),
+    (["a{v} = [n, {a}]", "b{v} = a{v}", "b{v}.append({b})", "a{v} = [{c}]"], "len(a{v}) * 100 + len(b{v}) * 10 + b{v}[-1]"),
+    (["x{v} = n + {a}", "y{v} = x{v}", "x{v} = x{v} * 2"], "x{v} * 10 + y{v}"),
+    (["d{v} = {{1: n}}", "e{v} = d{v}", "e{v}[2] = {a}", "d{v} = {{3: {b}}}"], "len(d{v}) * 100 + len(e{v}) * 10 + e{v}.get(2, -1)"),
+    (["d{v} = {{1: n}}", "setkey(d{v}, {a} + 1, n + 1)", "dropkey(d{v}, 1)"], "len(d{v}) * 100 + d{v}.get({a} + 1, -1)"),
+    (["xs{v} = [n, {a}, {b}]", "setfirst(xs{v}, {c})", "swap(xs{v})"], "xs{v}[0] * 100 + xs{v}[1] * 10 + xs{v}[2]"),
+    (["d{v} = {{1: n, 2: {a}, 3: {b}}}", "t{v} = len(d{v}) + n", "del d{v}[{c} % 3 + 1]", "u{v} = d{v}[n % 4] if n % 4 in d{v} else t{v}"], "len(d{v}) * 100 + t{v} * 10 + u{v}"),
+    (["s{v} = {{n, {a}, {b} + 10}}", "t{v} = len(s{v})", "s{v}.add(n + 20)"], "len(s{v}) * 10 + t{v}"),
+    (["r{v} = [{a}]", "if n > {c}:", "    r{v} = [n, {b}]", "r{v}.append({c})"], "sum(r{v}) * 100 + max(r{v}) * 10 + len(r{v})"),
+]
+
+
+def _make_aimed_program(rng):
+    """One to three EXTENDED5 snippets, plus at most one base snippet."""
+
+    chosen = [("x", index) for index in rng.sample(range(len(EXTENDED5)), rng.randint(1, 3))]
+    if rng.random() < 0.5:
+        chosen.append(("s", rng.randrange(len(SNIPPETS))))
+    rng.shuffle(chosen)
+    body, exprs = [], []
+    for v, (pool, index) in enumerate(chosen):
+        lines, expr = (EXTENDED5 if pool == "x" else SNIPPETS)[index]
+        values = {"v": v, "a": rng.randint(1, 6), "b": rng.randint(-3, 9), "c": rng.randint(0, 8)}
+        body += ["    " + line.format(**values) for line in lines]
+        exprs.append(expr.format(**values))
+    text = HELPERS + EXT3_HELPERS + EXT5_HELPERS + "def root(n: int) -> int:\n" + "\n".join(body) + "\n    return " + " + ".join(f"({e})" for e in exprs) + "\n"
+    return text, tuple(f"{pool}{index}" for pool, index in chosen)
+
+
 def make_program(rng):
+    if os.environ.get("FUZZ_EXT") == "5":
+        return _make_aimed_program(rng)
     pool = SNIPPETS + (EXTENDED if os.environ.get("FUZZ_EXT") else []) + (
         EXTENDED2 if os.environ.get("FUZZ_EXT") in {"2", "3", "4"} else []) + (
         EXTENDED3 if os.environ.get("FUZZ_EXT") in {"3", "4"} else []) + (

@@ -12184,7 +12184,37 @@ class _ControlSSABuilder(TiledObject):
         length = self.fresh_value(
             dtype="int64", transform=LOAD, operands=(length_address,),
         )
-        self.emit(Handler.Load, [length_address], length, attributes=attributes)
+        if (
+            query.operation in {"length", "truth"}
+            and descriptor.live_flags_value_id is not None
+        ):
+            # A table that retains deleted rows has the length of its live
+            # rows (the region-read rule in ``_read``); the length cell
+            # still counts the tombstones.
+            from .ir_sequence_tables import lower_sequence_live_length
+
+            helper_name = self._sequence_helper_name(
+                sequence_id, "live_length",
+            )
+            self._register_sequence_lowering(lower_sequence_live_length(
+                descriptor,
+                function_name=helper_name,
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+            ))
+            self.emit(
+                Handler.Call, list(storage), length,
+                attributes={
+                    **attributes,
+                    "callee": helper_name,
+                    "source_linked": True,
+                    "ssa_sequence_operation": "live_length",
+                    "sequence_id": sequence_id,
+                },
+            )
+        else:
+            self.emit(
+                Handler.Load, [length_address], length, attributes=attributes,
+            )
         if query.operation == "any":
             preheader = self.current
             header = self.new_block("sequence_any_header")
@@ -23063,9 +23093,14 @@ def _inject_field_slot_access(
     # arena form is the degenerate (and fastest) one-column case.  Slots keep a
     # logical index, while this table resolves that index to (arena, offset),
     # so mixed fields never need coercion or a tagged-object runtime.
+    # Every slot of the receiver has a location, touched here or not: one
+    # object arena passes through every method of its class.
     slot_dtypes = {
         int(slot): str((field_dtypes or {}).get(int(slot), dtype))
-        for _kind, _value_id, slot in field_ops
+        for slot in (
+            *range(int(field_count)),
+            *(int(slot) for _kind, _value_id, slot in field_ops),
+        )
     }
     column_keys = (
         tuple((slot_dtypes[slot], int(slot)) for slot in sorted(slot_dtypes))
@@ -23729,6 +23764,7 @@ def _schedule_loop_callsites(
     pure_region_indices: frozenset[int] = frozenset(),
     table_region_operations: Mapping[int, Any] | None = None,
     table_region_post_operations: Mapping[int, Any] | None = None,
+    sequence_read_before_effects: tuple[tuple[int, int], ...] = (),
 ) -> tuple[ControlProgram, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]]:
     """Install this closure's PlanCalls as ordinary scheduled statements.
 
@@ -24590,6 +24626,22 @@ def _schedule_loop_callsites(
                                 for value_id in length_signature[0]
                                 if int(value_id) in sequence_length_values
                             )
+                    # Program: ``xs0[i] += 1`` in a loop, then ``s2 = {n, 6};
+                    # addto(s2, 4)`` and ``sum(s2)`` (fuzz p7_59).  Wrong
+                    # record: the region summing ``s2`` takes the arena itself
+                    # as a feed, which counted as no read of it, so nothing
+                    # ordered it after the call that adds to ``s2`` and the
+                    # hierarchy put it first (the sum missed 4; clean audit).
+                    # Rule: a region fed an arena a mutation of this run
+                    # writes reads that arena.
+                    if isinstance(candidate, StatementBlock) and scheduled_region(candidate) is not None:
+                        arena_signature = dependency_signature(candidate)
+                        if arena_signature is not None:
+                            reads.update(
+                                int(value_id)
+                                for value_id in arena_signature[0]
+                                if int(value_id) in mutated_arenas
+                            )
                     # PROGRAM SHAPE: a region ``StatementBlock`` whose effects
                     # (append/extend/store/pack_bits/lookup ...) are recorded
                     # in table_region_operations / _post_operations.  WRONG
@@ -24665,6 +24717,23 @@ def _schedule_loop_callsites(
                     elif isinstance(candidate, SequenceQueryBlock):
                         if candidate.producer_loop_node_id is None:
                             reads.add(int(candidate.sequence_value_id))
+                    elif isinstance(candidate, LoopBlock):
+                        # Program: ``xs0 = [6, n]; xs0[1] = 1; xs0[0] += n;
+                        # xs2 = [n % 3, 3]``, then ``set(xs2)`` twice and
+                        # ``(xs0[0] + xs0[1]) + (len(s2) * 10 + len(t2))``
+                        # (fuzz p145_9).  Wrong record: the loop filling a
+                        # set from ``xs2`` runs to ``__iterable_extent_14__``
+                        # and reads its rows, but listed no read of arena 14,
+                        # so nothing ordered it after the appends building
+                        # ``xs2``.  The region holding ``xs0[0] + n`` and both
+                        # lengths pulled the loops ahead of them: two empty
+                        # sets (7 for 29; clean audit).  Rule: a loop over a
+                        # sequence's extent reads that sequence.
+                        extent = re.fullmatch(
+                            r"__iterable_extent_(\d+)__", str(candidate.stop).strip()
+                        )
+                        if extent is not None:
+                            reads.add(int(extent.group(1)))
                     elif isinstance(candidate, LoopControlBlock):
                         # A return hands its arenas to the caller as they
                         # stand at this edge.
@@ -24714,6 +24783,7 @@ def _schedule_loop_callsites(
                 # The run position of such a query says nothing about it, so
                 # it takes no write-after-read edge to that carrier either.
                 follows: set[tuple[int, int]] = set()
+                precedes: set[tuple[int, int]] = set()
                 deletions_by_position: dict[int, list[tuple[int, int]]] = {}
                 for position, child in enumerate(run):
                     if not isinstance(child, StatementBlock):
@@ -24735,6 +24805,20 @@ def _schedule_loop_callsites(
                             (int(arguments[0]), int(sequence_id))
                             for sequence_id in operation_writes
                         )
+                # Program: ``d = {1: n, 2: 4}; t = len(d); d[7] = 4`` then
+                # ``t * 100 + len(d) * 10 + d[1]`` (silent lane).  Wrong
+                # record: the graph numbers ``t``'s ``len`` after the store
+                # (demand order), so the id rule above ordered the query
+                # after the region carrying the store (327 for 227; clean
+                # audit).  Rule: a query the source reads before a write
+                # (``sequence_read_before_effects``, from authored spans,
+                # loops and branches accounted) precedes that write's
+                # carrier; value-id order decides only the writes the source
+                # does not order.
+                read_before_effect = {
+                    (int(reader), int(effect))
+                    for reader, effect in sequence_read_before_effects
+                }
                 for position, child in enumerate(run):
                     if not (
                         isinstance(child, SequenceQueryBlock)
@@ -24742,6 +24826,18 @@ def _schedule_loop_callsites(
                     ):
                         continue
                     for carrier, deletions in deletions_by_position.items():
+                        if carrier != position and any(
+                            sequence_id == int(child.sequence_value_id)
+                            and (int(child.result_value_id), effect_id)
+                            in read_before_effect
+                            for effect_id, sequence_id in deletions
+                        ):
+                            precedes.add((position, carrier))
+                            require(carrier, position, (
+                                "sequence_read_before_write",
+                                int(child.sequence_value_id),
+                            ))
+                            continue
                         if carrier != position and any(
                             sequence_id == int(child.sequence_value_id)
                             and effect_id < int(child.result_value_id)
@@ -24761,6 +24857,7 @@ def _schedule_loop_callsites(
                 last_access: dict[int, int] = {}
                 last_write: dict[int, int] = {}
                 reads_since_write: dict[int, list[int]] = {}
+                write_history: dict[int, list[int]] = {}
                 last_terminal = None
                 terminal_guard_candidates: list[tuple[int, int]] = []
                 for position, child in enumerate(run):
@@ -24816,8 +24913,15 @@ def _schedule_loop_callsites(
                                     "sequence_birth", int(arena)
                                 ))
                     for arena in reads:
-                        if arena in last_write:
-                            require(position, last_write[arena], (
+                        # A query the source reads before a write reads the
+                        # write before that one.
+                        prior_write = next((
+                            writer
+                            for writer in reversed(write_history.get(arena, ()))
+                            if (position, writer) not in precedes
+                        ), None)
+                        if prior_write is not None:
+                            require(position, prior_write, (
                                 "sequence_raw", int(arena)
                             ))
                     for arena in writes:
@@ -24874,6 +24978,7 @@ def _schedule_loop_callsites(
                         reads_since_write.setdefault(arena, []).append(position)
                     for arena in writes:
                         last_write[arena] = position
+                        write_history.setdefault(arena, []).append(position)
                         reads_since_write[arena] = []
                     # A source-placed call following a guarded continue/return
                     # must not execute on that terminal edge while waiting for
@@ -28481,6 +28586,7 @@ def lower_control_sections_to_ssa(
         ),
         table_region_operations=table_region_operations,
         table_region_post_operations=table_region_post_operations,
+        sequence_read_before_effects=sequence_read_before_effects,
     )
     # Uniform types describe a control use (for example an integer loop
     # bound), not authority to reinterpret an explicitly typed ABI buffer.
@@ -28867,13 +28973,26 @@ def lower_control_sections_to_ssa(
             ),
         )
         nested_record_slots.add(int(slot))
+    # Program: ``Walker.__init__`` writes ``k`` and ``steps``; ``count``
+    # reads only ``steps`` (the SSA interpreter thread's class-route
+    # repro).  Wrong record: each method's receiver view kept only the
+    # slots it touched, renumbered from 0, so ``count`` read ``steps`` from
+    # slot 0, where ``__init__`` had stored ``k`` (one object arena passes
+    # through every method; the class table names one layout).  Rule: a
+    # receiver's scalar slots are every scalar field of its record, in the
+    # record's order, whichever ones this method touches.  A declared
+    # ProgramABI record binds across call edges by field name, so its view
+    # keeps only the fields this method touches.
     scalar_slots = tuple(sorted({
         int(slot)
-        for _kind, _value_id, slot in field_ops
+        for slot in (
+            *(() if declared_contracts else range(len(field_names))),
+            *(int(slot) for _kind, _value_id, slot in field_ops),
+        )
         if int(slot) not in sequence_field_slots
         and int(slot) not in span_slots
         and int(slot) not in nested_record_slots
-    }))
+    })) if field_ops else ()
     compact_slot = {slot: index for index, slot in enumerate(scalar_slots)}
     scalar_field_ops = tuple(
         (kind, value_id, compact_slot[slot])
@@ -29322,6 +29441,23 @@ def lower_control_sections_to_ssa(
                         for sequence_id in sequence_ids
                         if control_sequences.by_id(sequence_id) is not None
                     })
+                # Program: ``rep = [1]; if k > 2: rep = [k, 2]``, then
+                # ``rep.append(3); sum(rep)`` (Lane D's report).  Wrong
+                # record: the conditional's merged spelling (11) claims the
+                # same column as the arena it replaces into (2), so two
+                # descriptors matched, the region got no length operand, and
+                # ``sum`` read the display's one row (12 for 42; clean
+                # audit).  Rule: descriptors of one column are one storage;
+                # the argument's own sequence is the descriptor.
+                if (
+                    len(descriptors) > 1
+                    and int(argument.id) in descriptors
+                    and len({
+                        tuple(candidate.column_value_ids)
+                        for candidate in descriptors.values()
+                    }) == 1
+                ):
+                    descriptors = {int(argument.id): descriptors[int(argument.id)]}
                 if len(descriptors) != 1:
                     continue
                 descriptor = next(iter(descriptors.values()))
@@ -29611,6 +29747,40 @@ def lower_control_sections_to_ssa(
     _settle_child_pool_operation_dtypes(
         module.functions, module.sequence_tables,
     )
+    # Program: ``ys = [n, 2]; ys[0] = 0.5; return ys[0] + ys[1]`` (Lane
+    # D's report).  Wrong record: the region stored a float64 into the
+    # list's int64 arena and the C store truncated it (2 for 2.5; clean
+    # audit).  A Python list row keeps the float.  Rule: a store of a
+    # floating value into an integer element is refused by name, never
+    # narrowed.
+    shortfalls = list(shortfalls)
+    for _function in module.functions.values():
+        _element_dtypes: dict[int, str] = {}
+        for _block in _function.blocks.values():
+            for _instruction in _block.instrs:
+                if (
+                    _instruction.op == "GetElementPtr"
+                    and _instruction.res is not None and _instruction.args
+                ):
+                    _element_dtypes[int(_instruction.res.id)] = str(
+                        _instruction.args[0].dtype or ""
+                    )
+                elif _instruction.op == "Store" and len(_instruction.args) == 2:
+                    _value, _address = _instruction.args
+                    _element = _element_dtypes.get(int(_address.id), "")
+                    if (
+                        str(_value.dtype or "").startswith("float")
+                        and (_element.startswith("int") or _element.startswith("uint")
+                             or _element == "bool")
+                    ):
+                        shortfalls.append(SSALoweringShortfall(
+                            "ssa-sequence", "float-into-integer-element",
+                            str(_function.name),
+                            f"a {_value.dtype} value {int(_value.id)} is "
+                            f"stored into a {_element} element; a Python "
+                            "row keeps the float, and narrowing it would "
+                            "change the value",
+                        ))
     report(
         f"complete; functions={len(module.functions)} "
         f"shortfalls={len(shortfalls) + len(control_shortfalls) + len(tensor_reference_shortfalls)}"
