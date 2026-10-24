@@ -3476,7 +3476,9 @@ def lower_tensor_calls_to_repository_ssa(
         # absence as rank zero froze tanh, square and subtraction at one
         # element, although its exact call feed later proved (2, 2).  Keep
         # semantic tensor operations intact until the call edge states the
-        # formal's shape or explicitly states scalar storage.
+        # formal's shape or explicitly states scalar storage.  The keyed
+        # tensor property's dynamic shape/rank/count formals are metadata
+        # for its already-proven span, not unshaped tensor data inputs.
         if (function.metadata or {}).get("source_region_integral"):
             scalar_formals = set(map(int, (
                 (function.metadata or {}).get("scalar_variant_argument_ids")
@@ -3484,6 +3486,7 @@ def lower_tensor_calls_to_repository_ssa(
             )))
             if any(
                 not tuple(formal.shape or ())
+                and (formal.accounting or {}).get("tensor_extent_for") is None
                 and int(formal.id) not in scalar_formals
                 and (formal.accounting or {}).get("program_abi_storage")
                 is None
