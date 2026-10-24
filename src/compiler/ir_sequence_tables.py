@@ -3928,10 +3928,16 @@ def lower_table_delete(
     absent = builder.block("delete_absent")
     complete = builder.block("complete")
     zero = builder.const(entry, 0)
-    one = builder.const(entry, 1)
     deleted = builder.const(entry, 4)
+    # Program: ``del d[2]; len(d)`` (c338, c406).  Wrong record: the row
+    # counter was an ``int`` phi whose latch increment the type linker
+    # settles to the int64 length it counts against, so LLVM refused the
+    # phi.  Rule: a row counter over an int64 length is int64, as in every
+    # other scan.
+    row_zero = builder.const(entry, 0, dtype="int64")
+    row_one = builder.const(entry, 1, dtype="int64")
     length_slot = builder.fresh("ptr")
-    length = builder.fresh("int")
+    length = builder.fresh("int64")
     status_slot = builder.fresh("ptr")
     builder.emit(entry, "GetElementPtr", [
         SSAValue(descriptor.length_address_id, dtype="int64", shape=(1,)), zero
@@ -3939,9 +3945,9 @@ def lower_table_delete(
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
     builder.branch(entry, header)
-    index = builder.fresh("int")
-    next_index = builder.fresh("int")
-    builder.emit(header, "Phi", [zero, next_index], index, attributes={
+    index = builder.fresh("int64")
+    next_index = builder.fresh("int64")
+    builder.emit(header, "Phi", [row_zero, next_index], index, attributes={
         "incoming_blocks": (entry.name, latch.name)
     })
     continues = builder.fresh("bool")
@@ -3975,7 +3981,7 @@ def lower_table_delete(
     builder.emit(body, "Load", [live_address], live)
     builder.emit(body, "LAnd", [matches, live], active_match)
     builder.cond(body, active_match, remove, latch)
-    builder.emit(latch, "Add", [index, one], next_index)
+    builder.emit(latch, "Add", [index, row_one], next_index)
     builder.branch(latch, header)
     builder.emit(remove, "Store", [zero, live_address])
     builder.emit(remove, "Store", [deleted, status_slot])
@@ -4030,10 +4036,16 @@ def lower_table_delete_first(
     absent = builder.block("delete_absent")
     complete = builder.block("complete")
     zero = builder.const(entry, 0)
-    one = builder.const(entry, 1)
     deleted = builder.const(entry, 4)
+    # Program: ``del d[2]; len(d)`` (c338, c406).  Wrong record: the row
+    # counter was an ``int`` phi whose latch increment the type linker
+    # settles to the int64 length it counts against, so LLVM refused the
+    # phi.  Rule: a row counter over an int64 length is int64, as in every
+    # other scan.
+    row_zero = builder.const(entry, 0, dtype="int64")
+    row_one = builder.const(entry, 1, dtype="int64")
     length_slot = builder.fresh("ptr")
-    length = builder.fresh("int")
+    length = builder.fresh("int64")
     status_slot = builder.fresh("ptr")
     builder.emit(entry, "GetElementPtr", [SSAValue(
         descriptor.length_address_id, dtype="int64", shape=(1,)
@@ -4041,9 +4053,9 @@ def lower_table_delete_first(
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
     builder.branch(entry, header)
-    index = builder.fresh("int")
-    next_index = builder.fresh("int")
-    builder.emit(header, "Phi", [zero, next_index], index, attributes={
+    index = builder.fresh("int64")
+    next_index = builder.fresh("int64")
+    builder.emit(header, "Phi", [row_zero, next_index], index, attributes={
         "incoming_blocks": (entry.name, latch.name)
     })
     continues = builder.fresh("bool")
@@ -4056,7 +4068,7 @@ def lower_table_delete_first(
     ), index], live_address)
     builder.emit(body, "Load", [live_address], live)
     builder.cond(body, live, remove, latch)
-    builder.emit(latch, "Add", [index, one], next_index)
+    builder.emit(latch, "Add", [index, row_one], next_index)
     builder.branch(latch, header)
     builder.emit(remove, "Store", [zero, live_address])
     builder.emit(remove, "Store", [deleted, status_slot])

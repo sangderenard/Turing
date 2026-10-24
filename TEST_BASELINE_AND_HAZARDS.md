@@ -1,3 +1,9 @@
+2026-10-24 LANE E, E24 (MEASURED, cloud): a table delete counts rows with an
+int64 counter, so LLVM compiles every keyed-delete program (12 were refused
+on an i32/i64 phi at main 11944336). At 376f1f19 (328 programs): C 328/328, LLVM
+327/328 (c367, same on main), Fortran 327 PASS (c22 by design). Fuzz seed
+64: 0 WRONG / 0 TYPE. Gate names identical to main 11944336.
+
 2026-10-24 GLSL ARENA CONTROLS (MEASURED, cloud): composed GLSL shaders read
 u_count/u_extent/u_slot from two read-only std430 storage blocks (set 0,
 bindings 1 and 2) instead of default-block uniforms, so the same source

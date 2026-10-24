@@ -791,3 +791,30 @@ unchanged (static, which is what Windows uses).
   0 WRONG and 0 TYPE. The new snippet was not drawn; c404 is its program.
 - Gate at `086aac37` and at main `da63b7dd`, each on a clean worktree: aa 89 /
   ab 7 / ac 26 / rec 20 on both, with the same failure names in every part.
+
+## E24: a table delete counts rows with an int64 counter
+
+- **Program:** `d = {1: n, 2: 3, 5: 7}; del d[2]; len(d)` (c338), and every
+  corpus program with a keyed delete (c337, c370, c371, c387-c389,
+  c430-c433, c406).
+- **Wrong record:** `lower_table_delete` and `lower_table_delete_first`
+  scanned rows with an `int` phi. The type linker settles the latch
+  increment to the int64 length it counts against, so LLVM refused the
+  i32/i64 phi on all twelve programs. C and Fortran were not affected.
+- **Rule:** a row counter over an int64 length is int64, as in every other
+  scan lowering (`ir_sequence_tables`).
+- **Separate finding (LLVM, loud, same at main):** a root whose result folds
+  to a constant and never reads `n` (fuzz p64_18:
+  `xs0 = [3, n, 0]; return xs0[0] * 7 + xs0[2]`) fails LLVM emission with
+  `emission_artifact: no source cell ... value_without_identity_cell`.
+
+### Receipts for E24
+
+- Corpus at `376f1f19` on main `11944336` (328 programs): C 328/328, LLVM
+  327/328 (c367, same at main), Fortran 327 PASS, 1 WRONG (c22, by design).
+- c406 is LLVM EMIT-INCOMPLETE (the phi) at main `11944336`.
+- Fuzz seed 64 (`FUZZ_EXT=3`, `llvm,fortran`, 30 programs, the new snippet
+  drawn once in p64_27): 29 PASS, 1 CRASH (p64_18, the separate finding
+  above), 0 WRONG and 0 TYPE.
+- Gate at `376f1f19` and at main `11944336`, each on a clean worktree: aa 89 /
+  ab 7 / ac 26 / rec 20 on both, with the same failure names in every part.
