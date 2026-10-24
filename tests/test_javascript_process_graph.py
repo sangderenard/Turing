@@ -149,7 +149,7 @@ def test_javascript_round_trips_through_the_process_graph(source):
 
 @pytest.mark.parametrize("source,code", [
     ("a == b", "unsupported-binary-operator"),
-    ("a % b", "unsupported-binary-operator"),
+    ("a & b", "unsupported-binary-operator"),
     ("a >>> b", "unsupported-binary-operator"),
     ("typeof a", "unsupported-unary-operator"),
     ("[a, b]", "unsupported-node-type"),
