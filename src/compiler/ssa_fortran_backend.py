@@ -243,8 +243,20 @@ _UNARY: dict[str, str] = {
         "(aint({0}) - merge(1.0_c_double, 0.0_c_double, "
         "{0} < aint({0})))"
     ),
-    "ceil": "real(ceiling({0}), c_double)",
-    "round": "real(nint({0}), c_double)",
+    # CEILING and NINT return a default (32-bit) INTEGER, so they had the
+    # same cliff at 2**31; and NINT rounds ties away from zero where
+    # Python's ``round`` (and the C lane's ``nearbyint``) rounds them to
+    # even: ``round(-2.5)`` came back -3, not -2 (silent lane D6, corpus
+    # c436).  Both stay in the reals.  A tie is the one place ANINT and
+    # ties-to-even disagree, and there twice ANINT of the half is even.
+    "ceil": (
+        "(aint({0}) + merge(1.0_c_double, 0.0_c_double, "
+        "{0} > aint({0})))"
+    ),
+    "round": (
+        "merge(2.0_c_double * anint({0} / 2.0_c_double), anint({0}), "
+        "abs({0} - aint({0})) == 0.5_c_double)"
+    ),
     "sign": "sign(1.0_c_double, {0})",
     "logical_not": "(.not. {0})",
     "trunc": "aint({0})",
@@ -3717,12 +3729,19 @@ class _FunctionEmitter:
 
         if operation not in ("max", "min", "sum", "all", "any"):
             return None
-        if not instr.args or tuple(instr.args[0].shape or ()):
+        if not instr.args:
             return None
         source = instr.args[0]
+        # Program: ``ys = [5] * (n % 4); ys.append(n); sum(ys)`` (E22a).  A
+        # heap sequence's operand is its pointer cell, whose (1,) shape is
+        # the cell, not the rows; its rows are its view over the live length.
+        heap = int(source.id) in self._heap_elements
+        if tuple(source.shape or ()) and not heap:
+            return None
         accounting = dict(source.accounting or {})
         if not (
-            accounting.get("sequence_arena")
+            heap
+            or accounting.get("sequence_arena")
             or accounting.get("program_abi_storage") in ("span", "sequence")
         ):
             return None
@@ -4358,6 +4377,18 @@ class _FunctionEmitter:
         elif left is not None and len(args) == 1:
             args = [_literal(left), args[0]]
 
+        if (
+            op in ("max", "min")
+            and len(instr.args) == 1
+            and instr.res is not None
+            and tuple(instr.res.shape or ())
+        ):
+            # Program: ``max(y)`` over a (2, 3) span.  Wrong record:
+            # ``maxval(y)`` was assigned to a (2, 3) result, so every element
+            # read 5.0, where Python raises (a row's truth is ambiguous).
+            # Rule: one operand reduced into an array is not a whole-array
+            # reduction; it has no registered expression.
+            return None
         if op in _REDUCTION and len(args) == 1:
             if op == "sum" and self._is_logical(instr.args[0]):
                 # Summing a mask counts its true elements, which Fortran

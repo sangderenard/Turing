@@ -1614,11 +1614,48 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         if carried_declarations and isinstance(incumbent_fact, FieldFact):
             field_fact = incumbent_fact
             cells = tuple(dict.fromkeys((*cells, incumbent_cell)))
+        mode = Mode.CONCORD
+        # Program: ``SSAReferenceEvaluator.run`` compiled as its own unit.
+        # Wrong record: the unit's partition keeps the class with ``run``
+        # alone, so ``history`` was declared from run's unannotated
+        # ``self.history = {...}``; the complete declared source then posted
+        # ``__init__``'s ``self.history: dict[int, list[Any]] = {}`` and the
+        # row refused the same field as a disagreement.  Rule: when every
+        # statement the incumbent was derived from is one of this view's
+        # declaring statements, this view is the same declaration seen with
+        # more of its statements, and only an annotation the incumbent's
+        # statements did not carry may be added (a REVISE from the larger
+        # cell set).  Two different annotations, or a view that does not
+        # contain the incumbent's statements, still disagree.
+        # The smaller view posted after the larger one reads the incumbent:
+        # its own statements are a subset of those the annotation came from.
+        if (
+            not carried_declarations
+            and isinstance(incumbent_fact, FieldFact)
+            and incumbent_fact != field_fact
+            and incumbent_fact.storage == field_fact.storage
+            and incumbent_fact.permissions == field_fact.permissions
+            and not (incumbent_fact.annotation and field_fact.annotation)
+        ):
+            incumbent_sources = {
+                source.key for source, _stage in book.edges_into(incumbent_cell)
+            }
+            view_sources = {cell.key for cell in cells}
+            if (
+                not incumbent_fact.annotation
+                and incumbent_sources and incumbent_sources < view_sources
+            ):
+                mode = Mode.REVISE
+            elif (
+                not field_fact.annotation
+                and view_sources and view_sources < incumbent_sources
+            ):
+                field_fact = incumbent_fact
         declaration_cells.append(book.post(
             CLASS_FIELD_DECLARATION,
             field_row,
             field_fact,
-            stage=INGESTION, provenance=Derived(cells), mode=Mode.CONCORD,
+            stage=INGESTION, provenance=Derived(cells), mode=mode,
         ))
     for method, entry in zip(methods, schema["methods"]):
         method_span = post_source_span(definition, method)
@@ -6426,7 +6463,8 @@ class ProcessGraph(TiledObject):
         # Each is a ``parameter_annotation`` row DERIVED from the ``arg``
         # span (plan 60, section 3.4); the dict is materialized from the page.
         from ...compiler.concordance_declarations import (
-            CLASS_DECLARATION, PARAMETER_ANNOTATION,
+            CLASS_DECLARATION, FUNCTION_RETURN_ANNOTATION,
+            PARAMETER_ANNOTATION,
         )
 
         annotation_rows = []
@@ -6460,6 +6498,35 @@ class ProcessGraph(TiledObject):
                 # owns the full qualified identity. Rebuilding that identity
                 # from the lifted name conflated stage: Any with Stage | None.
                 annotation_rows.append(((module_name, identity), ()))
+                # Lane D, D2.  ``def single(n) -> list[int]`` (corpus c215):
+                # the return annotation is authored ABI exactly as the
+                # parameters' are, but no page held it, so a caller's
+                # ``single(n)[0]`` had no element class until the callee's
+                # linked ABI arrived.  Post it beside the parameters, from
+                # its own span and the classes it names.
+                if function.returns is not None:
+                    returns_span = post_source_span(function, function.returns)
+                    if returns_span is not None:
+                        return_sources = [returns_span]
+                        for name in dict.fromkeys(
+                            node.id for node in ast.walk(function.returns)
+                            if isinstance(node, ast.Name)
+                        ):
+                            declared_class = book.latest_ref(
+                                CLASS_DECLARATION, (module_name, str(name)),
+                            )
+                            if declared_class is not None:
+                                return_sources.append(declared_class)
+                        book.post(
+                            FUNCTION_RETURN_ANNOTATION,
+                            (module_name, str(identity)),
+                            ast.unparse(function.returns),
+                            stage=INGESTION,
+                            provenance=Derived(tuple(dict.fromkeys(
+                                return_sources
+                            ))),
+                            mode=Mode.CONCORD,
+                        )
                 for parameter in parameters:
                     if parameter.annotation is None:
                         continue

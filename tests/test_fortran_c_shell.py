@@ -403,6 +403,88 @@ def test_list_rebound_on_one_branch_is_copied_into_its_initial_storage(
         assert got == [sum(rep) * 10 + len(rep) + max(rep)]
 
 
+_COPIED_NAME_PROGRAMS = {
+    # Two returned names bound to one value: each is its own output slot.
+    "returned_twice": (
+        "    p = k * 3\n"
+        "    a = p\n"
+        "    b = p\n"
+        "    return a, b\n"
+    ),
+    # ``a``'s value is not an earlier identity of ``b``'s output.
+    "rebound_after_copy": (
+        "    a = k + 2\n"
+        "    b = a\n"
+        "    b += 5\n"
+        "    return a, b\n"
+    ),
+    # Each name's arms belong to its own merge, not to the shared entry.
+    "branch_rebinds_each": (
+        "    a = k * 2\n"
+        "    b = a\n"
+        "    if k > 1:\n"
+        "        b = b - 1\n"
+        "    else:\n"
+        "        a = a + 10\n"
+        "    return b, a\n"
+    ),
+    # ``b`` is read in the loop as the preheader value, not ``c``'s Phi.
+    "loop_reads_seed": (
+        "    b = k + 2\n"
+        "    c = b\n"
+        "    while c < 40:\n"
+        "        c = c + b\n"
+        "    return c, b\n"
+    ),
+    # ... and in each unrolled copy.
+    "unrolled_reads_seed": (
+        "    b = k + 5\n"
+        "    c = b\n"
+        "    for i in range(3):\n"
+        "        c = c * 2 + b\n"
+        "    return c, b\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("program", sorted(_COPIED_NAME_PROGRAMS))
+def test_a_copied_name_keeps_its_own_value_when_either_is_rebound(
+    program, tmp_path,
+):
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    source = "def root(k: int):\n" + _COPIED_NAME_PROGRAMS[program]
+    namespace = {}
+    exec(source, namespace)
+    contract = str(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name=f"copied_name_{program}",
+        extraction_contract=contract, progress=lambda _: None,
+    )
+    root = module.functions[exports[0]]
+    params = dict(root.metadata["parameter_names"])
+    (ret,) = [
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    ]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native")
+    for k in (0, 1, 3, 5):
+        execution = artifact.prepare_execution(
+            {params["k"]: np.array([k])},
+        ).run()
+        got = [
+            execution.buffers[value.id].reshape(-1).tolist()[0]
+            for value in ret.args
+        ]
+        assert got == list(namespace["root"](k)), (program, k)
+
+
 def test_list_rebound_on_a_branch_while_another_name_holds_it_is_refused():
     # Copying the arm into the initial list would change ``keep`` too.
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa

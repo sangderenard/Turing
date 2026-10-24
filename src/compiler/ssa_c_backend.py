@@ -299,6 +299,9 @@ _UNARY_FOLDED = {
     key.casefold(): value for key, value in _UNARY.items()
     if value is not None
 }
+#: The folded unaries whose value is integral, so an integer result type
+#: holds it exactly (``round`` is ``nearbyint``: ties to even, as Python's).
+_INTEGER_VALUED_UNARY = frozenset({"floor", "ceil", "round", "trunc"})
 _UNARY_PREDICATES = {
     "isfinite": "isfinite",
     "isinf": "isinf",
@@ -4082,6 +4085,15 @@ def emit_ssa_module_to_c(
                         and descriptor.static_element_count
                     ):
                         count = int(descriptor.static_element_count)
+                    elif heap_element(source) is not None:
+                        # Program: ``ys = [5] * (n % 4); ys.append(n);
+                        # sum(ys)`` (E22a; lane E).  Wrong record: a heap
+                        # sequence's operand is its pointer CELL, shape
+                        # (1,), so the cell's extent was read as one row and
+                        # the reduction added the arena ADDRESS (silently
+                        # wrong for ints, a compile error for floats).  Rule:
+                        # a heap cell's rows are its live length, below.
+                        pass
                     else:
                         source_shape = tuple(source.shape or ())
                         if source_shape and all(
@@ -5764,7 +5776,9 @@ def emit_ssa_module_to_c(
                     )
                 elif op == "Trunc" and len(args) == 1 and _is_integer_dtype(
                     instruction.res.dtype
-                ):
+                ) and is_integer(instruction.args[0]):
+                    # Integer narrowing.  A float operand is ``math.trunc``,
+                    # which the integer-valued unary branch below spells.
                     result_type = _scalar_c_type(instruction.res.dtype)
                     unsigned_type = _unsigned_c_type(instruction.res.dtype)
                     integer_ids.add(result_id)
@@ -6052,7 +6066,34 @@ def emit_ssa_module_to_c(
                         f"({_unsigned_c_type(instruction.res.dtype)})"
                         f"({args[0]})) : ({args[0]}));"
                     )
+                elif (
+                    op.casefold() in _INTEGER_VALUED_UNARY and len(args) == 1
+                    and _is_integer_dtype(instruction.res.dtype)
+                ):
+                    # Program: ``x = n * 0.75; return round(x) + 3`` (silent
+                    # lane D6, corpus c436).  Wrong record: an int64
+                    # ``round`` was spelled into a double local whatever its
+                    # dtype, and the integer ``Add`` reading it converted
+                    # that double through ``uint64_t`` (undefined for a
+                    # negative double): n=-3 returned 2, not 1.  Rule: an
+                    # integer-valued unary with an integer result is
+                    # declared in the result's own type.  An integer operand
+                    # is already integral (Python's ``round``/``floor`` of an
+                    # int is the int) and never passes through double.
+                    kind = _scalar_c_type(instruction.res.dtype)
+                    declared_storage_type = kind
+                    integer_ids.add(result_id)
+                    rounded = (
+                        args[0] if is_integer(instruction.args[0])
+                        else f"{_UNARY_FOLDED[op.casefold()]}({args[0]})"
+                    )
+                    declared = f"const {kind} t{result_id} = ({kind})({rounded});"
                 elif op.casefold() in _UNARY_FOLDED and len(args) == 1:
+                    if _is_integer_dtype(instruction.res.dtype):
+                        shortfalls.append(CEmissionShortfall(
+                            op, f"no integer-result C spelling in {fn}",
+                        ))
+                        continue
                     declared_storage_type = "double"
                     declared = (
                         f"const double t{result_id} = "

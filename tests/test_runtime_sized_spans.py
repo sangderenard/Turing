@@ -301,3 +301,149 @@ def test_operator_matrix(tmp_path, backend, geometry, operation):
     np.testing.assert_allclose(
         got.reshape(-1).astype(float), expected.reshape(-1).astype(float),
     )
+
+
+# -- deployable SPIR-V from the same sanctioned entry ------------------------
+
+def test_rank_only_region_deploys_as_elementwise_spirv(tmp_path):
+    """The lowered region of the representative op is elementwise over
+    rank-2 runtime-sized spans, so it deploys one element per invocation."""
+
+    import shutil
+    import subprocess
+
+    from src.compiler.shader_deployment import spirv_deployment
+    from src.compiler.ssa_spirv_backend import emit_deployable_compute_shader
+
+    module, entry, _parameters, _result = _lower(
+        tmp_path, REPRESENTATIVE, "rep_spirv", 2,
+    )
+    (region_name,) = [name for name in module.functions if name != entry]
+    region = module.functions[region_name]
+    outputs = [
+        argument for block in region.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+        for argument in instruction.args
+    ]
+    shader = emit_deployable_compute_shader(region, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    record = spirv_deployment(shader).to_mapping()
+    spans = [
+        item["realizes"][0] for item in record["resources"]
+        if item["realizes"][0]["rank"]
+    ]
+    assert len(spans) == 3 and all(view["shape"] is None for view in spans)
+    if shutil.which("spirv-as") and shutil.which("spirv-val"):
+        source = tmp_path / "region.spvasm"
+        source.write_text(shader.source)
+        binary = tmp_path / "region.spv"
+        assembled = subprocess.run(
+            ["spirv-as", "--target-env", "vulkan1.1", str(source), "-o", str(binary)],
+            capture_output=True, text=True,
+        )
+        assert assembled.returncode == 0, assembled.stderr
+        validated = subprocess.run(
+            ["spirv-val", "--target-env", "vulkan1.1", str(binary)],
+            capture_output=True, text=True,
+        )
+        assert validated.returncode == 0, validated.stderr
+
+
+def test_static_reductions_deploy_and_runtime_ones_are_refused(tmp_path):
+    """``x.mean() - y.prod()`` lowers to one region per reduction.  With a
+    static shape each reduction region deploys; over runtime-sized spans it
+    is refused by name rather than read as an elementwise op."""
+
+    import shutil
+    import subprocess
+
+    from src.compiler.ssa_spirv_backend import emit_deployable_compute_shader
+
+    source = "def f(x, y):\n    return x.mean() - y.prod()\n"
+
+    def regions(name, shape):
+        module, entry, _parameters, _result = _lower(tmp_path, source, name, 1, shape)
+        for region_name, region in module.functions.items():
+            if region_name == entry:
+                continue
+            outputs = [
+                argument for block in region.blocks.values()
+                for instruction in block.instrs if instruction.op == "Ret"
+                for argument in instruction.args
+            ]
+            ops = {
+                instruction.op for block in region.blocks.values()
+                for instruction in block.instrs
+            }
+            yield ops, emit_deployable_compute_shader(region, outputs=outputs)
+
+    static = list(regions("red_static", (5,)))
+    assert {"mean", "prod"} <= set().union(*(ops for ops, _ in static))
+    for index, (_ops, shader) in enumerate(static):
+        assert shader.complete, shader.shortfalls
+        if not (shutil.which("spirv-as") and shutil.which("spirv-val")):
+            continue
+        text = tmp_path / f"region{index}.spvasm"
+        text.write_text(shader.source)
+        binary = tmp_path / f"region{index}.spv"
+        assembled = subprocess.run(
+            ["spirv-as", "--target-env", "vulkan1.1", str(text), "-o", str(binary)],
+            capture_output=True, text=True,
+        )
+        assert assembled.returncode == 0, assembled.stderr
+        validated = subprocess.run(
+            ["spirv-val", "--target-env", "vulkan1.1", str(binary)],
+            capture_output=True, text=True,
+        )
+        assert validated.returncode == 0, validated.stderr
+
+    for ops, shader in regions("red_runtime", None):
+        if ops & {"mean", "prod"}:
+            assert not shader.complete
+            assert "one element per invocation" in shader.shortfalls[0].reason
+
+
+# -- builtin max/min of one tensor ------------------------------------------
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("source,expected", [
+    ("def f(x, y):\n    return max(y) + min(x)\n", 9.0 + 1.0),
+    ("def f(x, y):\n    return y.max() - x.min()\n", 9.0 - 1.0),
+])
+def test_builtin_max_of_one_static_tensor_is_its_largest_element(
+    tmp_path, backend, source, expected,
+):
+    """``max(y)`` iterates a rank-1 tensor and returns one element, as
+    ``y.max()`` does; it is not an elementwise selector of one operand."""
+
+    module, entry, parameters, result = _lower(
+        tmp_path, source, f"one_max_{backend}", 1, shape=(5,),
+    )
+    x = np.array([1.0, 5.0, 2.0, 4.0, 3.0])
+    y = np.array([3.0, 9.0, -1.0, 2.0, 0.0])
+    _artifact, execution = _run(
+        backend, module, entry,
+        {parameters["x"]: x, parameters["y"]: y}, tmp_path,
+    )
+    got = np.asarray(execution.buffers[int(result.id)]).reshape(-1)
+    np.testing.assert_allclose(got, [expected])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("source", [
+    "def f(x, y):\n    return max(y)\n",
+    "def f(x, y):\n    return y.max(axis=0)\n",
+])
+def test_rank_two_max_reductions_are_refused_not_guessed(tmp_path, backend, source):
+    """``max(y)`` of a (2, 3) tensor raises in Python, and no backend spells
+    ``y.max(axis=0)`` yet: each is refused by name, never one row or a
+    broadcast whole-array maximum."""
+
+    module, entry, parameters, _result = _lower(
+        tmp_path, source, f"two_max_{backend}", 2, shape=(2, 3),
+    )
+    with pytest.raises(AssertionError):
+        _run(
+            backend, module, entry,
+            {parameters["y"]: np.arange(6.0).reshape(2, 3)}, tmp_path,
+        )

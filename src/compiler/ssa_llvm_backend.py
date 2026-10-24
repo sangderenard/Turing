@@ -87,7 +87,7 @@ _UNARY: dict[str, str] = {
     "Floor": "{out} = call double @llvm.floor.f64(double {0})",
     "Ceil": "{out} = call double @llvm.ceil.f64(double {0})",
     "Trunc": "{out} = call double @llvm.trunc.f64(double {0})",
-    "Round": "{out} = call double @llvm.round.f64(double {0})",
+    "Round": "{out} = call double @llvm.roundeven.f64(double {0})",
     "IsFinite": (
         "{out}.abs = call double @llvm.fabs.f64(double {0})\n"
         "{out} = fcmp one double {out}.abs, 0x7FF0000000000000"
@@ -173,7 +173,7 @@ _FUSED_UNARY: dict[str, str] = {
     "LOG": "{out} = call double @llvm.log.f64(double {0})",
     "NEG": "{out} = fneg double {0}",
     "ABS": "{out} = call double @llvm.fabs.f64(double {0})",
-    "ROUND": "{out} = call double @llvm.round.f64(double {0})",
+    "ROUND": "{out} = call double @llvm.roundeven.f64(double {0})",
     "TRUNC": "{out} = call double @llvm.trunc.f64(double {0})",
     "FLOOR": "{out} = call double @llvm.floor.f64(double {0})",
     "CEIL": "{out} = call double @llvm.ceil.f64(double {0})",
@@ -738,6 +738,13 @@ def integer_scalar_lines(
     evaluation converted back to the declared integer type.
     """
 
+    if (
+        str(operation).casefold() in {"floor", "ceil", "round", "trunc"}
+        and len(operands) == 1
+    ):
+        # ``math.floor(n)``/``round(n)`` of an int is the int itself (corpus
+        # c437); a round trip through double would lose bits above 2**53.
+        return ([f"{register} = add {operand_type} {operands[0]}, 0"], operand_type)
     if operation == "FloorDiv" and len(operands) == 2:
         # Heap-parent indexing in the compiler's own graph kernel uses
         # (position - 1) // 2, including -1 // 2 at the root. LLVM sdiv
@@ -1102,6 +1109,37 @@ def _declared_span_rank(value: _Any) -> int:
         int(accounting.get("program_abi_rank", 0) or 0),
         int(accounting.get("ssa_call_rank", 0) or 0),
     )
+
+
+def _reduction_read_as_selector(operation: str, instruction: _Any) -> str | None:
+    """Why a ``max``/``min`` reduction must not reach the elementwise table.
+
+    Program: ``y.max(axis=0)`` over a (2, 3) span returned row 0 (the
+    reduced axis read as a second operand of ``maxnum``), and ``max(y)`` of
+    a (2, 3) span raised IndexError in the binary template.  Rule: a
+    ``max``/``min`` that names an axis, or reduces ONE operand to an array,
+    is a reduction this emitter has no array spelling for; Python's builtin
+    ``max`` of a rank-2 tensor raises outright.
+    """
+
+    if str(operation).casefold() not in {"max", "min"}:
+        return None
+    result = instruction.res
+    if result is None or not tuple(result.shape or ()):
+        return None
+    attributes = instruction.attributes or {}
+    if attributes.get("axis") is not None or attributes.get("dim") is not None:
+        return (
+            f"{operation} over an axis has no LLVM array spelling; "
+            "only whole-array reductions are emitted"
+        )
+    if len(instruction.args) == 1:
+        return (
+            f"{operation} of one operand into an array is a reduction, not "
+            "an elementwise selector (builtin max/min of a rank-2 tensor "
+            "raises in Python)"
+        )
+    return None
 
 
 def _runtime_sized_span(value: _Any) -> bool:
@@ -4383,6 +4421,10 @@ def _emit_repository_call_module(
                 )
                 continue
 
+            selector = _reduction_read_as_selector(operation, instruction)
+            if selector is not None:
+                shortfalls.append(LLVMEmissionShortfall(name, operation, selector))
+                continue
             # The fused-module emitter and the reference evaluator both
             # resolve graph-native scalar names (``equal``, ``less_equal``,
             # and their siblings) through this shared vocabulary.  Keep the
@@ -4655,9 +4697,10 @@ def _emit_repository_call_module(
                     count = str(int(accounting["sequence_static_length"]))
                 elif static_shape and all(
                     isinstance(item, int) for item in static_shape
-                ) and accounting.get("program_abi_storage") not in {
-                    "span", "sequence",
-                }:
+                ) and accounting.get("program_abi_storage") != "sequence":
+                    # A span declared with a static shape has exactly that
+                    # many elements (``y.max()`` over a (5,) span, as C
+                    # reads it); a sequence's shape is its arena bound.
                     count = str(_math.prod(static_shape))
                 else:
                     sequence_ids = {

@@ -181,6 +181,55 @@ def test_reference_by_source_node_disambiguates_the_same_collision():
     assert table.reference_by_source_node(333) is None
 
 
+def _unbooked_addresses(monkeypatch):
+    # These tests read the name lookups only; the address book row is not
+    # under test.
+    monkeypatch.setattr(
+        FunctionTable, "_post_function_address",
+        staticmethod(lambda qualified, *_: repr(qualified)),
+    )
+
+
+def test_lexical_reference_never_answers_a_method(monkeypatch):
+    # Builtin ``min(a, b)`` beside AbstractTensor.min: the bare-name table
+    # answers the method; a bare source name never means a class member.
+    _unbooked_addresses(monkeypatch)
+    table = FunctionTable()
+    clamp = table.declare("min", qualified_name="helpers.min")
+    method = table.declare(
+        "min", qualified_name="Ops.min", metadata={"method_owner": "Ops"},
+    )
+
+    assert table.reference("min") == method
+    assert table.lexical_reference("min") == clamp
+
+    only_method = FunctionTable()
+    only_method.declare(
+        "min", qualified_name="Ops.min", metadata={"method_owner": "Ops"},
+    )
+    assert only_method.lexical_reference("min") is None
+
+
+def test_lexical_reference_prefers_the_calling_module_definition(monkeypatch):
+    # ``re._compile`` and ``re._compiler._compile`` share a bare name.
+    _unbooked_addresses(monkeypatch)
+    table = FunctionTable()
+    public = table.declare(
+        "_compile", qualified_name="re._compile",
+        metadata={"source_identity": ("re", "_compile")},
+    )
+    private = table.declare(
+        "_compile", qualified_name="re._compiler._compile",
+        metadata={"source_identity": ("re._compiler", "_compile")},
+    )
+
+    assert table.reference("_compile") == private
+    assert table.lexical_reference("_compile", module="re") == public
+    assert table.lexical_reference("_compile", module="re._compiler") == private
+    assert table.reference_by_source_identity(("re", "_compile")) == public
+    assert table.reference_by_source_identity(("builtins", "min")) is None
+
+
 def test_ssa_module_owns_the_same_neutral_function_table_type():
     module = IRModule(functions={})
     assert isinstance(module.function_table, FunctionTable)

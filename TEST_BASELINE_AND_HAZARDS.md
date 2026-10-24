@@ -1,3 +1,16 @@
+2026-10-24 LANE E, E22a (MEASURED, cloud): a heap sequence reduces over its
+live length, not its pointer cell (C summed the arena address: WRONG at main
+dd340a1b for ints, c407; floats did not compile, c408). At 73eb8a36 (331
+programs): C 331/331, LLVM 330/331 (c367, same on main), Fortran 330 PASS
+(c22 by design). Fuzz seed 65: 0 WRONG / 0 TYPE. Gate names identical to
+main dd340a1b.
+
+2026-10-24 LANE E, E24 (MEASURED, cloud): a table delete counts rows with an
+int64 counter, so LLVM compiles every keyed-delete program (12 were refused
+on an i32/i64 phi at main 11944336). At 376f1f19 (328 programs): C 328/328, LLVM
+327/328 (c367, same on main), Fortran 327 PASS (c22 by design). Fuzz seed
+64: 0 WRONG / 0 TYPE. Gate names identical to main 11944336.
+
 2026-10-24 WINDOWS PARITY (MEASURED, Windows, origin/main d440cd27): the C
 corpus is 328/328 PASS.  MinGW gfortran is 327 PASS plus c22's recorded LUT
 sin difference; owned-heap c400-c403 PASS.  Bootstrap completed its current

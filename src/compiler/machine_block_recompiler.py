@@ -1279,15 +1279,29 @@ def _emit_arithmetic(
 
         _emit_bool_flag(builder, flags_local, CF, carry_condition)
 
+        def authored_right():
+            # AF and OF are defined on the authored source, not on
+            # source + CF: right_local holds the effective subtrahend for
+            # SBB, so take CF back off.  Bits above the width do not reach
+            # either flag, so no mask is needed.
+            builder.local_get(right_local)
+            if kind == "sbb":
+                _emit_flag_truth(builder, CF)
+                builder.raw(OP_I64_EXTEND_I32_U, OP_I64_SUB)
+
         def auxiliary_condition():
-            builder.local_get(left_local).local_get(right_local).raw(OP_I64_XOR)
+            builder.local_get(left_local)
+            authored_right()
+            builder.raw(OP_I64_XOR)
             builder.local_get(result_local).raw(OP_I64_XOR)
             builder.i64_const(0x10).raw(OP_I64_AND, OP_I64_EQZ, OP_I32_EQZ)
 
         _emit_bool_flag(builder, flags_local, AF, auxiliary_condition)
 
         def overflow_condition():
-            builder.local_get(left_local).local_get(right_local).raw(OP_I64_XOR)
+            builder.local_get(left_local)
+            authored_right()
+            builder.raw(OP_I64_XOR)
             if kind == "add":
                 builder.i64_const(-1).raw(OP_I64_XOR)
             builder.local_get(left_local).local_get(result_local).raw(OP_I64_XOR)
@@ -2425,12 +2439,17 @@ def _wat_arithmetic(
         else:
             carry = "(i64.lt_u (local.get $left) (local.get $right))"
         flags = _wat_flag(flags, carry, CF)
+        # AF and OF use the authored source; $right is source + CF for SBB.
+        authored = (
+            f"(i64.sub (local.get $right) (i64.extend_i32_u {_wat_flag_truth(CF)}))"
+            if kind == "sbb" else "(local.get $right)"
+        )
         auxiliary_expr = (
             "(i64.and (i64.xor (i64.xor (local.get $left) "
-            "(local.get $right)) (local.get $result)) (i64.const 16))"
+            f"{authored}) (local.get $result)) (i64.const 16))"
         )
         flags = _wat_flag(flags, f"(i32.eqz (i64.eqz {auxiliary_expr}))", AF)
-        pair = "(i64.xor (local.get $left) (local.get $right))"
+        pair = f"(i64.xor (local.get $left) {authored})"
         if kind == "add":
             pair = f"(i64.xor {pair} (i64.const -1))"
         overflow_expr = (

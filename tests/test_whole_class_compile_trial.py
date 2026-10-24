@@ -102,3 +102,36 @@ def test_seeded_method_runs_natively_and_matches_python(tmp_path):
         result = ctypes.c_int64()
         add(a, b, ctypes.byref(result))
         assert result.value == a + b
+
+
+STORED_CALLABLE = '''
+from typing import Callable
+
+
+class Walker:
+    def __init__(self, {name}: Callable[[int], None]) -> None:
+        self.{name} = {name}
+        self.steps = 0
+
+    def poke(self, n: int) -> int:
+        self.{name}(n)
+        return n + 1
+'''
+
+
+@pytest.mark.parametrize("name", ["notify", "trace"])
+def test_call_through_a_stored_callable_field_is_refused_by_name(
+    tmp_path, name,
+):
+    # ``trace`` also spells a tensor operator: the unconsumed call used to be
+    # pruned as a dead pure tensor call and the library shipped without it.
+    source = tmp_path / "walker.py"
+    source.write_text(STORED_CALLABLE.format(name=name), encoding="utf-8")
+    route = run_class_route(source, "Walker", tmp_path / "out")
+    assert route["library"] is None
+    refusal = route["refusal"]
+    assert refusal is not None and refusal["type"] == "FortranEmissionError"
+    assert (
+        "call through a stored callable field with no lowered invocation: "
+        f"Walker.poke: self.{name}(n)"
+    ) in refusal["message"]

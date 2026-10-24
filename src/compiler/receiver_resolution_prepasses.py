@@ -345,6 +345,48 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         }
         return next(iter(matches)) if len(matches) == 1 else None
 
+    submitted_classes = {
+        str(name) for name in graph.G.graph.get("class_definitions") or ()
+    }
+
+    def class_object_binding(attributes: dict) -> str | None:
+        """The submitted class a free name IS (``Ops`` in ``Ops.m(...)``)."""
+
+        name = attributes.get("binding_name")
+        if (
+            attributes.get("binding_kind") == "external"
+            and name is not None
+            and str(name) in submitted_classes
+            and str(name) in class_table
+        ):
+            return str(name)
+        return None
+
+    method_bindings = {
+        int(entry.reference.address): entry.graph.G.graph.get("method_binding")
+        for entry in (getattr(graph, "function_table", None) or ())
+        if entry.graph is not None
+    }
+
+    def class_object_call_admits(receiver_id: int, reference: Any) -> bool:
+        """A call through the class object itself binds a static method.
+
+        Program: ``Ops.min(n, 1)`` with ``Ops.min`` a static method (silent
+        lane; the AbstractTensor init thread's repro).  Wrong record: the
+        free name ``Ops`` resolved to no class, so the call kept its
+        spelling and lowered as the canonical ``min`` reduction over
+        ``(Ops, n, 1)``: 0.0 for n=0, where Python returns -1.  Rule: a free
+        name that IS a submitted class is that class as a receiver, for a
+        static method only.  ``Ops.m(obj, x)`` on an instance method passes
+        ``obj`` as ``self``, which a receiver edge cannot state, so it stays
+        unlinked.
+        """
+
+        node = graph.G.nodes.get(int(receiver_id), {})
+        if class_object_binding(node.get("attributes") or {}) is None:
+            return True
+        return method_bindings.get(int(reference)) == "static"
+
     def receiver_class(value_id: int) -> str | None:
         pending = [int(value_id)]
         visited = set()
@@ -386,6 +428,9 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                 ) or specialized_class(attributes.get("binding_name"))
                 if class_ref is not None:
                     candidates.add(class_ref)
+                    continue
+                if class_object_binding(attributes) is not None:
+                    candidates.add(class_object_binding(attributes))
                     continue
             # Only identity-routing nodes may transmit a receiver class. An
             # arbitrary operation consuming an object does not return it.
@@ -437,7 +482,7 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         binding_name = (graph.G.nodes[receiver_id].get("attributes") or {}).get("binding_name")
         if method_name in (parameter_records.get(str(binding_name), {}).get("fields") or {}):
             continue  # An instance field can shadow a method.
-        if reference is None:
+        if reference is None or not class_object_call_admits(receiver_id, reference):
             continue
         data.setdefault("attributes", {}).update({
             "bound_method_ref": int(reference), "bound_receiver_id": int(receiver_id),
@@ -516,6 +561,16 @@ def _resolve_grounded_method_references(graph: Any) -> None:
             reference = specialized_method_reference(
                 expression.func.value.id,
                 expression.func.attr,
+            )
+        if reference is not None and not class_object_call_admits(
+            receiver_id, reference,
+        ):
+            # Left unlinked, the call keeps its spelling, and a method named
+            # like a canonical op (``min``, ``sum``) lowers as that op.
+            raise ValueError(
+                "class-qualified call to a non-static method has no "
+                f"receiver binding: {ast.unparse(expression.func)} "
+                f"({method_bindings.get(int(reference))} method)"
             )
         if reference is None:
             continue

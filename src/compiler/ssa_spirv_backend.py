@@ -215,9 +215,8 @@ _NOCONTRACTION_SPELLINGS: frozenset[str] = frozenset(
 )
 
 # Whole-array-to-scalar reductions -- not in any op table above (they need
-# accumulation across elements, not a single instruction), so they would
-# otherwise fall through to the generic "no opcode registered" shortfall.
-# Naming them lets that case report what it actually is.
+# accumulation across elements, not a single instruction). Over a static
+# array they unroll in ``_FunctionEmitter._emit_reduction``.
 _REDUCTION_OPS: frozenset[str] = frozenset(
     {"sum", "prod", "max", "min", "mean", "all", "any"}
 )
@@ -450,6 +449,71 @@ def _runtime_sized(value: SSAValue) -> bool:
     return _declared_rank(value) > len(tuple(value.shape or ()))
 
 
+def _elementwise_runtime_rank(
+    function: Function, outputs: Sequence[SSAValue],
+) -> tuple[int | None, str | None]:
+    """The rank R when ``function`` is elementwise over runtime-sized spans.
+
+    Every value must be a runtime-sized span of one rank R or a rank-0
+    scalar; every instruction that reads or writes a span must be an
+    elementwise operation whose result is such a span; every output must
+    be one. Then element ``k`` of every result depends only on element
+    ``k`` of the span operands and on the scalars, and one invocation per
+    element computes the function exactly. Returns ``(R, None)``, or
+    ``(None, reason)``.
+    """
+
+    from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+    from .ssa_llvm_backend import scalar_likeness
+
+    if len(function.blocks) != 1:
+        return None, "multi-block control flow"
+    block = next(iter(function.blocks.values()))
+    values = (
+        *function.args, *outputs,
+        *(instr.res for instr in block.instrs if instr.res is not None),
+    )
+    ranks = {_declared_rank(value) for value in values if _runtime_sized(value)}
+    if len(ranks) != 1:
+        return None, (
+            "runtime-sized spans of ranks "
+            f"{sorted(ranks)}; element mode needs one rank"
+        )
+    rank = next(iter(ranks))
+    shaped = next((value for value in values if value.shape), None)
+    if shaped is not None:
+        return None, (
+            f"%t{shaped.id} has static shape {tuple(shaped.shape)} beside "
+            "runtime-sized spans"
+        )
+    scalar_output = next(
+        (value for value in outputs if not _runtime_sized(value)), None,
+    )
+    if scalar_output is not None:
+        return None, (
+            f"output %t{scalar_output.id} is a scalar beside runtime-sized "
+            "outputs; element mode writes one element per invocation"
+        )
+    for instr in block.instrs:
+        if instr.op in ("Ret", "ret", "Return", "return"):
+            continue
+        spans_in = any(_runtime_sized(argument) for argument in instr.args)
+        span_out = instr.res is not None and _runtime_sized(instr.res)
+        if not (spans_in or span_out):
+            continue
+        operation = str(
+            instr.attributes.get("tensor_operation") or instr.op
+        )
+        operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+            operation.casefold(), operation,
+        )
+        if not span_out or scalar_likeness(operation) is None:
+            return None, (
+                f"{instr.op} over a runtime-sized span is not elementwise"
+            )
+    return rank, None
+
+
 class _FunctionEmitter:
     """Translate one straight-line SSA ``Function`` into SPIR-V.
 
@@ -466,8 +530,13 @@ class _FunctionEmitter:
         dtype: str = DEFAULT_DTYPE,
         outputs: Sequence[SSAValue] = (),
         carried_shortfalls: Sequence[SPIRVShortfall] = (),
+        runtime_elements: bool = False,
     ):
         self.function = function
+        # The deployable entry's element mode: runtime-sized spans of an
+        # elementwise function arrive one element per invocation, so the
+        # body computes on scalars (``_elementwise_runtime_rank``).
+        self.runtime_elements = bool(runtime_elements)
         self.builder = builder
         self.dtype = dtype
         self.outputs = tuple(outputs)
@@ -514,7 +583,7 @@ class _FunctionEmitter:
             )
             if _runtime_sized(value)
         ), None)
-        if runtime_sized is not None:
+        if runtime_sized is not None and not self.runtime_elements:
             return self._bail(
                 "<function>", block.name,
                 f"%t{runtime_sized.id} is a runtime-sized span (rank "
@@ -766,6 +835,175 @@ class _FunctionEmitter:
         )
         body.append(f"    OpStore {access} {value_id}")
 
+    def _convert(
+        self, value_id: str, source: str, target: str, body: list[str]
+    ) -> str | None:
+        """``value_id`` of dtype ``source`` as dtype ``target``, or ``None``."""
+
+        source_kind, target_kind = _DTYPE_KIND.get(source), _DTYPE_KIND.get(target)
+        source_width, target_width = _DTYPE_WIDTH.get(source), _DTYPE_WIDTH.get(target)
+        if (source_kind, source_width) == (target_kind, target_width):
+            return value_id
+        if source_kind == "int" and target_kind == "float":
+            opcode = "OpConvertSToF"
+        elif source_kind == target_kind == "float":
+            opcode = "OpFConvert"
+        elif source_kind == target_kind == "int":
+            opcode = "OpSConvert"
+        else:
+            return None
+        converted = self.builder.fresh("v")
+        body.append(
+            f"    {converted} = {opcode} {self.builder.scalar_type(target)} {value_id}"
+        )
+        return converted
+
+    def _emit_reduction(
+        self, op: str, instr: Instr, block: BasicBlock, body: list[str]
+    ) -> None:
+        """Whole-array ``sum``/``prod``/``max``/``min``/``mean``/``all``/``any``.
+
+        Program: ``total = x.sum()`` over a static (2, 3) ``x`` in a shader.
+        The shape is static, so the reduction unrolls like every other array
+        op here: each element is loaded in row-major order and folded left to
+        right, as Python adds.  ``sum(xs, start)`` starts from ``start``;
+        ``max``/``min`` let a NaN in and never displace one (the numpy
+        reference, and the C backend's rule); ``all``/``any`` count NaN as
+        true.  An axis reduction, or ``max``/``min``/``mean`` of no elements,
+        is refused by name.
+        """
+
+        source = instr.args[0]
+        if (
+            len(instr.args) > (2 if op == "sum" else 1)
+            or any(a.shape for a in instr.args[1:])
+            or instr.attributes.get("axis") is not None
+        ):
+            self._shortfall(
+                op, block.name,
+                "only whole-array reductions (no axis) are supported by the "
+                "SPIR-V backend",
+            )
+            return
+        pointer = self._array_pointer.get(source.id)
+        if pointer is None:
+            self._shortfall(op, block.name, "array operand has no known storage")
+            return
+        source_dtype = source.dtype or self.dtype
+        result_dtype = instr.res.dtype or self.dtype
+        source_kind = _DTYPE_KIND.get(source_dtype)
+        result_kind = _DTYPE_KIND.get(result_dtype)
+        source_type = self.builder.scalar_type(source_dtype)
+        result_type = self.builder.scalar_type(result_dtype)
+        shape = tuple(int(size) for size in source.shape)
+        indices = list(itertools.product(*(range(size) for size in shape)))
+        name = self._name(instr.res)
+
+        if op in ("all", "any"):
+            bool_type = self.builder.scalar_type("bool")
+            truth = self.builder.constant("bool", op == "all")
+            for index in indices:
+                value = self._load_element(pointer, index, source_type, body)
+                if source_kind == "float":
+                    test = self.builder.fresh("v")
+                    zero = self.builder.constant(source_dtype, 0.0)
+                    body.append(f"    {test} = OpFUnordNotEqual {bool_type} {value} {zero}")
+                elif source_kind == "int":
+                    test = self.builder.fresh("v")
+                    zero = self.builder.constant(source_dtype, 0)
+                    body.append(f"    {test} = OpINotEqual {bool_type} {value} {zero}")
+                else:
+                    test = value
+                folded = self.builder.fresh("v")
+                logical = "OpLogicalAnd" if op == "all" else "OpLogicalOr"
+                body.append(f"    {folded} = {logical} {bool_type} {truth} {test}")
+                truth = folded
+            if result_kind == "bool":
+                body.append(f"    {name} = OpCopyObject {bool_type} {truth}")
+            else:
+                one = self.builder.constant(result_dtype, 1)
+                zero = self.builder.constant(result_dtype, 0)
+                body.append(f"    {name} = OpSelect {result_type} {truth} {one} {zero}")
+            return
+
+        if source_kind == "bool" or result_kind == "bool":
+            self._shortfall(
+                op, block.name,
+                f"a {op} reduction over or into bool is not supported by the "
+                "SPIR-V backend",
+            )
+            return
+        if op == "mean" and result_kind != "float":
+            self._shortfall(op, block.name, "mean needs a float result")
+            return
+        if not indices and op in ("max", "min", "mean"):
+            self._shortfall(
+                op, block.name, f"{op} of an empty array has no value",
+            )
+            return
+
+        elements: list[str] = []
+        for index in indices:
+            value = self._load_element(pointer, index, source_type, body)
+            converted = self._convert(value, source_dtype, result_dtype, body)
+            if converted is None:
+                self._shortfall(
+                    op, block.name,
+                    f"no conversion from {source_dtype} to {result_dtype}",
+                )
+                return
+            elements.append(converted)
+
+        if op in ("max", "min"):
+            bool_type = self.builder.scalar_type("bool")
+            if result_kind == "float":
+                compare = "OpFOrdGreaterThan" if op == "max" else "OpFOrdLessThan"
+            else:
+                compare = "OpSGreaterThan" if op == "max" else "OpSLessThan"
+            accumulator = elements[0]
+            for value in elements[1:]:
+                wins = self.builder.fresh("v")
+                body.append(f"    {wins} = {compare} {bool_type} {value} {accumulator}")
+                if result_kind == "float":
+                    nan = self.builder.fresh("v")
+                    body.append(f"    {nan} = OpIsNan {bool_type} {value}")
+                    either = self.builder.fresh("v")
+                    body.append(f"    {either} = OpLogicalOr {bool_type} {wins} {nan}")
+                    wins = either
+                chosen = self.builder.fresh("v")
+                body.append(
+                    f"    {chosen} = OpSelect {result_type} {wins} {value} {accumulator}"
+                )
+                accumulator = chosen
+            body.append(f"    {name} = OpCopyObject {result_type} {accumulator}")
+            return
+
+        fold = "mul" if op == "prod" else "add"
+        kind, payload = self._resolve(fold, result_dtype, 2)
+        if op == "sum" and len(instr.args) == 2:
+            start = instr.args[1]
+            accumulator = self._convert(
+                self._name(start), start.dtype or self.dtype, result_dtype, body
+            )
+            if accumulator is None:
+                self._shortfall(
+                    op, block.name,
+                    f"no conversion from {start.dtype} to {result_dtype}",
+                )
+                return
+        else:
+            accumulator = self.builder.constant(result_dtype, 1 if op == "prod" else 0)
+        for value in elements:
+            folded = self.builder.fresh("v")
+            self._apply(kind, payload, result_type, folded, [accumulator, value], instr, body)
+            accumulator = folded
+        if op == "mean":
+            count = self.builder.constant(result_dtype, len(elements))
+            kind, payload = self._resolve("Div", result_dtype, 2)
+            self._apply(kind, payload, result_type, name, [accumulator, count], instr, body)
+            return
+        body.append(f"    {name} = OpCopyObject {result_type} {accumulator}")
+
     def _emit_instr(self, instr: Instr, block: BasicBlock, body: list[str]) -> None:
         if instr.op in ("Br", "br", "CondBr", "condbr", "Phi", "phi"):
             self._shortfall(
@@ -880,11 +1118,7 @@ class _FunctionEmitter:
             return
 
         if not result_shape and any(a.shape for a in instr.args) and op in _REDUCTION_OPS:
-            self._shortfall(
-                op, block.name,
-                "reductions over arrays are not yet supported by the "
-                "SPIR-V backend",
-            )
+            self._emit_reduction(op, instr, block, body)
             return
 
         operand_dtype = instr.args[0].dtype if instr.args else result_dtype
@@ -1158,6 +1392,11 @@ class SPIRVStorageBinding:
     #: scalar): the buffer holds ``element_count`` instances back to back,
     #: each ``prod(instance_shape)`` elements, row-major.
     instance_shape: tuple[int, ...] = ()
+    #: Element mode: the rank of a runtime-sized span read or written one
+    #: element per invocation (0 otherwise).
+    runtime_rank: int = 0
+    #: Element mode: a rank-0 feed every invocation reads at element 0.
+    broadcast: bool = False
 
 
 @dataclass
@@ -1219,9 +1458,15 @@ def emit_deployable_compute_shader(
     buffer. A scalar value occupies one element per instance; a value of
     static shape ``S`` occupies ``prod(S)`` consecutive elements, row-major,
     so instance ``i`` starts at element ``i * prod(S)``. Several outputs are
-    several output buffers, in order. What the contract cannot carry (a
-    runtime-sized span, a boolean element, no result) is a shortfall, never
-    a guessed layout.
+    several output buffers, in order.
+
+    An elementwise function over runtime-sized spans of one rank (rank
+    stated, no static shape) runs in ELEMENT mode instead: invocation ``i``
+    computes element ``i`` of every span, rank-0 feeds broadcast (each
+    invocation reads their element 0), and ``element_count`` is the product
+    of the host's extents. What neither mode can carry (mixed span ranks, a
+    non-elementwise operation over a span, a boolean element, no result) is
+    a shortfall, never a guessed layout.
     """
 
     name = str(name or function.name)
@@ -1243,14 +1488,22 @@ def emit_deployable_compute_shader(
             f"invocation; {function.name} names none",
         ))
         return refused()
-    for value in (*function.args, *outputs):
-        if _runtime_sized(value):
+    # Element mode: an elementwise function over runtime-sized spans of one
+    # rank runs one ELEMENT per invocation instead of one instance; its
+    # rank-0 feeds broadcast (every invocation reads element 0).
+    element_rank = None
+    if any(_runtime_sized(value) for value in (*function.args, *outputs)):
+        element_rank, reason = _elementwise_runtime_rank(function, outputs)
+        if element_rank is None:
             shortfalls.append(SPIRVShortfall(
                 "<entry>", "*",
-                f"%t{value.id} is a runtime-sized span (rank "
-                f"{_declared_rank(value)}, no static shape); one instance "
-                "per invocation needs its static extents",
+                f"{function.name} reads or writes runtime-sized spans but "
+                f"cannot run one element per invocation: {reason}",
             ))
+            return refused()
+    for value in (*function.args, *outputs):
+        if element_rank is not None:
+            pass
         elif not all(
             isinstance(size, int) and size > 0
             for size in tuple(value.shape or ())
@@ -1289,6 +1542,7 @@ def emit_deployable_compute_shader(
     emitter = _FunctionEmitter(
         function, builder, dtype=dtype, outputs=outputs,
         carried_shortfalls=precision.get(function.name, ()),
+        runtime_elements=element_rank is not None,
     )
     library = emitter.emit()
     if library.shortfalls:
@@ -1359,6 +1613,11 @@ def emit_deployable_compute_shader(
             "read" if role == "feed" else "read_write",
             int(value.id),
             instance_shape=shape,
+            runtime_rank=(
+                _declared_rank(value)
+                if element_rank is not None and _runtime_sized(value) else 0
+            ),
+            broadcast=element_rank is not None and not _runtime_sized(value),
         ))
         if role == "output":
             output_position += 1
@@ -1426,9 +1685,10 @@ def emit_deployable_compute_shader(
     loaded: list[str] = []
     for position, (variable, element_type, element_pointer, value) in enumerate(feeds):
         if not value.shape:
+            broadcast = element_rank is not None and not _runtime_sized(value)
             body.append(
                 f"%feed_ptr_{position} = OpAccessChain {element_pointer} "
-                f"{variable} {zero} %index"
+                f"{variable} {zero} {zero if broadcast else '%index'}"
             )
             body.append(f"%feed_val_{position} = OpLoad {element_type} %feed_ptr_{position}")
             loaded.append(f"%feed_val_{position}")
