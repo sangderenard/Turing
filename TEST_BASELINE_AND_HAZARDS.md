@@ -1,3 +1,17 @@
+2026-10-24 PRECISION COMPUTE PRODUCT (MEASURED, cloud): the precision-core
+GLSL compute lane publishes its SSBO ABI (component ABI, turing.shader-
+deployment.v1 record, product). Fixed a silent wrong answer: with a baked
+trip count the scalars block kept its padding word, so every coefficient
+was read one slot off (llvmpipe: fma(x, 3, 0.25) gave x * 0.25). Mesa's
+double fma() rounds twice on llvmpipe and lavapipe (GLSL allows it); the
+record carries an fma-rounding shortfall. The lane still cannot compile
+today's lowered cores (Cast bound, three regions per iteration); its 4
+tests fail instead of erroring now that the benchmark lowers with a
+contract. At this branch on main ae46579: GPU tests otherwise identical;
+C corpus 359/360, c428_class_keyword_construct WRONG on main ae46579 too.
+Fuzz seed 67 (40): 0 WRONG / 0 TYPE. Gate names identical to main ae46579
+in all four parts. See doc 38.
+
 2026-10-24 EXTRACTED SHADER INTERFACE (MEASURED, cloud): host-written shaders
 found by shader_extractor now publish a turing.shader-component.v1 ABI read
 from their own global declarations (glsl_interface.read_glsl_interface):
