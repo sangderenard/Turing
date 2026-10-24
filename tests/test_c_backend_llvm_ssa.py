@@ -33,12 +33,17 @@ _REAL_TRANSLATED_SYMBOLS = {
     "binary_value",
     "binary_double",
     "binary_scalar_double",
+    "binary_int64_value",
+    "binary_int64",
+    "binary_scalar_int64",
     "unary_double",
     "matmul_double",
     "batched_matmul_indexed_double",
     "where_double",
     "broadcast_double",
+    "broadcast_int64",
     "reduce_dim_double",
+    "mean_dim",
     "transpose_double",
     "cumsum_dim_double",
     "stack_double",
@@ -47,6 +52,7 @@ _REAL_TRANSLATED_SYMBOLS = {
     "slice_copy_double",
     "index_select_double",
     "gather_values_double",
+    "scatter_sum_double",
     "index_assign_double",
     "index_set_double",
     "unfold2d_double",
@@ -65,8 +71,10 @@ _REAL_TRANSLATED_SYMBOLS = {
     "cast_double_to_float_values",
     "cast_double_to_bool_values",
     "cast_double_to_double_values",
+    "cast_int64_to_double_values",
     "sum_double",
     "create_arange",
+    "create_arange_int64",
 }
 
 
@@ -97,7 +105,7 @@ def test_translation_table_uses_only_real_c_function_definitions():
 
     defined = set(
         re.findall(
-            r"(?m)^define(?:\s+internal)?\s+(?:void|double|i32)\s+@([A-Za-z0-9_]+)",
+            r"(?m)^define(?:\s+internal)?\s+(?:void|double|i32|i64)\s+@([A-Za-z0-9_]+)",
             LLVM_SSA_MODULE,
         )
     )
