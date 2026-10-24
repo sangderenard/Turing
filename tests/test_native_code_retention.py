@@ -228,3 +228,22 @@ def test_direct_call_worklist_preserves_alternate_entry_inside_same_owner():
     )
 
     assert targets == ((target_rva, owner),)
+
+
+def test_unnamed_build_target_is_this_host(monkeypatch):
+    # A Linux host built x86_64-windows-gnu images it could not load once the
+    # LLVM lane read the receipt; Windows keeps the Windows linker.
+    import platform
+    import sys
+
+    from src.compiler.native_code_retention import (
+        LINUX_AMD64_NATIVE_LINKER, host_build_target,
+    )
+
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert host_build_target() is LINUX_AMD64_NATIVE_LINKER
+    assert LINUX_AMD64_NATIVE_LINKER.llvm_triple == "x86_64-linux-gnu"
+    monkeypatch.setattr(platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert host_build_target() is WINDOWS_AMD64_NATIVE_LINKER

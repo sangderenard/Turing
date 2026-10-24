@@ -433,6 +433,7 @@ def lift_pe_export_to_ssa(
         root_rva=root_rva,
         root_calling_convention=root_calling_convention,
         argument_registers=_WINDOWS_X64_ARGUMENT_REGISTERS,
+        calling_convention="windows-x64",
         import_link_kind="pe-import",
         retained=lambda: retain_pe_image(
             image, source_identity=str(path.resolve()),
@@ -471,6 +472,7 @@ def lift_elf_export_to_ssa(
         root_rva=root_rva,
         root_calling_convention=root_calling_convention,
         argument_registers=_SYSV_AMD64_ARGUMENT_REGISTERS,
+        calling_convention="sysv-amd64",
         import_link_kind="elf-import",
         retained=lambda: retain_elf_image(
             image, source_identity=str(path.resolve()),
@@ -486,6 +488,7 @@ def _lift_image_export_to_ssa(
     root_rva: int | None,
     root_calling_convention: str,
     argument_registers: tuple[str, ...],
+    calling_convention: str,
     import_link_kind: str,
     retained: Any,
 ) -> NativeCompileSSAResult:
@@ -521,6 +524,7 @@ def _lift_image_export_to_ssa(
             base_address=int(image.image_base) + rva,
             name=function_name,
             argument_registers=argument_registers,
+            calling_convention=calling_convention,
             argument_names=tuple(
                 f"arg{index}" for index in range(len(argument_registers))
             ),

@@ -16,10 +16,11 @@ WRONG and TYPE are emergencies: stop and minimize.
 
 Programs using an implementation-approximated operation (``Math.sin``,
 ``**``, ...) are judged within the oracle's ulp tier.  ``%``,
-``Math.sign`` and ``Math.max``/``Math.min`` are exact programs, judged bit
-for bit.  The grammar also includes a spelling the frontend refuses today
-(``&&`` on Numbers) so that its refusal stays visible as a LOUD cluster
-rather than silently vanishing.
+``Math.sign``, ``Math.max``/``Math.min`` and ``&&``/``||`` on Numbers
+are exact programs, judged bit for bit.  The grammar also includes a
+spelling the frontend refuses today (``&&`` on a Number and a Boolean,
+whose result has no single kind) so that its refusal stays visible as a
+LOUD cluster rather than silently vanishing.
 
 Usage: python tools/javascript_differential_fuzz.py OUT SEED COUNT
 """
@@ -83,12 +84,15 @@ class Generator:
             return f"({self.number(depth - 1)} ** {self.number(depth - 1)})"
         if choice < 0.975:
             return f"Math.sign({self.number(depth - 1)})"
-        if choice < 0.99:
+        if choice < 0.985:
             call = rng.choice(("Math.max", "Math.min"))
             return f"{call}({self.number(depth - 1)}, {self.number(depth - 1)})"
+        if choice < 0.997:
+            # ``&&``/``||`` on Numbers return an operand, not a boolean.
+            op = rng.choice(("&&", "||"))
+            return f"({self.number(depth - 1)} {op} {self.number(depth - 1)})"
         # Rare on purpose: one refused spelling sinks the whole program.
-        # ``&&`` on Numbers returns an operand, not a boolean.
-        return f"({self.number(depth - 1)} && {self.number(depth - 1)})"
+        return f"({self.number(depth - 1)} && {self.boolean(depth - 1)})"
 
     def boolean(self, depth: int) -> str:
         rng = self.rng

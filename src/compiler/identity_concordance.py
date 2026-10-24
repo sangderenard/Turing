@@ -685,9 +685,16 @@ def publish_projected_iterable_layouts(module: Any) -> None:
     objects.
     """
 
+    from .ssa_record_return_state import accepted_ssa_component
+
     functions = getattr(module, "functions", {}) or {}
     sequence_tables = getattr(module, "sequence_tables", {}) or {}
     for function_name, function in functions.items():
+        if accepted_ssa_component(function):
+            # A linked, digest-pinned body published its own internal call
+            # edges in its owning book; the enclosing unit settles only the
+            # edges it owns.
+            continue
         occurrences = (
             *tuple(function.args),
             *tuple(

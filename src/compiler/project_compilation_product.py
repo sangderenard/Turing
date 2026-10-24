@@ -6324,10 +6324,25 @@ def compile_project_call(
     for dependency_name, (artifact, root_symbol) in sorted(
         linked_units.items()
     ):
-        with Path(artifact).resolve().open("rb") as stream:
-            dependency_module, dependency_outputs, _dependency_exports = (
-                pickle.load(stream)
-            )
+        artifact_bytes = Path(artifact).resolve().read_bytes()
+        dependency_module, dependency_outputs, _dependency_exports = (
+            pickle.loads(artifact_bytes)
+        )
+        # A linked body is a completed product whose blocks, values and
+        # output identities are owned by the dependency's own identity book,
+        # which travels with the artifact.  Record that owner exactly as SSA
+        # composition does, so passes that revisit the body read and revise
+        # it in the book that holds its facts, not the enclosing unit's.
+        owner_book = dependency_module.metadata.get("identity_book")
+        if owner_book is not None:
+            artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+            for function in dependency_module.functions.values():
+                function.metadata.setdefault("accepted_ssa_component", {
+                    "schema": "turing.accepted-ssa-component.v1",
+                    "artifact_sha256": artifact_sha256,
+                    "linked_unit": str(dependency_name),
+                    "identity_book": owner_book,
+                })
         linked_repository_ssa[str(dependency_name)] = (
             dependency_module, str(root_symbol), dependency_outputs,
         )

@@ -1499,6 +1499,36 @@ def reconcile_nondominating_identity_cast_results(module):
                         actual, target_block, int(instruction_index), phi_edge
                     ):
                         continue
+                    # Program: ``SSAReferenceEvaluator._value`` (its error
+                    # message formats ``int(value.id)`` from a branch-local
+                    # region).  Wrong record: the forward rewrote the use and
+                    # posted nothing, so the next ``ssa_block_geometry``
+                    # REVISE of this block had no changed source and was
+                    # refused.  Rule: a forwarded use is a dominance
+                    # rebinding on the book, the same row the loop-result
+                    # canonicalization posts, which the geometry reads as
+                    # its cause.
+                    from .concordance_declarations import (
+                        CONTROL_SSA_FINISH, LOOP_RESULT_USE_REBINDING,
+                    )
+                    from .identity_concordance import Mode
+
+                    post_dominance_rebinding(
+                        function, LOOP_RESULT_USE_REBINDING, (
+                            str(function.metadata.get(
+                                "tensor_shape_concordance_scope"
+                            ) or function.name),
+                            str(block_name), int(instruction_index),
+                            int(position),
+                        ), (
+                            int(incumbent.id), int(actual.id),
+                            "exact_physical_identity_cast_result",
+                            str(callee), int(slot), str(call_block),
+                        ),
+                        original=incumbent, replacement=actual,
+                        blocks=(target_block, str(call_block)),
+                        stage=CONTROL_SSA_FINISH, mode=Mode.REVISE,
+                    )
                     arguments[position] = actual
                     receipts.append({
                         "function": str(symbol),
