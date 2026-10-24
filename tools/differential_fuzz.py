@@ -74,6 +74,9 @@ EXTENDED = [
     (["xs{v} = [{a}, n, {b}, {c}]", "del xs{v}[1]"], "len(xs{v}) * 10 + xs{v}[1]"),
     (["q{v}, r{v} = pair(n, {a})"], "q{v} * 10 + r{v}"),
     (["c{v} = first_over(n, {a})"], "c{v}"),
+    # an early return beside a returned length of a list parameter (corpus
+    # c372, plan C7)
+    (["c{v} = neg_or_len([{a}, n, n - {b}])"], "c{v}"),
     (["xs{v} = []", "k{v} = n % 5 + 2", "while k{v} > 0:", "    xs{v}.append(k{v})", "    k{v} -= 2"], "len(xs{v}) * 10 + xs{v}[0]"),
     (["xs{v} = [{a}, n, {b}]", "for j{v} in range(len(xs{v})):", "    xs{v}[j{v}] = xs{v}[j{v}] * 2"], "xs{v}[0] + xs{v}[1] + xs{v}[2]"),
     (["xs{v} = [n, {a}, {b}]", "m{v} = xs{v}[0]", "for x{v} in xs{v}:", "    if x{v} > m{v}:", "        m{v} = x{v}"], "m{v}"),
@@ -161,6 +164,13 @@ def first_over(x: int, y: int) -> int:
         if i * y > x:
             return i
     return -1
+
+
+def neg_or_len(xs: list[int]) -> int:
+    for x in xs:
+        if x < 0:
+            return x
+    return len(xs)
 
 
 """
