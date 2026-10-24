@@ -1658,9 +1658,50 @@ def _contract_physical(
     return None
 
 
+def _runtime_rank_physical(
+    book: Any, shape_scope: Any, value: Any,
+) -> tuple[dict[str, Any], Ref] | None:
+    """A shapeless region result's runtime rank, read from its shape state.
+
+    Program: ``def f(x, y): return x * y`` with x and y declared
+    ``storage: span, rank: 1`` and no ``shape``.  Wrong record: the planner's
+    descriptor for the product said rank 1, runtime extents
+    (``shape_transformation_state``), and the region ``value`` carried that
+    rank as accounting, but its ``ssa_value`` row was posted scalar with no
+    rank -- so call-result settlement carried a scalar to the caller and
+    every backend sized a one-element result.  Rule: a result with no shape
+    and no contract row whose graph identity's shape state is a runtime-sized
+    span posts ``storage: span`` and that rank, DERIVED from the state cell.
+    """
+
+    from .identity_concordance import (
+        SHAPE_STATE_PAGE, descriptor_from_shape_transformation_state,
+    )
+
+    if shape_scope is None or tuple(value.shape or ()):
+        return None
+    row = (tuple(shape_scope), int(value.id))
+    cell = book.latest_ref(SHAPE_STATE_PAGE, row)
+    if cell is None:
+        return None
+    fact = book.page(SHAPE_STATE_PAGE).latest(row)
+    if not (isinstance(fact, tuple) and fact and fact[0] == "resolved"):
+        return None
+    descriptor = descriptor_from_shape_transformation_state(fact[1])
+    if not (
+        descriptor is not None
+        and not tuple(descriptor.get("shape") or ())
+        and int(descriptor.get("rank", 0) or 0) > 0
+        and str(descriptor.get("metadata_state") or "") == "dynamic"
+        and str(descriptor.get("dtype")) == str(value.dtype)
+    ):
+        return None
+    return {"storage": "span", "rank": int(descriptor["rank"])}, cell
+
+
 def _post_planned_region_identities(
     book: Any, scope: str, function: Function, signature_cell: Any,
-    graph_cell: Any,
+    graph_cell: Any, shape_scope: Any = None,
 ) -> None:
     """The identity cells of one planned region function (plan 100, 4.1
     item 2 and 2.6), posted where ``lower_control_sections_to_ssa``
@@ -1747,6 +1788,7 @@ def _post_planned_region_identities(
                 else _contract_physical(
                     book, value, graph_cell(int(value.id)),
                 )
+                or _runtime_rank_physical(book, shape_scope, value)
             )
             book.post(
                 SSA_VALUE, row,
@@ -27619,7 +27661,7 @@ def lower_control_sections_to_ssa(
             )
             _post_planned_region_identities(
                 _book(), str(tensor_shape_concordance_scope), region_function,
-                signature_cell, _graph_cell,
+                signature_cell, _graph_cell, shape_scope=shape_scope,
             )
             _concord_region_feed_consumers(
                 lexical_read_scope, tensor_shape_concordance_scope,

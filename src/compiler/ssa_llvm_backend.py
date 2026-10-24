@@ -1104,6 +1104,44 @@ def _declared_span_rank(value: _Any) -> int:
     )
 
 
+def _runtime_sized_span(value: _Any) -> bool:
+    """A span that states its rank but not its extents (they arrive with the
+    call): ``program_abi_rank > 0`` over an empty static shape."""
+
+    return (
+        value is not None
+        and not tuple(getattr(value, "shape", ()) or ())
+        and _declared_span_rank(value) > 0
+    )
+
+
+def _elementwise_extent_operand(instruction: _Any) -> _Any:
+    """The operand whose runtime extents an elementwise result takes.
+
+    The planner's elementwise law states a runtime-sized result only when its
+    span operands are runtime-sized spans of the result's rank and the rest
+    are rank-0 scalars.  The first such operand is the result's extent
+    source; every other span operand must agree with it at run time.
+    Returns None for anything else (a static result, a non-elementwise op).
+    """
+
+    result = getattr(instruction, "res", None)
+    if not _runtime_sized_span(result):
+        return None
+    operation = str(instruction.op)
+    operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+        operation.casefold(), operation,
+    )
+    if scalar_likeness(operation) is None:
+        return None
+    rank = _declared_span_rank(result)
+    return next((
+        argument for argument in instruction.args
+        if _runtime_sized_span(argument)
+        and _declared_span_rank(argument) == rank
+    ), None)
+
+
 def _span_element_count(
     function_name: str,
     value: _Any,
@@ -1796,6 +1834,9 @@ def _emit_repository_call_module(
     shape_extent_origin: dict[
         tuple[str, int], tuple[str, int]
     ] = {}
+    # Runtime-sized elementwise results: the locals among them are frames
+    # allocated from their measured extents.
+    elementwise_runtime_results: set[tuple[str, int]] = set()
     internal_callers: dict[str, set[str]] = {}
     for caller_name in reachable:
         caller_function = module.functions[caller_name]
@@ -1831,6 +1872,20 @@ def _emit_repository_call_module(
                     shape_extent_origin.setdefault(
                         (str(caller_name), int(instruction.res.id)),
                         (str(caller_name), int(instruction.args[0].id)),
+                    )
+                # A runtime-sized elementwise result has the extents of its
+                # runtime-sized operand of the same rank (the planner's
+                # elementwise law, ``_tensor_descriptor_rule``): that operand
+                # is its exact shape edge.  The other span operands are
+                # checked against it at run time where the loop is emitted.
+                extent_operand = _elementwise_extent_operand(instruction)
+                if extent_operand is not None:
+                    elementwise_runtime_results.add(
+                        (str(caller_name), int(instruction.res.id)),
+                    )
+                    shape_extent_origin.setdefault(
+                        (str(caller_name), int(instruction.res.id)),
+                        (str(caller_name), int(extent_operand.id)),
                     )
                 if instruction.op != "Call":
                     continue
@@ -1883,9 +1938,10 @@ def _emit_repository_call_module(
         for instruction in block.instrs
         if instruction.res is not None
         and _declared_span_rank(instruction.res) > 0
-        and (scalar_likeness(str(instruction.op)) is not None
+        and (scalar_likeness(TENSOR_OPERATION_SCALAR_SPELLING.get(
+                str(instruction.op).casefold(), str(instruction.op),
+             )) is not None
              or instruction.op in {"Cast", "CastLike", "cast_like"})
-        and not is_predicate_operation(instruction.op)
     )
     growing = True
     while growing:
@@ -2052,6 +2108,43 @@ def _emit_repository_call_module(
                 requirement = frame_storage_requirements.get(name, {}).get(value_id)
                 if requirement is not None and requirement.element_count is not None:
                     count = max(count, int(requirement.element_count))
+            if value_id not in allocated and (
+                (str(name), value_id) in elementwise_runtime_results
+            ):
+                # Program: ``x + y * 2.0`` over runtime-sized rank-2 spans.
+                # Wrong record: the intermediate ``y * 2.0`` is a local span
+                # with no static extents, so its frame slot was one element
+                # and every row of the loop overwrote it (LLVM returned
+                # x + 2*y[-1]).  Rule: a runtime-sized local is allocated
+                # from its own runtime extents, measured in the entry frame;
+                # one with no measurable origin is refused.
+                runtime_count = _span_element_count(
+                    name, value, f"frame.{value_id}", entry_allocas,
+                    public_span_value, module_extent_slot,
+                )
+                if runtime_count is None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, "frame",
+                        f"runtime-sized local %t{value_id} has no measurable "
+                        "extents; refusing a one-element frame slot",
+                    ))
+                else:
+                    width = _LLVM_TYPE_BYTES.get(str(llvm_type), 8)
+                    entry_allocas.append(
+                        f"  %frame.bytes.{value_id} = mul i64 "
+                        f"{width}, %frame.count64.{value_id}"
+                    )
+                    entry_allocas.insert(
+                        len(entry_allocas) - 1,
+                        f"  %frame.count64.{value_id} = sext i32 "
+                        f"{runtime_count} to i64",
+                    )
+                    entry_allocas.append(
+                        f"  {register} = call ptr @malloc("
+                        f"i64 %frame.bytes.{value_id})"
+                    )
+                    entry_frees.append(f"  call void @free(ptr {register})")
+                allocated.add(value_id)
             if value_id not in allocated:
                 _frame_slot(register, llvm_type, count, entry_allocas, entry_frees)
                 if owned_frame:
@@ -4309,7 +4402,6 @@ def _emit_repository_call_module(
                 template is not None
                 and result is not None
                 and _declared_span_rank(result) > 0
-                and not is_predicate_operation(operation)
             ):
                 # An elementwise operation whose RESULT is a span is an array
                 # operation, and rendering it as one scalar load/op/store
@@ -4334,6 +4426,86 @@ def _emit_repository_call_module(
                         "them; refusing to emit a one-element stand-in",
                     ))
                     continue
+                # Every other runtime-sized operand is read over the result's
+                # trip count, so its own extents must agree at run time.  A
+                # runtime broadcast is not stated by the planner's law; a
+                # mismatch raises (77) instead of reading past a buffer.
+                extent_operand = _elementwise_extent_operand(instruction)
+                checked = [
+                    argument for argument in instruction.args
+                    if _runtime_sized_span(argument)
+                    and argument is not extent_operand
+                ]
+                # Axis by axis: equal element counts over different extents
+                # ((2, 3) against (3, 2)) are a broadcast error in Python.
+                result_public = public_span_value(name, int(result.id))
+                checked_publics = [
+                    public_span_value(name, int(argument.id))
+                    for argument in checked
+                ]
+                if checked and (
+                    result_public is None
+                    or any(public is None for public in checked_publics)
+                ):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"elementwise {operation} over span %t{result_id} "
+                        "reads a runtime-sized operand whose extents no "
+                        "public origin declares",
+                    ))
+                    continue
+                operand_counts = []
+                for position, argument_public in enumerate(checked_publics):
+                    if int(argument_public) == int(result_public):
+                        continue
+                    for axis in range(_declared_span_rank(result)):
+                        pair = []
+                        for side, public_id in (
+                            ("op", argument_public), ("res", result_public),
+                        ):
+                            slot = module_extent_slot(public_id, axis)
+                            register = f"%ew.chk.{tag}.{position}.{axis}.{side}"
+                            body.append(
+                                f"  {register}.addr = getelementptr i32, "
+                                f"ptr %extents, i64 {slot}"
+                            )
+                            body.append(
+                                f"  {register} = load i32, ptr "
+                                f"{register}.addr, align 4"
+                            )
+                            pair.append(register)
+                        operand_counts.append(tuple(pair))
+                if operand_counts:
+                    entry_label = block_exit_label.get(
+                        active_block or "", active_block or "entry",
+                    )
+                    agree = None
+                    for position, (left, right) in enumerate(operand_counts):
+                        same = f"%ew.same.{tag}.{position}"
+                        body.append(f"  {same} = icmp eq i32 {left}, {right}")
+                        if agree is not None:
+                            joined = f"%ew.agree.{tag}.{position}"
+                            body.append(f"  {joined} = and i1 {agree}, {same}")
+                            same = joined
+                        agree = same
+                    mismatch = f"ew.mismatch.{tag}"
+                    checked_label = f"ew.checked.{tag}"
+                    body.append(
+                        f"  br i1 {agree}, label %{checked_label}, "
+                        f"label %{mismatch}"
+                    )
+                    body.append(f"{mismatch}:")
+                    body.append("  call void @turing_validation_error(i32 77)")
+                    body.append(f"  br label %{checked_label}")
+                    body.append(f"{checked_label}:")
+                    zero_trip = f"%ew.trip.{tag}"
+                    body.append(
+                        f"  {zero_trip} = phi i32 [ 0, %{mismatch} ], "
+                        f"[ {total}, %{entry_label} ]"
+                    )
+                    total = zero_trip
+                    if active_block is not None:
+                        block_exit_label[active_block] = checked_label
                 entry_label = block_exit_label.get(
                     active_block or "", active_block or "entry",
                 )
@@ -4356,6 +4528,20 @@ def _emit_repository_call_module(
                     f"label %{done}"
                 )
                 body.append(f"{loop_body}:")
+                # A comparison computes in its operands' domain and stores
+                # truth: an i1 element type would compare doubles as bits.
+                compute_type = element_type
+                predicate = is_predicate_operation(operation)
+                if predicate:
+                    operand_types = {
+                        _value_llvm_type(argument)
+                        for argument in instruction.args
+                    }
+                    compute_type = (
+                        "i64" if operand_types <= {"i1", "i32", "i64"}
+                        and operation in _INTEGER_COMPARISON
+                        else "double"
+                    )
                 operands = []
                 for position, argument in enumerate(instruction.args):
                     slot = f"%ew.op.{tag}.{position}"
@@ -4379,14 +4565,23 @@ def _emit_repository_call_module(
                             f"ptr {pointer(argument)}, align {_align(source_type)}"
                         )
                     operands.append(convert_loaded(
-                        slot, source_type, element_type,
+                        slot, source_type, compute_type,
                         f"ew.{tag}.{position}",
                     ))
                 computed = f"%ew.val.{tag}"
-                for rendered_line in template.format(
-                    *operands, out=computed
-                ).splitlines():
+                if predicate and compute_type == "i64":
+                    rendered = (
+                        f"{computed} = icmp {_INTEGER_COMPARISON[operation]} "
+                        f"i64 {operands[0]}, {operands[1]}"
+                    )
+                else:
+                    rendered = template.format(*operands, out=computed)
+                for rendered_line in rendered.splitlines():
                     body.append(f"  {rendered_line}")
+                if predicate and element_type != "i1":
+                    computed = convert_loaded(
+                        computed, "i1", element_type, f"ew.{tag}.truth",
+                    )
                 body.append(
                     f"  %ew.dst.{tag} = getelementptr {element_type}, "
                     f"ptr {pointer(result)}, i32 {index}"
@@ -4923,6 +5118,31 @@ def _emit_repository_call_module(
         wrapper.append(f"  {loaded} = load ptr, ptr {address}, align 8")
         entry_span.take(UnitKind.FORMAL, args=(value,), spelling=loaded)
         public_pointer[value_id] = loaded
+    # Program: ``def f(x, y): return x * y`` with x, y runtime-sized rank-1
+    # spans.  Wrong record: the public result had rank 1 and no extents, the
+    # caller allocated it from its empty authored shape (one element), and
+    # the region's elementwise loop wrote x's length into it.  Rule: a
+    # runtime-sized public result is allocated from the public input whose
+    # extents it takes, followed through the call-result hop and the shape
+    # edges; one with no such input is refused, never sized one.
+    public_input_ids = {int(value.id) for value in root_public_args}
+    output_extent_sources: list[tuple[int, int]] = []
+    for value in root_outputs:
+        if not _runtime_sized_span(value) or int(value.id) in public_input_ids:
+            continue
+        hop = (value.accounting or {}).get("ssa_call_result_from")
+        source = (
+            None if not hop
+            else public_span_value(str(hop[0]), int(hop[1]))
+        )
+        if source is None or int(source) not in public_input_ids:
+            shortfalls.append(LLVMEmissionShortfall(
+                function_name, "Ret",
+                f"runtime-sized result %t{int(value.id)} takes its extents "
+                "from no public input; refusing to size it as one element",
+            ))
+            continue
+        output_extent_sources.append((int(value.id), int(source)))
     wrapper_frees: list[str] = []
     allocated_counts: dict[int, int] = {}
     for storage_index, value in enumerate(root_internal_storage):
@@ -5228,6 +5448,11 @@ def _emit_repository_call_module(
         ),
         reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_LLVM,
     )
+    from .runtime_abi import public_buffer_contract
+
+    public_ranks, public_roles = public_buffer_contract(
+        buffer_order, root_public_args, root_outputs, _declared_span_rank,
+    )
     post_program_abi_field_slots(
         emission, root, entry_name, Backend.LLVM_MODULE,
         buffer_order=buffer_order,
@@ -5248,6 +5473,9 @@ def _emit_repository_call_module(
         extent_order=tuple(module_extent_order),
         shortfalls=tuple(shortfalls),
         buffer_dtypes=tuple(buffer_dtypes),
+        output_extent_sources=tuple(output_extent_sources),
+        buffer_ranks=public_ranks,
+        buffer_roles=public_roles,
         needs_text_sink=bool(text_sink),
         output_publications=publications,
         output_surfaces=publication_surface_plan(publications, target="llvm"),
@@ -5300,6 +5528,13 @@ class LLVMFunctionArtifact:
     #: (``external_functions.external_slot_rows``); the host fills them at
     #: load with ``external_functions.bind_external_slots``.
     external_slots: tuple = ()
+    #: ``(output id, input id)``: a runtime-sized result whose extents are
+    #: that public input's, axis for axis.  The caller allocates it so.
+    output_extent_sources: tuple[tuple[int, int], ...] = ()
+    #: Per public buffer: its rank (independent of any static shape) and its
+    #: role (input / output / inout / other).  Read by ``runtime_abi``.
+    buffer_ranks: tuple[int, ...] = ()
+    buffer_roles: tuple[str, ...] = ()
     _entry: _Any = _field(default=None, repr=False)
     _library: _Any = _field(default=None, repr=False)
     _validation_error_reset: _Any = _field(default=None, repr=False)
@@ -5332,6 +5567,34 @@ class LLVMFunctionArtifact:
             ]
             self._entry = function
         return self._entry
+
+    def runtime_abi(self) -> dict:
+        """The buffer/extent calling contract (``runtime_abi``), as data."""
+
+        from .runtime_abi import runtime_abi_description
+
+        # Element types in the host's vocabulary (float64, int64, ...), the
+        # same table ``prepare_artifact_execution`` allocates with.
+        numpy_names = _llvm_abi_numpy_table()
+        return runtime_abi_description(
+            entry=self.name, backend="llvm", extent_type="int32_t",
+            buffer_order=self.buffer_order,
+            buffer_dtypes=tuple(
+                numpy_names.get(str(dtype), str(dtype))
+                for dtype in (self.buffer_dtypes or tuple(
+                    "double" for _ in self.buffer_order
+                ))
+            ),
+            buffer_shapes=self.buffer_shapes,
+            buffer_ranks=self.buffer_ranks or tuple(
+                len(tuple(shape or ())) for shape in self.buffer_shapes
+            ),
+            buffer_roles=self.buffer_roles or tuple(
+                "other" for _ in self.buffer_order
+            ),
+            extent_order=self.extent_order,
+            output_extent_sources=self.output_extent_sources,
+        )
 
     def _uses_validation_runtime(self) -> bool:
         # The prepared object pocket was still scanning its 71,996-byte IR
@@ -5421,10 +5684,19 @@ def prepare_artifact_execution(
         for llvm_type, numpy_name in _llvm_abi_numpy_table().items()
     }
     buffers: dict[int, _Any] = {}
+    extent_sources = dict(artifact.output_extent_sources or ())
     for value_id, authored_shape, llvm_dtype in zip(
         artifact.buffer_order, artifact.buffer_shapes, llvm_dtypes
     ):
         value_id = int(value_id)
+        if value_id in extent_sources and value_id not in shape_overrides:
+            source = feed_values.get(int(extent_sources[value_id]))
+            if source is None:
+                raise ValueError(
+                    f"runtime-sized result {value_id} takes its extents from "
+                    f"input {extent_sources[value_id]}, which was not fed"
+                )
+            shape_overrides[value_id] = tuple(np.shape(source))
         dtype = numpy_dtypes.get(str(llvm_dtype))
         if dtype is None:
             raise ValueError(f"unsupported LLVM ABI dtype {llvm_dtype!r}")
