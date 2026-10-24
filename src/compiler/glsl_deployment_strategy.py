@@ -24021,6 +24021,49 @@ def _tensor_descriptor_rule(
     }
 
 
+def _stored_callable_field_call(graph: Any, data: Mapping[str, Any]):
+    """``(class, field)`` when a node calls a callable stored on ``self``.
+
+    ``self.notify(n)`` where the method graph's class-table record lists
+    ``notify`` as a field and not a method is a call through a stored
+    callable, not a method call and not an operator: its spelling can
+    coincide with a tensor operator (``trace``) without being one.  Reads
+    only the graph's own records: ``method_binding``, ``method_owner``,
+    ``class_table`` and the receiver Input's binding to the first positional
+    parameter.
+    """
+
+    if graph.graph.get("method_binding") != "instance":
+        return None
+    expression = data.get("expr_obj")
+    if not (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+    ):
+        return None
+    owner = str(graph.graph.get("method_owner") or "")
+    record = dict((graph.graph.get("class_table") or {}).get(owner) or {})
+    positional = tuple(graph.graph.get("positional_parameters") or ())
+    if not record or not positional:
+        return None
+    name = str(expression.func.attr)
+    if name not in set(map(str, record.get("fields") or ())) or name in set(
+        map(str, dict(record.get("methods") or {}))
+    ):
+        return None
+    for parent, role in data.get("parents") or ():
+        if str(role) not in {"operand", "receiver"} or parent not in graph:
+            continue
+        receiver = graph.nodes[parent]
+        if (
+            str(receiver.get("type")) == "Input"
+            and (receiver.get("attributes") or {}).get("binding_name")
+            == positional[0]
+        ):
+            return owner, name
+    return None
+
+
 def _remove_dead_metadata_nodes(
     graph: Any,
     protected_values: Any,
@@ -24057,6 +24100,15 @@ def _remove_dead_metadata_nodes(
 
     def is_candidate(node_id: int, data: Mapping[str, Any]) -> bool:
         if int(node_id) in effect_ids:
+            return False
+        # Program: ``self.trace(i)`` with ``trace`` a stored callable field
+        # (SSAReferenceEvaluator._execute).  Wrong record: the spelling reads
+        # as the tensor operator ``trace``, so the unconsumed call was pruned
+        # here as a dead pure tensor call and the class route shipped the
+        # method without it.  Rule: a call through a stored callable field
+        # is an effect the class surface must lower or refuse, never dead
+        # metadata.
+        if _stored_callable_field_call(graph.G, data) is not None:
             return False
         attributes = data.get("attributes") or {}
         dead_pure_tensor_call = bool(
