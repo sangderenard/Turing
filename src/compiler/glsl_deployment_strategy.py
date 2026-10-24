@@ -20381,6 +20381,7 @@ def _propagate_callsite_tensor_specializations(
     # completed state at round 1".  Rule: a graph the loop writes is part of
     # the state the guard reads.
     published_callee_graphs: dict[int, Any] = {}
+    from .identity_concordance import current_identity_book
 
     def specialization_state() -> tuple[str, int]:
         facts = []
@@ -20421,6 +20422,17 @@ def _propagate_callsite_tensor_specializations(
                         function_name, int(value_id), "leaves",
                         tuple(map(int, leaves)),
                     ))
+        # A generated VJP can publish formal shapes after every graph
+        # descriptor has settled.  Those exact ledger rows are state written
+        # by this loop, so the guard must read them before judging a round
+        # with unchanged graph descriptors to have repeated.
+        book = current_identity_book()
+        for page_name in ("formal_shape", "tensor_shape_settlement"):
+            page = book.page(page_name)
+            facts.extend(
+                (page_name, repr(row), repr(page.latest(row)))
+                for row in sorted(page.rows(), key=repr)
+            )
         digest = hashlib.sha256(repr(tuple(facts)).encode("utf-8")).hexdigest()
         return digest[:16], tensor_fact_count
 
@@ -25992,6 +26004,12 @@ def _fold_callsite_structural_values(
             )
             if key in source_attributes
         }
+        if attributes.get("producer_kind") == "sequence_replication":
+            # expand_reduction's `(1,) * len(shape)` is now the literal
+            # tuple `(1, 1)`.  It has no live replication or row operands;
+            # retaining that producer identity makes sequence lowering
+            # demand a fill from members the fold deliberately retired.
+            attributes.pop("producer_kind")
         attributes.update({
             "value": copy.deepcopy(value),
             "structural_specialization": True,
@@ -27029,6 +27047,16 @@ def _fold_callsite_structural_values(
                     if named_shape is not unresolved
                     else tuple(value for _position, value in shape_arguments)
                 )
+                if named_shape is unresolved and not shape_arguments:
+                    # The VJP's expanded unbroadcast writes its reshape
+                    # extent on the operation record.  An absent positional
+                    # shape is not an instruction to reshape to scalar ().
+                    attributes = data.get("attributes") or {}
+                    extra_args = data.get("extra_args") or {}
+                    result_shape = (
+                        attributes["shape"] if "shape" in attributes
+                        else extra_args.get("shape", unresolved)
+                    )
                 if (
                     isinstance(result_shape, tuple)
                     and len(result_shape) == 1
@@ -28257,6 +28285,25 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
     ), None)
     if input_id is None:
         return False
+    from ..common.tensors.topological_reducer import (
+        node_identity_cell, post_derived_node_identity,
+    )
+    from .concordance_declarations import PLANNER_TENSOR_SPECIALIZATION
+
+    # The specialized unbroadcast of a (2, 3) gradient previously placed
+    # its reshape at id 1, an existing source-graph value id.  The old
+    # scalar shape proof for id 1 then replaced the explicit (2, 3) result.
+    # New operations are new values and derive from this call's two formals.
+    next_id = max(map(int, graph.G.nodes), default=-1) + 1
+    source_cells = [node_identity_cell(graph, input_id)]
+    shape_input_id = next((
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "target_shape"
+    ), None)
+    if shape_input_id is not None:
+        source_cells.append(node_identity_cell(graph, shape_input_id))
     metadata = copy.deepcopy(dict(graph.G.graph))
     input_data = copy.deepcopy(dict(graph.G.nodes[input_id]))
     graph.G.clear()
@@ -28265,7 +28312,6 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
     input_data["children"] = []
     input_data["tensor"] = copy.deepcopy(dict(source_descriptor))
     graph.G.add_node(input_id, **input_data)
-    next_id = input_id + 1
     current = input_id
     current_shape = list(source_shape)
 
@@ -28288,6 +28334,10 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
                 "dtype": str(source_descriptor.get("dtype") or "float64"),
             },
             control={}, constant=None, expr_obj=None, store_id=None,
+        )
+        post_derived_node_identity(
+            graph, node_id, (*source_cells, node_identity_cell(graph, current)),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
         )
         _set_operands(graph, node_id, [(current, role)], cause=_UNBROADCAST_CHAIN)
         current = node_id

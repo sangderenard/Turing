@@ -1030,6 +1030,10 @@ def settle_canonical_value_metadata(module: IRModule) -> bool:
         numerical = [
             value for value in occurrences
             if str(value.dtype or "") not in excluded
+            # The generated VJP's bw_matmul reshape has storage id 81 but
+            # view shape (2, 2).  Its view is not a writer of storage 81's
+            # shape, including while that storage's shape is unresolved.
+            and not (value.accounting or {}).get("ssa_storage_view")
         ]
         exact_writer_shapes = {
             tuple(value.shape)
@@ -1904,6 +1908,18 @@ def propagate_repository_ssa_call_metadata(
                 live_source_shape, target_shape, declared_view,
                 int(value.id),
             ):
+                continue
+            if (
+                int(source.id) == int(value.id)
+                and shape_scope_of(
+                    function if source_function is None else source_function
+                ) == shape_scope_of(function)
+            ):
+                # expand_to's planned region and enclosing function both
+                # name value 2 in one shape scope.  Transporting its updated
+                # SSA row is a view refresh, not a transformation from the
+                # value to itself; a self-edge would invent a second shape
+                # writer with no distinct source cell.
                 continue
             shape_transformation_records.append((
                 (
@@ -3455,6 +3471,27 @@ def lower_tensor_calls_to_repository_ssa(
         _settle_operand_shapes(
             function, function.args, owner_tensor_descriptor,
         )
+        # In the generated bw_tanh VJP, planned-region formal %3 had no
+        # extent or scalar receipt during section lowering.  Treating that
+        # absence as rank zero froze tanh, square and subtraction at one
+        # element, although its exact call feed later proved (2, 2).  Keep
+        # semantic tensor operations intact until the call edge states the
+        # formal's shape or explicitly states scalar storage.
+        if (function.metadata or {}).get("source_region_integral"):
+            scalar_formals = set(map(int, (
+                (function.metadata or {}).get("scalar_variant_argument_ids")
+                or ()
+            )))
+            if any(
+                not tuple(formal.shape or ())
+                and int(formal.id) not in scalar_formals
+                and (formal.accounting or {}).get("program_abi_storage")
+                is None
+                and (formal.accounting or {}).get("exact_region_feed_source")
+                is None
+                for formal in function.args
+            ):
+                continue
         function_argument_ids = {int(value.id) for value in function.args}
         unresolved_argument_ids = {
             int(value.id)
@@ -4736,6 +4773,7 @@ def lower_tensor_calls_to_repository_ssa(
                 # result's shape/dtype annotation while aliasing its storage.
                 if operation in _VIEW_OPERATIONS and args:
                     source = args[0]
+                    explicit_reshape_shape = False
                     if operation in {"unsqueeze", "squeeze"}:
                         # These CHANGE the axes, and the annotation they were
                         # given may predate the moment the operand's shape was
@@ -4807,6 +4845,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     )
                                 if -1 not in resolved:
                                     result.shape = tuple(resolved)
+                                    explicit_reshape_shape = True
                     source_descriptor = register_tensor(
                         source,
                         storage=(
@@ -4843,16 +4882,16 @@ def lower_tensor_calls_to_repository_ssa(
                             tuple(source.shape or ())
                             and tuple(view_shape) != tuple(source.shape or ())
                         )
-                        # ``unsqueeze`` adds an axis, so its result differs
-                        # from its source by construction even while the
-                        # source's extents are still unsettled here (a call
-                        # result whose shape the concordance proves later).
-                        # Left unflagged, the alias carried the view's shape
-                        # under the owner's id and the module-wide settlement
-                        # then reported a disagreement with the owner.
+                        # The generated VJP's bw_matmul reshapes an as-yet
+                        # unshaped call result (storage id 81) to the exact
+                        # requested (2, 2).  Like unsqueeze, that result is
+                        # a view even before the storage shape settles.
                         or (
                             not tuple(source.shape or ())
-                            and str(operation) == "unsqueeze"
+                            and (
+                                str(operation) == "unsqueeze"
+                                or explicit_reshape_shape
+                            )
                         )
                     ):
                         view_accounting["ssa_storage_view"] = {
