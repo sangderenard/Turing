@@ -5710,6 +5710,42 @@ def emit_module(
         if isinstance(module, IRModule)
         else {}
     )
+
+    def _published_tensor_layout(
+        function_name: str, value_id: int, seen: set[tuple[str, int]] | None = None,
+    ) -> str | None:
+        """Follow the exact SSA result identity to its tensor descriptor."""
+
+        identity = (str(function_name), int(value_id))
+        visited = set() if seen is None else seen
+        if identity in visited:
+            return None
+        visited.add(identity)
+        table = module_tensor_tables.get(str(function_name))
+        if table is not None:
+            for descriptor in table.tensors.values():
+                if int(descriptor.data_value_id) == int(value_id):
+                    return str(descriptor.layout)
+        function = functions.get(str(function_name))
+        if function is None:
+            return None
+        values = [*function.args]
+        values.extend(
+            instruction.res
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        )
+        value = next(
+            (candidate for candidate in values if int(candidate.id) == int(value_id)),
+            None,
+        )
+        if value is None:
+            return None
+        hop = (value.accounting or {}).get("ssa_call_result_from")
+        if hop and len(hop) == 2:
+            return _published_tensor_layout(str(hop[0]), int(hop[1]), visited)
+        return None
     module_sequence_tables = (
         dict(getattr(module, "sequence_tables", {}))
         if isinstance(module, IRModule)
@@ -7265,6 +7301,16 @@ def emit_module(
                         (function.args, subroutine_by_name[function_name].argument_shapes),
                         (named_outputs.get(function_name, ()), subroutine_by_name[function_name].output_shapes))
                     for value, shape in zip(values, resolved_shapes, strict=True)},
+                value_layouts={
+                    int(value.id): layout
+                    for value in (
+                        *function.args,
+                        *named_outputs.get(function_name, ()),
+                    )
+                    if (layout := _published_tensor_layout(
+                        function_name, int(value.id),
+                    )) is not None
+                },
             )
         )
     control_entries = [e.name for e in entry_points if e.kind == "control"]
@@ -8019,9 +8065,15 @@ class FortranCoreNative:
     #: cannot happen, and repeated loads of the same artifact stop
     #: happening too.
     _LIBRARIES: dict = {}
+    # ``os.add_dll_directory`` search handles are active only while the handle
+    # lives.  The compiled API already publishes the exact runtime dependency
+    # paths selected by the producer; retain one handle per published directory
+    # alongside the process-lifetime library cache.
+    _DLL_DIRECTORIES: dict = {}
 
     def __init__(self, library_path: Path, entry_record, api=None):
         import ctypes
+        import os
 
         self._entry_record = entry_record
         self._api = api
@@ -8029,6 +8081,28 @@ class FortranCoreNative:
         resolved = str(Path(library_path).resolve())
         library = FortranCoreNative._LIBRARIES.get(resolved)
         if library is None:
+            if os.name == "nt" and hasattr(os, "add_dll_directory"):
+                metadata = {} if api is None else dict(api.metadata)
+                # Compilation appends its selected runtime paths to the API it
+                # publishes beside the DLL.  Callers often still hold the
+                # emitter's pre-build API object, so the artifact's own exact
+                # contract is authoritative for loader dependencies.
+                published_path = Path(resolved).with_suffix(".api.yaml")
+                if published_path.is_file():
+                    from .compiled_program_api import load_api
+
+                    published = load_api(published_path)
+                    metadata = {
+                        **metadata,
+                        **dict(published.get("metadata") or {}),
+                    }
+                for dependency in metadata.get("runtime_dependencies", ()):
+                    dependency_path = Path(str(dependency["path"])).resolve()
+                    directory = str(dependency_path.parent)
+                    if directory not in FortranCoreNative._DLL_DIRECTORIES:
+                        FortranCoreNative._DLL_DIRECTORIES[directory] = (
+                            os.add_dll_directory(directory)
+                        )
             library = ctypes.CDLL(resolved)
             FortranCoreNative._LIBRARIES[resolved] = library
         self._library = library
