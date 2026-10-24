@@ -24546,8 +24546,8 @@ def _schedule_loop_callsites(
                     # as a feed, which counted as no read of it, so nothing
                     # ordered it after the call that adds to ``s2`` and the
                     # hierarchy put it first (the sum missed 4; clean audit).
-                    # Rule: a region fed a sequence arena of this run reads
-                    # that arena.
+                    # Rule: a region fed an arena a mutation of this run
+                    # writes reads that arena.
                     if isinstance(candidate, StatementBlock) and scheduled_region(candidate) is not None:
                         arena_signature = dependency_signature(candidate)
                         if arena_signature is not None:
@@ -24555,7 +24555,6 @@ def _schedule_loop_callsites(
                                 int(value_id)
                                 for value_id in arena_signature[0]
                                 if int(value_id) in mutated_arenas
-                                or int(value_id) in run_arenas
                             )
                     # PROGRAM SHAPE: a region ``StatementBlock`` whose effects
                     # (append/extend/store/pack_bits/lookup ...) are recorded

@@ -2243,6 +2243,24 @@ def source_body_statements(definition: Any) -> tuple[Any, ...]:
     return (body,)
 
 
+def _field_order_walk(node: Any) -> tuple[Any, ...]:
+    """A method's nodes in the class schema's field order.
+
+    Program: ``Q.__init__`` sets ``self.b`` then ``self.a`` (corpus c428),
+    or ``Walker.__init__`` sets ``self.k`` then ``self.steps``.  Wrong
+    record: ``source_walk`` pops its stack, visiting a method's statements
+    last to first, so the class catalogue listed ``steps`` before ``k``
+    while the published class table (``instance_attribute_slot`` over
+    ``_class_schema_from_ast``, an ``ast.walk``) gives ``k`` slot 0, and a
+    host laid out by the class table read the other field.  Rule: field
+    discovery walks a Python method as the class schema does.
+    """
+
+    if isinstance(node, ast.AST):
+        return tuple(ast.walk(node))
+    return source_walk(node)
+
+
 def source_walk(node: Any) -> tuple[Any, ...]:
     """``ast.walk`` for any registered language, via ``source_child_nodes``.
 
@@ -19098,7 +19116,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             member,
                             (ast.FunctionDef, ast.AsyncFunctionDef),
                         )
-                        for target in source_walk(member)
+                        for target in _field_order_walk(member)
                         if isinstance(target, ast.Attribute)
                         and isinstance(target.ctx, ast.Store)
                         and isinstance(target.value, ast.Name)
@@ -20390,7 +20408,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             *(
                 target.attr
                 for target in (
-                    source_walk(function_definition)
+                    _field_order_walk(function_definition)
                     if isinstance(
                         function_definition,
                         (ast.FunctionDef, ast.AsyncFunctionDef),

@@ -9483,29 +9483,6 @@ def _field_slot_ops(
     # physical layout and identity. Class navigation supplies method bodies;
     # its descriptive field catalogue must not widen or reorder ABI storage.
     fields = declared_fields or tuple((record or {}).get("fields") or ())
-    if not declared_fields and fields:
-        # Program: ``Walker.__init__`` sets ``self.k`` then ``self.steps``
-        # (the SSA interpreter thread's class-route repro).  Wrong record:
-        # this catalogue listed ``steps`` first (its walk visits a method's
-        # statements last to first), while the published class table gives
-        # ``k`` slot 0 (``instance_attribute_slot`` over the class schema),
-        # so a host following the class table read the other field.  Rule:
-        # instance fields take the class schema's order, the one the class
-        # table publishes, all of them (a method's own catalogue can miss
-        # a field it never names); fields only this catalogue names follow.
-        schema_order = tuple(
-            str(attribute["name"])
-            for object_map in (graph_obj.graph.get("map_ir") or {}).get(
-                "objects", (),
-            )
-            if owner is not None and owner in {
-                str(object_map.get("class_name")),
-                str(object_map.get("class_identity")),
-            }
-            for attribute in object_map.get("attributes", ())
-            if str(attribute.get("storage")) == "instance"
-        )
-        fields = tuple(dict.fromkeys((*schema_order, *fields)))
     declared_identity = declared_self_record.get("identity")
     record_identity = (
         str(declared_identity) if declared_identity is not None else owner
