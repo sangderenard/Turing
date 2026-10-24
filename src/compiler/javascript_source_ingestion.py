@@ -187,7 +187,6 @@ def lower_javascript_source_to_ssa(
     nodes = graph.G.nodes
     values: dict[int, SSAValue] = {}
     arguments: list[SSAValue] = []
-    instructions: list[Instr] = []
     next_id = 0
 
     def fresh(dtype: str | None) -> SSAValue:
@@ -230,22 +229,84 @@ def lower_javascript_source_to_ssa(
         if node_id is not None:
             values[node_id] = value
 
-    def lower(node_id: int) -> SSAValue | None:
-        if node_id in values:
-            return values[node_id]
+    # Blocks.  The interpreter's region is acyclic except for its loops,
+    # which it records in ``javascript_loops`` with the id ranges their
+    # header (Phi nodes, then the condition) and body occupy; node ids are
+    # creation order, so an id range is a program region.  Each loop's
+    # back edge (a Phi's ``next`` value) lives in that table, not on the
+    # graph.
+    loops = sorted(
+        (dict(item) for item in graph.G.graph.get("javascript_loops", ())),
+        key=lambda item: int(item["header_start"]),
+    )
+    phi_loop = {
+        int(phi): loop for loop in loops for phi in loop["phis"].values()
+    }
+
+    root = int(lowering.root)
+    returned_nodes = _ordered_parents(nodes[root])
+    # Every loop is emitted, used or not: a loop that never terminates in
+    # JavaScript must not terminate here either.
+    needed: set[int] = set()
+    pending = list(returned_nodes)
+    for loop in loops:
+        pending.append(int(loop["condition"]))
+        pending.extend(int(item) for item in loop["phis"].values())
+        pending.extend(int(item) for item in loop["next"].values())
+    while pending:
+        node_id = pending.pop()
+        if node_id in needed:
+            continue
+        needed.add(node_id)
+        pending.extend(_ordered_parents(nodes[node_id]))
+        if node_id in phi_loop:
+            loop = phi_loop[node_id]
+            carried_name = next(
+                key for key, value in loop["phis"].items()
+                if int(value) == node_id
+            )
+            pending.append(int(loop["next"][carried_name]))
+            pending.append(int(loop["condition"]))
+
+    blocks: dict[str, BasicBlock] = {}
+    current = BasicBlock("entry", [])
+    blocks["entry"] = current
+    phi_instructions: dict[int, Instr] = {}
+    failed = False
+
+    def emit(node_id: int) -> None:
+        nonlocal failed
+        if node_id in values or node_id not in needed:
+            return
         data = nodes[node_id]
         node_type = str(data.get("type"))
         attributes = dict(data.get("attributes") or {})
-        operands = [lower(parent) for parent in _ordered_parents(data)]
+        if node_type == "Phi":
+            init = values.get(_ordered_parents(data)[0])
+            if init is None:
+                failed = True
+                return
+            value = fresh(dtype_of(node_id))
+            instruction = Instr(
+                Handler.Phi.value, [init], value,
+                attributes={"binding_name": attributes.get("binding_name")},
+            )
+            current.instrs.append(instruction)
+            phi_instructions[node_id] = instruction
+            values[node_id] = value
+            return
+        operands = [values.get(parent) for parent in _ordered_parents(data)]
         if node_type == "Untranslated" or any(item is None for item in operands):
-            return None
+            failed = True
+            return
         if node_type == "Input":
             shortfalls.append(JavaScriptSourceShortfall(
                 "free-javascript-name",
                 f"{attributes.get('binding_name')!r} is not a parameter or "
                 "const binding of this function",
             ))
-            return None
+            failed = True
+            return
         dtype = dtype_of(node_id)
         if node_type == "Constant":
             constant = data.get("constant")
@@ -254,7 +315,7 @@ def lower_javascript_source_to_ssa(
                 # JavaScript value is the double.
                 constant = float(constant)
             value = fresh(dtype)
-            instructions.append(Instr(
+            current.instrs.append(Instr(
                 Handler.Const.value, [], value,
                 attributes={"value": constant},
             ))
@@ -268,9 +329,10 @@ def lower_javascript_source_to_ssa(
                     "unlowered-call",
                     f"call node {node_id} names no repository operation",
                 ))
-                return None
+                failed = True
+                return
             value = fresh(dtype)
-            instructions.append(Instr(
+            current.instrs.append(Instr(
                 operation, list(operands), value,
                 attributes=_carried(attributes),
             ))
@@ -282,30 +344,100 @@ def lower_javascript_source_to_ssa(
                     "unlowered-node",
                     f"node type {node_type!r} has no SSA instruction",
                 ))
-                return None
+                failed = True
+                return
             value = fresh(dtype)
-            instructions.append(Instr(
+            current.instrs.append(Instr(
                 handler.value, list(operands), value,
                 attributes=_carried(attributes),
             ))
         values[node_id] = value
-        return value
 
-    root = int(lowering.root)
+    def branch(target: BasicBlock) -> None:
+        current.instrs.append(Instr(
+            Handler.Br.value, [], None, attributes={"target": target.name},
+        ))
+        current.successors.append(target.name)
+
+    def region(low: int, high: int) -> None:
+        nonlocal current
+        position = low
+        inner = [
+            loop for loop in loops
+            if low <= int(loop["header_start"]) and int(loop["body_end"]) <= high
+        ]
+        top = []
+        for loop in inner:
+            if not any(
+                other is not loop
+                and int(other["header_start"]) <= int(loop["header_start"])
+                and int(loop["body_end"]) <= int(other["body_end"])
+                for other in inner
+            ):
+                top.append(loop)
+        for loop in top:
+            for node_id in range(position, int(loop["header_start"])):
+                emit(node_id)
+            label = f"loop{int(loop['id'])}"
+            header = BasicBlock(f"{label}_header", [])
+            body = BasicBlock(f"{label}_body", [])
+            exit_block = BasicBlock(f"{label}_exit", [])
+            preheader = current
+            branch(header)
+            blocks[header.name] = header
+            current = header
+            for node_id in range(
+                int(loop["header_start"]), int(loop["condition_end"])
+            ):
+                emit(node_id)
+            condition = values.get(int(loop["condition"]))
+            if condition is None:
+                shortfalls.append(JavaScriptSourceShortfall(
+                    "unlowered-loop",
+                    f"loop {loop['id']} condition has no value",
+                ))
+                return
+            current.instrs.append(Instr(
+                Handler.CondBr.value, [condition], None,
+                attributes={
+                    "true_target": body.name, "false_target": exit_block.name,
+                },
+            ))
+            current.successors.extend((body.name, exit_block.name))
+            blocks[body.name] = body
+            current = body
+            region(int(loop["condition_end"]), int(loop["body_end"]))
+            latch = current
+            for carried_name, phi in loop["phis"].items():
+                instruction = phi_instructions.get(int(phi))
+                carried = values.get(int(loop["next"][carried_name]))
+                if instruction is None or carried is None:
+                    shortfalls.append(JavaScriptSourceShortfall(
+                        "unlowered-loop",
+                        f"loop {loop['id']} carries {carried_name!r} without a value",
+                    ))
+                    continue
+                instruction.args.append(carried)
+                instruction.attributes["incoming_blocks"] = (
+                    preheader.name, latch.name,
+                )
+            branch(header)
+            blocks[exit_block.name] = exit_block
+            current = exit_block
+            position = int(loop["body_end"])
+        for node_id in range(position, high):
+            emit(node_id)
+
+    region(0, root)
     result_kind = "unknown"
     returned: list[SSAValue] = []
-    parents = _ordered_parents(nodes[root])
-    if parents:
-        result_kind = kind_of(parents[0])
-        result = lower(parents[0])
+    if returned_nodes:
+        result_kind = kind_of(returned_nodes[0])
+        result = values.get(returned_nodes[0])
         if result is not None:
             returned.append(result)
-    instructions.append(Instr(Handler.Ret.value, returned, None))
-    function_ir = Function(
-        name,
-        arguments,
-        {"entry": BasicBlock("entry", instructions)},
-    )
+    current.instrs.append(Instr(Handler.Ret.value, returned, None))
+    function_ir = Function(name, arguments, blocks)
     function_ir.metadata["parameter_names"] = tuple(
         (parameter_name, value.id)
         for parameter_name, value in zip(parameter_names, arguments)
