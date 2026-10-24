@@ -97,3 +97,21 @@ defect, not new work.
 
 The gate was not run in the cloud (it adds about 70 names even on `main`).
 Both changes are on the library route only.
+
+## Follow-up: family A fixed (seeded methods get a body)
+
+`compile_ast_aot` called `prepare_graph_precompile` on the entry's shell
+alone.  Preparation walks only that shell's callsite tree, so every other
+activation root reached the whole-object lowering with no control program
+(and since #835, was refused by name).  Each activation root's own shell is
+now prepared.  `Acc.add` (a two-method class) compiles and returns `a + b`
+natively, the same as Python (`tests/test_whole_class_compile_trial.py`).
+
+The interpreter's class route now reaches `_execute`'s loop and stops at
+family D, in a narrower form: `_step` resolves now, and the one opaque effect
+left is `self.trace(...)`.  That is a call through an `Optional[Callable]`
+field, which has no modelled state transition.  New row: a call through a
+callable-valued field.
+
+Corpus 323/323 PASS, fuzz seed 48 30/30 PASS, cloud gate aa 89 / ab 7 /
+ac 26 / rec 20 (exactly the baselines).

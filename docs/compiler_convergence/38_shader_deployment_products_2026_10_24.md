@@ -89,8 +89,9 @@ the input whose extents an output takes, `extents.order` entries are
 - `graphics-stage` (WebGL): a raster pipeline with the companion vertex
   stage, not a compute dispatch.
 - `no-component-abi` (extracted shaders).
-- Deployable SPIR-V refuses by name: an array-shaped value, a dtype with no
-  storage element (bool), or more than one result.
+- Deployable SPIR-V refuses by name: a runtime-sized span (rank stated, no
+  static shape), a dtype with no storage element (bool), or no result.
+  Array-shaped values and several results are carried (see "Instances").
 
 ## Fault found on the way
 
@@ -117,4 +118,28 @@ words past the element count are untouched with an extra group dispatched.
 - A component ABI for extracted host shaders.
 - The precision-core compute lane (`ssa_glsl_compute_backend`) has no
   component ABI, so it has no product yet.
-- Deployable SPIR-V for array-shaped SSA values and multi-result functions.
+- Deployable SPIR-V for runtime-sized spans (it needs a structured loop in
+  the library function; static shapes are unrolled).
+
+## Instances (follow-up, rank-known tensor lowering thread)
+
+Program: a deployable entry over `(a + b) * s` and `a - b`, with `a` and `b`
+of shape (2, 3) and `s` a scalar. Wrong record: emission refused both the
+shape and the second result, so array-shaped products could not be
+deployed.
+
+Rule: invocation `i` runs one instance of the function. A value of static
+shape `S` holds `element_count` instances of `prod(S)` elements each, row
+major, back to back; a scalar's instance is one element. Each output is its
+own buffer, in order. The library function returns a struct when there are
+several outputs, and `main` extracts each member. Each `realizes` view
+states `instance_shape` (`[]` for a scalar), `rank` = 1 + its length,
+`shape` null (the leading extent is the instance count), and `byte_extent`
+scaled by `element_bytes * prod(instance_shape)`. A runtime-sized span is
+refused by name in both the library and the deployable product. Before
+this, the library read one as a scalar.
+
+Evidence: `test_deployable_spirv_states_instance_shapes_and_every_output`,
+and `test_instanced_deployable_spirv_matches_python_on_vulkan`. On lavapipe,
+over 300 instances, both outputs match numpy and the words past the
+instance count are untouched.

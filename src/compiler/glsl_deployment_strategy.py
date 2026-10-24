@@ -1981,6 +1981,46 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
             continue
         if hypotheses.setdefault(receiver, dtype) != dtype:
             hypotheses[receiver] = ""
+    # Program: ``xs = [6, n, 2]; for j in range(len(xs)): xs[j] = xs[j] *
+    # 2`` (corpus c169).  Lane D, D2.  The same cycle without ``get``: the
+    # display's element type is the join of its members and its stores, the
+    # store's value reads ``xs[j]``, and that read is the element type, so
+    # the rows fell to the float64 domain default.  Rule: a collection whose
+    # members are all proven and whose element type is not assumes its
+    # members' join, accepted only under the same check (its writers then
+    # join to exactly that type).
+    for node_id, data in G.nodes(data=True):
+        node_id = int(node_id)
+        attributes = data.get("attributes") or {}
+        if node_id in proven or node_id in hypotheses:
+            continue
+        if attributes.get("aggregate_kind") not in {"list", "set", "dict"}:
+            continue
+        if str(data.get("op") or data.get("type") or "").casefold().startswith(
+            "indexed"
+        ):
+            continue
+        role = (
+            "values" if attributes.get("aggregate_kind") == "dict"
+            else "arg"
+            if attributes.get("producer_kind") == "sequence_materialization"
+            else "elts"
+        )
+        members = [
+            int(parent) for parent, member_role in data.get("parents") or ()
+            if str(member_role).startswith(role) and int(parent) in G
+        ]
+        dtypes = {proven.get(member) for member in members}
+        if not members or None in dtypes or not dtypes <= {
+            "int64", "float64", "bool",
+        }:
+            continue
+        joined = (
+            next(iter(dtypes)) if len(dtypes) == 1
+            else "int64" if dtypes == {"int64", "bool"} else None
+        )
+        if joined is not None:
+            hypotheses[node_id] = joined
     hypotheses = {key: value for key, value in hypotheses.items() if value}
     if not hypotheses:
         return proven
