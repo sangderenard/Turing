@@ -11565,6 +11565,10 @@ def _sequence_value_kinds(
 
 
 #: Aggregate kinds whose truthiness is "has members" (``if r:``).
+# A mutable collection is one storage wherever it is returned (the planner's
+# rule 3): its output is the collection itself, never its member leaves.
+_MUTABLE_AGGREGATE_KINDS = frozenset({"list", "set", "dict", "bytearray"})
+
 _TRUTHINESS_AGGREGATE_KINDS = frozenset({
     "list", "set", "frozenset", "dict", "tuple", "bytes", "bytearray", "str",
 })
@@ -20693,6 +20697,24 @@ def _settle_linked_dynamic_sequences(
             (id(graph_obj), value_id)
             for value_id in local_lists & output_ids
         )
+        # Program: ``if n > 2: return [n]`` / ``return []`` (lanes plan A6).
+        # Wrong record: the result list (the ``[]``) was FIXED at its own
+        # zero rows, so the return edge's copy of ``[n]`` into it reported
+        # full and the caller read an empty list.  Rule: a list one return
+        # site returns while another site returns a different list is
+        # filled at run time from whichever site returned; it is DYNAMIC.
+        returned_by_slot: dict[int, set[int]] = {}
+        for site_values in (graph_obj.graph.get("return_slot_values") or {}).values():
+            for slot, value_id in enumerate(site_values or ()):
+                if value_id is not None:
+                    returned_by_slot.setdefault(slot, set()).add(int(value_id))
+        seeds.update(
+            (id(graph_obj), value_id)
+            for value_ids in returned_by_slot.values() if len(value_ids) > 1
+            for value_id in value_ids
+            if (graph_obj.nodes.get(value_id, {}).get("attributes") or {})
+            .get("aggregate_kind") == "list"
+        )
         for mutation in _sequence_append_call_mutations(graph_obj):
             if mutation.operator == "clear":
                 continue
@@ -26340,6 +26362,8 @@ def _class_surface_ssa_program(
                 if (
                     node_attributes.get("producer_kind") == "aggregate"
                     and members
+                    and node_attributes.get("aggregate_kind")
+                    not in _MUTABLE_AGGREGATE_KINDS
                 ):
                     return tuple(
                         leaf
@@ -26351,6 +26375,8 @@ def _class_surface_ssa_program(
             aggregate_root = bool(
                 root_attributes.get("producer_kind") == "aggregate"
                 and root_attributes.get("aggregate_leaf_value_ids")
+                and root_attributes.get("aggregate_kind")
+                not in _MUTABLE_AGGREGATE_KINDS
             )
             if aggregate_root:
                 required_root_output_value_ids.extend(
@@ -27768,6 +27794,39 @@ def _class_surface_ssa_program(
                 ):
                     dynamic_sequence_ids.add(destination_id)
                     grown = True
+        # Program: ``if n < 0: return []`` then a loop-built ``return out``
+        # (A6 probe c996).  Wrong record: the ``[]`` (a folded constant, no
+        # authored bound) was an output-history member, so it stayed
+        # caller-provided FIXED storage with no capacity and the wrapper
+        # refused it.  Rule: a list one return site returns while the
+        # output is another list is copied into the output at that site
+        # (``_copy_divergent_sequence_returns``); it is this function's
+        # private list, DYNAMIC unless a bound covers it.
+        returned_by_slot: dict[int, set[int]] = {}
+        for site_values in (graph_obj.graph.get("return_slot_values") or {}).values():
+            for slot, value_id in enumerate(site_values or ()):
+                if value_id is not None:
+                    returned_by_slot.setdefault(slot, set()).add(int(value_id))
+        final_output_ids = {
+            int(history[-1])
+            for name in tuple(graph_obj.graph.get("function_outputs") or ())
+            for history in (tuple(
+                (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
+            ),)
+            if history
+        }
+        dynamic_sequence_ids = {
+            *dynamic_sequence_ids,
+            *(
+                value_id
+                for value_ids in returned_by_slot.values() if len(value_ids) > 1
+                for value_id in value_ids
+                if value_id not in final_output_ids
+                and value_id not in sequence_capacity_bounds
+                and (graph_obj.nodes.get(value_id, {}).get("attributes") or {})
+                .get("aggregate_kind") == "list"
+            ),
+        }
         dynamic_sequence_ids = tuple(sorted(dynamic_sequence_ids))
         from types import SimpleNamespace as _GraphView
         from .glsl_deployment_strategy import _planned_scalar_dtypes
