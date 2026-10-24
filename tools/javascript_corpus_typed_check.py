@@ -15,6 +15,11 @@ matches only when its bits match (any NaN matches any NaN; ``-0`` does not
 match ``0``).  The returned kind must match too: a JavaScript number is a
 float buffer, a boolean a bool buffer.
 
+Programs whose implementation-approximated operations are all unary Math
+calls are judged bit for bit against node replaying with those calls
+answered by the C library (``pinned_node_rows``); programs using ``**`` or
+``Math.pow`` are judged within a ulp tier (``oracle_ulps``).
+
 Statuses: PASS, FAIL (WRONG or TYPE rows), REFUSED (named lowering
 shortfalls -- loud, never a wrong answer), LOWER-FAIL, EMIT-INCOMPLETE,
 EMIT-FAIL, NODE-FAIL.
@@ -36,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+from typing import Any
 
 import numpy as np
 
@@ -74,6 +80,25 @@ function encode(value) {
   return {kind: typeof value, text: String(value)};
 }
 const context = vm.createContext({});
+// Pinned transcendentals: Math.<fn> answers from the table (keyed by the
+// argument's bits) and records every argument it has no answer for.
+const pins = request.pins || null;
+const misses = [];
+if (pins) {
+  const view = new DataView(new ArrayBuffer(8));
+  const bits = (x) => { view.setFloat64(0, x); return view.getBigUint64(0).toString(16).padStart(16, "0"); };
+  const value = (h) => { view.setBigUint64(0, BigInt("0x" + h)); return view.getFloat64(0); };
+  const math = vm.runInContext("Math", context);
+  for (const name of request.pinned) {
+    const original = math[name];
+    math[name] = function (x) {
+      const key = name + ":" + bits(+x);
+      if (key in pins) return value(pins[key]);
+      misses.push(key);
+      return original(x);
+    };
+  }
+}
 vm.runInContext(request.source, context);
 const rows = vm.runInContext(request.inputs, context);
 const out = [];
@@ -87,12 +112,19 @@ for (const row of rows) {
   }
   out.push({args: args.map(encode), result});
 }
-process.stdout.write(JSON.stringify(out));
+process.stdout.write(JSON.stringify(pins ? {rows: out, misses} : out));
 """
 
 
-def node_rows(source: str, inputs: str, entry: str = "root") -> list[dict]:
-    """Evaluate ``entry`` on each JavaScript-spelled input row in node."""
+def node_rows(
+    source: str, inputs: str, entry: str = "root",
+    pins: dict[str, str] | None = None,
+) -> Any:
+    """Evaluate ``entry`` on each JavaScript-spelled input row in node.
+
+    With ``pins`` the unary approximated Math functions answer from that
+    table and the result is ``{"rows": ..., "misses": [...]}``.
+    """
 
     executable = node_executable()
     if executable is None:
@@ -104,6 +136,7 @@ def node_rows(source: str, inputs: str, entry: str = "root") -> list[dict]:
         [executable, "-e", _NODE_ORACLE],
         input=json.dumps({
             "source": exposed, "inputs": inputs, "entry": entry,
+            "pins": pins, "pinned": sorted(PINNED_MATH),
         }).encode("utf-8"),
         capture_output=True,
         timeout=60,
@@ -111,6 +144,57 @@ def node_rows(source: str, inputs: str, entry: str = "root") -> list[dict]:
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode("utf-8", "replace").strip())
     return json.loads(result.stdout.decode("utf-8"))
+
+
+#: Unary implementation-approximated Math functions the oracle can pin to
+#: the C library's answers.  ``Math.pow`` and ``**`` are not pinnable
+#: (``**`` is an operator), so programs using them keep the ulp tier.
+PINNED_MATH = frozenset({
+    "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh",
+    "exp", "log", "sin", "sinh", "tan", "tanh",
+})
+
+
+def _libm():
+    import ctypes
+    import ctypes.util
+
+    library = ctypes.CDLL(ctypes.util.find_library("m") or "libm.so.6")
+    functions = {}
+    for name in PINNED_MATH:
+        function = getattr(library, name)
+        function.restype = ctypes.c_double
+        function.argtypes = (ctypes.c_double,)
+        functions[name] = function
+    return functions
+
+
+def pinned_node_rows(source: str, inputs: str, entry: str = "root") -> list[dict]:
+    """node's answers with the transcendentals pinned to the C library's.
+
+    ECMAScript leaves Math.sin, Math.log, ... implementation-approximated,
+    and the compiled program calls the C library's.  An approximation
+    differing by one ulp can be amplified without bound downstream
+    (``Math.exp(10) % Math.log(3)``: ~2e4 ulp; a branch on it: anything),
+    so a ulp tier on the final value is no standard there.  Instead node
+    replays the program with every pinned call answered by libm (the same
+    functions the native code calls), and the result is compared bit for
+    bit: everything that is not the approximation itself -- the program's
+    JavaScript semantics -- must agree exactly.  Arguments a replay
+    reaches for the first time are answered on the next replay.
+    """
+
+    libm = _libm()
+    pins: dict[str, str] = {}
+    for _ in range(16):
+        result = node_rows(source, inputs, entry, pins=pins)
+        if not result["misses"]:
+            return result["rows"]
+        for key in result["misses"]:
+            name, bits = key.split(":")
+            argument = struct.unpack(">d", bytes.fromhex(bits))[0]
+            pins[key] = number_bits(libm[name](argument))
+    raise RuntimeError("pinned replay did not settle in 16 rounds")
 
 
 def decode(item: dict):
@@ -235,11 +319,22 @@ def check_program(source: str, inputs: str, *, entry: str = "root") -> str:
         artifact.compile(pathlib.Path(tempfile.mkdtemp()) / "native")
     except Exception as error:
         return f"EMIT-FAIL {type(error).__name__}: {str(error)[:300]}"
-    approximated = any(
-        instruction.attributes.get("ecmascript_approximated")
+    approximated_ops = {
+        str(instruction.op)
         for block in function.blocks.values()
         for instruction in block.instrs
-    )
+        if instruction.attributes.get("ecmascript_approximated")
+    }
+    approximated = bool(approximated_ops)
+    pinned = approximated and approximated_ops <= PINNED_MATH
+    if pinned:
+        # Every approximation is a pinnable call: judge bit for bit
+        # against node replaying with the C library's answers.
+        try:
+            rows = pinned_node_rows(source, inputs, entry)
+        except Exception as error:
+            return f"NODE-FAIL {type(error).__name__}: {str(error)[:300]}"
+        approximated = False
     tier, ulps = oracle_ulps() if approximated else (None, None)
     worst = 0.0
     verdicts = []
@@ -267,7 +362,9 @@ def check_program(source: str, inputs: str, *, entry: str = "root") -> str:
     bad = [item for item in verdicts if item != "ok"]
     standard = (
         f" (approximated: max {worst:.3g} ulp vs node, tier {tier} = {ulps:g})"
-        if approximated else ""
+        if approximated
+        else f" (libm-pinned: {', '.join(sorted(approximated_ops))})"
+        if pinned else ""
     )
     return (
         f"{'PASS' if not bad else 'FAIL'}{standard} {bad[:3] if bad else ''}"
