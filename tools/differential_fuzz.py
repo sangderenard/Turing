@@ -551,8 +551,8 @@ def run_one(text):
             built = compile_fortran_module_c_shell(
                 fortran, {}, pathlib.Path(tempfile.mkdtemp()), library=True,
                 entrypoint=exports[0], name=exports[0][:48],
-                # FUZZ_FORTRAN_STANDALONE=0 links libgfortran dynamically
-                # (a Linux libgfortran.a is not position independent).
+                # FUZZ_FORTRAN_STANDALONE=0 links the toolchain's
+                # libgfortran dynamically instead of staging it.
                 standalone=os.environ.get("FUZZ_FORTRAN_STANDALONE", "1") != "0",
             )
             record = next(e for e in fortran.api.entry_points if str(e.name) == exports[0])

@@ -234,6 +234,12 @@ unsigned long long turing_trace_drain(
 
 
 _C_SOURCE = r"""
+/* -std=c11 withholds POSIX declarations (clock_gettime, CLOCK_MONOTONIC)
+   unless they are requested before the first system header latches the
+   feature set; this source is the head of every generated shell. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdint.h>
 
 #if defined(_WIN32)

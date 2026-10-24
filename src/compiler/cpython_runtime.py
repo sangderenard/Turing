@@ -29,10 +29,40 @@ class CPythonRuntime:
     dlls: Path | None
     version: tuple[int, int, int]
     provenance: str
+    platlibdir: str = "lib"
+    abi_thread: str = ""
 
     @property
     def abi_tag(self) -> str:
         return f"cp{self.version[0]}{self.version[1]}"
+
+    @property
+    def stdlib_archive_name(self) -> str:
+        return f"python{self.version[0]}{self.version[1]}{self.abi_thread}.zip"
+
+    def staged_layout(self, target: Path) -> tuple[Path, Path, Path]:
+        """Where this runtime's own path computation looks under a home.
+
+        Returns (stdlib archive, pure library directory, extension
+        directory).  Windows reads the archive beside the DLL and ``Lib`` /
+        ``DLLs`` under its home; POSIX getpath reads
+        ``<platlibdir>/pythonXY.zip``, ``<platlibdir>/pythonX.Y`` and its
+        ``lib-dynload`` under the home the adapter sets.
+        """
+
+        if self.dll.suffix.casefold() == ".dll":
+            return (
+                target / self.stdlib_archive_name, target / "Lib", target / "DLLs",
+            )
+        library = (
+            target / self.platlibdir
+            / f"python{self.version[0]}.{self.version[1]}{self.abi_thread}"
+        )
+        return (
+            target / self.platlibdir / self.stdlib_archive_name,
+            library,
+            library / "lib-dynload",
+        )
 
 
 @dataclass(frozen=True)
@@ -47,15 +77,56 @@ _PROBE = r"""
 import json, pathlib, sys, sysconfig
 base = pathlib.Path(sys.base_prefix).resolve()
 major, minor, micro = sys.version_info[:3]
-dll = base / (f"python{major}{minor}.dll" if sys.platform == "win32" else f"libpython{major}.{minor}.so")
+thread = "t" if sysconfig.get_config_var("Py_GIL_DISABLED") else ""
+dll_refusal = None
+if sys.platform == "win32":
+    dll = base / f"python{major}{minor}{thread}.dll"
+elif not sysconfig.get_config_var("Py_ENABLE_SHARED"):
+    # A static-only interpreter has no shared library to load or stage.
+    dll = None
+    dll_refusal = "interpreter was built without a shared libpython (Py_ENABLE_SHARED=0)"
+else:
+    # The shared library is wherever this interpreter's build installed it,
+    # not under base_prefix: Debian keeps it in the multiarch LIBDIR.  A
+    # relocated build (python-build-standalone, pyenv) keeps a stale LIBDIR,
+    # so base_prefix/lib is the second place this interpreter itself names.
+    names = [
+        name for name in (
+            sysconfig.get_config_var("INSTSONAME"),
+            sysconfig.get_config_var("LDLIBRARY"),
+        ) if name and not name.endswith(".a")
+    ]
+    roots = [
+        root for root in (
+            sysconfig.get_config_var("LIBDIR"),
+            str(base / sys.platlibdir),
+            str(base / "lib"),
+        ) if root
+    ]
+    dll = next((
+        pathlib.Path(root) / name
+        for name in names for root in roots
+        if (pathlib.Path(root) / name).is_file()
+    ), None)
+    if dll is None:
+        dll_refusal = (
+            "shared libpython " + "/".join(names) + " not found in "
+            + ", ".join(roots)
+        )
 print(json.dumps({
     "executable": str(pathlib.Path(sys.executable).resolve()),
     "home": str(base),
-    "dll": str(dll),
+    "dll": None if dll is None else str(dll),
+    "dll_refusal": dll_refusal,
     "include": sysconfig.get_path("include"),
     "import_library": str(base / "libs" / f"python{major}{minor}.lib") if sys.platform == "win32" else None,
     "stdlib": sysconfig.get_path("stdlib"),
-    "dlls": str(base / "DLLs") if sys.platform == "win32" else None,
+    "dlls": (
+        str(base / "DLLs") if sys.platform == "win32"
+        else sysconfig.get_config_var("DESTSHARED")
+    ),
+    "platlibdir": sys.platlibdir,
+    "abi_thread": thread,
     "version": [major, minor, micro],
 }))
 """
@@ -71,19 +142,23 @@ for name in requested:
     if spec is None:
         raise SystemExit("module-unavailable:" + name)
     distributions = packages.get(name, ())
-    if distributions:
-        pending.extend(distributions)
+    pending.extend(distributions)
+    # A distro-installed distribution (Debian's python3-yaml) carries no
+    # RECORD, so its file list is empty; the module's own tree is then the
+    # only statement of what it needs.
+    if any(md.distribution(item).files for item in distributions):
+        pass
     elif spec.submodule_search_locations:
         for location in spec.submodule_search_locations:
             root = pathlib.Path(location).resolve()
             loose.extend(
-                [str(path.resolve()), str(pathlib.Path(name) / path.relative_to(root))]
+                (str(path.resolve()), str(pathlib.Path(name) / path.relative_to(root)))
                 for path in root.rglob("*")
                 if path.is_file() and "__pycache__" not in path.parts
             )
     elif spec.origin not in {None, "built-in", "frozen"}:
         origin = pathlib.Path(spec.origin).resolve()
-        loose.append([str(origin), name + origin.suffix])
+        loose.append((str(origin), name + origin.suffix))
 seen = set(); files = []
 while pending:
     name = pending.pop(0)
@@ -119,20 +194,26 @@ def _python_executable(value: str | Path) -> Path | None:
     return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
-def _inspect(executable: Path, provenance: str) -> CPythonRuntime | None:
+def _inspect(executable: Path, provenance: str) -> CPythonRuntime | str:
+    """The runtime this interpreter describes, or why it cannot be one."""
+
     completed = subprocess.run(
         [str(executable), "-I", "-S", "-c", _PROBE],
         capture_output=True,
         text=True,
     )
     if completed.returncode != 0:
-        return None
+        return f"{executable}: probe failed: {completed.stderr.strip()}"
     try:
         value = json.loads(completed.stdout)
+        if value.get("dll") is None:
+            return f"{executable}: {value.get('dll_refusal')}"
         dll = Path(value["dll"]).resolve()
         stdlib = Path(value["stdlib"]).resolve()
-        if not dll.is_file() or not stdlib.is_dir():
-            return None
+        if not dll.is_file():
+            return f"{executable}: runtime library {dll} is not a file"
+        if not stdlib.is_dir():
+            return f"{executable}: stdlib {stdlib} is not a directory"
         include = Path(value["include"]).resolve() if value.get("include") else None
         import_library = (
             Path(value["import_library"]).resolve()
@@ -151,9 +232,11 @@ def _inspect(executable: Path, provenance: str) -> CPythonRuntime | None:
             dlls=dlls if dlls and dlls.is_dir() else None,
             version=tuple(map(int, value["version"])),
             provenance=provenance,
+            platlibdir=str(value.get("platlibdir") or "lib"),
+            abi_thread=str(value.get("abi_thread") or ""),
         )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return f"{executable}: unreadable probe record: {error}"
 
 
 def discover_cpython_runtime(
@@ -181,15 +264,20 @@ def discover_cpython_runtime(
             candidates.append((f"PATH:{name}", found))
 
     seen: set[Path] = set()
+    refusals: list[str] = []
     for provenance, value in candidates:
         executable = _python_executable(value)
         if executable is None or executable in seen:
             continue
         seen.add(executable)
         runtime = _inspect(executable, provenance)
-        if runtime is not None:
+        if isinstance(runtime, CPythonRuntime):
             return runtime
-    raise FileNotFoundError("no usable CPython runtime was supplied or discovered")
+        refusals.append(f"{provenance}: {runtime}")
+    raise FileNotFoundError(
+        "no usable CPython runtime was supplied or discovered"
+        + "".join(f"\n  {refusal}" for refusal in refusals)
+    )
 
 
 def _copy(source: Path, destination: Path, files: list[Path]) -> None:
@@ -227,14 +315,18 @@ def _stage_installed_dependencies(
         if record.get(name)
     )
 
+    _archive, library_directory, extension_directory = runtime.staged_layout(
+        target,
+    )
+
     def destination(source: Path) -> Path:
         for root in roots:
             try:
                 relative = source.relative_to(root)
             except ValueError:
                 continue
-            return target / "Lib" / relative
-        return target / "DLLs" / source.name
+            return library_directory / relative
+        return extension_directory / source.name
 
     dependency_files = [
         (Path(value).resolve(), None) for value in record["files"]
@@ -255,7 +347,7 @@ def _stage_installed_dependencies(
         ):
             continue
         target_path = (
-            target / "Lib" / loose_relative
+            library_directory / loose_relative
             if loose_relative is not None else destination(source)
         )
         _copy(source, target_path, files)
@@ -371,10 +463,13 @@ def stage_cpython_runtime(
         if candidate.is_file():
             _copy(candidate, target / candidate.name, files)
 
-    stdlib_archive = target / f"python{runtime.version[0]}{runtime.version[1]}.zip"
+    stdlib_archive, _library_directory, extension_directory = (
+        runtime.staged_layout(target)
+    )
+    stdlib_archive.parent.mkdir(parents=True, exist_ok=True)
     excluded_parts = {
-        "site-packages", "__pycache__", "test", "tests", "tkinter",
-        "idlelib", "ensurepip",
+        "site-packages", "dist-packages", "__pycache__", "test", "tests",
+        "tkinter", "idlelib", "ensurepip", "lib-dynload",
     }
     with zipfile.ZipFile(
         stdlib_archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6,
@@ -385,7 +480,7 @@ def stage_cpython_runtime(
             relative = source.relative_to(runtime.stdlib)
             if excluded_parts.intersection(relative.parts):
                 continue
-            if source.suffix.casefold() in {".pyc", ".pyd", ".dll"}:
+            if source.suffix.casefold() in {".pyc", ".pyd", ".dll", ".so"}:
                 continue
             archive.write(source, relative.as_posix())
     files.append(stdlib_archive)
@@ -398,10 +493,11 @@ def stage_cpython_runtime(
         runtime, requested_modules, target, files,
     )
     if runtime.dlls is not None:
+        extension = ".pyd" if runtime.dll.suffix.casefold() == ".dll" else ".so"
         for module in requested_modules:
-            matches = tuple(runtime.dlls.glob(f"{module}*.pyd"))
+            matches = tuple(runtime.dlls.glob(f"{module}*{extension}"))
             for source in matches:
-                _copy(source, target / "DLLs" / source.name, files)
+                _copy(source, extension_directory / source.name, files)
     harvested_native_dependencies = _stage_pe_dependency_closure(
         runtime, target, files,
     )
@@ -413,7 +509,7 @@ def stage_cpython_runtime(
         "provenance": runtime.provenance,
         "source_home": runtime.home.as_posix(),
         "runtime_dll": runtime.dll.name,
-        "stdlib": stdlib_archive.name,
+        "stdlib": stdlib_archive.relative_to(target).as_posix(),
         "requested_modules": requested_modules,
         "installed_distributions": list(installed_distributions),
         "harvested_native_dependencies": list(harvested_native_dependencies),
@@ -426,6 +522,76 @@ def stage_cpython_runtime(
     )
     files.append(manifest_path)
     return StagedCPythonRuntime(target, runtime, tuple(files), manifest_path)
+
+
+def _posix_cpython_loader(runtime_dll: str) -> tuple[str, ...]:
+    """The POSIX counterpart of ``LoadLibraryW(L"pythonXY.dll")``.
+
+    Windows resolves a bare module name to the interpreter already mapped
+    into the process, else to the copy staged beside the application, whose
+    stdlib archive it finds beside the DLL.  POSIX has neither rule, so the
+    adapter states both: an interpreter already in the process (the artifact
+    loaded through ctypes) is the global scope's ``Py_IsInitialized``; else
+    the staged libpython beside this artifact is opened RTLD_GLOBAL, so the
+    staged extension modules bind to it, and its home is set to this
+    artifact's directory, where ``stage_cpython_runtime`` laid out getpath's
+    landmarks.  ``dladdr`` is reached through ``dlsym`` because ``-std=c11``
+    hides its declaration; ``Dl_info`` begins with these two members on
+    glibc, musl and Darwin.
+    """
+
+    return (
+        "#if !defined(_WIN32)",
+        "typedef struct { const char *dli_fname; void *dli_fbase; const char *dli_sname; void *dli_saddr; } TuringDlInfo;",
+        "static int turing_python_start(void);",
+        "static int turing_python_open(void) {",
+        "    void *process = dlopen(NULL, RTLD_NOW);",
+        "    int (*address_info)(const void *, TuringDlInfo *) = NULL;",
+        "    void (*set_home)(const wchar_t *) = NULL;",
+        "    wchar_t *(*decode)(const char *, size_t *) = NULL;",
+        "    char *(*real_path)(const char *, char *) = NULL;",
+        "    TuringDlInfo self = {0}; const char *slash; size_t directory_length;",
+        "    char *located, *path; wchar_t *home;",
+        "    if (process != NULL && dlsym(process, \"Py_IsInitialized\") != NULL) {",
+        "        turing_python_module = process; return 1;",
+        "    }",
+        "    if (process != NULL) {",
+        "        *(void **)&address_info = dlsym(process, \"dladdr\");",
+        "        *(void **)&real_path = dlsym(process, \"realpath\");",
+        "    }",
+        "    /* glibc names the main program by its argv[0]; a bare name came",
+        "       from PATH, and /proc/self/exe is then the file itself. */",
+        "    located = (address_info == NULL || real_path == NULL",
+        "        || !address_info((const void *)&turing_python_start, &self)",
+        "        || self.dli_fname == NULL) ? NULL",
+        "        : real_path(strchr(self.dli_fname, '/') != NULL ? self.dli_fname : \"/proc/self/exe\", NULL);",
+        "    if (located == NULL) {",
+        "        fprintf(stderr, \"private CPython runtime: cannot locate this artifact (dladdr/realpath)\\n\");",
+        "        return 0;",
+        "    }",
+        "    slash = strrchr(located, '/');",
+        "    directory_length = (size_t)(slash - located);",
+        f"    path = (char *)malloc(directory_length + {len(runtime_dll) + 2});",
+        "    if (path == NULL) { free(located); return 0; }",
+        "    memcpy(path, located, directory_length); free(located);",
+        f"    path[directory_length] = '/'; memcpy(path + directory_length + 1, {json.dumps(runtime_dll)}, {len(runtime_dll) + 1});",
+        "    turing_python_module = dlopen(path, RTLD_NOW | RTLD_GLOBAL);",
+        "    if (turing_python_module == NULL) {",
+        "        fprintf(stderr, \"private CPython runtime: %s\\n\", dlerror()); free(path); return 0;",
+        "    }",
+        "    *(void **)&set_home = dlsym(turing_python_module, \"Py_SetPythonHome\");",
+        "    *(void **)&decode = dlsym(turing_python_module, \"Py_DecodeLocale\");",
+        "    if (set_home == NULL || decode == NULL) {",
+        "        fprintf(stderr, \"private CPython runtime: %s exports no Py_SetPythonHome\\n\", path);",
+        "        free(path); turing_python_module = NULL; return 0;",
+        "    }",
+        "    path[directory_length] = '\\0'; home = decode(path, NULL); free(path);",
+        "    if (home == NULL) { turing_python_module = NULL; return 0; }",
+        "    set_home(home); /* CPython keeps this pointer; it lives with the process. */",
+        "    return 1;",
+        "}",
+        "#endif",
+    )
 
 
 def emit_private_cpython_adapter(
@@ -546,14 +712,23 @@ def emit_private_cpython_adapter(
             "}",
         )))
     return "\n".join((
-        "#if !defined(_WIN32)",
-        '#error "private CPython adapter currently requires the Windows loader ABI"',
-        "#endif",
         "#include <stddef.h>",
         "#include <stdint.h>",
+        "#include <stdio.h>",
         "#include <stdlib.h>",
         "#include <string.h>",
+        "#if defined(_WIN32)",
         "#include <windows.h>",
+        "#define TURING_PY_EXPORT __declspec(dllexport)",
+        "typedef HMODULE TuringPyLibrary;",
+        "#define TURING_PY_SYMBOL(name) ((void *)GetProcAddress(turing_python_module, name))",
+        "#else",
+        "#include <dlfcn.h>",
+        "#include <wchar.h>",
+        "#define TURING_PY_EXPORT __attribute__((visibility(\"default\")))",
+        "typedef void *TuringPyLibrary;",
+        "#define TURING_PY_SYMBOL(name) dlsym(turing_python_module, name)",
+        "#endif",
         "typedef intptr_t TuringPySsizeT;",
         "typedef struct _object TuringPyObject;",
         "typedef struct {",
@@ -579,14 +754,19 @@ def emit_private_cpython_adapter(
         "    int *Py_NoSiteFlag; int *Py_DontWriteBytecodeFlag;",
         "} TuringPythonAPI;",
         "static TuringPythonAPI py = {0};",
-        "static HMODULE turing_python_module = NULL;",
+        "static TuringPyLibrary turing_python_module = NULL;",
         "static TuringPyObject **turing_python_handles = NULL;",
         "static size_t turing_python_handle_count = 0, turing_python_handle_capacity = 0;",
+        *_posix_cpython_loader(runtime_dll),
         "static int turing_python_start(void) {",
         "    if (turing_python_module == NULL) {",
+        "#if defined(_WIN32)",
         f"        turing_python_module = LoadLibraryW(L{json.dumps(runtime_dll)});",
         "        if (turing_python_module == NULL) return 0;",
-        "#define TURING_PY_LOAD(name) *(FARPROC *)&py.name = GetProcAddress(turing_python_module, #name)",
+        "#else",
+        "        if (!turing_python_open()) return 0;",
+        "#endif",
+        "#define TURING_PY_LOAD(name) *(void **)&py.name = TURING_PY_SYMBOL(#name)",
         "        TURING_PY_LOAD(Py_Initialize); TURING_PY_LOAD(Py_IsInitialized);",
         "        TURING_PY_LOAD(PyImport_ImportModule); TURING_PY_LOAD(PyObject_GetAttrString);",
         "        TURING_PY_LOAD(PyObject_Call); TURING_PY_LOAD(PyTuple_New);",
@@ -649,7 +829,7 @@ def emit_private_cpython_adapter(
         "static TuringPyObject *turing_python_int(int64_t value) { return py.PyLong_FromLongLong(value); }",
         "static TuringPyObject *turing_python_float(double value) { return py.PyFloat_FromDouble(value); }",
         "static TuringPyObject *turing_python_bool(int value) { return py.PyBool_FromLong(value); }",
-        "__declspec(dllexport) int64_t turing_cpython_retain_bytes(const uint8_t *data, size_t length) {",
+        "TURING_PY_EXPORT int64_t turing_cpython_retain_bytes(const uint8_t *data, size_t length) {",
         "    TuringPyObject *value; if (!turing_python_start()) return 0;",
         "    value = py.PyBytes_FromStringAndSize((const char *)data, length);",
         "    return turing_python_retain(value);",

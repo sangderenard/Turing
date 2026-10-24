@@ -17,10 +17,11 @@ BACKENDS = tuple(
 unknown_backends = set(BACKENDS) - {"c", "llvm", "fortran"}
 if unknown_backends:
     raise SystemExit(f"unknown TYPED_CHECK_BACKENDS entries: {sorted(unknown_backends)}")
-# The Fortran artifact links its runtime statically by default.  A Linux
-# libgfortran.a is not position independent, so a library that needs the
-# runtime (``error stop``) cannot link there; TYPED_CHECK_FORTRAN_STANDALONE=0
-# links libgfortran dynamically instead.  The emitted program is the same.
+# The Fortran artifact carries its runtime by default: linked in on Windows,
+# staged beside the shared object on Linux (whose libgfortran.a is not
+# position independent; see fortran_toolchain.stages_shared_runtime).
+# TYPED_CHECK_FORTRAN_STANDALONE=0 links the toolchain's libgfortran
+# dynamically instead.  The emitted program is the same.
 FORTRAN_STANDALONE = os.environ.get("TYPED_CHECK_FORTRAN_STANDALONE", "1") != "0"
 
 
