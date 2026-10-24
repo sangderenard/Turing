@@ -822,8 +822,19 @@ def test_numerical_lowering_routes_scatter_through_real_llvm_algorithm():
         "Ret"
     ]
     assert function.blocks["entry"].instrs[0].attributes["callee"] == (
-        "index_assign_double"
+        "scatter_sum_double"
     )
+
+
+@pytest.mark.parametrize("reduce", ["mean", "max", "min"])
+def test_precompile_scatter_reduction_policy_is_refused_by_name(reduce):
+    program = _program(OpStep(0, "scatter", [0], {"reduce": reduce}, 1))
+
+    _, shortfalls = lower_fused_program_to_ssa(program)
+
+    scatter_shortfalls = [item for item in shortfalls if item.name == "scatter"]
+    assert len(scatter_shortfalls) == 1
+    assert f"scatter reduce='{reduce}'" in scatter_shortfalls[0].reason
 
 
 def test_planner_loop_becomes_phi_cfg_cycle_with_region_call():
