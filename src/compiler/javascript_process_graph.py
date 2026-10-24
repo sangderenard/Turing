@@ -133,6 +133,19 @@ _FUNCTION_NODES = frozenset({
 })
 
 
+def _loop_of(statement: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The ``for``/``while`` loop ``statement`` is, or labels; else None."""
+
+    kind = statement.get("type")
+    if kind in {"ForStatement", "WhileStatement"}:
+        return statement
+    if kind == "LabeledStatement":
+        body = statement.get("body") or {}
+        if body.get("type") in {"ForStatement", "WhileStatement"}:
+            return body
+    return None
+
+
 def _return_names(loop: Mapping[str, Any]) -> tuple[str, str]:
     """The hidden return flag and result of the loop at ``loop``."""
 
@@ -226,6 +239,8 @@ class _JavaScriptProcessInterpreter:
         self.last_version: dict[str, int] = {}
         self.loops: list[dict[str, Any]] = []
         self.loop_count = 0
+        # Labeled loops being interpreted: label -> their exit flags.
+        self.loop_labels: dict[str, dict[Any, str]] = {}
         self.shortfalls: list[JavaScriptExpressionShortfall] = []
         self.bindings: dict[str, dict[str, Any]] = {}
         self.binding_records: list[dict[str, Any]] = []
@@ -1268,19 +1283,21 @@ class _JavaScriptProcessInterpreter:
 
         return visit(node)
 
-    @staticmethod
-    def _own_exits(node: Any) -> set[str]:
-        """Exit kinds that leave THIS loop's iteration.
+    def _own_exits(self, node: Any, label: str | None = None) -> set[Any]:
+        """Exits that leave THIS loop's iteration (the loop labeled ``label``).
 
         ``break``/``continue`` of nested loops are theirs, but a ``return``
-        anywhere inside (nested loops included) leaves this loop too;
-        functions are opaque.  A labeled exit is reported as
-        ``LabeledExit``.
+        anywhere inside (nested loops included) leaves this loop too, as
+        does an exit labeled with this loop's label.  An exit labeled with
+        an enclosing loop's label (``self.loop_labels``) leaves this loop
+        and continues or breaks that one: it is reported as
+        ``(kind, label)``.  Any other labeled exit is ``LabeledExit``.
+        Functions are opaque.
         """
 
-        kinds: set[str] = set()
+        kinds: set[Any] = set()
 
-        def visit(item: Any, nested: bool) -> None:
+        def visit(item: Any, nested: bool, inner_labels: frozenset) -> None:
             if isinstance(item, Mapping):
                 kind = item.get("type")
                 if kind in _FUNCTION_NODES:
@@ -1288,20 +1305,32 @@ class _JavaScriptProcessInterpreter:
                 if kind == "ReturnStatement":
                     kinds.add("ReturnStatement")
                 elif kind in {"BreakStatement", "ContinueStatement"}:
-                    if not nested:
-                        kinds.add(
-                            "LabeledExit" if item.get("label") else str(kind)
-                        )
+                    target = (item.get("label") or {}).get("name")
+                    if target is None:
+                        if not nested:
+                            kinds.add(str(kind))
+                    elif target == label:
+                        kinds.add(str(kind))
+                    elif target in inner_labels:
+                        pass
+                    elif target in self.loop_labels:
+                        kinds.add((str(kind), str(target)))
+                    else:
+                        kinds.add("LabeledExit")
                     return
+                if kind == "LabeledStatement":
+                    inner_labels = inner_labels | {
+                        (item.get("label") or {}).get("name")
+                    }
                 inner = nested or kind in _OPAQUE_TO_LOOP_EXITS
                 for key, child in item.items():
-                    if key not in {"type", "start", "end"}:
-                        visit(child, inner)
+                    if key not in {"type", "start", "end", "label"}:
+                        visit(child, inner, inner_labels)
             elif isinstance(item, list):
                 for child in item:
-                    visit(child, nested)
+                    visit(child, nested, inner_labels)
 
-        visit(node, False)
+        visit(node, False, frozenset())
         return kinds
 
     def _static_kind(
@@ -1366,7 +1395,8 @@ class _JavaScriptProcessInterpreter:
     def _exit_flags(
         self,
         statements: Sequence[Mapping[str, Any]],
-        flags: Mapping[str, str],
+        flags: Mapping[Any, str],
+        label: str | None = None,
     ) -> list[Mapping[str, Any]]:
         """Rewrite ``break``/``continue`` as assignments to hidden flags.
 
@@ -1375,7 +1405,12 @@ class _JavaScriptProcessInterpreter:
         after a statement that may set one runs only while neither is set
         (an ``if`` on the flags around it, in its own block: the names it
         declares end with the list anyway).  Nested loops keep theirs.
+        An exit labeled with an enclosing loop's label sets that loop's
+        flag (``flags[(kind, label)]``), which this loop also stops on.
         """
+
+        def again(items: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+            return self._exit_flags(items, flags, label)
 
         lowered: list[Mapping[str, Any]] = []
         for index, statement in enumerate(statements):
@@ -1391,44 +1426,44 @@ class _JavaScriptProcessInterpreter:
                     lowered.append(
                         _flag_assignment(flags["ReturnStatement"], statement)
                     )
-            elif kind in flags:
-                lowered.append(_flag_assignment(flags[kind], statement))
-            elif kind in {"ForStatement", "WhileStatement"} and (
+            elif kind in {"BreakStatement", "ContinueStatement"}:
+                target = (statement.get("label") or {}).get("name")
+                key = kind if target in {None, label} else (kind, target)
+                lowered.append(_flag_assignment(flags[key], statement))
+            elif _loop_of(statement) is not None and (
                 "ReturnStatement" in flags
-                and "ReturnStatement" in self._own_exits(statement)
+                and "ReturnStatement" in self._own_exits(statement, label)
             ):
                 # The inner loop's own return check, rewritten into ours.
                 lowered.append({**statement, "%returns_checked": True})
-                lowered.extend(self._exit_flags(
-                    [_return_check(statement)], flags,
-                ))
+                lowered.extend(again([_return_check(_loop_of(statement))]))
             elif kind == "IfStatement":
                 lowered.append({
                     **statement,
                     "consequent": {
                         "type": "BlockStatement",
-                        "body": self._exit_flags(
+                        "body": again(
                             self._statement_body(statement.get("consequent")),
-                            flags,
                         ),
                     },
                     "alternate": None if statement.get("alternate") is None else {
                         "type": "BlockStatement",
-                        "body": self._exit_flags(
+                        "body": again(
                             self._statement_body(statement.get("alternate")),
-                            flags,
                         ),
                     },
                 })
             elif kind == "BlockStatement":
                 lowered.append({
                     **statement,
-                    "body": self._exit_flags(list(statement.get("body", ())), flags),
+                    "body": again(list(statement.get("body", ()))),
                 })
             else:
                 lowered.append(statement)
-            if kind in flags or self._own_exits(statement):
-                rest = self._exit_flags(statements[index + 1:], flags)
+            if kind in {
+                "BreakStatement", "ContinueStatement", "ReturnStatement",
+            } or self._own_exits(statement, label):
+                rest = again(statements[index + 1:])
                 if rest:
                     lowered.append({
                         "type": "IfStatement",
@@ -1445,7 +1480,9 @@ class _JavaScriptProcessInterpreter:
                 break
         return lowered
 
-    def loop(self, statement: Mapping[str, Any]) -> None:
+    def loop(
+        self, statement: Mapping[str, Any], label: str | None = None,
+    ) -> None:
         """``for``/``while`` as a loop region with one Phi per carried name.
 
         Every binding the loop assigns that is visible at its head becomes a
@@ -1464,14 +1501,23 @@ class _JavaScriptProcessInterpreter:
         header, which then exits with them.  A ``return`` is a break that
         also sets a hidden carried result (typed from the return arguments'
         shape); ``sequence`` follows the loop with ``if (returned) return
-        result``.  Labeled exits stay refusals.
+        result``.  A labeled exit to this loop is its own exit; one to an
+        enclosing labeled loop sets that loop's flag, and this loop stops on
+        it as on its own break.
         """
 
         kind = statement.get("type")
-        own = self._own_exits(statement.get("body"))
+        own = self._own_exits(statement.get("body"), label)
+        outward = {
+            item: self.loop_labels[item[1]].get(item[0])
+            for item in own if isinstance(item, tuple)
+        }
+        if None in outward.values():
+            own.add("LabeledExit")
         if "LabeledExit" in own or (
             statement.get("test") is None
             and not own & {"BreakStatement", "ReturnStatement"}
+            and not outward
         ):
             self.unsupported(
                 str(kind),
@@ -1490,9 +1536,12 @@ class _JavaScriptProcessInterpreter:
                 else {"type": "ExpressionStatement", "expression": initializer},
             ])
         loop_id = self.loop_count
-        flags = {
-            exit: f"%{label}{loop_id}"
-            for exit, label in (
+        # Keyed by position: a nested loop names an enclosing loop's flags
+        # for its labeled exits.
+        position = f"{statement.get('start')}:{statement.get('end')}"
+        flags: dict[Any, str] = {
+            exit: f"%{word}@{position}"
+            for exit, word in (
                 ("BreakStatement", "break"), ("ContinueStatement", "continue"),
             )
             if exit in own
@@ -1518,17 +1567,20 @@ class _JavaScriptProcessInterpreter:
                 else self._boolean(False, statement),
                 statement, kind="let",
             )
-        stops = tuple(
+        own_stops = tuple(
             flags[key] for key in ("BreakStatement", "ReturnStatement")
             if key in flags
         )
-        for name in stops:
+        for name in own_stops:
             self.bind(
                 name, self._boolean(False, statement), statement, kind="let",
             )
+        # An enclosing loop's flag set from in here stops this loop too.
+        stops = (*own_stops, *sorted(set(outward.values())))
+        guards = {**flags, **outward}
         body = self._statement_body(statement.get("body"))
-        if flags:
-            body = self._exit_flags(body, flags)
+        if guards:
+            body = self._exit_flags(body, guards, label)
         if "ContinueStatement" in flags:
             body = [_flag_declaration(flags["ContinueStatement"], statement), *body]
         update = statement.get("update")
@@ -1541,8 +1593,11 @@ class _JavaScriptProcessInterpreter:
                     "consequent": step, "alternate": None,
                 }
             body = [*body, step]
+        # A nested loop's labeled exit sets this loop's (or an enclosing
+        # loop's) flags only once that loop is interpreted, so every flag
+        # this loop stops on is carried from the start.
         carried = sorted(
-            self._assigned_names([statement.get("test"), body])
+            (self._assigned_names([statement.get("test"), body]) | set(stops))
             & set(self.bindings)
         )
         # Numbered on entry: an inner loop finishes (and is recorded) first.
@@ -1577,7 +1632,13 @@ class _JavaScriptProcessInterpreter:
                 statement, "boolean",
             )
         condition_end = self.next_id
-        _value, _returned, visible = self._branch(body, dict(self.bindings))
+        if label is not None:
+            self.loop_labels[label] = flags
+        try:
+            _value, _returned, visible = self._branch(body, dict(self.bindings))
+        finally:
+            if label is not None:
+                self.loop_labels.pop(label, None)
         carried_next = {
             name: int(visible[name]["value_node"]) for name in carried
         }
@@ -1771,9 +1832,15 @@ class _JavaScriptProcessInterpreter:
                 )
                 index += 1
                 continue
-            if kind in {"ForStatement", "WhileStatement"}:
-                self.loop(statement)
-                if not statement.get("%returns_checked") and (
+            loop_statement = _loop_of(statement)
+            if loop_statement is not None:
+                label = None
+                if kind == "LabeledStatement":
+                    label = str((statement.get("label") or {}).get("name"))
+                self.loop(loop_statement, label)
+                checked = statement.get("%returns_checked")
+                statement = loop_statement
+                if not checked and (
                     "ReturnStatement" in self._own_exits(statement)
                 ):
                     # A loop that may return is followed by its check;
