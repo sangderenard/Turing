@@ -6006,12 +6006,25 @@ def emit_ssa_module_to_c(
                     # integer operation should not depend on that.
                     left = f"(int64_t)({left})"
                     right = f"(int64_t)({right})"
-                    if op in {"LShr", "Shr"}:
+                    if op == "LShr":
                         left = f"({_unsigned_c_type(instruction.args[0].dtype)})({left})"
-                    declared = (
-                        f"const {kind} t{result_id} = "
-                        f"({kind})({left} {_INTEGER_BINARY[op]} {right});"
-                    )
+                    elif op in {"Shr", "AShr"}:
+                        # Program: ``(n - 100) >> 2`` at n = 0 (c410).  The
+                        # source ``>>`` sign-fills (-25 >> 2 == -7); the
+                        # unsigned cast that only LShr keeps made it
+                        # 2**62 - 7.  ``~`` turns
+                        # a negative left operand non-negative, so no signed
+                        # ``>>`` of a negative value is left to the C compiler.
+                        declared = (
+                            f"const {kind} t{result_id} = ({kind})("
+                            f"({left}) < 0 ? ~(~({left}) >> ({right})) "
+                            f": ({left}) >> ({right}));"
+                        )
+                    if op not in {"Shr", "AShr"}:
+                        declared = (
+                            f"const {kind} t{result_id} = "
+                            f"({kind})({left} {_INTEGER_BINARY[op]} {right});"
+                        )
                 elif op in _LOGICAL_BINARY and len(args) >= 2:
                     integer_ids.add(result_id)
                     logical_expression = f" {_LOGICAL_BINARY[op]} ".join(

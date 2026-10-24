@@ -119,7 +119,7 @@ def test_atomic_xadd_reverse_selection_requires_observed_source_and_ordering():
 
 def test_btc_reverse_selection_does_not_match_unproved_generic_xor_chain():
     tokens = (
-        Handler.Shr.value, Handler.And.value,
+        Handler.LShr.value, Handler.And.value,
         Handler.Shl.value, Handler.Xor.value,
     )
     facts = {

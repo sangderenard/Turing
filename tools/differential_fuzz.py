@@ -335,6 +335,8 @@ EXTENDED3 = [
     (["t{v} = 0", "for k{v}, x{v} in enumerate([{a}, n, {b}], n % 4 + {c}):", "    t{v} = t{v} * 10 + k{v} * x{v}"], "t{v}"),
     # a callee filters a list literal in its loop, so it keeps live flags (c197)
     ([], "positives([{a}, -{b}, {c}]) * 10 + n"),
+    # the source ``>>`` sign-fills a negative int (c410; lane E)
+    (["s{v} = (n - {a} * 40) >> ({b} % 3 + 1)"], "s{v} * 10 + ((-n - {c}) >> 1)"),
     # a runtime replication grown by an append, then reduced (E22a; lane E)
     (["ys{v} = [{a}] * (n % 4)", "ys{v}.append(n + {b})"], "sum(ys{v}) * 10 + len(ys{v})"),
     # a keyed delete, then a store and lookups (E24; lane E)

@@ -112,8 +112,11 @@ class Handler(Enum):
     Xor           = "Xor"
     Not           = "Not"
     Shl           = "Shl"
+    # ``Shr`` is the source ``>>``: arithmetic, as Python and C spell it on a
+    # signed integer.  A zero-filling machine shift is ``LShr``.
     Shr           = "Shr"
     AShr          = "AShr"
+    LShr          = "LShr"
 
     # Logical
     LAnd          = "LAnd"
