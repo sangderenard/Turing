@@ -551,6 +551,77 @@ def _reducing():
     return function, results
 
 
+def _axis_reducing(axis):
+    """``sum``/``prod``/``max``/``min``/``mean`` over ``axis`` of one (2, 3, 4)
+    instance."""
+
+    shape = (2, 3, 4)
+    kept = shape[:axis % 3] + shape[axis % 3 + 1:]
+    x = SSAValue(0, "float32", shape)
+    results = [SSAValue(1 + i, "float32", kept) for i in range(5)]
+    ops = ("sum", "prod", "max", "min", "mean")
+    instructions = []
+    for op, value in zip(ops, results):
+        instr = Instr(op, [x], value)
+        instr.attributes["axis"] = axis
+        if op in ("max", "min"):
+            instr.attributes["max_semantics"] = "reduce_axis"
+        instructions.append(instr)
+    function = Function("axis_reducing", [x], {"entry": BasicBlock("entry", [
+        *instructions, Instr("Ret", [], None),
+    ])})
+    return function, results, kept
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2, -1])
+def test_axis_reductions_over_instances_match_python_on_vulkan(tmp_path, axis):
+    probe = _vulkan_probe(tmp_path)
+    function, outputs, kept = _axis_reducing(axis)
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    product = publish_spirv_product(tmp_path / "product", shader)
+    record = product.deployment
+    count = 50
+    lanes = math.prod(kept)
+    rng = np.random.default_rng(9)
+    x = (rng.standard_normal((count, 2, 3, 4)) * 0.5 + 0.8).astype(np.float32)
+    x[7, 1, 2, 3] = np.nan  # one lane of instance 7 reads NaN
+    buffers = {}
+    for resource in record["resources"]:
+        if resource["access"] == "read":
+            buffers[resource["binding"]] = x
+        else:
+            buffers[resource["binding"]] = np.full(
+                (count + 8) * lanes, 12345, dtype=np.float32,
+            )
+    (control,) = record["launch"]["controls"]
+    buffers[control["binding"]] = np.array([count], dtype=np.uint32)
+    group = record["launch"]["group_count"]["invocations_per_group"]
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), str(math.ceil(count / group) + 1),
+         "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    got = {
+        item["name"]: np.fromfile(paths[item["binding"]], dtype=np.float32)
+        for item in record["resources"] if item["access"] == "read_write"
+    }
+    reduced_axis = 1 + axis % 3
+    for position, op in enumerate(("sum", "prod", "max", "min", "mean")):
+        want = getattr(np, op)(x, axis=reduced_axis).reshape(count, lanes)
+        have = got[f"output_{position}"][:count * lanes].reshape(count, lanes)
+        np.testing.assert_allclose(have, want, rtol=1e-5, atol=1e-6)
+        assert (got[f"output_{position}"][count * lanes:] == 12345).all()
+
+
 def test_reductions_over_instances_match_python_on_vulkan(tmp_path):
     probe = _vulkan_probe(tmp_path)
     function, outputs = _reducing()

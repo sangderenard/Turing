@@ -996,6 +996,108 @@ class _FunctionEmitter:
             )
             self._store_element(pointer, index, result_type, value, body)
 
+    def _emit_axis_reduction(
+        self, op: str, axis, instr: Instr, block: BasicBlock, body: list[str]
+    ) -> None:
+        """``y.sum(axis=k)`` (and prod/mean/max/min) over a static shape.
+
+        Unrolled like the whole-array form: one result per lane of the
+        kept axes, row-major, folded along axis k in index order; max/min
+        take numpy's rule (a NaN in the lane is its result), as in C.
+        """
+
+        source = instr.args[0]
+        shape = tuple(int(size) for size in source.shape or ())
+        result_shape = tuple(int(size) for size in instr.res.shape or ())
+        if not isinstance(axis, int) or not shape or not -len(shape) <= axis < len(shape):
+            self._shortfall(
+                op, block.name,
+                f"{op} over axis {axis!r} needs one in-range integer axis of a "
+                "static shape",
+            )
+            return
+        axis %= len(shape)
+        kept = shape[:axis] + shape[axis + 1:]
+        if math.prod(result_shape) != math.prod(kept) or (
+            shape[axis] == 0 and op in ("max", "min")
+        ):
+            self._shortfall(
+                op, block.name,
+                f"{op} over axis {axis} of {shape!r} into {result_shape!r} "
+                "(an empty max/min axis raises in numpy)",
+            )
+            return
+        pointer = self._array_pointer.get(source.id)
+        target = self._array_pointer.get(instr.res.id)
+        if pointer is None or target is None:
+            self._shortfall(op, block.name, "array operand has no known storage")
+            return
+        source_dtype = source.dtype or self.dtype
+        result_dtype = instr.res.dtype or self.dtype
+        result_kind = _DTYPE_KIND.get(result_dtype)
+        if "bool" in (_DTYPE_KIND.get(source_dtype), result_kind) or (
+            op == "mean" and result_kind != "float"
+        ):
+            self._shortfall(
+                op, block.name, f"{op} over an axis into {result_dtype}",
+            )
+            return
+        source_type = self.builder.scalar_type(source_dtype)
+        result_type = self.builder.scalar_type(result_dtype)
+        lanes = list(itertools.product(*(range(size) for size in kept)))
+        stored_shape = result_shape or (1,)
+        for flat, lane in enumerate(lanes):
+            elements = []
+            for step in range(shape[axis]):
+                index = lane[:axis] + (step,) + lane[axis:]
+                value = self._load_element(pointer, index, source_type, body)
+                converted = self._convert(value, source_dtype, result_dtype, body)
+                if converted is None:
+                    self._shortfall(
+                        op, block.name,
+                        f"no conversion from {source_dtype} to {result_dtype}",
+                    )
+                    return
+                elements.append(converted)
+            if op in ("max", "min"):
+                from .max_semantics import NUMPY, max_step_rule
+
+                accumulator = elements[0]
+                for value in elements[1:]:
+                    accumulator = self._max_step(
+                        max_step_rule(instr) or NUMPY, op == "max", accumulator,
+                        value, result_type, result_kind == "float", body,
+                    )
+            else:
+                kind, payload = self._resolve(
+                    "mul" if op == "prod" else "add", result_dtype, 2,
+                )
+                accumulator = self.builder.constant(
+                    result_dtype, 1 if op == "prod" else 0,
+                )
+                for value in elements:
+                    folded = self.builder.fresh("v")
+                    self._apply(
+                        kind, payload, result_type, folded,
+                        [accumulator, value], instr, body,
+                    )
+                    accumulator = folded
+                if op == "mean":
+                    count = self.builder.constant(result_dtype, len(elements))
+                    kind, payload = self._resolve("Div", result_dtype, 2)
+                    averaged = self.builder.fresh("v")
+                    self._apply(
+                        kind, payload, result_type, averaged,
+                        [accumulator, count], instr, body,
+                    )
+                    accumulator = averaged
+            at = []
+            remainder = flat
+            for size in reversed(stored_shape):
+                at.append(remainder % size)
+                remainder //= size
+            self._store_element(target, tuple(reversed(at)), result_type, accumulator, body)
+
     def _emit_reduction(
         self, op: str, instr: Instr, block: BasicBlock, body: list[str]
     ) -> None:
@@ -1012,10 +1114,16 @@ class _FunctionEmitter:
         """
 
         source = instr.args[0]
+        axis = instr.attributes.get("axis")
+        if axis is None:
+            axis = instr.attributes.get("dim")
+        if axis is not None and op in ("sum", "prod", "mean", "max", "min"):
+            self._emit_axis_reduction(op, axis, instr, block, body)
+            return
         if (
             len(instr.args) > (2 if op == "sum" else 1)
             or any(a.shape for a in instr.args[1:])
-            or instr.attributes.get("axis") is not None
+            or axis is not None
         ):
             self._shortfall(
                 op, block.name,
@@ -1246,6 +1354,22 @@ class _FunctionEmitter:
 
         if not result_shape and any(a.shape for a in instr.args) and op in _REDUCTION_OPS:
             self._emit_reduction(op, instr, block, body)
+            return
+        if (
+            op in ("sum", "prod", "mean", "max", "min")
+            and instr.args and instr.args[0].shape
+            and (
+                instr.attributes.get("axis") is not None
+                or instr.attributes.get("dim") is not None
+            )
+        ):
+            self._emit_axis_reduction(
+                op,
+                instr.attributes.get("axis")
+                if instr.attributes.get("axis") is not None
+                else instr.attributes.get("dim"),
+                instr, block, body,
+            )
             return
 
         from .max_semantics import is_max, max_step_rule
