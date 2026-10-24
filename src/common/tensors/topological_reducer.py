@@ -5449,6 +5449,7 @@ def _normalize_lexical_values(
     parameter_aggregate_kinds: dict[str, str] = {}
     parameter_sequence_record_widths: dict[str, int] = {}
     parameter_sequence_element_classes: dict[str, str] = {}
+    parameter_mapping_value_classes: dict[str, str] = {}
     known_class_identities = {
         record.identity for record in navigation_table.classes
     }
@@ -5663,6 +5664,23 @@ def _normalize_lexical_values(
         aggregate_kind = annotation_aggregate_kind(annotation)
         if aggregate_kind is not None:
             parameter_aggregate_kinds[argument.arg] = aggregate_kind
+        # Lane D, D2.  Program: ``def bump(d: dict[int, int], n): d[0] +=
+        # n``.  A mapping annotation names its value class second; nothing
+        # recorded it, so the formal's rows took the float64 domain default
+        # and the int64 store disagreed with them.  Rule: ``dict[K, V]``
+        # with a primitive ``V`` declares the mapping's value class (kept
+        # apart from the sequence element class: iterating a dict yields
+        # its keys).
+        if (
+            isinstance(annotation, ast.Subscript) and aggregate_kind == "dict"
+            and isinstance(annotation.slice, ast.Tuple)
+            and len(annotation.slice.elts) == 2
+            and isinstance(annotation.slice.elts[1], ast.Name)
+            and annotation.slice.elts[1].id in primitive_class_identities
+        ):
+            parameter_mapping_value_classes[argument.arg] = (
+                primitive_class_identities[annotation.slice.elts[1].id]
+            )
         if isinstance(annotation, ast.Subscript) and aggregate_kind in {
             "list", "set", "frozenset", "tuple",
         }:
@@ -6385,6 +6403,12 @@ def _normalize_lexical_values(
                 attributes.update({
                     "sequence_element_class_ref": str(element_class),
                     "sequence_element_annotation_cell": annotation_cell,
+                })
+            value_class = parameter_mapping_value_classes.get(name)
+            if value_class is not None and annotation_cell is not None:
+                attributes.update({
+                    "mapping_value_class_ref": str(value_class),
+                    "mapping_value_annotation_cell": annotation_cell,
                 })
         scalar_parameters = tuple(
             graph.G.graph.get("scalar_parameters") or ()

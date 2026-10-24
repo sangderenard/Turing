@@ -2047,6 +2047,25 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
         )
         if joined is not None:
             hypotheses[node_id] = joined
+    # The same cycle through an annotated formal (``def bump(d: dict[int,
+    # int], n): d[0] += n``): the annotation states the rows' class, the
+    # store's value reads a row, and the join waits on itself.  Rule: a
+    # value stamped with a declared element (or mapping value) class
+    # assumes it, accepted only under the same check.
+    declared_classes = {"int": "int64", "float": "float64", "bool": "bool"}
+    for node_id, data in G.nodes(data=True):
+        node_id = int(node_id)
+        if node_id in proven or node_id in hypotheses:
+            continue
+        attributes = data.get("attributes") or {}
+        declared = (
+            attributes.get("mapping_value_class_ref")
+            if attributes.get("aggregate_kind") == "dict"
+            else attributes.get("sequence_element_class_ref")
+        )
+        dtype = declared_classes.get(str(declared or "").removeprefix("builtins."))
+        if dtype is not None:
+            hypotheses[node_id] = dtype
     hypotheses = {key: value for key, value in hypotheses.items() if value}
     if not hypotheses:
         return proven
@@ -2273,7 +2292,10 @@ def _planned_scalar_dtypes_from(
                     # annotation with its writers, in the collection rule.
                     if (
                         attributes.get("aggregate_kind") in collection_kinds
-                        and attributes.get("sequence_element_class_ref")
+                        and (
+                            attributes.get("sequence_element_class_ref")
+                            or attributes.get("mapping_value_class_ref")
+                        )
                     ):
                         pass
                     else:
@@ -2591,6 +2613,7 @@ def _planned_scalar_dtypes_from(
             if (
                 is_collection(node_id)
                 or attributes.get("sequence_element_class_ref")
+                or attributes.get("mapping_value_class_ref")
             ) and not op.startswith("indexed"):
                 # Program: ``for y in [x * n for x in xs]: t += y``.  Wrong
                 # record: an unrolled comprehension (``sequence_materialization``)
@@ -2630,7 +2653,14 @@ def _planned_scalar_dtypes_from(
                 # element class: an annotated call result (its callee's
                 # ``function_return_annotation``), an annotated local, a
                 # record field.
-                if attributes.get("sequence_element_class_ref"):
+                # A mapping's rows are its values: ``dict[K, V]`` states V.
+                if attributes.get("aggregate_kind") == "dict" and attributes.get(
+                    "mapping_value_class_ref"
+                ):
+                    writers.append(classes.get(str(
+                        attributes["mapping_value_class_ref"]
+                    ).removeprefix("builtins.")))
+                elif attributes.get("sequence_element_class_ref"):
                     writers.append(classes.get(str(
                         attributes["sequence_element_class_ref"]
                     ).removeprefix("builtins.")))
