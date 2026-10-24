@@ -4823,6 +4823,15 @@ def _typed_parameter_record_receipts(
             or identity is None
         ):
             continue
+        if isinstance(attributes.get("numeric_feature_descriptor"), Mapping):
+            # A numeric value type (``x: Precision[2]``) is its limbs, laid
+            # out by the precision lowering; the composite ones get their
+            # record view from the numeric descriptor itself. Joining it to
+            # the class's projected record made ``Precision`` a record whose
+            # only field is ``limbs: int64``, so ``return y`` published the
+            # limb COUNT as y and the computed limbs never reached the
+            # output (C wrote 3 into y[0]; LLVM left y zero).
+            continue
         matches = tuple(
             record
             for name, record in records.items()

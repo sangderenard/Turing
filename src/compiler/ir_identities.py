@@ -2219,6 +2219,71 @@ def lower_precision_operations(
         if bases:
             precision_arrays[str(name)] = bases
 
+    # -- declared precision arrays, across the planned-region seam ---------
+    #
+    # Recognition by use stops at a call. The planner puts a pack loop's
+    # ``z = x[i]`` and ``y[i] = ...`` in regions of their own, so the load
+    # of x feeds only a Ret and the store into y stores a formal: neither
+    # region holds a precision operation, and both indexed element i as one
+    # double -- x[i] read element i/2's limbs as two elements, and y[i]
+    # kept only the leading limb. The parameter's declaration says what
+    # the array IS: a ``Precision[k]`` array parameter of the authored
+    # function is limb-strided at width k wherever it is addressed, and a
+    # region formal bound to it by position is the same array.
+    declared_arrays: dict[str, dict[int, int]] = {}
+    for name, function in functions.items():
+        for row in (
+            function.metadata.get("numeric_parameter_descriptors", ()) or ()
+        ):
+            if not isinstance(row, Mapping):
+                continue
+            descriptor = dict(row.get("descriptor") or {})
+            limbs_declared = int(descriptor.get("limbs") or 1)
+            if (
+                limbs_declared > 1
+                and "precision" in tuple(descriptor.get("features") or ())
+                and row.get("value_id") is not None
+            ):
+                declared_arrays.setdefault(str(name), {})[
+                    int(row["value_id"])
+                ] = limbs_declared
+    changed = True
+    while changed:
+        changed = False
+        for name, function in functions.items():
+            known = declared_arrays.get(str(name)) or {}
+            if not known:
+                continue
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in ("Call", "call"):
+                        continue
+                    callee = str(instruction.attributes.get("callee") or "")
+                    formals = original_formals.get(callee)
+                    if not formals:
+                        continue
+                    there = declared_arrays.setdefault(callee, {})
+                    for formal, actual in zip(formals, instruction.args):
+                        width = known.get(int(actual.id), 1)
+                        if width > there.get(int(formal.id), 1):
+                            there[int(formal.id)] = width
+                            changed = True
+    for name, function in functions.items():
+        known = declared_arrays.get(str(name)) or {}
+        if not known:
+            continue
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op) == "GetElementPtr" and instruction.args
+                    and int(instruction.args[0].id) in known
+                    and int(instruction.args[0].id)
+                    not in promoted_scalar_formals[str(name)]
+                ):
+                    base = int(instruction.args[0].id)
+                    bases = precision_arrays.setdefault(str(name), {})
+                    bases[base] = max(bases.get(base, 1), known[base])
+
     parameter_widths: dict[str, dict[int, int]] = {}
     for name, function in functions.items():
         formal_ids = {int(value.id) for value in function.args}
@@ -2273,6 +2338,29 @@ def lower_precision_operations(
                         widths[int(argument.id)] = max(
                             widths.get(int(argument.id), 1), width
                         )
+        # A formal stored into a precision array is an element of it: the
+        # store region of a pack loop receives the value to write as a
+        # formal, and keeping it one scalar wrote only the leading limb.
+        arrays_here = precision_arrays.get(str(name)) or {}
+        for block in function.blocks.values():
+            pointers = {
+                int(instruction.res.id): int(instruction.args[0].id)
+                for instruction in block.instrs
+                if str(instruction.op) == "GetElementPtr"
+                and instruction.args and instruction.res is not None
+            }
+            for instruction in block.instrs:
+                if str(instruction.op) != "Store" or len(instruction.args) < 2:
+                    continue
+                stored = int(instruction.args[0].id)
+                width = arrays_here.get(
+                    pointers.get(int(instruction.args[1].id), -1), 1
+                )
+                if (
+                    width > 1 and stored in formal_ids
+                    and stored not in promoted_scalar_formals[str(name)]
+                ):
+                    widths[stored] = max(widths.get(stored, 1), width)
         if widths:
             parameter_widths[str(name)] = widths
 
@@ -2366,7 +2454,37 @@ def lower_precision_operations(
             )
         seeded[str(name)] = rows
 
-    for function_name, function in functions.items():
+    # Callees first: a caller reading a region's result needs to know which
+    # aggregate fields the region appended for that result's limbs.
+    callee_first: list[str] = []
+
+    def visit(name: str, seen: set[str]) -> None:
+        if name in seen or name not in functions:
+            return
+        seen.add(name)
+        for block in functions[name].blocks.values():
+            for instruction in block.instrs:
+                if instruction.op in ("Call", "call"):
+                    visit(str(instruction.attributes.get("callee") or ""), seen)
+        callee_first.append(name)
+
+    aggregate_callees = {
+        str(instruction.attributes.get("callee") or "")
+        for function in functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in ("Call", "call")
+        and instruction.res is not None
+        and instruction.attributes.get("result_convention") == "ssa.aggregate"
+    }
+    visited: set[str] = set()
+    for name in functions:
+        visit(str(name), visited)
+    # result field -> the fields appended for its limbs, per region
+    returned_limb_fields: dict[str, dict[int, tuple[tuple[int, object], ...]]] = {}
+
+    for function_name in callee_first:
+        function = functions[function_name]
         # value id -> its limbs, high first. Absent means an ordinary value,
         # which is simply a one-limb expansion whose low limb is zero.
         limbs: dict[int, list] = {}
@@ -2906,6 +3024,10 @@ def lower_precision_operations(
             arrays = precision_arrays.get(str(function_name)) or {}
             # pointer value id -> (base array id, index value)
             addressed: dict[int, tuple] = {}
+            # aggregate value id -> the region that returned it, and a field
+            # pointer's id -> (its GetElementPtr, the field it addresses)
+            aggregates: dict[int, str] = {}
+            fields_of: dict[int, tuple] = {}
 
             def constant(number: int, like):
                 # Minted through the book from the index it strides.
@@ -2992,6 +3114,28 @@ def lower_precision_operations(
                         instruction.attributes[
                             "precision_actual_formal_ids"
                         ] = tuple(added_formal_ids)
+                    appended = returned_limb_fields.get(callee)
+                    if appended and instruction.res is not None:
+                        aggregates[int(instruction.res.id)] = callee
+                        if (
+                            "output_ids" in instruction.attributes
+                            and not instruction.attributes.get(
+                                "precision_result_limbs_bound"
+                            )
+                        ):
+                            instruction.attributes["output_ids"] = (
+                                *tuple(instruction.attributes["output_ids"]),
+                                *(
+                                    int(limb.id)
+                                    for _field, fields in sorted(
+                                        appended.items()
+                                    )
+                                    for _index, limb in fields
+                                ),
+                            )
+                            instruction.attributes[
+                                "precision_result_limbs_bound"
+                            ] = True
                     emitted.append(instruction)
                     continue
 
@@ -3002,6 +3146,11 @@ def lower_precision_operations(
                     addressed[int(instruction.res.id)] = (
                         instruction.args[0], instruction.args[1],
                     )
+                    if instruction.attributes.get("aggregate_index") is not None:
+                        fields_of[int(instruction.res.id)] = (
+                            instruction,
+                            int(instruction.attributes["aggregate_index"]),
+                        )
                     emitted.append(instruction)
                     continue
 
@@ -3032,6 +3181,61 @@ def lower_precision_operations(
                         # instruction read whatever the slot happened to hold.
                         collapse(loaded_limbs, instruction.res)
                         continue
+                    field = fields_of.get(int(instruction.args[0].id))
+                    callee = aggregates.get(int(where[0].id)) if where else None
+                    appended = (
+                        returned_limb_fields.get(callee, {}).get(field[1])
+                        if callee and field else None
+                    )
+                    if appended:
+                        # The region returned this result's limbs in fields
+                        # of their own; read each one back under the id the
+                        # region gave it, as the head field already is.
+                        emitted.append(instruction)
+                        pointer_instruction = field[0]
+                        received = []
+                        for index, limb in appended:
+                            pointer = fresh(pointer_instruction.res)
+                            pointer.dtype = pointer_instruction.res.dtype
+                            pointer.shape = tuple(
+                                pointer_instruction.res.shape or ()
+                            )
+                            emitted.append(Instr(
+                                "GetElementPtr",
+                                [where[0], constant(index, where[1])],
+                                pointer,
+                                attributes={
+                                    **dict(pointer_instruction.attributes),
+                                    "aggregate_index": int(index),
+                                    "source_output_id": int(limb.id),
+                                    PRECISION_SECTION_ATTRIBUTE: True,
+                                },
+                            ))
+                            value = SSAValue(
+                                int(limb.id), dtype=limb.dtype,
+                                shape=tuple(limb.shape or ()),
+                                device=limb.device,
+                                accounting={
+                                    "ssa_call_result_from": (
+                                        callee, int(limb.id),
+                                    ),
+                                },
+                            )
+                            emitted.append(Instr(
+                                "Load", [pointer], value,
+                                attributes={
+                                    **dict(instruction.attributes),
+                                    "aggregate_index": int(index),
+                                    "source_output_id": int(limb.id),
+                                    PRECISION_SECTION_ATTRIBUTE: True,
+                                },
+                            ))
+                            received.append(value)
+                        limbs[int(instruction.res.id)] = received
+                        lowered_limb_records[int(instruction.res.id)] = tuple(
+                            int(value.id) for value in received
+                        )
+                        continue
                     emitted.append(instruction)
                     continue
 
@@ -3056,6 +3260,48 @@ def lower_precision_operations(
                                 },
                             ))
                         continue
+                    emitted.append(instruction)
+                    continue
+
+                if (
+                    operation in ("Ret", "ret")
+                    and str(function_name) in aggregate_callees
+                    and not instruction.attributes.get(
+                        "precision_result_limbs_bound"
+                    )
+                    and any(
+                        len(limbs.get(int(value.id), ())) > 1
+                        for value in instruction.args
+                    )
+                ):
+                    # A region hands its results back as an aggregate the
+                    # caller takes apart field by field. A limbed result
+                    # keeps its collapsed head in its own field, for any
+                    # reader that wants one number, and its limbs follow in
+                    # fields appended after every existing one -- so no
+                    # existing field moves.
+                    appended: dict[int, tuple] = {}
+                    extra = []
+                    for position, value in enumerate(list(instruction.args)):
+                        held = limbs.get(int(value.id), ())
+                        if len(held) <= 1:
+                            continue
+                        rows = []
+                        for limb in held:
+                            rows.append((
+                                len(instruction.args) + len(extra), limb,
+                            ))
+                            extra.append(limb)
+                        appended[position] = tuple(rows)
+                    instruction.args.extend(extra)
+                    instruction.attributes["precision_result_limbs_bound"] = True
+                    returned_limb_fields[str(function_name)] = appended
+                    function.metadata["precision_returned_limb_fields"] = tuple(
+                        (position, tuple(
+                            (index, int(limb.id)) for index, limb in rows
+                        ))
+                        for position, rows in sorted(appended.items())
+                    )
                     emitted.append(instruction)
                     continue
 
