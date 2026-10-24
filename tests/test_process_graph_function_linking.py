@@ -1242,35 +1242,76 @@ def test_linker_prefers_retained_parameter_over_structural_identity_history():
     ) == 11
 
 
-def test_sympy_process_graph_is_registered_before_python_dependency_pursuit():
-    x = sympy.Symbol("x")
-    symbolic = compile_sympy_equations((
-        sympy.Eq(sympy.Symbol("out"), x + 1, evaluate=False),
-    ), name="linked_math")
-    root = ProcessGraph(materialize_memory=False)
-    references = link_process_graph_functions(
-        root, {"linked_math": symbolic.process_graph},
+@pytest.mark.parametrize("cache_state", ["cold", "warm"])
+def test_sympy_process_graph_is_registered_before_python_dependency_pursuit(
+    cache_state, tmp_path, monkeypatch,
+):
+    # The dual-IR cache is persistent, so this test once passed or failed by
+    # whether an earlier run had warmed it.  A miss compiles in the active
+    # book and the linker registers that very graph.  A hit unpickles a graph
+    # whose ingestion rows belong to an older book; the linker replays its
+    # recipe (``rebuild_symbolic_process_graph_in_current_book``) and
+    # registers the replay.  Both paths are pinned here, each on its own
+    # cache directory.
+    from src.compiler.concordance_declarations import INGESTION_VALUE
+    from src.compiler.identity_concordance import (
+        begin_identity_book,
+        current_identity_book,
+        end_identity_book,
     )
-    with contextlib.redirect_stdout(io.StringIO()):
-        root.build_from_ast(
-            ast.parse("def root(x):\n    return linked_math(x)\n"),
-            resolve_unresolved_parents=True,
-        )
-    reduce_abstract_tensor_topology(root)
 
-    callee = root.function_table.entry("linked_math")
-    caller = root.function_table.entry("root").graph
-    call = next(
-        data for _node, data in caller.G.nodes(data=True)
-        if data.get("op") == "Call"
-    )
-    assert callee.graph is symbolic.process_graph
-    assert callee.metadata["source_language"] == "sympy"
-    assert call["attributes"]["callee_ref"] == references["linked_math"]
-    assert all(role != "callee" for _parent, role in call["parents"])
-    assert tuple(callee.graph.G.graph["function_parameters"]) == tuple(
-        symbolic.input_ids
-    )
+    monkeypatch.setenv("TURING_SYMPY_DUAL_IR_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("TURING_DISABLE_SYMPY_DUAL_IR_CACHE", raising=False)
+    x = sympy.Symbol("x")
+    equations = (sympy.Eq(sympy.Symbol("out"), x + 1, evaluate=False),)
+    if cache_state == "warm":
+        # An earlier compile, outside the book below, warms the cache: its
+        # rows are not this compile's rows, as with an earlier process.
+        compile_sympy_equations(equations, name="linked_math")
+
+    _book, token = begin_identity_book()
+    try:
+        symbolic = compile_sympy_equations(equations, name="linked_math")
+        assert symbolic.cache_hit is (cache_state == "warm")
+        root = ProcessGraph(materialize_memory=False)
+        references = link_process_graph_functions(
+            root, {"linked_math": symbolic.process_graph},
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            root.build_from_ast(
+                ast.parse("def root(x):\n    return linked_math(x)\n"),
+                resolve_unresolved_parents=True,
+            )
+        reduce_abstract_tensor_topology(root)
+
+        callee = root.function_table.entry("linked_math")
+        caller = root.function_table.entry("root").graph
+        call = next(
+            data for _node, data in caller.G.nodes(data=True)
+            if data.get("op") == "Call"
+        )
+        if cache_state == "cold":
+            assert callee.graph is symbolic.process_graph
+        else:
+            assert callee.graph is not symbolic.process_graph
+            assert sorted(callee.graph.G.edges) == sorted(
+                symbolic.process_graph.G.edges
+            )
+        scope = tuple(callee.graph.G.graph["ingestion_value_scope"])
+        assert all(
+            current_identity_book().latest_ref(
+                INGESTION_VALUE, (scope, int(node_id)),
+            ) is not None
+            for node_id in callee.graph.G
+        )
+        assert callee.metadata["source_language"] == "sympy"
+        assert call["attributes"]["callee_ref"] == references["linked_math"]
+        assert all(role != "callee" for _parent, role in call["parents"])
+        assert tuple(callee.graph.G.graph["function_parameters"]) == tuple(
+            symbolic.input_ids
+        )
+    finally:
+        end_identity_book(token)
 
 
 def test_linked_sympy_function_address_derives_from_every_authored_equation():
