@@ -5,7 +5,8 @@ target, provenance, shortfalls) that refers to the component ABI. SPIR-V has
 a separate deployable-shader product; on lavapipe it matches numpy bit for bit.
 GLSL compute ports were labelled f32 while the source read int32 words; fixed.
 No lowering code changed. At 010ca12 (298 programs): C 298/298, same as main
-93b97b3. Fuzz seed 61 (40): 0 WRONG / 0 TYPE. See doc 38.
+93b97b3. Fuzz seed 61 (40): 0 WRONG / 0 TYPE. Gate names identical to
+main 93b97b3 in all four parts. See doc 38.
 
 2026-10-23 LANE E, E21 (MEASURED, cloud): a live-flag arena is bounded by its
 column's rows, so Fortran runs a callee that filters a list literal (c197,
