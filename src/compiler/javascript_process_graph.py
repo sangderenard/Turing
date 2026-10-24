@@ -92,13 +92,8 @@ _BINARY_REQUIREMENTS: Mapping[str, frozenset[str]] = {
         })
         for spelling in ("+", "-", "*", "/", "<", "<=", ">", ">=")
     },
-    # ECMAScript leaves Number::exponentiate implementation-approximated
-    # outside its special cases, and C's pow disagrees with it inside them:
-    # "the node oracle: 1 ** NaN" is NaN in JavaScript and 1.0 from pow, and
-    # (-1) ** Infinity likewise.  It needs a chosen reference program.
     "**": frozenset({
         "number-operands", "ecmascript-number-semantics",
-        "ecmascript-approximated-math-reference",
     }),
     "&&": frozenset({"boolean-operands", "pure-operands"}),
     "||": frozenset({"boolean-operands", "pure-operands"}),
@@ -399,6 +394,70 @@ class _JavaScriptProcessInterpreter:
             value_kind="boolean",
         )
 
+    def _exponentiate(
+        self, base: int, exponent: int, source: Mapping[str, Any],
+    ) -> int:
+        """ECMAScript Number::exponentiate (``**`` and ``Math.pow``).
+
+        "the node oracle: 1 ** NaN" -- C's pow, which the repository Pow
+        lowers to, returns 1 for a base of +-1 with a NaN or infinite
+        exponent; ECMAScript returns NaN.  Every other special case agrees,
+        so those two are selected explicitly and the rest is Pow.  Pow
+        itself is implementation-approximated (``ecmascript_approximated``).
+        """
+
+        power = self.make_node(
+            Handler.Pow.name, Handler.Pow.name, Handler.Pow.name,
+            ((base, "left"), (exponent, "right")), source=source,
+            attributes={"ecmascript_approximated": True},
+            value_kind="number",
+        )
+        exponent_nan = self.make_node(
+            "Call", Handler.Call.name, "isnan", ((exponent, "arg0"),),
+            attributes={"callee": "isnan", "tensor_operation": "isnan"},
+            source=source, value_kind="boolean",
+        )
+        magnitude = self.make_node(
+            "Call", Handler.Call.name, "abs", ((base, "arg0"),),
+            attributes={"callee": "abs", "tensor_operation": "abs"},
+            source=source, value_kind="number",
+        )
+        one = self.make_node(
+            "Constant", Handler.Const.name, "1", (),
+            attributes={"value": 1.0}, constant=1.0, source=source,
+            output_roles=("value",), value_kind="number",
+        )
+        unit_base = self.make_node(
+            Handler.Eq.name, Handler.Eq.name, Handler.Eq.name,
+            ((magnitude, "left"), (one, "right")), source=source,
+            value_kind="boolean",
+        )
+        exponent_infinite = self.make_node(
+            "Call", Handler.Call.name, "isinf", ((exponent, "arg0"),),
+            attributes={"callee": "isinf", "tensor_operation": "isinf"},
+            source=source, value_kind="boolean",
+        )
+        unit_infinite = self.make_node(
+            Handler.LAnd.name, Handler.LAnd.name, Handler.LAnd.name,
+            ((unit_base, "left"), (exponent_infinite, "right")),
+            source=source, value_kind="boolean",
+        )
+        undefined = self.make_node(
+            Handler.LOr.name, Handler.LOr.name, Handler.LOr.name,
+            ((exponent_nan, "left"), (unit_infinite, "right")),
+            source=source, value_kind="boolean",
+        )
+        nan = self.make_node(
+            "Constant", Handler.Const.name, "NaN", (),
+            attributes={"value": float("nan")}, constant=float("nan"),
+            source=source, output_roles=("value",), value_kind="number",
+        )
+        return self.make_node(
+            Handler.Select.name, Handler.Select.name, Handler.Select.name,
+            ((undefined, "condition"), (nan, "if_true"), (power, "if_false")),
+            source=source, value_kind="number",
+        )
+
     def truthy(self, operand: int, source: Mapping[str, Any]) -> int:
         kind = self._kind(operand)
         if kind == "boolean" or (
@@ -455,6 +514,8 @@ class _JavaScriptProcessInterpreter:
                     source=expr,
                     parents=parents,
                 )
+            if handler is Handler.Pow:
+                return self._exponentiate(left, right, expr)
             result_kind = (
                 "boolean"
                 if handler in {
@@ -598,6 +659,8 @@ class _JavaScriptProcessInterpreter:
                     source=expr,
                     parents=parents,
                 )
+            if program.operator == "pow":
+                return self._exponentiate(arguments[0], arguments[1], expr)
             attrs = {
                 "callee": program.operator,
                 "tensor_operation": program.operator,

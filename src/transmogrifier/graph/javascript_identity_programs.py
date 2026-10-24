@@ -73,10 +73,11 @@ _MATH_REQUIREMENTS = frozenset({
 
 
 # ECMAScript (Math function properties) calls these implementation-
-# approximated: no single double is "the" JavaScript answer.  "the node
-# oracle: Math.sin(2.5)" -- V8's port and the platform libm differ in the last
-# bit for sin, exp, log, acos, asinh, acosh and pow on ordinary inputs.  Until
-# a reference program is chosen they need a facet no region proves today.
+# approximated: no single double is "the" JavaScript answer, and V8's differs
+# from the repository's compiled one in the last bit ("the node oracle:
+# Math.sin(2.5)").  They lower to the repository's own operation like
+# Python's math functions do; ``ecmascript_approximated`` tells the oracle to
+# judge them by an ulp standard rather than by node's bits.
 _APPROXIMATED_MATH = frozenset({
     "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh",
     "exp", "log", "pow", "sin", "sinh", "tan", "tanh",
@@ -88,7 +89,6 @@ def _math(
 ) -> JavaScriptIdentityProgram:
     requirements = _MATH_REQUIREMENTS
     if identity in _APPROXIMATED_MATH:
-        requirements = requirements | {"ecmascript-approximated-math-reference"}
         attributes = {**attributes, "ecmascript_approximated": True}
     return JavaScriptIdentityProgram(
         identities=(f"javascript.realm.Math.{identity}",),

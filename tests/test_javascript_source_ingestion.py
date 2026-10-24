@@ -74,15 +74,40 @@ def test_jsdoc_of_another_function_does_not_type_this_one():
     # JavaScript returns one of the Numbers; LAnd would return a bool.
     "/** @param {number} x @param {number} y */ function f(x, y) { return x && y; }",
     "/** @param {number} x @param {number} y */ function f(x, y) { return x || y; }",
-    # C pow(1, NaN) is 1; JavaScript 1 ** NaN is NaN.
-    "/** @param {number} x @param {number} y */ function f(x, y) { return x ** y; }",
-    # Implementation-approximated: V8 and libm differ in the last bit.
-    "/** @param {number} x */ function f(x) { return Math.sin(x); }",
-    "/** @param {number} x @param {number} y */ function f(x, y) { return Math.pow(x, y); }",
 ])
-def test_oracle_findings_stay_loud_refusals(source):
+def test_number_logical_operators_stay_loud_refusals(source):
     lowered = lower_javascript_source_to_ssa(source)
     assert not lowered.complete
+
+
+@needs_node
+@pytest.mark.parametrize("source", [
+    # C pow(1, NaN) and pow(-1, Infinity) are 1; ECMAScript says NaN.
+    "/** @param {number} a @param {number} b */ function root(a, b) { return a ** b; }",
+    "/** @param {number} a @param {number} b */ function root(a, b) { return Math.pow(a, b); }",
+])
+def test_exponentiation_special_cases_match_node(source):
+    rows = "[[1, NaN], [-1, Infinity], [1, -Infinity], [NaN, 0], [NaN, -0], [-8, 1/3], [0, -1], [-0, -1], [2, 0.5], [-2, 3]]"
+    status = check_program(source, rows)
+    assert status.startswith("PASS"), status
+
+
+@needs_node
+def test_transcendentals_compile_to_repository_operations_within_the_ulp_tier():
+    source = (
+        "/** @param {number} x */ function root(x) "
+        "{ return Math.sin(x) + Math.exp(x) - Math.log(x + 2) + Math.atan(x); }"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    operations = {
+        instruction.op
+        for instruction in lowered.module.functions["root"].blocks["entry"].instrs
+    }
+    assert {"sin", "exp", "log", "atan"} <= operations
+    assert "Call" not in operations
+    status = check_program(source, "[[0.5], [1], [2.5], [-1.5], [10], [-0], [NaN], [Infinity]]")
+    assert status.startswith("PASS (approximated"), status
 
 
 @needs_node

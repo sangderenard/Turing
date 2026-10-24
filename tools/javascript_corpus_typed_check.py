@@ -27,6 +27,7 @@ the node executable (default: ``node`` on PATH, then /opt/node22/bin/node).
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -35,6 +36,8 @@ import subprocess
 import sys
 import tempfile
 import warnings
+
+import numpy as np
 
 warnings.filterwarnings("ignore")
 ROOT = os.environ.get(
@@ -129,14 +132,60 @@ def same_number(got: float, want_bits: str) -> bool:
     return number_bits(got) == want_bits
 
 
-def judge(row: dict, got, got_kind: str) -> str:
-    """``ok``, or a WRONG/TYPE line for one row."""
+def ulp_distance(got: float, want: float) -> float:
+    """Distance in ulps of ``want``; special values must match exactly.
+
+    NaN matches only NaN, an infinity only itself, and a zero only the zero
+    of the same sign.  Anything else is ``inf``.
+    """
+
+    if want != want or got != got:
+        return 0.0 if (want != want and got != got) else math.inf
+    if math.isinf(want) or math.isinf(got) or want == 0.0 or got == 0.0:
+        return 0.0 if number_bits(got) == number_bits(want) else math.inf
+    if (got < 0.0) != (want < 0.0):
+        return math.inf
+    return abs(got - want) / float(np.spacing(abs(want)))
+
+
+def oracle_ulps() -> tuple[str, float]:
+    """The standard for implementation-approximated programs.
+
+    ECMAScript leaves Math.sin, Math.exp, ``**`` and the rest
+    implementation-approximated, and V8's answers are not more accurate than
+    the repository's compiled ones (measured against a 200-bit reference,
+    V8 misrounds more often).  So a program that uses one is judged against
+    node within a named tier of ``precision_policy.PRECISION_TIERS``
+    (``JS_ORACLE_TIER``, default ``tight``); programs without one stay
+    bit-exact.
+    """
+
+    from src.compiler.precision_policy import PRECISION_TIERS
+
+    tier = os.environ.get("JS_ORACLE_TIER", "tight")
+    return tier, float(PRECISION_TIERS[tier])
+
+
+def judge(row: dict, got, got_kind: str, ulps: float | None = None) -> str:
+    """``ok``, or a WRONG/TYPE line for one row.
+
+    ``ulps`` None compares bits; a number compares within that many ulps
+    of node's value (special values still exactly).
+    """
 
     want = row["result"]
     args = [decode(item) for item in row["args"]]
     if want["kind"] == "number":
         if got_kind != "f":
             return f"TYPE {args} got kind {got_kind!r} want number (float)"
+        if ulps is not None:
+            distance = ulp_distance(float(got), decode(want))
+            if distance > ulps:
+                return (
+                    f"WRONG {args} got {float(got)!r} want {decode(want)!r} "
+                    f"({distance:.3g} ulp > {ulps:g})"
+                )
+            return "ok"
         if not same_number(float(got), want["bits"]):
             return (
                 f"WRONG {args} got {float(got)!r} [{number_bits(got)}] "
@@ -155,7 +204,6 @@ def judge(row: dict, got, got_kind: str) -> str:
 def check_program(source: str, inputs: str, *, entry: str = "root") -> str:
     """One status line (without the program name) for one program."""
 
-    import numpy as np
     from src.compiler.javascript_source_ingestion import (
         lower_javascript_source_to_ssa,
     )
@@ -187,6 +235,13 @@ def check_program(source: str, inputs: str, *, entry: str = "root") -> str:
         artifact.compile(pathlib.Path(tempfile.mkdtemp()) / "native")
     except Exception as error:
         return f"EMIT-FAIL {type(error).__name__}: {str(error)[:300]}"
+    approximated = any(
+        instruction.attributes.get("ecmascript_approximated")
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+    tier, ulps = oracle_ulps() if approximated else (None, None)
+    worst = 0.0
     verdicts = []
     for row in rows:
         args = [decode(item) for item in row["args"]]
@@ -201,11 +256,22 @@ def check_program(source: str, inputs: str, *, entry: str = "root") -> str:
                 for value, arg in zip(function.args, args)
             }).run()
             buffer = np.asarray(execution.buffers[returned[0].id]).reshape(-1)
-            verdicts.append(judge(row, buffer[0].item(), buffer.dtype.kind))
+            got = buffer[0].item()
+            verdicts.append(judge(row, got, buffer.dtype.kind, ulps))
+            if ulps is not None and row["result"]["kind"] == "number":
+                distance = ulp_distance(float(got), decode(row["result"]))
+                if math.isfinite(distance):
+                    worst = max(worst, distance)
         except Exception as error:
             verdicts.append(f"RUN-FAIL {args} {type(error).__name__}: {str(error)[:150]}")
     bad = [item for item in verdicts if item != "ok"]
-    return f"{'PASS' if not bad else 'FAIL'} {bad[:3] if bad else ''}".rstrip()
+    standard = (
+        f" (approximated: max {worst:.3g} ulp vs node, tier {tier} = {ulps:g})"
+        if approximated else ""
+    )
+    return (
+        f"{'PASS' if not bad else 'FAIL'}{standard} {bad[:3] if bad else ''}"
+    ).rstrip()
 
 
 def split_program(text: str) -> tuple[str, str]:

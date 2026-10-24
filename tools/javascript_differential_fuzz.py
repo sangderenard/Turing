@@ -12,8 +12,10 @@ Statuses: PASS, WRONG, TYPE, LOUD (a named refusal or emission shortfall),
 FINDING (anything else: lowering/emission crash, run failure, SEGV).
 WRONG and TYPE are emergencies: stop and minimize.
 
-The grammar deliberately includes spellings the frontend refuses today
-(``%``, ``**``, ``Math.sin``, ``Math.max``, ``&&`` on Numbers) so that each
+Programs using an implementation-approximated operation (``Math.sin``,
+``**``, ...) are judged within the oracle's ulp tier.  The grammar also
+includes spellings the frontend refuses today (``%``, ``Math.sign``,
+``Math.max``, ``&&`` on Numbers) so that each
 refusal stays visible as a LOUD cluster rather than silently vanishing.
 
 Usage: python tools/javascript_differential_fuzz.py OUT SEED COUNT
@@ -34,13 +36,16 @@ from javascript_corpus_typed_check import check_program  # noqa: E402
 INPUT_ROWS = (
     "[[1, 2, true, false], [-0, 0, false, true], [NaN, 3, true, true], "
     "[Infinity, -Infinity, false, false], [0.1, 0.2, true, false], "
-    "[-7, 2, false, true], [1e308, 1e-308, true, true], [0, NaN, false, false]]"
+    "[-7, 2, false, true], [1e308, 1e-308, true, true], [0, NaN, false, false], "
+    "[-1, Infinity, true, false], [1, NaN, false, true]]"
 )
 
 NUMBER_LITERALS = ("0", "1", "2", "0.5", "3", "1e308", "1e-308", "10")
+# Implementation-approximated: the oracle judges them by an ulp tier.
+APPROXIMATED_CALLS = ("Math.sin", "Math.cos", "Math.exp", "Math.log", "Math.atan")
 # Refused today; kept so their refusals stay counted.
-LOUD_NUMBER_CALLS = ("Math.sin", "Math.exp", "Math.log", "Math.sign")
-LOUD_NUMBER_BINARY = ("%", "**")
+LOUD_NUMBER_CALLS = ("Math.sign",)
+LOUD_NUMBER_BINARY = ("%",)
 
 
 class Generator:
@@ -69,8 +74,13 @@ class Generator:
                 f"({self.condition(depth - 1)} ? {self.number(depth - 1)} : "
                 f"{self.number(depth - 1)})"
             )
-        if choice < 0.97:
+        if choice < 0.88:
             return rng.choice(NUMBER_LITERALS)
+        if choice < 0.94:
+            call = rng.choice(APPROXIMATED_CALLS)
+            return f"{call}({self.number(depth - 1)})"
+        if choice < 0.97:
+            return f"({self.number(depth - 1)} ** {self.number(depth - 1)})"
         # Rare on purpose: one refused spelling sinks the whole program.
         loud = rng.randrange(4)
         if loud == 0:

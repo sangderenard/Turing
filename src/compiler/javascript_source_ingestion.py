@@ -105,6 +105,16 @@ def javascript_jsdoc_parameter_kinds(
     }
 
 
+#: Interpreter attributes that stay on the instruction.
+_CARRIED_ATTRIBUTES = ("javascript_identity", "ecmascript_approximated")
+
+
+def _carried(attributes: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: attributes[key] for key in _CARRIED_ATTRIBUTES if key in attributes
+    }
+
+
 def _ordered_parents(data: Mapping[str, Any]) -> list[int]:
     parents = list(data.get("parents") or ())
 
@@ -249,16 +259,20 @@ def lower_javascript_source_to_ssa(
                 attributes={"value": constant},
             ))
         elif node_type == "Call":
+            # A realm identity names an existing repository operation in
+            # ``tensor_operation``; it is written as that operation, the way
+            # the Python frontend writes math.sin as ``sin``.
+            operation = str(attributes.get("tensor_operation") or "")
+            if not operation:
+                shortfalls.append(JavaScriptSourceShortfall(
+                    "unlowered-call",
+                    f"call node {node_id} names no repository operation",
+                ))
+                return None
             value = fresh(dtype)
             instructions.append(Instr(
-                Handler.Call.value, list(operands), value,
-                attributes={
-                    key: attributes[key]
-                    for key in (
-                        "callee", "tensor_operation", "javascript_identity",
-                    )
-                    if key in attributes
-                },
+                operation, list(operands), value,
+                attributes=_carried(attributes),
             ))
         else:
             try:
@@ -270,7 +284,10 @@ def lower_javascript_source_to_ssa(
                 ))
                 return None
             value = fresh(dtype)
-            instructions.append(Instr(handler.value, list(operands), value))
+            instructions.append(Instr(
+                handler.value, list(operands), value,
+                attributes=_carried(attributes),
+            ))
         values[node_id] = value
         return value
 
