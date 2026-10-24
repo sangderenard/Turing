@@ -2,8 +2,9 @@
 
 The JavaScript counterpart of ``differential_fuzz.py``.  Each program is a
 random function over two Number parameters (``a``, ``b``) and two Boolean
-parameters (``p``, ``q``) built from ``const`` bindings, an optional
-early-return ``if`` and typed expression snippets.  It is lowered with
+parameters (``p``, ``q``) built from ``const``/``let`` bindings,
+reassignments (``=``, ``op=``, ``++``/``--``) under nested ``if``/``else``,
+an optional early-return ``if`` and typed expression snippets.  It is lowered with
 ``lower_javascript_source_to_ssa``, compiled through the C backend and run on
 rows of ordinary and special values (``NaN``, ``-0``, ``Infinity``), and
 compared bit for bit with node (``javascript_corpus_typed_check``).
@@ -124,18 +125,68 @@ class Generator:
             return self.number(depth)
         return self.boolean(depth)
 
+    def assignment(self, depth: int) -> str:
+        """One statement rebinding a ``let`` (or a parameter) of its own kind."""
+
+        rng = self.rng
+        if self.mutable_numbers and (not self.mutable_booleans or rng.random() < 0.75):
+            name = rng.choice(self.mutable_numbers)
+            form = rng.random()
+            if form < 0.15:
+                return f"{name}{rng.choice(('++', '--'))};"
+            if form < 0.55:
+                op = rng.choice(("+=", "-=", "*=", "/="))
+                return f"{name} {op} {self.number(depth)};"
+            return f"{name} = {self.number(depth)};"
+        name = rng.choice(self.mutable_booleans)
+        return f"{name} = {self.boolean(depth)};"
+
+    def block(self, depth: int, indent: str) -> list[str]:
+        """Statements that rebind outer names, possibly with a nested if."""
+
+        rng = self.rng
+        lines = []
+        for _ in range(rng.randint(1, 2)):
+            if depth > 0 and rng.random() < 0.3:
+                lines.extend(self.if_statement(depth - 1, indent))
+            else:
+                lines.append(f"{indent}{self.assignment(2)}")
+        return lines
+
+    def if_statement(self, depth: int, indent: str) -> list[str]:
+        lines = [f"{indent}if ({self.condition(2)}) {{"]
+        lines.extend(self.block(depth, indent + "  "))
+        if self.rng.random() < 0.6:
+            lines.append(f"{indent}}} else {{")
+            lines.extend(self.block(depth, indent + "  "))
+        lines.append(f"{indent}}}")
+        return lines
+
     def program(self) -> str:
         rng = self.rng
         lines = []
-        for index in range(rng.randint(0, 3)):
+        # Parameters are reassignable too.
+        self.mutable_numbers = ["a", "b"] if rng.random() < 0.3 else []
+        self.mutable_booleans = []
+        for index in range(rng.randint(0, 4)):
+            binding = "let" if rng.random() < 0.5 else "const"
             if rng.random() < 0.7:
                 name = f"n{index}"
-                lines.append(f"  const {name} = {self.number(3)};")
+                lines.append(f"  {binding} {name} = {self.number(3)};")
                 self.numbers.append(name)
+                if binding == "let":
+                    self.mutable_numbers.append(name)
             else:
                 name = f"t{index}"
-                lines.append(f"  const {name} = {self.boolean(3)};")
+                lines.append(f"  {binding} {name} = {self.boolean(3)};")
                 self.booleans.append(name)
+                if binding == "let":
+                    self.mutable_booleans.append(name)
+            if (self.mutable_numbers or self.mutable_booleans) and rng.random() < 0.5:
+                if rng.random() < 0.5:
+                    lines.extend(self.if_statement(1, "  "))
+                else:
+                    lines.append(f"  {self.assignment(3)}")
         returns_number = rng.random() < 0.7
         value = (lambda: self.number(3)) if returns_number else (
             lambda: self.boolean(3)

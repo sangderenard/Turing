@@ -271,7 +271,7 @@ def test_grounded_math_call_keeps_realm_identity_on_the_graph_node():
     assert call["attributes"]["callee"] == "sqrt"
 
 
-def test_mutable_binding_is_retained_as_a_cfg_shortfall():
+def test_reassigned_let_binding_is_a_new_version_of_the_same_name():
     program = _run_javascript_ast_parser("""
     function bump(x) {
       let y = x;
@@ -285,11 +285,27 @@ def test_mutable_binding_is_retained_as_a_cfg_shortfall():
         assumptions=PORTABLE_NUMERIC_ASSUMPTIONS,
     )
 
-    assert not lowering.complete
-    assert any(
-        item.code in {"unsupported-binding-kind", "unsupported-assignment"}
-        for item in lowering.shortfalls
+    assert lowering.complete, lowering.shortfalls
+    versions = [
+        (record["name"], record["version"])
+        for record in lowering.binding_identities
+        if record["name"] == "y"
+    ]
+    assert versions == [("y", 0), ("y", 1)]
+
+
+@pytest.mark.parametrize("source", [
+    "function f(x) { var y = x; return y; }",
+    "function f(x) { const y = x; y = 1; return y; }",
+    "function f(x) { let y = x; y &&= 1; return y; }",
+])
+def test_var_const_reassignment_and_conditional_assignment_are_refused(source):
+    graph = ProcessGraph(materialize_memory=False)
+    lowering = ingest_javascript_program(
+        graph, _run_javascript_ast_parser(source), owner="assignment.js",
+        entry="f", assumptions=PORTABLE_NUMERIC_ASSUMPTIONS,
     )
+    assert not lowering.complete
 
 
 def test_shadowed_math_is_not_resolved_as_a_realm_identity():
