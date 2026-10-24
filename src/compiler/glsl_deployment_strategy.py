@@ -20429,9 +20429,10 @@ def _propagate_callsite_tensor_specializations(
         book = current_identity_book()
         for page_name in ("formal_shape", "tensor_shape_settlement"):
             page = book.page(page_name)
+            # Page rows retain posting order, the same order the guard saw.
             facts.extend(
                 (page_name, repr(row), repr(page.latest(row)))
-                for row in sorted(page.rows(), key=repr)
+                for row in page.rows()
             )
         digest = hashlib.sha256(repr(tuple(facts)).encode("utf-8")).hexdigest()
         return digest[:16], tensor_fact_count
