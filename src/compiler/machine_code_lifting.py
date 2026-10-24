@@ -1073,8 +1073,10 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
         width = getattr(operand, "width", None)
         if width is not None:
             return int(width)
+        # The trailing separator is a lookahead: consuming it would hide the
+        # next operand's leading ``_`` and read MOVZX_R32_RM16 as one width.
         widths = re.findall(
-            r"(?:^|_)(?:XMMM|RM|R|M)(128|64|32|16|8)(?:_|$)",
+            r"(?:^|_)(?:XMMM|RM|R|M)(128|64|32|16|8)(?=_|$)",
             source.token.name,
         )
         if widths:
@@ -3112,6 +3114,60 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
             )
             self.write_operand(operands[0], result, source, width=width)
             return
+        if semantic is MachineSemanticToken.INTEGER_ADD_WITH_CARRY:
+            if len(operands) != 2 or not isinstance(
+                operands[0], (RegisterOperand, EffectiveAddressOperand)
+            ) or not isinstance(
+                operands[1],
+                (RegisterOperand, EffectiveAddressOperand, ImmediateOperand),
+            ):
+                raise MachineLiftError(f"{source.address:#x}: malformed ADC operands")
+            width = self.operand_width(source, 0)
+            left = self.read_operand(operands[0], source, width=width)
+            right = self.read_operand(operands[1], source, width=width)
+            incoming_cf = self.flag("CF")
+            carry_in = self.emit(
+                Handler.Select,
+                (
+                    incoming_cf,
+                    self.constant(1, source, dtype="int64"),
+                    self.constant(0, source, dtype="int64"),
+                ),
+                source, dtype="int64", machine_carry_input=True,
+            )
+            partial = self.emit(
+                Handler.Add, (left, right), source, dtype=f"int{width}",
+            )
+            raw = self.emit(
+                Handler.Add, (partial, carry_in), source, dtype=f"int{width}",
+            )
+            result = self.truncate_bits(raw, width, source)
+            # OF, AF, SF, ZF and PF are defined on the authored operands and
+            # the final sum.  CF is the carry out of left + right + CF: with
+            # a carry in, a result equal to left has also wrapped.
+            self.arithmetic_flags(left, right, raw, width, source, subtract=False)
+            truncated_left = self.truncate_bits(left, width, source)
+            wrapped = self._bool(
+                Handler.ULt, (result, truncated_left), source,
+                comparison_unsigned=True, machine_carry_without_input=True,
+            )
+            wrapped_equal = self._bool(
+                Handler.LAnd,
+                (
+                    incoming_cf,
+                    self._bool(
+                        Handler.Eq, (result, truncated_left), source,
+                        machine_carry_boundary=True,
+                    ),
+                ),
+                source, machine_carry_boundary=True,
+            )
+            self.flags["CF"] = self._bool(
+                Handler.LOr, (wrapped_equal, wrapped), source,
+                machine_flag="CF", machine_add_with_carry=True,
+            )
+            self.write_operand(operands[0], result, source, width=width)
+            return
         if semantic is MachineSemanticToken.BITWISE_NOT:
             if len(operands) != 1 or not isinstance(
                 operands[0], (RegisterOperand, EffectiveAddressOperand)
@@ -4156,10 +4212,19 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
             if not isinstance(destination, RegisterOperand) or not isinstance(immediate, ImmediateOperand):
                 raise MachineLiftError(f"{source.address:#x}: malformed MOV immediate operands")
             self.registers[destination.register] = self.constant(immediate.value, source, dtype="int64")
-        elif token is X86InstructionToken.PUSH_R64:
+        elif token in {
+            X86InstructionToken.PUSH_R64,
+            X86InstructionToken.PUSH_RM64,
+            X86InstructionToken.PUSH_IMM8,
+        }:
             (operand,) = operands
-            if not isinstance(operand, RegisterOperand):
+            if not isinstance(
+                operand, (RegisterOperand, EffectiveAddressOperand, ImmediateOperand),
+            ):
                 raise MachineLiftError(f"{source.address:#x}: malformed PUSH operand")
+            # The source is read before RSP moves: push [rsp+8] reads the
+            # slot above the old top of stack.
+            pushed = self.read_operand(operand, source, width=64)
             rsp = self.emit(
                 Handler.Sub,
                 (self.value(X86Register.RSP, source), self.constant(8, source, dtype="int64")),
@@ -4169,7 +4234,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
             )
             self.registers[X86Register.RSP] = rsp
             self.memory = self.emit(
-                Handler.Store, (self.memory, rsp, self.value(operand.register, source)),
+                Handler.Store, (self.memory, rsp, pushed),
                 source, dtype="memory", machine_state="stack-push", width=64,
             )
         elif token is X86InstructionToken.POP_R64:

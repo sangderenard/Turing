@@ -85,6 +85,9 @@ EXTENDED = [
     (["xs{v} = [{a}, {b}]", "bump_alt(xs{v}, n)"], "xs{v}[0] * 10 + xs{v}[1]"),
     # a loop bounded by len() of a list formal (corpus c376, plan C19)
     (["c{v} = weigh([{a}, n, {b}])"], "c{v}"),
+    # a call whose argument is a dict display runs after the display's
+    # member stores (corpus c377, dict formal)
+    (["c{v} = bump_key({{0: {a}, 1: {b}}}, n)"], "c{v}"),
     # a dict row stored from its own read (corpus c374, plan C6)
     (["d{v} = {{0: {a}, 1: {b}}}", "d{v}[n % 2] += n * {c}", "d{v}[1] = d{v}[0] + d{v}[1]"], "d{v}[0] * 10 + d{v}[1]"),
     (["xs{v} = []", "k{v} = n % 5 + 2", "while k{v} > 0:", "    xs{v}.append(k{v})", "    k{v} -= 2"], "len(xs{v}) * 10 + xs{v}[0]"),
@@ -220,6 +223,11 @@ def bump_alt(xs: list[int], n: int) -> None:
         xs[i % 2] += n
 
 
+def bump_key(d: dict[int, int], n: int) -> int:
+    d[0] += n
+    return d[0] * 10 + d[1]
+
+
 def weigh(xs: list[int]) -> int:
     t = 0
     for i in range(len(xs)):
@@ -335,6 +343,8 @@ EXTENDED3 = [
     (["d{v} = {{{a}: n + 36028797018963969, {b}: {c}}}", "t{v} = 0", "for k{v}, w{v} in d{v}.items():", "    t{v} += k{v} * 10 + w{v}"], "t{v}"),
     # a list grown at run time, then sorted (Fortran list growth; lane E)
     (["xs{v} = []", "for k{v} in range(n % 4 + {a} + 1):", "    xs{v}.append((k{v} * {b} + n) % 9)", "ys{v} = sorted(xs{v})"], "ys{v}[0] * 100 + ys{v}[-1] * 10 + len(xs{v})"),
+    # a sorted grown list, then a runtime replication with no region body (E22b; lane E)
+    (["xs{v} = []", "for k{v} in range(n % 4 + {a} + 1):", "    xs{v}.append((k{v} * {b} + n) % 9)", "ys{v} = sorted(xs{v})", "zs{v} = [{c}] * (n % 4 + 1)"], "ys{v}[0] * 100 + len(zs{v}) * 10 + zs{v}[0]"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v

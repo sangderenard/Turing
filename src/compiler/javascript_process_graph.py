@@ -129,6 +129,9 @@ class _JavaScriptProcessInterpreter:
         self.owner = str(owner)
         self.assumptions = frozenset(map(str, assumptions))
         self.parameter_kinds = dict(parameter_kinds or {})
+        self.last_version: dict[str, int] = {}
+        self.loops: list[dict[str, Any]] = []
+        self.loop_count = 0
         self.shortfalls: list[JavaScriptExpressionShortfall] = []
         self.bindings: dict[str, dict[str, Any]] = {}
         self.binding_records: list[dict[str, Any]] = []
@@ -318,6 +321,12 @@ class _JavaScriptProcessInterpreter:
                 f"binding {name!r} is already declared in this JavaScript region",
             ))
             return self.bindings[name]
+        # One name may be declared in sibling scopes (each arm's ``let t``)
+        # or read free after a block's own declaration went out of scope;
+        # each is its own row on the book.  "if/else arms that both declare
+        # let t": the second re-posted version 0 and the book refused it.
+        version = self.last_version.get(name, -1) + 1
+        self.last_version[name] = version
         record = {
             "declaration_identity": (
                 f"{self.owner}#javascript-binding:{kind}:{name}:"
@@ -325,7 +334,7 @@ class _JavaScriptProcessInterpreter:
             ),
             "name": name,
             "kind": kind,
-            "version": 0,
+            "version": version,
             "value_node": int(value_node),
             "start": declaration.get("start"),
             "end": declaration.get("end"),
@@ -392,6 +401,166 @@ class _JavaScriptProcessInterpreter:
             Handler.LOr.name, Handler.LOr.name, Handler.LOr.name,
             ((equals_zero, "left"), (is_nan, "right")), source=source,
             value_kind="boolean",
+        )
+
+    def _node(
+        self,
+        handler: Handler,
+        parents: Sequence[tuple[int, str]],
+        source: Mapping[str, Any],
+        kind: str,
+    ) -> int:
+        return self.make_node(
+            handler.name, handler.name, handler.name, parents,
+            source=source, value_kind=kind,
+        )
+
+    def _call(
+        self, operation: str, operand: int, source: Mapping[str, Any], kind: str,
+    ) -> int:
+        return self.make_node(
+            "Call", Handler.Call.name, operation, ((operand, "arg0"),),
+            attributes={"callee": operation, "tensor_operation": operation},
+            source=source, value_kind=kind,
+        )
+
+    def _number(self, value: float, source: Mapping[str, Any]) -> int:
+        return self.make_node(
+            "Constant", Handler.Const.name, repr(value), (),
+            attributes={"value": float(value)}, constant=float(value),
+            source=source, output_roles=("value",), value_kind="number",
+        )
+
+    def _negative_sign(self, value: int, source: Mapping[str, Any]) -> int:
+        """True for negative numbers and -0 (``1 / -0`` is -Infinity)."""
+
+        zero = self._number(0.0, source)
+        below = self._node(
+            Handler.Lt, ((value, "left"), (zero, "right")), source, "boolean",
+        )
+        is_zero = self._node(
+            Handler.Eq, ((value, "left"), (zero, "right")), source, "boolean",
+        )
+        reciprocal = self._node(
+            Handler.Div, ((self._number(1.0, source), "left"), (value, "right")),
+            source, "number",
+        )
+        negative_zero = self._node(
+            Handler.LAnd,
+            ((is_zero, "left"), (self._node(
+                Handler.Lt, ((reciprocal, "left"), (zero, "right")),
+                source, "boolean",
+            ), "right")),
+            source, "boolean",
+        )
+        return self._node(
+            Handler.LOr, ((below, "left"), (negative_zero, "right")),
+            source, "boolean",
+        )
+
+    def _remainder(
+        self, dividend: int, divisor: int, source: Mapping[str, Any],
+    ) -> int:
+        """ECMAScript Number::remainder: truncated, with the dividend's sign.
+
+        The repository Mod is floored (Python's ``%``).  On non-negative
+        operands floored and truncated agree, and the remainder of
+        magnitudes is exact, so ``|a| mod |b|`` carries the dividend's sign
+        back, -0 included.  NaN, an infinite dividend and a zero divisor
+        give NaN through Mod itself; an infinite divisor returns ``|a|``.
+        """
+
+        magnitude = self._node(
+            Handler.Mod,
+            ((self._call("abs", dividend, source, "number"), "left"),
+             (self._call("abs", divisor, source, "number"), "right")),
+            source, "number",
+        )
+        negated = self._node(
+            Handler.Neg, ((magnitude, "operand"),), source, "number",
+        )
+        return self._node(
+            Handler.Select,
+            ((self._negative_sign(dividend, source), "condition"),
+             (negated, "if_true"), (magnitude, "if_false")),
+            source, "number",
+        )
+
+    def _sign(self, value: int, source: Mapping[str, Any]) -> int:
+        """Math.sign: 1, -1, or the operand itself for +-0 and NaN."""
+
+        zero = self._number(0.0, source)
+        below = self._node(
+            Handler.Select,
+            ((self._node(Handler.Lt, ((value, "left"), (zero, "right")),
+                         source, "boolean"), "condition"),
+             (self._number(-1.0, source), "if_true"), (value, "if_false")),
+            source, "number",
+        )
+        return self._node(
+            Handler.Select,
+            ((self._node(Handler.Gt, ((value, "left"), (zero, "right")),
+                         source, "boolean"), "condition"),
+             (self._number(1.0, source), "if_true"), (below, "if_false")),
+            source, "number",
+        )
+
+    def _extremum(
+        self, left: int, right: int, source: Mapping[str, Any], *, largest: bool,
+    ) -> int:
+        """Math.max / Math.min of two Numbers.
+
+        Any NaN gives NaN, and among equal zeros max prefers +0 and min
+        -0 -- C's fmax/fmin promise neither.  Equal zeros are resolved by
+        addition (``-0 + -0`` is the only sum that is -0) for max, and by
+        its mirror ``-((-a) + (-b))`` for min.
+        """
+
+        order = Handler.Gt if largest else Handler.Lt
+        first = self._node(order, ((left, "left"), (right, "right")), source, "boolean")
+        second = self._node(order, ((right, "left"), (left, "right")), source, "boolean")
+        either_nan = self._node(
+            Handler.LOr,
+            ((self._call("isnan", left, source, "boolean"), "left"),
+             (self._call("isnan", right, source, "boolean"), "right")),
+            source, "boolean",
+        )
+        if largest:
+            zeros = self._node(
+                Handler.Add, ((left, "left"), (right, "right")), source, "number",
+            )
+        else:
+            mirrored = self._node(
+                Handler.Add,
+                ((self._node(Handler.Neg, ((left, "operand"),), source, "number"), "left"),
+                 (self._node(Handler.Neg, ((right, "operand"),), source, "number"), "right")),
+                source, "number",
+            )
+            zeros = self._node(
+                Handler.Neg, ((mirrored, "operand"),), source, "number",
+            )
+        equal = self._node(
+            Handler.Select,
+            ((self._node(Handler.Eq, ((left, "left"), (self._number(0.0, source), "right")),
+                         source, "boolean"), "condition"),
+             (zeros, "if_true"), (left, "if_false")),
+            source, "number",
+        )
+        unordered = self._node(
+            Handler.Select,
+            ((either_nan, "condition"), (self._number(float("nan"), source), "if_true"),
+             (equal, "if_false")),
+            source, "number",
+        )
+        inner = self._node(
+            Handler.Select,
+            ((second, "condition"), (right, "if_true"), (unordered, "if_false")),
+            source, "number",
+        )
+        return self._node(
+            Handler.Select,
+            ((first, "condition"), (left, "if_true"), (inner, "if_false")),
+            source, "number",
         )
 
     def _exponentiate(
@@ -482,30 +651,21 @@ class _JavaScriptProcessInterpreter:
             parents=((operand, "value"),),
         )
 
-    def expression(self, expr: Mapping[str, Any]) -> int:
-        kind = expr.get("type")
-        if kind in ("BinaryExpression", "LogicalExpression"):
-            operator = str(expr.get("operator"))
-            left = self.expression(expr["left"])
-            right = self.expression(expr["right"])
-            parents = ((left, "left"), (right, "right"))
-            handler = JAVASCRIPT_BINARY_TO_SSA.get(operator)
-            if handler is None:
-                reason = (
-                    "needs a JavaScript-specific reduction program"
-                    if operator in JAVASCRIPT_UNSUPPORTED_BINARY
-                    else "is not a recognized JavaScript binary operator"
-                )
-                return self.unsupported(
-                    operator,
-                    "unsupported-binary-operator",
-                    f"{operator!r} {reason}",
-                    source=expr,
-                    parents=parents,
-                )
+    def binary(
+        self, operator: str, left: int, right: int,
+        expr: Mapping[str, Any],
+    ) -> int:
+        """One JavaScript binary operator on two interpreted operands.
+
+        Shared by binary expressions and compound assignment (``x += y`` is
+        ``x = x + y`` on the binding's current version).
+        """
+
+        parents = ((left, "left"), (right, "right"))
+        if operator == "%":
             if not self.require(
-                _BINARY_REQUIREMENTS.get(operator, ()), spelling=operator,
-                operands=(left, right),
+                ("number-operands", "ecmascript-number-semantics"),
+                spelling=operator, operands=(left, right),
             ):
                 return self.unsupported(
                     operator,
@@ -514,20 +674,54 @@ class _JavaScriptProcessInterpreter:
                     source=expr,
                     parents=parents,
                 )
-            if handler is Handler.Pow:
-                return self._exponentiate(left, right, expr)
-            result_kind = (
-                "boolean"
-                if handler in {
-                    Handler.Eq, Handler.Ne, Handler.Lt, Handler.Le,
-                    Handler.Gt, Handler.Ge, Handler.LAnd, Handler.LOr,
-                }
-                else "number"
+            return self._remainder(left, right, expr)
+        handler = JAVASCRIPT_BINARY_TO_SSA.get(operator)
+        if handler is None:
+            reason = (
+                "needs a JavaScript-specific reduction program"
+                if operator in JAVASCRIPT_UNSUPPORTED_BINARY
+                else "is not a recognized JavaScript binary operator"
             )
-            return self.make_node(
-                handler.name, handler.name, handler.name, parents,
-                source=expr, value_kind=result_kind,
+            return self.unsupported(
+                operator,
+                "unsupported-binary-operator",
+                f"{operator!r} {reason}",
+                source=expr,
+                parents=parents,
             )
+        if not self.require(
+            _BINARY_REQUIREMENTS.get(operator, ()), spelling=operator,
+            operands=(left, right),
+        ):
+            return self.unsupported(
+                operator,
+                "untranslated-binary-operator",
+                f"{operator!r} has unproved JavaScript semantics",
+                source=expr,
+                parents=parents,
+            )
+        if handler is Handler.Pow:
+            return self._exponentiate(left, right, expr)
+        result_kind = (
+            "boolean"
+            if handler in {
+                Handler.Eq, Handler.Ne, Handler.Lt, Handler.Le,
+                Handler.Gt, Handler.Ge, Handler.LAnd, Handler.LOr,
+            }
+            else "number"
+        )
+        return self.make_node(
+            handler.name, handler.name, handler.name, parents,
+            source=expr, value_kind=result_kind,
+        )
+
+    def expression(self, expr: Mapping[str, Any]) -> int:
+        kind = expr.get("type")
+        if kind in ("BinaryExpression", "LogicalExpression"):
+            operator = str(expr.get("operator"))
+            left = self.expression(expr["left"])
+            right = self.expression(expr["right"])
+            return self.binary(operator, left, right, expr)
         if kind == "UnaryExpression":
             operator = str(expr.get("operator"))
             operand = self.expression(expr["argument"])
@@ -661,6 +855,13 @@ class _JavaScriptProcessInterpreter:
                 )
             if program.operator == "pow":
                 return self._exponentiate(arguments[0], arguments[1], expr)
+            if program.operator in {"maximum", "minimum"}:
+                return self._extremum(
+                    arguments[0], arguments[1], expr,
+                    largest=program.operator == "maximum",
+                )
+            if program.operator == "sign":
+                return self._sign(arguments[0], expr)
             attrs = {
                 "callee": program.operator,
                 "tensor_operation": program.operator,
@@ -725,6 +926,296 @@ class _JavaScriptProcessInterpreter:
             return list(node.get("body", ()))
         return [node]
 
+    def assign(
+        self,
+        name: str,
+        value_node: int,
+        source: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """A new version of an existing ``let`` or parameter binding.
+
+        A JavaScript assignment rebinds the name; the region stays acyclic
+        because the new value is a new node and later reads see the new
+        version.  ``const`` and free names are refused, as JavaScript would
+        throw (TypeError / ReferenceError in strict code).
+        """
+
+        binding = self.bindings.get(name)
+        if binding is None or binding["kind"] not in {"let", "parameter"}:
+            self.shortfalls.append(JavaScriptExpressionShortfall(
+                "unsupported-assignment-target",
+                f"{name!r} is "
+                + ("not a binding of this region" if binding is None
+                   else f"a {binding['kind']} binding")
+                + "; only let and parameter bindings are reassignable",
+            ))
+            return None
+        # Versions are numbered per name across the whole region, so the two
+        # arms of an if never post different values under one version.
+        version = self.last_version.get(name, int(binding["version"])) + 1
+        self.last_version[name] = version
+        record = {
+            **binding,
+            "version": version,
+            "value_node": int(value_node),
+            "start": source.get("start"),
+            "end": source.get("end"),
+        }
+        record["binding_cell"] = self._post_binding(record)
+        self.bindings[name] = record
+        self.binding_records.append(record)
+        return record
+
+    def assignment_statement(self, expr: Mapping[str, Any]) -> None:
+        """``x = e``, ``x op= e``, ``x++``/``x--`` as a whole statement."""
+
+        kind = expr.get("type")
+        target = (
+            expr.get("left") if kind == "AssignmentExpression"
+            else expr.get("argument")
+        ) or {}
+        if target.get("type") != "Identifier":
+            self.unsupported(
+                str(target.get("type")),
+                "unsupported-assignment-target",
+                "only plain names are assignable in the numeric region",
+                source=expr,
+            )
+            return
+        name = str(target["name"])
+        if kind == "UpdateExpression":
+            current = self.read_identifier(target)
+            one = self.make_node(
+                "Constant", Handler.Const.name, "1", (),
+                attributes={"value": 1.0}, constant=1.0, source=expr,
+                output_roles=("value",), value_kind="number",
+            )
+            operator = "+" if expr.get("operator") == "++" else "-"
+            value = self.binary(operator, current, one, expr)
+        else:
+            operator = str(expr.get("operator"))
+            right = self.expression(expr.get("right") or {})
+            if operator == "=":
+                value = right
+            elif operator.endswith("=") and (
+                operator[:-1] in JAVASCRIPT_BINARY_TO_SSA or operator == "%="
+            ):
+                if operator[:-1] in {"&&", "||"}:
+                    # x &&= y assigns only when x is truthy: a branch, not
+                    # a binary operator.
+                    value = self.unsupported(
+                        operator,
+                        "unsupported-assignment",
+                        f"{operator!r} is a conditional assignment",
+                        source=expr,
+                        parents=((right, "right"),),
+                    )
+                else:
+                    value = self.binary(
+                        operator[:-1], self.read_identifier(target), right, expr,
+                    )
+            else:
+                value = self.unsupported(
+                    operator,
+                    "unsupported-assignment",
+                    f"{operator!r} has no JavaScript translation here",
+                    source=expr,
+                    parents=((right, "right"),),
+                )
+        self.assign(name, value, expr)
+
+    def _branch(
+        self,
+        statements: Sequence[Mapping[str, Any]],
+        outer: Mapping[str, dict[str, Any]],
+    ) -> tuple[int | None, bool, dict[str, dict[str, Any]]]:
+        """Interpret one arm in its own block scope.
+
+        Returns the arm's value and whether every path returned, and the
+        arm's final versions of the bindings visible outside it.  Names the
+        arm declares are dropped: ``let``/``const`` are block scoped.
+        """
+
+        self.bindings = dict(outer)
+        value, returned = self.sequence(statements)
+        visible = {name: self.bindings[name] for name in outer}
+        return value, returned, visible
+
+    def _select(
+        self,
+        condition: int,
+        yes: int,
+        no: int,
+        source: Mapping[str, Any],
+        *,
+        control: str,
+    ) -> int:
+        if self._kind(yes) != self._kind(no):
+            return self.unsupported(
+                "if",
+                "unproved-conditional-result",
+                f"{control} arms have different JavaScript value kinds",
+                source=source,
+                parents=(
+                    (condition, "condition"), (yes, "if_true"),
+                    (no, "if_false"),
+                ),
+            )
+        return self.make_node(
+            Handler.Select.name, Handler.Select.name, Handler.Select.name,
+            ((condition, "condition"), (yes, "if_true"), (no, "if_false")),
+            attributes={"javascript_control": control},
+            source=source,
+            value_kind=self._kind(yes),
+        )
+
+    @staticmethod
+    def _assigned_names(node: Any) -> set[str]:
+        """Names a statement (re)assigns, not looking into nested functions."""
+
+        names: set[str] = set()
+
+        def visit(item: Any) -> None:
+            if isinstance(item, Mapping):
+                kind = item.get("type")
+                if kind in {
+                    "FunctionDeclaration", "FunctionExpression",
+                    "ArrowFunctionExpression",
+                }:
+                    return
+                target = (
+                    item.get("left") if kind == "AssignmentExpression"
+                    else item.get("argument") if kind == "UpdateExpression"
+                    else None
+                )
+                if isinstance(target, Mapping) and target.get("type") == "Identifier":
+                    names.add(str(target.get("name")))
+                for key, child in item.items():
+                    if key not in {"type", "start", "end"}:
+                        visit(child)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+
+        visit(node)
+        return names
+
+    @staticmethod
+    def _loop_exit(node: Any) -> str | None:
+        """The first return/break/continue/label inside a loop body."""
+
+        def visit(item: Any) -> str | None:
+            if isinstance(item, Mapping):
+                kind = item.get("type")
+                if kind in {
+                    "FunctionDeclaration", "FunctionExpression",
+                    "ArrowFunctionExpression",
+                }:
+                    return None
+                if kind in {
+                    "ReturnStatement", "BreakStatement", "ContinueStatement",
+                    "LabeledStatement",
+                }:
+                    return str(kind)
+                for key, child in item.items():
+                    if key not in {"type", "start", "end"}:
+                        found = visit(child)
+                        if found:
+                            return found
+            elif isinstance(item, list):
+                for child in item:
+                    found = visit(child)
+                    if found:
+                        return found
+            return None
+
+        return visit(node)
+
+    def loop(self, statement: Mapping[str, Any]) -> None:
+        """``for``/``while`` as a loop region with one Phi per carried name.
+
+        Every binding the loop assigns that is visible at its head becomes a
+        Phi (its value on entry, and its value at the end of the body).  The
+        condition and body are interpreted once against the Phis.  The back
+        edge is recorded in ``javascript_loops`` -- not as a graph edge, so
+        the graph itself stays acyclic -- with the id ranges the header and
+        body occupy (node ids are creation order).  After the loop each
+        outer name reads its Phi: the loop leaves through the header.
+        """
+
+        kind = statement.get("type")
+        exit_kind = self._loop_exit(statement.get("body"))
+        if exit_kind is not None or statement.get("test") is None:
+            self.unsupported(
+                str(kind),
+                "unsupported-loop-exit",
+                f"{exit_kind or 'a loop without a condition'} leaves the loop "
+                "other than through its condition",
+                source=statement,
+            )
+            return
+        outer = dict(self.bindings)
+        self.bindings = dict(outer)
+        initializer = statement.get("init")
+        if initializer is not None:
+            self.sequence([
+                initializer if initializer.get("type") == "VariableDeclaration"
+                else {"type": "ExpressionStatement", "expression": initializer},
+            ])
+        body = self._statement_body(statement.get("body"))
+        update = statement.get("update")
+        if update is not None:
+            body = [*body, {"type": "ExpressionStatement", "expression": update}]
+        carried = sorted(
+            self._assigned_names([statement.get("test"), body])
+            & set(self.bindings)
+        )
+        # Numbered on entry: an inner loop finishes (and is recorded) first.
+        loop_id = self.loop_count
+        self.loop_count += 1
+        header_start = self.next_id
+        phis: dict[str, int] = {}
+        phi_records: dict[str, dict[str, Any]] = {}
+        for name in carried:
+            initial = int(self.bindings[name]["value_node"])
+            phi = self.make_node(
+                Handler.Phi.name, Handler.Phi.name, name, ((initial, "init"),),
+                attributes={"javascript_loop": loop_id, "binding_name": name},
+                source=statement, value_kind=self._kind(initial),
+            )
+            if self.assign(name, phi, statement) is None:
+                self.bindings = outer
+                return
+            phis[name] = phi
+            phi_records[name] = self.bindings[name]
+        condition_value = self.expression(statement["test"])
+        condition = self.truthy(condition_value, statement["test"])
+        condition_end = self.next_id
+        _value, _returned, visible = self._branch(body, dict(self.bindings))
+        carried_next = {
+            name: int(visible[name]["value_node"]) for name in carried
+        }
+        for name in carried:
+            if self._kind(carried_next[name]) != self._kind(phis[name]):
+                self.unsupported(
+                    name,
+                    "unproved-loop-carried-kind",
+                    f"{name!r} changes JavaScript value kind across the loop",
+                    source=statement,
+                )
+        self.loops.append({
+            "id": loop_id,
+            "header_start": header_start,
+            "condition": condition,
+            "condition_end": condition_end,
+            "body_end": self.next_id,
+            "phis": dict(phis),
+            "next": carried_next,
+        })
+        self.bindings = {
+            name: phi_records.get(name, record) for name, record in outer.items()
+        }
+
     def sequence(
         self, statements: Sequence[Mapping[str, Any]],
     ) -> tuple[int | None, bool]:
@@ -733,11 +1224,11 @@ class _JavaScriptProcessInterpreter:
             statement = statements[index]
             kind = statement.get("type")
             if kind == "VariableDeclaration":
-                if statement.get("kind") != "const":
+                if statement.get("kind") not in {"const", "let"}:
                     self.unsupported(
                         str(statement.get("kind")),
                         "unsupported-binding-kind",
-                        "let/var require lexical lifetime and CFG handling",
+                        "var bindings are function scoped and hoisted",
                         source=statement,
                     )
                     index += 1
@@ -754,7 +1245,10 @@ class _JavaScriptProcessInterpreter:
                         )
                         continue
                     value = self.expression(initializer)
-                    self.bind(str(target["name"]), value, target, kind="const")
+                    self.bind(
+                        str(target["name"]), value, target,
+                        kind=str(statement.get("kind")),
+                    )
                 index += 1
                 continue
             if kind == "ReturnStatement":
@@ -767,54 +1261,77 @@ class _JavaScriptProcessInterpreter:
                         source=statement,
                     ), True
                 return self.expression(argument), True
+            if kind == "BlockStatement":
+                outer = dict(self.bindings)
+                value, returned, visible = self._branch(
+                    list(statement.get("body", ())), outer,
+                )
+                self.bindings = visible
+                if returned:
+                    return value, True
+                index += 1
+                continue
             if kind == "IfStatement":
-                if statement.get("alternate") is not None:
+                # Both arms are interpreted; their versions of each outer
+                # binding meet in a Select on the condition.  An arm that
+                # returns takes the rest of the function with the other arm
+                # only: the rest runs on that path alone.
+                outer = dict(self.bindings)
+                condition_value = self.expression(statement["test"])
+                condition = self.truthy(condition_value, statement["test"])
+                yes, yes_returns, yes_bindings = self._branch(
+                    self._statement_body(statement.get("consequent")), outer,
+                )
+                no, no_returns, no_bindings = self._branch(
+                    self._statement_body(statement.get("alternate")), outer,
+                )
+                rest = list(statements[index + 1:])
+                if yes_returns and not no_returns:
+                    self.bindings = no_bindings
+                    no, no_returns = self.sequence(rest)
+                elif no_returns and not yes_returns:
+                    self.bindings = yes_bindings
+                    yes, yes_returns = self.sequence(rest)
+                if yes_returns and no_returns:
+                    self.bindings = outer
+                    if yes is None or no is None:
+                        return None, False
+                    return self._select(
+                        condition, yes, no, statement,
+                        control="early-return-if",
+                    ), True
+                if yes_returns or no_returns:
+                    self.bindings = outer
                     return self.unsupported(
                         "if",
                         "unsupported-control-flow",
-                        "the acyclic region accepts early-return if without else",
+                        "both early-return paths must produce a value",
                         source=statement,
                     ), False
-                saved = dict(self.bindings)
-                condition_value = self.expression(statement["test"])
-                condition = self.truthy(condition_value, statement["test"])
-                self.bindings = dict(saved)
-                yes, yes_returns = self.sequence(
-                    self._statement_body(statement.get("consequent"))
-                )
-                self.bindings = dict(saved)
-                no, no_returns = self.sequence(statements[index + 1:])
-                self.bindings = saved
-                if yes_returns and no_returns and yes is not None and no is not None:
-                    if self._kind(yes) != self._kind(no):
-                        return self.unsupported(
-                            "if",
-                            "unproved-conditional-result",
-                            "early-return arms have different JavaScript value kinds",
-                            source=statement,
-                            parents=(
-                                (condition, "condition"), (yes, "if_true"),
-                                (no, "if_false"),
-                            ),
-                        ), False
-                    return self.make_node(
-                        Handler.Select.name,
-                        Handler.Select.name,
-                        Handler.Select.name,
-                        ((condition, "condition"), (yes, "if_true"),
-                         (no, "if_false")),
-                        attributes={"javascript_control": "early-return-if"},
-                        source=statement,
-                        value_kind=self._kind(yes),
-                    ), True
-                return self.unsupported(
-                    "if",
-                    "unsupported-control-flow",
-                    "both early-return paths must produce a value",
-                    source=statement,
-                ), False
+                self.bindings = dict(outer)
+                for name, record in outer.items():
+                    a = yes_bindings[name]
+                    b = no_bindings[name]
+                    if a["value_node"] == b["value_node"]:
+                        self.bindings[name] = a if a["version"] >= b["version"] else b
+                        continue
+                    merged = self._select(
+                        condition, int(a["value_node"]), int(b["value_node"]),
+                        statement, control="if-merge",
+                    )
+                    self.bindings[name] = record
+                    self.assign(name, merged, statement)
+                index += 1
+                continue
             if kind == "ExpressionStatement":
-                value = self.expression(statement["expression"])
+                expression = statement["expression"]
+                if expression.get("type") in {
+                    "AssignmentExpression", "UpdateExpression",
+                }:
+                    self.assignment_statement(expression)
+                    index += 1
+                    continue
+                value = self.expression(expression)
                 self.unsupported(
                     "expression-statement",
                     "unsupported-effect",
@@ -822,6 +1339,13 @@ class _JavaScriptProcessInterpreter:
                     source=statement,
                     parents=((value, "value"),),
                 )
+                index += 1
+                continue
+            if kind in {"ForStatement", "WhileStatement"}:
+                self.loop(statement)
+                index += 1
+                continue
+            if kind == "EmptyStatement":
                 index += 1
                 continue
             self.unsupported(
@@ -899,6 +1423,9 @@ class _JavaScriptProcessInterpreter:
         self.graph.roots = [root]
         self.graph.domain_shape = (1,)
         self.graph.G.graph["javascript_entry_identity"] = self.entry_identity
+        self.graph.G.graph["javascript_loops"] = tuple(
+            dict(record) for record in self.loops
+        )
         self.graph.G.graph["javascript_binding_identities"] = tuple(
             dict(record) for record in self.binding_records
         )

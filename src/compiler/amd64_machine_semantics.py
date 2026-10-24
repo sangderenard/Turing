@@ -395,6 +395,19 @@ def _subtract_with_borrow(state: MachineExecutionState, instruction) -> MachineE
     )
 
 
+def _add_with_carry(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    left = read_operand(state, instruction, 0, width=width)
+    right = read_operand(state, instruction, 1, width=width)
+    raw = left + right + int(bool(state.flags & (1 << CF)))
+    # Every flag is defined on the authored operands and the full sum, so
+    # CF is the carry out of left + right + CF.
+    flags = _arithmetic_flags(state.flags, left, right, raw, width, subtract=False)
+    return write_operand(
+        replace(state, flags=flags), instruction, 0, raw, width=width,
+    )
+
+
 def _move(state: MachineExecutionState, instruction) -> MachineExecutionState:
     width = _data_width(instruction, 0)
     value = read_operand(state, instruction, 1, width=width)
@@ -1471,6 +1484,7 @@ def default_effect_handlers() -> Mapping[int, object]:
         MachineSemanticToken.INTEGER_INCREMENT: _incdec(1),
         MachineSemanticToken.INTEGER_DECREMENT: _incdec(-1),
         MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW: _subtract_with_borrow,
+        MachineSemanticToken.INTEGER_ADD_WITH_CARRY: _add_with_carry,
         MachineSemanticToken.INTEGER_NEGATE: _negate,
         MachineSemanticToken.BITWISE_NOT: _not,
         MachineSemanticToken.SHIFT_LEFT: _shift("left"),

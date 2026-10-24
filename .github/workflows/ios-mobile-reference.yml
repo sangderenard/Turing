@@ -1,0 +1,70 @@
+name: iOS mobile reference
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/ios-mobile-reference.yml"
+      - "examples/mobile_reference_app/**"
+      - "extraction_contracts/program_extraction.yaml"
+      - "requirements.txt"
+      - "src/compiler/**"
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned-ipa:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install compiler and shader dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install ziglang==0.16.0 pytest
+          brew install glslang spirv-cross
+
+      - name: Run focused mobile tests
+        run: python -m pytest -q tests/test_mobile_reference_app.py tests/test_application_product.py tests/test_build_targets.py
+
+      - name: Build the iOS ARM64 compiler product
+        run: python examples/mobile_reference_app/build_mobile.py --ios
+
+      - name: Link the iPhoneOS application and package the IPA
+        run: python examples/mobile_reference_app/ios/package_ios.py
+
+      - name: Validate native and Metal products
+        run: |
+          file build/mobile-reference/ios/mobile_main.o
+          file build/mobile-reference/ios/Payload/TuringMobile.app/TuringMobile
+          otool -l build/mobile-reference/ios/Payload/TuringMobile.app/TuringMobile
+          plutil -lint build/mobile-reference/ios/Payload/TuringMobile.app/Info.plist
+          xcrun --sdk iphoneos metal -c build/mobile-reference/ios/fullscreen.vert.metal -o build/mobile-reference/ios/fullscreen.vert.air
+          xcrun --sdk iphoneos metal -c build/mobile-reference/ios/main_output.frag.metal -o build/mobile-reference/ios/main_output.frag.air
+
+      - name: Record Xcode and SDK versions
+        run: |
+          xcodebuild -version | tee build/mobile-reference/ios/xcode-version.txt
+          xcrun --sdk iphoneos --show-sdk-version | tee build/mobile-reference/ios/iphoneos-sdk-version.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turing-mobile-ios-unsigned
+          path: |
+            build/mobile-reference/TuringMobile-unsigned.ipa
+            build/mobile-reference/ios/compiler-product.json
+            build/mobile-reference/ios/program.abi.json
+            build/mobile-reference/ios/xcode-version.txt
+            build/mobile-reference/ios/iphoneos-sdk-version.txt
+          if-no-files-found: error
+          retention-days: 14

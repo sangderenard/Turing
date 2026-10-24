@@ -70,7 +70,8 @@ the input whose extents an output takes, `extents.order` entries are
 - **WebGL fragment**. Sampled textures (by uniform name) and draw buffers
   (by location), `turing_resolution` when sampling is normalized.
 - **Extracted host shader**. Exact source plus filename, line, source
-  symbol, compiler call and digest. No component ABI is derived yet.
+  symbol, compiler call and digest, and a component ABI read from the
+  source's own global declarations (section "Extracted shader interface").
 - **Deployable SPIR-V** (`ssa_spirv_backend.emit_deployable_compute_shader`).
   `main` is a GLCompute entry with `LocalSize`; it reads one element of each
   feed at `GlobalInvocationId.x`, calls the library translation of the SSA
@@ -89,7 +90,12 @@ the input whose extents an output takes, `extents.order` entries are
   Closed by the follow-up below; the record no longer carries it.
 - `graphics-stage` (WebGL): a raster pipeline with the companion vertex
   stage, not a compute dispatch.
-- `no-component-abi` (extracted shaders).
+- `no-component-abi` (extracted shaders): only when the declared
+  interface cannot be read with certainty, with the reader's reason.
+- `link-assigned` (extracted shaders): a resource whose binding or
+  location the source leaves to the host program or the linker.
+- `host-launch` (extracted compute shaders): the host's dispatch call picks
+  the group count.
 - Deployable SPIR-V refuses by name: a runtime-sized span (rank stated, no
   static shape), a dtype with no storage element (bool), or no result.
   Array-shaped values and several results are carried (see "Instances").
@@ -118,9 +124,11 @@ words past the element count are untouched with an extra group dispatched.
 - The installed control shell (`compose_control_shader`) compiles for
   Vulkan now (section "Vulkan-ready control shell"), but it is not a
   published product yet.
-- A component ABI for extracted host shaders.
-- The precision-core compute lane (`ssa_glsl_compute_backend`) has no
-  component ABI, so it has no product yet.
+- The precision-core compute lane cannot compile today's lowered precision
+  cores: the wrapper's bound is now a `Cast` of the count and its body calls
+  three planned regions, while the emitter reads one (section "Precision
+  compute product"). Its product is proven on hand-built kernels of the shape
+  it reads.
 - Deployable SPIR-V for a matmul, an axis reduction, or any function that
   mixes a reduction with other work over runtime-sized spans. Elementwise
   functions deploy in element mode, and a lone whole-span reduction deploys
@@ -242,3 +250,109 @@ That second test runs on lavapipe and covers:
 - a NaN for `max`/`min`;
 - an empty span, where `max`/`min`/`mean` leave the sentinel untouched;
 - two groups launched, with no effect beyond the first invocation.
+
+## Extracted shader interface (follow-up, 2026-10-24)
+
+Wrong record: every extracted host shader was published with no component
+ABI and the `no-component-abi` shortfall, so a consumer had to parse the
+source to find what to bind.
+
+Rule: `glsl_interface.read_glsl_interface` reads the global declarations,
+and only those: stage inputs and outputs (`attribute`/`varying` by stage),
+default-block uniforms, opaque uniforms, uniform/buffer/IO blocks and their
+members, `layout` qualifiers, and a compute `local_size`. Function bodies,
+comments, `const`/`shared` globals and builtin redeclarations are not
+interface. `extracted_shader_component` turns each declaration into one
+`turing.shader-component.v1` port (feeds, then outputs, then uniforms, each
+in declaration order) and one physical resource:
+
+| Declaration | role | transport / kind | access |
+| --- | --- | --- | --- |
+| vertex `in` | feed | vertex-attribute | read |
+| other `in` | feed | stage-input | read |
+| fragment `out` | output | draw-buffer | write |
+| other `out` | output | stage-output | write |
+| `buffer` block | feed if `readonly`, else output | storage-buffer | read / write / read_write |
+| `uniform` block | uniform | uniform-buffer | read |
+| sampler/texture | feed | texture / sampled-texture | read |
+| image | feed if `readonly`, else output | storage-image | as declared |
+| plain `uniform` | uniform | default-uniform (by name) | read |
+
+Dtypes: `f32`/`i32`/`u32`/`bool`, vectors `f32x4`, matrices `f32x4x4`
+(columns first), opaque types by GLSL name, and `block` for a block of
+several members, whose members are listed on the resource. A runtime-sized
+array is `shape: null`, `extents_from: "fed"`. `backend_binding` is the
+declared binding, else the declared location, else `-1`. A sampler, image or
+block without a `binding`, a vertex attribute without a `location`, or one
+of several fragment outputs without one, is named in a `link-assigned`
+shortfall. Graphics stages keep `graphics-stage`. A compute shader states
+its local size and carries `host-launch`.
+
+Refused by name (the product keeps `no-component-abi` with the reason):
+conditional compilation (`#if`, `#ifdef`, ...), a macro in a global
+declaration, a struct-typed interface variable or block member, and a
+non-literal array size or layout value.
+
+Evidence:
+
+- `tests/test_extracted_shader_interface.py`, with `glslangValidator`'s
+  reflection database (`-l -q --reflect-separate-buffers`) as the oracle:
+  for all 24 shaders the extractor finds in `src` (12 vertex, 12 fragment),
+  every uniform, block, buffer variable, pipeline input and output glslang
+  reports appears in the record with the same type, binding and runtime-array
+  status. The same check passes on a compute shader with every resource kind;
+- on llvmpipe, an extracted compute shader runs from its record alone
+  (storage buffers bound at the record's bindings, uniforms set by the
+  record's names, groups from its local size) and matches numpy over 1000
+  elements, with the words past the count left untouched.
+
+## Precision compute product (follow-up, 2026-10-24)
+
+Wrong records found on the way:
+
+- **Baked trip count read every coefficient one slot off.** With the count
+  baked, `emit_ssa_module_to_glsl_compute` dropped `element_count` from the
+  scalars block but kept `uint _pad0`, so `scalars[]` sat at byte 8 while
+  `prepare_execution` packs the doubles from byte 0. On llvmpipe,
+  `y = fma(x, 3, 0.25)` computed `x * 0.25`. The block now has no header when
+  the count is baked (glslang reflection: `ScalarFeed.scalars` at offset 0).
+- **GLSL `fma()` is not single-rounding on Mesa.** A `precise double`
+  `fma()` on llvmpipe and on lavapipe rounds twice: 45 of 777 elements equal
+  `x*c + d` and differ from the once-rounded value. GLSL allows this (it
+  fixes only that every fma() consumed by a precise variable rounds the same
+  way). The record publishes an `fma-rounding` shortfall whenever the source
+  calls `fma()`.
+
+Rule: `GLSLComputeArtifact.component_abi`, `.deployment()`
+(`shader_deployment.precision_compute_deployment`) and `.write()` publish
+the layout the emitter already documented:
+
+- ports: read buffers, then each coefficient (a feed carried in the scalars
+  block), then written buffers; all `f64`, `value_id` the wrapper's SSA id;
+- resources: `Buffer<slot>` at set 0, binding `slot` (`read`, or
+  `read_write` when stored into), runtime-sized (`extents_from: "fed"`); and
+  `ScalarFeed` at binding `n` with one view per coefficient at byte
+  `8 + 8k` (or `8k` baked), its members listed with their offsets;
+- launch: local size 64; the `element_count` control (u32 at byte 0 of
+  `ScalarFeed`, derived from the count's value id) and a `cover` group rule
+  on x only, or, baked, `exact` groups and no control;
+- targets OpenGL 4.3 and Vulkan 1.1 (`Float64`), with the source's
+  `#extension` lines on each resource.
+
+Evidence (`tests/test_precision_compute_product.py`, kernels built by hand
+in the wrapper-plus-region shape, run and baked count each):
+
+- every block's binding and `ScalarFeed`'s member offsets match glslang
+  reflection, and the source compiles for OpenGL and `-V --target-env
+  vulkan1.1`;
+- driven only from the record (buffer bytes from views and control offsets,
+  groups from the rule), the shader matches the fma reference on llvmpipe
+  and on lavapipe over 777 elements, with words past the count untouched;
+  `prepare_execution` now feeds a baked kernel the coefficients it reads.
+
+Also: `tools/benchmark_microprecision_matrix._prepare_core` lowers with an
+extraction contract that declares no records (a pack core passes only
+limb arrays, a count and coefficients), which `lower_ast_source_to_ssa`
+requires. The lane's own tests still fail after that, on the wrapper shape
+above.
+
