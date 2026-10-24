@@ -5069,12 +5069,18 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
                 continue
             if any(graph.successors(node_id)):
                 continue
+            try:
+                signature = host_callback_signature(callables[field])
+            except ValueError:
+                # No declared callback shape: the store stays, and a method
+                # that calls the field refuses there with the type named.
+                continue
             _set_operands(view, node_id, [], cause="host_callback_binding")
             graph.remove_node(node_id)
             bindings.append({
                 "schema": HOST_CALLBACK_SCHEMA, "owner": owner,
                 "field": str(field), **bound,
-                "signature": host_callback_signature(callables[field]),
+                "signature": signature,
             })
             lowered += 1
         if bindings:

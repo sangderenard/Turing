@@ -288,7 +288,10 @@ Albert chose the real native call for `self.trace(...)`.  A `Callable`
 field is now a function pointer and an opaque context the host passes to
 each method (`turing-host-callback-v1`, doc 41).  A test class with one
 required and one optional callback matches Python in results and in the
-order of the host's calls.  The interpreter itself now stops earlier, at
-planning: `trace` is `Callable[[str, Any, dict[int, Any]], None] | None`, and
-a `str` or `dict` argument has no declared callback representation yet.
-That refusal names the type; it replaces the old refusal of the call.
+order of the host's calls.  The interpreter itself now refuses while
+planning `_execute`'s `self.trace(...)`: `trace` is
+`Callable[[str, Any, dict[int, Any]], None] | None`, and a `str` or `dict`
+argument has no declared callback representation yet.  That refusal names
+the type; it replaces the old refusal of the call.  The constructor's store
+of a field with no callback shape stays a store, so methods that never call
+`trace` (`_value`, `_operand`) compile as before.
