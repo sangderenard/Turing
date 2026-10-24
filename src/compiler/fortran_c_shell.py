@@ -9161,12 +9161,90 @@ def emit_fortran_packed_library_source(entry: Any) -> tuple[str, str]:
     symbol = f"{entry.symbol}__packed"
     prototype_arguments = []
     call_arguments = []
+    ranked = {
+        index: parameter
+        for index, parameter in enumerate(entry.parameters)
+        if parameter.passing == "reference"
+        and len(tuple(parameter.extents or parameter.shape or ())) >= 2
+    }
+    extent_parameters = {
+        str(parameter.name): (index, parameter)
+        for index, parameter in enumerate(entry.parameters)
+        if parameter.role == "extent"
+    }
+    extent_names = {
+        name
+        for parameter in ranked.values()
+        for name in tuple(parameter.extents or ())
+    }
+    extent_lines = []
+    extent_expressions = {}
+    for name in sorted(extent_names):
+        index, parameter = extent_parameters[name]
+        variable = f"turing_extent_{index}"
+        extent_lines.extend((
+            f"    if (arguments[{index}] == NULL || "
+            f"*(({parameter.c_type} *)arguments[{index}]) < 1) return 0;",
+            f"    const size_t {variable} = "
+            f"(size_t)*(({parameter.c_type} *)arguments[{index}]);",
+        ))
+        extent_expressions[name] = variable
+    # c411's x[0, 1] read 3.0 instead of 7.0: the packed entry passed a
+    # row-major host pointer directly to a column-major Fortran dummy. The
+    # executable shell already uses _fortran_storage_index at this boundary;
+    # the packed entry must use the same exact permutation in both directions.
+    input_lines = []
+    output_lines = []
+    cleanup_lines = []
+    for index, parameter in ranked.items():
+        c_type = str(parameter.c_type)
+        converted = f"turing_fortran_{index}"
+        count = f"turing_count_{index}"
+        sizes = tuple(parameter.extents or parameter.shape or ())
+        storage_index = _fortran_storage_index(
+            parameter, extent_expressions, "logical_index"
+        )
+        input_lines.append(f"    size_t {count} = 1;")
+        for size in sizes:
+            extent = extent_expressions.get(str(size), str(size))
+            input_lines.extend((
+                f"    if ((size_t)({extent}) > SIZE_MAX / {count}) "
+                "{ turing_status = 0; goto turing_cleanup; }",
+                f"    {count} *= (size_t)({extent});",
+            ))
+        input_lines.extend((
+            f"    if ({count} > SIZE_MAX / sizeof({c_type})) "
+            "{ turing_status = 0; goto turing_cleanup; }",
+            f"    if (arguments[{index}] == NULL) "
+            "{ turing_status = 0; goto turing_cleanup; }",
+            f"    {converted} = ({c_type} *)calloc({count}, sizeof({c_type}));",
+            f"    if ({converted} == NULL) "
+            "{ turing_status = 0; goto turing_cleanup; }",
+        ))
+        if parameter.role != "output":
+            input_lines.extend((
+                f"    for (size_t logical_index = 0; logical_index < {count}; "
+                "++logical_index) {",
+                f"        {converted}[{storage_index}] = "
+                f"(({c_type} *)arguments[{index}])[logical_index];",
+                "    }",
+            ))
+        if parameter.role != "input":
+            output_lines.extend((
+                f"    for (size_t logical_index = 0; logical_index < {count}; "
+                "++logical_index) {",
+                f"        (({c_type} *)arguments[{index}])[logical_index] = "
+                f"{converted}[{storage_index}];",
+                "    }",
+            ))
+        cleanup_lines.append(f"    free({converted});")
     for index, parameter in enumerate(entry.parameters):
         c_type = str(parameter.c_type)
         pointer = parameter.passing == "reference"
         prototype_arguments.append(c_type + (" *" if pointer else ""))
         call_arguments.append(
-            f"({c_type} *)arguments[{index}]" if pointer
+            f"({c_type} *)turing_fortran_{index}" if index in ranked
+            else f"({c_type} *)arguments[{index}]" if pointer
             else f"*(({c_type} *)arguments[{index}])"
         )
     prototype = ", ".join(prototype_arguments) or "void"
@@ -9175,6 +9253,7 @@ def emit_fortran_packed_library_source(entry: Any) -> tuple[str, str]:
         "#include <stddef.h>",
         "#include <stdint.h>",
         "#include <stdbool.h>",
+        "#include <stdlib.h>",
         "#if defined(_WIN32)",
         "#  define TURING_EXPORT __declspec(dllexport)",
         "#else",
@@ -9185,8 +9264,17 @@ def emit_fortran_packed_library_source(entry: Any) -> tuple[str, str]:
         f"TURING_EXPORT int {symbol}(void **arguments, size_t argument_count) {{",
         f"    if (argument_count != {len(entry.parameters)}) return 0;",
         "    if (argument_count != 0 && arguments == NULL) return 0;",
+        *(('    int turing_status = 1;',) if ranked else ()),
+        *(
+            f"    {parameter.c_type} *turing_fortran_{index} = NULL;"
+            for index, parameter in ranked.items()
+        ),
+        *extent_lines,
+        *input_lines,
         f"    {entry.symbol}({call});",
-        "    return 1;",
+        *output_lines,
+        *(("turing_cleanup:", *cleanup_lines, "    return turing_status;")
+          if ranked else ("    return 1;",)),
         "}",
         "",
     ))
