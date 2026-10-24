@@ -43,3 +43,19 @@ def test_mixed_row_list_is_refused_not_truncated(name: str) -> None:
             PROGRAMS[name], "root", name=f"mixed_{name}",
             extraction_contract=str(CONTRACT), progress=lambda _: None,
         )
+
+
+def test_float_stored_into_int_list_row_is_refused() -> None:
+    """``ys = [n, 2]; ys[0] = 0.5`` (Lane D): the float store into the
+    int64 arena was narrowed (2 for 2.5); now refused by name."""
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    with pytest.raises(Exception, match="float-into-integer-element"):
+        lower_ast_source_to_ssa(
+            "def root(n: int) -> float:\n"
+            "    ys = [n, 2]\n"
+            "    ys[0] = 0.5\n"
+            "    return ys[0] + ys[1]\n",
+            "root", name="mixed_store_float_into_int_row",
+            extraction_contract=str(CONTRACT), progress=lambda _: None,
+        )

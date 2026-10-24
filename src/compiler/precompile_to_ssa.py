@@ -24716,6 +24716,23 @@ def _schedule_loop_callsites(
                     elif isinstance(candidate, SequenceQueryBlock):
                         if candidate.producer_loop_node_id is None:
                             reads.add(int(candidate.sequence_value_id))
+                    elif isinstance(candidate, LoopBlock):
+                        # Program: ``xs0 = [6, n]; xs0[1] = 1; xs0[0] += n;
+                        # xs2 = [n % 3, 3]``, then ``set(xs2)`` twice and
+                        # ``(xs0[0] + xs0[1]) + (len(s2) * 10 + len(t2))``
+                        # (fuzz p145_9).  Wrong record: the loop filling a
+                        # set from ``xs2`` runs to ``__iterable_extent_14__``
+                        # and reads its rows, but listed no read of arena 14,
+                        # so nothing ordered it after the appends building
+                        # ``xs2``.  The region holding ``xs0[0] + n`` and both
+                        # lengths pulled the loops ahead of them: two empty
+                        # sets (7 for 29; clean audit).  Rule: a loop over a
+                        # sequence's extent reads that sequence.
+                        extent = re.fullmatch(
+                            r"__iterable_extent_(\d+)__", str(candidate.stop).strip()
+                        )
+                        if extent is not None:
+                            reads.add(int(extent.group(1)))
                     elif isinstance(candidate, LoopControlBlock):
                         # A return hands its arenas to the caller as they
                         # stand at this edge.
@@ -29692,6 +29709,40 @@ def lower_control_sections_to_ssa(
     _settle_child_pool_operation_dtypes(
         module.functions, module.sequence_tables,
     )
+    # Program: ``ys = [n, 2]; ys[0] = 0.5; return ys[0] + ys[1]`` (Lane
+    # D's report).  Wrong record: the region stored a float64 into the
+    # list's int64 arena and the C store truncated it (2 for 2.5; clean
+    # audit).  A Python list row keeps the float.  Rule: a store of a
+    # floating value into an integer element is refused by name, never
+    # narrowed.
+    shortfalls = list(shortfalls)
+    for _function in module.functions.values():
+        _element_dtypes: dict[int, str] = {}
+        for _block in _function.blocks.values():
+            for _instruction in _block.instrs:
+                if (
+                    _instruction.op == "GetElementPtr"
+                    and _instruction.res is not None and _instruction.args
+                ):
+                    _element_dtypes[int(_instruction.res.id)] = str(
+                        _instruction.args[0].dtype or ""
+                    )
+                elif _instruction.op == "Store" and len(_instruction.args) == 2:
+                    _value, _address = _instruction.args
+                    _element = _element_dtypes.get(int(_address.id), "")
+                    if (
+                        str(_value.dtype or "").startswith("float")
+                        and (_element.startswith("int") or _element.startswith("uint")
+                             or _element == "bool")
+                    ):
+                        shortfalls.append(SSALoweringShortfall(
+                            "ssa-sequence", "float-into-integer-element",
+                            str(_function.name),
+                            f"a {_value.dtype} value {int(_value.id)} is "
+                            f"stored into a {_element} element; a Python "
+                            "row keeps the float, and narrowing it would "
+                            "change the value",
+                        ))
     report(
         f"complete; functions={len(module.functions)} "
         f"shortfalls={len(shortfalls) + len(control_shortfalls) + len(tensor_reference_shortfalls)}"

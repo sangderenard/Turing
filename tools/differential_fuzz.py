@@ -558,6 +558,7 @@ EXTENDED5 = [
     (["s{v} = {{{a}, n % 3, {b} % 3}}", "s{v}.add(n % 5)", "s{v}.discard({c} % 3)"], "len(s{v}) * 10 + int((n % 3) in s{v})"),
     (["s{v} = {{x{v} % {a} for x{v} in range(n % 6 + 1)}}"], "len(s{v}) * 10 + int(0 in s{v})"),
     (["xs{v} = [n % 3, {a}, n % 3]", "s{v} = set(xs{v})", "t{v} = frozenset(x{v} + 1 for x{v} in xs{v})"], "len(s{v}) * 10 + len(t{v})"),
+    (["ys{v} = [{a}, n]", "ys{v}[1] = {b}", "ys{v}[0] += n", "xs{v} = [n % 3, {c}]", "s{v} = set(xs{v})", "t{v} = set(xs{v})"], "(ys{v}[0] + ys{v}[1]) + (len(s{v}) * 10 + len(t{v}))"),
     (["p{v} = Pt(n, {a})", "p{v}.x = p{v}.x + {b}"], "p{v}.x * 10 + p{v}.y"),
     (["p{v} = Pt({a}, {b})", "if n > {c}:", "    p{v}.y = n", "else:", "    p{v}.x = -n"], "p{v}.x * 100 + p{v}.y"),
     (["q{v} = Acc({a})", "q{v}.add(n)", "q{v}.add({b})"], "q{v}.total + Acc.scale(n, {c})"),
