@@ -658,19 +658,22 @@ def run_one(text):
     return "PASS", ""
 
 
+def _isolated_entry(child, text):
+    try:
+        child.send(run_one(text))
+    except Exception as error:  # noqa: BLE001
+        child.send(("CRASH", signature(f"{type(error).__name__}: {error}")))
+
+
 def isolated(text, limit=300):
     """run_one in a forked child: a native segfault or hang is a result."""
     import multiprocessing as mp
-    context = mp.get_context("fork")
+    # Windows has no ``fork`` context (as in native_corpus_typed_check's
+    # Windows parity receipt): spawn a module-level child there.  Unix keeps
+    # fork.  The child receives only the program text.
+    context = mp.get_context("spawn" if os.name == "nt" else "fork")
     parent, child = context.Pipe(duplex=False)
-
-    def target():
-        try:
-            child.send(run_one(text))
-        except Exception as error:  # noqa: BLE001
-            child.send(("CRASH", signature(f"{type(error).__name__}: {error}")))
-
-    process = context.Process(target=target)
+    process = context.Process(target=_isolated_entry, args=(child, text))
     process.start()
     process.join(limit)
     if process.is_alive():
