@@ -185,19 +185,67 @@ def test_array_rank_mismatch_reports_shortfall():
     assert "broadcast" in module.shortfalls[0].reason
 
 
-def test_reduction_over_array_reports_shortfall():
-    a = SSAValue(0, "float32", (4,))
+def _reductions(dtype):
+    """Every whole-array reduction of one static (2, 3) operand."""
+
+    a = SSAValue(0, dtype, (2, 3))
+    start = SSAValue(1, dtype, ())
+    float_dtype = dtype if dtype.startswith("float") else "float32"
+    results = {
+        "sum": SSAValue(2, dtype, ()), "prod": SSAValue(3, dtype, ()),
+        "max": SSAValue(4, dtype, ()), "min": SSAValue(5, dtype, ()),
+        "mean": SSAValue(6, float_dtype, ()), "all": SSAValue(7, "bool", ()),
+        "any": SSAValue(8, float_dtype, ()), "sum_start": SSAValue(9, dtype, ()),
+    }
+    instrs = [
+        Instr(op, [a], value) for op, value in results.items() if op != "sum_start"
+    ]
+    instrs.append(Instr("sum", [a, start], results["sum_start"]))
+    instrs.append(Instr("Ret", [], None))
+    function = Function(
+        f"reduce_{dtype}", [a, start], {"entry": BasicBlock("entry", instrs)}
+    )
+    return function, list(results.values())
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64", "int32"])
+def test_whole_array_reductions_assemble_and_validate(dtype):
+    function, outputs = _reductions(dtype)
+    module = emit_function(function, outputs=outputs)
+    assert module.complete, module.shortfalls
+    if shutil.which("spirv-as") is None or shutil.which("spirv-val") is None:
+        pytest.skip("no spirv-as/spirv-val")
+    workdir = Path(tempfile.mkdtemp(prefix="turing_spirv_test_")).resolve()
+    binary = workdir / f"{module.name}.spv"
+    assembled = subprocess.run(
+        ["spirv-as", str(module.write(workdir)), "-o", str(binary)],
+        capture_output=True, text=True,
+    )
+    assert assembled.returncode == 0, assembled.stderr
+    validated = subprocess.run(
+        ["spirv-val", str(binary)], capture_output=True, text=True
+    )
+    assert validated.returncode == 0, validated.stderr
+
+
+def test_axis_reduction_and_empty_max_report_shortfalls():
+    a = SSAValue(0, "float32", (4, 2))
     total = SSAValue(1, "float32", ())
     block = BasicBlock(
         "entry",
-        [Instr("sum", [a], total), Instr("Ret", [], None)],
+        [Instr("sum", [a], total, attributes={"axis": 0}), Instr("Ret", [], None)],
     )
-    function = Function("reduce_sum", [a], {"entry": block})
-
-    module = emit_function(function, outputs=[total])
-
+    module = emit_function(Function("reduce_axis", [a], {"entry": block}), outputs=[total])
     assert not module.complete
-    assert "reductions" in module.shortfalls[0].reason
+    assert "no axis" in module.shortfalls[0].reason
+
+    empty = SSAValue(0, "float32", (0,))
+    block = BasicBlock(
+        "entry", [Instr("max", [empty], total), Instr("Ret", [], None)],
+    )
+    module = emit_function(Function("reduce_empty", [empty], {"entry": block}), outputs=[total])
+    assert not module.complete
+    assert "empty" in module.shortfalls[0].reason
 
 
 def test_region_call_reports_shortfall():
