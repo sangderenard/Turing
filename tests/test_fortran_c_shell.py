@@ -315,6 +315,50 @@ def test_scalar_control_item_records_identity_instead_of_a_new_formal():
     assert not any(block.instrs for block in builder.blocks.values())
 
 
+def test_item_while_test_reevaluated_by_the_latch_is_the_items_next_generation(
+    tmp_path,
+):
+    # Lanes plan A4 (the tire's ``run_superstep``): the latch re-evaluates
+    # ``(lim - total).item() > 0.5`` with ``total`` at its carried value.
+    # The one ``scalar_item_merge`` row per function refused that second
+    # operand as a disagreement; it is the item's next generation.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    source = (
+        "from src.common.tensors.abstraction import AbstractTensor\n"
+        "def root(n: float) -> float:\n"
+        "    lim = AbstractTensor.tensor(n)\n"
+        "    total = AbstractTensor.tensor(0.0)\n"
+        "    while (lim - total).item() > 0.5:\n"
+        "        total = total + 1.0\n"
+        "    return float(total.item())\n"
+    )
+    contract = str(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="item_latch_generation",
+        extraction_contract=contract, progress=lambda _: None,
+    )
+    root = module.functions[exports[0]]
+    params = dict(root.metadata["parameter_names"])
+    (ret,) = [
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    ]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native")
+    for n, want in ((0.0, 0.0), (3.2, 3.0), (7.0, 7.0)):
+        execution = artifact.prepare_execution(
+            {params["n"]: np.array([n])},
+        ).run()
+        got = execution.buffers[ret.args[0].id].reshape(-1).tolist()
+        assert got == [want]
+
+
 def test_validation_only_plan_call_is_removed_by_exact_callsite_identity():
     from src.compiler.hierarchical_plan import PlanCall, PlanClosure
 

@@ -120,8 +120,15 @@ EXTENDED = [
     # (corpus c364-c367, doc 34 U1).
     (["o{v} = maybe_pick(n, {a})", "q{v} = None if o{v} is None else o{v} * 3 - {b}"], "(-9 if q{v} is None else q{v})"),
     (["o{v} = bump_pick(n, {a})"], "(-4 if o{v} is None else o{v})"),
+    # a while test through ``.item()`` of a carried tensor, re-evaluated
+    # by the latch (corpus c369/c390/c391, lanes plan A4)
+    (["c{v} = item_steps(n + {a})"], "c{v} * 3"),
+    (["t{v} = AbstractTensor.tensor(0.0)", "k{v} = 0", "while (t{v} * 2.0).item() < n + {a}:", "    t{v} = t{v} + 1.0", "    k{v} += 1"], "k{v} + int(t{v}.item())"),
 ]
-EXT_HELPERS = """def pair(x: int, y: int) -> tuple[int, int]:
+EXT_HELPERS = """from src.common.tensors.abstraction import AbstractTensor
+
+
+def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
 
 
@@ -150,6 +157,16 @@ def wrap_pick(x: int, y: int):
 def bump_pick(x: int, y: int):
     s = maybe_pick(x, y)
     return None if s is None else s + 1
+
+
+def item_steps(x: int) -> int:
+    lim = AbstractTensor.tensor(x * 1.0)
+    total = AbstractTensor.tensor(0.0)
+    count = 0
+    while (lim - total).item() > 0.5:
+        total = total + 1.5
+        count += 1
+    return count
 
 
 def first_over(x: int, y: int) -> int:

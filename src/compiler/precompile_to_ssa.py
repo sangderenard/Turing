@@ -10066,6 +10066,23 @@ class _ControlSSABuilder(TiledObject):
             self._binding_cell(int(source.id)), source_cell,
             self._canonical_cell(item_id),
         )
+        if latest is not None and self.__dict__.get("_latch_test_generation"):
+            # Program: ``while (lim - total).item() > eps: total = total +
+            # dt`` (the tire's ``run_superstep``, lanes plan A4).  Wrong
+            # record: the latch re-evaluates the test with ``total`` at its
+            # carried value, so the item's operand is a new SSA value, and
+            # the entry test's row (one per function) refused it as a
+            # disagreement.  Rule: as for every value the latch's test
+            # defines again, this is the item's next generation -- a
+            # revision of its row derived from the entry row and the
+            # latch's operand.  Outside the latch a second source is still
+            # a disagreement.
+            return book.post(
+                SCALAR_ITEM_MERGE, row, source_cell,
+                stage=self.active_stage,
+                provenance=Derived(self._cells(latest, *sources)),
+                mode=Mode.REVISE,
+            )
         return book.post(
             SCALAR_ITEM_MERGE, row, source_cell,
             stage=self.active_stage,
