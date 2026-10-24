@@ -144,3 +144,57 @@ That is Lane C's frontier, so no corpus program can hold this yet.
 
 Corpus 323/323 PASS, fuzz seed 49 30/30 PASS, cloud gate aa 89 / ab 7 /
 ac 26 / rec 20 (exactly the baselines).
+
+## Follow-up: a call through a stored callable field (loud, not lowered)
+
+`self.trace(...)` in `_execute` refuses loudly inside the loop (family D,
+"opaque-state-effect").  Out of a loop it did not.  A reduced class:
+
+```python
+class Walker:
+    def __init__(self, trace: Callable[[int], None]) -> None:
+        self.trace = trace
+    def poke(self, n: int) -> int:
+        self.trace(n)
+        return n + 1
+```
+
+shipped `Walker.so` with `poke` returning `n + 1` and never calling `trace`.
+That was a silent wrong answer: `trace` also spells a tensor operator, so the
+unconsumed call was pruned by `_remove_dead_metadata_nodes` as a dead pure
+tensor call.  Spelled `self.notify(n)`, the call reached the class surface and
+was dropped there without a word.
+
+Fix: `_stored_callable_field_call` reads the method graph's own records
+(`method_binding`, `method_owner`, `class_table` fields minus methods, and
+the receiver Input bound to the first positional parameter).  Such a call is
+an effect, never dead metadata, and the class surface refuses it by
+`Owner.method: expression (node N)` until it has a lowered invocation.  Both
+spellings are pinned in `tests/test_whole_class_compile_trial.py`.
+
+Not done (Albert's call): the real lowering, a native-to-host callback through
+an opaque handle.  The refusal names every site that needs it.
+
+## Follow-up: two per-method units reach their real refusals
+
+- `run` refused at source normalisation: "class_field_declaration
+  disagreement for ... 'history'".  A method's unit partitions the class to
+  that method alone, so run's unannotated `self.history = {...}` declared
+  the field with no annotation, and the unit's declared complete source then
+  posted `__init__`'s `dict[int, list[Any]]`.  A view whose declaring
+  statements are a strict subset of the other's now reads (or is revised
+  to) the fuller declaration.  Two different annotations still disagree
+  (`tests/test_partition_field_declaration_view.py`).  `run` now stops at
+  "sequence row dtype concordance disagreement ... value 19: ('int64',
+  'int64') vs table store ('int64', 'opaque_ref')", the
+  `{int(v): [] for v in ...}` dict (inferred).
+- `_external_call` crashed at worker hand-off: "cannot pickle
+  '_struct.Struct' object".  Resolved-graph checkpoints now restore a Struct
+  by its format.  The unit now refuses by name: a loop over a closure
+  aggregate, the same as `_call`.
+
+Also found, handed to the silent lane: `len(set(v for v in xs))` and
+`len(frozenset(xs))` compile and return 0 (repros c470-c472).
+
+Corpus 325/325 PASS, fuzz seed 54 30/30 PASS, cloud gate aa 89 / ab 7 /
+ac 26 / rec 20 (exactly the baselines).

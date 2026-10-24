@@ -44,6 +44,7 @@ from ...compiler.concordance_declarations import (
     CLASS_FIELD_DECLARATION as _CLASS_FIELD_DECLARATION,
     CLASS_METHOD_DECLARATION as _CLASS_METHOD_DECLARATION,
     FUNCTION_ADDRESS as _FUNCTION_ADDRESS,
+    FUNCTION_RETURN_ANNOTATION as _FUNCTION_RETURN_ANNOTATION,
     FUNCTION_SUBGRAPH as _FUNCTION_SUBGRAPH,
     HELPER_CALLER_UNROUTED as _HELPER_CALLER_UNROUTED,
     IDENTITY_TRANSITION as _IDENTITY_TRANSITION,
@@ -5448,6 +5449,7 @@ def _normalize_lexical_values(
     parameter_aggregate_kinds: dict[str, str] = {}
     parameter_sequence_record_widths: dict[str, int] = {}
     parameter_sequence_element_classes: dict[str, str] = {}
+    parameter_mapping_value_classes: dict[str, str] = {}
     known_class_identities = {
         record.identity for record in navigation_table.classes
     }
@@ -5662,6 +5664,23 @@ def _normalize_lexical_values(
         aggregate_kind = annotation_aggregate_kind(annotation)
         if aggregate_kind is not None:
             parameter_aggregate_kinds[argument.arg] = aggregate_kind
+        # Lane D, D2.  Program: ``def bump(d: dict[int, int], n): d[0] +=
+        # n``.  A mapping annotation names its value class second; nothing
+        # recorded it, so the formal's rows took the float64 domain default
+        # and the int64 store disagreed with them.  Rule: ``dict[K, V]``
+        # with a primitive ``V`` declares the mapping's value class (kept
+        # apart from the sequence element class: iterating a dict yields
+        # its keys).
+        if (
+            isinstance(annotation, ast.Subscript) and aggregate_kind == "dict"
+            and isinstance(annotation.slice, ast.Tuple)
+            and len(annotation.slice.elts) == 2
+            and isinstance(annotation.slice.elts[1], ast.Name)
+            and annotation.slice.elts[1].id in primitive_class_identities
+        ):
+            parameter_mapping_value_classes[argument.arg] = (
+                primitive_class_identities[annotation.slice.elts[1].id]
+            )
         if isinstance(annotation, ast.Subscript) and aggregate_kind in {
             "list", "set", "frozenset", "tuple",
         }:
@@ -5669,6 +5688,34 @@ def _normalize_lexical_values(
             element_identity = (
                 element.id if isinstance(element, ast.Name) else None
             )
+            # Lane D, D2.  Program: ``def first(xs: tuple[int, int]): return
+            # xs[0]`` (corpus c184).  A tuple annotation spells one class per
+            # position, so its slice is a Tuple, not a Name, and nothing was
+            # recorded: the callee's rows took the float64 domain default.
+            # Rule: a tuple annotation whose positions all name one class
+            # (``tuple[int, int]``, or ``tuple[int, ...]``) declares that
+            # element class; positions of different classes declare none.
+            if (
+                aggregate_kind == "tuple"
+                and isinstance(element, ast.Tuple)
+                and element.elts
+            ):
+                positions = [
+                    item for item in element.elts
+                    if not (
+                        isinstance(item, ast.Constant)
+                        and item.value is Ellipsis
+                    )
+                ]
+                names = {
+                    item.id if isinstance(item, ast.Name) else None
+                    for item in positions
+                }
+                if len(names) == 1 and None not in names and (
+                    len(positions) == len(element.elts)
+                    or (len(positions) == 1 and len(element.elts) == 2)
+                ):
+                    element_identity = next(iter(names))
             if element_identity in primitive_class_identities:
                 parameter_sequence_element_classes[argument.arg] = (
                     primitive_class_identities[element_identity]
@@ -6356,6 +6403,12 @@ def _normalize_lexical_values(
                 attributes.update({
                     "sequence_element_class_ref": str(element_class),
                     "sequence_element_annotation_cell": annotation_cell,
+                })
+            value_class = parameter_mapping_value_classes.get(name)
+            if value_class is not None and annotation_cell is not None:
+                attributes.update({
+                    "mapping_value_class_ref": str(value_class),
+                    "mapping_value_annotation_cell": annotation_cell,
                 })
         scalar_parameters = tuple(
             graph.G.graph.get("scalar_parameters") or ()
@@ -20082,11 +20135,83 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         )
         return None if inferred_class is None else str(inferred_class)
 
+    # Lane D, D2.  Program: ``def single(n) -> list[int]: return [n]``;
+    # ``t = single(n); t[0]`` (corpus c215).  The call's result was stamped
+    # only as a list, so ``t[0]`` took the float64 domain default until the
+    # callee's linked ABI arrived.  Rule: a declared sequence return whose
+    # element is one primitive class (``list[int]``, ``tuple[int, int]``,
+    # ``tuple[int, ...]``) states the call result's element class, with its
+    # ``function_return_annotation`` cell, as a parameter annotation does.
+    primitive_element_classes = {
+        "int": "builtins.int", "float": "builtins.float",
+        "bool": "builtins.bool",
+    }
+    returned_element_by_reference: dict[int, tuple[str, Any]] = {}
+
+    def returned_element(definition: Any) -> tuple[str, Any] | None:
+        if isinstance(definition, int) and definition in graph.G:
+            definition = graph.G.nodes[definition].get("expr_obj")
+        if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        annotation = definition.returns
+        if isinstance(annotation, ast.Constant) and isinstance(
+            annotation.value, str
+        ):
+            try:
+                annotation = ast.parse(annotation.value, mode="eval").body
+            except SyntaxError:
+                return None
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        container = (
+            annotation.value.id if isinstance(annotation.value, ast.Name)
+            else ""
+        )
+        if container not in {
+            "list", "List", "set", "Set", "frozenset", "tuple", "Tuple",
+        }:
+            return None
+        element = annotation.slice
+        if container in {"tuple", "Tuple"} and isinstance(element, ast.Tuple):
+            positions = [
+                item for item in element.elts
+                if not (
+                    isinstance(item, ast.Constant) and item.value is Ellipsis
+                )
+            ]
+            if not positions or (
+                len(positions) != len(element.elts)
+                and not (len(positions) == 1 and len(element.elts) == 2)
+            ):
+                return None
+            names = {
+                item.id if isinstance(item, ast.Name) else None
+                for item in positions
+            }
+            if len(names) != 1:
+                return None
+            element = positions[0]
+        if not isinstance(element, ast.Name):
+            return None
+        element_class = primitive_element_classes.get(element.id)
+        row = getattr(definition, "_turing_source_span_row", None)
+        if element_class is None or not isinstance(row, tuple) or len(row) < 2:
+            return None
+        cell = current_identity_book().latest_ref(
+            _FUNCTION_RETURN_ANNOTATION, (row[0], str(row[1])),
+        )
+        return None if cell is None else (element_class, cell)
+
     for function_node_id, reference in function_nodes.items():
         definition = graph.G.nodes.get(function_node_id, {}).get("expr_obj")
         inferred_class = returned_class(definition)
         if inferred_class is not None:
             returned_class_by_reference[int(reference.address)] = inferred_class
+        declared_element = returned_element(definition)
+        if declared_element is not None:
+            returned_element_by_reference[int(reference.address)] = (
+                declared_element
+            )
     for entry in function_table:
         inferred_class = returned_class(
             entry.metadata.get("source_node")
@@ -20094,6 +20219,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         if inferred_class is not None:
             returned_class_by_reference[int(entry.reference.address)] = (
                 inferred_class
+            )
+        declared_element = returned_element(entry.metadata.get("source_node"))
+        if declared_element is not None:
+            returned_element_by_reference.setdefault(
+                int(entry.reference.address), declared_element,
             )
 
     def propagate_returned_receiver_types(target_graph: Any) -> None:
@@ -20120,6 +20250,18 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 None if callee_reference is None
                 else returned_class_by_reference.get(int(callee_reference))
             )
+            declared_element = (
+                None if callee_reference is None
+                else returned_element_by_reference.get(int(callee_reference))
+            )
+            if (
+                declared_element is not None
+                and "sequence_element_class_ref" not in attributes
+            ):
+                attributes.update({
+                    "sequence_element_class_ref": declared_element[0],
+                    "sequence_element_annotation_cell": declared_element[1],
+                })
             if (
                 returned_class is None
                 and isinstance(expression.func, ast.Attribute)
