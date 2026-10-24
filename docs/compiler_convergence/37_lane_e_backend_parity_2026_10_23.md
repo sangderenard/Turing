@@ -707,3 +707,58 @@ unchanged (static, which is what Windows uses).
 - Gate at `9e50732a` and at main `a67c8a9c`, each on a clean worktree:
   aa 89 / ab 8 / ac 26 / rec 21 on both, with the same failure names in
   every part.
+
+## E22: Fortran emits owned-heap lists
+
+- **Program:** any list grown at run time: `xs = []` then `xs.append(...)`
+  in a loop (c400, c402), `[0.5] * (n % 4)` then appends (c401, c201,
+  c202), `sorted(xs)` on a grown list (c403, c127), and a list a callee
+  returns (c56, c60, c215, c216).
+- **Wrong record:** the Fortran writer had no emission for `Alloca
+  [allocate]`, so all 86 such programs at main stopped at EMIT-INCOMPLETE.
+  C and LLVM were not affected.
+- **Rule:** a heap cell is a `type(c_ptr)`. Its elements are read and
+  written through a `c_f_pointer` view, refreshed at entry, after an
+  allocation, after a store into the cell, and after any call that passes
+  the cell. Allocation, `copy_elements` and `release_owner` go to module
+  helpers that call libc `malloc`, `memmove` and `free` through bind(C)
+  interfaces. An entry releases its heap owner formals at every Ret. A
+  caller cell that a callee fills starts at `c_null_ptr`, as C's calloc
+  does. The emitter still refuses loudly when a heap cell is indexed with
+  no point at which its view can follow the arena.
+- **Found on the way:**
+  - A callee with two Rets never wrote its status output on the exhausted
+    edge, so the caller read a stale status (c202 WRONG, c201 crash). Each
+    Ret now writes every output it carries.
+  - Element stores were coerced to the cell's dtype (`ptr`) instead of the
+    element dtype.
+  - Heap capacity cells were given a rank, so the entry asked for a
+    dynamic extent (c127). Their ranks are zeroed module-wide.
+  - `-9223372036854775808_c_int64_t` is too big a literal for gfortran
+    (c57, c62). It is now `(-huge(0_c_int64_t) - 1_c_int64_t)`.
+  - The harness bound a heap capacity from a callee binding whose sequence
+    id collided with a root list (c193 crash). A ptr column parameter is
+    now never bound.
+- **Separate finding (C, not fixed here):** `ys = [0.5] * (n % 4)`, two
+  appends, then `sum(ys)` fails to compile in C: the reduction reads the
+  replication's static extent although two appends write the sequence
+  (identity concordance names it). c401 sums with a loop instead.
+
+### Receipts for E22
+
+- Corpus at `ea3e85b5` on main `39fe7283` (303 programs): C 303/303, LLVM
+  298/303, Fortran 302 PASS (up from 184 at E21), 1 WRONG (c22, by design),
+  0 EMIT-INCOMPLETE. The LLVM misses are c337, c338, c367, c370 and c371
+  (LLVM refuses a phi type); c367, c370 and c371 do the same at main
+  `39fe7283`.
+- c400-c403 are EMIT-INCOMPLETE (Alloca) on Fortran at main `39fe7283`.
+- Fuzz seeds 59 to 62 (`FUZZ_EXT=3`, `llvm,fortran`, 30 programs each):
+  116 PASS, 3 LOUD, 1 LLVM-LOUD, 0 WRONG and 0 TYPE. The new snippet was
+  drawn once (p60_9), and that program is LOUD in C at main `39fe7283`
+  too: a list grown in a loop and sorted, followed by `[6] * (n % 4 + 1)`,
+  emits a call to `numerical_region_2`, a region C never defines
+  (`call to unknown function`). Each half alone passes on all three
+  backends. This is a separate C finding.
+- Gate at `ea3e85b5` and at main `39fe7283`, each on a clean worktree:
+  aa 89 / ab 8 / ac 26 / rec 21 on both, with the same failure names in
+  every part.
