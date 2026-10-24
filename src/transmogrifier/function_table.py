@@ -312,6 +312,32 @@ class FunctionTable(TiledObject):
 
         return self._bindings.get(str(name))
 
+    def lexical_reference(self, name: str) -> FunctionReference | None:
+        """Return the function a bare source NAME refers to, if any.
+
+        Program: a module function calls builtin ``min(h, k + 1)`` while a
+        compiled class defines a method ``min`` (AbstractTensor.min, reached
+        from ``compression/jpeg/frame.py``).  Wrong record: ``reference``
+        (last writer wins) bound the bare call to the method, its arguments
+        retyped the method's ``keepdim`` as int, and callsite specialization
+        never settled.  Rule: class-body names are not in a function's
+        lexical scope, so a bare name never resolves to a method (an entry
+        declared with ``metadata["method_owner"]``); only a unique
+        non-method definition of that name is its lexical function.
+        """
+
+        reference = self.reference(name)
+        if reference is None or self._entries[reference].metadata.get(
+            "method_owner"
+        ) is None:
+            return reference
+        lexical = tuple(
+            candidate for candidate, entry in self._entries.items()
+            if entry.name == str(name)
+            and entry.metadata.get("method_owner") is None
+        )
+        return lexical[0] if len(lexical) == 1 else None
+
     def reference_by_source_node(self, node_id: int) -> FunctionReference | None:
         """Return the reference declared for a specific source AST node.
 
