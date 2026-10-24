@@ -2961,13 +2961,17 @@ class SSAMachineIndirectLink:
         if self.edge_kind not in {"call", "jump"}:
             raise ValueError(f"unknown indirect edge kind {self.edge_kind!r}")
         if self.target_kind not in {
-            "internal-function", "pe-import", "unresolved-slot", "dynamic-state",
+            "internal-function", "pe-import", "elf-import", "unresolved-slot",
+            "dynamic-state",
         }:
             raise ValueError(f"unknown indirect target kind {self.target_kind!r}")
         if self.target_kind == "internal-function" and not self.target_function:
             raise ValueError("internal indirect link requires target_function")
-        if self.target_kind == "pe-import" and not self.external_identity:
-            raise ValueError("PE import link requires external_identity")
+        if (
+            self.target_kind in {"pe-import", "elf-import"}
+            and not self.external_identity
+        ):
+            raise ValueError("import link requires external_identity")
 
 
 @dataclass

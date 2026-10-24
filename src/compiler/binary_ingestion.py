@@ -1083,6 +1083,7 @@ X86_SSA_EQUIVALENCE_TABLE: tuple[BinaryEquivalence, ...] = (
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.STOSB), "aa", MachineSemanticToken.STRING_STORE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Store.value, Handler.Select.value, Handler.Add.value), "store AL at RDI and advance by direction flag", "single iteration does not read or write RCX"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.VMOVNTDQ_M256_YMM), "VEX.256.66.0f.WIG e7 /r", MachineSemanticToken.VECTOR_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Store.value,), "non-temporal 256-bit YMM bit-pattern store", "non-temporal is an ordering/cache hint; repository memory state receives the exact 256 bits without host AVX forwarding"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.REP_STOSB), "f3 aa", MachineSemanticToken.STRING_STORE.name, BinaryLayer.REPOSITORY_SSA, (Handler.StridedStoreFill.value, Handler.Select.value, Handler.Mul.value, Handler.Add.value), "repeat AL byte fill from RDI for RCX elements", "explicit iterative memory operation consumes RCX and advances RDI under DF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ENDBR64), "f3 0f 1e fa", MachineSemanticToken.NO_OPERATION.name, BinaryLayer.MACHINE_SEMANTIC, ("machine_noop",), "CET indirect-branch landing mark", "no architectural effect outside CET enforcement; the full ModRM byte FA is part of the encoding"),
 )
 
 

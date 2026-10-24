@@ -69,9 +69,10 @@ def test_every_authoritative_token_legalizes_to_repository_ssa():
 
     # VEX forms are decoded and legalized by the authoritative vocabulary but
     # intentionally excluded from the legacy-prefix tensor write head until
-    # that head carries explicit VEX fields.
+    # that head carries explicit VEX fields.  ENDBR64 is excluded too: its
+    # ModRM byte is part of the opcode, which a head row cannot pin.
     assert len(profile.rows) == 308
-    assert len(X86InstructionToken) == 313
+    assert len(X86InstructionToken) == 314
     assert failures == []
 
 
