@@ -1,3 +1,17 @@
+2026-10-24 WINDOWS PARITY (MEASURED, Windows, origin/main d440cd27): the C
+corpus is 328/328 PASS.  MinGW gfortran is 327 PASS plus c22's recorded LUT
+sin difference; owned-heap c400-c403 PASS.  Bootstrap completed its current
+358-unit plan with 47 compiled-unverified, 72 partial and 239 failed; the
+admitted count matches the cloud's 47, while the changed plan size makes the
+old 371 denominator non-comparable.  The managed tire reaches the same
+`function_output` alias disagreement recorded by the cloud.  Windows fixes
+make the Git Bash gate use the sanctioned interpreter and LF inputs, declare
+pytest-timeout, export the validation-runtime DLL ABI, keep SPIR-V tool names
+stable across `.EXE`, use multiprocessing spawn in the corpus driver, and
+make the bootstrap script directly runnable.  Gate ab was 255 passed / 7
+baseline failures; aa/ac/rec reached Windows' 900-second timeout.  See
+`docs/compiler_convergence/windows_parity_2026-10-24.md`.
+
 2026-10-24 GLSL ARENA CONTROLS (MEASURED, cloud): composed GLSL shaders read
 u_count/u_extent/u_slot from two read-only std430 storage blocks (set 0,
 bindings 1 and 2) instead of default-block uniforms, so the same source
