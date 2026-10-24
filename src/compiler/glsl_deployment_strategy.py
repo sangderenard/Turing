@@ -245,6 +245,7 @@ from .receiver_resolution_prepasses import (
     _resolve_bound_function_references as _resolve_bound_function_references,
     _resolve_grounded_method_references as _resolve_grounded_method_references,
     _resolve_grounded_tensor_operations as _resolve_grounded_tensor_operations,
+    _stamp_max_semantics as _stamp_max_semantics,
 )
 
 
@@ -15685,10 +15686,31 @@ def _coordinate_scheduled_capture_impl(
                             # semantics as an elementwise tensor operation;
                             # scalar and singleton arenas are its degenerate
                             # case and therefore retain a distinct SSA result.
+                            #
+                            # Program: ``max(x, y)`` over two (3,) tensors.
+                            # Python raises (a tensor's truth value is
+                            # ambiguous), but the plan compiled it as an
+                            # elementwise maximum.  Rule: more than one
+                            # element is refused as Python refuses it; the
+                            # elementwise meaning is spelled ``x.emax(y)``.
+                            many = next((
+                                value for value in args
+                                if isinstance(value, AbstractTensor)
+                                and int(value.numel()) != 1
+                            ), None)
+                            if many is not None:
+                                raise ValueError(
+                                    f"builtin {reference}() of a tensor with "
+                                    f"{int(many.numel())} elements raises in "
+                                    "Python (the truth value of a tensor with "
+                                    "more than one element is ambiguous); "
+                                    f"write x.e{reference}(y) for the "
+                                    "elementwise builtin rule, or "
+                                    f"x.{'maximum' if reference == 'max' else 'minimum'}(y) "
+                                    "for numpy's"
+                                )
                             result = args[0]
-                            method_name = (
-                                "maximum" if reference == "max" else "minimum"
-                            )
+                            method_name = "emax" if reference == "max" else "emin"
                             for operand in args[1:]:
                                 if not isinstance(result, AbstractTensor):
                                     result = AbstractTensor.tensor(result)
@@ -21664,7 +21686,7 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "add", "sub", "mul", "div", "truediv", "floordiv", "mod", "pow",
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
     "eq", "ne", "lt", "le", "gt", "ge",
-    "maximum", "minimum", "clamp_min", "clamp_max",
+    "maximum", "minimum", "emax", "emin", "clamp_min", "clamp_max",
     "logical_and", "logical_or", "logical_xor",
     "bitwise_and", "bitwise_or", "bitwise_xor",
 })
@@ -21726,12 +21748,18 @@ def _runtime_sized_descriptor(descriptor: Any) -> bool:
 
 
 def _elementwise_operands(data: Mapping) -> tuple[int, ...]:
+    # Program: ``x.maximum(y)`` over runtime-sized spans.  Wrong record: the
+    # method's argument arrives under role ``arg:0``, so only the receiver
+    # was an operand, the runtime-sized law never fired, and the result was
+    # one scalar -- element 0 on every backend.  Rule: a method call's
+    # positional arguments are operands too.
     return tuple(
         int(parent)
         for parent, role in data.get("parents") or ()
         if str(role).casefold() in {
             "lhs", "rhs", "left", "right", "operand", "value", "other",
         }
+        or str(role).casefold().startswith("arg:")
     )
 
 
@@ -23372,8 +23400,9 @@ def _tensor_descriptor_rule(
                         "lhs", "rhs", "left", "right", "operand", "value",
                         "other",
                     }
-                    or variadic_builtin_selector
-                    and str(role).casefold().startswith("arg:")
+                    # A method call's argument (``x.maximum(y)``) is an
+                    # operand under role ``arg:0``, as a builtin's are.
+                    or str(role).casefold().startswith("arg:")
                 )
                 and int(parent) in graph.G
             )
@@ -26442,7 +26471,7 @@ def _fold_callsite_structural_values(
             if (
                 operation in {
                     "add", "sub", "mult", "mul", "div", "truediv",
-                    "floordiv", "mod", "pow", "maximum", "minimum",
+                    "floordiv", "mod", "pow", "maximum", "minimum", "emax", "emin",
                     "max", "min",
                 } | comparison_operations
                 or semantic_operation in comparison_operations
@@ -26487,6 +26516,32 @@ def _fold_callsite_structural_values(
                         "dtype": parent_descriptors[0]["dtype"],
                     }
                     parent_descriptors = ()
+                # Program: ``max(x, y)`` over two (3,) tensors.  Wrong
+                # record: the operands broadcast to (3,) and the builtin
+                # compiled as an elementwise maximum, where Python raises (a
+                # tensor's truth value is ambiguous).  Rule: builtin
+                # ``max``/``min`` of operands holding more than one element,
+                # or a runtime count, is refused as Python refuses it; the
+                # elementwise builtin rule is spelled ``x.emax(y)``.
+                if (
+                    operation in {"max", "min"}
+                    and isinstance(data.get("expr_obj"), ast.Call)
+                    and isinstance(data["expr_obj"].func, ast.Name)
+                    and len(data["expr_obj"].args) >= 2
+                    and any(
+                        int(np.prod(tuple(descriptor["shape"]) or (1,))) != 1
+                        or int(descriptor.get("rank") or 0)
+                        > len(tuple(descriptor["shape"]))
+                        for descriptor in parent_descriptors
+                    )
+                ):
+                    raise ValueError(
+                        f"builtin {operation}() of tensors with more than one "
+                        "element (or a runtime count) raises in Python (the truth value of a "
+                        "tensor with more than one element is ambiguous); "
+                        f"write x.e{operation}(y) for the builtin rule per "
+                        f"element, or x.{operation}imum(y) for numpy's"
+                    )
                 if parent_descriptors:
                     try:
                         shape = tuple(np.broadcast_shapes(*(
@@ -32791,6 +32846,10 @@ def strategize_shell_deployment(
     selection_phase(
         "resolve-grounded-tensor-operations",
         lambda: _resolve_grounded_tensor_operations(graph),
+    )
+    selection_phase(
+        "stamp-max-semantics",
+        lambda: _stamp_max_semantics(graph),
     )
     reference_tables = selection_phase(
         "build-shell-reference-tables",

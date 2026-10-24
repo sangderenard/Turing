@@ -142,6 +142,8 @@ COMPOSITE_MATH_OPERATORS = frozenset(
         "csch",
         "csc",
         "deg2rad",
+        "emax",
+        "emin",
         "erf",
         "imag",
         "invert",
@@ -428,9 +430,10 @@ def compositional_tensor_source_references():
     replacing a working primitive lowering.
     """
 
+    from .abstraction_methods.elementwise import emax, emin
     from .linalg import solve
 
-    return {"solve": solve}
+    return {"emax": emax, "emin": emin, "solve": solve}
 
 
 def include_ast_parent_outside_abstract_tensor(value) -> bool:
