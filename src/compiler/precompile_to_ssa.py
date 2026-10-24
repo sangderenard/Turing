@@ -8883,6 +8883,24 @@ class _ControlSSABuilder(TiledObject):
             ))
             return
         callee = self.region_callees[region_index]
+        # Program: ``ys1 = sorted(xs1); xs2 = [6] * (n % 4 + 1)`` (E22b;
+        # lane E).  Wrong record: the replication's region kept only its
+        # post-operation (the fill); its count came from another region, so
+        # no body was lowered and no signature recorded, yet the call to the
+        # defaulted ``numerical_region_N`` was still emitted and C refused an
+        # undefined function.  Rule: when this lowering records its regions'
+        # signatures, a scheduled region with none, no pre-operations and no
+        # stores has no body: its post-operations are its whole work.
+        if (
+            self.region_signatures
+            and int(region_index) not in self.region_signatures
+            and callee == f"numerical_region_{int(region_index)}"
+            and not self.table_region_operations.get(int(region_index))
+            and self.table_region_post_operations.get(int(region_index))
+            and int(region_index) not in self.region_writing_indices
+        ):
+            self._emit_region_post_operations(region_index, location=location)
+            return
         feeds, outputs = self.region_signatures.get(
             region_index, ((), ())
         )
@@ -9019,6 +9037,13 @@ class _ControlSSABuilder(TiledObject):
                         # for declared in/out storage and versions those writes.
                         claim_provisional_definition=True,
                     )
+        self._emit_region_post_operations(region_index, location=location)
+
+    def _emit_region_post_operations(
+        self, region_index: int, *, location: str,
+    ) -> None:
+        """Run the table operations scheduled after region ``region_index``."""
+
         for kind, table_arguments in self.table_region_post_operations.get(
             int(region_index), ()
         ):
