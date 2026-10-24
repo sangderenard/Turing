@@ -23803,6 +23803,30 @@ def _schedule_loop_callsites(
             consumed: set[int] = set()
             produced: set[int] = set(produced_sequences(block))
 
+            def loop_offset_starts(loop: Any) -> set[int]:
+                # Program: ``r0 = xs0[-1]; xs0.pop(0)``, then ``for k, x in
+                # enumerate(ys, n % 4 + 4)`` and ``len(xs0)`` (fuzz p91_9).
+                # Wrong record: the loop body's ``enumerate_start`` reads the
+                # start value, but the loop's signature did not list it, so
+                # the start's region was ordered after the loop (62 for
+                # 2389).  Rule: a loop reads the start of every counter its
+                # induction offsets (``induction_offsets``).
+                if not isinstance(loop, LoopBlock):
+                    return set()
+                targets = {
+                    int(target_id)
+                    for _iterable_id, target_id, induction, projection
+                    in control.projected_iterable_bindings
+                    if induction == loop.induction and projection == "induction"
+                }
+                return {
+                    int(start_id)
+                    for target_id, start_id in control.induction_offsets
+                    if int(target_id) in targets
+                }
+
+            consumed.update(loop_offset_starts(block))
+
             def collect_surface(candidate: Any) -> None:
                 if isinstance(candidate, StatementBlock):
                     region_index = scheduled_region(candidate)
@@ -23832,6 +23856,7 @@ def _schedule_loop_callsites(
                     if isinstance(candidate, WhileBlock):
                         consumed.add(int(candidate.predicate_value_id))
                         collect_surface(candidate.condition)
+                    consumed.update(loop_offset_starts(candidate))
                     collect_surface(candidate.body)
                     return
                 signature = dependency_signature(candidate)
@@ -24050,7 +24075,11 @@ def _schedule_loop_callsites(
                             "hierarchy", int(_prior_rank), int(_rank)
                         ))
 
-                def sequence_accesses(candidate):
+                # The arenas some statement of this run reads or writes; a
+                # call's arguments among them are its writes (below).
+                run_arenas: set[int] = set()
+
+                def sequence_accesses(candidate, include_calls=True):
                     """One arena's reads and its writes, told apart.
 
                     These used to be one set, and every pair of accesses to an
@@ -24092,6 +24121,30 @@ def _schedule_loop_callsites(
                                 )
                                 reads |= operation_reads
                                 writes |= operation_writes
+                    # Program: ``xs2 = [n, 6]; swap(xs2)``, then ``xs2[0]``
+                    # after list and table work (fuzzer p92_28).  Wrong
+                    # record: a ``__plan_callsite_N__`` statement yielded no
+                    # arena access, so no edge ordered the region reading
+                    # ``xs2[0]`` after the call that rewrote it, and an
+                    # unrelated value edge placed that read first (-329 for
+                    # -239).  Rule: a call writes every arena of this run it
+                    # receives as an argument -- its callee may store into
+                    # that storage, and the call boundary is where the
+                    # caller sees it.  (Which callee stores is not known
+                    # here, so such a write takes no write-after-read edge;
+                    # see ``call_writes`` below.)
+                    if include_calls and isinstance(candidate, StatementBlock):
+                        for line in candidate.lines:
+                            match = _CALLSITE_MARKER.fullmatch(str(line))
+                            if match is None:
+                                continue
+                            writes.update(
+                                int(value_id)
+                                for value_id in bindings.get(
+                                    int(match.group(1)), ((), ())
+                                )[0]
+                                if int(value_id) in run_arenas
+                            )
                     if isinstance(candidate, SequenceMutationBlock):
                         writes.add(int(candidate.mutation.sequence_value_id))
                         if candidate.mutation.operator == "replace":
@@ -24111,16 +24164,24 @@ def _schedule_loop_callsites(
                     for mutation in getattr(candidate, 'sequence_mutations', ()):
                         writes.add(int(mutation.sequence_value_id))
                     for child in getattr(candidate, 'blocks', ()):
-                        child_reads, child_writes = sequence_accesses(child)
+                        child_reads, child_writes = sequence_accesses(
+                            child, include_calls
+                        )
                         reads |= child_reads
                         writes |= child_writes
                     for field in ('condition', 'body', 'orelse', 'callee'):
                         child = getattr(candidate, field, None)
                         if child is not None:
-                            child_reads, child_writes = sequence_accesses(child)
+                            child_reads, child_writes = sequence_accesses(
+                                child, include_calls
+                            )
                             reads |= child_reads
                             writes |= child_writes
                     return reads, writes
+
+                for child in run:
+                    child_reads, child_writes = sequence_accesses(child)
+                    run_arenas.update(child_reads | child_writes)
 
                 # Program: ``d = {1: n, 2: 4}; del d[1]`` beside list work,
                 # then ``int(1 in d)`` (fuzzer p81_13).  Wrong record: the
@@ -24191,6 +24252,33 @@ def _schedule_loop_callsites(
                 terminal_guard_candidates: list[tuple[int, int]] = []
                 for position, child in enumerate(run):
                     reads, writes = sequence_accesses(child)
+                    # Program: ``xs = [n, 4]; ys = [0]; grow(ys, 2)``, then
+                    # ``head(xs) + width(ys) * 10 + ys[-1]`` (c193).  A call
+                    # write is "the callee MAY store here": a read-only
+                    # ``width(ys)`` inside the return region that reads
+                    # ``ys[-1]`` would take a write-after-read edge to that
+                    # region while the region consumes its result -- a cycle
+                    # the program does not have.  Rule: a call's arena write
+                    # follows the arena's last write and precedes its later
+                    # readers (RAW), but takes no WAR edge from an earlier
+                    # reader.
+                    call_writes = writes - sequence_accesses(
+                        child, include_calls=False
+                    )[1]
+                    # A call fed an arena VALUE a later statement of the run
+                    # produces already follows that producer by its value
+                    # edge; ordering it as a writer by run position would
+                    # close a cycle with that edge (a generator call placed
+                    # ahead of the loop filling its argument).
+                    late_fed = {
+                        arena for arena in call_writes
+                        if any(
+                            producer > position
+                            for producer in producers.get(int(arena), ())
+                        )
+                    }
+                    writes -= late_fed
+                    call_writes -= late_fed
                     # Program: ``if n > 6: t = [n, 3] else: t = [8, n]``,
                     # ``t.append(6)``, then a comprehension (fuzz p85_1).
                     # Wrong record: the join's birth (clear, then one
@@ -24235,6 +24323,12 @@ def _schedule_loop_callsites(
                                 access_kind == "sequence_war"
                                 and position in births.get(int(arena), ())
                             ):
+                                continue
+                            if access_kind == "sequence_war" and arena in call_writes:
+                                if arena in last_write:
+                                    require(position, last_write[arena], (
+                                        "sequence_waw", int(arena)
+                                    ))
                                 continue
                             prior = last_access[arena]
                             if (
