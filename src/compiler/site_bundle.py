@@ -92,6 +92,7 @@ _SOURCE_EXTENSIONS = {
 # any stage capable of changing the emitted ABI/control/module bytes must.
 _BUNDLE_COMPILER_IMPLEMENTATION_FILES = (
     Path(__file__),
+    Path(__file__).with_name("application_product.py"),
     Path(__file__).with_name("backend_sources.py"),
     Path(__file__).with_name("fused_program_wasm_backend.py"),
     *(
@@ -4373,6 +4374,15 @@ def build_program_bundle(
             effective_shader_configuration,
             canvas_only=canvas_output_presentation,
         )
+        from .application_product import publish_web_application_product
+
+        application_product = publish_web_application_product(
+            temporary,
+            identity=contract.slug,
+            api=module.api,
+            coordinator=str(card_manifest["coordinator"]["url"]),
+            execution_manifest=card_manifest,
+        )
         channel.log("writing audio asset", path="audio")
         audio_runtime = _write_audio_asset(
             temporary, contract.audio_configuration
@@ -4437,6 +4447,10 @@ def build_program_bundle(
         manifest = {
             "schema": BUNDLE_SCHEMA,
             "layout_version": BUNDLE_LAYOUT_VERSION,
+            "application": {
+                "schema": "turing.application-product.v1",
+                **application_product.to_mapping(),
+            },
             "program": {
                 "slug": contract.slug,
                 "title": contract.title,

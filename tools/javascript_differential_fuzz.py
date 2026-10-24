@@ -3,7 +3,8 @@
 The JavaScript counterpart of ``differential_fuzz.py``.  Each program is a
 random function over two Number parameters (``a``, ``b``) and two Boolean
 parameters (``p``, ``q``) built from ``const``/``let`` bindings,
-reassignments (``=``, ``op=``, ``++``/``--``) under nested ``if``/``else``,
+reassignments (``=``, ``op=``, ``++``/``--``) under nested ``if``/``else``
+and bounded ``for``/``while`` loops,
 an optional early-return ``if`` and typed expression snippets.  It is lowered with
 ``lower_javascript_source_to_ssa``, compiled through the C backend and run on
 rows of ordinary and special values (``NaN``, ``-0``, ``Infinity``), and
@@ -14,10 +15,11 @@ FINDING (anything else: lowering/emission crash, run failure, SEGV).
 WRONG and TYPE are emergencies: stop and minimize.
 
 Programs using an implementation-approximated operation (``Math.sin``,
-``**``, ...) are judged within the oracle's ulp tier.  The grammar also
-includes spellings the frontend refuses today (``%``, ``Math.sign``,
-``Math.max``, ``&&`` on Numbers) so that each
-refusal stays visible as a LOUD cluster rather than silently vanishing.
+``**``, ...) are judged within the oracle's ulp tier.  ``%``,
+``Math.sign`` and ``Math.max``/``Math.min`` are exact programs, judged bit
+for bit.  The grammar also includes a spelling the frontend refuses today
+(``&&`` on Numbers) so that its refusal stays visible as a LOUD cluster
+rather than silently vanishing.
 
 Usage: python tools/javascript_differential_fuzz.py OUT SEED COUNT
 """
@@ -44,9 +46,6 @@ INPUT_ROWS = (
 NUMBER_LITERALS = ("0", "1", "2", "0.5", "3", "1e308", "1e-308", "10")
 # Implementation-approximated: the oracle judges them by an ulp tier.
 APPROXIMATED_CALLS = ("Math.sin", "Math.cos", "Math.exp", "Math.log", "Math.atan")
-# Refused today; kept so their refusals stay counted.
-LOUD_NUMBER_CALLS = ("Math.sign",)
-LOUD_NUMBER_BINARY = ("%",)
 
 
 class Generator:
@@ -61,7 +60,7 @@ class Generator:
             return rng.choice(self.numbers + list(NUMBER_LITERALS[:4]))
         choice = rng.random()
         if choice < 0.40:
-            op = rng.choice(("+", "-", "*", "/"))
+            op = rng.choice(("+", "-", "*", "/", "%"))
             return f"({self.number(depth - 1)} {op} {self.number(depth - 1)})"
         if choice < 0.50:
             return f"(-{self.number(depth - 1)})"
@@ -80,20 +79,16 @@ class Generator:
         if choice < 0.94:
             call = rng.choice(APPROXIMATED_CALLS)
             return f"{call}({self.number(depth - 1)})"
-        if choice < 0.97:
+        if choice < 0.96:
             return f"({self.number(depth - 1)} ** {self.number(depth - 1)})"
+        if choice < 0.975:
+            return f"Math.sign({self.number(depth - 1)})"
+        if choice < 0.99:
+            call = rng.choice(("Math.max", "Math.min"))
+            return f"{call}({self.number(depth - 1)}, {self.number(depth - 1)})"
         # Rare on purpose: one refused spelling sinks the whole program.
-        loud = rng.randrange(4)
-        if loud == 0:
-            call = rng.choice(LOUD_NUMBER_CALLS)
-            return f"{call}({self.number(depth - 1)})"
-        if loud == 1:
-            op = rng.choice(LOUD_NUMBER_BINARY)
-            return f"({self.number(depth - 1)} {op} {self.number(depth - 1)})"
-        if loud == 2:
-            # ``&&`` on Numbers returns an operand, not a boolean.
-            return f"({self.number(depth - 1)} && {self.number(depth - 1)})"
-        return f"Math.max({self.number(depth - 1)}, {self.number(depth - 1)})"
+        # ``&&`` on Numbers returns an operand, not a boolean.
+        return f"({self.number(depth - 1)} && {self.number(depth - 1)})"
 
     def boolean(self, depth: int) -> str:
         rng = self.rng
@@ -135,7 +130,7 @@ class Generator:
             if form < 0.15:
                 return f"{name}{rng.choice(('++', '--'))};"
             if form < 0.55:
-                op = rng.choice(("+=", "-=", "*=", "/="))
+                op = rng.choice(("+=", "-=", "*=", "/=", "%="))
                 return f"{name} {op} {self.number(depth)};"
             return f"{name} = {self.number(depth)};"
         name = rng.choice(self.mutable_booleans)
@@ -146,11 +141,45 @@ class Generator:
 
         rng = self.rng
         lines = []
+        # Names declared in this block (a while counter) end with it.
+        visible = list(self.numbers)
         for _ in range(rng.randint(1, 2)):
-            if depth > 0 and rng.random() < 0.3:
+            choice = rng.random()
+            if depth > 0 and choice < 0.15:
+                lines.extend(self.loop_statement(depth - 1, indent))
+            elif depth > 0 and choice < 0.4:
                 lines.extend(self.if_statement(depth - 1, indent))
             else:
                 lines.append(f"{indent}{self.assignment(2)}")
+        self.numbers[:] = visible
+        return lines
+
+    def loop_statement(self, depth: int, indent: str) -> list[str]:
+        """A bounded for/while loop rebinding outer names in its body.
+
+        The trip count is at most a small literal, optionally cut short by
+        a data comparison, so every program terminates in node.
+        """
+
+        rng = self.rng
+        self.loop_index += 1
+        counter = f"i{self.loop_index}"
+        limit = rng.choice(("0", "1", "3", "4"))
+        guard = f"{counter} < {limit}"
+        if rng.random() < 0.4:
+            guard += f" && {counter} < {rng.choice(('a', 'b'))}"
+        self.numbers.append(counter)
+        if rng.random() < 0.7:
+            lines = [f"{indent}for (let {counter} = 0; {guard}; {counter}++) {{"]
+            lines.extend(self.block(depth, indent + "  "))
+        else:
+            lines = [f"{indent}let {counter} = 0;", f"{indent}while ({guard}) {{"]
+            lines.extend(self.block(depth, indent + "  "))
+            lines.append(f"{indent}  {counter}++;")
+        lines.append(f"{indent}}}")
+        if lines[0].lstrip().startswith("for"):
+            # A for-head let is scoped to the loop.
+            self.numbers.remove(counter)
         return lines
 
     def if_statement(self, depth: int, indent: str) -> list[str]:
@@ -168,6 +197,7 @@ class Generator:
         # Parameters are reassignable too.
         self.mutable_numbers = ["a", "b"] if rng.random() < 0.3 else []
         self.mutable_booleans = []
+        self.loop_index = 0
         for index in range(rng.randint(0, 4)):
             binding = "let" if rng.random() < 0.5 else "const"
             if rng.random() < 0.7:
@@ -183,7 +213,10 @@ class Generator:
                 if binding == "let":
                     self.mutable_booleans.append(name)
             if (self.mutable_numbers or self.mutable_booleans) and rng.random() < 0.5:
-                if rng.random() < 0.5:
+                form = rng.random()
+                if form < 0.35:
+                    lines.extend(self.loop_statement(1, "  "))
+                elif form < 0.65:
                     lines.extend(self.if_statement(1, "  "))
                 else:
                     lines.append(f"  {self.assignment(3)}")

@@ -53,14 +53,15 @@ SSA_TO_JAVASCRIPT_UNARY: Mapping[Handler, str] = MappingProxyType({
     handler: spelling for spelling, handler in JAVASCRIPT_UNARY_TO_SSA.items()
 })
 
-# Listed for precise diagnostics. Loose '==' / '!=' involve type coercion,
-# Remainder, shifts and bitwise operators need ECMAScript's ToInt32/ToUint32
-# programs.  ``Handler.And``/``Or``/``Xor`` and ``Handler.Not`` are logical in
+# Listed for precise diagnostics. Loose '==' / '!=' involve type coercion;
+# shifts and bitwise operators need ECMAScript's ToInt32/ToUint32 programs.  ``Handler.And``/``Or``/``Xor`` and ``Handler.Not`` are logical in
 # the repository evaluator, so selecting them here would be a silent semantic
 # substitution.  They remain named shortfalls until those programs exist.
 JAVASCRIPT_UNSUPPORTED_BINARY = frozenset({
-    "==", "!=", "%", "<<", ">>", ">>>", "&", "|", "^",
+    "==", "!=", "<<", ">>", ">>>", "&", "|", "^",
 })
+# ``%`` has no single Handler (the repository Mod is floored); the
+# interpreter lowers it through its ECMAScript remainder program.
 JAVASCRIPT_UNSUPPORTED_UNARY = frozenset({
     "+", "~", "typeof", "void", "delete",
 })

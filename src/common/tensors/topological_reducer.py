@@ -5210,6 +5210,89 @@ def _normalize_lexical_values(
                 ):
                     names.add(str(keyword.value.id))
         return names
+    #: Per loop being reduced, innermost last: ``(receiver, field) ->
+    #: (name, pre-loop value id)`` for the fields of locally constructed
+    #: records that the loop body writes.  At the loop exit each becomes a
+    #: carried binding ``name.field`` (initial, body-exit value), exactly as
+    #: a rebound name is carried.
+    loop_field_entry_values: list[dict[tuple[int, str], tuple[str, int]]] = []
+
+    def concord_carried_field_read(
+        expression: ast.Attribute, receiver: int, attribute_id: int,
+    ) -> None:
+        """A read of a loop-carried field names its binding ``name.field``
+        on its consumer edges, as a Name read does: the loop's header and
+        exit choose per read, and an unattributed read of the initial is
+        refused there."""
+
+        if not isinstance(expression.value, ast.Name):
+            return
+        key = (int(receiver), str(expression.attr))
+        cursor_cell = field_state_cursor.get(key)
+        state = field_state_at(cursor_cell)
+        carried = any(key in entries for entries in loop_field_entry_values) or (
+            isinstance(state, _FieldState)
+            and state.kind is _FieldStateKind.LOOP_EXIT
+        )
+        if not carried:
+            return
+        _concord_lexical_reads(
+            graph, ingestion_read_scope, int(attribute_id),
+            f"{expression.value.id}.{expression.attr}",
+            binding_cell=cursor_cell or current_name_binding_cell(
+                str(expression.value.id), int(receiver),
+            ),
+        )
+
+    def constructed_field_value(name: str, attr: str) -> int | None:
+        """The current value of field ``attr`` of the record ``name`` this
+        function constructed: the field-state cursor's value, else the
+        constructor argument that initialised it.  None when neither is
+        known (no constructor schema, a nested call)."""
+
+        receiver = environment.get(name)
+        if not isinstance(receiver, int) or receiver not in graph.G:
+            return None
+        receiver_data = graph.G.nodes[int(receiver)]
+        construction = receiver_data.get("expr_obj")
+        class_identity = (receiver_data.get("attributes") or {}).get("class_ref")
+        if not isinstance(construction, ast.Call) or class_identity is None:
+            return None
+        state = field_state_at(field_state_cursor.get((int(receiver), str(attr))))
+        if isinstance(state, _FieldState):
+            value = _cell_node_id(state.value)
+            return int(value) if value is not None and value in graph.G else None
+        if state is not None:
+            return None
+        records = dict(
+            (graph.G.graph.get("program_abi") or {}).get("records") or {}
+        )
+        matching = tuple(
+            record for record_name, record in records.items()
+            if str(record_name) == str(class_identity)
+            or str(record.get("identity") or record_name) == str(class_identity)
+            or str(record.get("identity") or record_name).endswith(
+                "." + str(class_identity)
+            )
+        )
+        if len(matching) != 1 or matching[0].get("constructor_complete") is False:
+            # A projection view is not a constructor schema: its field order
+            # is not the constructor's argument order (``self.b = a``).
+            return None
+        field_names = tuple(map(str, dict(matching[0].get("fields") or {})))
+        field_expression = next((
+            keyword.value for keyword in construction.keywords
+            if keyword.arg == attr
+        ), None)
+        if field_expression is None and attr in field_names:
+            position = field_names.index(attr)
+            if position < len(construction.args):
+                field_expression = construction.args[position]
+        if field_expression is None:
+            return None
+        value = resolve_expression(field_expression)
+        return int(value) if isinstance(value, int) and value in graph.G else None
+
     # The most recent node that mutated ``(receiver_node_id, attr)`` --
     # a whole-attribute ``SetAttr`` or an element-wise ``obj.field[i, j] =``
     # ``IndexedStore``.  A later bare read of the same field consults this so
@@ -8537,6 +8620,9 @@ def _normalize_lexical_values(
                     # assigned field is read above.
                     current_value = _cell_node_id(constructed_state.value)
                     if current_value is not None and current_value in graph.G:
+                        concord_carried_field_read(
+                            expression, int(receiver), int(attribute_id),
+                        )
                         _redirect_value(
                             graph, int(attribute_id), int(current_value)
                         )
@@ -8546,7 +8632,11 @@ def _normalize_lexical_values(
                     and any(
                         (str(expression.value.id), str(expression.attr))
                         in writes
-                        for writes in loop_body_field_writes
+                        and (int(receiver), str(expression.attr))
+                        not in entries
+                        for writes, entries in zip(
+                            loop_body_field_writes, loop_field_entry_values,
+                        )
                     )
                 )
                 if (
@@ -8625,6 +8715,9 @@ def _normalize_lexical_values(
                                 post_callable_identity(
                                     int(field_value), int(function_ref),
                                 )
+                            concord_carried_field_read(
+                                expression, int(receiver), int(attribute_id),
+                            )
                             _redirect_value(
                                 graph, int(attribute_id), int(field_value)
                             )
@@ -13455,6 +13548,36 @@ def _normalize_lexical_values(
             })
         return id(dispatch)
 
+    def capture_loop_field_entries(body_statement: ast.stmt) -> None:
+        """Push the pre-loop value of every constructed-record field the
+        loop body writes (``loop_field_entry_values``).  A ``while``
+        pushes before its test, which is read every iteration."""
+
+        entry_values: dict[tuple[int, str], tuple[str, int]] = {}
+        for nested in body_statement.body:
+            for member in source_walk(nested):
+                for target in (
+                    member.targets if isinstance(member, ast.Assign)
+                    else (member.target,)
+                    if isinstance(member, (ast.AugAssign, ast.AnnAssign))
+                    else ()
+                ):
+                    if not (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                    ):
+                        continue
+                    receiver_id = environment.get(target.value.id)
+                    key = (receiver_id, str(target.attr))
+                    if not isinstance(receiver_id, int) or key in entry_values:
+                        continue
+                    value = constructed_field_value(
+                        str(target.value.id), str(target.attr),
+                    )
+                    if value is not None:
+                        entry_values[key] = (str(target.value.id), int(value))
+        loop_field_entry_values.append(entry_values)
+
     def reduce_statement(body_statement: ast.stmt) -> int | None:
         # A simple statement's own reads may follow its storing call
         # (``return acc.add(b) + acc.total``), so its names are marked
@@ -14136,7 +14259,51 @@ def _normalize_lexical_values(
                 for field_key in tuple(dict.fromkeys(
                     (*body_field_cells, *else_field_cells)
                 )):
+                    carried_entry = next((
+                        entries[field_key]
+                        for entries in reversed(loop_field_entry_values)
+                        if field_key in entries
+                    ), None)
                     if field_key in before_field_cells:
+                        entered_cell = before_field_cells[field_key]
+                        entered = field_state_at(entered_cell)
+                        if not (
+                            carried_entry is not None
+                            and isinstance(entered, _FieldState)
+                            and entered.kind is not _FieldStateKind.OBSERVED
+                            and _cell_node_id(entered.value)
+                            == int(carried_entry[1])
+                        ):
+                            continue
+                        # The branch is entered with the field unchanged
+                        # since the loop began: a write BEFORE the loop.  Its
+                        # version is the pre-loop one, but inside the loop
+                        # the field is the carried value.  Re-enter as an
+                        # observation of that value (below), so the arm that
+                        # leaves it alone reads the loop's version.
+                        for arm_cells in (body_field_cells, else_field_cells):
+                            if arm_cells.get(field_key) in (None, entered_cell):
+                                arm_cells.pop(field_key, None)
+                        before_field_cells.pop(field_key)
+                    if carried_entry is not None:
+                        # Inside a loop that carries this field, the state
+                        # before the branch is the carried value, not a read
+                        # of the record's storage: field writes are versions,
+                        # and the storage still holds the construction.
+                        seeded_cell = post_field_state(
+                            field_key[0], field_key[1],
+                            _FieldStateKind.OBSERVED,
+                            int(carried_entry[1]), int(carried_entry[1]),
+                            sources=field_state_sources(
+                                field_key[0], field_key[1],
+                                node_identity_cell(graph, int(carried_entry[1])),
+                            ),
+                            stage=_REDUCER_FIELD_MERGE,
+                        )
+                        before_field_cells[field_key] = seeded_cell
+                        for arm_cells in (body_field_cells, else_field_cells):
+                            if arm_effect_cell(arm_cells, field_key) is None:
+                                arm_cells[field_key] = seeded_cell
                         continue
                     receiver_id, attribute_name = field_key
                     receiver_class = receiver_class_identity(receiver_id)
@@ -14351,6 +14518,43 @@ def _normalize_lexical_values(
                         ),
                         source=body_statement,
                     )
+                    carried_entry = next((
+                        entries[field_key]
+                        for entries in reversed(loop_field_entry_values)
+                        if field_key in entries
+                    ), None)
+                    if carried_entry is not None:
+                        # The arm that left a carried field alone reads its
+                        # carried version: name that binding on the Phi's
+                        # operand, as a Name read would, so the loop header
+                        # rebinds it.
+                        from ...compiler.concordance_declarations import (
+                            OPERAND_POSITION as _OPERAND_POSITION_STAGE,
+                        )
+
+                        carried_name = (
+                            f"{carried_entry[0]}.{attribute_name}"
+                        )
+                        for operand_value, operand_role, operand_cell in (
+                            (body_value, "body", body_cell),
+                            (else_value, "orelse", else_cell),
+                        ):
+                            if int(operand_value) != int(carried_entry[1]):
+                                continue
+                            current_identity_book().post(
+                                _LEXICAL_READ_BINDING,
+                                (
+                                    ingestion_read_scope,
+                                    int(merged_value), operand_role, 0,
+                                ),
+                                carried_name,
+                                stage=_OPERAND_POSITION_STAGE,
+                                provenance=_Derived(_source_cells((
+                                    operand_cell,
+                                    node_identity_cell(graph, int(merged_value)),
+                                ))),
+                                mode=_Mode.CONCORD,
+                            )
                     if merged_attributes.get("producer_kind") == (
                         "aggregate_phi"
                     ):
@@ -14515,6 +14719,8 @@ def _normalize_lexical_values(
                 reduce_statement(nested)
             return id(body_statement)
         if isinstance(body_statement, (ast.For, ast.While)):
+            if isinstance(body_statement, ast.While):
+                capture_loop_field_entries(body_statement)
             # A discarded bound-method result is an effectful body statement
             # unless a later lowering proves otherwise.  Record the actual
             # statement calls here; loop composition must not rediscover
@@ -14830,6 +15036,8 @@ def _normalize_lexical_values(
                 # body updates such as ``data = data[0] if data else []``.
                 before_loop = dict(environment)
             before_loop_field_cells = dict(field_state_cursor)
+            if not isinstance(body_statement, ast.While):
+                capture_loop_field_entries(body_statement)
             loop_body_field_writes.append(frozenset(
                 (str(target.value.id), str(target.attr))
                 for nested in body_statement.body
@@ -14854,6 +15062,7 @@ def _normalize_lexical_values(
             finally:
                 loop_body_field_writes.pop()
                 loop_body_storing_receivers.pop()
+                carried_field_entries = loop_field_entry_values.pop()
             for nested in body_statement.orelse:
                 reduce_statement(nested)
             loop_id = id(body_statement)
@@ -14866,9 +15075,45 @@ def _normalize_lexical_values(
             loop_cell = (
                 node_identity_cell(graph, loop_id) if loop_id in graph.G else None
             )
+            carried_fields: dict[str, tuple[int, int]] = {}
             for field_key, exit_cell in tuple(field_state_cursor.items()):
                 entry_cell = before_loop_field_cells.get(field_key)
                 if entry_cell == exit_cell:
+                    continue
+                exit_state = field_state_at(exit_cell)
+                entry = carried_field_entries.get(field_key)
+                exit_value = (
+                    _cell_node_id(exit_state.value)
+                    if isinstance(exit_state, _FieldState) else None
+                )
+                if (
+                    entry is not None
+                    and exit_value is not None
+                    and exit_value in graph.G
+                    and loop_id in graph.G
+                    and int(exit_value) != int(entry[1])
+                ):
+                    # The pre-loop and body-exit versions of a constructed
+                    # record's field are a carried pair, like a rebound
+                    # name: the loop's realization gives the header and exit
+                    # their phi/port.  The post-loop state is LOOP_EXIT at
+                    # the body-exit value, which that port continues.
+                    binding = f"{entry[0]}.{field_key[1]}"
+                    carried_fields[binding] = (int(entry[1]), int(exit_value))
+                    read_cells = tuple(dict.fromkeys(
+                        cell for cell in (entry_cell, exit_cell, loop_cell)
+                        if cell is not None
+                    ))
+                    field_state_cursor[field_key] = field_state_book.post(
+                        _REDUCER_FIELD_STATE, field_state_row(*field_key),
+                        _FieldState(
+                            _FieldStateKind.LOOP_EXIT,
+                            node_identity_cell(graph, int(exit_value)),
+                            node_identity_cell(graph, int(loop_id)),
+                        ),
+                        stage=_REDUCER_FIELD_MERGE,
+                        provenance=_Derived(read_cells), mode=_Mode.REVISE,
+                    )
                     continue
                 # Normalizing ``field[i] = value`` retires the Assign
                 # wrapper that the original For body edge named. The field
@@ -15126,6 +15371,8 @@ def _normalize_lexical_values(
                         loop_carried_bindings[name] = (
                             int(initial), next(iter(continuation_values)),
                         )
+                for binding, pair in carried_fields.items():
+                    loop_carried_bindings.setdefault(binding, pair)
                 loop_attributes["loop_carried_bindings"] = (
                     loop_carried_bindings
                 )

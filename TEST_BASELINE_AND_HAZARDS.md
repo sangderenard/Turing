@@ -1,3 +1,34 @@
+2026-10-24 WINDOWS LLVM ROW EXPORT (MEASURED, Windows, base a6fdb31a):
+linking the explicitly exported validation runtime disabled MinGW's automatic
+export of the plain LLVM row entry, so Nodus correctly refused the retained
+DLL named by its own Buffer ABI descriptor. Windows shared builds now pass a
+focused `.def` file naming that declared entry. `tests/test_ssa_llvm_backend.py`:
+21 passed, 3 skipped. Real Nodus crossings execute runtime rank 1 `(7,)` and
+rank 2 `(2,3)` LLVM rows; a `(2,3)`/`(3,2)` mismatch returns validation code
+77 and publishes no output token. No SSA lowering or numerical law changed.
+
+2026-10-24 PRECISION COMPUTE PRODUCT (MEASURED, cloud): the precision-core
+GLSL compute lane publishes its SSBO ABI (component ABI, turing.shader-
+deployment.v1 record, product). Fixed a silent wrong answer: with a baked
+trip count the scalars block kept its padding word, so every coefficient
+was read one slot off (llvmpipe: fma(x, 3, 0.25) gave x * 0.25). Mesa's
+double fma() rounds twice on llvmpipe and lavapipe (GLSL allows it); the
+record carries an fma-rounding shortfall. The lane still cannot compile
+today's lowered cores (Cast bound, three regions per iteration); its 4
+tests fail instead of erroring now that the benchmark lowers with a
+contract. At this branch on main ae46579: GPU tests otherwise identical;
+C corpus 359/360, c428_class_keyword_construct WRONG on main ae46579 too.
+Fuzz seed 67 (40): 0 WRONG / 0 TYPE. Gate names identical to main ae46579
+in all four parts. See doc 38.
+
+2026-10-24 LANE E, E22b (MEASURED, cloud): a scheduled region with no body
+(only a post-operation fill) runs only its post-operations instead of calling
+an undefined numerical_region_N (C LOUD at main daaa83c0, c409). Re-measured on
+main 7e1fa643 + E22b (360 programs): C 360/360, LLVM 358/360 (c367, c398; same
+on main), Fortran 349/360 (c22 by design; c397, c399, c423-c429 loud, same on
+main). Fuzz seed 67 (30): 0 WRONG / 0 TYPE. Gate names identical to main
+7e1fa643 in all four parts.
+
 2026-10-24 EXTRACTED SHADER INTERFACE (MEASURED, cloud): host-written shaders
 found by shader_extractor now publish a turing.shader-component.v1 ABI read
 from their own global declarations (glsl_interface.read_glsl_interface):
