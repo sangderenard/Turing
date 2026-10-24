@@ -80,6 +80,8 @@ EXTENDED = [
     # an augmented store at a computed list index in a loop (corpus c373,
     # plan C6)
     (["xs{v} = [{a}, 0, {b}]", "for i{v} in range({c} + 2):", "    xs{v}[(i{v} + n) % 3] += i{v} + {a}"], "xs{v}[0] * 100 + xs{v}[1] * 10 + xs{v}[2]"),
+    # a dict row stored from its own read (corpus c374, plan C6)
+    (["d{v} = {{0: {a}, 1: {b}}}", "d{v}[n % 2] += n * {c}", "d{v}[1] = d{v}[0] + d{v}[1]"], "d{v}[0] * 10 + d{v}[1]"),
     (["xs{v} = []", "k{v} = n % 5 + 2", "while k{v} > 0:", "    xs{v}.append(k{v})", "    k{v} -= 2"], "len(xs{v}) * 10 + xs{v}[0]"),
     (["xs{v} = [{a}, n, {b}]", "for j{v} in range(len(xs{v})):", "    xs{v}[j{v}] = xs{v}[j{v}] * 2"], "xs{v}[0] + xs{v}[1] + xs{v}[2]"),
     (["xs{v} = [n, {a}, {b}]", "m{v} = xs{v}[0]", "for x{v} in xs{v}:", "    if x{v} > m{v}:", "        m{v} = x{v}"], "m{v}"),
